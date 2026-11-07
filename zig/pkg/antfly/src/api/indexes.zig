@@ -81,6 +81,8 @@ pub fn addIndexToTableIndexesJsonWithIo(
     index_name: []const u8,
     index_json: []const u8,
 ) ![]u8 {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
+    try @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(alloc, index_json);
     if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.InvalidCreateIndexRequest;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
@@ -195,6 +197,7 @@ pub fn removeIndexFromTableIndexesJson(
     current_indexes_json: []const u8,
     index_name: []const u8,
 ) !?[]u8 {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
     if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.ExtensionOwnedObject;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
@@ -264,6 +267,8 @@ pub fn addEnrichmentToTableIndexesJson(
     enrichment_name: []const u8,
     enrichment_json: []const u8,
 ) ![]u8 {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, enrichment_name);
+    try @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(alloc, enrichment_json);
     try validateEnrichmentConfigName(alloc, enrichment_name, enrichment_json);
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
@@ -321,6 +326,7 @@ pub fn removeEnrichmentFromTableIndexesJson(
     current_indexes_json: []const u8,
     enrichment_name: []const u8,
 ) !?[]u8 {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, enrichment_name);
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
 
@@ -380,13 +386,16 @@ pub fn encodeArtifactEnrichmentList(
     indexes_json: []const u8,
 ) ![]u8 {
     var enrichments = try collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
-    var unique_len: usize = 0;
+    // Retain ownership of every collected config through fallible sorting.
+    // Compaction below has no fallible operations and then narrows this span.
+    var unique_len: usize = enrichments.len;
     defer {
         for (enrichments[0..unique_len]) |*cfg| cfg.deinit(alloc);
         alloc.free(enrichments);
     }
 
-    sortArtifactEnrichmentsByDependency(enrichments);
+    try sortArtifactEnrichmentsByDependency(alloc, enrichments);
+    unique_len = 0;
     for (enrichments, 0..) |*cfg, i| {
         var duplicate = false;
         for (enrichments[0..unique_len]) |prior| {
@@ -743,6 +752,17 @@ pub fn encodeIndexList(
     return try out.toOwnedSlice(alloc);
 }
 
+fn isRetryableLakeBuildFailure(reason: []const u8) bool {
+    // This controls coordinator readiness, not HTTP replay. The coordinator
+    // reacquires its fence and resumes verified checkpoints after backoff.
+    // In particular, an ambiguous TLS write must not be blindly replayed.
+    if (@import("httpx").isRetryableTransportErrorName(reason)) return true;
+    inline for (.{ "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "TlsTransportReadFailed", "RateLimited", "RemoteUnavailable", "StorageReadTemporarilyUnavailable" }) |name| {
+        if (std.mem.eql(u8, reason, name)) return true;
+    }
+    return false;
+}
+
 /// Remote readiness is catalog owned. Empty native shard indexes cannot prove
 /// external coverage. Queryability is supplied only by a serving proof.
 pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, index_name: []const u8, config: std.json.Value, queryable: bool) ![]u8 {
@@ -765,7 +785,7 @@ pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_m
                     const name = mat.object.get("name") orelse break :published null;
                     if (name != .string) break :published null;
                     const found = for (value.declarations) |declaration| {
-                        if (declaration.artifact.kind == .algebraic_segment and try @import("lake_index_names.zig").matches(alloc, declaration.name, index_name, name.string, declaration.artifact.metadata_version)) break true;
+                        if (declaration.artifact.kind == .algebraic_segment and try @import("lake_index_names.zig").matches(alloc, declaration.name, index_name, name.string)) break true;
                     } else false;
                     if (!found) break :published null;
                 }
@@ -775,13 +795,16 @@ pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_m
         break :published null;
     } else null;
     const serving_ready = queryable and published != null;
+    // Reconciliation retries interruptions and transient transport failures
+    // after durable backoff. Queryability still requires the independent proof.
+    const terminal_failure = if (failure) |value| !isRetryableLakeBuildFailure(value.reason) else false;
     const readiness: indexes_openapi.IndexReadinessStatus = .{
-        .state = if (serving_ready) .ready else if (failure != null) .failed else .pending,
+        .state = if (serving_ready) .ready else if (terminal_failure) .failed else .pending,
         .queryable = serving_ready,
         .complete = serving_ready,
         .target_revision = if (state.value.generation > 0) state.value.generation else null,
         .published_revision = published,
-        .pending_reasons = if (serving_ready) &.{} else if (failure != null) &.{.load_failure} else &.{.publication},
+        .pending_reasons = if (serving_ready) &.{} else if (terminal_failure) &.{.load_failure} else &.{.publication},
     };
     const status = try std.json.Stringify.valueAlloc(alloc, .{
         .index_type = indexTypeName(inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata),
@@ -1269,9 +1292,17 @@ pub fn indexesConfigUsesArtifactSources(alloc: std.mem.Allocator, indexes_json: 
     if (parsed.value != .object) return error.InvalidCreateTableRequest;
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
+            @import("antfly_local_sources").api_index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
         if (try indexConfigValueUsesArtifactSources(entry.value_ptr.*)) return true;
     }
     return false;
+}
+
+test "privacy restore artifact admission skips opaque state and declarations in any order" {
+    const a = std.testing.allocator;
+    try std.testing.expect(!try indexesConfigUsesArtifactSources(a, "{\"enrichments\":[],\"_privacy\":{\"coverage\":{}},\"resolvers\":[],\"full_text_index_v0\":{\"type\":\"full_text\"}}"));
+    try std.testing.expect(try indexesConfigUsesArtifactSources(a, "{\"_privacy\":{},\"enrichments\":[],\"full_text_index_v0\":{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"safe\"}]}}"));
 }
 
 fn appendIndexConfig(
@@ -5092,6 +5123,56 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "public media pass admits named outputs from model chunks (#1210)" {
+            const a = std.testing.allocator;
+            const recipe =
+                \\{"enrichments":[{"name":"windows","kind":"chunk","field":"recording","chunker":{"provider":"antfly","embedding":{"model":"model","dimensions":2},"outputs":{"boundary_model":"embedding","targets":[{"name":"embedding","kind":"embedding","model":"model","dimensions":2},{"name":"speech","kind":"transcribe","model":"whisper"}]}}},{"name":"transcript","kind":"asset","source_artifact_name":"windows","producer":{"type":"media_output","config":{"output_name":"speech"}}},{"name":"transcript_chunks","kind":"chunk","field":"text","source_artifact_name":"transcript","chunk_size":512},{"name":"media_vectors","kind":"embedding","source_artifact_name":"windows","expected_dims":2}]}
+            ;
+            const body = try std.fmt.allocPrint(a, "{{\"type\":\"full_text\",\"field\":\"body\",{s}", .{recipe[1..]});
+            defer a.free(body);
+            const normalized = try parseCreateIndexRequest(a, body);
+            defer a.free(normalized);
+            try validateArtifactEnrichmentsForIndexRequestJson(a, normalized);
+            try validateArtifactEnrichmentsForTableIndexesJson(a, normalized);
+            try validateArtifactEnrichmentsForTableIndexesJson(a, recipe);
+            const configs = try collectArtifactEnrichmentsFromTableIndexesJson(a, recipe);
+            defer db_mod.types.freeEnrichmentConfigs(a, configs);
+            try sortArtifactEnrichmentsByDependency(a, configs);
+            try std.testing.expectEqualStrings("windows", configs[0].name);
+            try std.testing.expectEqualStrings("transcript", configs[1].name);
+            try std.testing.expectEqualStrings("transcript_chunks", configs[2].name);
+            try std.testing.expectEqualStrings("media_vectors", configs[3].name);
+            // A model output is also a valid root for ordinary asset chains.
+            var chained = [_]db_mod.types.EnrichmentConfig{ configs[0], configs[1], .{ .name = "transcript_copy", .kind = .asset, .source_artifact_name = "transcript", .producer_json = "{\"type\":\"copy\"}" } };
+            try validateArtifactEnrichmentConfigs(a, &chained);
+            try sortArtifactEnrichmentsByDependency(a, &chained);
+            try std.testing.expectEqualStrings("transcript_copy", chained[2].name);
+
+            const Sort = struct {
+                fn qualify(allocator: std.mem.Allocator) !void {
+                    var entries = [_]db_mod.types.EnrichmentConfig{
+                        .{ .name = "result", .kind = .asset, .source_artifact_name = "chunks" },
+                        .{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 10 },
+                    };
+                    try sortArtifactEnrichmentsByDependency(allocator, &entries);
+                    try std.testing.expectEqualStrings("chunks", entries[0].name);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(a, Sort.qualify, .{});
+            var cyclic = [_]db_mod.types.EnrichmentConfig{
+                .{ .name = "a", .kind = .asset, .source_artifact_name = "b" },
+                .{ .name = "b", .kind = .chunk, .source_artifact_name = "a", .chunk_size = 10 },
+            };
+            try std.testing.expectError(error.InvalidEnrichmentConfig, sortArtifactEnrichmentsByDependency(a, &cyclic));
+
+            for (configs) |*config| if (config.kind == .asset) {
+                const original = config.producer_json;
+                config.producer_json = @constCast("{\"type\":\"media_output\",\"config\":{\"output_name\":\"missing\"}}");
+                defer config.producer_json = original;
+                try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentConfigs(a, configs));
+            };
+        }
+
         test "artifact source admission recognizes canonical and v0.2 request forms" {
             const alloc = std.testing.allocator;
             try std.testing.expect(try indexConfigUsesArtifactSources(alloc, "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks\"}]}"));
@@ -11193,4 +11274,43 @@ test "resolver curation HTTP hides destination namespace metadata from index res
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
     try std.testing.expect(parsed.value.object.contains("default"));
+}
+
+test "external lake native interrupted publication is pending while integrity and admission failures remain terminal" {
+    const a = std.testing.allocator;
+    const lake = @import("antfly_local_sources").metadata_lake_index_catalog;
+    var config = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"full_text\"}", .{});
+    defer config.deinit();
+    var table: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "events", .indexes_json = "{\"body_text\":{\"type\":\"full_text\"}}" };
+    const desired = lake.desiredFingerprint(table);
+    const pending_errors = [_][]const u8{ "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "TlsTransportReadFailed", "NameServerFailure", "ConnectionReset", "ConnectionResetByPeer", "ConnectionAborted", "ConnectionTimedOut", "ConnectionTimeout", "BrokenPipe", "ConnectionClosed", "ConnectionRefused", "Closed", "NotConnected", "EndOfStream", "UnexpectedEof", "ReadFailed", "WriteFailed", "RecvFailed", "SendFailed", "RateLimited", "RemoteUnavailable", "StorageReadTemporarilyUnavailable" };
+    const terminal_errors = [_][]const u8{ "ArtifactIntegrityMismatch", "SqlProgramLimitExceeded", "TlsBadRecordMac", "TlsAlert", "AccessDenied", "Unauthorized", "PreconditionFailed" };
+    for (pending_errors ++ terminal_errors, 0..) |reason, i| {
+        const catalog_json = try lake.encode(a, .{ .generation = 1, .failure = .{ .generation = 1, .desired = desired, .reason = reason, .retry_at_ms = 1000 } });
+        defer a.free(catalog_json);
+        table.lake_index_catalog_json = catalog_json;
+        const bytes = try encodeLakeIndexResource(a, table, "body_text", config.value, false);
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer parsed.deinit();
+        const status = parsed.value.object.get("status").?;
+        const readiness = status.object.get("readiness").?;
+        try std.testing.expectEqualStrings(if (i < pending_errors.len) "pending" else "failed", readiness.object.get("state").?.string);
+        try std.testing.expect(!readiness.object.get("queryable").?.bool);
+        try std.testing.expectEqualStrings(if (i < pending_errors.len) "publication" else "load_failure", readiness.object.get("pending_reasons").?.array.items[0].string);
+        try std.testing.expectEqualStrings(reason, status.object.get("error").?.string);
+    }
+}
+
+test "ordered artifact inventory enrichment list owns configs through allocation failures" {
+    const Harness = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const recipe =
+                \\{"enrichments":[{"name":"first","kind":"chunk","field":"body","chunk_size":10},{"name":"second","kind":"chunk","field":"body","chunk_size":10}]}
+            ;
+            const listed = try encodeArtifactEnrichmentList(a, "docs", recipe);
+            defer a.free(listed);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

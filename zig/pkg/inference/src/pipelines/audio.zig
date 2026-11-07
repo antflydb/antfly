@@ -28,6 +28,7 @@ pub const PcmAudio = generic.PcmAudio;
 pub const PcmAudioInterleaved = generic.PcmAudioInterleaved;
 pub const EncodedFormat = generic.EncodedFormat;
 pub const DecodeOptions = generic.DecodeOptions;
+pub const EncodedClip = generic.EncodedClip;
 pub const decodeWav = generic.decodeWav;
 pub const detectFormat = generic.detectFormat;
 pub const detectFormatFromMime = generic.detectFormatFromMime;
@@ -44,6 +45,18 @@ pub const downmixToMono = generic.downmixToMono;
 pub const resample = generic.resample;
 pub const copyOrResample = generic.copyOrResample;
 pub const logMelSpectrogramWithConfig = generic.logMelSpectrogramWithConfig;
+
+/// Only exact decoded zero establishes silence; quiet nonzero samples must
+/// remain available to recognition. Reject non-finite PCM at this boundary.
+pub fn digitalSilence(samples: []const f32) !bool {
+    if (samples.len == 0) return false;
+    var silent = true;
+    for (samples) |sample| {
+        if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
+        if (sample != 0) silent = false;
+    }
+    return silent;
+}
 
 pub const WHISPER_SAMPLE_RATE: u32 = 16000;
 pub const WHISPER_N_FFT: u32 = 400;

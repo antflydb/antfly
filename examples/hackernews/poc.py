@@ -21,6 +21,7 @@ to configuration, results, or stdout. This does not change cloud IAM or buckets.
 """
 
 import argparse
+import datetime
 import hashlib
 import struct
 import json
@@ -39,6 +40,145 @@ import urllib.request
 import uuid
 
 
+class RequestFailure(RuntimeError):
+    """Retain bounded failure evidence without provider bodies or credentials."""
+
+    def __init__(self, record):
+        self.record = record
+        super().__init__(
+            f"{record['method']} {record['route']}: "
+            f"HTTP {record.get('http_status', 'transport')}: {record['code']}"
+        )
+
+    @classmethod
+    def http(cls, method, path, status, body, elapsed_ms):
+        try:
+            detail = json.loads(body)
+        except ValueError:
+            detail = {}
+        if not isinstance(detail, dict):
+            detail = {}
+        code = detail.get("code")
+        if not isinstance(code, str) or code not in {
+            "query_timeout",
+            "index_rebuilding",
+            "catalog_conflict",
+            "resource_exhausted",
+            "too_many_requests",
+            "temporarily_unavailable",
+            "metadata_leader_unavailable",
+            # Stable QueryTemporarilyUnavailableReason values from the public
+            # query contract. Preserve the reason, never the provider message.
+            "decision_provider_unavailable",
+            "doc_identity_unavailable",
+            "read_requires_primary",
+            "standby_read_unavailable",
+            "distributed_query_unavailable",
+            "storage_read_temporarily_unavailable",
+            "metric_not_ready",
+            "metric_stale",
+            "query_embedding_temporarily_unavailable",
+            "reranker_temporarily_unavailable",
+            "invalid_request",
+            "unsupported_exact_sort",
+            "unsupported_query",
+            "unauthorized",
+            "forbidden",
+            "not_found",
+            "internal_error",
+        }:
+            code = "http_error"
+        record = {
+            "method": method,
+            "route": path.partition("?")[0],
+            "http_status": status,
+            "code": code,
+            "elapsed_ms": elapsed_ms,
+        }
+        if type(detail.get("retryable")) is bool:
+            record["retryable"] = detail["retryable"]
+        return cls(record)
+
+    @classmethod
+    def transport(
+        cls, method, path, error, elapsed_ms, *, phase=None, response_status=None
+    ):
+        reason = error.reason if isinstance(error, urllib.error.URLError) else error
+        record = {
+            "method": method,
+            "route": path.partition("?")[0],
+            "code": "transport_error",
+            "transport_type": type(reason).__name__,
+            "elapsed_ms": elapsed_ms,
+        }
+        if type(getattr(reason, "errno", None)) is int:
+            record["errno"] = reason.errno
+        if phase in {"connect_or_headers", "response_body"}:
+            record["transport_phase"] = phase
+        # Separate from http_status: a broken body is still a transport failure,
+        # even after 200 headers, and must retain the existing resume policy.
+        if type(response_status) is int and 100 <= response_status <= 599:
+            record["response_status"] = response_status
+        return cls(record)
+
+
+def gcs_bearer(project, minimum_seconds=1800):
+    """Require enough remaining lifetime; never persist helper output/errors."""
+    try:
+        result = subprocess.run(
+            [
+                "gcloud",
+                "config",
+                "config-helper",
+                "--project",
+                project,
+                "--min-expiry",
+                str(minimum_seconds) + "s",
+                "--format=json",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        credential = json.loads(result.stdout)["credential"]
+        expiry = datetime.datetime.fromisoformat(credential["token_expiry"])
+        remaining = (
+            expiry - datetime.datetime.now(datetime.timezone.utc)
+        ).total_seconds()
+        token = credential["access_token"]
+        if (
+            not isinstance(token, str)
+            or not token
+            or len(token) > 65536
+            or remaining < minimum_seconds
+        ):
+            raise ValueError("Insufficient token lifetime")
+        return token
+    except (subprocess.SubprocessError, OSError, ValueError, KeyError, TypeError):
+        raise RuntimeError(
+            "Unable to acquire a GCS token with sufficient remaining lifetime"
+        ) from None
+
+
+def wait_for_server(
+    read_ready, deadline, before_poll, *, now=time.monotonic, sleep=time.sleep
+):
+    """Retry startup probes only; measured queries never use this loop."""
+    while now() < deadline:
+        before_poll()
+        try:
+            read_ready(min(2, max(0.001, deadline - now())))
+            return
+        except RequestFailure as failure:
+            if failure.record["code"] != "transport_error" and failure.record.get(
+                "http_status"
+            ) not in (502, 503, 504):
+                raise
+        sleep(min(0.5, max(0, deadline - now())))
+    raise RuntimeError("Antfly startup timed out")
+
+
 def parse_lake_metrics(text):
     """Retain aggregate query phases without arbitrary metric label values."""
     phases = {"total", "publication", "search", "hydration", "delivery"}
@@ -49,7 +189,9 @@ def parse_lake_metrics(text):
     result = {}
     for line in text.splitlines():
         fields = line.split()
-        if len(fields) != 2 or not fields[0].startswith("antfly_lake_"):
+        if len(fields) != 2 or not fields[0].startswith(
+            ("antfly_lake_", "antfly_objectstore_")
+        ):
             continue
         key = fields[0]
         if "{" in key and key not in phase_keys:
@@ -58,11 +200,48 @@ def parse_lake_metrics(text):
     return result
 
 
+def process_cpu_seconds(text):
+    """Parse ps TIME (optional days/hours, otherwise minutes:seconds)."""
+    value = text.strip()
+    days = 0
+    if "-" in value:
+        day, value = value.split("-", 1)
+        days = int(day)
+    parts = [float(part) for part in value.split(":")]
+    if len(parts) not in (2, 3) or any(
+        not math.isfinite(part) or part < 0 for part in parts
+    ):
+        raise ValueError("Invalid process CPU time")
+    clock = 0
+    for part in parts:
+        clock = clock * 60 + part
+    return days * 86400 + clock
+
+
 def lake_metric_deltas(before, after):
     return {
         key: value - before.get(key, 0)
         for key, value in after.items()
         if key.split("{", 1)[0].endswith("_total")
+    }
+
+
+def publication_profile(before, after, elapsed_seconds, fresh_registration):
+    """Keep construction counters separate from retained inventories and queries."""
+    keys = {
+        key
+        for key in before.keys() & after.keys()
+        if key.startswith("antfly_objectstore_") and key.endswith("_total")
+    }
+    valid = bool(keys) and all(after[key] >= before[key] for key in keys)
+    return {
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "fresh_registration": fresh_registration,
+        "counters_available": valid,
+        "object_operations": {key: after[key] - before[key] for key in sorted(keys)}
+        if valid
+        else None,
+        "scope": "Linked API-runtime logical object operations from before registration through all index readiness checks; includes background/nested calls, excludes later SQL/search queries and separately compiled native owners. Not provider billing or a retained-object inventory.",
     }
 
 
@@ -199,10 +378,41 @@ def wait_for_index(
             )
         if readiness.get("queryable"):
             return status
-        if readiness.get("state") == "failed":
-            code = detail.get("error")
-            if code not in {"Timeout", "DeadlineExceeded"}:
-                raise RuntimeError("Index construction failed: " + json.dumps(status))
+        code = detail.get("error")
+        # Older engines label these coordinator-retryable failures failed.
+        # Wait for fenced recovery; never replay the underlying HTTP write.
+        retryable = code in {
+            "Timeout",
+            "DeadlineExceeded",
+            "Canceled",
+            "Cancelled",
+            "TlsTransportReadFailed",
+            "NameServerFailure",
+            "ConnectionReset",
+            "ConnectionResetByPeer",
+            "ConnectionAborted",
+            "ConnectionClosed",
+            "ConnectionTimeout",
+            "ConnectionTimedOut",
+            "BrokenPipe",
+            "RateLimited",
+            "RemoteUnavailable",
+            "ConnectionRefused",
+            "Closed",
+            "NotConnected",
+            "EndOfStream",
+            "UnexpectedEof",
+            "ReadFailed",
+            "WriteFailed",
+            "RecvFailed",
+            "SendFailed",
+            "StorageReadTemporarilyUnavailable",
+        }
+        if readiness.get("state") == "failed" and not retryable:
+            raise RuntimeError("Index construction failed: " + json.dumps(status))
+        if retryable and readiness.get("state") in {"failed", "pending"}:
+            # Preserve diagnostics from corrected engines too, where pending
+            # status accurately reports recovery instead of terminating it.
             elapsed = round(now() - started, 2)
             failure = failures.setdefault(
                 code,
@@ -437,6 +647,11 @@ def main():
         help="Skip pre-query metric-refresh sleeps for the first archive query",
     )
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument(
+        "--diagnose-warm",
+        action="store_true",
+        help="Collect serial metrics around every warm query; adds idle intervals and changes the timing scenario",
+    )
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--workload-terms", nargs="+", default=[])
     parser.add_argument("--query-term", default="database")
@@ -466,7 +681,12 @@ def main():
         default=1000,
         help="Bounded recent-row sample copied into a native table for composition benchmarks",
     )
-    parser.add_argument("--store-source", action="store_true")
+    parser.add_argument(
+        "--store-source",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable stored source for serving comparisons; --no-store-source explicitly qualifies remote Parquet hydration",
+    )
     parser.add_argument(
         "--cursor-term", help="Separate broad query for deep cursor coverage"
     )
@@ -511,6 +731,7 @@ def main():
         else ["hn_id", "created_at", "item_type", "author", "points"]
     )
     args.state.mkdir(parents=True, exist_ok=True)
+    token_valid_until = 0.0
     if args.filesystem_source:
         token = ""
     elif args.bearer_stdin:
@@ -518,12 +739,12 @@ def main():
         if not token or len(token) > 65536:
             raise ValueError("Expected a bounded bearer token on stdin")
     else:
-        token = subprocess.run(
-            ["gcloud", "auth", "print-access-token", "--project", args.project],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
+        # Begin with nearly a full token lifetime. Besides bounding this run,
+        # this permits matched measurements of older engines whose publication
+        # signatures incorrectly depended on the literal bearer token.
+        acquired_started = time.monotonic()
+        token = gcs_bearer(args.project, 3300)
+        token_valid_until = acquired_started + 3300
     local_source_root = (
         prepare_filesystem_source(args.filesystem_source, args.state)
         if args.filesystem_source
@@ -594,8 +815,17 @@ def main():
     startup_samples_ms = []
 
     def start():
+        nonlocal process, log, container, token, token_valid_until
+        if not args.filesystem_source and not args.bearer_stdin:
+            minimum = min(3300, max(1800, args.build_timeout + 600))
+            if time.monotonic() + minimum >= token_valid_until:
+                acquired_started = time.monotonic()
+                token = gcs_bearer(args.project, 3300)
+                token_valid_until = acquired_started + 3300
+            # Keep our still-valid token if another gcloud user refreshes its
+            # shared CLI cache. Restart comparisons must not rotate by accident.
+            env["HN_GCS_BEARER"] = token
         startup_started = time.monotonic()
-        nonlocal process, log, container
         log = (args.state / "server.log").open("a")
         command = [
             str(Path(args.binary).resolve()),
@@ -655,21 +885,19 @@ def main():
             stdout=log,
             stderr=subprocess.STDOUT,
         )
-        deadline = time.monotonic() + 90
-        while time.monotonic() < deadline:
+
+        def check_process():
             if process.poll() is not None:
                 raise RuntimeError(
                     f"Antfly exited with {process.returncode}; see {args.state / 'server.log'}"
                 )
-            try:
-                call("GET", "/tables")
-                startup_samples_ms.append(
-                    round((time.monotonic() - startup_started) * 1000, 2)
-                )
-                return
-            except (urllib.error.URLError, TimeoutError, ConnectionError):
-                time.sleep(0.5)
-        raise RuntimeError("Antfly startup timed out")
+
+        wait_for_server(
+            lambda timeout: call("GET", "/tables", timeout=timeout),
+            time.monotonic() + 90,
+            check_process,
+        )
+        startup_samples_ms.append(round((time.monotonic() - startup_started) * 1000, 2))
 
     def stop():
         nonlocal container
@@ -681,7 +909,7 @@ def main():
                 check=False,
             )
             container = None
-        if process is not None and process.poll() is None:
+        if (process is not None and process.poll() is None) or container is not None:
             process.terminate()
             try:
                 process.wait(timeout=30)
@@ -705,13 +933,24 @@ def main():
                 raw = response.read()
                 value = json.loads(raw) if raw else None
         except urllib.error.HTTPError as exc:
-            # Avoid echoing arbitrary server/provider bodies into task output.
-            detail = exc.read().decode(errors="replace")
-            if token:
-                detail = detail.replace(token, "[redacted]")
-            raise RuntimeError(
-                f"{method} {path}: HTTP {exc.code}: {detail[:1000]}"
-            ) from exc
+            failure = RequestFailure.http(
+                method,
+                path,
+                exc.code,
+                exc.read(4096),
+                round((time.monotonic() - request_started) * 1000, 2),
+            )
+            print(json.dumps({"failed_request": failure.record}), flush=True)
+            raise failure from None
+        except (urllib.error.URLError, OSError) as exc:
+            failure = RequestFailure.transport(
+                method,
+                path,
+                exc,
+                round((time.monotonic() - request_started) * 1000, 2),
+            )
+            print(json.dumps({"failed_request": failure.record}), flush=True)
+            raise failure from None
         print(
             json.dumps(
                 {
@@ -732,6 +971,17 @@ def main():
     def resource_counters():
         # Linux counters help separate CPU work from remote transfer. Network
         # counters cover non-loopback interfaces, including TLS/DNS overhead.
+        if args.diagnose_warm and sys.platform == "darwin" and not args.docker:
+            try:
+                sample = subprocess.run(
+                    ["ps", "-o", "time=", "-p", str(process.pid)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return {"child_cpu_seconds": process_cpu_seconds(sample.stdout)}
+            except (subprocess.SubprocessError, OSError, ValueError):
+                return None
         if args.docker or not Path("/proc/net/dev").exists():
             return None
         counters = {"network_rx_bytes": 0, "network_tx_bytes": 0}
@@ -764,12 +1014,20 @@ def main():
             "cursor_initial",
             "cursor_depth_restart",
         } or phase.startswith("composed_cold.")
+        if args.diagnose_warm and (
+            phase == "warm" or phase.startswith("composed_warm.")
+        ):
+            serial_profile = True
         if args.immediate_first_query and phase == "cold":
             serial_profile = False
         metrics_before = lake_metrics() if serial_profile else None
         before = resource_counters()
         started = time.monotonic()
-        result = call("POST", path, query)
+        try:
+            result = call("POST", path, query)
+        except RequestFailure as failure:
+            failure.record["phase"] = phase
+            raise
         elapsed = round((time.monotonic() - started) * 1000, 2)
         after = resource_counters()
         metrics_after = lake_metrics() if serial_profile else None
@@ -807,7 +1065,10 @@ def main():
     try:
         start()
         existing = call("GET", "/tables")
+        publication_metrics_before = lake_metrics()
+        publication_started = time.monotonic()
         registration_seconds = 0
+        fresh_registration = False
         if "hn_archive_poc" not in json.dumps(existing):
             registration_started = time.monotonic()
             call(
@@ -841,6 +1102,7 @@ def main():
                 },
             )
             registration_seconds = round(time.monotonic() - registration_started, 2)
+            fresh_registration = True
         phase = "index_build"
         started = time.monotonic()
         build_before = resource_counters()
@@ -882,6 +1144,12 @@ def main():
                 metadata_status[column]
             )
         phase = "row_count"
+        publication_io = publication_profile(
+            publication_metrics_before,
+            lake_metrics(),
+            time.monotonic() - publication_started,
+            fresh_registration,
+        )
         count = call(
             "POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn_archive_poc"}
         )
@@ -893,6 +1161,7 @@ def main():
                         "rows": args.expected_rows,
                         "ready_seconds": ready_seconds,
                         "registration_seconds": registration_seconds,
+                        "publication_io": publication_io,
                         "metadata_indexes_queryable": list(metadata_status),
                         "query_measurements_performed": False,
                     },
@@ -967,6 +1236,9 @@ def main():
             ]
             warm_samples.append(elapsed)
         warm_ms = round(statistics.median(warm_samples), 2)
+        # Capture request-local slow gauges once outside the uninterrupted burst.
+        # A later restart must not erase the evidence for an archive outlier.
+        archive_warm_metrics = lake_metrics()
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             concurrent_samples = list(
                 pool.map(
@@ -1332,6 +1604,13 @@ def main():
                     (h["_table"], h["_id"], h["_score"]) for h in cold["hits"]["hits"]
                 ]
                 samples = []
+                # Keep both completed workloads and the current partial burst
+                # if a later request fails. Never label it a passing result.
+                composed_benchmarks[name] = {
+                    "complete": False,
+                    "first_search_ms": cold_ms,
+                    "warm_samples_ms": samples,
+                }
                 for _ in range(args.repeats):
                     result, elapsed = timed_query(
                         request, "composed_warm." + name, "/query"
@@ -1344,6 +1623,7 @@ def main():
                 # Read after the burst and before stopping its dedicated process.
                 final_metrics = lake_metrics()
                 composed_benchmarks[name] = {
+                    "complete": True,
                     "first_search_ms": cold_ms,
                     "warm_samples_ms": samples,
                     "warm_p95_ms": sorted(samples)[math.ceil(len(samples) * 0.95) - 1],
@@ -1375,6 +1655,12 @@ def main():
             "cold_cache_cleared_after_publication": args.cold_cache,
             "first_query_without_metric_refresh_delay": args.immediate_first_query,
             "process_memory_budget_mb": args.process_memory_budget_mb,
+            "diagnose_warm": args.diagnose_warm,
+            "credential_mode": "filesystem"
+            if args.filesystem_source
+            else "supplied_bearer"
+            if args.bearer_stdin
+            else "gcloud_min_expiry",
             "navigation_warming_enabled": not args.disable_navigation_warming,
             "startup_samples_ms": startup_samples_ms,
             "engine_child_peak_rss_bytes": engine_peak_rss_bytes,
@@ -1382,6 +1668,7 @@ def main():
             "composed_benchmarks": composed_benchmarks,
             "cache_files_before_search": cache_files_before_search,
             "warm_samples_ms": warm_samples,
+            "archive_warm_metrics": archive_warm_metrics,
             "concurrent_search_ms": [elapsed for _, elapsed in concurrent_samples],
             "concurrency": args.concurrency,
             "cursor_retention_ms": args.cursor_retention_ms,
@@ -1411,6 +1698,7 @@ def main():
             ),
             "registration_seconds": registration_seconds,
             "build_profile": build_profile,
+            "publication_io": publication_io,
             "build_peak_rss_bytes": peak_rss_bytes,
             "first_search_ms": first_ms,
             "warm_search_ms": warm_ms,
@@ -1460,6 +1748,8 @@ def main():
     except Exception as exc:
         # Do not persist arbitrary provider error bodies or credentials.
         failure = {"phase": phase, "exception": type(exc).__name__}
+        if isinstance(exc, RequestFailure):
+            failure["failed_request"] = exc.record
         if "started" in locals():
             failure["elapsed_since_build_start_seconds"] = round(
                 time.monotonic() - started, 2
@@ -1475,14 +1765,17 @@ def main():
         for name, target in (
             ("first_ms", "first_search_ms"),
             ("warm_samples", "warm_samples_ms"),
+            ("archive_warm_metrics", "archive_warm_metrics"),
             ("workload_results", "workloads"),
             ("cursor_depth", "cursor_depth"),
             ("restart_ms", "after_restart_ms"),
             ("io_profiles", "io_profiles"),
             ("ready_seconds", "ready_seconds"),
             ("build_profile", "build_profile"),
+            ("publication_io", "publication_io"),
             ("filter_results", "metadata_filters"),
             ("count", "sql_count"),
+            ("composed_benchmarks", "composed_benchmarks"),
         ):
             if name in scope:
                 measurements[target] = scope[name]
@@ -1494,6 +1787,13 @@ def main():
             )
             if phase == "index_build" and "last_status" in build_observed:
                 failure["index_status"] = build_observed["last_status"]
+        # Preserve request-local slow phases before shutdown resets owner
+        # metrics. This bounded observation is outside every query timing.
+        if process is not None and process.poll() is None:
+            try:
+                failure["lake_metrics_after_failure"] = lake_metrics()
+            except Exception as metrics_error:
+                failure["metrics_collection_error"] = type(metrics_error).__name__
         (args.state / "failure.json").write_text(json.dumps(failure, indent=2) + "\n")
         raise
     finally:

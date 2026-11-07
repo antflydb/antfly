@@ -92,7 +92,13 @@ pub const RunAdmission = struct {
         kv_width: usize = 0,
     };
 
+    pub const DenialObserver = struct {
+        context: *anyopaque,
+        record: *const fn (*anyopaque, anyerror, ?memory.AdmissionPressure, memory.AdmissionRequest) void,
+    };
+
     controller: *memory.AdmissionController,
+    denial_observer: ?DenialObserver = null,
     backend_class: memory.BackendClass,
     limits: memory.Limits,
     static_workspace_bytes: usize,
@@ -132,16 +138,50 @@ pub const RunAdmission = struct {
         self: RunAdmission,
         amounts: memory.AdmissionAmounts,
     ) !memory.AdmissionLease {
+        var pressure: ?memory.AdmissionPressure = null;
+        return self.acquireAmountsWithPressure(amounts, &pressure);
+    }
+
+    fn acquireAmountsWithPressure(self: RunAdmission, amounts: memory.AdmissionAmounts, pressure: *?memory.AdmissionPressure) !memory.AdmissionLease {
+        pressure.* = null;
         if (self.controller.consumeForcedRunDenialForTesting()) {
             std.log.warn("test-only forced inference run admission denial", .{});
             return error.ResourceTemporarilyUnavailable;
         }
-        return self.controller.tryAcquire(
+        return self.controller.tryAcquireWithPressure(
             self.backend_class,
             self.limits,
             amounts,
             self.check_live_memory,
-        );
+            pressure,
+        ) catch |err| {
+            // Controller locks are released before inspecting OS memory or
+            // emitting diagnostics. Sessions share the manager's sampler gate.
+            if (self.denial_observer) |observer| observer.record(observer.context, err, pressure.*, .{
+                .backend_class = self.backend_class,
+                .limits = self.limits,
+                .amounts = amounts,
+            });
+            return err;
+        };
+    }
+
+    /// Validate all host scratch already owned by one request before acquiring
+    /// a delta. Independent leases must not hide its intrinsic policy limit.
+    pub fn validateOwnedHostScratch(self: RunAdmission, bytes: usize) !void {
+        const amounts = memory.AdmissionAmounts{ .host_scratch_bytes = bytes };
+        const shared = self.controller.sharedLimitsSnapshot();
+        if ((amounts.firstLimitExceeded(self.limits) catch return error.ResourceLimitExceeded) != null or
+            (shared.host_limit_bytes != 0 and bytes > shared.host_limit_bytes) or
+            (shared.unified_limit_bytes != 0 and bytes > shared.unified_limit_bytes))
+        {
+            if (self.denial_observer) |observer| observer.record(observer.context, error.ResourceLimitExceeded, null, .{
+                .backend_class = self.backend_class,
+                .limits = self.limits,
+                .amounts = amounts,
+            });
+            return error.ResourceLimitExceeded;
+        }
     }
 
     fn estimateResidentAmounts(
@@ -639,6 +679,22 @@ pub const OutputCredits = struct {
 
 /// Session represents a loaded model that can run forward passes.
 /// This is the core abstraction all backends implement.
+pub const ExecutionCapabilities = struct {
+    /// A backend declaration, never inferred by the generic scheduler.
+    /// Backend-qualified encoder cohorts, independent of generation.
+    text_batch_rows: usize = 1,
+    text_batch_tokens: usize = 0,
+    /// Maximum sum of bucket-padded token rows in one encoder cohort.
+    text_batch_padded_tokens: usize = 0,
+    cooperative_steps: bool = false,
+    max_active_requests: usize = 1,
+    max_batch_rows: usize = 1,
+    /// Mixed prefill/decode padding is excluded unless explicitly qualified.
+    decode_only_batching: bool = true,
+    /// Eager, immutable weight inventory; excludes KV and retained scratch.
+    measured_resident_weights: ?usize = null,
+};
+
 pub const Session = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -674,6 +730,8 @@ pub const Session = struct {
     }
 
     pub const VTable = struct {
+        executionOwnerStats: ?*const fn (*anyopaque) @import("../ops/execution_scope.zig").OwnerSnapshot = null,
+        executionCapabilities: ?*const fn (*anyopaque) ExecutionCapabilities = null,
         hasLayaDecisions: ?*const fn (ptr: *anyopaque) bool = null,
         runLayaDecisions: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) anyerror!?[]Tensor = null,
         run: *const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor,
@@ -701,6 +759,14 @@ pub const Session = struct {
         runResidentInputsWithControl: ?*const fn (ptr: *anyopaque, inputs: []const ResidentInput, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
         runResidentTextEmbeddingWithControl: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, request: ResidentTextEmbeddingRequest, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
     };
+
+    pub fn executionOwnerStats(self: Session) @import("../ops/execution_scope.zig").OwnerSnapshot {
+        return if (self.vtable.executionOwnerStats) |query| query(self.ptr) else .{};
+    }
+
+    pub fn executionCapabilities(self: Session) ExecutionCapabilities {
+        return if (self.vtable.executionCapabilities) |query| query(self.ptr) else .{};
+    }
 
     /// Run a forward pass with the given input tensors.
     pub fn run(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
@@ -871,8 +937,7 @@ pub const Session = struct {
         var extra = memory.AdmissionAmounts{};
         inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |name| @field(extra, name) = @field(target, name) -| @field(owned, name);
         if (std.meta.eql(extra, memory.AdmissionAmounts{})) return .{ .session = self, .lease = null };
-        if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
-        return .{ .session = self, .lease = try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, extra, admission.check_live_memory, pressure) };
+        return .{ .session = self, .lease = try admission.acquireAmountsWithPressure(extra, pressure) };
     }
 
     /// Preserve the exact denial constraint for bounded batch planning. A
@@ -883,8 +948,7 @@ pub const Session = struct {
             .session = self,
             .request = request,
             .lease = if (self.run_admission) |admission| blk: {
-                if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
-                break :blk try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, try admission.estimateRequest(request, self.outputInfo()), admission.check_live_memory, pressure);
+                break :blk try admission.acquireAmountsWithPressure(try admission.estimateRequest(request, self.outputInfo()), pressure);
             } else null,
         };
     }
@@ -1026,8 +1090,7 @@ pub const Session = struct {
         return .{
             .session = self,
             .lease = if (self.run_admission) |admission| blk: {
-                if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
-                break :blk try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, .{ .host_scratch_bytes = host_scratch_bytes }, admission.check_live_memory, pressure);
+                break :blk try admission.acquireAmountsWithPressure(.{ .host_scratch_bytes = host_scratch_bytes }, pressure);
             } else null,
         };
     }
@@ -2177,4 +2240,42 @@ test "embeddinggemma2 explicit phase workspace replaces only the generic model a
     try std.testing.expectEqual(@as(usize, 6144), (try admission.estimateRequest(request, &.{})).backend_scratch_bytes);
     request.workspace_bytes = 0;
     try std.testing.expectError(error.ResourceLimitExceeded, admission.estimateRequest(request, &.{}));
+}
+
+test "run admission observer preserves session refusal identity outside controller lock" {
+    const Observer = struct {
+        controller: *memory.AdmissionController,
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        pressure: ?memory.AdmissionPressure = null,
+        bytes: usize = 0,
+        fn record(raw: *anyopaque, err: anyerror, pressure: ?memory.AdmissionPressure, request: memory.AdmissionRequest) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.controller.snapshot(); // Must not deadlock on the controller.
+            self.calls += 1;
+            self.failure = err;
+            self.pressure = pressure;
+            self.bytes = request.amounts.host_scratch_bytes;
+        }
+    };
+    var controller: memory.AdmissionController = .{};
+    var observer = Observer{ .controller = &controller };
+    const session = Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{ .host_limit_bytes = 100 },
+        .static_workspace_bytes = 0,
+        .check_live_memory = false,
+        .denial_observer = .{ .context = &observer, .record = Observer.record },
+    } };
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitHostPreprocess(101));
+    try std.testing.expectEqual(@as(?anyerror, error.ResourceLimitExceeded), observer.failure);
+    try std.testing.expect(observer.pressure == null);
+    try std.testing.expectEqual(@as(usize, 101), observer.bytes);
+    var held = try session.admitHostPreprocess(80);
+    defer held.deinit();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admitHostPreprocess(30));
+    try std.testing.expectEqual(@as(?anyerror, error.ResourceTemporarilyUnavailable), observer.failure);
+    try std.testing.expect(observer.pressure != null);
+    try std.testing.expectEqual(@as(usize, 2), observer.calls);
 }

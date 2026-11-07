@@ -303,6 +303,9 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
         _ERR,
     ),
     ("antfly_db_batch_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_last_error_outcome_receipt", [_BUF_P], _ERR),
+    ("antfly_db_outcome_receipt_status", [_VOID_P, AntflySlice, ctypes.POINTER(ctypes.c_uint8)], _ERR),
+    ("antfly_db_outcome_receipt_forget", [_VOID_P, AntflySlice], _ERR),
     (
         "antfly_db_begin_transaction_with_id",
         [_VOID_P, _TXN_P, ctypes.c_uint64, ctypes.POINTER(AntflySlice), ctypes.c_size_t],
@@ -409,7 +412,6 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_inference_decide_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_extract_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_read_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
-    ("antfly_inference_transcribe_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_list_models_json", [_VOID_P, _BUF_P], _ERR),
     (
         "antfly_inference_pull_json",

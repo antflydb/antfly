@@ -7,6 +7,7 @@ const antfly_eval_openapi = @import("antfly_eval_openapi");
 const antfly_generating_api_openapi = @import("antfly_generating_api_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 const antfly_indexes_openapi = @import("antfly_indexes_openapi");
+const antfly_privacy_openapi = @import("antfly_privacy_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 const antfly_schema_openapi = @import("antfly_schema_openapi");
 const antfly_sort_openapi = @import("antfly_sort_openapi");
@@ -4339,6 +4340,8 @@ pub const Error = struct {
     @"error": []const u8,
     /// Human-readable error description when supplied by the endpoint.
     message: ?[]const u8 = null,
+    /// Optional RFC 6901 JSON Pointer identifying the invalid request field.
+    pointer: ?[]const u8 = null,
     /// Whether retrying the operation may succeed without changing the request.
     retryable: ?bool = null,
     /// Suggested minimum retry delay in milliseconds.
@@ -4349,6 +4352,7 @@ pub const Error = struct {
         .{ "code", "code", true },
         .{ "error", "error", false },
         .{ "message", "message", true },
+        .{ "pointer", "pointer", true },
         .{ "retryable", "retryable", true },
         .{ "retry_after_ms", "retry_after_ms", true },
     };
@@ -4371,6 +4375,10 @@ pub const Error = struct {
         try jw.write(self.@"error");
         if (self.message) |value| {
             try jw.objectField("message");
+            try jw.write(value);
+        }
+        if (self.pointer) |value| {
+            try jw.objectField("pointer");
             try jw.write(value);
         }
         if (self.retryable) |value| {
@@ -5711,6 +5719,10 @@ pub const HierarchyArtifact = struct {
     /// Independent media output sub-window within the parent chunk; omitted for an unsplit vector.
     window_index: ?u32 = null,
     unit_id: ?[]const u8 = null,
+    /// Opaque fingerprint of this member's native content and captured producer/input state; independent of hierarchy traversal cursors.
+    revision: ?[]const u8 = null,
+    /// Opaque fingerprint of the captured producer/input state, when available. Changes to producer configuration or acquired input reopen this identity.
+    derivation_revision: ?[]const u8 = null,
     source: ?HierarchyArtifactSource = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -5720,6 +5732,8 @@ pub const HierarchyArtifact = struct {
         .{ "chunk_id", "chunk_id", true },
         .{ "window_index", "window_index", true },
         .{ "unit_id", "unit_id", true },
+        .{ "revision", "revision", true },
+        .{ "derivation_revision", "derivation_revision", true },
         .{ "source", "source", true },
     };
 
@@ -5747,6 +5761,14 @@ pub const HierarchyArtifact = struct {
         }
         if (self.unit_id) |value| {
             try jw.objectField("unit_id");
+            try jw.write(value);
+        }
+        if (self.revision) |value| {
+            try jw.objectField("revision");
+            try jw.write(value);
+        }
+        if (self.derivation_revision) |value| {
+            try jw.objectField("derivation_revision");
             try jw.write(value);
         }
         if (self.source) |value| {
@@ -5806,13 +5828,75 @@ pub const HierarchyArtifactSource = struct {
 
 pub const HierarchyChildParent = struct {
     level: []const u8,
-    id: []const u8,
+    id: ?[]const u8 = null,
+    /// Bounded source selection for member traversal; unit traversal requires id.
+    ids: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "level", "level", false },
+        .{ "id", "id", true },
+        .{ "ids", "ids", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("level");
+        try jw.write(self.level);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.ids) |value| {
+            try jw.objectField("ids");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HierarchyChildren = struct {
     parent: HierarchyChildParent,
-    /// Child level to enumerate. Unit traversal reads the versioned extraction hierarchy rather than a relevance index, so empty and failed units are included.
+    /// Child level to enumerate. Unit traversal reads the versioned extraction hierarchy rather than a relevance index, so empty and failed units are included. Member traversal requires artifact and seeks that producer's native storage prefixes within the selected source or parent.ids batch (up to 100). One global cursor orders the selected members; it includes generic assets and chunks. Scalar member payloads are returned as {"$": value} in _source so every query hit retains an object-shaped projection. Continuation requires the remote_snapshot returned with the first page.
     level: []const u8,
+    /// Producer name; required for member traversal and omitted for unit traversal.
+    artifact: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "parent", "parent", false },
+        .{ "level", "level", false },
+        .{ "artifact", "artifact", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("parent");
+        try jw.write(self.parent);
+        try jw.objectField("level");
+        try jw.write(self.level);
+        if (self.artifact) |value| {
+            try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The required public order for sequential hierarchy traversal. Specify `_hierarchy.position` ascending; Antfly appends `_id` ascending as the deterministic tie-breaker and returns both values in each hit's `_sort`.
@@ -7809,6 +7893,28 @@ pub const PermissionType = enum {
     }
 };
 
+pub const PrivacyCategory = antfly_privacy_openapi.PrivacyCategory;
+
+pub const PrivacyFinding = antfly_privacy_openapi.PrivacyFinding;
+
+pub const PrivacyFindingsPage = antfly_privacy_openapi.PrivacyFindingsPage;
+
+pub const PrivacyFindingsRequest = antfly_privacy_openapi.PrivacyFindingsRequest;
+
+pub const PrivacyPolicy = antfly_privacy_openapi.PrivacyPolicy;
+
+pub const PrivacyPreview = antfly_privacy_openapi.PrivacyPreview;
+
+pub const PrivacyPreviewRequest = antfly_privacy_openapi.PrivacyPreviewRequest;
+
+pub const PrivacyProducer = antfly_privacy_openapi.PrivacyProducer;
+
+pub const PrivacyScan = antfly_privacy_openapi.PrivacyScan;
+
+pub const PrivacyScanRequest = antfly_privacy_openapi.PrivacyScanRequest;
+
+pub const PrivacyStatus = antfly_privacy_openapi.PrivacyStatus;
+
 /// Exactly one expression node: literal, field, ref, param, call with args, case with optional else, cast, or a binary operator. Pure expressions lower to the same typed scalar IR as SQL SELECT and CASE. AI/provider calls remain in evaluate, never execute implicitly in select. value_identity(field) returns an opaque identity for a present logical value (including JSON null); missing has no identity. is_missing(field) distinguishes missing from present null. Identity reads require the same authorization and retained source revision as value reads. Metadata may accelerate them; unsupported/old metadata falls back to ordinary reads. Untaken CASE branches do not load fields or evaluate erroring calls. Supported binary nodes include eq, neq, lt, lte, gt, gte, is_distinct_from, is_not_distinct_from, and, or, add, subtract, multiply, divide and concat. Expressions are limited to depth 64 including referenced aliases, and 8192 nodes per request. Alias dependencies are acyclic; each alias is a requested output and is evaluated once per row.
 pub const ProjectionExpression = std.json.Value;
 
@@ -8314,7 +8420,7 @@ pub const QueryFilterError = struct {
     retryable: bool,
 };
 
-/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit source-grouped result shape.
+/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. For member traversal, `filter_query` applies to source parents before any artifact enumeration; it never filters member payloads or changes the member pagination order. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit source-grouped result shape.
 pub const QueryHierarchy = struct {
     group_by: ?HierarchyGroupBy = null,
     ancestors: ?HierarchyAncestors = null,
@@ -9135,6 +9241,8 @@ pub const QueryResult = struct {
     next_source_cursor: ?[]const u8 = null,
     /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
+    /// True when an ordered query read live state because this deployment's storage (Lite) cannot retain a snapshot. No remote_snapshot is returned, so the page cannot be continued with search_after or search_before.
+    live_read: ?bool = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -9161,6 +9269,7 @@ pub const QueryResult = struct {
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
+        .{ "live_read", "live_read", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -9194,6 +9303,10 @@ pub const QueryResult = struct {
         }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
+        if (self.live_read) |value| {
+            try jw.objectField("live_read");
             try jw.write(value);
         }
         if (self.evaluation) |value| {
@@ -9251,6 +9364,8 @@ pub const QueryResultBase = struct {
     next_source_cursor: ?[]const u8 = null,
     /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
+    /// True when an ordered query read live state because this deployment's storage (Lite) cannot retain a snapshot. No remote_snapshot is returned, so the page cannot be continued with search_after or search_before.
+    live_read: ?bool = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -9276,6 +9391,7 @@ pub const QueryResultBase = struct {
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
+        .{ "live_read", "live_read", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -9308,6 +9424,10 @@ pub const QueryResultBase = struct {
         }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
+        if (self.live_read) |value| {
+            try jw.objectField("live_read");
             try jw.write(value);
         }
         if (self.evaluation) |value| {
@@ -15336,6 +15456,8 @@ pub const StatefulQueryResult = struct {
     next_source_cursor: ?[]const u8 = null,
     /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
+    /// True when an ordered query read live state because this deployment's storage (Lite) cannot retain a snapshot. No remote_snapshot is returned, so the page cannot be continued with search_after or search_before.
+    live_read: ?bool = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -15362,6 +15484,7 @@ pub const StatefulQueryResult = struct {
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
+        .{ "live_read", "live_read", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -15395,6 +15518,10 @@ pub const StatefulQueryResult = struct {
         }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
+        if (self.live_read) |value| {
+            try jw.objectField("live_read");
             try jw.write(value);
         }
         if (self.evaluation) |value| {

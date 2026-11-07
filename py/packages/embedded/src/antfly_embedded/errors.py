@@ -61,6 +61,8 @@ __all__ = [
     "ReplacementConfigurationMismatchError",
     "InternalError",
     "raise_for_code",
+    "raise_for_outcome_code",
+    "last_outcome_receipt",
     "error_class_for_code",
 ]
 
@@ -71,8 +73,9 @@ VERSION_CONFLICT = 3
 INTENT_CONFLICT = 4
 TXN_NOT_FOUND = 5
 BUSY = 6
-# The operation crossed its publication point, but crash durability could
-# not be confirmed. Inspect the destination; do not retry automatically.
+# The operation may have taken effect: it was published but crash durability
+# could not be confirmed, or a failure left it unknown whether it applied.
+# Inspect the affected data; do not retry automatically.
 OUTCOME_UNKNOWN = 7
 # The operation requires a capability unavailable on this platform or
 # filesystem. Retrying unchanged will not succeed.
@@ -115,8 +118,8 @@ _DESCRIPTIONS: dict[int, str] = {
     TXN_NOT_FOUND: "the requested transaction was not found",
     BUSY: "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
     OUTCOME_UNKNOWN: (
-        "the operation was published, but crash durability could not be confirmed; "
-        "inspect the destination and do not retry automatically"
+        "the operation may have taken effect, but whether it applied or became durable "
+        "could not be confirmed; inspect the affected data and do not retry automatically"
     ),
     UNSUPPORTED: "the operation requires a capability that is not supported by this platform or filesystem",
     STALLED: "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",
@@ -187,7 +190,25 @@ class BusyError(AntflyError):
 
 
 class OutcomeUnknownError(AntflyError):
+    """The operation may have taken effect; do not retry it automatically.
+
+    Attributes:
+        outcome_receipt: for a failed batch or autocommit SQL write, the
+            receipt the database issued for it (resolve it later with
+            Database.outcome_receipt_status), else None.
+    """
+
     CODE = OUTCOME_UNKNOWN
+
+    def __init__(
+        self,
+        code: int | None = None,
+        message: str | None = None,
+        *,
+        outcome_receipt: str | None = None,
+    ) -> None:
+        super().__init__(code, message)
+        self.outcome_receipt = outcome_receipt
 
 
 class UnsupportedError(AntflyError):
@@ -262,3 +283,35 @@ def raise_for_code(code: int) -> None:
         detail = lib.antfly_last_error_detail()
     message = detail.decode("utf-8", errors="replace") if detail else None
     raise error_class_for_code(code)(code, message)
+
+
+def last_outcome_receipt() -> str | None:
+    """This thread's most recent outcome receipt, or None when the failed
+    call issued none. Call right after a batch or autocommit SQL write
+    returned ANTFLY_OUTCOME_UNKNOWN, before any other native call."""
+    import ctypes
+
+    from . import _ffi
+
+    lib = _ffi._lib
+    if lib is None:
+        return None
+    buffer = _ffi.AntflyBuffer()
+    if lib.antfly_last_error_outcome_receipt(ctypes.byref(buffer)) != OK:
+        return None
+    receipt = _ffi.take_buffer(buffer)
+    return receipt.decode("ascii", errors="replace") if receipt else None
+
+
+def raise_for_outcome_code(code: int) -> None:
+    """raise_for_code for calls that issue outcome receipts: an
+    OutcomeUnknownError carries the call's receipt, if any."""
+    if code != OUTCOME_UNKNOWN:
+        raise_for_code(code)
+        return
+    receipt = last_outcome_receipt()
+    try:
+        raise_for_code(code)
+    except OutcomeUnknownError as err:
+        err.outcome_receipt = receipt
+        raise

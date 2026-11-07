@@ -24,6 +24,8 @@ fn repeatBytesComptime(comptime bytes: []const u8, comptime count: usize) [bytes
 }
 const syntax = @import("pdf_syntax");
 const text_encoding = @import("pdf_text_encoding");
+const inline_image = @import("inline_image.zig");
+const structure_text = @import("structure_text.zig");
 const jbig2 = @import("jbig2.zig");
 const image_lib = @import("antfly_image");
 const font_lib = @import("antfly_font");
@@ -364,6 +366,9 @@ const DecodeBudgetAllocator = struct {
     max_cumulative_growth_bytes: usize = std.math.maxInt(usize),
     rejected_growth_charge: usize = 0,
     limit_exceeded: bool = false,
+    reclaimer: ?Reclaimer = null,
+
+    const Reclaimer = struct { context: *anyopaque, reclaim: *const fn (*anyopaque, *DecodeBudgetAllocator, usize) void };
 
     fn init(backing: Allocator, initial_live_bytes: usize, max_live_bytes: usize) DecodeBudgetAllocator {
         return .{
@@ -379,6 +384,21 @@ const DecodeBudgetAllocator = struct {
         return result;
     }
 
+    fn adopt(self: *DecodeBudgetAllocator, source: *DecodeBudgetAllocator, bytes: []u8) !void {
+        try self.adoptAllocation(source, bytes.len);
+    }
+
+    fn adoptAllocation(self: *DecodeBudgetAllocator, source: *DecodeBudgetAllocator, byte_count: usize) !void {
+        // Move ownership between ledgers sharing one backing allocator;
+        // neither copy the data nor charge the backing live bytes twice.
+        std.debug.assert(self.backing.ptr == source.backing.ptr and self.backing.vtable == source.backing.vtable);
+        std.debug.assert(source.live_bytes >= byte_count);
+        if (!self.permitsGrowth(byte_count)) return error.OutOfMemory;
+        source.live_bytes -= byte_count;
+        self.live_bytes += byte_count;
+        self.recordSuccessfulGrowth(byte_count);
+    }
+
     fn allocator(self: *DecodeBudgetAllocator) Allocator {
         return .{
             .ptr = self,
@@ -392,8 +412,14 @@ const DecodeBudgetAllocator = struct {
     }
 
     fn permitsGrowth(self: *DecodeBudgetAllocator, additional_bytes: usize) bool {
-        const live_permitted = additional_bytes <= self.max_live_bytes -| self.live_bytes;
+        var live_permitted = additional_bytes <= self.max_live_bytes -| self.live_bytes;
         const cumulative_permitted = additional_bytes <= self.max_cumulative_growth_bytes -| self.cumulative_growth_bytes;
+        if (!live_permitted and cumulative_permitted) if (self.reclaimer) |reclaimer| {
+            // Reclaim optional retained bytes before classifying a live quota
+            // rejection. Never retry or conceal a backing-allocator OOM.
+            reclaimer.reclaim(reclaimer.context, self, additional_bytes);
+            live_permitted = additional_bytes <= self.max_live_bytes -| self.live_bytes;
+        };
         if (live_permitted and cumulative_permitted) return true;
         if (!live_permitted) self.rejected_growth_charge = @max(self.rejected_growth_charge, self.max_live_bytes);
         if (!cumulative_permitted) self.rejected_growth_charge = @max(self.rejected_growth_charge, self.max_cumulative_growth_bytes);
@@ -618,6 +644,11 @@ const FontDecoder = struct {
     }
 };
 
+const FontStyle = struct {
+    bold: ?bool = null,
+    italic: ?bool = null,
+};
+
 const PageFont = struct {
     name: []u8,
     decoder: FontDecoder,
@@ -627,6 +658,8 @@ const PageFont = struct {
     cff_otf: ?CffOpenTypeFont = null,
     cff: ?EmbeddedCffFont = null,
     outline_fallback: bool = false,
+    bold: ?bool = null,
+    italic: ?bool = null,
     borrowed: bool = false,
 
     pub fn deinit(self: *PageFont, alloc: Allocator) void {
@@ -654,6 +687,8 @@ const PageFont = struct {
             .cff_otf = self.cff_otf,
             .cff = self.cff,
             .outline_fallback = self.outline_fallback,
+            .bold = self.bold,
+            .italic = self.italic,
             .borrowed = true,
         };
     }
@@ -722,6 +757,52 @@ fn substituteLatinFontIsBold(base_font: []const u8) ?bool {
         containsAsciiIgnoreCase(name, "semibold") or
         containsAsciiIgnoreCase(name, "demi") or
         containsAsciiIgnoreCase(name, "heavy");
+}
+fn standard14LatinFontIsItalic(base_font: []const u8) ?bool {
+    const name = if (std.mem.lastIndexOfScalar(u8, base_font, '+')) |separator|
+        base_font[separator + 1 ..]
+    else
+        base_font;
+    const upright = [_][]const u8{
+        "Times-Roman",
+        "Times-Bold",
+        "Helvetica",
+        "Helvetica-Bold",
+        "Courier",
+        "Courier-Bold",
+    };
+    for (upright) |candidate| if (std.mem.eql(u8, name, candidate)) return false;
+    const italic = [_][]const u8{
+        "Times-Italic",
+        "Times-BoldItalic",
+        "Helvetica-Oblique",
+        "Helvetica-BoldOblique",
+        "Courier-Oblique",
+        "Courier-BoldOblique",
+    };
+    for (italic) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    return null;
+}
+
+fn mergeFontNameStyle(style: *FontStyle, font_name: []const u8) void {
+    if (style.bold == null) {
+        style.bold = standard14LatinFontIsBold(font_name);
+        if (style.bold == null and
+            (containsAsciiIgnoreCase(font_name, "bold") or
+                containsAsciiIgnoreCase(font_name, "black") or
+                containsAsciiIgnoreCase(font_name, "semibold") or
+                containsAsciiIgnoreCase(font_name, "demi") or
+                containsAsciiIgnoreCase(font_name, "heavy")))
+            style.bold = true;
+    }
+    if (style.italic == null) {
+        style.italic = standard14LatinFontIsItalic(font_name);
+        if (style.italic == null and
+            (containsAsciiIgnoreCase(font_name, "italic") or
+                containsAsciiIgnoreCase(font_name, "oblique") or
+                containsAsciiIgnoreCase(font_name, "slanted")))
+            style.italic = true;
+    }
 }
 
 fn pageFontsUsedOutlineFallback(fonts: []const PageFont) bool {
@@ -1238,6 +1319,9 @@ const Type3Font = struct {
         return null;
     }
 };
+pub const TextExtractionPolicy = @import("pdf_values").TextExtractionPolicy;
+
+pub const NativeTextDiagnostics = @import("pdf_values").NativeTextDiagnostics;
 
 const TextExtractionState = struct {
     current_font_index: ?usize = null,
@@ -1256,6 +1340,16 @@ fn jpeg2000CancellationProbe(probe: CancellationProbe) image_lib.jpeg2000.Cancel
 }
 
 pub const TextRun = @import("pdf_values").TextRun;
+/// Unknown geometry is retained conservatively by extraction policies.
+fn extractionTextRunBounds(run: anytype) ?PageBox {
+    if (run.vertical) return null;
+    inline for (.{ run.x, run.y, run.a, run.b, run.c, run.d, run.advance_width, run.ascent, run.descent }) |value| if (!std.math.isFinite(value)) return null;
+    if (run.ascent < 0 or run.descent < 0) return null;
+    const box = textRunBounds(run);
+    inline for (.{ box.min_x, box.min_y, box.max_x, box.max_y }) |value| if (!std.math.isFinite(value)) return null;
+    if (box.min_x >= box.max_x or box.min_y >= box.max_y) return null;
+    return .{ .min_x = box.min_x, .min_y = box.min_y, .max_x = box.max_x, .max_y = box.max_y };
+}
 const LayoutTextRun = struct {
     text: []const u8,
     x: f64,
@@ -1270,8 +1364,24 @@ const LayoutTextRun = struct {
     ascent: f64 = 0,
     descent: f64 = 0,
     paint_order: usize = 0,
+    text_object_id: ?usize = null,
+    render_mode: i64 = 0,
+    policy_excluded: bool = false,
     text_show_tracking_gap: ?f64 = null,
     output_span: ?TextOutputSpan = null,
+    semantic_span_index: usize = no_semantic_span,
+    source_index: usize = 0,
+    ordering_fence: bool = false,
+    ancestor_groups_visible: bool = true,
+    alpha: u8 = 0xff,
+    stroke_alpha: u8 = 0xff,
+    group_alpha: u8 = 0xff,
+    vertical: bool = false,
+    clip_box: ?PageBox = null,
+
+    pub fn bounds(self: LayoutTextRun) ?PageBox {
+        return extractionTextRunBounds(self);
+    }
 
     pub fn deinit(self: *LayoutTextRun, alloc: Allocator) void {
         alloc.free(self.text);
@@ -1289,7 +1399,7 @@ fn contentHasNontextPaint(alloc: Allocator, bytes: []const u8, cancellation: Can
     while (true) {
         if (count & 255 == 0) try cancellation.check();
         count +|= 1;
-        var token = (try readContentLexeme(&scanner)) orelse continue;
+        var token = (try readContentLexemeRaw(&scanner)) orelse continue;
         defer syntax.Scanner.freeLexeme(alloc, &token);
         if (token == .eof) return false;
         if (token != .keyword) continue;
@@ -1690,7 +1800,9 @@ fn appendOwnedValue(comptime T: type, alloc: Allocator, out: *std.ArrayList(T), 
 pub const PageRenderRuns = @import("pdf_values").PageRenderRuns;
 
 const TextRunState = struct {
+    ancestor_groups_visible: bool = true,
     current_font_index: ?usize = null,
+    text_object_id: ?usize = null,
     font_size: f64 = 12,
     alpha: u8 = 0xff,
     stroke_alpha: u8 = 0xff,
@@ -1733,6 +1845,7 @@ const TextVerticalMetrics = struct {
 };
 
 const TextRunStackEntry = struct {
+    ancestor_groups_visible: bool,
     matrix: GraphicsMatrix,
     current_font_index: ?usize,
     font_size: f64,
@@ -2487,6 +2600,9 @@ const PageShading = struct {
 
 const PageExtGState = struct {
     name: []u8,
+    fill_alpha_specified: bool = true,
+    stroke_alpha_specified: bool = true,
+    blend_mode_specified: bool = true,
     fill_alpha: u8 = 0xff,
     stroke_alpha: u8 = 0xff,
     blend_mode: BlendMode = .normal,
@@ -2555,7 +2671,903 @@ const PagePattern = struct {
     }
 };
 
+const MarkedContentId = union(enum) {
+    index: i64,
+    reference: syntax.ObjRef,
+
+    fn object(self: @This()) syntax.Object {
+        return switch (self) {
+            .index => |value| .{ .integer = value },
+            .reference => |value| .{ .obj_ref = value },
+        };
+    }
+};
+
+const EncodedActualText = union(enum) {
+    string: []const u8,
+    reference: syntax.ObjRef,
+    invalid,
+
+    fn object(self: @This()) syntax.Object {
+        return switch (self) {
+            // syntax.Object uses mutable slices for ownership, but this view
+            // is borrowed and only read by the replacement decoder.
+            .string => |bytes| .{ .string = @constCast(bytes) },
+            .reference => |ref| .{ .obj_ref = ref },
+            .invalid => .{ .boolean = false },
+        };
+    }
+};
+
+const PageTextProperty = struct {
+    name: []u8,
+    // Legacy decoded values are used by small parser fixtures. Production
+    // properties borrow compact metadata from the page-local resource cache.
+    actual_text: ?[]u8 = null,
+    source: Source = .{ .normalized = .{} },
+
+    const Source = union(enum) {
+        normalized: TextResourceCache.PropertyValue,
+        cached: struct { cache: *TextResourceCache, reader: *const Reader, entry: *TextResourceCache.PropertyEntry },
+        deferred: *TextResourceCache.Bindings,
+    };
+
+    fn value(self: *const PageTextProperty) anyerror!TextResourceCache.PropertyValue {
+        while (true) switch (self.source) {
+            .normalized => |result| return result,
+            .cached => |binding| return binding.cache.entryProperty(binding.reader, binding.entry),
+            .deferred => |bindings| try bindings.resolve(),
+        };
+    }
+
+    fn append(alloc: Allocator, out: *std.ArrayList(PageTextProperty), name: []const u8, source: Source) !void {
+        const owned = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned);
+        try out.append(alloc, .{ .name = owned, .source = source });
+    }
+
+    fn deinit(self: *PageTextProperty, alloc: Allocator) void {
+        alloc.free(self.name);
+        if (self.actual_text) |text| alloc.free(text);
+        self.* = undefined;
+    }
+};
+// Page-local immutable metadata. All Form instances borrow the same indirect
+// resource/property objects; only the small selected-name records are copied.
+// A sorted index is built once per property dictionary, without resolving
+// unreferenced property values. The bounded allocator owns every borrow.
+const MetadataObjectStreamCache = struct {
+    budget: ?*DecodeBudgetAllocator = null,
+    live_budget: ?*DecodeBudgetAllocator = null,
+    retained: std.AutoHashMapUnmanaged(u32, *Frame) = .empty,
+    newest: ?*Frame = null,
+    oldest: ?*Frame = null,
+    loads: usize = 0,
+    decodes: usize = 0,
+    pins: usize = 0,
+    mutating_index: bool = false,
+
+    const Entry = struct { id: u32, start: usize, end: usize };
+    const Frame = struct {
+        id: u32,
+        bytes: []u8,
+        first: usize,
+        entries: []Entry,
+        previous: ?*Frame = null,
+        next: ?*Frame = null,
+        pins: usize = 0,
+    };
+
+    fn hasFrames(self: *const @This()) bool {
+        return self.retained.count() != 0;
+    }
+
+    fn unlink(self: *@This(), frame: *Frame) void {
+        if (frame.previous) |previous| previous.next = frame.next else self.newest = frame.next;
+        if (frame.next) |next| next.previous = frame.previous else self.oldest = frame.previous;
+    }
+
+    fn touch(self: *@This(), frame: *Frame) void {
+        if (self.newest == frame) return;
+        self.unlink(frame);
+        self.linkNewest(frame);
+    }
+
+    fn linkNewest(self: *@This(), frame: *Frame) void {
+        frame.previous = null;
+        frame.next = self.newest;
+        if (self.newest) |newest| newest.previous = frame else self.oldest = frame;
+        self.newest = frame;
+    }
+
+    fn evictOldest(self: *@This()) bool {
+        var candidate = self.oldest;
+        while (candidate) |frame| : (candidate = frame.previous) {
+            if (frame.pins != 0) continue;
+            self.unlink(frame);
+            const removed = self.retained.remove(frame.id);
+            std.debug.assert(removed);
+            const a = self.budget.?.allocator();
+            a.free(frame.entries);
+            a.free(frame.bytes);
+            a.destroy(frame);
+            return true;
+        }
+        return false;
+    }
+
+    fn reclaim(raw: *anyopaque, requesting: *DecodeBudgetAllocator, growth: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        // Hash-table growth must not reenter removal on that same table.
+        // reserveSlot retries verified quota failures after explicit eviction.
+        if (self.mutating_index) return;
+        while (growth > requesting.max_live_bytes -| requesting.live_bytes) {
+            if (!self.evictOldest()) break;
+        }
+    }
+
+    fn deinit(self: *@This()) void {
+        std.debug.assert(self.pins == 0);
+        while (self.evictOldest()) {}
+        if (self.budget) |budget| self.retained.deinit(budget.allocator());
+        self.retained = .empty;
+    }
+
+    fn beginAllocation(self: *@This()) void {
+        self.budget.?.limit_exceeded = false;
+        if (self.live_budget) |live| live.limit_exceeded = false;
+    }
+
+    fn quotaExceeded(self: *const @This()) bool {
+        return self.budget.?.limit_exceeded or if (self.live_budget) |live| live.limit_exceeded else false;
+    }
+
+    fn reserveSlot(self: *@This()) !void {
+        self.mutating_index = true;
+        defer self.mutating_index = false;
+        while (true) {
+            self.beginAllocation();
+            self.retained.ensureUnusedCapacity(self.budget.?.allocator(), 1) catch |err| {
+                if (err == error.OutOfMemory and self.quotaExceeded() and self.evictOldest()) continue;
+                return err;
+            };
+            return;
+        }
+    }
+
+    fn parseFrame(self: *@This(), reader: *const Reader, frame: *Frame, ptr: syntax.ObjRef, index: usize, projection: syntax.Projection, location: ?syntax.DeferredValue) !syntax.Object {
+        if (index >= frame.entries.len) return error.ObjectNotFound;
+        self.touch(frame);
+        frame.pins += 1;
+        self.pins += 1;
+        defer {
+            frame.pins -= 1;
+            self.pins -= 1;
+        }
+        return reader.parseCompressedObject(frame.bytes, frame.first, frame.entries[index], ptr, projection, location);
+    }
+
+    // Retention rejection has private provenance. Actual decoder limits,
+    // malformed input, cancellation and genuine allocator failures never retry.
+    const ReadResult = union(enum) { object: syntax.Object, retention_limit };
+
+    fn takeQuotaFailure(self: *@This(), err: anyerror) bool {
+        const quota = err == error.OutOfMemory and self.quotaExceeded();
+        self.beginAllocation();
+        return quota;
+    }
+
+    fn transient(self: *@This(), reader: *const Reader, stream: *const syntax.Object, first: usize, count: usize, ptr: syntax.ObjRef, index: usize, projection: syntax.Projection, location: ?syntax.DeferredValue) !syntax.Object {
+        self.decodes += 1;
+        const bytes = try reader.readDecodedStreamData(stream);
+        defer reader.alloc.free(bytes);
+        const entry = try reader.scanObjectStreamIndex(bytes, first, count, index, null);
+        return reader.parseCompressedObject(bytes, first, entry, ptr, projection, location);
+    }
+
+    fn read(self: *@This(), reader: *const Reader, id: u32, stream: *const syntax.Object, first: usize, count: usize, ptr: syntax.ObjRef, index: usize, projection: syntax.Projection, location: ?syntax.DeferredValue) !syntax.Object {
+        return switch (try self.readRetaining(reader, id, stream, first, count, ptr, index, projection, location)) {
+            .object => |object| object,
+            .retention_limit => if (reader.metadata_frame_fallback)
+                try self.transient(reader, stream, first, count, ptr, index, projection, location)
+            else
+                error.PdfDecodeWorkingSetTooLarge,
+        };
+    }
+
+    fn readRetaining(self: *@This(), reader: *const Reader, id: u32, stream: *const syntax.Object, first: usize, count: usize, ptr: syntax.ObjRef, index: usize, projection: syntax.Projection, location: ?syntax.DeferredValue) anyerror!ReadResult {
+        self.beginAllocation();
+        if (count > first) return error.InvalidObjectStream;
+        // An exhausted allowance cannot admit even the minimum possible frame.
+        // Skip admission without touching the codec or evicting useful frames.
+        const minimum = @sizeOf(Frame) +| (count *| @sizeOf(Entry)) +| first +| 1;
+        if (minimum > self.budget.?.max_live_bytes or minimum > self.budget.?.max_cumulative_growth_bytes -| self.budget.?.cumulative_growth_bytes)
+            return .retention_limit;
+        self.reserveSlot() catch |err| {
+            if (self.takeQuotaFailure(err)) return .retention_limit;
+            return err;
+        };
+        self.beginAllocation();
+        const a = self.budget.?.allocator();
+        const frame = a.create(Frame) catch |err| {
+            if (self.takeQuotaFailure(err)) return .retention_limit;
+            return err;
+        };
+        var installed = false;
+        defer if (!installed) a.destroy(frame);
+        self.beginAllocation();
+        const entries = a.alloc(Entry, count) catch |err| {
+            if (self.takeQuotaFailure(err)) return .retention_limit;
+            return err;
+        };
+        defer if (!installed) a.free(entries);
+
+        var scratch = DecodeBudgetAllocator.initWithCumulativeLimit(self.budget.?.backing, 0, self.budget.?.max_live_bytes, self.budget.?.max_live_bytes *| 4);
+        defer std.debug.assert(scratch.live_bytes == 0);
+        const decode_allocator = scratch.allocator();
+        var decoder = reader.*;
+        decoder.alloc = decode_allocator;
+        decoder.metadata_frames = null;
+        var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
+        defer encrypted_streams.deinit(decode_allocator);
+        decoder.encrypted_streams = &encrypted_streams;
+        decoder.encrypted_stream_generation = 0;
+        if (reader.encrypted_streams.get(stream.stream.data_offset)) |reference| {
+            decoder.rememberEncryptedStream(stream.stream.data_offset, reference) catch |err| {
+                const quota = err == error.OutOfMemory and (scratch.limit_exceeded or self.quotaExceeded());
+                self.beginAllocation();
+                if (quota) return .retention_limit;
+                return err;
+            };
+        }
+        self.decodes += 1;
+        const bytes = decoder.readDecodedStreamData(stream) catch |err| {
+            const quota = (err == error.OutOfMemory or err == error.PdfDecodeWorkingSetTooLarge) and (scratch.limit_exceeded or self.quotaExceeded());
+            self.beginAllocation();
+            if (quota) return .retention_limit;
+            return err;
+        };
+        var adopted = false;
+        defer if (!adopted) decode_allocator.free(bytes);
+        if (first > bytes.len) return error.InvalidObjectStream;
+        _ = try decoder.scanObjectStreamIndex(bytes, first, count, index, entries);
+        self.beginAllocation();
+        self.budget.?.adopt(&scratch, bytes) catch |err| {
+            if (!self.takeQuotaFailure(err)) return err;
+            if (!reader.metadata_frame_fallback) return .retention_limit;
+            // Decoding succeeded. Use that buffer transiently rather than
+            // freeing it and invoking the same decoder a second time.
+            return .{ .object = try reader.parseCompressedObject(bytes, first, entries[index], ptr, projection, location) };
+        };
+        adopted = true;
+        frame.* = .{ .id = id, .bytes = bytes, .first = first, .entries = entries };
+        self.retained.putAssumeCapacity(id, frame);
+        self.linkNewest(frame);
+        installed = true;
+        self.loads += 1;
+        return .{ .object = try self.parseFrame(reader, frame, ptr, index, projection, location) };
+    }
+};
+
+fn metadataScanControl(reader: *const Reader) syntax.ScanControl {
+    return .{
+        .remaining_work = @min(2 * 1024 * 1024 * 1024, @max(1024 * 1024, reader.decode_limits.max_working_set_bytes *| 16)),
+        .context = reader.cancellation.context,
+        .is_cancelled_fn = reader.cancellation.is_cancelled_fn,
+    };
+}
+
+const TextResourceCache = struct {
+    budget: *DecodeBudgetAllocator,
+    frames: MetadataObjectStreamCache = .{},
+    scan_control: syntax.ScanControl = .{},
+    scan_ready: bool = false,
+    live_budget: ?*DecodeBudgetAllocator = null,
+    objects: std.AutoHashMapUnmanaged(ObjectKey, union(enum) { object: syntax.Object, invalid }) = .empty,
+    bindings: std.ArrayList(*Bindings) = .empty,
+    direct_resources: std.ArrayList(syntax.Object) = .empty,
+    scopes: std.AutoHashMapUnmanaged(usize, []PropertyEntry) = .empty,
+    page_resources: ?syntax.Object = null,
+    property_resources: std.AutoHashMapUnmanaged(usize, ResourceSource) = .empty,
+
+    const PropertyValue = struct {
+        actual_text: ?EncodedActualText = null,
+        mcid: ?MarkedContentId = null,
+        invalid: bool = false,
+    };
+    const PropertyEntry = struct {
+        raw: *const syntax.DictEntry,
+        parsed: ?PropertyValue = null,
+    };
+
+    fn prepareScan(self: *@This(), reader: *const Reader) void {
+        if (!self.scan_ready) {
+            self.scan_control = metadataScanControl(reader);
+            self.frames.budget = self.budget;
+            self.frames.live_budget = self.live_budget;
+            const reclaimer = DecodeBudgetAllocator.Reclaimer{ .context = &self.frames, .reclaim = MetadataObjectStreamCache.reclaim };
+            self.budget.reclaimer = reclaimer;
+            if (self.live_budget) |live| live.reclaimer = reclaimer;
+            self.scan_ready = true;
+        }
+    }
+
+    fn allocator(self: *@This()) Allocator {
+        return self.budget.allocator();
+    }
+
+    fn deinit(self: *@This()) void {
+        const a = self.allocator();
+        for (self.bindings.items) |binding| a.destroy(binding);
+        self.bindings.deinit(a);
+        var scopes = self.scopes.valueIterator();
+        while (scopes.next()) |index| a.free(index.*);
+        self.scopes.deinit(a);
+        self.property_resources.deinit(a);
+        var objects = self.objects.valueIterator();
+        while (objects.next()) |entry| if (entry.* == .object) entry.object.deinit(a);
+        self.objects.deinit(a);
+        for (self.direct_resources.items) |*object| object.deinit(a);
+        self.direct_resources.deinit(a);
+        self.frames.deinit();
+        if (self.scan_ready) {
+            self.budget.reclaimer = null;
+            if (self.live_budget) |live| live.reclaimer = null;
+        }
+    }
+
+    // Call only at a cache-budget allocation boundary, never around work
+    // using the caller allocator. Recovery consumes the rejection state so
+    // later genuine allocator failures cannot inherit an earlier quota error.
+    fn allocationFailure(self: *@This(), err: anyerror) anyerror {
+        defer self.beginResolution();
+        return if (err == error.OutOfMemory and (self.budget.limit_exceeded or if (self.live_budget) |budget| budget.limit_exceeded else false)) error.PdfDecodeWorkingSetTooLarge else err;
+    }
+
+    fn retain(self: *@This(), owned: syntax.Object) !syntax.Object {
+        var value = owned;
+        errdefer value.deinit(self.allocator());
+        self.direct_resources.append(self.allocator(), value) catch |err| return self.allocationFailure(err);
+        return value;
+    }
+
+    // Metadata is parsed with a temporary per-object allocation allowance,
+    // sharing the live-byte ceiling with retained cache entries. Only fields
+    // used by native extraction enter the retained cache. Unknown
+    // payloads can never accumulate merely because a dictionary was inspected.
+    const Purpose = enum { resources, required_resources, resource_properties, container_properties, property_table, property };
+    const ResourceSource = struct { reference: syntax.ObjRef, container: bool = false };
+    const ObjectKey = struct { reference: u64, purpose: Purpose, start: usize = 0 };
+
+    fn cloneMetadata(self: *@This(), reader: *const Reader, object: syntax.Object, purpose: Purpose) anyerror!syntax.Object {
+        if (object == .obj_ref or object == .deferred) return object;
+        if (object != .dict) return .null;
+        var count: usize = 0;
+        for (object.dict) |entry| if (keepsField(purpose, entry.key)) {
+            count += 1;
+        };
+        const fields = self.allocator().alloc(syntax.DictEntry, count) catch |err| return self.allocationFailure(err);
+        var initialized: usize = 0;
+        errdefer {
+            for (fields[0..initialized]) |*entry| {
+                self.allocator().free(entry.key);
+                entry.value.deinit(self.allocator());
+            }
+            self.allocator().free(fields);
+        }
+        for (object.dict, 0..) |entry, i| {
+            if (i % 256 == 0) try reader.checkCancellation();
+            if (!keepsField(purpose, entry.key)) continue;
+            const key = self.allocator().dupe(u8, entry.key) catch |err| return self.allocationFailure(err);
+            errdefer self.allocator().free(key);
+            const value: syntax.Object = switch (purpose) {
+                .resources => if (std.mem.eql(u8, entry.key, "Properties"))
+                    self.cloneMetadata(reader, entry.value, .property_table) catch |err| blk: {
+                        _ = try self.selectedFailure(err);
+                        self.beginResolution();
+                        break :blk .{ .boolean = false };
+                    }
+                else
+                    entry.value.clone(self.allocator()) catch |err| return self.allocationFailure(err),
+                // Keep a small marker for the deferred source. It also gives
+                // property-only resource dictionaries distinct stable storage.
+                .required_resources => if (std.mem.eql(u8, entry.key, "Properties")) .null else entry.value.clone(self.allocator()) catch |err| return self.allocationFailure(err),
+                .resource_properties, .container_properties => unreachable,
+                .property_table => try self.cloneMetadata(reader, entry.value, .property),
+                .property => switch (entry.value) {
+                    .obj_ref, .null => entry.value,
+                    .integer => if (std.mem.eql(u8, entry.key, "MCID")) entry.value else syntax.Object{ .boolean = false },
+                    .string => if (std.mem.eql(u8, entry.key, "ActualText"))
+                        entry.value.clone(self.allocator()) catch |err| blk: {
+                            // A large optional string must not discard MCID or
+                            // other, small properties in the same resource table.
+                            _ = try self.selectedFailure(err);
+                            self.beginResolution();
+                            break :blk .{ .boolean = false };
+                        }
+                    else
+                        syntax.Object{ .boolean = false },
+                    else => .{ .boolean = false },
+                },
+            };
+            fields[initialized] = .{ .key = key, .value = value };
+            initialized += 1;
+        }
+        return .{ .dict = fields };
+    }
+
+    fn keepsField(purpose: Purpose, key: []const u8) bool {
+        return switch (purpose) {
+            .resources => for ([_][]const u8{ "Font", "XObject", "ExtGState", "ColorSpace", "Properties" }) |field| {
+                if (std.mem.eql(u8, key, field)) break true;
+            } else false,
+            .required_resources => keepsField(.resources, key),
+            .resource_properties, .container_properties => unreachable,
+            .property_table => true,
+            .property => std.mem.eql(u8, key, "MCID") or std.mem.eql(u8, key, "ActualText"),
+        };
+    }
+
+    fn resolve(self: *@This(), reader: *const Reader, raw: *const syntax.Object, purpose: Purpose) !syntax.Object {
+        try reader.checkCancellation();
+        self.prepareScan(reader);
+        if (raw.* != .obj_ref and raw.* != .deferred) return raw.*;
+        const reference = if (raw.* == .obj_ref) raw.obj_ref else raw.deferred.reference;
+        const key = ObjectKey{ .reference = (@as(u64, reference.id) << 16) | reference.gen, .purpose = purpose, .start = if (raw.* == .deferred) raw.deferred.start else 0 };
+        if (self.objects.get(key)) |entry| return switch (entry) {
+            .object => |value| value,
+            .invalid => error.InvalidPdfStructure,
+        };
+        self.beginResolution();
+        // Reserve before parsing: if the map cannot grow, fail without
+        // repeatedly reading the same optional object for every Form scope.
+        // Parsing and projection do not insert into this map, so both success
+        // and deterministic failure can commit without another allocation.
+        self.objects.ensureUnusedCapacity(self.allocator(), 1) catch |err| return self.allocationFailure(err);
+        return self.resolveUncached(reader, raw, purpose, key) catch |original| {
+            const err = self.allocationFailure(original);
+            if ((purpose == .property_table or purpose == .property or purpose == .resource_properties or purpose == .container_properties) and
+                (err == error.PdfDecodeWorkingSetTooLarge or err == error.DecodedStreamTooLarge or err == error.PdfMetadataWorkLimit))
+            {
+                // A shared optional object that exceeded a deterministic limit
+                // must not be parsed again for every Form using that resource.
+                self.objects.putAssumeCapacity(key, .invalid);
+            }
+            return err;
+        };
+    }
+
+    fn resolveUncached(self: *@This(), reader: *const Reader, raw: *const syntax.Object, purpose: Purpose, key: ObjectKey) !syntax.Object {
+        self.beginResolution();
+        var scratch = DecodeBudgetAllocator.initWithCumulativeLimit(self.budget.backing, 0, self.budget.max_live_bytes, self.budget.max_live_bytes *| 4);
+        const context = StructureResolverContext{ .reader = reader, .budget = &scratch, .scan = &self.scan_control, .frames = &self.frames };
+        const projection: syntax.Projection = switch (purpose) {
+            .resources => .resources,
+            .required_resources => .required_resources,
+            .resource_properties => .resource_properties,
+            .container_properties => .container_properties,
+            .property_table => .property_table,
+            .property => .property,
+        };
+        var parsed = context.resolveProjected(scratch.allocator(), raw, projection) catch |err| switch (err) {
+            error.OutOfMemory => {
+                const classified = if (scratch.limit_exceeded) error.PdfDecodeWorkingSetTooLarge else self.allocationFailure(err);
+                self.beginResolution();
+                return classified;
+            },
+            error.Canceled, error.PdfDecodeWorkingSetTooLarge, error.DecodedStreamTooLarge, error.PdfMetadataWorkLimit => return err,
+            else => {
+                self.objects.putAssumeCapacity(key, .invalid);
+                return error.InvalidPdfStructure;
+            },
+        };
+        defer parsed.deinit(scratch.allocator());
+        self.beginResolution();
+        const resource_object = if (purpose == .container_properties) parsed.get("Resources") else &parsed;
+        const properties_only = purpose == .resource_properties or purpose == .container_properties;
+        var value: syntax.Object = .null;
+        if (properties_only) {
+            if (resource_object) |resources_object| if (resources_object.get("Properties")) |properties| {
+                value = properties.*;
+                @constCast(properties).* = .null;
+            };
+        } else {
+            value = parsed;
+            parsed = .null;
+        }
+        parsed.deinit(scratch.allocator());
+        parsed = .null;
+        if (value != .dict and value != .obj_ref and value != .deferred) {
+            value.deinit(scratch.allocator());
+            value = .null;
+        }
+        errdefer value.deinit(scratch.allocator());
+        // Projection already removed unused fields. Retain its owned graph
+        // directly, avoiding a second copy alongside a decoded source frame.
+        if (scratch.live_bytes > self.budget.max_live_bytes -| self.budget.live_bytes) self.frames.deinit();
+        try self.budget.adoptAllocation(&scratch, scratch.live_bytes);
+        std.debug.assert(scratch.live_bytes == 0);
+        self.objects.putAssumeCapacity(key, .{ .object = value });
+        return value;
+    }
+
+    fn beginResolution(self: *@This()) void {
+        // Failure classification belongs to this operation. A prior quota
+        // rejection must not turn a later backing-allocator OOM into fallback.
+        self.budget.limit_exceeded = false;
+        if (self.live_budget) |budget| budget.limit_exceeded = false;
+    }
+
+    fn resources(self: *@This(), reader: *const Reader, raw: *const syntax.Object) !syntax.Object {
+        if (raw.* == .obj_ref) {
+            const value = try self.resolve(reader, raw, .required_resources);
+            try self.rememberPropertySource(value, .{ .reference = raw.obj_ref });
+            return value;
+        }
+        return self.retain(try self.cloneMetadata(reader, raw.*, .resources));
+    }
+
+    fn rememberPropertySource(self: *@This(), value: syntax.Object, source: ResourceSource) !void {
+        if (value.get("Properties") != null and !self.property_resources.contains(@intFromPtr(value.dict.ptr)))
+            self.property_resources.put(self.allocator(), @intFromPtr(value.dict.ptr), source) catch |err| return self.allocationFailure(err);
+    }
+
+    fn inheritedResources(self: *@This(), reader: *const Reader, raw: *const syntax.Object, container: syntax.ObjRef) !syntax.Object {
+        if (raw.* == .obj_ref) return self.resources(reader, raw);
+        // The parent projection kept a Properties marker, not its values.
+        // Retain the parent's identity so selected scopes can resolve those
+        // values later without forcing unused or overridden replacements.
+        const value = try self.retain(try self.cloneMetadata(reader, raw.*, .required_resources));
+        try self.rememberPropertySource(value, .{ .reference = container, .container = true });
+        return value;
+    }
+
+    fn pageResources(self: *@This(), reader: *const Reader, page: *const syntax.Object) !syntax.Object {
+        if (self.page_resources) |value| return value;
+        self.prepareScan(reader);
+        if (page.get("Resources")) |raw| {
+            self.page_resources = try self.resources(reader, raw);
+            return self.page_resources.?;
+        }
+        self.beginResolution();
+        var scratch = DecodeBudgetAllocator.initWithCumulativeLimit(self.budget.backing, 0, self.budget.max_live_bytes, self.budget.max_live_bytes *| 4);
+        var scoped = reader.*;
+        scoped.alloc = scratch.allocator();
+        scoped.object_depth_limit = 128;
+        scoped.metadata_scan = &self.scan_control;
+        scoped.metadata_frames = &self.frames;
+        var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
+        defer encrypted_streams.deinit(scratch.allocator());
+        scoped.encrypted_streams = &encrypted_streams;
+        scoped.encrypted_stream_generation = 0;
+        self.page_resources = (scoped.findInheritedTextResources(page, self, null, 0) catch |err| {
+            const classified = if (err == error.OutOfMemory and scratch.limit_exceeded) error.PdfDecodeWorkingSetTooLarge else self.allocationFailure(err);
+            self.beginResolution();
+            return classified;
+        }) orelse try self.retain(.null);
+        return self.page_resources.?;
+    }
+
+    // Binding sets borrow their name records until extraction ends. Resolving
+    // an indirect Properties table is deferred until a selected BDC needs it;
+    // dense tables bind every record in one merge over the two sorted arrays.
+    const Bindings = struct {
+        cache: *TextResourceCache,
+        reader: *const Reader,
+        raw: PropertySource,
+        records: []PageTextProperty,
+
+        fn resolve(self: *@This()) !void {
+            const index = self.cache.sourceEntries(self.reader, self.raw) catch |err| blk: {
+                _ = try self.cache.selectedFailure(err);
+                break :blk null;
+            };
+            if (index) |items| {
+                if (self.records.len >= (items.len + 3) / 4) {
+                    var cursor: usize = 0;
+                    for (self.records, 0..) |*record, i| {
+                        if (i % 256 == 0) try self.reader.checkCancellation();
+                        while (cursor < items.len and std.mem.order(u8, items[cursor].raw.key, record.name) == .lt) : (cursor += 1) {
+                            if (cursor % 256 == 0) try self.reader.checkCancellation();
+                        }
+                        const entry = if (cursor < items.len and std.mem.eql(u8, items[cursor].raw.key, record.name)) &items[cursor] else null;
+                        record.source = self.cache.bindingSource(self.reader, entry);
+                    }
+                    return;
+                }
+                for (self.records, 0..) |*record, i| {
+                    if (i % 256 == 0) try self.reader.checkCancellation();
+                    record.source = self.cache.bindingSource(self.reader, findEntry(items, record.name));
+                }
+            } else {
+                for (self.records, 0..) |*record, i| {
+                    if (i % 256 == 0) try self.reader.checkCancellation();
+                    record.source = .{ .normalized = .{ .invalid = true } };
+                }
+            }
+        }
+    };
+
+    fn bindingSource(self: *@This(), reader: *const Reader, entry: ?*PropertyEntry) PageTextProperty.Source {
+        return if (entry) |selected| .{ .cached = .{ .cache = self, .reader = reader, .entry = selected } } else .{ .normalized = .{ .invalid = true } };
+    }
+
+    const PropertySource = union(enum) {
+        table: syntax.Object,
+        resources: ResourceSource,
+    };
+
+    fn propertySource(self: *@This(), resource_object: *const syntax.Object) ?PropertySource {
+        if (resource_object.* == .dict) {
+            if (self.property_resources.get(@intFromPtr(resource_object.dict.ptr))) |ref| return .{ .resources = ref };
+        }
+        return if (resource_object.get("Properties")) |raw| .{ .table = raw.* } else null;
+    }
+
+    fn sourceEntries(self: *@This(), reader: *const Reader, source: PropertySource) !?[]PropertyEntry {
+        return switch (source) {
+            .table => |raw| self.entries(reader, &raw),
+            .resources => |source_resource| blk: {
+                const raw = syntax.Object{ .obj_ref = source_resource.reference };
+                const table = try self.resolve(reader, &raw, if (source_resource.container) .container_properties else .resource_properties);
+                break :blk self.entries(reader, &table);
+            },
+        };
+    }
+
+    fn deferBindings(self: *@This(), reader: *const Reader, raw: PropertySource, records: []PageTextProperty) !void {
+        const binding = self.allocator().create(Bindings) catch |err| return self.allocationFailure(err);
+        errdefer self.allocator().destroy(binding);
+        binding.* = .{ .cache = self, .reader = reader, .raw = raw, .records = records };
+        self.bindings.append(self.allocator(), binding) catch |err| return self.allocationFailure(err);
+        for (records) |*record| record.source = .{ .deferred = binding };
+    }
+
+    fn selectedFailure(self: *@This(), original: anyerror) !PropertyValue {
+        const err = self.allocationFailure(original);
+        switch (err) {
+            error.OutOfMemory, error.Canceled => return err,
+            else => return .{ .invalid = true },
+        }
+    }
+
+    fn findEntry(index: []PropertyEntry, name: []const u8) ?*PropertyEntry {
+        var low: usize = 0;
+        var high = index.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            switch (std.mem.order(u8, index[mid].raw.key, name)) {
+                .lt => low = mid + 1,
+                .gt => high = mid,
+                .eq => return &index[mid],
+            }
+        }
+        return null;
+    }
+
+    fn keyLess(self: *@This(), left: []const u8, right: []const u8) !bool {
+        try self.scan_control.spend(1 +| @min(left.len, right.len));
+        return std.mem.lessThan(u8, left, right);
+    }
+
+    fn entryLess(self: *@This(), left: PropertyEntry, right: PropertyEntry) !bool {
+        return self.keyLess(left.raw.key, right.raw.key);
+    }
+
+    fn siftEntries(self: *@This(), items: []PropertyEntry, initial: usize) !void {
+        var root = initial;
+        while (root < items.len / 2) {
+            var child = root * 2 + 1;
+            if (child + 1 < items.len and try self.entryLess(items[child], items[child + 1])) child += 1;
+            if (!try self.entryLess(items[root], items[child])) return;
+            std.mem.swap(PropertyEntry, &items[root], &items[child]);
+            root = child;
+        }
+    }
+
+    fn heapEntries(self: *@This(), items: []PropertyEntry) !void {
+        // In-place heapsort keeps index memory bounded and allows work and
+        // cancellation checks inside the sort, not just before and after it.
+        var root = items.len / 2;
+        while (root > 0) {
+            root -= 1;
+            try self.siftEntries(items, root);
+        }
+        var end = items.len;
+        while (end > 1) {
+            end -= 1;
+            std.mem.swap(PropertyEntry, &items[0], &items[end]);
+            try self.siftEntries(items[0..end], 0);
+        }
+    }
+
+    fn sortRange(self: *@This(), input: []PropertyEntry, depth: usize) anyerror!void {
+        var items = input;
+        var remaining = depth;
+        while (items.len > 16) {
+            if (remaining == 0) return self.heapEntries(items);
+            remaining -= 1;
+            const middle = items.len / 2;
+            const last = items.len - 1;
+            if (try self.entryLess(items[middle], items[0])) std.mem.swap(PropertyEntry, &items[middle], &items[0]);
+            if (try self.entryLess(items[last], items[0])) std.mem.swap(PropertyEntry, &items[last], &items[0]);
+            if (try self.entryLess(items[last], items[middle])) std.mem.swap(PropertyEntry, &items[last], &items[middle]);
+            const pivot = items[middle].raw.key;
+            var left: usize = 0;
+            var right: usize = last;
+            while (true) {
+                while (left < last and try self.keyLess(items[left].raw.key, pivot)) left += 1;
+                while (right > 0 and try self.keyLess(pivot, items[right].raw.key)) right -= 1;
+                if (left >= right) break;
+                std.mem.swap(PropertyEntry, &items[left], &items[right]);
+                left += 1;
+                right -= 1;
+            }
+            if (left == 0 or left == items.len) return self.heapEntries(items);
+            // Recurse only into the smaller partition: O(log n) stack space.
+            if (left < items.len - left) {
+                try self.sortRange(items[0..left], remaining);
+                items = items[left..];
+            } else {
+                try self.sortRange(items[left..], remaining);
+                items = items[0..left];
+            }
+        }
+        for (1..items.len) |i| {
+            var j = i;
+            while (j > 0 and try self.entryLess(items[j], items[j - 1])) : (j -= 1)
+                std.mem.swap(PropertyEntry, &items[j], &items[j - 1]);
+        }
+    }
+
+    fn sortEntries(self: *@This(), items: []PropertyEntry) !void {
+        if (items.len < 2) return;
+        var ordered = true;
+        for (1..items.len) |i| if (try self.entryLess(items[i], items[i - 1])) {
+            ordered = false;
+            break;
+        };
+        if (ordered) return;
+        var depth: usize = 0;
+        var count = items.len;
+        while (count > 1) : (count /= 2) depth += 2;
+        try self.sortRange(items, depth);
+    }
+
+    fn entries(self: *@This(), reader: *const Reader, raw: *const syntax.Object) !?[]PropertyEntry {
+        self.beginResolution();
+        const value = try self.resolve(reader, raw, .property_table);
+        if (value != .dict) return null;
+        const id = @intFromPtr(value.dict.ptr);
+        if (self.scopes.get(id)) |cached| return cached;
+        self.prepareScan(reader);
+        try self.scan_control.spend(1);
+        // No fallible map growth may remain after allocating and sorting a
+        // shared index. A saturated cache must reject before doing that work.
+        self.scopes.ensureUnusedCapacity(self.allocator(), 1) catch |err| return self.allocationFailure(err);
+        const index = self.allocator().alloc(PropertyEntry, value.dict.len) catch |err| return self.allocationFailure(err);
+        errdefer self.allocator().free(index);
+        for (value.dict, index, 0..) |*entry, *slot, i| {
+            if (i % 256 == 0) try reader.checkCancellation();
+            slot.* = .{ .raw = entry };
+        }
+        try self.sortEntries(index);
+        self.scopes.putAssumeCapacity(id, index);
+        return index;
+    }
+
+    fn property(self: *@This(), reader: *const Reader, raw: ?*const syntax.Object, name: []const u8) !PropertyValue {
+        const index = (if (raw) |object| self.entries(reader, object) catch |err| {
+            return self.selectedFailure(err);
+        } else null) orelse return .{ .invalid = true };
+        return if (findEntry(index, name)) |entry| self.entryProperty(reader, entry) else .{ .invalid = true };
+    }
+
+    fn entryProperty(self: *@This(), reader: *const Reader, entry: *PropertyEntry) !PropertyValue {
+        try reader.checkCancellation();
+        self.beginResolution();
+        if (entry.parsed) |cached| return cached;
+        const object = self.resolve(reader, &entry.raw.value, .property) catch |err| {
+            const result = try self.selectedFailure(err);
+            entry.parsed = result;
+            return result;
+        };
+        var result = PropertyValue{};
+        if (object != .dict) {
+            result.invalid = true;
+        } else {
+            if (object.get("MCID")) |value| result.mcid = switch (value.*) {
+                .null => null,
+                .integer => |number| .{ .index = number },
+                .obj_ref => |ref| .{ .reference = ref },
+                else => .{ .index = -1 },
+            };
+            if (object.get("ActualText")) |value| result.actual_text = switch (value.*) {
+                .null => null,
+                .string => |bytes| .{ .string = bytes },
+                .obj_ref => |ref| .{ .reference = ref },
+                else => .invalid,
+            };
+        }
+        entry.parsed = result;
+        return result;
+    }
+};
+
+const ActualTextScope = struct {
+    structure_owner: ?u64 = null,
+    replacement: ?[]u8 = null,
+    output_start: usize = 0,
+    run_start: usize = 0,
+    effective: bool = false,
+
+    fn deinit(self: *ActualTextScope, alloc: Allocator) void {
+        if (self.replacement) |text| alloc.free(text);
+        self.* = undefined;
+    }
+};
+
+fn findTextProperty(properties: []const PageTextProperty, name: []const u8) ?*const PageTextProperty {
+    // Resource collection sorts once. Binary search keeps immutable borrows
+    // allocation-free and avoids scanning every property for every BDC.
+    var low: usize = 0;
+    var high = properties.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        switch (std.mem.order(u8, properties[mid].name, name)) {
+            .lt => low = mid + 1,
+            .gt => high = mid,
+            .eq => return &properties[mid],
+        }
+    }
+    return null;
+}
+
+fn actualTextFromBdcAlloc(
+    alloc: Allocator,
+    operands: []const syntax.Object,
+    properties: []const PageTextProperty,
+    lookup: ?*structure_text.Lookup,
+    selected_named: ?*const PageTextProperty,
+) !?[]u8 {
+    return actualTextFromBdcImplAlloc(alloc, operands, properties, lookup, selected_named) catch |err| switch (err) {
+        error.InvalidUtf16, error.InvalidPdfStructure => {
+            if (lookup) |context| context.incomplete = true;
+            return null;
+        },
+        else => return err,
+    };
+}
+
+fn actualTextFromBdcImplAlloc(alloc: Allocator, operands: []const syntax.Object, properties: []const PageTextProperty, lookup: ?*structure_text.Lookup, selected_named: ?*const PageTextProperty) !?[]u8 {
+    if (operands.len == 0) return null;
+    const property = &operands[operands.len - 1];
+    if (property.* == .name) {
+        const named = selected_named orelse findTextProperty(properties, property.name) orelse return error.InvalidPdfStructure;
+        const value = try named.value();
+        if (value.invalid) return error.InvalidPdfStructure;
+        if (value.actual_text) |encoded| {
+            const raw = encoded.object();
+            if (lookup) |context| {
+                const text = (try context.propertyText(&raw)) orelse return null;
+                return try alloc.dupe(u8, text);
+            }
+            if (raw != .string) return error.InvalidPdfStructure;
+            return try text_encoding.pdfDocDecodeAlloc(alloc, raw.string);
+        }
+        return if (named.actual_text) |text| try alloc.dupe(u8, text) else null;
+    }
+    if (property.* != .dict) return null;
+    const actual = property.get("ActualText") orelse return null;
+    if (actual.* == .null) return null;
+    if (actual.* != .string) return error.InvalidPdfStructure;
+    return try text_encoding.pdfDocDecodeAlloc(alloc, actual.string);
+}
+
 const PageForm = struct {
+    structure_parent: ?i64 = null,
+    structure_object: bool = false,
+    text_image: bool = false,
     name: []u8,
     content: []u8,
     matrix: GraphicsMatrix = .{},
@@ -2570,6 +3582,7 @@ const PageForm = struct {
     gstates: []PageExtGState = &.{},
     color_spaces: []PageColorSpace = &.{},
     forms: []PageForm = &.{},
+    text_properties: []PageTextProperty = &.{},
 
     pub fn deinit(self: *PageForm, alloc: Allocator) void {
         alloc.free(self.name);
@@ -2586,6 +3599,8 @@ const PageForm = struct {
         if (self.gstates.len > 0) alloc.free(self.gstates);
         for (self.color_spaces) |*color_space| color_space.deinit(alloc);
         if (self.color_spaces.len > 0) alloc.free(self.color_spaces);
+        for (self.text_properties) |*property| property.deinit(alloc);
+        if (self.text_properties.len > 0) alloc.free(self.text_properties);
         for (self.forms) |*form| form.deinit(alloc);
         if (self.forms.len > 0) alloc.free(self.forms);
         self.* = undefined;
@@ -2830,6 +3845,213 @@ const PositionedTextOutput = union(enum) {
         };
     }
 };
+const no_semantic_span = @import("pdf_values").no_semantic_span;
+
+fn unionTextBox(left: ?PageBox, right: PageBox) PageBox {
+    const box = left orelse return right;
+    return .{ .min_x = @min(box.min_x, right.min_x), .min_y = @min(box.min_y, right.min_y), .max_x = @max(box.max_x, right.max_x), .max_y = @max(box.max_y, right.max_y) };
+}
+
+/// Constant-space summary of the actual source paints. Eligibility is tested
+/// per paint, before unioning bounds, so two exterior paints cannot invent an
+/// on-page intersection by straddling the page.
+const SemanticPaint = @import("pdf_values").SemanticPaint;
+
+/// One authored semantic replacement, independent of its source glyphs.
+/// run_start/run_end retain the source-order slot even when no glyphs exist.
+/// Entry/exit indices and output bounds are selected once for the active policy.
+pub const SemanticTextSpan = @import("pdf_values").SemanticTextSpan;
+
+const SemanticTextContext = struct {
+    structure: ?*structure_text.Lookup = null,
+    structure_parent: ?i64 = null,
+    structure_spans: ?*std.AutoHashMapUnmanaged(u64, usize) = null,
+    marked: std.ArrayList(ActualTextScope) = .empty,
+    owned_spans: std.ArrayList(SemanticTextSpan) = .empty,
+    shared_spans: ?*std.ArrayList(SemanticTextSpan) = null,
+    active: ?SemanticPaint = null,
+    inherited: ?*SemanticPaint = null,
+    suppress: bool = false,
+    page_box: ?PageBox = null,
+
+    fn spans(self: *@This()) *std.ArrayList(SemanticTextSpan) {
+        return self.shared_spans orelse &self.owned_spans;
+    }
+
+    fn paint(self: *@This()) ?*SemanticPaint {
+        return if (self.active) |*active| active else self.inherited;
+    }
+
+    fn finish(self: *@This()) void {
+        if (self.structure) |lookup| for (self.marked.items) |scope| {
+            if (scope.effective) lookup.incomplete = true;
+        };
+    }
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.marked.items) |*scope| scope.deinit(alloc);
+        self.marked.deinit(alloc);
+        for (self.owned_spans.items) |*span| span.deinit(alloc);
+        self.owned_spans.deinit(alloc);
+    }
+
+    fn markedOperator(self: *@This(), alloc: Allocator, out: PositionedTextOutput, op: []const u8, operands: []const syntax.Object, properties: []const PageTextProperty, cancellation: CancellationProbe) !bool {
+        const opening = std.mem.eql(u8, op, "BMC") or std.mem.eql(u8, op, "BDC");
+        if (!opening and !std.mem.eql(u8, op, "EMC")) return false;
+        if (!out.isTextOnly()) return true;
+        if (opening) {
+            // Suppressed scopes need a stack frame, but never their replacement
+            // bytes. In particular, named properties can be large shared input.
+            var owner: ?u64 = null;
+            var replacement: ?[]u8 = null;
+            if (!self.suppress and self.active == null and std.mem.eql(u8, op, "BDC")) {
+                var mcid: ?syntax.Object = null;
+                var named_property: ?*const PageTextProperty = null;
+                if (operands.len > 0) {
+                    const property = &operands[operands.len - 1];
+                    if (property.* == .name) {
+                        named_property = findTextProperty(properties, property.name);
+                        if (named_property) |named| if ((try named.value()).mcid) |id| {
+                            mcid = id.object();
+                        };
+                    } else if (property.get("MCID")) |value| mcid = value.*;
+                }
+                if (mcid) |*id| if (self.structure) |lookup| if (try lookup.getObject(self.structure_parent, id)) |selected| {
+                    owner = selected.owner;
+                    // Later sequences contribute paint and glyph membership,
+                    // but do not copy or emit the shared replacement again.
+                    replacement = try alloc.dupe(u8, if (self.structure_spans.?.contains(selected.owner)) "" else selected.text);
+                };
+                if (replacement == null) {
+                    replacement = try actualTextFromBdcAlloc(alloc, operands, properties, self.structure, named_property);
+                }
+            }
+            errdefer if (replacement) |text| alloc.free(text);
+            const effective = replacement != null;
+            try self.marked.append(alloc, .{ .replacement = replacement, .structure_owner = owner, .run_start = out.len(), .effective = effective });
+            replacement = null;
+            if (effective) self.active = .{};
+        } else if (self.marked.pop()) |popped| {
+            var scope = popped;
+            defer scope.deinit(alloc);
+            if (scope.effective) {
+                const existing = if (scope.structure_owner) |id| self.structure_spans.?.get(id) else null;
+                const index = existing orelse self.spans().items.len;
+                if (existing != null) {
+                    const span = &self.spans().items[index];
+                    span.run_end = out.len();
+                    span.multiple_scopes = true;
+                    span.paint.merge(self.active.?);
+                } else {
+                    if (out == .analysis and index >= out.analysis.max_runs) return error.TextRunLimitExceeded;
+                    try self.spans().append(alloc, .{ .text = scope.replacement.?, .run_start = scope.run_start, .run_end = out.len(), .paint = self.active.? });
+                    scope.replacement = null;
+                    if (scope.structure_owner) |id| try self.structure_spans.?.put(alloc, id, index);
+                }
+                self.active = null;
+                switch (out) {
+                    .layout => |runs| for (runs.items[scope.run_start..], 0..) |*run, i| {
+                        if (i % 256 == 0) try cancellation.check();
+                        run.semantic_span_index = index;
+                    },
+                    .analysis => |analysis| for (analysis.runs.items[scope.run_start..], 0..) |*run, i| {
+                        if (i % 256 == 0) try cancellation.check();
+                        run.semantic_span_index = index;
+                    },
+                    .render => unreachable,
+                }
+            }
+        }
+        return true;
+    }
+
+    fn glyphs(self: *@This(), out: PositionedTextOutput, start: usize) void {
+        const evidence = self.paint() orelse return;
+        switch (out) {
+            .layout => |runs| for (runs.items[start..]) |run| evidence.add(run.bounds(), run.clip_box, !textRunInvisible(run), self.page_box),
+            .analysis => |analysis| for (analysis.runs.items[start..]) |run| evidence.add(run.bounds(), run.clip_box, !textRunInvisible(run), self.page_box),
+            .render => {},
+        }
+    }
+
+    fn sourcePaint(self: *@This(), state: *const TextRunState, path: *const TextClipPath, op: []const u8) void {
+        const evidence = self.paint() orelse return;
+        if (isShapePaintOperator(op)) {
+            const fill = !std.mem.eql(u8, op, "S") and !std.mem.eql(u8, op, "s");
+            const stroke = !std.mem.eql(u8, op, "f") and !std.mem.eql(u8, op, "F") and !std.mem.eql(u8, op, "f*");
+            // No path is known absence of paint, not unknown geometry.
+            if (!path.has_path) return;
+            var bounds = path.paint_box;
+            if (!stroke) {
+                const hull = bounds orelse return;
+                if (hull.min_x >= hull.max_x or hull.min_y >= hull.max_y) return;
+            }
+            // Stroke joins, miter limits, and device-space hairlines can
+            // exceed the path hull. Retain unknown bounds rather than falsely
+            // excluding semantic text using an underestimated paint extent.
+            if (stroke) bounds = null;
+            evidence.add(bounds, state.clip_box, textGroupsVisible(state.*) and ((fill and state.alpha != 0) or (stroke and state.stroke_alpha != 0)), self.page_box);
+        } else if (std.mem.eql(u8, op, "sh") or std.mem.eql(u8, op, "BI")) {
+            const bounds = if (std.mem.eql(u8, op, "BI")) transformPageBox(.{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }, state.matrix) else null;
+            evidence.add(bounds, state.clip_box, state.alpha != 0 and textGroupsVisible(state.*), self.page_box);
+        }
+    }
+};
+
+/// Text extraction only needs a conservative bound for rectangular clips.
+/// Keep this constant-space and leave arbitrary paths unknown instead of
+/// retaining/vectorizing paint paths on the text-only hot path.
+const TextClipPath = struct {
+    has_path: bool = false,
+    pending_clip: bool = false,
+    paint_box: ?PageBox = null,
+    box: ?PageBox = null,
+    unknown: bool = false,
+
+    fn consume(self: *@This(), state: *TextRunState, op: []const u8, operands: []const syntax.Object) void {
+        if (std.mem.eql(u8, op, "re") and operands.len >= 4) {
+            const x = numericObjectValue(&operands[operands.len - 4]) orelse return;
+            const y = numericObjectValue(&operands[operands.len - 3]) orelse return;
+            const w = numericObjectValue(&operands[operands.len - 2]) orelse return;
+            const h = numericObjectValue(&operands[operands.len - 1]) orelse return;
+            const rect = transformPageBox(.{ .min_x = @min(x, x + w), .min_y = @min(y, y + h), .max_x = @max(x, x + w), .max_y = @max(y, y + h) }, state.matrix);
+            self.has_path = true;
+            // Degenerate rectangular subpaths have no fill area. Including
+            // them in a union can fabricate on-page paint or a nonempty clip.
+            const has_area = w != 0 and h != 0 and state.matrix.a * state.matrix.d != state.matrix.b * state.matrix.c;
+            if (has_area) {
+                self.paint_box = unionTextBox(self.paint_box, rect);
+                const previous = if (self.box) |box| if (box.min_x < box.max_x and box.min_y < box.max_y) self.box else null else null;
+                self.box = unionTextBox(previous, rect);
+            } else if (self.box == null) self.box = .{ .min_x = rect.min_x, .max_x = rect.min_x, .min_y = rect.min_y, .max_y = rect.min_y };
+        } else if (std.mem.eql(u8, op, "W") or std.mem.eql(u8, op, "W*")) {
+            self.pending_clip = true;
+        } else if (std.mem.eql(u8, op, "n") or isShapePaintOperator(op)) {
+            // W/W* take effect after the terminating paint (or n), not before
+            // it. A known empty path establishes an empty clip.
+            if (self.pending_clip and !self.unknown) {
+                const box = self.box orelse PageBox{ .min_x = 0, .max_x = 0, .min_y = 0, .max_y = 0 };
+                state.clip_box = if (state.clip_box) |clip| intersectPageBoxes(clip, box) else box;
+            }
+            self.* = .{};
+        } else if (std.mem.eql(u8, op, "m") or std.mem.eql(u8, op, "l") or std.mem.eql(u8, op, "c") or std.mem.eql(u8, op, "v") or std.mem.eql(u8, op, "y")) {
+            self.unknown = true;
+            self.has_path = true;
+            var i: usize = 0;
+            while (i + 1 < operands.len) : (i += 2) {
+                const x = numericObjectValue(&operands[i]) orelse continue;
+                const y = numericObjectValue(&operands[i + 1]) orelse continue;
+                const point = applyMatrixToPoint(state.matrix, x, y);
+                self.paint_box = unionTextBox(self.paint_box, .{ .min_x = point[0], .max_x = point[0], .min_y = point[1], .max_y = point[1] });
+            }
+        }
+    }
+};
+
+fn formsHaveStructureParents(forms: []const PageForm) bool {
+    for (forms) |form| if (form.structure_parent != null or form.structure_object or formsHaveStructureParents(form.forms)) return true;
+    return false;
+}
 
 const PositionedTextParser = struct {
     alloc: Allocator,
@@ -2839,6 +4061,8 @@ const PositionedTextParser = struct {
     retained_pattern_names: ContentNameInterner = .{},
     state: TextRunState = .{},
     stack: std.ArrayList(TextRunStackEntry) = .empty,
+    semantic: SemanticTextContext = .{},
+    text_clip_path: TextClipPath = .{},
     current_path: std.ArrayList([2]f64) = .empty,
     current_path_closed: bool = false,
     current_clip_points: std.ArrayList([2]f64) = .empty,
@@ -2874,6 +4098,7 @@ const PositionedTextParser = struct {
         self.retained_pattern_names.deinit(self.alloc);
         for (self.stack.items) |*entry| entry.deinit(self.alloc);
         self.stack.deinit(self.alloc);
+        self.semantic.deinit(self.alloc);
         self.current_path.deinit(self.alloc);
         self.current_clip_points.deinit(self.alloc);
         self.* = undefined;
@@ -2885,6 +4110,7 @@ const PositionedTextParser = struct {
         fonts: []const PageFont,
         gstates: []const PageExtGState,
         forms: []const PageForm,
+        properties: []const PageTextProperty,
     ) anyerror!void {
         var scanner = syntax.Scanner.init(self.alloc, bytes);
         defer scanner.deinit();
@@ -2893,7 +4119,7 @@ const PositionedTextParser = struct {
         while (true) {
             if (lexeme_count & 255 == 0) try self.cancellation.check();
             lexeme_count +|= 1;
-            var lex = (try readContentLexeme(&scanner)) orelse {
+            var lex = (try if (self.output.isTextOnly()) readContentLexemeCancelable(&scanner, self.cancellation) else readRenderContentLexeme(&scanner, self.cancellation)) orelse {
                 clearContentOperands(self.alloc, &self.operands);
                 continue;
             };
@@ -2901,12 +4127,19 @@ const PositionedTextParser = struct {
 
             if (lex == .eof) break;
             if (lex == .keyword and !isContentObjectStartKeyword(lex.keyword)) {
+                if (try self.semantic.markedOperator(self.alloc, self.output, lex.keyword, self.operands.items, properties, self.cancellation)) {
+                    clearContentOperands(self.alloc, &self.operands);
+                    continue;
+                }
+                if (self.output.isTextOnly()) self.semantic.sourcePaint(&self.state, &self.text_clip_path, lex.keyword);
+                const run_start = self.output.len();
                 try applyTextRunOperator(
                     self.alloc,
                     self.output,
                     &self.state,
                     &self.retained_pattern_names,
                     &self.stack,
+                    &self.text_clip_path,
                     &self.current_path,
                     &self.current_path_closed,
                     &self.current_clip_points,
@@ -2914,6 +4147,8 @@ const PositionedTextParser = struct {
                     fonts,
                     gstates,
                     forms,
+                    properties,
+                    &self.semantic,
                     &self.paint_order,
                     &self.next_group_id,
                     self.cancellation,
@@ -2921,6 +4156,7 @@ const PositionedTextParser = struct {
                     lex.keyword,
                     self.operands.items,
                 );
+                if (isTextShowOperator(lex.keyword)) self.semantic.glyphs(self.output, run_start);
                 clearContentOperands(self.alloc, &self.operands);
                 continue;
             }
@@ -2946,7 +4182,7 @@ fn extractTextRunsFromContentAppend(
 ) !void {
     var parser = try PositionedTextParser.init(alloc, .{ .render = out }, .{}, &.{}, .nonzero);
     defer parser.deinit();
-    try parser.consume(bytes, fonts, gstates, forms);
+    try parser.consume(bytes, fonts, gstates, forms, &.{});
 }
 
 fn extractImageRunsFromContentAppend(
@@ -3033,7 +4269,7 @@ fn extractImageRunsFromContentAppendWithStateCancelable(
     while (true) {
         if (lexeme_count & 255 == 0) try cancellation.check();
         lexeme_count +|= 1;
-        var lex = (try readContentLexeme(&scanner)) orelse {
+        var lex = (try readRenderContentLexeme(&scanner, cancellation)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
         };
@@ -3189,7 +4425,7 @@ fn extractShadingRunsFromContentAppendWithStateCancelable(
     while (true) {
         if (lexeme_count & 255 == 0) try cancellation.check();
         lexeme_count +|= 1;
-        var lex = (try readContentLexeme(&scanner)) orelse {
+        var lex = (try readRenderContentLexeme(&scanner, cancellation)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
         };
@@ -3279,7 +4515,7 @@ fn extractPatternRunsFromContentAppendWithStateCancelable(
     while (true) {
         if (lexeme_count & 255 == 0) try cancellation.check();
         lexeme_count +|= 1;
-        var lex = (try readContentLexeme(&scanner)) orelse {
+        var lex = (try readRenderContentLexeme(&scanner, cancellation)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
         };
@@ -3368,7 +4604,7 @@ fn extractShapeRunsFromContentAppendWithStateCancelable(
     while (true) {
         if (lexeme_count & 255 == 0) try cancellation.check();
         lexeme_count +|= 1;
-        var lex = (try readContentLexeme(&scanner)) orelse {
+        var lex = (try readRenderContentLexeme(&scanner, cancellation)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
         };
@@ -3537,11 +4773,12 @@ pub const RenderForkTemplate = struct {
     alloc: Allocator,
     bytes: []const u8,
     decode_limits: DecodeLimits,
+    text_extraction_policy: TextExtractionPolicy = .source,
     version_minor: u8,
     startxref_offset: usize,
     xref_entries: []XrefEntry,
     trailer: syntax.Object,
-    page_index: []syntax.Object,
+    page_index: []PageIndexEntry,
     encryption: ?EncryptionContext,
     encrypted_stream_registry: *const std.AutoHashMapUnmanaged(usize, syntax.ObjRef),
     encrypted_stream_generation: u64,
@@ -3588,6 +4825,7 @@ pub const RenderForkTemplate = struct {
             .encryption = self.encryption,
             .encrypted_streams = encrypted_streams,
             .encrypted_stream_generation = self.encrypted_stream_generation,
+            .text_extraction_policy = self.text_extraction_policy,
             .cancellation = cancellation,
             .owns_document_metadata = false,
         };
@@ -3610,6 +4848,7 @@ pub const RenderForkTemplate = struct {
             return error.RenderForkTemplateSourceMismatch;
         }
         self.decode_limits = source.decode_limits;
+        self.text_extraction_policy = source.text_extraction_policy;
         self.version_minor = source.version_minor;
         self.startxref_offset = source.startxref_offset;
         self.trailer = source.trailer;
@@ -3631,7 +4870,238 @@ pub const RenderForkTemplate = struct {
     }
 };
 
+const PageIndexEntry = struct {
+    object: syntax.Object,
+    reference: ?syntax.ObjRef,
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        self.object.deinit(alloc);
+    }
+};
+
+// Object resolution uses the same bounded allocator as structure indexing.
+const StructureResolverContext = struct {
+    reader: *const Reader,
+    budget: *DecodeBudgetAllocator,
+    scan: ?*syntax.ScanControl = null,
+    frames: ?*MetadataObjectStreamCache = null,
+    fn root(raw: *const anyopaque, alloc: Allocator) anyerror!syntax.Object {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        var reader = self.reader.*;
+        reader.alloc = alloc;
+        reader.object_depth_limit = 128;
+        var local_scan = metadataScanControl(self.reader);
+        reader.metadata_scan = self.scan orelse &local_scan;
+        reader.metadata_frames = self.frames;
+        // Metadata reads may inspect stream headers or compressed objects, but
+        // must not mutate the source Reader's encryption registry/generation
+        // through a temporary allocator. Payload reads stay in this scope.
+        var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
+        defer encrypted_streams.deinit(alloc);
+        reader.encrypted_streams = &encrypted_streams;
+        reader.encrypted_stream_generation = 0;
+        var catalog = try reader.resolveValue(reader.trailerGet("Root") orelse return error.MissingRoot);
+        defer catalog.deinit(alloc);
+        return if (catalog.get("StructTreeRoot")) |tree| try tree.clone(alloc) else .null;
+    }
+    fn resolve(raw: *const anyopaque, alloc: Allocator, value: *const syntax.Object) anyerror!syntax.Object {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        return self.resolveProjected(alloc, value, .structure_metadata);
+    }
+    fn resolveProjected(self: *const @This(), alloc: Allocator, value: *const syntax.Object, projection: syntax.Projection) anyerror!syntax.Object {
+        var reader = self.reader.*;
+        reader.alloc = alloc;
+        reader.object_depth_limit = 128;
+        var local_scan = metadataScanControl(self.reader);
+        reader.metadata_scan = self.scan orelse &local_scan;
+        reader.metadata_frames = self.frames;
+        reader.metadata_frame_fallback = switch (projection) {
+            .resources, .required_resources, .resource_container, .resource_fields, .resource_entries => true,
+            else => false,
+        };
+        var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
+        defer encrypted_streams.deinit(alloc);
+        reader.encrypted_streams = &encrypted_streams;
+        reader.encrypted_stream_generation = 0;
+        return switch (value.*) {
+            .obj_ref => reader.readIndirectObjectProjected(value.obj_ref, projection),
+            .deferred => reader.readDeferredObjectProjected(value.deferred, projection),
+            else => value.clone(alloc),
+        };
+    }
+    fn check(raw: *const anyopaque) anyerror!void {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        try self.reader.checkCancellation();
+    }
+    fn exhausted(raw: *const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        return self.budget.limit_exceeded or if (self.reader.structure_cache) |cache| cache.budget.limit_exceeded or cache.shared_budget.limit_exceeded else false;
+    }
+};
+
+const StructureMetadataCache = struct {
+    shared_budget: DecodeBudgetAllocator,
+    budget: DecodeBudgetAllocator,
+    document: structure_text.Document,
+};
+
+// Resource tables stay as source views. Only requested names (including misses)
+// enter this index; returned objects borrow owned allocations, never map slots.
+const ResourceTableLookup = struct {
+    source: syntax.Object,
+    selected: std.StringHashMapUnmanaged(?syntax.Object) = .empty,
+    scans: usize = 0,
+    dependency_requests: ?*ReferencedResourceNames = null,
+    waiting_for_dependency: bool = false,
+    frame_budget: ?DecodeBudgetAllocator = null,
+    frames: MetadataObjectStreamCache = .{},
+    encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty,
+
+    fn scopedReader(self: *@This(), reader: *const Reader) Reader {
+        var scoped = reader.*;
+        scoped.encrypted_streams = &self.encrypted_streams;
+        scoped.encrypted_stream_generation = 0;
+        // Native extraction already shares a page-wide decoded-frame cache.
+        // Standalone/rendering lookups also need reuse across alias requests,
+        // without making optional frame retention necessary for required reads.
+        if (scoped.metadata_frames == null) {
+            if (self.frame_budget == null) {
+                const limit = reader.decode_limits.max_working_set_bytes;
+                self.frame_budget = DecodeBudgetAllocator.initWithCumulativeLimit(reader.alloc, 0, limit, limit *| 4);
+                self.frames.budget = &self.frame_budget.?;
+                self.frame_budget.?.reclaimer = .{ .context = &self.frames, .reclaim = MetadataObjectStreamCache.reclaim };
+            }
+            scoped.metadata_frames = &self.frames;
+            scoped.metadata_frame_fallback = true;
+        }
+        return scoped;
+    }
+
+    fn resolveValue(self: *@This(), reader: *const Reader, value: *const syntax.Object) !syntax.Object {
+        var scoped = self.scopedReader(reader);
+        return scoped.resolveValue(value);
+    }
+
+    fn deinit(self: *@This(), a: Allocator) void {
+        std.debug.assert(self.dependency_requests == null);
+        var entries = self.selected.iterator();
+        while (entries.next()) |entry| {
+            a.free(entry.key_ptr.*);
+            if (entry.value_ptr.*) |*value| value.deinit(a);
+        }
+        self.selected.deinit(a);
+        self.frames.deinit();
+        self.encrypted_streams.deinit(a);
+    }
+
+    fn prime(self: *@This(), reader: *const Reader, names: *const std.StringHashMapUnmanaged(void)) !void {
+        var pending: std.StringHashMapUnmanaged(void) = .empty;
+        defer pending.deinit(reader.alloc);
+        var keys = names.keyIterator();
+        while (keys.next()) |key| {
+            try reader.checkCancellation();
+            if (!self.selected.contains(key.*)) try pending.put(reader.alloc, key.*, {});
+        }
+        if (pending.count() == 0) return;
+        try self.selected.ensureUnusedCapacity(reader.alloc, pending.count());
+        var scoped = self.scopedReader(reader);
+        scoped.resource_names = &pending;
+        self.scans += 1;
+        var table = scoped.resourceTable(&self.source) catch |err| switch (err) {
+            error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.PdfMetadataWorkLimit, error.Canceled => return err,
+            // Existing color consumers treat malformed resource tables as
+            // empty. Keep that policy here without swallowing errors while
+            // interpreting a selected color definition.
+            else => syntax.Object.null,
+        };
+        defer table.deinit(reader.alloc);
+        // Preserve first-key semantics without quadratic searches when many
+        // names are selected. Partial successful entries survive allocation
+        // failure; negative results are published only after parsing succeeds.
+        if (table == .dict) for (table.dict) |*entry| {
+            try reader.checkCancellation();
+            if (!pending.contains(entry.key) or self.selected.contains(entry.key)) continue;
+            // The projected table already owns these allocations through the
+            // caller allocator. Transfer them instead of deep-cloning again.
+            self.selected.putAssumeCapacity(entry.key, entry.value);
+            entry.* = .{ .key = &.{}, .value = .null };
+        };
+        keys = pending.keyIterator();
+        while (keys.next()) |key| {
+            try reader.checkCancellation();
+            if (self.selected.contains(key.*)) continue;
+            const owned_key = try reader.alloc.dupe(u8, key.*);
+            self.selected.putAssumeCapacity(owned_key, null);
+        }
+    }
+
+    fn get(self: *@This(), reader: *const Reader, name: []const u8) !?syntax.Object {
+        if (self.selected.get(name)) |value| return value;
+        if (self.dependency_requests) |requests| {
+            // Classification is probing this frontier. Its result cannot be
+            // committed until every requested name has been loaded or proved
+            // absent. Own names because the classifier frees temporary values.
+            self.waiting_for_dependency = true;
+            try requests.add(reader.alloc, name);
+            return null;
+        }
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        defer names.deinit(reader.alloc);
+        try names.put(reader.alloc, name, {});
+        try self.prime(reader, &names);
+        return self.selected.get(name).?;
+    }
+};
+
+// A page owns these stable records, so Forms sharing indirect or deferred tables
+// reuse both selected entries and negative lookups. Direct dictionaries borrow
+// their enclosing scope and use a local lookup instead.
+const ResourceLookupCache = struct {
+    tables: std.AutoHashMapUnmanaged(Key, *ResourceTableLookup) = .empty,
+    const Key = struct { reference: u64, start: usize, end: usize, deferred: bool };
+
+    fn deinit(self: *@This(), a: Allocator) void {
+        var values = self.tables.valueIterator();
+        while (values.next()) |value| {
+            value.*.deinit(a);
+            a.destroy(value.*);
+        }
+        self.tables.deinit(a);
+    }
+
+    fn table(self: *@This(), reader: *const Reader, source: syntax.Object) !*ResourceTableLookup {
+        const reference = if (source == .obj_ref) source.obj_ref else source.deferred.reference;
+        const key = Key{
+            .reference = (@as(u64, reference.id) << 16) | reference.gen,
+            .start = if (source == .deferred) source.deferred.start else 0,
+            .end = if (source == .deferred) source.deferred.end else 0,
+            .deferred = source == .deferred,
+        };
+        if (self.tables.get(key)) |cached| return cached;
+        try self.tables.ensureUnusedCapacity(reader.alloc, 1);
+        const lookup = try reader.alloc.create(ResourceTableLookup);
+        lookup.* = .{ .source = source };
+        self.tables.putAssumeCapacity(key, lookup);
+        return lookup;
+    }
+};
+
 pub const Reader = struct {
+    const LengthResolution = struct {
+        reference: syntax.ObjRef,
+        parent: ?*const LengthResolution,
+        depth: usize,
+    };
+    // Borrowed only by synchronous scoped readers during length resolution.
+    length_resolution: ?*const LengthResolution = null,
+    object_depth_limit: usize = std.math.maxInt(usize),
+    metadata_scan: ?*syntax.ScanControl = null,
+    metadata_frames: ?*MetadataObjectStreamCache = null,
+    // Required reads can share optional decoded frames without making frame
+    // retention a prerequisite for successfully reading a selected object.
+    metadata_frame_fallback: bool = false,
+    resource_names: ?*const std.StringHashMapUnmanaged(void) = null,
+    resource_lookup_cache: ?*ResourceLookupCache = null,
+    structure_cache: ?*StructureMetadataCache = null,
     alloc: Allocator,
     bytes: []const u8,
     decode_limits: DecodeLimits,
@@ -3639,7 +5109,7 @@ pub const Reader = struct {
     startxref_offset: usize,
     xref_entries: []XrefEntry,
     trailer: syntax.Object,
-    page_index: ?[]syntax.Object = null,
+    page_index: ?[]PageIndexEntry = null,
     font_cache: *std.AutoHashMapUnmanaged(u64, PageFont),
     image_cache: ?*DecodedImageCache = null,
     encryption: ?EncryptionContext = null,
@@ -3659,6 +5129,7 @@ pub const Reader = struct {
     render_target: ?RenderTarget = null,
     last_render_diagnostics: ?PageRenderDiagnostics = null,
     cancellation: CancellationProbe = .{},
+    text_extraction_policy: TextExtractionPolicy = .source,
     /// Render forks borrow the immutable document index from their source
     /// reader. Mutable decode caches remain fork-local, while this flag keeps
     /// teardown from walking or freeing the shared xref/trailer/page tree.
@@ -3686,6 +5157,9 @@ pub const Reader = struct {
     pub fn setCancellationProbe(self: *Reader, probe: CancellationProbe) void {
         self.cancellation = probe;
     }
+    pub fn setTextExtractionPolicy(self: *Reader, policy: TextExtractionPolicy) void {
+        self.text_extraction_policy = policy;
+    }
 
     pub fn cancellationProbe(self: *const Reader) CancellationProbe {
         return self.cancellation;
@@ -3693,6 +5167,16 @@ pub const Reader = struct {
 
     pub fn checkCancellation(self: *const Reader) !void {
         return self.cancellation.check();
+    }
+
+    fn scannerControl(self: *const Reader, local: *syntax.ScanControl) ?*syntax.ScanControl {
+        if (self.metadata_scan) |shared| return shared;
+        if (self.cancellation.is_cancelled_fn == null) return null;
+        local.* = .{
+            .context = self.cancellation.context,
+            .is_cancelled_fn = self.cancellation.is_cancelled_fn,
+        };
+        return local;
     }
 
     fn beginImageCacheScope(self: *Reader) !void {
@@ -3826,10 +5310,25 @@ pub const Reader = struct {
     /// must not mutate limits while a fork or decode is active.
     pub fn setDecodeLimits(self: *Reader, decode_limits: DecodeLimits) !void {
         try decode_limits.validate();
+        if (std.meta.eql(self.decode_limits, decode_limits)) return;
+        // Metadata may have been retained or rejected under the old stream,
+        // live-byte, or cumulative limits. Rebuild lazily under the new limits;
+        // unchanged limits retain the warm cache and its work accounting.
+        self.clearStructureMetadataCache();
         self.decode_limits = decode_limits;
     }
 
+    fn clearStructureMetadataCache(self: *Reader) void {
+        if (self.structure_cache) |cache| {
+            cache.document.deinit();
+            std.debug.assert(cache.shared_budget.live_bytes == @sizeOf(StructureMetadataCache));
+            self.alloc.destroy(cache);
+            self.structure_cache = null;
+        }
+    }
+
     pub fn deinit(self: *Reader) void {
+        self.clearStructureMetadataCache();
         if (self.owns_document_metadata) {
             if (self.page_index) |pages| {
                 for (pages) |*page| page.deinit(self.alloc);
@@ -3878,6 +5377,7 @@ pub const Reader = struct {
             .alloc = alloc,
             .bytes = self.bytes,
             .decode_limits = self.decode_limits,
+            .text_extraction_policy = self.text_extraction_policy,
             .version_minor = self.version_minor,
             .startxref_offset = self.startxref_offset,
             .xref_entries = self.xref_entries,
@@ -4021,7 +5521,7 @@ pub const Reader = struct {
                 obj.* = .{ .string = decrypted };
             },
             .array => |items| for (items) |*item| try self.decryptObject(item, ptr),
-            .dict => |entries| for (entries) |*entry| try self.decryptObject(&entry.value, ptr),
+            .dict, .stream_header => |entries| for (entries) |*entry| try self.decryptObject(&entry.value, ptr),
             .stream => |stream| {
                 for (stream.header) |*entry| try self.decryptObject(&entry.value, ptr);
                 // Do not decrypt or retain stream payloads during object
@@ -4050,17 +5550,32 @@ pub const Reader = struct {
     }
 
     pub fn readIndirectObject(self: *const Reader, ptr: syntax.ObjRef) anyerror!syntax.Object {
+        return self.readIndirectObjectProjected(ptr, .full);
+    }
+
+    fn readIndirectObjectProjected(self: *const Reader, ptr: syntax.ObjRef, projection: syntax.Projection) anyerror!syntax.Object {
         const entry = self.findXref(ptr) orelse return error.ObjectNotFound;
         if (!entry.in_use) return error.ObjectNotInUse;
         if (entry.compressed_obj_stream_id) |obj_stream_id| {
-            return try self.readCompressedObject(ptr, obj_stream_id, entry.compressed_index orelse return error.InvalidObjectStream);
+            return try self.readCompressedObject(ptr, obj_stream_id, entry.compressed_index orelse return error.InvalidObjectStream, projection, null);
         }
-        if (entry.offset >= self.bytes.len) return error.InvalidObjectOffset;
+        return self.readUncompressedIndirectObjectProjected(ptr, entry, projection);
+    }
 
+    fn readUncompressedIndirectObjectProjected(self: *const Reader, ptr: syntax.ObjRef, entry: XrefEntry, projection: syntax.Projection) anyerror!syntax.Object {
+        std.debug.assert(entry.compressed_obj_stream_id == null);
+        if (!entry.in_use) return error.ObjectNotInUse;
+        if (entry.offset >= self.bytes.len) return error.InvalidObjectOffset;
         var scanner = syntax.Scanner.initWithOffset(self.alloc, self.bytes[entry.offset..], entry.offset);
+        scanner.max_object_depth = self.object_depth_limit;
+        scanner.source_ref = ptr;
+        scanner.resource_names = self.resource_names;
+        scanner.stream_length_resolver = .{ .context = self, .resolve = resolveStreamLengthReference };
+        var scan_control: syntax.ScanControl = undefined;
+        scanner.control = self.scannerControl(&scan_control);
         defer scanner.deinit();
 
-        var parsed = try scanner.readObject();
+        var parsed = try scanner.readObjectProjected(projection);
         errdefer parsed.deinit(self.alloc);
         if (parsed != .obj_def) return error.ExpectedIndirectObject;
         if (parsed.obj_def.ptr.id != ptr.id or parsed.obj_def.ptr.gen != ptr.gen) return error.ObjectPointerMismatch;
@@ -4075,6 +5590,26 @@ pub const Reader = struct {
         errdefer decrypted.deinit(self.alloc);
         if (self.encryption != null) try self.decryptObject(&decrypted, ptr);
         return decrypted;
+    }
+
+    fn readDeferredObjectProjected(self: *const Reader, location: syntax.DeferredValue, projection: syntax.Projection) !syntax.Object {
+        const entry = self.findXref(location.reference) orelse return error.ObjectNotFound;
+        if (!entry.in_use) return error.ObjectNotInUse;
+        if (entry.compressed_obj_stream_id) |stream_id|
+            return self.readCompressedObject(location.reference, stream_id, entry.compressed_index orelse return error.InvalidObjectStream, projection, location);
+        if (location.start < entry.offset or location.start >= location.end or location.end > self.bytes.len) return error.InvalidObjectOffset;
+        var scanner = syntax.Scanner.initWithOffset(self.alloc, self.bytes[location.start..location.end], location.start);
+        scanner.max_object_depth = self.object_depth_limit;
+        scanner.source_ref = location.reference;
+        scanner.resource_names = self.resource_names;
+        scanner.stream_length_resolver = .{ .context = self, .resolve = resolveStreamLengthReference };
+        var scan_control: syntax.ScanControl = undefined;
+        scanner.control = self.scannerControl(&scan_control);
+        defer scanner.deinit();
+        var value = try scanner.readObjectProjected(projection);
+        errdefer value.deinit(self.alloc);
+        if (self.encryption != null) try self.decryptObject(&value, location.reference);
+        return value;
     }
 
     pub fn readRawStreamData(self: *const Reader, obj: *const syntax.Object) ![]u8 {
@@ -4122,18 +5657,62 @@ pub const Reader = struct {
         return try self.alloc.dupe(u8, encoded);
     }
 
+    fn resolveStreamLengthReference(raw: *const anyopaque, initial: syntax.ObjRef, object_stream: bool) anyerror!?usize {
+        const self: *const Reader = @ptrCast(@alignCast(raw));
+        var scalar_reader = self.*;
+        scalar_reader.object_depth_limit = @min(self.object_depth_limit, 128);
+        var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
+        defer encrypted_streams.deinit(self.alloc);
+        scalar_reader.encrypted_streams = &encrypted_streams;
+        scalar_reader.encrypted_stream_generation = 0;
+        var visited: [128]LengthResolution = undefined;
+        var count: usize = 0;
+        var reference = initial;
+        while (count < visited.len) {
+            try self.checkCancellation();
+            const parent = scalar_reader.length_resolution;
+            if (parent) |node| if (node.depth >= visited.len) return error.InvalidStreamLength;
+            var ancestor = parent;
+            while (ancestor) |node| : (ancestor = node.parent) {
+                if (node.reference.id == reference.id and node.reference.gen == reference.gen) return error.InvalidStreamLength;
+            }
+            visited[count] = .{ .reference = reference, .parent = parent, .depth = if (parent) |node| node.depth + 1 else 1 };
+            scalar_reader.length_resolution = &visited[count];
+            count += 1;
+            const entry = self.findXref(reference) orelse return error.ObjectNotFound;
+            if (!entry.in_use) return error.ObjectNotInUse;
+            // Only an object stream's own Length must be uncompressed. Ordinary
+            // stream lengths may live in another object stream. The dependency
+            // path survives those container reads and bounds malformed cycles.
+            if (object_stream and entry.compressed_obj_stream_id != null) return error.InvalidStreamLength;
+            var value = if (entry.compressed_obj_stream_id) |stream_id|
+                try scalar_reader.readCompressedObject(reference, stream_id, entry.compressed_index orelse return error.InvalidObjectStream, .integer, null)
+            else
+                try scalar_reader.readUncompressedIndirectObjectProjected(reference, entry, .integer);
+            defer value.deinit(self.alloc);
+            if (value.asInteger()) |length| {
+                if (length < 0) return error.InvalidStreamLength;
+                return std.math.cast(usize, length) orelse error.InvalidStreamLength;
+            }
+            if (value == .obj_ref) {
+                reference = value.obj_ref;
+                continue;
+            }
+            return null;
+        }
+        return error.InvalidStreamLength;
+    }
+
     fn resolvedStreamDataLength(self: *const Reader, obj: *const syntax.Object) !usize {
         if (obj.* != .stream) return error.NotAStream;
         const length_obj = obj.get("Length") orelse return obj.stream.data_length;
         if (length_obj.asInteger()) |length| {
             if (length < 0) return error.InvalidStreamLength;
-            return @intCast(length);
+            return std.math.cast(usize, length) orelse error.InvalidStreamLength;
         }
-        var resolved = try self.resolveValue(length_obj);
-        defer resolved.deinit(self.alloc);
-        const length = resolved.asInteger() orelse return obj.stream.data_length;
-        if (length < 0) return error.InvalidStreamLength;
-        return @intCast(length);
+        if (length_obj.* == .obj_ref)
+            return (try resolveStreamLengthReference(self, length_obj.obj_ref, if (obj.get("Type")) |ty| std.mem.eql(u8, ty.asName() orelse "", "ObjStm") else false)) orelse obj.stream.data_length;
+        return obj.stream.data_length;
     }
 
     pub fn readDecodedStreamData(self: *const Reader, obj: *const syntax.Object) ![]u8 {
@@ -4198,71 +5777,17 @@ pub const Reader = struct {
         try self.ensurePageIndex();
         const pages = self.page_index.?;
         if (page_num > pages.len) return error.PageOutOfRange;
-        return try pages[page_num - 1].clone(self.alloc);
+        return try pages[page_num - 1].object.clone(self.alloc);
     }
 
     pub fn extractPageTextAlloc(self: *Reader, page_num: usize) ![]u8 {
-        try self.beginImageCacheScope();
-        defer self.endImageCacheScope();
-        var page = try self.readPageObject(page_num);
-        defer page.deinit(self.alloc);
-        const contents = page.get("Contents") orelse return try self.alloc.dupe(u8, "");
-        var stream_ranges: ?[]ContentStreamRange = null;
-        const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
-        defer self.alloc.free(decoded_content);
-        defer self.alloc.free(stream_ranges.?);
-
-        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
-        defer {
-            for (fonts) |*font| font.deinit(self.alloc);
-            self.alloc.free(fonts);
-        }
-        const forms = try self.collectPageTextFormsForContentAlloc(&page, decoded_content);
-        defer {
-            for (forms) |*form| form.deinit(self.alloc);
-            self.alloc.free(forms);
-        }
-        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
-        defer {
-            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
-            self.alloc.free(color_spaces);
-        }
-
-        var canonical = std.ArrayList(u8).empty;
-        defer canonical.deinit(self.alloc);
-        var layout_runs = std.ArrayList(LayoutTextRun).empty;
-        defer layout_runs.deinit(self.alloc);
-        defer for (layout_runs.items) |*run| run.deinit(self.alloc);
-        var layout_parser = try PositionedTextParser.init(self.alloc, .{ .layout = &layout_runs }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
-        defer layout_parser.deinit();
-        layout_parser.cancellation = self.cancellation;
-
-        for (stream_ranges.?) |range| {
-            const stream_content = decoded_content[range.start..range.end];
-            // Keep the pre-reconstruction extraction contract as the byte
-            // preservation baseline. Real-world PDFs sometimes package
-            // independently generated content streams whose inherited font
-            // state would otherwise decode (and drop) different glyphs.
-            // Compare canonical bytes with this original run sequence before
-            // any extraction-only geometric permutation is applied.
-            var text_parser = TextContentParser.init(self.alloc, &canonical);
-            defer text_parser.deinit();
-            try text_parser.consume(stream_content, fonts, forms, 0);
-            try layout_parser.consume(stream_content, fonts, &.{}, forms);
-        }
-
-        var owned_text = try canonical.toOwnedSlice(self.alloc);
-        errdefer self.alloc.free(owned_text);
-        if (layout_runs.items.len > 0 and
-            sameNonWhitespaceBytesAsTextRuns(owned_text, layout_runs.items))
-        {
-            const reconstructed = try reconstructTextFromRunsCancelableAlloc(self.alloc, layout_runs.items, self.cancellation);
-            self.alloc.free(owned_text);
-            owned_text = reconstructed;
-        } else {
-            clearTextRunOutputSpans(layout_runs.items);
-        }
-        return owned_text;
+        const analysis = try self.extractPageTextAnalysisCoreAlloc(page_num, std.math.maxInt(usize), false);
+        const text = analysis.text;
+        for (analysis.runs) |*run| run.deinit(self.alloc);
+        if (analysis.runs.len > 0) self.alloc.free(analysis.runs);
+        for (analysis.semantic_spans) |*span| span.deinit(self.alloc);
+        if (analysis.semantic_spans.len > 0) self.alloc.free(analysis.semantic_spans);
+        return text;
     }
 
     /// Metadata-only coverage inspection: never decode appearance streams or
@@ -4282,12 +5807,18 @@ pub const Reader = struct {
         }
     };
     fn annotationValue(self: *Reader, object: *const syntax.Object) !AnnotationValue {
+        return self.annotationValueProjected(object, .full);
+    }
+    fn annotationValueProjected(self: *Reader, object: *const syntax.Object, projection: syntax.Projection) !AnnotationValue {
         var result = AnnotationValue{ .value = object.* };
         errdefer result.deinit(self.alloc);
         for (0..32) |_| {
-            if (result.value != .obj_ref) return result;
+            if (result.value != .obj_ref and result.value != .deferred) return result;
             try self.checkCancellation();
-            const next = try self.readIndirectObject(result.value.obj_ref);
+            const next = if (result.value == .obj_ref)
+                try self.readIndirectObjectProjected(result.value.obj_ref, projection)
+            else
+                try self.readDeferredObjectProjected(result.value.deferred, projection);
             result.deinit(self.alloc);
             result = .{ .value = next, .owned = true };
         }
@@ -4379,7 +5910,7 @@ pub const Reader = struct {
 
     /// Resolve only static normal appearances. No actions, scripts, rollover
     /// state or viewer-generated painting are executed by this path.
-    fn staticAppearance(self: *Reader, annotation: *const syntax.Object) !?StaticAppearance {
+    fn staticAppearance(self: *Reader, annotation: *const syntax.Object, metadata_only: bool) !?StaticAppearance {
         if (annotation.get("OC") != null) return null; // Optional-content visibility needs its own policy.
         if (annotation.get("CA")) |alpha| if (try self.annotationNumber(alpha) != 1) return null;
         if (annotation.get("BM")) |blend| {
@@ -4403,20 +5934,21 @@ pub const Reader = struct {
         var ap = try self.annotationValue(annotation.get("AP") orelse return null);
         defer ap.deinit(self.alloc);
         if (ap.value != .dict) return null;
-        var normal = try self.annotationValue(ap.value.get("N") orelse return null);
+        const projection: syntax.Projection = if (metadata_only) .appearance_header else .full;
+        var normal = try self.annotationValueProjected(ap.value.get("N") orelse return null, projection);
         defer normal.deinit(self.alloc);
         if (normal.value == .dict) {
             var state = try self.annotationValue(annotation.get("AS") orelse return null);
             defer state.deinit(self.alloc);
             if (state.value != .name) return error.InvalidPdfAnnotations;
             const selected = normal.value.get(state.value.name) orelse return null;
-            var resolved = try self.annotationValue(selected);
+            var resolved = try self.annotationValueProjected(selected, projection);
             defer resolved.deinit(self.alloc);
             const owned = try resolved.value.clone(self.alloc);
             normal.deinit(self.alloc);
             normal = .{ .value = owned, .owned = true };
         }
-        if (normal.value != .stream) return null;
+        if (normal.value != .stream and !(metadata_only and normal.value == .stream_header)) return null;
         const subtype = normal.value.get("Subtype") orelse return null;
         if (!std.mem.eql(u8, subtype.asName() orelse return null, "Form")) return null;
         var bounds = try self.annotationValue(normal.value.get("BBox") orelse return null);
@@ -4443,6 +5975,7 @@ pub const Reader = struct {
             transformed[3] = @max(transformed[3], y);
         }
         if (transformed[0] >= transformed[2] or transformed[1] >= transformed[3]) return error.InvalidPdfAnnotations;
+        if (metadata_only) return .{ .stream = .null, .rect = normalized, .bounds = transformed };
         var stream = try normal.value.clone(self.alloc);
         errdefer stream.deinit(self.alloc);
         try self.setRenderNumericArray(&stream, "BBox", &b);
@@ -4466,7 +5999,7 @@ pub const Reader = struct {
             var annotation = try self.annotationValue(raw);
             defer annotation.deinit(self.alloc);
             if (!try self.annotationIsVisible(&annotation.value)) continue;
-            var appearance = (try self.staticAppearance(&annotation.value)) orelse return true;
+            var appearance = (try self.staticAppearance(&annotation.value, true)) orelse return true;
             appearance.deinit(self.alloc);
         }
         return false;
@@ -4515,7 +6048,7 @@ pub const Reader = struct {
             var annotation = try self.annotationValue(raw);
             defer annotation.deinit(self.alloc);
             if (!try self.annotationIsVisible(&annotation.value)) continue;
-            var appearance = (try self.staticAppearance(&annotation.value)) orelse return error.UnsupportedPdfAnnotationRendering;
+            var appearance = (try self.staticAppearance(&annotation.value, false)) orelse return error.UnsupportedPdfAnnotationRendering;
             defer appearance.deinit(self.alloc);
             var name_buffer: [64]u8 = undefined;
             const name = while (true) : (id += 1) {
@@ -4555,8 +6088,8 @@ pub const Reader = struct {
     /// Extracts canonical page text and positioned text runs while sharing the
     /// page object, resource collection, content stream resolution, and stream
     /// decoding work between both representations.
-    /// Paint-only resources are not needed for character positions. Keep mask
-    /// and image decoding in the rendering APIs, as in plain-text extraction.
+    /// Alpha graphics state is retained for policy diagnostics; images and
+    /// masks remain paint-only work in the rendering APIs.
     pub fn extractPageTextAnalysisAlloc(self: *Reader, page_num: usize) !PageTextAnalysis {
         return self.extractPageTextAnalysisWithRunLimitAlloc(page_num, std.math.maxInt(usize));
     }
@@ -4564,13 +6097,17 @@ pub const Reader = struct {
     /// The shared run count includes nested forms and all content streams.
     /// Reject excess runs before copying their text or reconstructing layout.
     pub fn extractPageTextAnalysisWithRunLimitAlloc(self: *Reader, page_num: usize, max_runs: usize) !PageTextAnalysis {
+        return self.extractPageTextAnalysisCoreAlloc(page_num, max_runs, true);
+    }
+
+    fn extractPageTextAnalysisCoreAlloc(self: *Reader, page_num: usize, max_runs: usize, comptime include_page_metadata: bool) !PageTextAnalysis {
         try self.beginImageCacheScope();
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
-        const annotations = try self.pageHasUnsupportedAnnotationsFromObject(&page);
-        const visible_annotations = try self.pageHasVisibleAnnotationsFromObject(&page);
+        const annotations = if (include_page_metadata) try self.pageHasUnsupportedAnnotationsFromObject(&page) else false;
+        const visible_annotations = if (include_page_metadata) try self.pageHasVisibleAnnotationsFromObject(&page) else false;
         const contents = page.get("Contents") orelse return .{
             .text = try self.alloc.dupe(u8, ""),
             .runs = try self.alloc.alloc(TextRun, 0),
@@ -4578,31 +6115,81 @@ pub const Reader = struct {
             .has_unrendered_annotations = annotations,
             .has_nontext_visual = visible_annotations,
         };
+        const page_box = try self.extractPageBoxFromObject(&page);
         var stream_ranges: ?[]ContentStreamRange = null;
         const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
         defer self.alloc.free(decoded_content);
         defer self.alloc.free(stream_ranges.?);
-        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
+        var resource_live_budget = DecodeBudgetAllocator.init(self.alloc, 0, self.decode_limits.max_working_set_bytes);
+        var resource_budget = DecodeBudgetAllocator.initWithCumulativeLimit(resource_live_budget.allocator(), 0, self.decode_limits.max_working_set_bytes, self.decode_limits.max_working_set_bytes *| 4);
+        var text_resources = TextResourceCache{ .budget = &resource_budget, .live_budget = &resource_live_budget };
+        defer text_resources.deinit();
+        text_resources.prepareScan(self);
+        var lookup_cache = ResourceLookupCache{};
+        defer lookup_cache.deinit(self.alloc);
+        const previous_lookup_cache = self.resource_lookup_cache;
+        self.resource_lookup_cache = &lookup_cache;
+        defer self.resource_lookup_cache = previous_lookup_cache;
+        const previous_frames = self.metadata_frames;
+        const previous_fallback = self.metadata_frame_fallback;
+        self.metadata_frames = &text_resources.frames;
+        self.metadata_frame_fallback = true;
+        defer {
+            self.metadata_frames = previous_frames;
+            self.metadata_frame_fallback = previous_fallback;
+        }
+        const resources = try text_resources.pageResources(self, &page);
+        const fonts = try self.collectFontsFromResourcesAlloc(&resources, decoded_content);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
-        const forms = try self.collectPageTextFormsForContentAlloc(&page, decoded_content);
+        const gstates = try self.collectTextExtGStatesFromResourcesAlloc(&resources, decoded_content);
+        defer {
+            for (gstates) |*gstate| gstate.deinit(self.alloc);
+            self.alloc.free(gstates);
+        }
+        const forms = try self.collectPageTextFormsForContentAlloc(&page, decoded_content, &text_resources);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
-        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        const text_properties = try self.collectPageTextPropertiesForContentAlloc(&page, decoded_content, &text_resources);
+        defer {
+            for (text_properties) |*property| property.deinit(self.alloc);
+            self.alloc.free(text_properties);
+        }
+        const color_spaces = try self.collectColorSpacesFromResourcesAlloc(&resources, decoded_content);
         defer {
             for (color_spaces) |*color_space| color_space.deinit(self.alloc);
             self.alloc.free(color_spaces);
         }
 
-        var analysis = try self.extractDecodedTextAnalysisAlloc(decoded_content, stream_ranges.?, fonts, &.{}, forms, color_spaces, max_runs);
+        var structure_budget = DecodeBudgetAllocator.initWithCumulativeLimit(self.alloc, 0, self.decode_limits.max_working_set_bytes, self.decode_limits.max_working_set_bytes *| 4);
+        const structure_context = StructureResolverContext{ .reader = self, .budget = &structure_budget };
+        const structure_parent = try self.structureParent(&page);
+        if (self.structure_cache == null and (structure_parent != null or formsHaveStructureParents(forms))) {
+            const cache = try self.alloc.create(StructureMetadataCache);
+            cache.shared_budget = DecodeBudgetAllocator.init(self.alloc, @sizeOf(StructureMetadataCache), self.decode_limits.max_working_set_bytes);
+            cache.budget = DecodeBudgetAllocator.initWithCumulativeLimit(cache.shared_budget.allocator(), 0, self.decode_limits.max_working_set_bytes, self.decode_limits.max_working_set_bytes *| 4);
+            cache.document = .{ .alloc = cache.budget.allocator() };
+            self.structure_cache = cache;
+        }
+        if (self.structure_cache) |cache| structure_budget.backing = cache.shared_budget.allocator();
+        var structure = structure_text.Lookup{
+            .alloc = structure_budget.allocator(),
+            .document = if (self.structure_cache) |cache| &cache.document else null,
+            .page = self.page_index.?[page_num - 1].reference,
+            .page_parent = structure_parent,
+            .resolver = .{ .context = &structure_context, .root = StructureResolverContext.root, .resolve = StructureResolverContext.resolve, .check = StructureResolverContext.check, .exhausted = StructureResolverContext.exhausted },
+        };
+        defer structure.deinit();
+        var analysis = try self.extractDecodedTextAnalysisAlloc(decoded_content, stream_ranges.?, fonts, gstates, forms, text_properties, color_spaces, page_box, max_runs, include_page_metadata, &structure, structure_parent);
         errdefer analysis.deinit(self.alloc);
         analysis.has_unrendered_annotations = annotations;
         analysis.outline_fallback = pageFontsUsedOutlineFallback(fonts);
-        analysis.has_nontext_visual = visible_annotations or try contentHasNontextPaint(self.alloc, decoded_content, self.cancellation);
+        analysis.has_nontext_visual = visible_annotations or
+            (include_page_metadata and try contentHasNontextPaint(self.alloc, decoded_content, self.cancellation));
         return analysis;
     }
 
@@ -5542,7 +7129,7 @@ pub const Reader = struct {
 
         for (1..count + 1) |page_num| {
             const text = self.extractPageTextAlloc(page_num) catch |err| switch (err) {
-                std.mem.Allocator.Error.OutOfMemory => return err,
+                std.mem.Allocator.Error.OutOfMemory, error.Canceled => return err,
                 else => continue,
             };
             defer self.alloc.free(text);
@@ -5561,7 +7148,7 @@ pub const Reader = struct {
         parser.cancellation = self.cancellation;
 
         for (ranges) |range|
-            try parser.consume(decoded[range.start..range.end], fonts, gstates, forms);
+            try parser.consume(decoded[range.start..range.end], fonts, gstates, forms, &.{});
 
         return try out.toOwnedSlice(self.alloc);
     }
@@ -5630,7 +7217,7 @@ pub const Reader = struct {
         forms: []const PageForm,
         color_spaces: []const PageColorSpace,
     ) !void {
-        try text_parser.consume(decoded, fonts, gstates, forms);
+        try text_parser.consume(decoded, fonts, gstates, forms, &.{});
         const has_do = contentMayContainOperator(decoded, "Do");
         const has_shape_paint = contentMayContainShapePaintOperator(decoded);
         const has_shading_paint = contentMayContainOperator(decoded, "sh");
@@ -5664,61 +7251,143 @@ pub const Reader = struct {
         return null;
     }
 
-    fn readCompressedObject(self: *const Reader, ptr: syntax.ObjRef, obj_stream_id: u32, obj_index: usize) anyerror!syntax.Object {
+    fn readCompressedObject(self: *const Reader, ptr: syntax.ObjRef, obj_stream_id: u32, obj_index: usize, projection: syntax.Projection, location: ?syntax.DeferredValue) anyerror!syntax.Object {
+        if (self.metadata_frames) |cache| if (cache.retained.get(obj_stream_id)) |frame|
+            return cache.parseFrame(self, frame, ptr, obj_index, projection, location);
         var obj_stream = try self.readIndirectObject(.{ .id = obj_stream_id, .gen = 0 });
         defer obj_stream.deinit(self.alloc);
         if (obj_stream != .stream) return error.ExpectedObjectStream;
-
         const ty = obj_stream.get("Type") orelse return error.ExpectedObjectStream;
-        if (!std.mem.eql(u8, ty.asName() orelse return error.ExpectedObjectStream, "ObjStm")) {
-            return error.ExpectedObjectStream;
-        }
-
+        if (!std.mem.eql(u8, ty.asName() orelse return error.ExpectedObjectStream, "ObjStm")) return error.ExpectedObjectStream;
         const first_i = (obj_stream.get("First") orelse return error.InvalidObjectStream).asInteger() orelse return error.InvalidObjectStream;
         const count_i = (obj_stream.get("N") orelse return error.InvalidObjectStream).asInteger() orelse return error.InvalidObjectStream;
         if (first_i < 0 or count_i < 0) return error.InvalidObjectStream;
-        const first: usize = @intCast(first_i);
-        const count: usize = @intCast(count_i);
+        const first = std.math.cast(usize, first_i) orelse return error.InvalidObjectStream;
+        const count = std.math.cast(usize, count_i) orelse return error.InvalidObjectStream;
         if (obj_index >= count) return error.ObjectNotFound;
-
+        const keep_frame = self.metadata_frame_fallback or switch (projection) {
+            .resource_properties, .container_properties, .property_table, .property => true,
+            else => location != null,
+        };
+        if (keep_frame) if (self.metadata_frames) |cache|
+            return cache.read(self, obj_stream_id, &obj_stream, first, count, ptr, obj_index, projection, location);
         const decoded = try self.readDecodedStreamData(&obj_stream);
         defer self.alloc.free(decoded);
+        const entry = try self.scanObjectStreamIndex(decoded, first, count, obj_index, null);
+        return self.parseCompressedObject(decoded, first, entry, ptr, projection, location);
+    }
+
+    fn scanObjectStreamIndex(self: *const Reader, decoded: []const u8, first: usize, count: usize, selected: usize, output: ?[]MetadataObjectStreamCache.Entry) !MetadataObjectStreamCache.Entry {
         if (first > decoded.len) return error.InvalidObjectStream;
-
-        var header_scanner = syntax.Scanner.init(self.alloc, decoded[0..first]);
-        defer header_scanner.deinit();
-
-        var found_id: ?u32 = null;
-        var found_offset: ?usize = null;
-        var i: usize = 0;
-        while (i < count) : (i += 1) {
-            var id_obj = try header_scanner.readObject();
-            defer id_obj.deinit(self.alloc);
-            var off_obj = try header_scanner.readObject();
-            defer off_obj.deinit(self.alloc);
-
-            const id_i = id_obj.asInteger() orelse return error.InvalidObjectStream;
-            const off_i = off_obj.asInteger() orelse return error.InvalidObjectStream;
-            if (id_i < 0 or off_i < 0) return error.InvalidObjectStream;
-            if (i == obj_index) {
-                found_id = @intCast(id_i);
-                found_offset = @intCast(off_i);
+        var scanner = syntax.Scanner.init(self.alloc, decoded[0..first]);
+        var scan_control: syntax.ScanControl = undefined;
+        scanner.control = self.scannerControl(&scan_control);
+        defer scanner.deinit();
+        var result: ?MetadataObjectStreamCache.Entry = null;
+        var previous_offset: ?usize = null;
+        for (0..count) |i| {
+            if (i % 256 == 0) try self.checkCancellation();
+            var id_token = try scanner.readLexeme();
+            defer syntax.Scanner.freeLexeme(self.alloc, &id_token);
+            var offset_token = try scanner.readLexeme();
+            defer syntax.Scanner.freeLexeme(self.alloc, &offset_token);
+            if (id_token != .integer or offset_token != .integer) return error.InvalidObjectStream;
+            const id_i = id_token.integer;
+            const off_i = offset_token.integer;
+            if (id_i < 0 or id_i > std.math.maxInt(u32) or off_i < 0) return error.InvalidObjectStream;
+            const offset = std.math.cast(usize, off_i) orelse return error.InvalidObjectStream;
+            if (offset >= decoded.len - first) return error.InvalidObjectStream;
+            if (previous_offset) |previous| if (offset <= previous) return error.InvalidObjectStream;
+            previous_offset = offset;
+            const entry = MetadataObjectStreamCache.Entry{ .id = @intCast(id_i), .start = offset, .end = decoded.len - first };
+            if (output) |entries| {
+                entries[i] = entry;
+                if (i > 0) entries[i - 1].end = offset;
             }
+            if (i == selected) result = entry else if (i == selected + 1) result.?.end = offset;
         }
+        return result orelse error.ObjectNotFound;
+    }
 
-        const target_id = found_id orelse return error.ObjectNotFound;
-        const target_offset = found_offset orelse return error.ObjectNotFound;
-        if (target_id != ptr.id) return error.ObjectPointerMismatch;
-        if (first + target_offset > decoded.len) return error.InvalidObjectStream;
-
-        var obj_scanner = syntax.Scanner.init(self.alloc, decoded[first + target_offset ..]);
-        defer obj_scanner.deinit();
-        return try obj_scanner.readObject();
+    fn parseCompressedObject(self: *const Reader, decoded: []const u8, first: usize, entry: MetadataObjectStreamCache.Entry, ptr: syntax.ObjRef, projection: syntax.Projection, location: ?syntax.DeferredValue) !syntax.Object {
+        if (entry.id != ptr.id) return error.ObjectPointerMismatch;
+        const bytes = decoded[first + entry.start .. first + entry.end];
+        const start = if (location) |value| value.start else 0;
+        const end = if (location) |value| value.end else bytes.len;
+        if (start >= end or end > bytes.len) return error.InvalidObjectOffset;
+        var scanner = syntax.Scanner.initWithOffset(self.alloc, bytes[start..end], start);
+        scanner.source_ref = ptr;
+        scanner.resource_names = self.resource_names;
+        var scan_control: syntax.ScanControl = undefined;
+        scanner.control = self.scannerControl(&scan_control);
+        scanner.allow_stream = false;
+        scanner.max_object_depth = self.object_depth_limit;
+        defer scanner.deinit();
+        return scanner.readObjectProjected(projection);
     }
 
     fn resolveValue(self: *const Reader, obj: *const syntax.Object) !syntax.Object {
         return switch (obj.*) {
             .obj_ref => |ptr| try self.readIndirectObject(ptr),
+            .deferred => |location| blk: {
+                var value = try self.readDeferredObjectProjected(location, .full);
+                if (value == .obj_ref) {
+                    defer value.deinit(self.alloc);
+                    break :blk try self.readIndirectObject(value.obj_ref);
+                }
+                break :blk value;
+            },
+            else => try obj.clone(self.alloc),
+        };
+    }
+
+    // Tables retain names and references, with source spans for compound values.
+    // Collectors select entries before resolving them; unused definitions are
+    // scanned once and never allocated, even in indirect/compressed tables.
+    fn resourceTable(self: *const Reader, obj: *const syntax.Object) !syntax.Object {
+        if (obj.* == .dict) if (self.resource_names) |names| {
+            var entries: std.ArrayList(syntax.DictEntry) = .empty;
+            errdefer {
+                for (entries.items) |*entry| entry.deinit(self.alloc);
+                entries.deinit(self.alloc);
+            }
+            for (obj.dict) |entry| {
+                try self.checkCancellation();
+                if (!names.contains(entry.key)) continue;
+                const key = try self.alloc.dupe(u8, entry.key);
+                errdefer self.alloc.free(key);
+                var value = try entry.value.clone(self.alloc);
+                errdefer value.deinit(self.alloc);
+                try entries.append(self.alloc, .{ .key = key, .value = value });
+            }
+            return .{ .dict = try entries.toOwnedSlice(self.alloc) };
+        };
+        return switch (obj.*) {
+            .obj_ref => |ptr| try self.readIndirectObjectProjected(ptr, .resource_entries),
+            .deferred => |location| try self.readDeferredObjectProjected(location, .resource_entries),
+            else => try obj.clone(self.alloc),
+        };
+    }
+
+    fn resourceLookup(self: *const Reader, source: *const syntax.Object, local: *ResourceTableLookup) !*ResourceTableLookup {
+        if (source.* == .obj_ref or source.* == .deferred)
+            if (self.resource_lookup_cache) |cache| return cache.table(self, source.*);
+        local.* = .{ .source = source.* };
+        return local;
+    }
+
+    fn selectedResourceTable(self: *const Reader, obj: *const syntax.Object, references: *const ReferencedResourceNames) !syntax.Object {
+        var reader = self.*;
+        reader.resource_names = &references.names;
+        return reader.resourceTable(obj);
+    }
+
+    // Color-space consumers use N, Alternate and Range, never ICC payloads.
+    // Keep their probes independent of stream lengths and decoder allowances.
+    fn colorProfileMetadata(self: *const Reader, obj: *const syntax.Object) !syntax.Object {
+        return switch (obj.*) {
+            .obj_ref => |ptr| try self.readIndirectObjectProjected(ptr, .color_profile_header),
+            .deferred => |location| try self.readDeferredObjectProjected(location, .color_profile_header),
             else => try obj.clone(self.alloc),
         };
     }
@@ -5748,7 +7417,7 @@ pub const Reader = struct {
         defer root.deinit(self.alloc);
         const pages_obj = root.get("Pages") orelse return error.MissingPages;
 
-        var pages = std.ArrayList(syntax.Object).empty;
+        var pages = std.ArrayList(PageIndexEntry).empty;
         defer pages.deinit(self.alloc);
         errdefer for (pages.items) |*page| page.deinit(self.alloc);
         var guard: TraversalGuard = .{};
@@ -5758,7 +7427,7 @@ pub const Reader = struct {
         self.page_index = try pages.toOwnedSlice(self.alloc);
     }
 
-    fn appendPageTreeLeaves(self: *const Reader, out: *std.ArrayList(syntax.Object), node_obj: *const syntax.Object, depth: usize, guard: *TraversalGuard) anyerror!void {
+    fn appendPageTreeLeaves(self: *const Reader, out: *std.ArrayList(PageIndexEntry), node_obj: *const syntax.Object, depth: usize, guard: *TraversalGuard) anyerror!void {
         if (depth > 128) return error.InvalidPageTree;
         try guard.enter(self.alloc, node_obj, error.InvalidPageTree);
         var node = try self.resolveValue(node_obj);
@@ -5772,7 +7441,7 @@ pub const Reader = struct {
             // Grow first so a successful deep clone always has an infallible
             // ownership transfer into the result list.
             try out.ensureUnusedCapacity(self.alloc, 1);
-            out.appendAssumeCapacity(try node.clone(self.alloc));
+            out.appendAssumeCapacity(.{ .object = try node.clone(self.alloc), .reference = if (node_obj.* == .obj_ref) node_obj.obj_ref else null });
             return;
         }
         if (!std.mem.eql(u8, name, "Pages")) return error.InvalidPageTree;
@@ -5970,45 +7639,108 @@ pub const Reader = struct {
         fonts: []const PageFont,
         gstates: []const PageExtGState,
         forms: []const PageForm,
+        properties: []const PageTextProperty,
         color_spaces: []const PageColorSpace,
+        page_box: PageBox,
         max_runs: usize,
+        comptime positioned: bool,
+        structure: *structure_text.Lookup,
+        structure_parent: ?i64,
     ) !PageTextAnalysis {
+        // Plain extraction returns one string. All parser/run storage is
+        // page-local scratch: coalesce its small allocations and release it in
+        // one operation instead of retaining allocator size classes per run.
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const alloc = if (positioned) self.alloc else scratch.allocator();
         var text = std.ArrayList(u8).empty;
-        errdefer text.deinit(self.alloc);
-        var runs = std.ArrayList(TextRun).empty;
-        errdefer {
-            for (runs.items) |*run| run.deinit(self.alloc);
-            runs.deinit(self.alloc);
-        }
-        var run_parser = try PositionedTextParser.init(self.alloc, .{ .analysis = .{ .runs = &runs, .max_runs = max_runs } }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
+        errdefer text.deinit(alloc);
+        const Run = if (positioned) TextRun else LayoutTextRun;
+        var runs = std.ArrayList(Run).empty;
+        errdefer if (positioned) {
+            for (runs.items) |*run| run.deinit(alloc);
+            runs.deinit(alloc);
+        };
+        const output: PositionedTextOutput = if (positioned) .{ .analysis = .{ .runs = &runs, .max_runs = max_runs } } else .{ .layout = &runs };
+        var spans = std.ArrayList(SemanticTextSpan).empty;
+        errdefer if (positioned) {
+            for (spans.items) |*span| span.deinit(alloc);
+            spans.deinit(alloc);
+        };
+        var run_parser = try PositionedTextParser.init(alloc, output, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
         defer run_parser.deinit();
+        var structure_spans: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+        defer structure_spans.deinit(alloc);
+        run_parser.semantic.structure = structure;
+        run_parser.semantic.structure_parent = structure_parent;
+        run_parser.semantic.structure_spans = &structure_spans;
         run_parser.cancellation = self.cancellation;
+        run_parser.semantic.shared_spans = &spans;
+        run_parser.semantic.page_box = page_box;
+        var text_parser = TextContentParser.init(alloc, &text);
+        defer text_parser.deinit();
+        text_parser.cancellation = self.cancellation;
+        text_parser.structure = structure;
 
         for (ranges) |range| {
             const stream_content = decoded[range.start..range.end];
-            // Runs retain cross-stream graphics/text state for geometry, while
-            // canonical bytes retain the legacy per-stream decoding behavior.
-            // Validate against the original run sequence before ordering;
-            // ordered reconstruction is intentionally not content order.
-            var text_parser = TextContentParser.init(self.alloc, &text);
-            defer text_parser.deinit();
-            try run_parser.consume(stream_content, fonts, gstates, forms);
-            try text_parser.consume(stream_content, fonts, forms, 0);
+            // Positioned geometry retains the graphics and text state that PDF
+            // carries between streams. Canonical decoding preserves its
+            // historical per-stream font reset while marked-content scopes
+            // remain active when a producer splits a span across streams.
+            try run_parser.consume(stream_content, fonts, gstates, forms, properties);
         }
+        run_parser.semantic.finish();
+        const uses_structure_text = structure_spans.count() > 0;
+        const use_semantic_transcript = uses_structure_text or structure.incomplete;
+        // Structure replacements are authoritative and can cover several
+        // disjoint MCIDs. Reuse the positioned decoder's original glyphs;
+        // materializing an alternate canonical transcript would both ignore
+        // structure and allocate text that the replacement immediately removes.
+        // An unresolved outer replacement must retain the positioned glyph
+        // fallback, rather than letting canonical decoding apply an inner
+        // replacement that was correctly suppressed by that outer scope.
+        if (!use_semantic_transcript) for (ranges) |range| {
+            text_parser.state = .{};
+            try text_parser.consume(decoded[range.start..range.end], fonts, forms, properties, 0);
+        };
 
-        var owned_text = try text.toOwnedSlice(self.alloc);
-        errdefer self.alloc.free(owned_text);
-        if (runs.items.len > 0 and
-            sameNonWhitespaceBytesAsTextRuns(owned_text, runs.items))
-        {
-            const reconstructed = try reconstructTextFromRunsCancelableAlloc(self.alloc, runs.items, self.cancellation);
-            self.alloc.free(owned_text);
+        var diagnostics = NativeTextDiagnostics{ .actual_text_replacements = spans.items.len, .actual_text_incomplete = structure.incomplete };
+        if (positioned or self.text_extraction_policy != .source) applyTextExtractionPolicy(runs.items, page_box, self.text_extraction_policy, &diagnostics);
+        var owned_text = try text.toOwnedSlice(alloc);
+        errdefer alloc.free(owned_text);
+        if (spans.items.len > 0) {
+            const items = try semanticTextItemsAlloc(alloc, runs.items, spans.items, self.text_extraction_policy, self.cancellation);
+            defer alloc.free(items);
+            if (use_semantic_transcript or sameNonWhitespaceBytesAsTextRuns(owned_text, items) or self.text_extraction_policy != .source) {
+                const reconstructed = try reconstructTextItemsCancelableAlloc(alloc, items, runs.items, spans.items, self.cancellation);
+                alloc.free(owned_text);
+                owned_text = reconstructed;
+                try propagateSemanticTextSpans(runs.items, spans.items, items, self.cancellation);
+            }
+        } else if (runs.items.len > 0 and (use_semantic_transcript or sameNonWhitespaceBytesAsTextRuns(owned_text, runs.items) or self.text_extraction_policy != .source)) {
+            const reconstructed = try reconstructTextFromRunsCancelableAlloc(alloc, runs.items, self.cancellation);
+            alloc.free(owned_text);
             owned_text = reconstructed;
-        } else {
-            clearTextRunOutputSpans(runs.items);
         }
-        const owned_runs = try runs.toOwnedSlice(self.alloc);
-        return .{ .text = owned_text, .runs = owned_runs };
+        if (positioned) {
+            finalizeNativeTextDiagnostics(runs.items, &diagnostics);
+            for (spans.items) |span| {
+                if (span.text.len == 0) continue;
+                if (span.paint.has_paint and !span.paint.page_eligible) diagnostics.outside_page_spans +|= 1;
+                if (span.paint.has_paint and !span.paint.any_visible) diagnostics.invisible_spans +|= 1;
+                if (span.output_span != null and span.output_bounds == null) diagnostics.unpositioned_spans +|= 1;
+            }
+            const owned_runs = try runs.toOwnedSlice(alloc);
+            errdefer {
+                for (owned_runs) |*run| run.deinit(alloc);
+                alloc.free(owned_runs);
+            }
+            const owned_spans = try spans.toOwnedSlice(alloc);
+            return .{ .text = owned_text, .runs = owned_runs, .semantic_spans = owned_spans, .diagnostics = diagnostics };
+        } else {
+            return .{ .text = try self.alloc.dupe(u8, owned_text), .runs = &.{} };
+        }
     }
 
     fn extractSingleContentImageRunsAppend(self: *const Reader, out: *std.ArrayList(ImageRun), obj: *const syntax.Object, images: []const PageImage, gstates: []const PageExtGState, forms: []const PageForm) !void {
@@ -6248,7 +7980,7 @@ pub const Reader = struct {
             text_parser.cancellation = cancellation;
             text_parser.vectorize_form_text = true;
             text_parser.next_group_id = glyph_group_base;
-            try text_parser.consume(glyph.content, type3.fonts, type3.gstates, type3.forms);
+            try text_parser.consume(glyph.content, type3.fonts, type3.gstates, type3.forms, &.{});
             next_resource_group_id.* = @max(next_non_text_group_id, text_parser.next_group_id);
             var nested_type3_phase: usize = 0;
             for (glyph_text.items) |text| {
@@ -6891,32 +8623,28 @@ pub const Reader = struct {
     fn classifyColorSpaceResource(
         self: *const Reader,
         value: *const syntax.Object,
-        resource_entries: []const syntax.DictEntry,
+        resource_entries: *ResourceTableLookup,
         depth: u8,
         allow_default_remap: bool,
     ) anyerror!ColorSpaceSelection {
         if (depth >= 8) return colorSpaceSelectionForKind(.unsupported);
-        var resolved = try self.resolveValue(value);
+        var resolved = try resource_entries.resolveValue(self, value);
         defer resolved.deinit(self.alloc);
         if (resolved.asName()) |name| {
             const direct = colorSpaceKindFromName(name);
             if (direct != .unsupported) {
                 if (allow_default_remap) if (defaultColorSpaceName(direct)) |default_name| {
-                    for (resource_entries) |entry| {
-                        if (!std.mem.eql(u8, entry.key, default_name)) continue;
-                        const remapped = try self.classifyColorSpaceResource(&entry.value, resource_entries, depth + 1, false);
+                    if (try resource_entries.get(self, default_name)) |entry| {
+                        const remapped = try self.classifyColorSpaceResource(&entry, resource_entries, depth + 1, false);
                         if (remapped.kind != .pattern and remapped.kind != .unsupported and
                             colorSpaceComponentCount(remapped.kind) == colorSpaceComponentCount(direct))
                             return remapped;
-                        break;
                     }
                 };
                 return colorSpaceSelectionForKind(direct);
             }
-            for (resource_entries) |entry| {
-                if (std.mem.eql(u8, entry.key, name))
-                    return try self.classifyColorSpaceResource(&entry.value, resource_entries, depth + 1, allow_default_remap);
-            }
+            if (try resource_entries.get(self, name)) |entry|
+                return try self.classifyColorSpaceResource(&entry, resource_entries, depth + 1, allow_default_remap);
             return colorSpaceSelectionForKind(.unsupported);
         }
         if (resolved != .array or resolved.array.len == 0) return colorSpaceSelectionForKind(.unsupported);
@@ -6932,7 +8660,7 @@ pub const Reader = struct {
             return try self.classifyCalibratedColorSpace(family, &resolved.array[1]);
         }
         if (std.mem.eql(u8, family, "ICCBased") and resolved.array.len >= 2) {
-            var profile = try self.resolveValue(&resolved.array[1]);
+            var profile = try self.colorProfileMetadata(&resolved.array[1]);
             defer profile.deinit(self.alloc);
             const components_integer = if (profile.get("N")) |count| try self.resolvedIntegerObjectValue(count) else null;
             const components: u8 = switch (components_integer orelse 0) {
@@ -6952,6 +8680,10 @@ pub const Reader = struct {
                     4 => .device_cmyk,
                     else => unreachable,
                 });
+            if (resource_entries.dependency_requests != null and resource_entries.waiting_for_dependency) {
+                deinitColorSpaceSelection(&selection, self.alloc);
+                return colorSpaceSelectionForKind(.unsupported);
+            }
             if (selection.kind == .pattern or
                 selection.kind == .unsupported or
                 colorSpaceComponentCount(selection.kind) != components)
@@ -6993,6 +8725,10 @@ pub const Reader = struct {
             if (input_components != 1) return colorSpaceSelectionForKind(.unsupported);
 
             var alternate = try self.classifyColorSpaceResource(&resolved.array[2], resource_entries, depth + 1, allow_default_remap);
+            if (resource_entries.dependency_requests != null and resource_entries.waiting_for_dependency) {
+                deinitColorSpaceSelection(&alternate, self.alloc);
+                return colorSpaceSelectionForKind(.unsupported);
+            }
             if (alternate.value.tint != null or (alternate.pattern_base != null and alternate.pattern_base.?.tint != null)) {
                 deinitColorSpaceSelection(&alternate, self.alloc);
                 return colorSpaceSelectionForKind(.unsupported);
@@ -7141,7 +8877,7 @@ pub const Reader = struct {
     }
 
     fn collectColorSpacesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, referenced_content: []const u8) ![]PageColorSpace {
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, referenced_content, &.{ "cs", "CS" });
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, referenced_content, &.{ "cs", "CS" }, self.cancellation);
         defer references.deinit(self.alloc);
         {
             const content = referenced_content;
@@ -7157,40 +8893,73 @@ pub const Reader = struct {
         if (references.names.count() == 0) return try self.alloc.alloc(PageColorSpace, 0);
 
         const color_spaces_obj = resources.get("ColorSpace") orelse return try self.alloc.alloc(PageColorSpace, 0);
-        var resolved_color_spaces = self.resolveValue(color_spaces_obj) catch |err| switch (err) {
-            error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
+        var local = ResourceTableLookup{ .source = .null };
+        defer local.deinit(self.alloc);
+        const lookup = try self.resourceLookup(color_spaces_obj, &local);
+        lookup.prime(self, &references.names) catch |err| switch (err) {
+            error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.PdfMetadataWorkLimit, error.Canceled => return err,
             else => return try self.alloc.alloc(PageColorSpace, 0),
         };
-        defer resolved_color_spaces.deinit(self.alloc);
-        if (resolved_color_spaces != .dict) return try self.alloc.alloc(PageColorSpace, 0);
 
         var out = std.ArrayList(PageColorSpace).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*color_space| color_space.deinit(self.alloc);
-        for (resolved_color_spaces.dict) |entry| {
+        var unresolved: std.ArrayList([]const u8) = .empty;
+        defer unresolved.deinit(self.alloc);
+        var names = references.names.keyIterator();
+        while (names.next()) |key| try unresolved.append(self.alloc, key.*);
+        while (unresolved.items.len != 0) {
+            var requests = ReferencedResourceNames{};
+            defer requests.deinit(self.alloc);
+            try self.collectColorSpaceFrontier(lookup, &unresolved, &out, &requests);
+            // Each unresolved root discovered at least one uncached dependency.
+            // Classifier depth bounds the number of frontiers independently of
+            // the number of selected names. Successful roots are never retried.
+            if (unresolved.items.len != 0) {
+                std.debug.assert(requests.names.count() != 0);
+                try lookup.prime(self, &requests.names);
+            }
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn collectColorSpaceFrontier(
+        self: *const Reader,
+        lookup: *ResourceTableLookup,
+        unresolved: *std.ArrayList([]const u8),
+        out: *std.ArrayList(PageColorSpace),
+        requests: *ReferencedResourceNames,
+    ) !void {
+        std.debug.assert(lookup.dependency_requests == null);
+        lookup.dependency_requests = requests;
+        defer lookup.dependency_requests = null;
+        var remaining: usize = 0;
+        for (unresolved.items) |key| {
             try self.checkCancellation();
-            if (!references.contains(entry.key)) continue;
-            var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
-            errdefer if (name) |owned| self.alloc.free(owned);
+            lookup.waiting_for_dependency = false;
+            const entry = (try lookup.get(self, key)) orelse continue;
             var selection = self.classifyColorSpaceResource(
-                &entry.value,
-                resolved_color_spaces.dict,
+                &entry,
+                lookup,
                 0,
-                !isDefaultDeviceColorSpaceName(entry.key),
+                !isDefaultDeviceColorSpaceName(key),
             ) catch |err| switch (err) {
-                error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
+                error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.PdfMetadataWorkLimit, error.Canceled => return err,
                 else => colorSpaceSelectionForKind(.unsupported),
             };
             var selection_owned = true;
-            errdefer if (selection_owned) deinitColorSpaceSelection(&selection, self.alloc);
-            try out.append(self.alloc, .{
-                .name = name.?,
-                .selection = selection,
-            });
+            defer if (selection_owned) deinitColorSpaceSelection(&selection, self.alloc);
+            if (lookup.waiting_for_dependency) {
+                unresolved.items[remaining] = key;
+                remaining += 1;
+                continue;
+            }
+            const name = try self.alloc.dupe(u8, key);
+            errdefer self.alloc.free(name);
+            try out.append(self.alloc, .{ .name = name, .selection = selection });
             selection_owned = false;
-            name = null;
         }
-        return try out.toOwnedSlice(self.alloc);
+        unresolved.shrinkRetainingCapacity(remaining);
     }
 
     fn collectPageColorSpacesForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageColorSpace {
@@ -7245,6 +9014,75 @@ pub const Reader = struct {
         defer if (resources) |*obj| obj.deinit(self.alloc);
         return try self.collectExtGStatesFromResourcesAlloc(&resources.?, content);
     }
+    fn collectPageTextExtGStatesForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageExtGState {
+        var resources = try self.findInheritedPageValue(page, "Resources");
+        if (resources == null) return try self.alloc.alloc(PageExtGState, 0);
+        defer if (resources) |*obj| obj.deinit(self.alloc);
+        return try self.collectTextExtGStatesFromResourcesAlloc(&resources.?, content);
+    }
+
+    fn collectPageTextPropertiesForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8, cache: *TextResourceCache) ![]PageTextProperty {
+        const resources = try cache.pageResources(self, page);
+        return self.collectTextPropertiesFromResourcesAlloc(&resources, content, cache);
+    }
+
+    fn collectTextPropertiesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8, cache: *TextResourceCache) ![]PageTextProperty {
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, content, &.{"BDC"}, self.cancellation);
+        defer references.deinit(self.alloc);
+        var out = std.ArrayList(PageTextProperty).empty;
+        defer out.deinit(self.alloc);
+        errdefer for (out.items) |*property| property.deinit(self.alloc);
+        if (references.names.count() == 0) return out.toOwnedSlice(self.alloc);
+        const source = cache.propertySource(resources);
+        const raw: ?*const syntax.Object = if (source != null and source.? == .table) &source.?.table else null;
+        // Direct tables are already compact owned metadata. Use their known
+        // order without resolving a property dictionary or replacement value.
+        const dense_direct = raw != null and raw.?.* == .dict and references.names.count() >= (raw.?.dict.len + 3) / 4;
+        const index = if (dense_direct) cache.entries(self, raw.?) catch |err| blk: {
+            _ = try cache.selectedFailure(err);
+            break :blk null;
+        } else null;
+        if (index != null and references.names.count() >= (index.?.len + 3) / 4) {
+            for (index.?, 0..) |*entry, i| {
+                if (i % 256 == 0) try self.checkCancellation();
+                if (!references.contains(entry.raw.key)) continue;
+                try PageTextProperty.append(self.alloc, &out, entry.raw.key, cache.bindingSource(self, entry));
+            }
+            if (out.items.len == references.names.count()) return out.toOwnedSlice(self.alloc);
+            const present = out.items.len;
+            var names = references.names.keyIterator();
+            while (names.next()) |name| {
+                try self.checkCancellation();
+                if (findTextProperty(out.items[0..present], name.*) != null) continue;
+                try PageTextProperty.append(self.alloc, &out, name.*, .{ .normalized = .{ .invalid = true } });
+            }
+        } else {
+            var names = references.names.keyIterator();
+            while (names.next()) |name| {
+                try self.checkCancellation();
+                try PageTextProperty.append(self.alloc, &out, name.*, cache.bindingSource(self, if (index) |items| TextResourceCache.findEntry(items, name.*) else null));
+            }
+        }
+        std.mem.sort(PageTextProperty, out.items, {}, struct {
+            fn lessThan(_: void, left: PageTextProperty, right: PageTextProperty) bool {
+                return std.mem.lessThan(u8, left.name, right.name);
+            }
+        }.lessThan);
+        const records = try out.toOwnedSlice(self.alloc);
+        errdefer {
+            for (records) |*record| record.deinit(self.alloc);
+            self.alloc.free(records);
+        }
+        if (index == null and !dense_direct) if (source) |property_source| {
+            cache.deferBindings(self, property_source, records) catch |err| {
+                // Binding storage is optional metadata too. Records already
+                // contain invalid values, diagnosed only if a scope selects
+                // them. A known direct-table failure needs no deferred retry.
+                _ = try cache.selectedFailure(err);
+            };
+        };
+        return records;
+    }
 
     fn collectPageFormsAlloc(self: *const Reader, page: *const syntax.Object) ![]PageForm {
         var resources = try self.findInheritedPageValue(page, "Resources");
@@ -7262,20 +9100,9 @@ pub const Reader = struct {
         return try self.collectFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content, false);
     }
 
-    fn collectPageTextFormsAlloc(self: *const Reader, page: *const syntax.Object) ![]PageForm {
-        var resources = try self.findInheritedPageValue(page, "Resources");
-        if (resources == null) return try self.alloc.alloc(PageForm, 0);
-        defer if (resources) |*obj| obj.deinit(self.alloc);
-        const content = try self.collectPageContentAlloc(page);
-        defer self.alloc.free(content);
-        return try self.collectTextFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
-    }
-
-    fn collectPageTextFormsForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageForm {
-        var resources = try self.findInheritedPageValue(page, "Resources");
-        if (resources == null) return try self.alloc.alloc(PageForm, 0);
-        defer if (resources) |*obj| obj.deinit(self.alloc);
-        return try self.collectTextFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
+    fn collectPageTextFormsForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8, cache: *TextResourceCache) ![]PageForm {
+        const resources = try cache.pageResources(self, page);
+        return self.collectTextFormsFromResourcesAlloc(&resources, &resources, 0, content, cache);
     }
 
     fn collectPageContentAlloc(self: *const Reader, page: *const syntax.Object) ![]u8 {
@@ -7289,11 +9116,12 @@ pub const Reader = struct {
 
     fn collectFontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageFont {
         const fonts_obj = resources.get("Font") orelse return try self.alloc.alloc(PageFont, 0);
-        var resolved_fonts = try self.resolveValue(fonts_obj);
+        var references = try collectReferencedFontNamesCancelableAlloc(self.alloc, content, self.cancellation);
+        defer references.deinit(self.alloc);
+        if (references.names.count() == 0) return try self.alloc.alloc(PageFont, 0);
+        var resolved_fonts = try self.selectedResourceTable(fonts_obj, &references);
         defer resolved_fonts.deinit(self.alloc);
         if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
-        var references = try collectReferencedFontNamesAlloc(self.alloc, content);
-        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageFont).empty;
         errdefer {
@@ -7343,11 +9171,12 @@ pub const Reader = struct {
     /// their own resource dictionary.
     fn collectNonType3FontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) anyerror![]PageFont {
         const fonts_obj = resources.get("Font") orelse return try self.alloc.alloc(PageFont, 0);
-        var resolved_fonts = try self.resolveValue(fonts_obj);
+        var references = try collectReferencedFontNamesCancelableAlloc(self.alloc, content, self.cancellation);
+        defer references.deinit(self.alloc);
+        if (references.names.count() == 0) return try self.alloc.alloc(PageFont, 0);
+        var resolved_fonts = try self.selectedResourceTable(fonts_obj, &references);
         defer resolved_fonts.deinit(self.alloc);
         if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
-        var references = try collectReferencedFontNamesAlloc(self.alloc, content);
-        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageFont).empty;
         errdefer {
@@ -7379,30 +9208,25 @@ pub const Reader = struct {
     ) !bool {
         const value = image.get("ColorSpace") orelse return false;
         const color_spaces_obj = resources.get("ColorSpace") orelse return false;
-        var color_spaces = self.resolveValue(color_spaces_obj) catch |err| switch (err) {
-            error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
-            else => return false,
-        };
-        defer color_spaces.deinit(self.alloc);
-        if (color_spaces != .dict) return false;
-        return try self.imageColorSpaceValueDependsOnResources(value, color_spaces.dict, 0);
+        var local = ResourceTableLookup{ .source = .null };
+        defer local.deinit(self.alloc);
+        const lookup = try self.resourceLookup(color_spaces_obj, &local);
+        return try self.imageColorSpaceValueDependsOnResources(value, lookup, 0);
     }
 
     fn imageColorSpaceValueDependsOnResources(
         self: *const Reader,
         value: *const syntax.Object,
-        resource_entries: []const syntax.DictEntry,
+        resource_entries: *ResourceTableLookup,
         depth: u8,
     ) anyerror!bool {
         if (depth >= 8) return true;
-        var resolved = try self.resolveValue(value);
+        var resolved = try resource_entries.resolveValue(self, value);
         defer resolved.deinit(self.alloc);
         if (resolved.asName()) |name| {
             const direct = colorSpaceKindFromName(name);
             const resource_name = if (defaultColorSpaceName(direct)) |default_name| default_name else name;
-            for (resource_entries) |entry|
-                if (std.mem.eql(u8, entry.key, resource_name)) return true;
-            return false;
+            return (try resource_entries.get(self, resource_name)) != null;
         }
         if (resolved != .array or resolved.array.len == 0) return false;
         const family = resolved.array[0].asName() orelse return false;
@@ -7419,7 +9243,7 @@ pub const Reader = struct {
         if (nested_index) |index|
             return try self.imageColorSpaceValueDependsOnResources(&resolved.array[index], resource_entries, depth + 1);
         if (std.mem.eql(u8, family, "ICCBased") and resolved.array.len > 1) {
-            var profile = try self.resolveValue(&resolved.array[1]);
+            var profile = try self.colorProfileMetadata(&resolved.array[1]);
             defer profile.deinit(self.alloc);
             if (profile.get("Alternate")) |alternate|
                 return try self.imageColorSpaceValueDependsOnResources(alternate, resource_entries, depth + 1);
@@ -7430,11 +9254,11 @@ pub const Reader = struct {
     fn resolveImageColorSpaceValueAlloc(
         self: *const Reader,
         value: *const syntax.Object,
-        resource_entries: []const syntax.DictEntry,
+        resource_entries: *ResourceTableLookup,
         depth: u8,
         allow_default_remap: bool,
     ) anyerror!syntax.Object {
-        var resolved = try self.resolveValue(value);
+        var resolved = try resource_entries.resolveValue(self, value);
         errdefer resolved.deinit(self.alloc);
         if (depth >= 8) return resolved;
         if (resolved == .array and resolved.array.len > 0) {
@@ -7459,9 +9283,8 @@ pub const Reader = struct {
         const name = resolved.asName() orelse return resolved;
         const direct = colorSpaceKindFromName(name);
         if (allow_default_remap) if (defaultColorSpaceName(direct)) |default_name| {
-            for (resource_entries) |entry| {
-                if (!std.mem.eql(u8, entry.key, default_name)) continue;
-                var replacement = try self.resolveImageColorSpaceValueAlloc(&entry.value, resource_entries, depth + 1, false);
+            if (try resource_entries.get(self, default_name)) |entry| {
+                var replacement = try self.resolveImageColorSpaceValueAlloc(&entry, resource_entries, depth + 1, false);
                 errdefer replacement.deinit(self.alloc);
                 const component_count = self.colorSpaceInputComponentCount(&replacement) catch |err| switch (err) {
                     error.UnsupportedPdfRendering => 0,
@@ -7476,9 +9299,8 @@ pub const Reader = struct {
             }
         };
         if (direct != .unsupported) return resolved;
-        for (resource_entries) |entry| {
-            if (!std.mem.eql(u8, entry.key, name)) continue;
-            const replacement = try self.resolveImageColorSpaceValueAlloc(&entry.value, resource_entries, depth + 1, allow_default_remap);
+        if (try resource_entries.get(self, name)) |entry| {
+            const replacement = try self.resolveImageColorSpaceValueAlloc(&entry, resource_entries, depth + 1, allow_default_remap);
             resolved.deinit(self.alloc);
             return replacement;
         }
@@ -7501,21 +9323,18 @@ pub const Reader = struct {
     fn resolveImageColorSpaceForDecodeRawAlloc(self: *const Reader, value: *const syntax.Object) anyerror!syntax.Object {
         const resources = self.image_color_space_resources orelse return try self.resolveValue(value);
         const color_spaces_obj = resources.get("ColorSpace") orelse return try self.resolveValue(value);
-        var color_spaces = self.resolveValue(color_spaces_obj) catch |err| switch (err) {
-            error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
-            else => return try self.resolveValue(value),
-        };
-        defer color_spaces.deinit(self.alloc);
-        if (color_spaces != .dict) return try self.resolveValue(value);
-        return try self.resolveImageColorSpaceValueAlloc(value, color_spaces.dict, 0, true);
+        var local = ResourceTableLookup{ .source = .null };
+        defer local.deinit(self.alloc);
+        const lookup = try self.resourceLookup(color_spaces_obj, &local);
+        return try self.resolveImageColorSpaceValueAlloc(value, lookup, 0, true);
     }
 
     fn collectImagesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageImage {
         const xobject_obj = resources.get("XObject") orelse return try self.alloc.alloc(PageImage, 0);
-        var resolved_xobjects = try self.resolveValue(xobject_obj);
+        var resolved_xobjects = try self.resourceTable(xobject_obj);
         defer resolved_xobjects.deinit(self.alloc);
         if (resolved_xobjects != .dict) return try self.alloc.alloc(PageImage, 0);
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, content, &.{"Do"});
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, content, &.{"Do"}, self.cancellation);
         defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageImage).empty;
@@ -7616,7 +9435,7 @@ pub const Reader = struct {
         var resolved_shadings = try self.resolveValue(shadings_obj);
         defer resolved_shadings.deinit(self.alloc);
         if (resolved_shadings != .dict) return try self.alloc.alloc(PageShading, 0);
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, content, &.{"sh"});
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, content, &.{"sh"}, self.cancellation);
         defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageShading).empty;
@@ -7635,32 +9454,52 @@ pub const Reader = struct {
     }
 
     fn collectExtGStatesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageExtGState {
+        return self.collectExtGStatesWithSoftMasksFromResourcesAlloc(resources, content, true);
+    }
+
+    fn collectTextExtGStatesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageExtGState {
+        return self.collectExtGStatesWithSoftMasksFromResourcesAlloc(resources, content, false);
+    }
+
+    fn collectExtGStatesWithSoftMasksFromResourcesAlloc(
+        self: *const Reader,
+        resources: *const syntax.Object,
+        content: []const u8,
+        decode_soft_masks: bool,
+    ) ![]PageExtGState {
         const ext_obj = resources.get("ExtGState") orelse return try self.alloc.alloc(PageExtGState, 0);
-        var resolved_ext = try self.resolveValue(ext_obj);
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, content, &.{"gs"}, self.cancellation);
+        defer references.deinit(self.alloc);
+        if (references.names.count() == 0) return try self.alloc.alloc(PageExtGState, 0);
+        var resolved_ext = try self.selectedResourceTable(ext_obj, &references);
         defer resolved_ext.deinit(self.alloc);
         if (resolved_ext != .dict) return try self.alloc.alloc(PageExtGState, 0);
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, content, &.{"gs"});
-        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageExtGState).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*gstate| gstate.deinit(self.alloc);
         for (resolved_ext.dict) |entry| {
+            try self.checkCancellation();
             if (!references.contains(entry.key)) continue;
             var gs = try self.resolveValue(&entry.value);
             defer gs.deinit(self.alloc);
             if (gs != .dict) continue;
-            const fill_alpha = if (gs.get("ca")) |obj| alphaByteFromNumber(numericObjectValue(obj) orelse 1.0) else @as(u8, 0xff);
-            const stroke_alpha = if (gs.get("CA")) |obj| alphaByteFromNumber(numericObjectValue(obj) orelse 1.0) else @as(u8, 0xff);
+            const fill_alpha_value = if (gs.get("ca")) |obj| numericObjectValue(obj) orelse 1.0 else 1.0;
+            const stroke_alpha_value = if (gs.get("CA")) |obj| numericObjectValue(obj) orelse 1.0 else 1.0;
+            const fill_alpha = alphaByteFromNumber(fill_alpha_value);
+            const stroke_alpha = alphaByteFromNumber(stroke_alpha_value);
             const blend_mode = if (gs.get("BM")) |obj| parseBlendModeObject(obj) else BlendMode.normal;
-            var soft_mask = try self.buildImageExtGStateSoftMaskAlloc(&gs);
+            var soft_mask = if (decode_soft_masks) try self.buildImageExtGStateSoftMaskAlloc(&gs) else null;
             errdefer if (soft_mask) |*mask| mask.deinit(self.alloc);
             var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
             errdefer if (name) |owned| self.alloc.free(owned);
             try out.append(self.alloc, .{
                 .name = name.?,
-                .fill_alpha = fill_alpha,
-                .stroke_alpha = stroke_alpha,
+                .fill_alpha = if (!decode_soft_masks and fill_alpha_value > 0) @max(1, fill_alpha) else fill_alpha,
+                .stroke_alpha = if (!decode_soft_masks and stroke_alpha_value > 0) @max(1, stroke_alpha) else stroke_alpha,
+                .fill_alpha_specified = gs.get("ca") != null,
+                .stroke_alpha_specified = gs.get("CA") != null,
+                .blend_mode_specified = gs.get("BM") != null,
                 .blend_mode = blend_mode,
                 .soft_mask = soft_mask,
                 .soft_mask_specified = gs.get("SMask") != null,
@@ -7834,7 +9673,7 @@ pub const Reader = struct {
         var resolved_patterns = try self.resolveValue(pattern_obj);
         defer resolved_patterns.deinit(self.alloc);
         if (resolved_patterns != .dict) return try self.alloc.alloc(PagePattern, 0);
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, parent_content, &.{ "scn", "SCN" });
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, parent_content, &.{ "scn", "SCN" }, self.cancellation);
         defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PagePattern).empty;
@@ -7970,10 +9809,10 @@ pub const Reader = struct {
     fn collectFormsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, fallback_resources: ?*const syntax.Object, depth: u8, parent_content: []const u8, exclude_type3_fonts: bool) anyerror![]PageForm {
         if (depth > 1) return try self.alloc.alloc(PageForm, 0);
         const xobject_obj = resources.get("XObject") orelse return try self.alloc.alloc(PageForm, 0);
-        var resolved_xobjects = try self.resolveValue(xobject_obj);
+        var resolved_xobjects = try self.resourceTable(xobject_obj);
         defer resolved_xobjects.deinit(self.alloc);
         if (resolved_xobjects != .dict) return try self.alloc.alloc(PageForm, 0);
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, parent_content, &.{"Do"});
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, parent_content, &.{"Do"}, self.cancellation);
         defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageForm).empty;
@@ -8096,20 +9935,43 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    fn structureParent(self: *const Reader, object: *const syntax.Object) !?i64 {
+        const raw = object.get("StructParents") orelse return null;
+        var value = self.resolveValue(raw) catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled, error.PdfDecodeWorkingSetTooLarge, error.DecodedStreamTooLarge => return err,
+            else => return -1,
+        };
+        defer value.deinit(self.alloc);
+        if (value == .null) return null;
+        return value.asInteger() orelse -1;
+    }
+
+    fn textXObject(self: *const Reader, raw: *const syntax.Object) !syntax.Object {
+        // Classify and parse once: only PDF Forms need validated payloads.
+        // Images and ignored XObjects stop at their header.
+        return switch (raw.*) {
+            .obj_ref => |reference| try self.readIndirectObjectProjected(reference, .text_xobject),
+            .deferred => |location| try self.readDeferredObjectProjected(location, .text_xobject),
+            else => try raw.clone(self.alloc),
+        };
+    }
+
     fn collectTextFormsFromResourcesAlloc(
         self: *const Reader,
         resources: *const syntax.Object,
         fallback_resources: ?*const syntax.Object,
         depth: u8,
         parent_content: []const u8,
+        cache: *TextResourceCache,
     ) anyerror![]PageForm {
         if (depth > 1) return try self.alloc.alloc(PageForm, 0);
         const xobject_obj = resources.get("XObject") orelse return try self.alloc.alloc(PageForm, 0);
-        var resolved_xobjects = try self.resolveValue(xobject_obj);
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, parent_content, &.{"Do"}, self.cancellation);
+        defer references.deinit(self.alloc);
+        if (references.names.count() == 0) return try self.alloc.alloc(PageForm, 0);
+        var resolved_xobjects = try self.selectedResourceTable(xobject_obj, &references);
         defer resolved_xobjects.deinit(self.alloc);
         if (resolved_xobjects != .dict) return try self.alloc.alloc(PageForm, 0);
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, parent_content, &.{"Do"});
-        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageForm).empty;
         defer out.deinit(self.alloc);
@@ -8117,20 +9979,27 @@ pub const Reader = struct {
         for (resolved_xobjects.dict) |entry| {
             try self.checkCancellation();
             if (!references.contains(entry.key)) continue;
-            var xobj = try self.resolveValue(&entry.value);
+            var xobj = try self.textXObject(&entry.value);
             defer xobj.deinit(self.alloc);
-            if (xobj != .stream) continue;
+            if (xobj != .stream and xobj != .stream_header) continue;
             const subtype = xobj.get("Subtype") orelse continue;
-            if (!std.mem.eql(u8, subtype.asName() orelse continue, "Form")) continue;
+            if (std.mem.eql(u8, subtype.asName() orelse continue, "Image")) {
+                const name = try self.alloc.dupe(u8, entry.key);
+                errdefer self.alloc.free(name);
+                const content = try self.alloc.dupe(u8, "");
+                errdefer self.alloc.free(content);
+                try out.append(self.alloc, .{ .name = name, .content = content, .text_image = true, .structure_object = xobj.get("StructParent") != null });
+                continue;
+            }
+            if (xobj != .stream or !std.mem.eql(u8, subtype.asName() orelse continue, "Form")) continue;
 
             var content: ?[]u8 = try self.readDecodedStreamData(&xobj);
             errdefer if (content) |owned| self.alloc.free(owned);
             var resolved_form_resources: ?syntax.Object = null;
-            defer if (resolved_form_resources) |*obj| obj.deinit(self.alloc);
             if (xobj.get("Resources")) |form_resources_obj| {
-                resolved_form_resources = try self.resolveValue(form_resources_obj);
+                resolved_form_resources = try cache.resources(self, form_resources_obj);
             } else if (fallback_resources) |fallback| {
-                resolved_form_resources = try fallback.clone(self.alloc);
+                resolved_form_resources = fallback.*;
             }
 
             var fonts: ?[]PageFont = if (resolved_form_resources) |*form_resources|
@@ -8142,11 +10011,27 @@ pub const Reader = struct {
                 if (owned.len > 0) self.alloc.free(owned);
             };
             var forms: ?[]PageForm = if (resolved_form_resources) |*form_resources|
-                try self.collectTextFormsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1, content.?)
+                try self.collectTextFormsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1, content.?, cache)
             else
                 try self.alloc.alloc(PageForm, 0);
             errdefer if (forms) |owned| {
                 for (owned) |*form| form.deinit(self.alloc);
+                if (owned.len > 0) self.alloc.free(owned);
+            };
+            var gstates: ?[]PageExtGState = if (resolved_form_resources) |*form_resources|
+                try self.collectTextExtGStatesFromResourcesAlloc(form_resources, content.?)
+            else
+                try self.alloc.alloc(PageExtGState, 0);
+            errdefer if (gstates) |owned| {
+                for (owned) |*gstate| gstate.deinit(self.alloc);
+                if (owned.len > 0) self.alloc.free(owned);
+            };
+            var text_properties: ?[]PageTextProperty = if (resolved_form_resources) |*form_resources|
+                try self.collectTextPropertiesFromResourcesAlloc(form_resources, content.?, cache)
+            else
+                try self.alloc.alloc(PageTextProperty, 0);
+            errdefer if (text_properties) |owned| {
+                for (owned) |*property| property.deinit(self.alloc);
                 if (owned.len > 0) self.alloc.free(owned);
             };
             var color_spaces: ?[]PageColorSpace = if (resolved_form_resources) |*form_resources|
@@ -8157,10 +10042,28 @@ pub const Reader = struct {
                 for (owned) |*color_space| color_space.deinit(self.alloc);
                 if (owned.len > 0) self.alloc.free(owned);
             };
+            const bbox = if (xobj.get("BBox")) |bbox_obj| try parsePageBox(bbox_obj) else null;
+            var transparency_group = false;
+            var group_isolated = false;
+            var group_knockout = false;
+            if (xobj.get("Group")) |group_obj| {
+                var group = try self.resolveValue(group_obj);
+                defer group.deinit(self.alloc);
+                if (group == .dict) {
+                    if (dictGetObject(group.dict, "S")) |subtype_obj|
+                        transparency_group = std.mem.eql(u8, subtype_obj.asName() orelse "", "Transparency");
+                    if (dictGetObject(group.dict, "I")) |isolated_obj|
+                        group_isolated = isolated_obj.* == .boolean and isolated_obj.boolean;
+                    if (dictGetObject(group.dict, "K")) |knockout_obj|
+                        group_knockout = knockout_obj.* == .boolean and knockout_obj.boolean;
+                }
+            }
             var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
             errdefer if (name) |owned| self.alloc.free(owned);
 
             try out.append(self.alloc, .{
+                .structure_parent = try self.structureParent(&xobj),
+                .structure_object = xobj.get("StructParent") != null,
                 .name = name.?,
                 .content = content.?,
                 .matrix = blk: {
@@ -8175,14 +10078,22 @@ pub const Reader = struct {
                         .f = numericObjectValue(&matrix_obj.array[5]) orelse 0,
                     };
                 },
+                .bbox = bbox,
+                .transparency_group = transparency_group,
+                .group_isolated = group_isolated,
+                .group_knockout = group_knockout,
                 .fonts = fonts.?,
                 .color_spaces = color_spaces.?,
+                .gstates = gstates.?,
+                .text_properties = text_properties.?,
                 .forms = forms.?,
             });
             name = null;
             content = null;
             fonts = null;
             color_spaces = null;
+            gstates = null;
+            text_properties = null;
             forms = null;
         }
         return try out.toOwnedSlice(self.alloc);
@@ -8201,9 +10112,9 @@ pub const Reader = struct {
         if (resolved != .array or resolved.array.len < 2) return error.UnsupportedPdfRendering;
         const family = resolved.array[0].asName() orelse return error.UnsupportedPdfRendering;
         if (!std.mem.eql(u8, family, "ICCBased")) return error.UnsupportedPdfRendering;
-        var profile = try self.resolveValue(&resolved.array[1]);
+        var profile = try self.colorProfileMetadata(&resolved.array[1]);
         defer profile.deinit(self.alloc);
-        if (profile != .stream) return error.UnsupportedPdfRendering;
+        if (profile != .stream and profile != .stream_header) return error.UnsupportedPdfRendering;
         if (profile.get("Alternate")) |alternate| return try self.shadingColorSpaceKind(alternate);
         const components = (try self.resolvedIntegerObjectValue(profile.get("N") orelse return error.UnsupportedPdfRendering)) orelse
             return error.UnsupportedPdfRendering;
@@ -8487,9 +10398,9 @@ pub const Reader = struct {
         const family = color_space.array[0].asName() orelse return false;
         if (!std.mem.eql(u8, family, "ICCBased")) return false;
 
-        var profile = try self.resolveValue(&color_space.array[1]);
+        var profile = try self.colorProfileMetadata(&color_space.array[1]);
         defer profile.deinit(self.alloc);
-        if (profile != .stream) return false;
+        if (profile != .stream and profile != .stream_header) return false;
         const component_count = (try self.resolvedIntegerObjectValue(profile.get("N") orelse return false)) orelse return false;
         if (component_count != 4) return false;
 
@@ -9675,9 +11586,9 @@ pub const Reader = struct {
         }
         if (std.mem.eql(u8, family, "ICCBased")) {
             if (color_space.array.len < 2) return error.UnsupportedPdfRendering;
-            var profile = try self.resolveValue(&color_space.array[1]);
+            var profile = try self.colorProfileMetadata(&color_space.array[1]);
             defer profile.deinit(self.alloc);
-            if (profile != .stream) return error.UnsupportedPdfRendering;
+            if (profile != .stream and profile != .stream_header) return error.UnsupportedPdfRendering;
             const count = (profile.get("N") orelse return error.UnsupportedPdfRendering).asInteger() orelse
                 return error.UnsupportedPdfRendering;
             if (count <= 0) return error.UnsupportedPdfRendering;
@@ -9740,9 +11651,9 @@ pub const Reader = struct {
         const color_space_name = color_space[0].asName() orelse return false;
         if (!std.mem.eql(u8, color_space_name, "ICCBased")) return false;
 
-        var profile = try self.resolveValue(&color_space[1]);
+        var profile = try self.colorProfileMetadata(&color_space[1]);
         defer profile.deinit(self.alloc);
-        if (profile != .stream) return error.UnsupportedPdfRendering;
+        if (profile != .stream and profile != .stream_header) return error.UnsupportedPdfRendering;
 
         const components_obj = profile.get("N") orelse return error.UnsupportedPdfRendering;
         const components_i = (try self.resolvedIntegerObjectValue(components_obj)) orelse
@@ -9810,9 +11721,9 @@ pub const Reader = struct {
         if (std.mem.eql(u8, name, "CalGray")) return true;
         if (!std.mem.eql(u8, name, "ICCBased") or color_space.array.len < 2) return false;
 
-        var profile = try self.resolveValue(&color_space.array[1]);
+        var profile = try self.colorProfileMetadata(&color_space.array[1]);
         defer profile.deinit(self.alloc);
-        if (profile != .stream) return false;
+        if (profile != .stream and profile != .stream_header) return false;
         if (profile.get("N")) |components| {
             if ((components.asInteger() orelse 0) == 1) return true;
         }
@@ -11001,9 +12912,9 @@ pub const Reader = struct {
         }
         if (std.mem.eql(u8, family, "ICCBased")) {
             if (color_space.array.len < 2) return error.UnsupportedPdfRendering;
-            var profile = try self.resolveValue(&color_space.array[1]);
+            var profile = try self.colorProfileMetadata(&color_space.array[1]);
             defer profile.deinit(self.alloc);
-            if (profile != .stream) return error.UnsupportedPdfRendering;
+            if (profile != .stream and profile != .stream_header) return error.UnsupportedPdfRendering;
             if (profile.get("Range")) |range_obj| {
                 var resolved_range = try self.resolveValue(range_obj);
                 defer resolved_range.deinit(self.alloc);
@@ -11106,6 +13017,20 @@ pub const Reader = struct {
         }
     }
 
+    // Preserve an inherited resource reference so optional property metadata
+    // can be resolved independently, only when a selected marked scope needs it.
+    fn findInheritedTextResources(self: *const Reader, page: *const syntax.Object, cache: *TextResourceCache, container: ?syntax.ObjRef, depth: usize) !?syntax.Object {
+        try self.checkCancellation();
+        if (depth > 128) return error.InvalidPageTree;
+        if (page.get("Resources")) |value| return if (container) |reference| try cache.inheritedResources(self, value, reference) else try cache.resources(self, value);
+        if (page.get("Parent")) |parent| {
+            var resolved_parent = if (parent.* == .obj_ref) try self.readIndirectObjectProjected(parent.obj_ref, .resource_container) else try self.resolveValue(parent);
+            defer resolved_parent.deinit(self.alloc);
+            if (resolved_parent == .dict) return self.findInheritedTextResources(&resolved_parent, cache, if (parent.* == .obj_ref) parent.obj_ref else null, depth + 1);
+        }
+        return null;
+    }
+
     fn findInheritedPageValue(self: *const Reader, page: *const syntax.Object, key: []const u8) !?syntax.Object {
         if (page.get(key)) |value| {
             return try self.resolveValue(value);
@@ -11117,6 +13042,60 @@ pub const Reader = struct {
             return try self.findInheritedPageValue(&resolved_parent, key);
         }
         return null;
+    }
+
+    fn fontStyleAlloc(self: *const Reader, font_obj: *const syntax.Object, depth: u8) !FontStyle {
+        if (depth >= 4 or font_obj.* != .dict) return .{};
+        var style = FontStyle{};
+        if (font_obj.get("BaseFont")) |base_font_obj| {
+            var base_font = try self.resolveValue(base_font_obj);
+            defer base_font.deinit(self.alloc);
+            if (base_font.asName()) |font_name| mergeFontNameStyle(&style, font_name);
+        }
+        if (font_obj.get("DescendantFonts")) |descendants_obj| {
+            var descendants = try self.resolveValue(descendants_obj);
+            defer descendants.deinit(self.alloc);
+            if (descendants == .array and descendants.array.len > 0) {
+                var descendant = try self.resolveValue(&descendants.array[0]);
+                defer descendant.deinit(self.alloc);
+                const descendant_style = try self.fontStyleAlloc(&descendant, depth + 1);
+                if (descendant_style.bold != null) style.bold = descendant_style.bold;
+                if (descendant_style.italic != null) style.italic = descendant_style.italic;
+            }
+        }
+        if (font_obj.get("FontDescriptor")) |descriptor_obj| {
+            var descriptor = try self.resolveValue(descriptor_obj);
+            defer descriptor.deinit(self.alloc);
+            if (descriptor == .dict) {
+                if (descriptor.get("FontName")) |font_name_obj| {
+                    var font_name = try self.resolveValue(font_name_obj);
+                    defer font_name.deinit(self.alloc);
+                    if (font_name.asName()) |value| {
+                        var descriptor_style = FontStyle{};
+                        mergeFontNameStyle(&descriptor_style, value);
+                        if (descriptor_style.bold != null) style.bold = descriptor_style.bold;
+                        if (descriptor_style.italic != null) style.italic = descriptor_style.italic;
+                    }
+                }
+                if (descriptor.get("FontWeight")) |weight_obj| {
+                    var weight = try self.resolveValue(weight_obj);
+                    defer weight.deinit(self.alloc);
+                    if (numericObjectValue(&weight)) |value| {
+                        if (value >= 600) style.bold = true else if (value <= 500) style.bold = false;
+                    }
+                }
+                if (descriptor.get("ItalicAngle")) |angle_obj| {
+                    var angle = try self.resolveValue(angle_obj);
+                    defer angle.deinit(self.alloc);
+                    if (numericObjectValue(&angle)) |value| style.italic = value != 0;
+                } else if (descriptor.get("Flags")) |flags_obj| {
+                    var flags = try self.resolveValue(flags_obj);
+                    defer flags.deinit(self.alloc);
+                    if (flags.asInteger()) |value| style.italic = (value & 64) != 0;
+                }
+            }
+        }
+        return style;
     }
 
     fn buildPageFont(self: *const Reader, name: []const u8, font_obj: *const syntax.Object) !PageFont {
@@ -11134,6 +13113,12 @@ pub const Reader = struct {
             .cff_otf = null,
             .cff = null,
         };
+        const style = self.fontStyleAlloc(font_obj, 0) catch |err| switch (err) {
+            error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
+            else => FontStyle{},
+        };
+        font.bold = style.bold;
+        font.italic = style.italic;
         owned_name = null;
         decoder = null;
         errdefer font.deinit(self.alloc);
@@ -13275,7 +15260,10 @@ fn decodeStreamFiltersOwnedBudgetAlloc(
     final_output_limit: ?usize,
     cancellation: CancellationProbe,
 ) ![]u8 {
-    try cancellation.check();
+    cancellation.check() catch |err| {
+        alloc.free(raw);
+        return err;
+    };
     const terminal_limit = if (final_output_limit) |limit|
         @min(limit, max_decoded_stream_bytes)
     else
@@ -14867,6 +16855,12 @@ const TextContentParser = struct {
     out: *std.ArrayList(u8),
     operands: std.ArrayList(syntax.Object) = .empty,
     state: TextExtractionState = .{},
+    marked_content: std.ArrayList(ActualTextScope) = .empty,
+    active_actual_text: bool = false,
+    /// An enclosing Form invocation is already covered by a replacement.
+    suppress_actual_text: bool = false,
+    cancellation: CancellationProbe = .{},
+    structure: ?*structure_text.Lookup = null,
 
     fn init(alloc: Allocator, out: *std.ArrayList(u8)) TextContentParser {
         return .{ .alloc = alloc, .out = out };
@@ -14875,6 +16869,8 @@ const TextContentParser = struct {
     pub fn deinit(self: *TextContentParser) void {
         clearContentOperands(self.alloc, &self.operands);
         self.operands.deinit(self.alloc);
+        for (self.marked_content.items) |*scope| scope.deinit(self.alloc);
+        self.marked_content.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -14883,14 +16879,18 @@ const TextContentParser = struct {
         bytes: []const u8,
         fonts: []const PageFont,
         forms: []const PageForm,
+        properties: []const PageTextProperty,
         form_depth: usize,
     ) anyerror!void {
         if (form_depth > 128) return error.InvalidContents;
         var scanner = syntax.Scanner.init(self.alloc, bytes);
         defer scanner.deinit();
 
+        var lexeme_count: usize = 0;
         while (true) {
-            var lex = (try readContentLexeme(&scanner)) orelse {
+            if (lexeme_count % 256 == 0) try self.cancellation.check();
+            lexeme_count +|= 1;
+            var lex = (try readContentLexemeCancelable(&scanner, self.cancellation)) orelse {
                 clearContentOperands(self.alloc, &self.operands);
                 continue;
             };
@@ -14904,6 +16904,12 @@ const TextContentParser = struct {
                     &self.state,
                     fonts,
                     forms,
+                    properties,
+                    self.structure,
+                    &self.marked_content,
+                    &self.active_actual_text,
+                    self.suppress_actual_text,
+                    self.cancellation,
                     form_depth,
                     lex.keyword,
                     self.operands.items,
@@ -14928,17 +16934,63 @@ fn extractTextFromContentAlloc(
     bytes: []const u8,
     fonts: []const PageFont,
     forms: []const PageForm,
+    properties: []const PageTextProperty,
     form_depth: usize,
+) anyerror![]u8 {
+    return extractTextFromContentCancelableAlloc(alloc, bytes, fonts, forms, properties, form_depth, .{}, false, null);
+}
+
+fn extractTextFromContentCancelableAlloc(
+    alloc: Allocator,
+    bytes: []const u8,
+    fonts: []const PageFont,
+    forms: []const PageForm,
+    properties: []const PageTextProperty,
+    form_depth: usize,
+    cancellation: CancellationProbe,
+    suppress_actual_text: bool,
+    structure: ?*structure_text.Lookup,
 ) anyerror![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
     var parser = TextContentParser.init(alloc, &out);
     defer parser.deinit();
-    try parser.consume(bytes, fonts, forms, form_depth);
+    parser.cancellation = cancellation;
+    parser.suppress_actual_text = suppress_actual_text;
+    parser.structure = structure;
+    try parser.consume(bytes, fonts, forms, properties, form_depth);
     return try out.toOwnedSlice(alloc);
 }
 
 fn readContentLexeme(scanner: *syntax.Scanner) anyerror!?syntax.Lexeme {
+    return readContentLexemeCancelable(scanner, .{});
+}
+
+fn readContentLexemeCancelable(scanner: *syntax.Scanner, cancellation: CancellationProbe) anyerror!?syntax.Lexeme {
+    var token = (try readContentLexemeRaw(scanner)) orelse return null;
+    errdefer syntax.Scanner.freeLexeme(scanner.alloc, &token);
+    if (token == .keyword and std.mem.eql(u8, token.keyword, "BI"))
+        try inline_image.skip(scanner, cancellation, 64 * 1024 * 1024);
+    return token;
+}
+
+// Inline pixels are framed for extraction, but are not represented in the
+// native raster IR. Reject the paint rather than silently producing a blank
+// raster; callers can use their existing compatibility backend or report it.
+fn readRenderContentLexeme(scanner: *syntax.Scanner, cancellation: CancellationProbe) anyerror!?syntax.Lexeme {
+    var token = (readContentLexemeCancelable(scanner, cancellation) catch |err| switch (err) {
+        error.UnsupportedPdfInlineImage, error.InvalidPdfInlineImage => return error.UnsupportedPdfRendering,
+        else => return err,
+    }) orelse return null;
+    if (token == .keyword and std.mem.eql(u8, token.keyword, "BI")) {
+        syntax.Scanner.freeLexeme(scanner.alloc, &token);
+        return error.UnsupportedPdfRendering;
+    }
+    return token;
+}
+
+// Coverage/safety probes that stop immediately at BI need no payload scan.
+fn readContentLexemeRaw(scanner: *syntax.Scanner) anyerror!?syntax.Lexeme {
     return scanner.readLexeme() catch |err| {
         if (isRecoverableContentSyntaxError(err)) return null;
         return err;
@@ -15050,10 +17102,44 @@ fn applyTextOperator(
     state: *TextExtractionState,
     fonts: []const PageFont,
     forms: []const PageForm,
+    properties: []const PageTextProperty,
+    structure: ?*structure_text.Lookup,
+    marked_content: *std.ArrayList(ActualTextScope),
+    active_actual_text: *bool,
+    suppress_actual_text: bool,
+    cancellation: CancellationProbe,
     form_depth: usize,
     op: []const u8,
     operands: []const syntax.Object,
 ) !void {
+    if (std.mem.eql(u8, op, "BMC") or std.mem.eql(u8, op, "BDC")) {
+        var replacement = if (!suppress_actual_text and !active_actual_text.* and std.mem.eql(u8, op, "BDC"))
+            try actualTextFromBdcAlloc(alloc, operands, properties, structure, null)
+        else
+            null;
+        errdefer if (replacement) |text| alloc.free(text);
+        const effective = replacement != null;
+        try marked_content.append(alloc, .{
+            .replacement = replacement,
+            .output_start = out.items.len,
+            .effective = effective,
+        });
+        replacement = null;
+        if (effective) active_actual_text.* = true;
+        return;
+    }
+    if (std.mem.eql(u8, op, "EMC")) {
+        if (marked_content.pop()) |popped| {
+            var scope = popped;
+            defer scope.deinit(alloc);
+            if (scope.effective) {
+                active_actual_text.* = false;
+                out.shrinkRetainingCapacity(scope.output_start);
+                try out.appendSlice(alloc, scope.replacement.?);
+            }
+        }
+        return;
+    }
     if (std.mem.eql(u8, op, "Tf")) {
         if (operands.len >= 2 and operands[operands.len - 2] == .name) {
             const font_name = operands[operands.len - 2].name;
@@ -15097,7 +17183,8 @@ fn applyTextOperator(
     if (std.mem.eql(u8, op, "Do")) {
         if (operands.len == 0 or operands[operands.len - 1] != .name) return;
         const form = findPageForm(forms, operands[operands.len - 1].name) orelse return;
-        const nested = try extractTextFromContentAlloc(alloc, form.content, form.fonts, form.forms, form_depth + 1);
+        if (form.text_image) return;
+        const nested = try extractTextFromContentCancelableAlloc(alloc, form.content, form.fonts, form.forms, form.text_properties, form_depth + 1, cancellation, suppress_actual_text or active_actual_text.*, structure);
         defer alloc.free(nested);
         if (nested.len == 0) return;
         try appendNewline(alloc, out);
@@ -15112,6 +17199,7 @@ fn applyTextRunOperator(
     state: *TextRunState,
     retained_pattern_names: *ContentNameInterner,
     stack: *std.ArrayList(TextRunStackEntry),
+    text_clip_path: *TextClipPath,
     current_path: *std.ArrayList([2]f64),
     current_path_closed: *bool,
     current_clip_points: *std.ArrayList([2]f64),
@@ -15119,6 +17207,8 @@ fn applyTextRunOperator(
     fonts: []const PageFont,
     gstates: []const PageExtGState,
     forms: []const PageForm,
+    _: []const PageTextProperty,
+    semantic: *SemanticTextContext,
     paint_order: *usize,
     next_group_id: *u32,
     cancellation: CancellationProbe,
@@ -15136,6 +17226,7 @@ fn applyTextRunOperator(
         const clip_points = if (out.isTextOnly()) null else try alloc.dupe([2]f64, current_clip_points.items);
         errdefer if (clip_points) |points| alloc.free(points);
         try stack.append(alloc, .{
+            .ancestor_groups_visible = state.ancestor_groups_visible,
             .matrix = state.matrix,
             .current_font_index = state.current_font_index,
             .font_size = state.font_size,
@@ -15176,6 +17267,7 @@ fn applyTextRunOperator(
         if (stack.items.len > 0) {
             var entry = stack.pop().?;
             defer entry.deinit(alloc);
+            state.ancestor_groups_visible = entry.ancestor_groups_visible;
             state.matrix = entry.matrix;
             state.current_font_index = entry.current_font_index;
             state.font_size = entry.font_size;
@@ -15217,12 +17309,11 @@ fn applyTextRunOperator(
         current_path_closed.* = false;
         return;
     }
-    if (std.mem.eql(u8, op, "gs") and out.isTextOnly()) return;
     if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
         if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
-            state.alpha = gstate.fill_alpha;
-            state.stroke_alpha = gstate.stroke_alpha;
-            state.blend_mode = gstate.blend_mode;
+            if (gstate.fill_alpha_specified) state.alpha = gstate.fill_alpha;
+            if (gstate.stroke_alpha_specified) state.stroke_alpha = gstate.stroke_alpha;
+            if (gstate.blend_mode_specified) state.blend_mode = gstate.blend_mode;
         }
         return;
     }
@@ -15240,7 +17331,10 @@ fn applyTextRunOperator(
         }
         return;
     }
-    if (out.isTextOnly() and isLayoutIgnoredTextOperator(op)) return;
+    if (out.isTextOnly() and isLayoutIgnoredTextOperator(op)) {
+        text_clip_path.consume(state, op, operands);
+        return;
+    }
     if (std.mem.eql(u8, op, "m") and operands.len >= 2) {
         current_path.clearRetainingCapacity();
         current_path_closed.* = false;
@@ -15349,6 +17443,7 @@ fn applyTextRunOperator(
         return;
     }
     if (std.mem.eql(u8, op, "BT")) {
+        state.text_object_id = paint_order.*;
         state.x = 0;
         state.y = 0;
         state.line_x = 0;
@@ -15594,7 +17689,17 @@ fn applyTextRunOperator(
     if (std.mem.eql(u8, op, "Do")) {
         if (operands.len == 0 or operands[operands.len - 1] != .name) return;
         const name = operands[operands.len - 1].name;
-        const form = findPageForm(forms, name) orelse return;
+        const form = findPageForm(forms, name) orelse {
+            if (semantic.paint()) |evidence| evidence.add(null, state.clip_box, state.alpha != 0 and textGroupsVisible(state.*), semantic.page_box);
+            return;
+        };
+        if (form.structure_object and semantic.paint() == null) if (semantic.structure) |lookup| {
+            lookup.incomplete = true;
+        };
+        if (form.text_image) {
+            if (semantic.paint()) |evidence| evidence.add(transformPageBox(.{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }, state.matrix), state.clip_box, state.alpha != 0 and textGroupsVisible(state.*), semantic.page_box);
+            return;
+        }
         const start_len = out.len();
         var nested_state = buildFormTextState(state.*, form);
         if (form.transparency_group)
@@ -15606,7 +17711,15 @@ fn applyTextRunOperator(
         nested_parser.paint_order = paint_order.*;
         nested_parser.next_group_id = next_group_id.*;
         nested_parser.vectorize_form_text = vectorize_form_text;
-        try nested_parser.consume(form.content, form.fonts, form.gstates, form.forms);
+        nested_parser.semantic.shared_spans = semantic.spans();
+        nested_parser.semantic.structure = semantic.structure;
+        nested_parser.semantic.structure_parent = form.structure_parent;
+        nested_parser.semantic.structure_spans = semantic.structure_spans;
+        nested_parser.semantic.suppress = semantic.suppress or semantic.active != null;
+        nested_parser.semantic.inherited = semantic.paint();
+        nested_parser.semantic.page_box = semantic.page_box;
+        try nested_parser.consume(form.content, form.fonts, form.gstates, form.forms, form.text_properties);
+        nested_parser.semantic.finish();
         paint_order.* = nested_parser.paint_order;
         next_group_id.* = nested_parser.next_group_id;
         switch (out) {
@@ -15757,9 +17870,9 @@ fn applyImageOperator(
     }
     if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
         if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
-            state.fill_alpha = gstate.fill_alpha;
-            state.stroke_alpha = gstate.stroke_alpha;
-            state.blend_mode = gstate.blend_mode;
+            if (gstate.fill_alpha_specified) state.fill_alpha = gstate.fill_alpha;
+            if (gstate.stroke_alpha_specified) state.stroke_alpha = gstate.stroke_alpha;
+            if (gstate.blend_mode_specified) state.blend_mode = gstate.blend_mode;
             if (gstate.soft_mask_specified) {
                 state.soft_mask = if (gstate.soft_mask) |mask| blk: {
                     var placed = mask;
@@ -16057,9 +18170,9 @@ fn applyShapeOperator(
     }
     if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
         if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
-            state.fill_alpha = gstate.fill_alpha;
-            state.stroke_alpha = gstate.stroke_alpha;
-            state.blend_mode = gstate.blend_mode;
+            if (gstate.fill_alpha_specified) state.fill_alpha = gstate.fill_alpha;
+            if (gstate.stroke_alpha_specified) state.stroke_alpha = gstate.stroke_alpha;
+            if (gstate.blend_mode_specified) state.blend_mode = gstate.blend_mode;
         }
         return;
     }
@@ -16462,9 +18575,9 @@ fn applyShadingOperator(
     }
     if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
         if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
-            state.fill_alpha = gstate.fill_alpha;
-            state.stroke_alpha = gstate.stroke_alpha;
-            state.blend_mode = gstate.blend_mode;
+            if (gstate.fill_alpha_specified) state.fill_alpha = gstate.fill_alpha;
+            if (gstate.stroke_alpha_specified) state.stroke_alpha = gstate.stroke_alpha;
+            if (gstate.blend_mode_specified) state.blend_mode = gstate.blend_mode;
         }
         return;
     }
@@ -16674,9 +18787,9 @@ fn applyPatternOperator(
     }
     if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
         if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
-            state.fill_alpha = gstate.fill_alpha;
-            state.stroke_alpha = gstate.stroke_alpha;
-            state.blend_mode = gstate.blend_mode;
+            if (gstate.fill_alpha_specified) state.fill_alpha = gstate.fill_alpha;
+            if (gstate.stroke_alpha_specified) state.stroke_alpha = gstate.stroke_alpha;
+            if (gstate.blend_mode_specified) state.blend_mode = gstate.blend_mode;
         }
         return;
     }
@@ -17068,7 +19181,7 @@ fn appendDecodedString(
     const decoded = if (state.current_font_index) |font_idx|
         try fonts[font_idx].decoder.decodeAlloc(alloc, raw)
     else
-        try text_encoding.pdfDocDecodeAlloc(alloc, raw);
+        try text_encoding.decodeNamedAlloc(alloc, .pdf_doc, raw);
     defer alloc.free(decoded);
     try out.appendSlice(alloc, decoded);
 }
@@ -17100,7 +19213,7 @@ fn appendTextRunDecodedString(
     const decoded = if (state.current_font_index) |font_idx|
         try fonts[font_idx].decoder.decodeAlloc(alloc, raw)
     else
-        try text_encoding.pdfDocDecodeAlloc(alloc, raw);
+        try text_encoding.decodeNamedAlloc(alloc, .pdf_doc, raw);
     defer alloc.free(decoded);
     if (decoded.len == 0) return;
 
@@ -17124,7 +19237,11 @@ fn appendTextRunDecodedString(
         .layout, .analysis => state.render_mode,
         .render => try effectiveTextRenderMode(state.*),
     };
-    if (render_mode != 3) switch (out) {
+    // Invisible text is commonly the searchable OCR layer of a scanned PDF.
+    // Extraction needs its positions to reconstruct spaces and line breaks;
+    // only paint runs omit it. Otherwise the preservation check falls back to
+    // concatenated canonical bytes for the entire page (including visible text).
+    if (render_mode != 3 or out.isTextOnly()) switch (out) {
         .layout => |layout_out| {
             const text = try alloc.dupe(u8, decoded);
             errdefer alloc.free(text);
@@ -17142,6 +19259,14 @@ fn appendTextRunDecodedString(
                 .ascent = metrics.ascent,
                 .descent = metrics.descent,
                 .paint_order = paint_order,
+                .text_object_id = state.text_object_id,
+                .render_mode = render_mode,
+                .alpha = state.alpha,
+                .stroke_alpha = state.stroke_alpha,
+                .group_alpha = state.group_alpha,
+                .ancestor_groups_visible = state.ancestor_groups_visible,
+                .vertical = vertical,
+                .clip_box = state.clip_box,
             });
         },
         .analysis, .render => {
@@ -17173,6 +19298,8 @@ fn appendTextRunDecodedString(
                 .x = position[0],
                 .y = position[1],
                 .font_size = state.font_size,
+                .bold = if (state.current_font_index) |idx| fonts[idx].bold else null,
+                .italic = if (state.current_font_index) |idx| fonts[idx].italic else null,
                 .a = basis_x[0],
                 .b = basis_x[1],
                 .c = basis_y[0],
@@ -17192,6 +19319,8 @@ fn appendTextRunDecodedString(
                 .ascent = metrics.ascent,
                 .descent = metrics.descent,
                 .paint_order = paint_order,
+                .text_object_id = state.text_object_id,
+                .ancestor_groups_visible = state.ancestor_groups_visible,
                 .blend_mode = state.blend_mode,
                 .group_id = state.group_id,
                 .group_parent_id = state.group_parent_id,
@@ -17549,6 +19678,12 @@ fn textRunIsVertical(run: anytype) bool {
     else
         false;
 }
+fn textRunPolicyExcluded(run: anytype) bool {
+    return if (comptime @hasField(@TypeOf(run), "policy_excluded"))
+        run.policy_excluded
+    else
+        false;
+}
 
 fn textRunHasSupportedOrderingGeometry(run: anytype) bool {
     if (textRunIsVertical(run)) return false;
@@ -17584,6 +19719,205 @@ fn textRunAxesCompatible(left: anytype, right: anytype) bool {
     const axis_alignment = (left.a * right.a + left.b * right.b) / (left_axis * right_axis);
     const vertical_alignment = (left.c * right.c + left.d * right.d) / (left_vertical * right_vertical);
     return axis_alignment >= 0.995 and vertical_alignment >= 0.995;
+}
+fn pageBoxesOverlap(left: PageBox, right: PageBox) bool {
+    // Intersecting disjoint clips produces an empty (possibly inverted) box.
+    // A large text bound spanning both endpoints must not make it nonempty.
+    if (left.min_x >= left.max_x or left.min_y >= left.max_y or
+        right.min_x >= right.max_x or right.min_y >= right.max_y) return false;
+    return left.max_x > right.min_x and left.min_x < right.max_x and
+        left.max_y > right.min_y and left.min_y < right.max_y;
+}
+
+fn textRunOutsidePageOrClip(run: anytype, page_box: PageBox) bool {
+    // A known empty page/clip intersection excludes every glyph, even
+    // when its own extent is unknown (for example vertical writing).
+    if (run.clip_box) |clip| if (!pageBoxesOverlap(clip, page_box)) return true;
+    const bounds = run.bounds() orelse return false;
+    if (!pageBoxesOverlap(bounds, page_box)) return true;
+    if (run.clip_box) |clip_box| if (!pageBoxesOverlap(bounds, clip_box)) return true;
+    return false;
+}
+
+fn textGroupsVisible(value: anytype) bool {
+    const ancestors = if (comptime @hasField(@TypeOf(value), "ancestor_groups_visible")) value.ancestor_groups_visible else true;
+    return ancestors and value.group_alpha != 0;
+}
+
+fn textRunInvisible(run: anytype) bool {
+    const mode = @mod(run.render_mode, 8);
+    if (mode == 3 or mode == 7 or !textGroupsVisible(run)) return true;
+    const fill_visible = run.alpha != 0;
+    const stroke_visible = run.stroke_alpha != 0;
+    return switch (mode) {
+        0, 4 => !fill_visible,
+        1, 5 => !stroke_visible,
+        2, 6 => !fill_visible and !stroke_visible,
+        else => true,
+    };
+}
+
+fn applyTextExtractionPolicy(
+    runs: anytype,
+    page_box: PageBox,
+    policy: TextExtractionPolicy,
+    diagnostics: *NativeTextDiagnostics,
+) void {
+    diagnostics.source_run_count = runs.len;
+    for (runs) |*run| {
+        const outside = textRunOutsidePageOrClip(run.*, page_box);
+        const invisible = textRunInvisible(run.*);
+        const unsupported = !textRunHasSupportedOrderingGeometry(run.*);
+        if (outside) diagnostics.outside_page_runs +|= 1;
+        if (invisible) diagnostics.invisible_runs +|= 1;
+        if (unsupported) diagnostics.unsupported_ordering_runs +|= 1;
+        run.policy_excluded = switch (policy) {
+            .source => false,
+            .page => outside,
+            .visible => outside or invisible,
+        };
+    }
+}
+
+fn compactTextRun(run: anytype, source_index: usize) LayoutTextRun {
+    var item = LayoutTextRun{ .text = run.text, .x = run.x, .y = run.y, .font_size = run.font_size, .horizontal_scale = run.horizontal_scale };
+    inline for (@typeInfo(LayoutTextRun).@"struct".field_names) |name| {
+        if (comptime @hasField(@TypeOf(run), name)) @field(item, name) = @field(run, name);
+    }
+    item.source_index = source_index;
+    return item;
+}
+
+fn semanticTextItemsAlloc(alloc: Allocator, runs: anytype, spans: []SemanticTextSpan, policy: TextExtractionPolicy, cancellation: CancellationProbe) ![]LayoutTextRun {
+    const State = struct { same_line: bool = true, style_initialized: bool = false };
+    const states = try alloc.alloc(State, spans.len);
+    defer alloc.free(states);
+    for (spans, states, 0..) |*span, *state, index| {
+        if (index % 256 == 0) try cancellation.check();
+        state.* = .{};
+        span.entry_run = null;
+        span.exit_run = null;
+        span.font_size = null;
+        span.bold = null;
+        span.italic = null;
+        span.policy_excluded = switch (policy) {
+            .source => false,
+            .page => span.paint.has_paint and !span.paint.page_eligible,
+            .visible => !span.paint.visible_eligible,
+        };
+        span.output_bounds = switch (policy) {
+            .source => if (span.paint.source_unknown) null else span.paint.source_bounds,
+            .page => if (span.paint.page_unknown) null else span.paint.page_bounds,
+            .visible => if (span.paint.visible_unknown) null else span.paint.visible_bounds,
+        };
+    }
+    // Membership, not the enclosing source interval, selects glyphs. A shared
+    // structure replacement can have unrelated content between its MCIDs.
+    // One glyph pass keeps overlapping intervals linear rather than O(R*S).
+    for (runs, 0..) |run, index| {
+        if (index % 256 == 0) try cancellation.check();
+        if (run.semantic_span_index >= spans.len or run.policy_excluded) continue;
+        const span = &spans[run.semantic_span_index];
+        if (span.policy_excluded) continue;
+        const state = &states[run.semantic_span_index];
+        if (span.entry_run) |entry| {
+            state.same_line = state.same_line and textRunsShareLine(runs[entry], run) and textRunAxesCompatible(runs[entry], run) and textRunHasSupportedOrderingGeometry(run);
+        } else {
+            span.entry_run = index;
+            state.same_line = textRunHasSupportedOrderingGeometry(run);
+        }
+        span.exit_run = index;
+        if (comptime @hasField(@TypeOf(run), "bold")) {
+            const size = @abs(run.font_size) * textRunVerticalScale(run);
+            const font_size: ?f64 = if (std.math.isFinite(size) and size > 0) size else null;
+            if (!state.style_initialized) {
+                span.font_size = font_size;
+                span.bold = run.bold;
+                span.italic = run.italic;
+                state.style_initialized = true;
+            } else {
+                if (span.font_size != font_size) span.font_size = null;
+                if (span.bold != run.bold) span.bold = null;
+                if (span.italic != run.italic) span.italic = null;
+            }
+        }
+    }
+    var items = std.ArrayList(LayoutTextRun).empty;
+    errdefer items.deinit(alloc);
+    var run_index: usize = 0;
+    var span_index: usize = 0;
+    while (run_index < runs.len or span_index < spans.len) {
+        if ((run_index + span_index) % 256 == 0) try cancellation.check();
+        if (span_index < spans.len and spans[span_index].run_start == run_index) {
+            const span = &spans[span_index];
+            if (!span.policy_excluded) {
+                var item = if (span.entry_run) |entry| compactTextRun(runs[entry], entry) else LayoutTextRun{ .text = span.text, .x = 0, .y = 0, .font_size = 0, .horizontal_scale = 1 };
+                item.text = span.text;
+                item.semantic_span_index = span_index;
+                const same_line = states[span_index].same_line;
+                if (span.exit_run) |exit| {
+                    if (same_line) {
+                        const last = runs[exit];
+                        const axis = textRunAxisLength(item);
+                        const end_x = last.x + last.a * last.advance_width;
+                        const end_y = last.y + last.b * last.advance_width;
+                        item.advance_width = ((end_x - item.x) * (item.a / axis) +
+                            (end_y - item.y) * (item.b / axis)) / axis;
+                    }
+                }
+                item.ordering_fence = span.multiple_scopes or !same_line or span.entry_run == null or span.text.len == 0 or std.mem.indexOfScalar(u8, span.text, '\n') != null;
+                if (span.text.len != 0 or span.entry_run != null) try items.append(alloc, item);
+            }
+            span_index += 1;
+        } else {
+            std.debug.assert(run_index < runs.len);
+            if (!runs[run_index].policy_excluded and runs[run_index].semantic_span_index == no_semantic_span) try items.append(alloc, compactTextRun(runs[run_index], run_index));
+            run_index += 1;
+        }
+    }
+    return items.toOwnedSlice(alloc);
+}
+
+fn propagateSemanticTextSpans(runs: anytype, spans: []SemanticTextSpan, items: []const LayoutTextRun, cancellation: CancellationProbe) !void {
+    for (items, 0..) |item, index| {
+        if (index % 256 == 0) try cancellation.check();
+        if (item.semantic_span_index == no_semantic_span) {
+            runs[item.source_index].output_span = item.output_span;
+        } else spans[item.semantic_span_index].output_span = item.output_span;
+    }
+    for (runs, 0..) |*run, index| {
+        if (index % 256 == 0) try cancellation.check();
+        if (!run.policy_excluded and run.semantic_span_index < spans.len) run.output_span = spans[run.semantic_span_index].output_span;
+    }
+}
+
+fn textRunOrderingFence(run: anytype) bool {
+    return if (comptime @hasField(@TypeOf(run), "ordering_fence")) run.ordering_fence else false;
+}
+
+fn textRunExitGeometry(run: anytype, source_runs: anytype, spans: []const SemanticTextSpan) @TypeOf(run) {
+    if (comptime @hasField(@TypeOf(run), "source_index")) {
+        if (run.semantic_span_index != no_semantic_span and run.semantic_span_index < spans.len) {
+            if (spans[run.semantic_span_index].exit_run) |index| {
+                var exit = compactTextRun(source_runs[index], index);
+                exit.text = run.text;
+                return exit;
+            }
+        }
+    }
+    return run;
+}
+
+fn finalizeNativeTextDiagnostics(runs: []const TextRun, diagnostics: *NativeTextDiagnostics) void {
+    for (runs) |run| {
+        if (run.output_span != null) {
+            diagnostics.emitted_run_count +|= 1;
+        } else if (!run.policy_excluded and run.semantic_span_index == no_semantic_span and
+            std.mem.trim(u8, run.text, &std.ascii.whitespace).len > 0)
+        {
+            diagnostics.unaligned_runs +|= 1;
+        }
+    }
 }
 
 const TextLayoutMetrics = struct {
@@ -17907,9 +20241,8 @@ fn appendOriginalTextRunIndices(alloc: Allocator, out: *std.ArrayList(usize), in
     try out.appendSlice(alloc, indices);
 }
 
-fn textLayoutNeedsColumnReordering(
+fn textLayoutHasProseColumns(
     runs: anytype,
-    indices: []const usize,
     lines: []const TextLayoutLine,
     metrics: TextLayoutMetrics,
     gutter: TextLayoutGutter,
@@ -17932,15 +20265,29 @@ fn textLayoutNeedsColumnReordering(
     var left_prose_lines: usize = 0;
     var right_prose_lines: usize = 0;
     for (lines) |line| {
-        var left_words: usize = 0;
-        var right_words: usize = 0;
-        var previous_left: ?usize = null;
-        var previous_right_run: ?usize = null;
-        for (line.run_indices.items) |index| {
+        // Overprinted copies cannot turn a two-word table cell into prose.
+        var left_words = [_]usize{ 0, 0 };
+        var right_words = [_]usize{ 0, 0 };
+        var previous_left = [_]?usize{ null, null };
+        var previous_right_run = [_]?usize{ null, null };
+        var covered_x = [_]f64{ -std.math.inf(f64), -std.math.inf(f64) };
+        for (line.run_indices.items, 0..) |index, position| {
             const bounds = textRunBounds(runs[index]);
             const is_left = bounds.max_x <= gutter.left;
             const is_right = bounds.min_x >= gutter.right;
-            const previous = if (is_left) previous_left else previous_right_run;
+            const layer: usize = @intFromBool(invisibleTextRun(runs[index]));
+            // Independent invisible copies must not inflate the prose test.
+            // X-sorted disjoint words avoid the optional backwards scan.
+            const may_duplicate = layer == 1 and bounds.min_x < covered_x[layer];
+            covered_x[layer] = @max(covered_x[layer], bounds.max_x);
+            if (may_duplicate) {
+                const duplicate = for (line.run_indices.items[0..position]) |prior| {
+                    if (invisibleTextRun(runs[prior]) and independentTextCopies(runs[prior], runs[index]) and
+                        textBoundsOverlap(textRunBounds(runs[prior]), bounds)) break true;
+                } else false;
+                if (duplicate) continue;
+            }
+            const previous = if (is_left) previous_left[layer] else previous_right_run[layer];
             var first = true;
             var words = std.mem.tokenizeAny(u8, runs[index].text, &std.ascii.whitespace);
             while (words.next()) |word| {
@@ -17956,21 +20303,23 @@ fn textLayoutNeedsColumnReordering(
                 for (word) |byte| has_letter = has_letter or std.ascii.isAlphabetic(byte) or byte >= 0x80;
                 const numeric = (std.fmt.parseFloat(f64, word) catch null) != null;
                 if (has_letter and !numeric and !joins_previous) {
-                    if (is_left) left_words += 1;
-                    if (is_right) right_words += 1;
+                    if (is_left) left_words[layer] += 1;
+                    if (is_right) right_words[layer] += 1;
                 }
                 first = false;
             }
-            if (is_left) previous_left = index;
-            if (is_right) previous_right_run = index;
+            if (is_left) previous_left[layer] = index;
+            if (is_right) previous_right_run[layer] = index;
         }
         const center_y = (line.bounds.min_y + line.bounds.max_y) * 0.5;
         if (center_y < gutter.body_bottom or center_y > gutter.body_top) continue;
-        if (left_words >= 3) left_prose_lines += 1;
-        if (right_words >= 3) right_prose_lines += 1;
+        if (@max(left_words[0], left_words[1]) >= 3) left_prose_lines += 1;
+        if (@max(right_words[0], right_words[1]) >= 3) right_prose_lines += 1;
     }
-    if (left_prose_lines < 3 or right_prose_lines < 3) return false;
+    return left_prose_lines >= 3 and right_prose_lines >= 3;
+}
 
+fn textLayoutColumnsAreInterleaved(runs: anytype, indices: []const usize, metrics: TextLayoutMetrics, gutter: TextLayoutGutter) bool {
     // Repair demonstrably interleaved columns, not already grouped streams.
     // A return from the right column to a later left-column row identifies
     // row-major painting. Require repeated evidence; isolated margin text
@@ -18016,6 +20365,7 @@ fn appendPartitionedTextRunOrder(
     metrics: TextLayoutMetrics,
     depth: usize,
     cancellation: CancellationProbe,
+    break_before: ?[]bool,
 ) !void {
     try cancellation.check();
     if (indices.len <= 1) return appendOriginalTextRunIndices(alloc, out, indices);
@@ -18027,9 +20377,12 @@ fn appendPartitionedTextRunOrder(
     // Without positive evidence of interleaved columns, retain content order.
     // Sorting an unpartitioned leaf can interleave overprinted glyphs or move
     // marginal annotations into otherwise intact sentences.
-    const gutter = gutter_search.best orelse return appendOriginalTextRunIndices(alloc, out, indices);
-    if (!textLayoutNeedsColumnReordering(runs, indices, lines, metrics, gutter))
-        return appendOriginalTextRunIndices(alloc, out, indices);
+    const gutter = gutter_search.best orelse return appendTextLayerRegions(alloc, out, runs, indices, lines, metrics, cancellation, break_before);
+    // Mixed layers require independent column regions even when each layer
+    // was already painted column-by-column. Tables still retain row groups.
+    if (!textLayoutHasProseColumns(runs, lines, metrics, gutter) or
+        (!textRunsNeedTrackRepair(runs, indices) and !textLayoutColumnsAreInterleaved(runs, indices, metrics, gutter)))
+        return appendTextLayerRegions(alloc, out, runs, indices, lines, metrics, cancellation, break_before);
 
     var headings = std.ArrayList(usize).empty;
     defer headings.deinit(alloc);
@@ -18055,47 +20408,482 @@ fn appendPartitionedTextRunOrder(
     }
     if (left.items.len == 0 or right.items.len == 0)
         return appendOriginalTextRunIndices(alloc, out, indices);
-    try appendPartitionedTextRunOrder(alloc, out, runs, headings.items, metrics, depth + 1, cancellation);
-    try appendPartitionedTextRunOrder(alloc, out, runs, left.items, metrics, depth + 1, cancellation);
-    try appendPartitionedTextRunOrder(alloc, out, runs, right.items, metrics, depth + 1, cancellation);
-    try appendPartitionedTextRunOrder(alloc, out, runs, footers.items, metrics, depth + 1, cancellation);
+    try appendPartitionedTextRunOrder(alloc, out, runs, headings.items, metrics, depth + 1, cancellation, break_before);
+    try appendPartitionedTextRunOrder(alloc, out, runs, left.items, metrics, depth + 1, cancellation, break_before);
+    try appendPartitionedTextRunOrder(alloc, out, runs, right.items, metrics, depth + 1, cancellation, break_before);
+    try appendPartitionedTextRunOrder(alloc, out, runs, footers.items, metrics, depth + 1, cancellation, break_before);
 }
 
 fn orderedTextRunIndicesAlloc(alloc: Allocator, runs: anytype) ![]usize {
     return orderedTextRunIndicesCancelableAlloc(alloc, runs, .{});
 }
 
-fn orderedTextRunIndicesCancelableAlloc(alloc: Allocator, runs: anytype, cancellation: CancellationProbe) ![]usize {
-    var original = std.ArrayList(usize).empty;
-    defer original.deinit(alloc);
-    var ordering_supported = true;
-    var reference_index: ?usize = null;
-    for (runs, 0..) |run, run_index| {
-        if (run_index % 256 == 0) try cancellation.check();
-        if (run.text.len == 0) continue;
-        try original.append(alloc, run_index);
-        if (!textRunHasSupportedOrderingGeometry(run)) {
-            ordering_supported = false;
+fn invisibleTextRun(run: anytype) bool {
+    const mode = @mod(run.render_mode, 8);
+    return mode == 3 or mode == 7;
+}
+
+fn textBoundsOverlap(left: TextRunBounds, right: TextRunBounds) bool {
+    const width = @min(left.max_x, right.max_x) - @max(left.min_x, right.min_x);
+    const height = @min(left.max_y, right.max_y) - @max(left.min_y, right.min_y);
+    return width > @min(left.max_x - left.min_x, right.max_x - right.min_x) * 0.5 and
+        height > @min(left.max_y - left.min_y, right.max_y - right.min_y) * 0.5;
+}
+
+const TextLayerRegion = struct {
+    indices: []const usize,
+    bounds: TextRunBounds,
+    overlapping: bool,
+    isolated_line: bool,
+    parent: usize,
+    next: ?usize = null,
+    head: ?usize = null,
+    tail: ?usize = null,
+    emitted: bool = false,
+};
+
+fn textLayerRegionRoot(regions: []TextLayerRegion, index: usize) usize {
+    var root = index;
+    while (regions[root].parent != root) root = regions[root].parent;
+    var cursor = index;
+    while (regions[cursor].parent != cursor) {
+        const next = regions[cursor].parent;
+        regions[cursor].parent = root;
+        cursor = next;
+    }
+    return root;
+}
+
+fn textRunsHaveMixedLayers(runs: anytype, indices: []const usize) bool {
+    var visible = false;
+    var invisible = false;
+    for (indices) |index| {
+        if (invisibleTextRun(runs[index])) invisible = true else visible = true;
+        if (visible and invisible) return true;
+    }
+    return false;
+}
+
+/// Render mode distinguishes visible/OCR transcriptions. Independent invisible
+/// BT objects may also be separate copies; glyph fragments in the same object
+/// remain one authored sequence, including deliberate negative kerning.
+fn independentTextCopies(left: anytype, right: anytype) bool {
+    if (invisibleTextRun(left) != invisibleTextRun(right)) return true;
+    return invisibleTextRun(left) and left.text_object_id != null and
+        right.text_object_id != null and left.text_object_id.? != right.text_object_id.?;
+}
+
+fn textRunsNeedTrackRepair(runs: anytype, indices: []const usize) bool {
+    if (textRunsHaveMixedLayers(runs, indices)) return true;
+    var first_object: ?usize = null;
+    for (indices) |index| {
+        if (!invisibleTextRun(runs[index])) continue;
+        if (runs[index].text_object_id) |id| {
+            if (first_object) |first| {
+                if (first != id) return true;
+            } else first_object = id;
+        }
+    }
+    return false;
+}
+
+const TextTrackRun = struct {
+    bounds: TextRunBounds,
+    cohort: usize = 0,
+    next: ?usize = null,
+};
+const TextTrack = struct {
+    invisible: bool,
+    blocked: bool = false,
+    head: ?usize = null,
+    tail: ?usize = null,
+};
+
+const TextSourceKey = struct {
+    object: ?usize,
+    invisible: bool,
+};
+fn textSourceKey(run: anytype) TextSourceKey {
+    return .{ .object = run.text_object_id, .invisible = invisibleTextRun(run) };
+}
+const TextSourceCohort = struct {
+    head: usize,
+    tail: usize,
+    linked: bool = false,
+    track: ?usize = null,
+    first_spatial: usize = std.math.maxInt(usize),
+    last_spatial: usize = 0,
+};
+
+/// Color source cohorts into independent tracks. Once a text object is tied
+/// to an overlapping transcription, all its words retain that membership.
+/// Unanchored words trigger an authored-object fallback rather than a guessed
+/// sentence. Every run is emitted once with its original span.
+/// Pair discovery and coloring are O(n^2), bounded by the layout run ceiling;
+/// linked output lists make emission O(n), even for many coincident copies.
+fn appendTextRegionTracks(
+    alloc: Allocator,
+    out: *std.ArrayList(usize),
+    runs: anytype,
+    regions: []const TextLayerRegion,
+    head: ?usize,
+    info: []TextTrackRun,
+    track_scratch: *?[]TextTrack,
+    cancellation: CancellationProbe,
+    break_before: ?[]bool,
+) !void {
+    var spatial = std.ArrayList(usize).empty;
+    defer spatial.deinit(alloc);
+    var cursor = head;
+    while (cursor) |region| : (cursor = regions[region].next)
+        try spatial.appendSlice(alloc, regions[region].indices);
+    const authored = try alloc.dupe(usize, spatial.items);
+    defer alloc.free(authored);
+    std.mem.sort(usize, authored, {}, std.sort.asc(usize));
+    var sources = std.AutoHashMap(TextSourceKey, usize).init(alloc);
+    defer sources.deinit();
+    var cohorts = std.ArrayList(TextSourceCohort).empty;
+    defer cohorts.deinit(alloc);
+    for (authored) |index| {
+        const entry = try sources.getOrPut(textSourceKey(runs[index]));
+        if (!entry.found_existing) {
+            entry.value_ptr.* = cohorts.items.len;
+            try cohorts.append(alloc, .{ .head = index, .tail = index });
+        } else {
+            const source = &cohorts.items[entry.value_ptr.*];
+            info[source.tail].next = index;
+            source.tail = index;
+        }
+        info[index] = .{ .bounds = textRunBounds(runs[index]), .cohort = entry.value_ptr.* };
+    }
+    for (spatial.items, 0..) |index, position| {
+        const source = &cohorts.items[info[index].cohort];
+        source.first_spatial = @min(source.first_spatial, position);
+        source.last_spatial = @max(source.last_spatial, position);
+    }
+    for (authored, 0..) |left, i| {
+        try cancellation.check();
+        for (authored[i + 1 ..]) |right| {
+            if (independentTextCopies(runs[left], runs[right]) and textBoundsOverlap(info[left].bounds, info[right].bounds)) {
+                cohorts.items[info[left].cohort].linked = true;
+                cohorts.items[info[right].cohort].linked = true;
+            }
+        }
+    }
+    const ambiguous = for (cohorts.items) |cohort| {
+        if (!cohort.linked) break true;
+    } else false;
+    if (ambiguous) {
+        // Geometry cannot establish which transcription owns an unanchored
+        // word. Preserve complete authored objects instead of guessing a
+        // synthesized sentence. This also handles interleaved Form content.
+        for (cohorts.items) |cohort| {
+            try cancellation.check();
+            if (break_before) |flags| flags[cohort.head] = true;
+            cursor = cohort.head;
+            while (cursor) |index| : (cursor = info[index].next) try out.append(alloc, index);
+        }
+        return;
+    }
+    if (track_scratch.* == null) track_scratch.* = try alloc.alloc(TextTrack, runs.len);
+    const tracks = track_scratch.*.?;
+    var count: usize = 0;
+    for (cohorts.items) |*cohort| {
+        try cancellation.check();
+        for (tracks[0..count]) |*track| track.blocked = false;
+        // Disjoint glyph boxes can still interleave an authored phrase. Those
+        // source cohorts must not share a track just because the words moved.
+        for (cohorts.items) |prior| {
+            const assigned = prior.track orelse continue;
+            if (cohort.first_spatial < prior.last_spatial and prior.first_spatial < cohort.last_spatial)
+                tracks[assigned].blocked = true;
+        }
+        var member: ?usize = cohort.head;
+        while (member) |index| : (member = info[index].next) {
+            // Each run scans previously colored cohorts once: O(n^2) in total.
+            for (authored) |prior| {
+                const assigned = cohorts.items[info[prior].cohort].track orelse continue;
+                if (independentTextCopies(runs[prior], runs[index]) and
+                    textBoundsOverlap(info[prior].bounds, info[index].bounds)) tracks[assigned].blocked = true;
+            }
+        }
+        const invisible = invisibleTextRun(runs[cohort.head]);
+        const selected = for (tracks[0..count], 0..) |track, t| {
+            if (track.invisible == invisible and !track.blocked) break t;
+        } else blk: {
+            tracks[count] = .{ .invisible = invisible };
+            count += 1;
+            break :blk count - 1;
+        };
+        cohort.track = selected;
+    }
+    std.debug.assert(count > 0);
+    // Cohort links are no longer needed; reuse them for the output lists.
+    for (spatial.items) |index| info[index].next = null;
+    for (spatial.items) |index| {
+        const track = cohorts.items[info[index].cohort].track.?;
+        if (tracks[track].tail) |tail| info[tail].next = index else tracks[track].head = index;
+        tracks[track].tail = index;
+    }
+    // Emit tracks in stable authored order.
+    for (0..count) |t| {
+        cursor = tracks[t].head;
+        if (t != 0) if (break_before) |flags| {
+            flags[cursor.?] = true;
+        };
+        while (cursor) |index| : (cursor = info[index].next) try out.append(alloc, index);
+    }
+}
+
+/// Build transcription regions from contiguous portions of layout lines.
+/// Wide gaps use the same geometric floor as column detection, so OCR in one
+/// column cannot pull unrelated cells or an adjacent column into its layer.
+/// Splice each region at its first authored occurrence; all other runs retain
+/// the order selected by column repair. All transcriptions keep their spans.
+fn appendTextLayerRegions(
+    alloc: Allocator,
+    out: *std.ArrayList(usize),
+    runs: anytype,
+    indices: []const usize,
+    lines: []const TextLayoutLine,
+    metrics: TextLayoutMetrics,
+    cancellation: CancellationProbe,
+    break_before: ?[]bool,
+) !void {
+    if (runs.len > 2048) return appendOriginalTextRunIndices(alloc, out, indices);
+    if (!textRunsNeedTrackRepair(runs, indices)) return appendOriginalTextRunIndices(alloc, out, indices);
+
+    const anchored = try alloc.alloc(bool, runs.len);
+    defer alloc.free(anchored);
+    @memset(anchored, false);
+    var anchored_sources = std.AutoHashMap(TextSourceKey, usize).init(alloc);
+    defer anchored_sources.deinit();
+    for (lines) |line| {
+        for (line.run_indices.items, 0..) |left, i| {
+            try cancellation.check();
+            const left_bounds = textRunBounds(runs[left]);
+            for (line.run_indices.items[i + 1 ..]) |right| {
+                const right_bounds = textRunBounds(runs[right]);
+                if (right_bounds.min_x >= left_bounds.max_x) break;
+                if (!independentTextCopies(runs[left], runs[right]) or !textBoundsOverlap(left_bounds, right_bounds)) continue;
+                for ([_]usize{ left, right }) |index| {
+                    if (!anchored[index] and runs[index].text_object_id != null)
+                        try anchored_sources.put(textSourceKey(runs[index]), std.math.maxInt(usize));
+                    anchored[index] = true;
+                }
+            }
+        }
+    }
+    for (indices) |index| {
+        if (runs[index].text_object_id != null and anchored_sources.contains(textSourceKey(runs[index]))) anchored[index] = true;
+    }
+
+    var regions = std.ArrayList(TextLayerRegion).empty;
+    defer regions.deinit(alloc);
+    const membership = try alloc.alloc(usize, runs.len);
+    defer alloc.free(membership);
+    @memset(membership, std.math.maxInt(usize));
+    const maximum_gap = @max(metrics.median_height * 2.0, metrics.median_space_advance * 4.0);
+    for (lines) |line| {
+        try cancellation.check();
+        const first_region = regions.items.len;
+        var overlapping_members: usize = 0;
+        var start: usize = 0;
+        while (start < line.run_indices.items.len) {
+            var end = start + 1;
+            var bounds = textRunBounds(runs[line.run_indices.items[start]]);
+            while (end < line.run_indices.items.len) : (end += 1) {
+                const next = textRunBounds(runs[line.run_indices.items[end]]);
+                if (next.min_x - bounds.max_x >= maximum_gap) break;
+                bounds.include(next);
+            }
+            const region_indices = line.run_indices.items[start..end];
+            var has_visible = false;
+            var has_invisible = false;
+            for (region_indices) |index| {
+                if (invisibleTextRun(runs[index])) has_invisible = true else has_visible = true;
+            }
+            const overlapping = for (region_indices) |index| {
+                if (anchored[index]) break true;
+            } else false;
+            if ((has_visible and has_invisible) or overlapping) {
+                if (overlapping) overlapping_members += region_indices.len;
+                for (region_indices) |index| membership[index] = regions.items.len;
+                try regions.append(alloc, .{
+                    .indices = region_indices,
+                    .overlapping = overlapping,
+                    .isolated_line = start == 0 and end == line.run_indices.items.len,
+                    .bounds = bounds,
+                    .parent = regions.items.len,
+                });
+            }
+            start = end;
+        }
+        if (regions.items.len > first_region + 1 and overlapping_members == line.run_indices.items.len) {
+            // Fully overprinted table cells are alternate copies of one row.
+            // Keep each row association intact, rather than joining columns.
+            regions.shrinkRetainingCapacity(first_region + 1);
+            regions.items[first_region] = .{
+                .indices = line.run_indices.items,
+                .bounds = line.bounds,
+                .overlapping = true,
+                .isolated_line = false,
+                .parent = first_region,
+            };
+            for (line.run_indices.items) |index| membership[index] = first_region;
+        }
+    }
+    // Source membership spans line and gap boundaries. Joining only the
+    // colliding words would strand the rest of that authored transcription.
+    for (indices) |index| {
+        if (!anchored[index] or runs[index].text_object_id == null) continue;
+        const first = anchored_sources.getPtr(textSourceKey(runs[index])).?;
+        const region = membership[index];
+        std.debug.assert(region != std.math.maxInt(usize));
+        if (first.* == std.math.maxInt(usize)) {
+            first.* = region;
+        } else {
+            const root = textLayerRegionRoot(regions.items, first.*);
+            const other = textLayerRegionRoot(regions.items, region);
+            regions.items[other].parent = root;
+        }
+    }
+    // Join adjacent overlapping lines into a transcription region. A header
+    // overlap cannot capture complementary OCR words or an unrelated footer.
+    // The caller's 2048-run ceiling bounds this optional component search.
+    for (regions.items, 0..) |left, i| {
+        try cancellation.check();
+        if (!left.overlapping or !left.isolated_line) continue;
+        for (i + 1..regions.items.len) |j| {
+            const right = regions.items[j];
+            if (!right.overlapping or !right.isolated_line) continue;
+            const horizontal = @min(left.bounds.max_x, right.bounds.max_x) - @max(left.bounds.min_x, right.bounds.min_x);
+            const vertical_gap = @max(left.bounds.min_y, right.bounds.min_y) - @min(left.bounds.max_y, right.bounds.max_y);
+            if (horizontal <= @min(left.bounds.max_x - left.bounds.min_x, right.bounds.max_x - right.bounds.min_x) * 0.5 or
+                vertical_gap > metrics.median_height) continue;
+            const left_root = textLayerRegionRoot(regions.items, i);
+            const right_root = textLayerRegionRoot(regions.items, j);
+            regions.items[right_root].parent = left_root;
+        }
+    }
+    // Build each component's list in geometric line order once. Emitting all
+    // components then costs O(number of retained runs), without rescanning.
+    for (0..regions.items.len) |i| {
+        const root_index = textLayerRegionRoot(regions.items, i);
+        const root = &regions.items[root_index];
+        if (root.tail) |tail| regions.items[tail].next = i else root.head = i;
+        root.tail = i;
+    }
+    var track_runs: ?[]TextTrackRun = null;
+    defer if (track_runs) |scratch| alloc.free(scratch);
+    var tracks: ?[]TextTrack = null;
+    defer if (tracks) |scratch| alloc.free(scratch);
+    for (indices) |index| {
+        const region_index = membership[index];
+        if (region_index == std.math.maxInt(usize)) {
+            try out.append(alloc, index);
             continue;
         }
-        if (reference_index) |reference| {
-            if (!textRunAxesCompatible(runs[reference], run))
-                ordering_supported = false;
+        const root_index = textLayerRegionRoot(regions.items, region_index);
+        const root = &regions.items[root_index];
+        if (root.emitted) continue;
+        root.emitted = true;
+        if (root.overlapping) {
+            if (track_runs == null) track_runs = try alloc.alloc(TextTrackRun, runs.len);
+            try appendTextRegionTracks(alloc, out, runs, regions.items, root.head, track_runs.?, &tracks, cancellation, break_before);
         } else {
-            reference_index = run_index;
+            // Complementary OCR words belong in their geometric sentence.
+            try out.appendSlice(alloc, root.indices);
         }
+    }
+}
+
+fn orderedTextRunIndicesCancelableAlloc(alloc: Allocator, runs: anytype, cancellation: CancellationProbe) ![]usize {
+    return orderedTextRunIndicesWithBreaksAlloc(alloc, runs, cancellation, null);
+}
+
+const TextOrientationGroup = struct {
+    anchor: usize,
+    indices: std.ArrayList(usize) = .empty,
+    emitted: bool = false,
+
+    fn deinit(self: *TextOrientationGroup, alloc: Allocator) void {
+        self.indices.deinit(alloc);
+    }
+};
+
+fn orderedTextRunIndicesWithBreaksAlloc(alloc: Allocator, runs: anytype, cancellation: CancellationProbe, break_before: ?[]bool) ![]usize {
+    var original = std.ArrayList(usize).empty;
+    defer original.deinit(alloc);
+    for (runs, 0..) |run, run_index| {
+        if (run_index % 256 == 0) try cancellation.check();
+        if ((run.text.len == 0 and !textRunOrderingFence(run)) or textRunPolicyExcluded(run)) continue;
+        try original.append(alloc, run_index);
     }
     // Above this bound, preserve authored order. Both line clustering and
     // candidate validation have quadratic worst cases; optional layout repair
     // must have a fixed work ceiling even for glyph-per-run documents.
-    if (!ordering_supported or original.items.len <= 1 or original.items.len > 2048)
+    if (original.items.len <= 1 or original.items.len > 2048 or runs.len > 2048)
         return try original.toOwnedSlice(alloc);
-    const metrics = try textLayoutMetricsAlloc(alloc, runs, original.items);
+
     var ordered = std.ArrayList(usize).empty;
     errdefer ordered.deinit(alloc);
-    try appendPartitionedTextRunOrder(alloc, &ordered, runs, original.items, metrics, 0, cancellation);
-    std.debug.assert(ordered.items.len == original.items.len);
-    return try ordered.toOwnedSlice(alloc);
+    var start: usize = 0;
+    for (original.items, 0..) |run_index, ordinal| {
+        if (!textRunOrderingFence(runs[run_index])) continue;
+        try appendOrientationTextOrder(alloc, &ordered, runs, original.items[start..ordinal], cancellation, break_before);
+        try ordered.append(alloc, run_index);
+        start = ordinal + 1;
+    }
+    try appendOrientationTextOrder(alloc, &ordered, runs, original.items[start..], cancellation, break_before);
+    return ordered.toOwnedSlice(alloc);
+}
+
+fn appendOrientationTextOrder(alloc: Allocator, ordered: *std.ArrayList(usize), runs: anytype, indices: []const usize, cancellation: CancellationProbe, break_before: ?[]bool) !void {
+    if (indices.len == 0) return;
+    const no_group = std.math.maxInt(usize);
+    const membership = try alloc.alloc(usize, indices.len);
+    defer alloc.free(membership);
+    @memset(membership, no_group);
+    var groups = std.ArrayList(TextOrientationGroup).empty;
+    defer {
+        for (groups.items) |*group| group.deinit(alloc);
+        groups.deinit(alloc);
+    }
+    for (indices, 0..) |run_index, ordinal| {
+        if (ordinal % 256 == 0) try cancellation.check();
+        if (!textRunHasSupportedOrderingGeometry(runs[run_index])) continue;
+        var group_index: ?usize = null;
+        for (groups.items, 0..) |group, index| {
+            if (textRunAxesCompatible(runs[group.anchor], runs[run_index])) {
+                group_index = index;
+                break;
+            }
+        }
+        if (group_index == null) {
+            try groups.append(alloc, .{ .anchor = run_index });
+            group_index = groups.items.len - 1;
+        }
+        try groups.items[group_index.?].indices.append(alloc, run_index);
+        membership[ordinal] = group_index.?;
+    }
+
+    for (indices, 0..) |run_index, ordinal| {
+        const group_index = membership[ordinal];
+        if (group_index == no_group) {
+            try ordered.append(alloc, run_index);
+            continue;
+        }
+        const group = &groups.items[group_index];
+        if (group.emitted) continue;
+        group.emitted = true;
+        if (group.indices.items.len <= 1) {
+            try ordered.appendSlice(alloc, group.indices.items);
+            continue;
+        }
+        const metrics = try textLayoutMetricsAlloc(alloc, runs, group.indices.items);
+        try appendPartitionedTextRunOrder(alloc, ordered, runs, group.indices.items, metrics, 0, cancellation, break_before);
+    }
 }
 
 fn clearTextRunOutputSpans(runs: anytype) void {
@@ -18162,21 +20950,55 @@ fn reconstructTextFromRunsAlloc(alloc: Allocator, runs: anytype) ![]u8 {
 }
 
 fn reconstructTextFromRunsCancelableAlloc(alloc: Allocator, runs: anytype, cancellation: CancellationProbe) ![]u8 {
+    return reconstructTextItemsCancelableAlloc(alloc, runs, runs, &.{}, cancellation);
+}
+
+fn reconstructTextItemsCancelableAlloc(alloc: Allocator, runs: anytype, source_runs: anytype, spans: []const SemanticTextSpan, cancellation: CancellationProbe) ![]u8 {
     try cancellation.check();
     clearTextRunOutputSpans(runs);
-    const ordered_indices = try orderedTextRunIndicesCancelableAlloc(alloc, runs, cancellation);
+    var boundary_storage: [2048]bool = @splat(false);
+    const boundaries: ?[]bool = if (runs.len <= boundary_storage.len) boundary_storage[0..runs.len] else null;
+    const ordered_indices = try orderedTextRunIndicesWithBreaksAlloc(alloc, runs, cancellation, boundaries);
     defer alloc.free(ordered_indices);
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
     var previous_index: ?usize = null;
+    var deleted_content = false;
+    var deletion_exit_index: ?usize = null;
     for (ordered_indices, 0..) |run_index, emitted_index| {
         if (emitted_index % 256 == 0) try cancellation.check();
         const run = &runs[run_index];
+        if (run.text.len == 0) {
+            // Retain the last surviving line context. Deletion suppresses
+            // horizontal spacing, while independent line boundaries remain.
+            if (run.semantic_span_index < spans.len and spans[run.semantic_span_index].entry_run != null) {
+                if (previous_index) |survivor| {
+                    const prior = textRunExitGeometry(runs[deletion_exit_index orelse survivor], source_runs, spans);
+                    const exit = textRunExitGeometry(run.*, source_runs, spans);
+                    deleted_content = (deletion_exit_index == null or deleted_content) and
+                        textRunsShareLine(prior, run.*) and textRunsShareLine(run.*, exit);
+                    deletion_exit_index = run_index;
+                }
+            }
+            continue;
+        }
         if (previous_index) |prior_index| {
-            const prior = runs[prior_index];
-            if (!textRunsShareLine(prior, run.*)) {
+            const prior = textRunExitGeometry(runs[prior_index], source_runs, spans);
+            const bridges_deletion = deleted_content and if (deletion_exit_index) |index|
+                textRunsShareLine(textRunExitGeometry(runs[index], source_runs, spans), run.*)
+            else
+                false;
+            const layer_boundary = invisibleTextRun(prior) != invisibleTextRun(run.*) and
+                (textRunForwardGap(prior, run.*) < 0 or
+                    textBoundsOverlap(textRunBounds(prior), textRunBounds(run.*)));
+            const authored_ocr_boundary = invisibleTextRun(prior) and invisibleTextRun(run.*) and
+                independentTextCopies(prior, run.*) and
+                textRunForwardGap(prior, run.*) < 0 and
+                textBoundsOverlap(textRunBounds(prior), textRunBounds(run.*));
+            const track_boundary = if (boundaries) |flags| flags[run_index] else false;
+            if (track_boundary or authored_ocr_boundary or layer_boundary or !textRunsShareLine(prior, run.*)) {
                 try appendLayoutNewline(alloc, &out, runs, ordered_indices[0..emitted_index]);
-            } else if (!std.ascii.isWhitespace(out.items[out.items.len - 1]) and
+            } else if (!bridges_deletion and !std.ascii.isWhitespace(out.items[out.items.len - 1]) and
                 !std.ascii.isWhitespace(run.text[0]))
             {
                 const axis = textRunAxisLength(prior);
@@ -18210,6 +21032,8 @@ fn reconstructTextFromRunsCancelableAlloc(alloc: Allocator, runs: anytype, cance
         const end = out.items.len;
         if (start < end) run.output_span = .{ .start = start, .end = end };
         previous_index = run_index;
+        deleted_content = false;
+        deletion_exit_index = null;
     }
     try appendNewline(alloc, &out);
     return try out.toOwnedSlice(alloc);
@@ -18268,7 +21092,7 @@ fn type3CharProcIsVectorizableAlloc(alloc: Allocator, bytes: []const u8) !bool {
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
     while (true) {
-        var lex = (try readContentLexeme(&scanner)) orelse continue;
+        var lex = (try readContentLexemeRaw(&scanner)) orelse continue;
         defer syntax.Scanner.freeLexeme(alloc, &lex);
         switch (lex) {
             .eof => return true,
@@ -18297,7 +21121,7 @@ fn type3CharProcIsNativelyRenderableAlloc(alloc: Allocator, bytes: []const u8) !
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
     while (true) {
-        var lex = (try readContentLexeme(&scanner)) orelse continue;
+        var lex = (try readContentLexemeRaw(&scanner)) orelse continue;
         defer syntax.Scanner.freeLexeme(alloc, &lex);
         switch (lex) {
             .eof => return true,
@@ -18334,7 +21158,7 @@ fn contentIsSingleImageSoftMaskAlloc(alloc: Allocator, bytes: []const u8) !bool 
     defer scanner.deinit();
     var image_count: usize = 0;
     while (true) {
-        var lex = (try readContentLexeme(&scanner)) orelse return false;
+        var lex = (try readContentLexemeRaw(&scanner)) orelse return false;
         defer syntax.Scanner.freeLexeme(alloc, &lex);
         switch (lex) {
             .eof => return image_count == 1,
@@ -18388,6 +21212,15 @@ fn collectReferencedResourceNamesAlloc(
     bytes: []const u8,
     operators: []const []const u8,
 ) !ReferencedResourceNames {
+    return collectReferencedResourceNamesCancelableAlloc(alloc, bytes, operators, .{});
+}
+
+fn collectReferencedResourceNamesCancelableAlloc(
+    alloc: Allocator,
+    bytes: []const u8,
+    operators: []const []const u8,
+    cancellation: CancellationProbe,
+) !ReferencedResourceNames {
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
     var result = ReferencedResourceNames{};
@@ -18395,8 +21228,11 @@ fn collectReferencedResourceNamesAlloc(
     var previous_name: ?[]u8 = null;
     defer if (previous_name) |name| alloc.free(name);
 
+    var token_count: usize = 0;
     while (true) {
-        var lex = (try readContentLexeme(&scanner)) orelse {
+        if (token_count % 256 == 0) try cancellation.check();
+        token_count +|= 1;
+        var lex = (try readContentLexemeCancelable(&scanner, cancellation)) orelse {
             if (previous_name) |name| alloc.free(name);
             previous_name = null;
             continue;
@@ -18406,6 +21242,7 @@ fn collectReferencedResourceNamesAlloc(
             .eof => return result,
             .name => |name| {
                 if (previous_name) |owned| alloc.free(owned);
+                previous_name = null;
                 previous_name = try alloc.dupe(u8, name);
             },
             .keyword => |keyword| {
@@ -18447,6 +21284,10 @@ fn collectReferencedResourceNamesAlloc(
 /// immediate-name collector cannot identify it. Retain the last name in the
 /// current operator's operand list and clear it at every operator boundary.
 fn collectReferencedFontNamesAlloc(alloc: Allocator, bytes: []const u8) !ReferencedResourceNames {
+    return collectReferencedFontNamesCancelableAlloc(alloc, bytes, .{});
+}
+
+fn collectReferencedFontNamesCancelableAlloc(alloc: Allocator, bytes: []const u8, cancellation: CancellationProbe) !ReferencedResourceNames {
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
     var result = ReferencedResourceNames{};
@@ -18454,8 +21295,11 @@ fn collectReferencedFontNamesAlloc(alloc: Allocator, bytes: []const u8) !Referen
     var operand_name: ?[]u8 = null;
     defer if (operand_name) |name| alloc.free(name);
 
+    var token_count: usize = 0;
     while (true) {
-        var lex = (try readContentLexeme(&scanner)) orelse {
+        if (token_count % 256 == 0) try cancellation.check();
+        token_count +|= 1;
+        var lex = (try readContentLexemeCancelable(&scanner, cancellation)) orelse {
             if (operand_name) |name| alloc.free(name);
             operand_name = null;
             continue;
@@ -18465,6 +21309,7 @@ fn collectReferencedFontNamesAlloc(alloc: Allocator, bytes: []const u8) !Referen
             .eof => return result,
             .name => |name| {
                 if (operand_name) |owned| alloc.free(owned);
+                operand_name = null;
                 operand_name = try alloc.dupe(u8, name);
             },
             .keyword => |operator| {
@@ -18603,6 +21448,9 @@ fn enterGraphicsTransparencyGroup(parent: GraphicsState, nested: *GraphicsState,
 }
 
 fn enterTextTransparencyGroup(parent: TextRunState, nested: *TextRunState, form: *const PageForm, next_group_id: *u32) !void {
+    // Retain ancestor visibility independently of this group's compositing
+    // alpha. A boolean avoids underflow for arbitrarily faint nonzero groups.
+    nested.ancestor_groups_visible = textGroupsVisible(parent);
     nested.group_parent_id = parent.group_id;
     nested.group_id = next_group_id.*;
     nested.group_isolated = form.group_isolated;
@@ -18617,6 +21465,7 @@ fn enterTextTransparencyGroup(parent: TextRunState, nested: *TextRunState, form:
 
 fn buildFormTextState(state: TextRunState, form: *const PageForm) TextRunState {
     var next = TextRunState{
+        .ancestor_groups_visible = state.ancestor_groups_visible,
         .current_font_index = null,
         .font_size = state.font_size,
         .alpha = state.alpha,
@@ -18789,7 +21638,7 @@ fn buildPatternRunAlloc(
     defer text_parser.deinit();
     text_parser.paint_order = tile_paint_order;
     text_parser.next_group_id = tile_group_id;
-    try text_parser.consume(pattern.content, pattern.fonts, pattern.gstates, pattern.forms);
+    try text_parser.consume(pattern.content, pattern.fonts, pattern.gstates, pattern.forms, &.{});
     tile_paint_order = text_parser.paint_order;
     tile_group_id = text_parser.next_group_id;
 
@@ -20696,7 +23545,7 @@ test "reader resolves indirect stream length when compressed payload ends in new
     defer reader.deinit();
     var obj = try reader.readIndirectObject(.{ .id = 1, .gen = 0 });
     defer obj.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 11), obj.stream.data_length);
+    try std.testing.expectEqual(@as(usize, 12), obj.stream.data_length);
     const decoded = try reader.readDecodedStreamData(&obj);
     defer alloc.free(decoded);
     try std.testing.expectEqualStrings("x103", decoded);
@@ -21212,7 +24061,7 @@ test "recursive page and content collectors are allocation-failure safe" {
                 .{ .key = @constCast("Kids"), .value = .{ .array = &kids } },
             };
             var pages: syntax.Object = .{ .dict = &pages_entries };
-            var page_out = std.ArrayList(syntax.Object).empty;
+            var page_out = std.ArrayList(PageIndexEntry).empty;
             defer {
                 for (page_out.items) |*page| page.deinit(alloc);
                 page_out.deinit(alloc);
@@ -22040,6 +24889,242 @@ fn buildTextOrderingTestPdfAlloc(alloc: Allocator, content: []const u8) ![]u8 {
     };
     return buildImageDecodeTestPdfAlloc(alloc, &objects);
 }
+test "reader ActualText spans preserve source geometry across content streams" {
+    const alloc = std.testing.allocator;
+    var runs = std.ArrayList(TextRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+    var parser = try PositionedTextParser.init(alloc, .{ .analysis = .{ .runs = &runs, .max_runs = 8 } }, .{}, &.{}, .nonzero);
+    defer parser.deinit();
+    try parser.consume(
+        "/Span << /ActualText <FEFF00530065006D0061006E00740069006300202713> >> BDC BT /F1 12 Tf 1 0 0 1 10 50 Tm (VIS) Tj",
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+    );
+    try parser.consume("(IBLE) Tj ET EMC", &.{}, &.{}, &.{}, &.{});
+
+    try std.testing.expectEqual(@as(usize, 2), runs.items.len);
+    try std.testing.expectEqualStrings("VIS", runs.items[0].text);
+    try std.testing.expectEqualStrings("Semantic \xE2\x9C\x93", parser.semantic.spans().items[0].text);
+    try std.testing.expectEqualStrings("IBLE", runs.items[1].text);
+    try std.testing.expectEqualStrings("VIS", runs.items[0].raw_text.?);
+    try std.testing.expectEqualStrings("IBLE", runs.items[1].raw_text.?);
+    try std.testing.expect(runs.items[1].x > runs.items[0].x);
+    try std.testing.expect(runs.items[0].advance_width > 0);
+    try std.testing.expect(runs.items[1].advance_width > 0);
+    try std.testing.expectEqual(@as(usize, 1), parser.semantic.spans().items.len);
+    try std.testing.expectEqual(@as(usize, 0), runs.items[0].semantic_span_index);
+    try std.testing.expectEqual(@as(usize, 0), runs.items[1].semantic_span_index);
+    try std.testing.expectEqual(@as(usize, 0), parser.semantic.spans().items[0].run_start);
+    try std.testing.expectEqual(@as(usize, 2), parser.semantic.spans().items[0].run_end);
+
+    var canonical = std.ArrayList(u8).empty;
+    defer canonical.deinit(alloc);
+    var text_parser = TextContentParser.init(alloc, &canonical);
+    defer text_parser.deinit();
+    try text_parser.consume(
+        "/Span << /ActualText <FEFF00530065006D0061006E00740069006300202713> >> BDC BT /F1 12 Tf (VIS) Tj",
+        &.{},
+        &.{},
+        &.{},
+        0,
+    );
+    text_parser.state = .{};
+    try text_parser.consume("(IBLE) Tj ET EMC", &.{}, &.{}, &.{}, 0);
+    try std.testing.expectEqualStrings("Semantic \xE2\x9C\x93", canonical.items);
+    var render_runs = std.ArrayList(TextRun).empty;
+    defer {
+        for (render_runs.items) |*run| run.deinit(alloc);
+        render_runs.deinit(alloc);
+    }
+    var render_parser = try PositionedTextParser.init(alloc, .{ .render = &render_runs }, .{}, &.{}, .nonzero);
+    defer render_parser.deinit();
+    try render_parser.consume(
+        "/Span << /ActualText (Semantic) >> BDC BT /F1 12 Tf (Visible Glyphs) Tj ET EMC",
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+    );
+    try std.testing.expectEqualStrings("Visible Glyphs", render_runs.items[0].text);
+    try std.testing.expectEqualStrings("Visible Glyphs", render_runs.items[0].raw_text.?);
+    try std.testing.expect(render_runs.items[0].advance_width > 0);
+}
+
+test "reader ActualText replacement is allocation safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var runs = std.ArrayList(TextRun).empty;
+            defer {
+                for (runs.items) |*text_run| text_run.deinit(alloc);
+                runs.deinit(alloc);
+            }
+            var parser = try PositionedTextParser.init(alloc, .{ .analysis = .{ .runs = &runs, .max_runs = 8 } }, .{}, &.{}, .nonzero);
+            defer parser.deinit();
+            try parser.consume(
+                "/Span << /ActualText (Semantic) >> BDC BT /F1 12 Tf (Visible) Tj (Glyphs) Tj ET EMC",
+                &.{},
+                &.{},
+                &.{},
+                &.{},
+            );
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "reader named ActualText in forms and nested scopes replaces once" {
+    const alloc = std.testing.allocator;
+    const inner_properties = [_]PageTextProperty{.{
+        .name = @constCast("Inner"),
+        .actual_text = @constCast("Form Semantic"),
+    }};
+    const page_properties = [_]PageTextProperty{.{
+        .name = @constCast("Outer"),
+        .actual_text = @constCast("Outer Semantic"),
+    }};
+    const form = PageForm{
+        .name = @constCast("Fm0"),
+        .content = @constCast(
+            "BT /F1 12 Tf 1 0 0 1 10 50 Tm /Span /Inner BDC (VISIBLE) Tj " ++
+                "/Span << /ActualText (Nested Duplicate) >> BDC (GLYPHS) Tj EMC EMC ET",
+        ),
+        .text_properties = @constCast(inner_properties[0..]),
+    };
+    var runs = std.ArrayList(TextRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+    var parser = try PositionedTextParser.init(alloc, .{ .analysis = .{ .runs = &runs, .max_runs = 8 } }, .{}, &.{}, .nonzero);
+    defer parser.deinit();
+    try parser.consume("/Fm0 Do", &.{}, &.{}, &.{form}, &page_properties);
+    try parser.consume("/Span /Outer BDC /Fm0 Do EMC", &.{}, &.{}, &.{form}, &page_properties);
+
+    try std.testing.expectEqual(@as(usize, 4), runs.items.len);
+    try std.testing.expectEqualStrings("VISIBLE", runs.items[0].text);
+    try std.testing.expectEqualStrings("GLYPHS", runs.items[1].text);
+    try std.testing.expectEqualStrings("VISIBLE", runs.items[2].text);
+    try std.testing.expectEqualStrings("GLYPHS", runs.items[3].text);
+    try std.testing.expectEqualStrings("Form Semantic", parser.semantic.spans().items[0].text);
+    try std.testing.expectEqualStrings("Outer Semantic", parser.semantic.spans().items[1].text);
+    for (runs.items) |run| try std.testing.expect(run.raw_text != null);
+    try std.testing.expectEqual(@as(usize, 2), parser.semantic.spans().items.len);
+
+    const canonical = try extractTextFromContentAlloc(
+        alloc,
+        "/Fm0 Do /Span /Outer BDC /Fm0 Do EMC",
+        &.{},
+        &.{form},
+        &page_properties,
+        0,
+    );
+    defer alloc.free(canonical);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, canonical, "Form Semantic"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, canonical, "Outer Semantic"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, canonical, "Nested Duplicate"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, canonical, "VISIBLE"));
+}
+
+test "reader page policy retains hidden OCR while visible policy excludes nonpainting text" {
+    const alloc = std.testing.allocator;
+    const content =
+        "BT /F1 10 Tf 1 0 0 1 10 85 Tm (Visible) Tj ET\n" ++
+        "BT /F1 10 Tf 3 Tr 1 0 0 1 10 65 Tm (Hidden OCR) Tj ET\n" ++
+        "q /GS0 gs BT /F1 10 Tf 0 Tr 1 0 0 1 10 45 Tm (Transparent) Tj ET Q\n" ++
+        "BT /F1 10 Tf 0 Tr 1 0 0 1 250 25 Tm (Off Page) Tj ET\n";
+    const stream = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(stream);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] " ++
+            "/Resources << /Font << /F1 5 0 R >> /ExtGState << /GS0 << /ca 0 /CA 0 >> >> >> " ++
+            "/Contents 4 0 R >>\nendobj\n",
+        stream,
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /StandardEncoding >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    var source = try reader.extractPageTextAnalysisAlloc(1);
+    defer source.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, source.text, "Off Page") != null);
+    try std.testing.expectEqual(@as(usize, 4), source.diagnostics.source_run_count);
+    try std.testing.expectEqual(@as(usize, 1), source.diagnostics.outside_page_runs);
+    try std.testing.expectEqual(@as(usize, 2), source.diagnostics.invisible_runs);
+
+    reader.text_extraction_policy = .page;
+    var page = try reader.extractPageTextAnalysisAlloc(1);
+    defer page.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, page.text, "Visible") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page.text, "Hidden OCR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page.text, "Transparent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page.text, "Off Page") == null);
+    try std.testing.expect(page.runs[1].output_span != null);
+    try std.testing.expect(page.runs[3].output_span == null);
+
+    reader.text_extraction_policy = .visible;
+    var visible = try reader.extractPageTextAnalysisAlloc(1);
+    defer visible.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, visible.text, "Visible") != null);
+    try std.testing.expect(std.mem.indexOf(u8, visible.text, "Hidden OCR") == null);
+    try std.testing.expect(std.mem.indexOf(u8, visible.text, "Transparent") == null);
+    try std.testing.expect(std.mem.indexOf(u8, visible.text, "Off Page") == null);
+    try std.testing.expectEqual(@as(usize, 1), visible.diagnostics.emitted_run_count);
+}
+test "reader native diagnostics ignore whitespace-only unaligned runs" {
+    const runs = [_]TextRun{
+        .{ .text = " \n\t", .x = 0, .y = 0, .font_size = 10 },
+        .{ .text = "", .x = 0, .y = 0, .font_size = 10 },
+        .{ .text = "Meaningful", .x = 0, .y = 0, .font_size = 10 },
+    };
+    var diagnostics = NativeTextDiagnostics{};
+    finalizeNativeTextDiagnostics(&runs, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.unaligned_runs);
+}
+
+test "reader text runs expose font style without retaining font names" {
+    const alloc = std.testing.allocator;
+    const content =
+        "BT /FB 10 Tf 1 0 0 1 10 70 Tm (Bold Italic) Tj " ++
+        "/FR 10 Tf 1 0 0 1 10 40 Tm (Regular) Tj ET\n";
+    const stream = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(stream);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] " ++
+            "/Resources << /Font << /FB 5 0 R /FR 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        stream,
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-BoldOblique /Encoding /StandardEncoding >>\nendobj\n",
+        "6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /StandardEncoding >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    try std.testing.expectEqual(true, analysis.runs[0].bold.?);
+    try std.testing.expectEqual(true, analysis.runs[0].italic.?);
+    try std.testing.expectEqual(false, analysis.runs[1].bold.?);
+    try std.testing.expectEqual(false, analysis.runs[1].italic.?);
+}
 
 test "reader reconstructs spaces and lines from positioned text runs" {
     const alloc = std.testing.allocator;
@@ -22253,6 +25338,32 @@ test "reader extracts full-width heading and split-operator columns without chan
     try std.testing.expectEqual(@as(usize, 13), render_runs.text_runs.len);
     try std.testing.expectEqualStrings("RIG", render_runs.text_runs[3].text);
     try std.testing.expectEqualStrings("LEF", render_runs.text_runs[5].text);
+}
+
+test "reader rotated annotations do not disable upright column recovery" {
+    const alloc = std.testing.allocator;
+    const content =
+        "BT /F1 10 Tf 1 0 0 1 220 240 Tm (RIGHT1 body text) Tj 1 0 0 1 20 240 Tm (LEFT1 body text) Tj ET\n" ++
+        "BT /F1 10 Tf 0 1 -1 0 390 20 Tm (ROTATED NOTE) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 220 220 Tm (RIGHT2 body text) Tj 1 0 0 1 20 220 Tm (LEFT2 body text) Tj ET\n" ++
+        "BT /F1 10 Tf 1 0 0 1 220 200 Tm (RIGHT3 body text) Tj 1 0 0 1 20 200 Tm (LEFT3 body text) Tj ET\n";
+    const sample = try buildTextOrderingTestPdfAlloc(alloc, content);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+
+    const left1 = std.mem.indexOf(u8, analysis.text, "LEFT1").?;
+    const left2 = std.mem.indexOf(u8, analysis.text, "LEFT2").?;
+    const left3 = std.mem.indexOf(u8, analysis.text, "LEFT3").?;
+    const right1 = std.mem.indexOf(u8, analysis.text, "RIGHT1").?;
+    const right2 = std.mem.indexOf(u8, analysis.text, "RIGHT2").?;
+    const right3 = std.mem.indexOf(u8, analysis.text, "RIGHT3").?;
+    try std.testing.expect(left1 < left2 and left2 < left3);
+    try std.testing.expect(left3 < right1 and right1 < right2 and right2 < right3);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, analysis.text, "ROTATED NOTE"));
+    try std.testing.expectEqual(@as(usize, 1), analysis.diagnostics.unsupported_ordering_runs);
 }
 
 test "reader orders text columns emitted through form xobjects" {
@@ -31577,13 +34688,14 @@ test "document bounded PDF runs share one allowance across consumes and nested f
         for (runs.items) |*run| run.deinit(a);
         runs.deinit(a);
     }
-    var parser = try PositionedTextParser.init(a, .{ .analysis = .{ .runs = &runs, .max_runs = 2 } }, .{}, &.{}, .nonzero);
+    var parser = try PositionedTextParser.init(a, .{ .analysis = .{ .runs = &runs, .max_runs = 3 } }, .{}, &.{}, .nonzero);
     defer parser.deinit();
-    try parser.consume("BT 3 Tr (Invisible) Tj 0 Tr (First) Tj ET", &.{}, &.{}, &.{});
+    try parser.consume("BT 3 Tr (Invisible) Tj 0 Tr (First) Tj ET", &.{}, &.{}, &.{}, &.{});
     const form = PageForm{ .name = @constCast("Fm"), .content = @constCast("BT (Second) Tj (Excess) Tj ET") };
-    try std.testing.expectError(error.TextRunLimitExceeded, parser.consume("/Fm Do", &.{}, &.{}, &.{form}));
-    try std.testing.expectEqual(@as(usize, 2), runs.items.len);
-    try std.testing.expectEqualStrings("Second", runs.items[1].text);
+    try std.testing.expectError(error.TextRunLimitExceeded, parser.consume("/Fm Do", &.{}, &.{}, &.{form}, &.{}));
+    try std.testing.expectEqual(@as(usize, 3), runs.items.len);
+    try std.testing.expectEqualStrings("Invisible", runs.items[0].text);
+    try std.testing.expectEqualStrings("Second", runs.items[2].text);
 }
 
 test "document bounded PDF run allocation failures release partially collected text" {
@@ -31596,7 +34708,7 @@ test "document bounded PDF run allocation failures release partially collected t
             }
             var parser = try PositionedTextParser.init(a, .{ .analysis = .{ .runs = &runs, .max_runs = 1 } }, .{}, &.{}, .nonzero);
             defer parser.deinit();
-            parser.consume("BT (First) Tj (Excess) Tj ET", &.{}, &.{}, &.{}) catch |err| switch (err) {
+            parser.consume("BT (First) Tj (Excess) Tj ET", &.{}, &.{}, &.{}, &.{}) catch |err| switch (err) {
                 error.TextRunLimitExceeded => return,
                 else => return err,
             };
@@ -31635,4 +34747,4711 @@ test "document PDF static annotation states composite through Form geometry and 
     const center = ((raster.height / 2) * raster.width + raster.width / 2) * 4;
     try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, raster.rgba[center..][0..4]);
     try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, raster.rgba[0..4]);
+}
+
+test "reader reconstructs invisible OCR spacing without painting the OCR layer" {
+    const alloc = std.testing.allocator;
+    const content = "BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (replace) Tj 1 0 0 1 60 50 Tm (all) Tj 1 0 0 1 85 50 Tm (six) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET";
+    const fonts = [_]PageFont{.{ .name = try alloc.dupe(u8, "F1"), .decoder = .{} }};
+    defer {
+        var font = fonts[0];
+        font.deinit(alloc);
+    }
+    var runs = std.ArrayList(TextRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+    var parser = try PositionedTextParser.init(alloc, .{ .analysis = .{ .runs = &runs, .max_runs = 4 } }, .{}, &.{}, .nonzero);
+    defer parser.deinit();
+    try parser.consume(content, &fonts, &.{}, &.{}, &.{});
+    try std.testing.expectEqual(@as(usize, 4), runs.items.len);
+    const text = try reconstructTextFromRunsAlloc(alloc, runs.items);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("replace all six gyroscopes\n", text);
+    for (runs.items) |run| {
+        try std.testing.expectEqual(@as(i64, 3), run.render_mode);
+        try std.testing.expectEqualStrings(run.text, text[run.output_span.?.start..run.output_span.?.end]);
+    }
+    var painted = std.ArrayList(TextRun).empty;
+    defer painted.deinit(alloc);
+    try extractTextRunsFromContentAppend(alloc, &painted, content, &fonts, &.{}, &.{});
+    try std.testing.expectEqual(@as(usize, 0), painted.items.len);
+}
+
+test "reader NASA SM3A OCR report retains searchable words in both extraction APIs" {
+    const a = std.testing.allocator;
+    var reader = try Reader.init(a, @embedFile("testdata/nasa-hubble-sm3a.pdf"));
+    defer reader.deinit();
+    const text = try reader.extractPageTextAlloc(1);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "replace all six gyroscopes") != null);
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings(text, analysis.text);
+    try std.testing.expect(analysis.runs.len > 100);
+    for (analysis.runs) |run| {
+        if (run.output_span) |span| try std.testing.expectEqualStrings(run.text, analysis.text[span.start..span.end]);
+    }
+    // OCR runs still observe the caller's working-set bound.
+    try std.testing.expectError(error.TextRunLimitExceeded, reader.extractPageTextAnalysisWithRunLimitAlloc(1, 10));
+}
+
+test "reader mixed OCR layers preserve words phrases and nonoverlapping reading order" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { content: []const u8, expected: []const u8 }{
+        .{ .content = "BT /F1 12 Tf 10 50 Td (The) Tj ET BT /F1 12 Tf 40 50 Td (cat) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (The) Tj ET BT /F1 12 Tf 3 Tr 70 50 Td (dog) Tj ET", .expected = "The\ncat\nThe\ndog\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (The ) Tj 1 0 0 1 40 50 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (The ) Tj 1 0 0 1 70 50 Tm (dog) Tj ET", .expected = "The cat\nThe dog\n" },
+        .{ .content = "BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (The ) Tj 1 0 0 1 40 50 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (The ) Tj 1 0 0 1 70 50 Tm (dog) Tj ET", .expected = "The cat\nThe dog\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (The) Tj 1 0 0 1 40 50 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (The) Tj 1 0 0 1 200 50 Tm (dog) Tj ET", .expected = "The cat\nThe dog\n" },
+        .{ .content = "BT /F1 12 Tf 10 90 Td (The) Tj 1 0 0 1 10 70 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 10 90 Td (The) Tj 1 0 0 1 10 50 Tm (dog) Tj ET", .expected = "The\ncat\nThe\ndog\n" },
+        .{ .content = "BT /F1 12 Tf 10 50 Td (replace) Tj ET BT /F1 12 Tf 110 50 Td (gyroscopes) Tj ET BT /F1 12 Tf 3 Tr 55 50 Td (all six gyroscopes) Tj ET", .expected = "replace\ngyroscopes\nall six gyroscopes\n" },
+        .{ .content = "BT /F1 12 Tf 10 50 Td (The) Tj 1 0 0 1 80 50 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (The) Tj 1 0 0 1 80 50 Tm (dog) Tj ET BT /F1 12 Tf 3 Tr 40 50 Td (very) Tj ET", .expected = "The cat\nThe dog\nvery\n" },
+        .{ .content = "BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (First name) Tj 1 0 0 1 200 90 Tm (Alice Smith) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Home city) Tj 1 0 0 1 200 70 Tm (Paris France) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Job title) Tj 1 0 0 1 200 50 Tm (Chief Engineer) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (First name) Tj 1 0 0 1 200 90 Tm (Alice Smith) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Home city) Tj 1 0 0 1 200 70 Tm (Paris France) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Job title) Tj 1 0 0 1 200 50 Tm (Chief Engineer) Tj ET ", .expected = "First name Alice Smith\nFirst name Alice Smith\nHome city Paris France\nHome city Paris France\nJob title Chief Engineer\nJob title Chief Engineer\n" },
+        .{ .content = "BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (Left prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Left prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Left prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 90 Tm (Right prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 70 Tm (Right prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 50 Tm (Right prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (Left prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Left prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Left prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 90 Tm (Right prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 70 Tm (Right prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 50 Tm (Right prose three) Tj ET ", .expected = "Left prose one\nLeft prose two\nLeft prose three\nLeft prose one\nLeft prose two\nLeft prose three\nRight prose one\nRight prose two\nRight prose three\nRight prose one\nRight prose two\nRight prose three\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (replace) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 55 50 Tm (all) Tj 1 0 0 1 80 50 Tm (six) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET", .expected = "replace gyroscopes\nall six gyroscopes\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (replace) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 55 50 Tm (all six gyroscopes) Tj ET", .expected = "replace gyroscopes\nall six gyroscopes\n" },
+        .{ .content = "BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET", .expected = "needle\nneedle\n" },
+        .{ .content = "BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET", .expected = "needle\nneedle\nneedle\n" },
+        .{ .content = "BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (f) Tj 1 0 0 1 11 50 Tm (i) Tj ET", .expected = "fi\n" },
+        .{ .content = "BT /F1 12 Tf 3 Tr 10 90 Td (first line) Tj 1 0 0 1 10 70 Tm (second line) Tj ET BT /F1 12 Tf 3 Tr 10 90 Td (first line) Tj 1 0 0 1 10 70 Tm (second line) Tj ET", .expected = "first line\nsecond line\nfirst line\nsecond line\n" },
+        .{ .content = "BT /F1 10 Tf 0 Tr 1 0 0 1 10 90 Tm (First name) Tj 1 0 0 1 200 90 Tm (Alice Smith) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 10 70 Tm (Home city) Tj 1 0 0 1 200 70 Tm (Paris France) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 10 50 Tm (Job title) Tj 1 0 0 1 200 50 Tm (Chief Engineer) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (First name) Tj 1 0 0 1 200 90 Tm (Alice Smith) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Home city) Tj 1 0 0 1 200 70 Tm (Paris France) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Job title) Tj 1 0 0 1 200 50 Tm (Chief Engineer) Tj ET ", .expected = "First name Alice Smith\nFirst name Alice Smith\nHome city Paris France\nHome city Paris France\nJob title Chief Engineer\nJob title Chief Engineer\n" },
+        .{ .content = "BT /F1 10 Tf 0 Tr 1 0 0 1 10 90 Tm (Left prose one) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 10 70 Tm (Left prose two) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 10 50 Tm (Left prose three) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 200 90 Tm (Right prose one) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 200 70 Tm (Right prose two) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 200 50 Tm (Right prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (Left prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Left prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Left prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 90 Tm (Right prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 70 Tm (Right prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 50 Tm (Right prose three) Tj ET ", .expected = "Left prose one\nLeft prose two\nLeft prose three\nLeft prose one\nLeft prose two\nLeft prose three\nRight prose one\nRight prose two\nRight prose three\nRight prose one\nRight prose two\nRight prose three\n" },
+        .{ .content = "BT /F1 12 Tf 10 90 Td (Heading) Tj ET BT /F1 12 Tf 0 Tr 10 70 Td (replace) Tj 1 0 0 1 150 70 Tm (gyroscopes) Tj ET BT /F1 12 Tf 0 Tr 10 50 Td (Footer) Tj ET BT /F1 12 Tf 3 Tr 10 90 Td (Heading) Tj ET BT /F1 12 Tf 3 Tr 70 70 Td (all six) Tj ET", .expected = "Heading\nHeading\nreplace all six gyroscopes\nFooter\n" },
+        .{ .content = "BT /F1 12 Tf 10 90 Td (first line) Tj 1 0 0 1 10 70 Tm (second line) Tj ET BT /F1 12 Tf 3 Tr 10 90 Td (first line) Tj 1 0 0 1 10 70 Tm (second line) Tj ET", .expected = "first line\nsecond line\nfirst line\nsecond line\n" },
+        .{ .content = "BT /F1 12 Tf 10 50 Td (left) Tj 1 0 0 1 200 50 Tm (right) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (left) Tj 1 0 0 1 200 50 Tm (other) Tj ET", .expected = "left right\nleft other\n" },
+        .{ .content = "BT /F1 12 Tf 10 50 Td (needle) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET", .expected = "needle\nneedle\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (alpha) Tj 1 0 0 1 60 50 Tm (beta) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (alpha) Tj 1 0 0 1 60 50 Tm (gamma) Tj ET", .expected = "alpha beta\nalpha gamma\n" },
+        .{ .content = "BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET BT /F1 12 Tf 0 Tr 10 50 Td (visible) Tj ET", .expected = "needle\nvisible\n" },
+        .{ .content = "BT /F1 12 Tf 10 90 Td (Heading) Tj ET BT /F1 12 Tf 3 Tr 10 70 Td (body words) Tj ET BT /F1 12 Tf 0 Tr 10 50 Td (Footer) Tj ET", .expected = "Heading\nbody words\nFooter\n" },
+    };
+    for (cases) |case| {
+        const bytes = try buildTextOrderingTestPdfAlloc(a, case.content);
+        defer a.free(bytes);
+        var reader = try Reader.init(a, bytes);
+        defer reader.deinit();
+        const text = try reader.extractPageTextAlloc(1);
+        defer a.free(text);
+        try std.testing.expectEqualStrings(case.expected, text);
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        try std.testing.expectEqualStrings(text, analysis.text);
+        for (analysis.runs) |run| if (run.output_span) |span| {
+            try std.testing.expectEqualStrings(run.text, text[span.start..span.end]);
+        };
+    }
+}
+
+test "reader mixed OCR layer reconstruction bounds work and remains cancellable" {
+    const a = std.testing.allocator;
+    const runs = try a.alloc(TextRun, 2050);
+    defer a.free(runs);
+    for (runs, 0..) |*run, i| run.* = .{
+        .text = "word",
+        .x = 10,
+        .y = 50,
+        .font_size = 12,
+        .advance_width = 24,
+        .ascent = 10,
+        .descent = 2,
+        .render_mode = if (i % 2 == 0) 0 else 3,
+    };
+    const order = try orderedTextRunIndicesAlloc(a, runs);
+    defer a.free(order);
+    for (order, 0..) |index, i| try std.testing.expectEqual(i, index);
+    const text = try reconstructTextFromRunsAlloc(a, runs);
+    defer a.free(text);
+    try std.testing.expectEqual(@as(usize, runs.len * "word\n".len), text.len);
+    for (runs) |run| {
+        const span = run.output_span.?;
+        try std.testing.expectEqualStrings(run.text, text[span.start..span.end]);
+    }
+    const Cancelled = struct {
+        fn check(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    // Also exercise cancellation in the bounded overlapping-layer search.
+    try std.testing.expectError(error.Canceled, orderedTextRunIndicesCancelableAlloc(a, runs[0..2048], .{ .is_cancelled_fn = Cancelled.check }));
+}
+
+test "reader transcription tracks release every partial allocation" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var runs = [_]TextRun{
+                .{ .text = "replace", .x = 10, .y = 50, .font_size = 12, .advance_width = 36, .ascent = 10, .descent = 2, .text_object_id = 0 },
+                .{ .text = "gyroscopes", .x = 110, .y = 50, .font_size = 12, .advance_width = 60, .ascent = 10, .descent = 2, .text_object_id = 0 },
+                .{ .text = "all", .x = 55, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 1, .render_mode = 3 },
+                .{ .text = "six", .x = 80, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 1, .render_mode = 3 },
+                .{ .text = "gyroscopes", .x = 110, .y = 50, .font_size = 12, .advance_width = 60, .ascent = 10, .descent = 2, .text_object_id = 1, .render_mode = 3 },
+            };
+            const text = try reconstructTextFromRunsAlloc(a, &runs);
+            defer a.free(text);
+            try std.testing.expectEqualStrings("replace gyroscopes\nall six gyroscopes\n", text);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "reader invisible copy boundaries survive the dense page fallback" {
+    const a = std.testing.allocator;
+    const runs = try a.alloc(TextRun, 2050);
+    defer a.free(runs);
+    for (runs, 0..) |*run, i| run.* = .{
+        .text = "needle",
+        .x = 10,
+        .y = 50,
+        .font_size = 12,
+        .advance_width = 36,
+        .ascent = 10,
+        .descent = 2,
+        .render_mode = 3,
+        .text_object_id = i,
+    };
+    const text = try reconstructTextFromRunsAlloc(a, runs);
+    defer a.free(text);
+    try std.testing.expectEqual(runs.len * "needle\n".len, text.len);
+    for (runs) |run| {
+        const span = run.output_span.?;
+        try std.testing.expectEqualStrings(run.text, text[span.start..span.end]);
+    }
+}
+
+test "reader ambiguous overlap keeps interleaved text objects coherent" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var runs = [_]TextRun{
+                .{ .text = "The", .x = 10, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 0 },
+                .{ .text = "very", .x = 40, .y = 50, .font_size = 12, .advance_width = 24, .ascent = 10, .descent = 2, .text_object_id = 1, .render_mode = 3 },
+                .{ .text = "cat", .x = 80, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 0 },
+                .{ .text = "The", .x = 10, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 2, .render_mode = 3 },
+                .{ .text = "dog", .x = 80, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 2, .render_mode = 3 },
+            };
+            const text = try reconstructTextFromRunsAlloc(a, &runs);
+            defer a.free(text);
+            try std.testing.expectEqualStrings("The cat\nvery\nThe dog\n", text);
+            for (runs) |source_run| {
+                const span = source_run.output_span.?;
+                try std.testing.expectEqualStrings(source_run.text, text[span.start..span.end]);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "reader policies preserve vector ActualText without synthetic glyphs in both APIs" {
+    const alloc = std.testing.allocator;
+    const sample = try buildTextOrderingTestPdfAlloc(
+        alloc,
+        "/Span << /ActualText (Vector label) >> BDC 10 100 30 30 re f EMC " ++
+            "BT /F1 12 Tf 10 50 Td (Visible) Tj ET " ++
+            "/Span << /ActualText () >> BDC 10 10 5 5 re f EMC",
+    );
+    defer alloc.free(sample);
+    var parsed = try Reader.init(alloc, sample);
+    defer parsed.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        parsed.setTextExtractionPolicy(policy);
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(alloc);
+        const text = try parsed.extractPageTextAlloc(1);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings(analysis.text, text);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Vector label"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Visible"));
+        try std.testing.expect(analysis.semantic_spans[0].entry_run == null);
+        try std.testing.expect(analysis.semantic_spans[0].output_bounds != null);
+        try std.testing.expect(analysis.semantic_spans[0].output_span != null);
+    }
+    try std.testing.expectError(error.TextRunLimitExceeded, parsed.extractPageTextAnalysisWithRunLimitAlloc(1, 0));
+}
+
+test "reader rectangular clip policy is constant space and respects transforms and restore" {
+    const alloc = std.testing.allocator;
+    const sample = try buildTextOrderingTestPdfAlloc(
+        alloc,
+        "q 1 0 0 1 20 20 cm 0 0 30 30 re W n " ++
+            "BT /F1 10 Tf 100 100 Td (Clipped) Tj ET " ++
+            "BT /F1 10 Tf 5 5 Td (Inside) Tj ET Q " ++
+            "BT /F1 10 Tf 100 100 Td (Restored) Tj ET",
+    );
+    defer alloc.free(sample);
+    var parsed = try Reader.init(alloc, sample);
+    defer parsed.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        parsed.setTextExtractionPolicy(policy);
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(alloc);
+        const text = try parsed.extractPageTextAlloc(1);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings(analysis.text, text);
+        try std.testing.expectEqual(policy == .source, std.mem.indexOf(u8, text, "Clipped") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Inside") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Restored") != null);
+        try std.testing.expectEqual(@as(usize, 1), analysis.diagnostics.outside_page_runs);
+    }
+    var path = TextClipPath{};
+    var state = TextRunState{};
+    const rect = [_]syntax.Object{ .{ .integer = 0 }, .{ .integer = 0 }, .{ .integer = 20 }, .{ .integer = 20 } };
+    path.consume(&state, "re", &rect);
+    path.consume(&state, "m", &.{});
+    path.consume(&state, "W", &.{});
+    try std.testing.expect(state.clip_box == null); // Unknown path stays conservative.
+    const empty_clip = intersectPageBoxes(
+        .{ .min_x = 0, .min_y = 0, .max_x = 20, .max_y = 20 },
+        .{ .min_x = 100, .min_y = 100, .max_x = 120, .max_y = 120 },
+    );
+    try std.testing.expect(!pageBoxesOverlap(.{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 200 }, empty_clip));
+}
+
+test "reader semantic selection preserves source ownership through cancellation" {
+    const alloc = std.testing.allocator;
+    var runs = [_]TextRun{
+        .{ .text = try alloc.dupe(u8, "source one"), .x = 300, .y = 10, .font_size = 10, .policy_excluded = true, .semantic_span_index = 0 },
+        .{ .text = try alloc.dupe(u8, "source two"), .x = 10, .y = 10, .font_size = 10, .semantic_span_index = 0 },
+    };
+    defer for (&runs) |*run| run.deinit(alloc);
+    var spans = [_]SemanticTextSpan{.{ .text = try alloc.dupe(u8, "replacement"), .run_start = 0, .run_end = 2 }};
+    defer spans[0].deinit(alloc);
+    const Probe = struct {
+        calls: usize = 0,
+        fn canceled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls >= 2;
+        }
+    };
+    var probe = Probe{};
+    try std.testing.expectError(error.Canceled, semanticTextItemsAlloc(alloc, &runs, &spans, .page, .{ .context = &probe, .is_cancelled_fn = Probe.canceled }));
+    try std.testing.expectEqualStrings("source one", runs[0].text);
+    try std.testing.expectEqualStrings("source two", runs[1].text);
+    try std.testing.expectEqualStrings("replacement", spans[0].text);
+}
+
+test "reader visibility preserves partial alpha state and nonzero alpha" {
+    const alloc = std.testing.allocator;
+    const content = "/Zero gs BT /F1 10 Tf 10 100 Td (Hidden) Tj ET " ++
+        "/Stroke gs BT /F1 10 Tf 10 80 Td (StillHidden) Tj ET " ++
+        "/Faint gs BT /F1 10 Tf 10 60 Td (Faint) Tj ET";
+    const stream = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
+    defer alloc.free(stream);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &.{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> /ExtGState << /Zero << /ca 0 >> /Stroke << /CA 1 >> /Faint << /ca 0.001 >> >> >> /Contents 4 0 R >>\nendobj\n",
+        stream,
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    });
+    defer alloc.free(sample);
+    var parsed = try Reader.init(alloc, sample);
+    defer parsed.deinit();
+    parsed.setTextExtractionPolicy(.visible);
+    var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    const text = try parsed.extractPageTextAlloc(1);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Faint\n", text);
+    try std.testing.expectEqualStrings(analysis.text, text);
+    try std.testing.expectEqual(@as(usize, 2), analysis.diagnostics.invisible_runs);
+}
+
+test "reader plain text scratch releases all allocations and returns owned output" {
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            var parsed = try Reader.init(alloc, @embedFile("../testdata/two_page_text_fixture.pdf"));
+            defer parsed.deinit();
+            parsed.setTextExtractionPolicy(.page);
+            const text = try parsed.extractPageTextAlloc(1);
+            defer alloc.free(text);
+            try std.testing.expectEqualStrings("FIRST PAGE", std.mem.trim(u8, text, &std.ascii.whitespace));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "reader semantic scopes preserve punctuation deletion and authored anchors" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { content: []const u8, expected: []const u8, glyphs: usize }{
+        .{ .content = "BT /F1 10 Tf 10 100 Td /Span << /ActualText (Hello) >> BDC (H) Tj (ello) Tj EMC (.) Tj ET", .expected = "Hello.\n", .glyphs = 3 },
+        .{ .content = "BT /F1 10 Tf 10 100 Td (pre) Tj /Span << /ActualText () >> BDC (delete) Tj EMC (post) Tj ET", .expected = "prepost\n", .glyphs = 3 },
+        .{ .content = "BT /F1 10 Tf 10 150 Td (Before) Tj ET /Span << /ActualText () >> BDC BT /F1 10 Tf 10 100 Td (delete) Tj ET EMC BT /F1 10 Tf 10 50 Td (After) Tj ET", .expected = "Before\nAfter\n", .glyphs = 3 },
+        .{ .content = "BT /F1 10 Tf 10 150 Td (Before) Tj ET /Span << /ActualText () >> BDC 10 100 20 20 re f EMC BT /F1 10 Tf 10 50 Td (After) Tj ET", .expected = "Before\nAfter\n", .glyphs = 2 },
+        .{ .content = "BT /F1 10 Tf 10 100 Td (Left) Tj ET /Span << /ActualText () >> BDC 10 50 20 20 re f EMC BT /F1 10 Tf 200 100 Td (Right) Tj ET", .expected = "Left Right\n", .glyphs = 2 },
+        .{ .content = "BT /F1 10 Tf 10 100 Td (Left) Tj ET /Span << /ActualText () >> BDC BT /F1 10 Tf 10 50 Td (delete) Tj ET EMC BT /F1 10 Tf 200 100 Td (Right) Tj ET", .expected = "Left Right\n", .glyphs = 3 },
+        .{ .content = "BT /F1 10 Tf 10 150 Td (Before) Tj ET /Span << /ActualText (Middle semantic label) >> BDC 10 100 20 20 re f EMC BT /F1 10 Tf 10 50 Td (After) Tj ET", .expected = "Before\nMiddle semantic label\nAfter\n", .glyphs = 2 },
+    };
+    for (cases) |case| {
+        const sample = try buildTextOrderingTestPdfAlloc(alloc, case.content);
+        defer alloc.free(sample);
+        var parsed = try Reader.init(alloc, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(alloc);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer alloc.free(plain);
+            try std.testing.expectEqualStrings(case.expected, analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expectEqual(case.glyphs, analysis.runs.len);
+            try std.testing.expectEqual(@as(usize, 1), analysis.semantic_spans.len);
+            for (analysis.runs) |run| try std.testing.expectEqualStrings(run.raw_text.?, run.text);
+        }
+    }
+}
+
+test "reader semantic extent projects mixed scale endpoints into the entry basis" {
+    const alloc = std.testing.allocator;
+    for ([_]f64{ 0.5, 1, 3 }) |scale| {
+        // The exit glyph has a different scale and a slightly tilted baseline.
+        // Both endpoints are in page space; advances are in each glyph's basis.
+        const runs = [_]TextRun{
+            .{ .text = "first", .semantic_span_index = 0, .x = 10, .y = 100, .a = scale, .d = scale, .font_size = 10 / scale, .advance_width = 10 / scale, .ascent = 8 / scale, .descent = 2 / scale },
+            .{ .text = "last", .semantic_span_index = 0, .x = 30, .y = 100, .a = 2, .b = 0.1, .d = 2, .font_size = 5, .advance_width = 5, .ascent = 4, .descent = 1 },
+        };
+        var spans = [_]SemanticTextSpan{.{ .text = "replacement", .run_start = 0, .run_end = runs.len }};
+        const items = try semanticTextItemsAlloc(alloc, &runs, &spans, .source, .{});
+        defer alloc.free(items);
+        try std.testing.expectEqual(@as(usize, 1), items.len);
+        try std.testing.expect(!items[0].ordering_fence);
+        try std.testing.expectApproxEqAbs(@as(f64, 30 / scale), items[0].advance_width, 0.000001);
+        try std.testing.expectApproxEqAbs(@as(f64, 40), textRunBounds(items[0]).max_x, 0.000001);
+        const exit = textRunExitGeometry(items[0], &runs, &spans);
+        try std.testing.expectEqual(@as(f64, 2), exit.a);
+        try std.testing.expectEqual(@as(f64, 5), exit.advance_width);
+    }
+}
+
+test "reader empty semantic spans with excluded glyphs do not enter layout" {
+    const alloc = std.testing.allocator;
+    const runs = [_]TextRun{.{ .text = "hidden", .x = 10, .y = 100, .font_size = 10, .policy_excluded = true }};
+    const box = PageBox{ .min_x = 10, .min_y = 10, .max_x = 11, .max_y = 11 };
+    // Visible vector paint keeps the scope eligible even though its glyph is
+    // excluded. There is no selected glyph deletion to preserve in layout.
+    var spans = [_]SemanticTextSpan{.{ .text = "", .run_start = 0, .run_end = 1, .paint = .{
+        .has_paint = true,
+        .visible_eligible = true,
+        .visible_bounds = box,
+    } }};
+    const items = try semanticTextItemsAlloc(alloc, &runs, &spans, .visible, .{});
+    defer alloc.free(items);
+    try std.testing.expectEqual(@as(usize, 0), items.len);
+    try std.testing.expect(!spans[0].policy_excluded);
+    try std.testing.expectEqual(box, spans[0].output_bounds.?);
+    try std.testing.expect(spans[0].entry_run == null);
+}
+
+test "reader semantic column ordering is invariant under uniform scaling" {
+    const alloc = std.testing.allocator;
+    const expected = "Left narrative column line one\nLeft narrative column line two\nLeft narrative column line three\n" ++
+        "Right narrative column line one\nRight narrative column line two\nRight narrative column line three\n";
+    for ([_]f64{ 0.5, 1, 3 }) |scale| {
+        for ([_]bool{ false, true }) |replacement| {
+            var content = std.ArrayList(u8).empty;
+            defer content.deinit(alloc);
+            try content.print(alloc, "{d} 0 0 {d} 0 0 cm\n", .{ scale, scale });
+            for ([_][]const u8{ "one", "two", "three" }, 0..) |number, row| {
+                for ([_][]const u8{ "Left", "Right" }, 0..) |side, column| {
+                    try content.print(alloc, "BT /F1 {d} Tf 1 0 0 1 {d} {d} Tm ", .{
+                        10 / scale,                                        (if (column == 0) @as(f64, 10) else 220) / scale,
+                        (240 - @as(f64, @floatFromInt(row)) * 20) / scale,
+                    });
+                    if (replacement and row == 0 and column == 0) {
+                        try content.appendSlice(alloc, "/Span << /ActualText (Left narrative column line one) >> BDC (Left narrative ) Tj (column line ) Tj (one) Tj EMC ");
+                    } else {
+                        try content.print(alloc, "({s} narrative column line {s}) Tj ", .{ side, number });
+                    }
+                    try content.appendSlice(alloc, "ET\n");
+                }
+            }
+            const sample = try buildTextOrderingTestPdfAlloc(alloc, content.items);
+            defer alloc.free(sample);
+            var parsed = try Reader.init(alloc, sample);
+            defer parsed.deinit();
+            inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+                parsed.setTextExtractionPolicy(policy);
+                var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+                defer analysis.deinit(alloc);
+                const plain = try parsed.extractPageTextAlloc(1);
+                defer alloc.free(plain);
+                try std.testing.expectEqualStrings(expected, analysis.text);
+                try std.testing.expectEqualStrings(expected, plain);
+                for (analysis.runs) |run| try std.testing.expectEqualStrings(run.raw_text.?, run.text);
+            }
+        }
+    }
+}
+
+test "reader empty vector semantic spans preserve column ordering and layout capacity" {
+    const alloc = std.testing.allocator;
+    const expected = "Left prose words one\nLeft prose words two\nLeft prose words three\n" ++
+        "Right prose words one\nRight prose words two\nRight prose words three\n";
+    for ([_]usize{ 0, 1, 2050 }) |empty_count| {
+        var content = std.ArrayList(u8).empty;
+        defer content.deinit(alloc);
+        for ([_][]const u8{ "one", "two", "three" }, 0..) |number, row| {
+            for ([_][]const u8{ "Left", "Right" }, 0..) |side, column| {
+                try content.print(alloc, "BT /F1 10 Tf 1 0 0 1 {d} {d} Tm ({s} prose words {s}) Tj ET\n", .{
+                    if (column == 0) @as(usize, 10) else 220, 240 - row * 20, side, number,
+                });
+                if (row == 0 and column == 0) for (0..empty_count) |_| {
+                    try content.appendSlice(alloc, "/Span << /ActualText () >> BDC 10 10 1 1 re f EMC\n");
+                };
+            }
+        }
+        const sample = try buildTextOrderingTestPdfAlloc(alloc, content.items);
+        defer alloc.free(sample);
+        var parsed = try Reader.init(alloc, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(alloc);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer alloc.free(plain);
+            try std.testing.expectEqualStrings(expected, analysis.text);
+            try std.testing.expectEqualStrings(expected, plain);
+            try std.testing.expectEqual(empty_count, analysis.semantic_spans.len);
+            for (analysis.semantic_spans) |span| {
+                try std.testing.expect(span.entry_run == null);
+                try std.testing.expect(span.output_bounds != null);
+                try std.testing.expect(span.output_span == null);
+            }
+        }
+    }
+}
+
+test "reader semantic paint policies use individual paints and conservative bounds" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { content: []const u8, page: bool, visible: bool, unknown: bool = false, outside: usize = 0, invisible: usize = 0 }{
+        .{ .content = "/Span << /ActualText (Label) >> BDC 1000 1000 10 10 re f EMC", .page = false, .visible = false, .outside = 1 },
+        // A union that crosses the page does not establish any on-page paint.
+        .{ .content = "/Span << /ActualText (Label) >> BDC -100 10 10 10 re f 1000 10 10 10 re f EMC", .page = false, .visible = false, .outside = 1 },
+        .{ .content = "/Span << /ActualText (Label) >> BDC q 1000 1000 10 10 re W n 10 10 10 10 re f Q EMC", .page = false, .visible = false, .outside = 1 },
+        .{ .content = "/Span << /ActualText (Label) >> BDC BT /F1 10 Tf 3 Tr 10 100 Td (hidden) Tj ET EMC", .page = true, .visible = false, .invisible = 1 },
+        .{ .content = "/Span << /ActualText (Label) >> BDC BT /F1 10 Tf 3 Tr 10 100 Td (hidden) Tj 0 Tr (visible) Tj ET EMC", .page = true, .visible = true },
+        // Device hairlines and unrestricted miter joins have no safe path-only bound.
+        .{ .content = "/Span << /ActualText (Label) >> BDC 0 w 1000 1000 10 10 re S EMC", .page = true, .visible = true, .unknown = true },
+        .{ .content = "/Span << /ActualText (Label) >> BDC q 100 w 410 100 10 10 re W S Q EMC", .page = true, .visible = true, .unknown = true },
+    };
+    for (cases) |case| {
+        const sample = try buildTextOrderingTestPdfAlloc(alloc, case.content);
+        defer alloc.free(sample);
+        var parsed = try Reader.init(alloc, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            const present = policy == .source or (if (policy == .page) case.page else case.visible);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(alloc);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer alloc.free(plain);
+            try std.testing.expectEqualStrings(if (present) "Label\n" else "", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expectEqual(case.outside, analysis.diagnostics.outside_page_spans);
+            try std.testing.expectEqual(case.invisible, analysis.diagnostics.invisible_spans);
+            try std.testing.expectEqual(@as(usize, if (present and case.unknown) 1 else 0), analysis.diagnostics.unpositioned_spans);
+            try std.testing.expectEqual(@as(usize, 1), analysis.semantic_spans.len);
+        }
+    }
+}
+
+test "reader semantic image evidence needs no pixel decoding and inherits form state" {
+    const alloc = std.testing.allocator;
+    const content = "/Span << /ActualText (Image label) >> BDC /Fm Do EMC";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject << /Fm 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content }),
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Resources << /XObject << /Im 6 0 R >> /ExtGState << /Hidden << /ca 0 >> >> >> /Length 41 >>\nstream\nq /Hidden gs 20 0 0 20 10 10 cm /Im Do Q\nendstream\nendobj\n",
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /Filter /Unsupported /Length 7 >>\nstream\ngarbage\nendstream\nendobj\n",
+    };
+    defer alloc.free(objects[3]);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var parsed = try Reader.init(alloc, sample);
+    defer parsed.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        parsed.setTextExtractionPolicy(policy);
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(alloc);
+        const plain = try parsed.extractPageTextAlloc(1);
+        defer alloc.free(plain);
+        try std.testing.expectEqualStrings(if (policy == .visible) "" else "Image label\n", analysis.text);
+        try std.testing.expectEqualStrings(analysis.text, plain);
+        try std.testing.expectEqual(@as(usize, 0), analysis.runs.len);
+        try std.testing.expectEqual(@as(usize, 1), analysis.diagnostics.invisible_spans);
+        try std.testing.expectEqual(PageBox{ .min_x = 10, .min_y = 10, .max_x = 30, .max_y = 30 }, analysis.semantic_spans[0].paint.source_bounds.?);
+    }
+}
+
+test "reader page clips exclude every glyph when their intersection is empty" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "q 450 100 50 50 re W n BT /F1 1000 Tf 0 0 Td (A) Tj ET Q",
+        "q W n BT /F1 10 Tf 10 100 Td (A) Tj ET Q",
+        "q 10 10 0 0 re 30 30 0 0 re W n BT /F1 100 Tf 0 0 Td (A) Tj ET Q",
+    }) |content| {
+        const sample = try buildTextOrderingTestPdfAlloc(a, content);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer a.free(plain);
+            try std.testing.expectEqualStrings(if (policy == .source) "A\n" else "", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expectEqual(@as(usize, 1), analysis.diagnostics.outside_page_runs);
+        }
+    }
+    var unknown = TextRun{ .text = "vertical", .x = 0, .y = 0, .font_size = 10, .vertical = true, .clip_box = .{ .min_x = 500, .min_y = 0, .max_x = 600, .max_y = 100 } };
+    const page = PageBox{ .min_x = 0, .min_y = 0, .max_x = 400, .max_y = 300 };
+    try std.testing.expect(textRunOutsidePageOrClip(unknown, page));
+    unknown.clip_box = .{ .min_x = 20, .max_x = 20, .min_y = 0, .max_y = 100 };
+    try std.testing.expect(textRunOutsidePageOrClip(unknown, page));
+}
+
+test "reader visible semantic text requires a potentially painting path" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "f", "S", "10 10 0 0 re f", "10 10 0 5 re 30 30 0 5 re f", "10 10 m 10 30 l f" }) |paint| {
+        const content = try std.fmt.allocPrint(a, "/Span << /ActualText (Label) >> BDC {s} EMC", .{paint});
+        defer a.free(content);
+        const sample = try buildTextOrderingTestPdfAlloc(a, content);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer a.free(plain);
+            try std.testing.expectEqualStrings(if (policy == .visible) "" else "Label\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+        }
+    }
+    // Zero-area subpaths cannot pull an exterior fill or clip onto the page.
+    const sample = try buildTextOrderingTestPdfAlloc(a, "/Span << /ActualText (Label) >> BDC 10 10 0 0 re 1000 1000 10 10 re f EMC");
+    defer a.free(sample);
+    var parsed = try Reader.init(a, sample);
+    defer parsed.deinit();
+    parsed.setTextExtractionPolicy(.page);
+    const text = try parsed.extractPageTextAlloc(1);
+    defer a.free(text);
+    try std.testing.expectEqualStrings("", text);
+}
+
+test "reader inline image bytes cannot alter scopes resources or extraction" {
+    const a = std.testing.allocator;
+    const pixels = " EI EMC BT /Fake 10 Tf (PIXELS) Tj ET /Ghost Do ";
+    const content = try std.fmt.allocPrint(a, "/Real Do BT /F1 10 Tf 10 150 Td (Before) Tj ET /Span << /ActualText (Image label) >> BDC q 20 0 0 20 10 10 cm BI /W {d} /H 1 /BPC 8 /CS /G ID {s} EI Q EMC BT /F1 10 Tf 10 50 Td (After) Tj ET", .{ pixels.len, pixels });
+    defer a.free(content);
+    var refs = try collectReferencedResourceNamesAlloc(a, content, &.{ "Tf", "Do" });
+    defer refs.deinit(a);
+    try std.testing.expect(refs.contains("Real"));
+    try std.testing.expect(!refs.contains("Ghost"));
+    var fonts = try collectReferencedFontNamesAlloc(a, content);
+    defer fonts.deinit(a);
+    try std.testing.expect(fonts.contains("F1") and !fonts.contains("Fake"));
+    const sample = try buildTextOrderingTestPdfAlloc(a, content);
+    defer a.free(sample);
+    var parsed = try Reader.init(a, sample);
+    defer parsed.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        parsed.setTextExtractionPolicy(policy);
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        const plain = try parsed.extractPageTextAlloc(1);
+        defer a.free(plain);
+        try std.testing.expectEqualStrings("Before\nImage label\nAfter\n", analysis.text);
+        try std.testing.expectEqualStrings(analysis.text, plain);
+        try std.testing.expectEqual(@as(usize, 2), analysis.runs.len);
+        try std.testing.expectEqual(@as(usize, 1), analysis.semantic_spans.len);
+        try std.testing.expectEqual(PageBox{ .min_x = 10, .min_y = 10, .max_x = 30, .max_y = 30 }, analysis.semantic_spans[0].output_bounds.?);
+    }
+    const raster_sample = try buildTextOrderingTestPdfAlloc(a, "BI /W 1 /H 1 /BPC 8 /CS /G ID x EI");
+    defer a.free(raster_sample);
+    var raster_reader = try Reader.init(a, raster_sample);
+    defer raster_reader.deinit();
+    try std.testing.expectError(error.UnsupportedPdfRendering, raster_reader.extractPageRenderRunsAlloc(1));
+}
+
+test "reader nested transparency groups retain effective visibility for every paint" {
+    const a = std.testing.allocator;
+    const group = "/Type /XObject /Subtype /Form /BBox [0 0 400 300] /Group << /S /Transparency /I true /CS /DeviceRGB >>";
+    const paints = [_][]const u8{
+        "BT /F1 10 Tf 10 150 Td (Middle) Tj ET",
+        "/Span << /ActualText (Middle) >> BDC BT /F1 10 Tf 10 150 Td (GLYPH) Tj ET EMC",
+        "/Span << /ActualText (Middle) >> BDC 10 150 30 10 re f EMC",
+        "/Span << /ActualText (Middle) >> BDC q 10 0 0 10 10 150 cm BI /W 1 /H 1 /BPC 8 /CS /G ID x EI Q EMC",
+    };
+    for ([_][]const u8{ "0", "0.001", "1" }, 0..) |outer_alpha, outer_index| {
+        for ([_][]const u8{ "0", "0.001", "1" }, 0..) |inner_alpha, inner_index| {
+            for (paints) |paint| {
+                const page_content = "BT /F1 10 Tf 10 250 Td (Before) Tj ET q /OuterAlpha gs /Outer Do Q BT /F1 10 Tf 10 50 Td (After) Tj ET";
+                const page = try std.fmt.allocPrint(a, "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources << /Font << /F1 5 0 R >> /XObject << /Outer 6 0 R >> /ExtGState << /OuterAlpha << /ca {s} >> >> >> /Contents 4 0 R >>\nendobj\n", .{outer_alpha});
+                defer a.free(page);
+                const content = try std.fmt.allocPrint(a, "4 0 obj\n<< /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ page_content.len, page_content });
+                defer a.free(content);
+                const outer_content = "q /InnerAlpha gs /Inner Do Q";
+                const outer = try std.fmt.allocPrint(a, "6 0 obj\n<< {s} /Resources << /XObject << /Inner 7 0 R >> /ExtGState << /InnerAlpha << /ca {s} >> >> >> /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ group, inner_alpha, outer_content.len, outer_content });
+                defer a.free(outer);
+                const inner = try std.fmt.allocPrint(a, "7 0 obj\n<< {s} /Resources << /Font << /F1 5 0 R >> >> /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ group, paint.len, paint });
+                defer a.free(inner);
+                const sample = try buildImageDecodeTestPdfAlloc(a, &.{
+                    "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+                    "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+                    page,
+                    content,
+                    "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+                    outer,
+                    inner,
+                });
+                defer a.free(sample);
+                var parsed = try Reader.init(a, sample);
+                defer parsed.deinit();
+                inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+                    parsed.setTextExtractionPolicy(policy);
+                    var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+                    defer analysis.deinit(a);
+                    const plain = try parsed.extractPageTextAlloc(1);
+                    defer a.free(plain);
+                    const hidden = outer_index == 0 or inner_index == 0;
+                    const expected = if (hidden and policy == .visible) "Before\nAfter\n" else "Before\nMiddle\nAfter\n";
+                    try std.testing.expectEqualStrings(expected, analysis.text);
+                    try std.testing.expectEqualStrings(expected, plain);
+                    if (analysis.semantic_spans.len > 0) {
+                        try std.testing.expectEqual(!hidden, analysis.semantic_spans[0].paint.any_visible);
+                        try std.testing.expectEqual(@as(usize, @intFromBool(hidden)), analysis.diagnostics.invisible_spans);
+                    } else {
+                        try std.testing.expectEqual(@as(usize, @intFromBool(hidden)), analysis.diagnostics.invisible_runs);
+                    }
+                    for (analysis.runs) |run| try std.testing.expectEqualStrings(run.raw_text.?, run.text);
+                }
+            }
+        }
+    }
+}
+
+test "reader suppressed ActualText properties stay within a fixed allocation budget" {
+    const a = std.testing.allocator;
+    const large = try a.alloc(u8, 256 * 1024);
+    defer a.free(large);
+    @memset(large, 'X');
+    const properties = [_]PageTextProperty{.{ .name = @constCast("Large"), .actual_text = large }};
+    // Shared input: ignored references must not retain 128 MiB of unused text.
+    const storage = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(storage);
+    inline for (.{ false, true }) |positioned| {
+        var bounded = std.heap.FixedBufferAllocator.init(storage);
+        const alloc = bounded.allocator();
+        var text = std.ArrayList(u8).empty;
+        defer text.deinit(alloc);
+        var canonical = TextContentParser.init(alloc, &text);
+        defer canonical.deinit();
+        var runs = std.ArrayList(TextRun).empty;
+        defer {
+            for (runs.items) |*run| run.deinit(alloc);
+            runs.deinit(alloc);
+        }
+        var parser = try PositionedTextParser.init(alloc, .{ .analysis = .{ .runs = &runs, .max_runs = 8 } }, .{}, &.{}, .nonzero);
+        defer parser.deinit();
+        const content = "/Span << /ActualText (Outer) >> BDC " ++
+            repeatBytesComptime("/Span /Large BDC ", 512) ++
+            "BT (glyph) Tj ET " ++ repeatBytesComptime("EMC ", 513) ++
+            "/Span /Large BDC EMC";
+        if (positioned) {
+            try parser.consume(content, &.{}, &.{}, &.{}, &properties);
+            try std.testing.expectEqual(@as(usize, 2), parser.semantic.spans().items.len);
+            try std.testing.expectEqualStrings("Outer", parser.semantic.spans().items[0].text);
+            try std.testing.expectEqualStrings(large, parser.semantic.spans().items[1].text);
+            try std.testing.expectEqualStrings("glyph", runs.items[0].text);
+            try std.testing.expectEqual(@as(usize, 0), parser.semantic.marked.items.len);
+        } else {
+            try canonical.consume(content, &.{}, &.{}, &properties, 0);
+            try std.testing.expectEqualStrings("Outer", text.items[0..5]);
+            try std.testing.expectEqualStrings(large, text.items[5..]);
+            try std.testing.expect(!canonical.active_actual_text);
+            try std.testing.expectEqual(@as(usize, 0), canonical.marked_content.items.len);
+            const forms = [_]PageForm{.{
+                .name = @constCast("Fm"),
+                .content = @constCast(repeatBytesComptime("/Span /Large BDC BT (glyph) Tj ET EMC ", 512)[0..]),
+                .text_properties = @constCast(&properties),
+            }};
+            const start = text.items.len;
+            try canonical.consume("/Span << /ActualText (Form outer) >> BDC /Fm Do", &.{}, &forms, &.{}, 0);
+            // Forms inherit the outer replacement's suppression, but retain
+            // raw glyph fallback until that outer scope actually closes.
+            try std.testing.expect(std.mem.indexOf(u8, text.items[start..], "glyph") != null);
+            try std.testing.expect(std.mem.indexOf(u8, text.items[start..], large) == null);
+            try canonical.consume("EMC", &.{}, &forms, &.{}, 0);
+            try std.testing.expectEqualStrings("Form outer", text.items[start..]);
+        }
+    }
+}
+
+test "reader inherited ActualText suppression skips unused named property copies" {
+    const a = std.testing.allocator;
+    const large = try a.alloc(u8, 256 * 1024);
+    defer a.free(large);
+    @memset(large, 'X');
+    const properties = [_]PageTextProperty{.{ .name = @constCast("Large"), .actual_text = large }};
+    const storage = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(storage);
+    var bounded = std.heap.FixedBufferAllocator.init(storage);
+    const alloc = bounded.allocator();
+    var runs = std.ArrayList(LayoutTextRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+    var evidence = SemanticPaint{};
+    var parser = try PositionedTextParser.init(alloc, .{ .layout = &runs }, .{}, &.{}, .nonzero);
+    defer parser.deinit();
+    parser.semantic.suppress = true;
+    parser.semantic.inherited = &evidence;
+    try parser.consume(repeatBytesComptime("/Span /Large BDC ", 512) ++ "BT (glyph) Tj ET " ++ repeatBytesComptime("EMC ", 512), &.{}, &.{}, &.{}, &properties);
+    try std.testing.expectEqual(@as(usize, 0), parser.semantic.spans().items.len);
+    try std.testing.expectEqual(@as(usize, 0), parser.semantic.marked.items.len);
+    try std.testing.expectEqualStrings("glyph", runs.items[0].text);
+    try std.testing.expect(evidence.has_paint and evidence.visible_eligible);
+}
+
+const TaggedTextFixture = struct {
+    content: []const u8,
+    root_type: []const u8 = "/StructTreeRoot",
+    element_page: []const u8 = "3 0 R",
+    contents: []const u8 = "4 0 R",
+    element: []const u8 = "/P 9 0 R /K 0 /ActualText (Label)",
+    document: []const u8 = "",
+    document_k: []const u8 = "7 0 R",
+    parents: []const u8 = "/Nums [0 [7 0 R]]",
+    form_content: []const u8 = "",
+    form_parent: []const u8 = "/StructParents 1",
+    page_properties: []const u8 = "/Tag << /MCID 0 >>",
+    inherit_resources: bool = false,
+    form_properties: []const u8 = "",
+    extra: []const []const u8 = &.{},
+    pages: []const u8 = "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+};
+
+fn buildTaggedTextTestPdfAlloc(a: Allocator, fixture: TaggedTextFixture) ![]u8 {
+    const page_stream = try std.fmt.allocPrint(a, "4 0 obj\n<< /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ fixture.content.len, fixture.content });
+    defer a.free(page_stream);
+    const element = try std.fmt.allocPrint(a, "7 0 obj\n<< /Type /StructElem /S /Span /Pg {s} {s} >>\nendobj\n", .{ fixture.element_page, fixture.element });
+    defer a.free(element);
+    const parents = try std.fmt.allocPrint(a, "8 0 obj\n<< {s} >>\nendobj\n", .{fixture.parents});
+    defer a.free(parents);
+    const document = try std.fmt.allocPrint(a, "9 0 obj\n<< /Type /StructElem /S /Document /P 6 0 R /K {s} {s} >>\nendobj\n", .{ fixture.document_k, fixture.document });
+    defer a.free(document);
+    const form = try std.fmt.allocPrint(a, "10 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 400 300] {s} /Resources << /Font << /F1 5 0 R >> /Properties << {s} >> >> /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ fixture.form_parent, fixture.form_properties, fixture.form_content.len, fixture.form_content });
+    defer a.free(form);
+    const resource_field = if (fixture.inherit_resources) try a.dupe(u8, "") else try std.fmt.allocPrint(a, "/Resources << /Font << /F1 5 0 R >> /Properties << {s} >> /XObject << /Fm 10 0 R >> >>", .{fixture.page_properties});
+    defer a.free(resource_field);
+    const page = try std.fmt.allocPrint(a, "3 0 obj\n<< /Type /Page /Parent 2 0 R /StructParents 0 /MediaBox [0 0 400 300] {s} /Contents {s} >>\nendobj\n", .{ resource_field, fixture.contents });
+    defer a.free(page);
+    const pages = try std.fmt.allocPrint(a, "2 0 obj\n{s}\nendobj\n", .{fixture.pages});
+    defer a.free(pages);
+    const root = try std.fmt.allocPrint(a, "6 0 obj\n<< /Type {s} /K [9 0 R] /ParentTree 8 0 R >>\nendobj\n", .{fixture.root_type});
+    defer a.free(root);
+    var objects = std.ArrayList([]const u8).empty;
+    defer objects.deinit(a);
+    try objects.appendSlice(a, &.{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /MarkInfo << /Marked true >> /StructTreeRoot 6 0 R >>\nendobj\n",
+        pages,
+        page,
+        page_stream,
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        root,
+        element,
+        parents,
+        document,
+        form,
+    });
+    try objects.appendSlice(a, fixture.extra);
+    return buildImageDecodeTestPdfAlloc(a, objects.items);
+}
+
+test "reader structure ActualText replaces glyph vector and inline image content in both APIs" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET",
+        "10 100 30 10 re f",
+        "q 20 0 0 20 10 100 cm BI /W 1 /H 1 /BPC 8 /CS /G ID x EI Q",
+    }) |paint| {
+        for ([_][]const u8{ "<< /MCID 0 >>", "/Tag" }) |property| {
+            const content = try std.fmt.allocPrint(a, "/Span {s} BDC {s} EMC", .{ property, paint });
+            defer a.free(content);
+            const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = content });
+            defer a.free(sample);
+            var parsed = try Reader.init(a, sample);
+            defer parsed.deinit();
+            inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+                parsed.setTextExtractionPolicy(policy);
+                var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+                defer analysis.deinit(a);
+                const plain = try parsed.extractPageTextAlloc(1);
+                defer a.free(plain);
+                try std.testing.expectEqualStrings("Label\n", analysis.text);
+                try std.testing.expectEqualStrings(analysis.text, plain);
+                try std.testing.expectEqual(@as(usize, 1), analysis.diagnostics.actual_text_replacements);
+                try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+                try std.testing.expect(analysis.semantic_spans[0].output_bounds != null);
+                for (analysis.runs) |run| try std.testing.expectEqualStrings("SOURCE", run.text);
+            }
+        }
+    }
+}
+
+test "reader indirect MCIDs resolve in named page and Form properties and MCR bindings" {
+    const a = std.testing.allocator;
+    const paint = "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET";
+    const cases = [_]struct { fixture: TaggedTextFixture, incomplete: bool = false }{
+        .{ .fixture = .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /MCID 11 0 R >>", .extra = &.{"11 0 obj\n0\nendobj\n"} } },
+        .{ .fixture = .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .element = "/P 9 0 R /K << /Type /MCR /Pg 3 0 R /MCID 11 0 R >> /ActualText (Label)", .extra = &.{"11 0 obj\n0\nendobj\n"} } },
+        .{ .fixture = .{ .content = "/Fm Do", .form_content = "/Span /Tag BDC " ++ paint ++ " EMC", .form_properties = "/Tag << /MCID 11 0 R >>", .element = "/P 9 0 R /K << /Type /MCR /Pg 3 0 R /Stm 10 0 R /MCID 11 0 R >> /ActualText (Label)", .parents = "/Nums [0 [] 1 [7 0 R]]", .extra = &.{"11 0 obj\n0\nendobj\n"} } },
+        .{ .fixture = .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /MCID 11 0 R >>" }, .incomplete = true },
+        .{ .fixture = .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /MCID 11 0 R >>", .extra = &.{"11 0 obj\n(wrong type)\nendobj\n"} }, .incomplete = true },
+        .{ .fixture = .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /MCID 11 0 R >>", .extra = &.{"11 0 obj\n11 0 R\nendobj\n"} }, .incomplete = true },
+        .{ .fixture = .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .element = "/P 9 0 R /K << /Type /MCR /Pg 3 0 R /MCID 11 0 R >> /ActualText (Label)", .extra = &.{"11 0 obj\n-1\nendobj\n"} }, .incomplete = true },
+        .{ .fixture = .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /MCID 11 0 R >>", .extra = &.{"11 0 obj\n" ++ repeatBytesComptime("[", 256) ++ "0" ++ repeatBytesComptime("]", 256) ++ "\nendobj\n"} }, .incomplete = true },
+    };
+    for (cases) |case| {
+        const sample = try buildTaggedTextTestPdfAlloc(a, case.fixture);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer a.free(plain);
+            try std.testing.expectEqualStrings(if (case.incomplete) "SOURCE\n" else "Label\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expectEqual(case.incomplete, analysis.diagnostics.actual_text_incomplete);
+        }
+    }
+}
+
+test "reader structure scalar references resolve number keys limits names and nested containers" {
+    const a = std.testing.allocator;
+    const content = "/Span /Tag BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC";
+    const cases = [_]TaggedTextFixture{
+        .{ .content = content, .parents = "/Nums [11 0 R [7 0 R]]", .extra = &.{"11 0 obj\n0\nendobj\n"} },
+        .{ .content = content, .parents = "/Kids [11 0 R]", .extra = &.{ "11 0 obj\n<< /Limits [12 0 R 12 0 R] /Nums [0 [7 0 R]] >>\nendobj\n", "12 0 obj\n0\nendobj\n" } },
+        .{ .content = content, .root_type = "11 0 R", .extra = &.{"11 0 obj\n/StructTreeRoot\nendobj\n"} },
+        // Both sides of a Kids search, shared scalar references, indirect
+        // arrays, and page/Form MCIDs all select the same replacement owner.
+        .{
+            .content = content ++ " /Fm Do",
+            .root_type = "13 0 R",
+            .page_properties = "/Tag << /MCID 14 0 R >>",
+            .form_content = content,
+            .form_properties = "/Tag << /MCID 14 0 R >>",
+            .form_parent = "/StructParents 15 0 R",
+            .parents = "/Kids 16 0 R",
+            .element = "/P 9 0 R /K [0 << /Type /MCR /Pg 3 0 R /Stm 10 0 R /MCID 14 0 R >>] /ActualText (Label)",
+            .extra = &.{
+                "11 0 obj\n<< /Limits 17 0 R /Nums 19 0 R >>\nendobj\n",
+                "12 0 obj\n<< /Limits 18 0 R /Nums 21 0 R >>\nendobj\n",
+                "13 0 obj\n/StructTreeRoot\nendobj\n",
+                "14 0 obj\n0\nendobj\n",
+                "15 0 obj\n1\nendobj\n",
+                "16 0 obj\n[11 0 R 12 0 R]\nendobj\n",
+                "17 0 obj\n[14 0 R 14 0 R]\nendobj\n",
+                "18 0 obj\n[15 0 R 15 0 R]\nendobj\n",
+                "19 0 obj\n[14 0 R 20 0 R]\nendobj\n",
+                "20 0 obj\n[7 0 R]\nendobj\n",
+                "21 0 obj\n[15 0 R 20 0 R]\nendobj\n",
+            },
+        },
+    };
+    for (cases) |fixture| {
+        const sample = try buildTaggedTextTestPdfAlloc(a, fixture);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("Label\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+            try std.testing.expectEqual(@as(usize, 1), analysis.semantic_spans.len);
+        }
+    }
+}
+
+test "reader structure scalar references retain empty slots and diagnose malformed values" {
+    const a = std.testing.allocator;
+    const content = "/Span /Tag BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC";
+    const cases = [_]struct { fixture: TaggedTextFixture, incomplete: bool = true }{
+        .{ .fixture = .{ .content = content, .parents = "/Nums [0 [null]]" }, .incomplete = false },
+        .{ .fixture = .{ .content = content, .parents = "/Nums [0 [11 0 R]]", .extra = &.{"11 0 obj\nnull\nendobj\n"} }, .incomplete = false },
+        .{ .fixture = .{ .content = content, .element = "/P 11 0 R /K 0 /ActualText (Label)", .extra = &.{"11 0 obj\nnull\nendobj\n"} } },
+        .{ .fixture = .{ .content = content, .parents = "/Nums [11 0 R [7 0 R]]" } },
+        .{ .fixture = .{ .content = content, .parents = "/Nums [11 0 R [7 0 R]]", .extra = &.{"11 0 obj\n(wrong type)\nendobj\n"} } },
+        .{ .fixture = .{ .content = content, .parents = "/Nums [11 0 R [7 0 R]]", .extra = &.{"11 0 obj\n11 0 R\nendobj\n"} } },
+        .{ .fixture = .{ .content = content, .parents = "/Nums [11 0 R [7 0 R] 12 0 R [7 0 R]]", .extra = &.{ "11 0 obj\n1\nendobj\n", "12 0 obj\n0\nendobj\n" } } },
+        .{ .fixture = .{ .content = content, .parents = "/Nums [11 0 R [7 0 R] 11 0 R [7 0 R]]", .extra = &.{"11 0 obj\n0\nendobj\n"} } },
+        .{ .fixture = .{ .content = content, .parents = "/Kids [11 0 R]", .extra = &.{ "11 0 obj\n<< /Limits [12 0 R 12 0 R] /Nums [0 [7 0 R]] >>\nendobj\n", "12 0 obj\nnull\nendobj\n" } } },
+        .{ .fixture = .{ .content = content, .root_type = "11 0 R" } },
+        .{ .fixture = .{ .content = content, .root_type = "11 0 R", .extra = &.{"11 0 obj\n11 0 R\nendobj\n"} } },
+    };
+    for (cases) |case| {
+        const sample = try buildTaggedTextTestPdfAlloc(a, case.fixture);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("SOURCE\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expectEqual(case.incomplete, analysis.diagnostics.actual_text_incomplete);
+        }
+    }
+}
+
+test "reader named property index preserves source order and missing name fallback" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{
+        .page_properties = "/Zulu << /ActualText (Z) >> /Alpha << /ActualText (A) >> /Middle << /ActualText (M) >>",
+        .content = "/Span /Zulu BDC BT /F1 10 Tf 10 100 Td (g) Tj ET EMC /Span /Alpha BDC BT /F1 10 Tf 10 100 Td (g) Tj ET EMC /Span /Middle BDC BT /F1 10 Tf 10 100 Td (g) Tj ET EMC /Span /Missing BDC BT /F1 10 Tf 10 100 Td (raw) Tj ET EMC",
+    });
+    defer a.free(sample);
+    var parsed = try Reader.init(a, sample);
+    defer parsed.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        parsed.setTextExtractionPolicy(policy);
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        const plain = try parsed.extractPageTextAlloc(1);
+        defer a.free(plain);
+        try std.testing.expectEqualStrings("ZAMraw\n", analysis.text);
+        try std.testing.expectEqualStrings(analysis.text, plain);
+        try std.testing.expectEqual(@as(usize, 3), analysis.semantic_spans.len);
+    }
+}
+
+test "reader structure replacements preserve precedence Unicode and deletion" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { fixture: TaggedTextFixture, expected: []const u8 }{
+        .{ .fixture = .{ .content = "/Span << /MCID 0 /ActualText (Inline) >> BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC" }, .expected = "Label\n" },
+        .{ .fixture = .{ .content = "/Span << /MCID 0 >> BDC /Span << /ActualText (Inner) >> BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC EMC", .document = "/ActualText (Ancestor)" }, .expected = "Ancestor\n" },
+        .{ .fixture = .{ .content = "/Span << /ActualText (Outer inline) >> BDC /Span << /MCID 0 >> BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC EMC" }, .expected = "Outer inline\n" },
+        .{ .fixture = .{ .content = "/Span << /MCID 0 >> BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC", .element = "/P 9 0 R /K << /Type /MCR /Pg 3 0 R /MCID 0 >> /ActualText 11 0 R", .extra = &.{"11 0 obj\n<FEFF4E16754C>\nendobj\n"} }, .expected = "世界\n" },
+        .{ .fixture = .{ .content = "BT /F1 10 Tf 10 150 Td (Before) Tj ET /Span << /MCID 0 >> BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC BT /F1 10 Tf 10 50 Td (After) Tj ET", .element = "/P 9 0 R /K 0 /ActualText ()" }, .expected = "Before\nAfter\n" },
+        .{ .fixture = .{ .content = "/Span << /MCID 0 >> BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC", .parents = "/Kids [11 0 R]", .extra = &.{"11 0 obj\n<< /Limits [0 0] /Nums [0 [7 0 R]] >>\nendobj\n"} }, .expected = "Label\n" },
+    };
+    for (cases) |case| {
+        const sample = try buildTaggedTextTestPdfAlloc(a, case.fixture);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer a.free(plain);
+            try std.testing.expectEqualStrings(case.expected, analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+    }
+}
+
+test "reader shared structure spans preserve unrelated glyphs and scope MCIDs by Form" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { fixture: TaggedTextFixture, expected: []const u8, spans: usize }{
+        .{ .fixture = .{
+            .content = "/Span << /MCID 0 >> BDC BT /F1 10 Tf 10 250 Td (First) Tj ET EMC BT /F1 10 Tf 10 200 Td (Middle) Tj ET /Span << /MCID 1 >> BDC BT /F1 10 Tf 10 150 Td (Last) Tj ET EMC BT /F1 10 Tf 10 100 Td (After) Tj ET",
+            .element = "/P 9 0 R /K [0 1] /ActualText (Label)",
+            .parents = "/Nums [0 [7 0 R 7 0 R]]",
+        }, .expected = "Label\nMiddle\nAfter\n", .spans = 1 },
+        .{ .fixture = .{
+            .content = "/Span << /MCID 0 >> BDC BT /F1 10 Tf 10 250 Td (First) Tj ET EMC /Fm Do",
+            .form_content = "/Span << /MCID 0 >> BDC BT /F1 10 Tf 10 150 Td (Last) Tj ET EMC",
+            .parents = "/Nums [0 [7 0 R] 1 [11 0 R]]",
+            .document_k = "[7 0 R 11 0 R]",
+            .extra = &.{"11 0 obj\n<< /Type /StructElem /S /Span /P 9 0 R /Pg 3 0 R /K << /Type /MCR /Pg 3 0 R /Stm 10 0 R /MCID 0 >> /ActualText (Form label) >>\nendobj\n"},
+        }, .expected = "Label\nForm label\n", .spans = 2 },
+        .{ .fixture = .{
+            .content = "/Span << /MCID 0 >> BDC BT /F1 10 Tf 10 250 Td (First) Tj ET EMC /Fm Do",
+            .form_content = "/Span << /MCID 0 >> BDC BT /F1 10 Tf 10 150 Td (Last) Tj ET EMC",
+            .parents = "/Nums [0 [7 0 R] 1 [7 0 R]]",
+            .element = "/P 9 0 R /K [0 << /Type /MCR /Pg 3 0 R /Stm 10 0 R /MCID 0 >>] /ActualText (Label)",
+        }, .expected = "Label\n", .spans = 1 },
+    };
+    for (cases) |case| {
+        const sample = try buildTaggedTextTestPdfAlloc(a, case.fixture);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer a.free(plain);
+            try std.testing.expectEqualStrings(case.expected, analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expectEqual(case.spans, analysis.semantic_spans.len);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+            for (analysis.runs) |run| if (std.mem.eql(u8, run.text, "Middle")) {
+                const output = run.output_span.?;
+                try std.testing.expectEqualStrings("Middle", analysis.text[output.start..output.end]);
+                try std.testing.expectEqual(no_semantic_span, run.semantic_span_index);
+            };
+        }
+    }
+}
+
+test "reader malformed and cross-page structures retain native text with partial diagnostics" {
+    const a = std.testing.allocator;
+    const content = "/Span << /MCID 0 >> BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC";
+    const cases = [_]TaggedTextFixture{
+        .{ .content = content, .element = "/P 9 0 R /K " ++ repeatBytesComptime("[", 256) ++ "0" ++ repeatBytesComptime("]", 256) ++ " /ActualText (Label)" },
+        .{ .content = "/Fm Do", .form_content = "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET", .form_parent = "/StructParent 2", .element = "/P 9 0 R /K << /Type /OBJR /Pg 3 0 R /Obj 10 0 R >> /ActualText (Label)", .parents = "/Nums [0 [] 2 7 0 R]" },
+        .{ .content = "/Span << /MCID 0 >> BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET" },
+        .{ .content = content, .element = "/P 7 0 R /K 0 /ActualText (Label)" },
+        .{ .content = content, .element = "/P 9 0 R /K [7 0 R] /ActualText (Label)" },
+        .{ .content = content, .parents = "/Limits [0 0] /Kids [8 0 R]" },
+        .{ .content = content, .parents = "/Nums [0 []]" },
+        .{ .content = content, .element = "/P 9 0 R /K 1 /ActualText (Wrong MCID)" },
+        .{ .content = content, .element = "/P 9 0 R /K << /Type /OBJR /Obj 10 0 R >> /ActualText (Label)" },
+        .{ .content = content, .element = "/P 9 0 R /K [0 << /Type /MCR /Pg 11 0 R /MCID 0 >>] /ActualText (Label)", .pages = "<< /Type /Pages /Count 2 /Kids [3 0 R 11 0 R] >>", .parents = "/Nums [0 [7 0 R] 2 [7 0 R]]", .extra = &.{"11 0 obj\n<< /Type /Page /Parent 2 0 R /StructParents 2 /MediaBox [0 0 400 300] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n"} },
+    };
+    for (cases) |fixture| {
+        const sample = try buildTaggedTextTestPdfAlloc(a, fixture);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        for (1..try parsed.pageCount() + 1) |page| inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(page);
+            defer analysis.deinit(a);
+            try std.testing.expectEqualStrings("SOURCE\n", analysis.text);
+            try std.testing.expect(analysis.diagnostics.actual_text_incomplete);
+        };
+    }
+}
+
+fn exerciseStructureLookupAlloc(a: Allocator, parsed: *Reader, use_document: bool, mcid: syntax.Object) !void {
+    // Force grow/shrink paths to allocate/free: platform remaps can change
+    // the allocation count between failure-sweep attempts. The outer failing
+    // allocator still checks every allocation and all ownership cleanup.
+    var no_remap = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    var budget = DecodeBudgetAllocator.initWithCumulativeLimit(no_remap.allocator(), 0, 1024 * 1024, 4 * 1024 * 1024);
+    const context = StructureResolverContext{ .reader = parsed, .budget = &budget };
+    var document = structure_text.Document{ .alloc = budget.allocator() };
+    defer document.deinit();
+    var lookup = structure_text.Lookup{
+        .document = if (use_document) &document else null,
+        .alloc = budget.allocator(),
+        .page = parsed.page_index.?[0].reference,
+        .page_parent = 0,
+        .resolver = .{ .context = &context, .root = StructureResolverContext.root, .resolve = StructureResolverContext.resolve, .check = StructureResolverContext.check, .exhausted = StructureResolverContext.exhausted },
+    };
+    defer lookup.deinit();
+    const first = (try lookup.getObject(0, &mcid)).?;
+    try std.testing.expectEqualStrings("Label", first.text);
+    const work = lookup.work;
+    for (0..4096) |_| {
+        const next = (try lookup.getObject(0, &mcid)).?;
+        try std.testing.expectEqual(first.text.ptr, next.text.ptr);
+    }
+    try std.testing.expectEqual(work, lookup.work);
+    try std.testing.expect(!lookup.incomplete);
+    lookup.max_nodes = work;
+    const cached_at_limit = (try lookup.getObject(0, &mcid)).?;
+    try std.testing.expectEqual(first.text.ptr, cached_at_limit.text.ptr);
+}
+
+test "reader structure lookup memoizes shared ancestry and owns allocations on failure" {
+    const a = std.testing.allocator;
+    inline for (.{ false, true }) |indirect| {
+        const sample = try buildTaggedTextTestPdfAlloc(a, .{
+            .content = "/Span << /MCID 0 >> BDC BT (SOURCE) Tj ET EMC",
+            .root_type = if (indirect) "12 0 R" else "/StructTreeRoot",
+            .parents = if (indirect) "/Kids [13 0 R]" else "/Nums [0 [7 0 R]]",
+            .element = if (indirect) "/P 9 0 R /K << /Type /MCR /Pg 3 0 R /MCID 11 0 R >> /ActualText (Label)" else "/P 9 0 R /K 0 /ActualText (Label)",
+            .extra = &.{ "11 0 obj\n0\nendobj\n", "12 0 obj\n/StructTreeRoot\nendobj\n", "13 0 obj\n<< /Limits [11 0 R 11 0 R] /Nums [11 0 R [7 0 R]] >>\nendobj\n" },
+        });
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        _ = try parsed.pageCount();
+        const mcid = if (indirect) syntax.Object{ .obj_ref = .{ .id = 11, .gen = 0 } } else syntax.Object{ .integer = 0 };
+        inline for (.{ false, true }) |use_document| try std.testing.checkAllAllocationFailures(a, exerciseStructureLookupAlloc, .{ &parsed, use_document, mcid });
+    }
+}
+
+test "reader structure lookup bounds memory work and cancellation without hiding native text" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "/Span << /MCID 0 >> BDC BT (SOURCE) Tj ET EMC" });
+    defer a.free(sample);
+    var parsed = try Reader.init(a, sample);
+    defer parsed.deinit();
+    _ = try parsed.pageCount();
+    for ([_]bool{ false, true }) |memory_limit| {
+        var budget = DecodeBudgetAllocator.initWithCumulativeLimit(a, 0, if (memory_limit) 128 else 1024 * 1024, 4 * 1024 * 1024);
+        const context = StructureResolverContext{ .reader = &parsed, .budget = &budget };
+        var lookup = structure_text.Lookup{
+            .alloc = budget.allocator(),
+            .page = parsed.page_index.?[0].reference,
+            .page_parent = 0,
+            .max_nodes = if (memory_limit) 100_000 else 3,
+            .resolver = .{ .context = &context, .root = StructureResolverContext.root, .resolve = StructureResolverContext.resolve, .check = StructureResolverContext.check, .exhausted = StructureResolverContext.exhausted },
+        };
+        defer lookup.deinit();
+        try std.testing.expect((try lookup.get(0, 0)) == null);
+        try std.testing.expect(lookup.incomplete);
+        if (memory_limit) try std.testing.expect(budget.limit_exceeded) else try std.testing.expect(lookup.work <= 3);
+    }
+    const Probe = struct {
+        calls: usize = 0,
+        fn canceled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls >= 10;
+        }
+    };
+    var probe = Probe{};
+    parsed.setCancellationProbe(.{ .context = &probe, .is_cancelled_fn = Probe.canceled });
+    try std.testing.expectError(error.Canceled, exerciseStructureLookupAlloc(a, &parsed, true, .{ .integer = 0 }));
+    try std.testing.expect(probe.calls >= 10);
+}
+
+test "reader overlapping structure intervals select glyph membership in linear work" {
+    const a = std.testing.allocator;
+    const runs = try a.alloc(TextRun, 5000);
+    defer a.free(runs);
+    for (runs, 0..) |*run, index| run.* = .{ .text = "g", .x = @floatFromInt(index), .y = 100, .font_size = 10, .advance_width = 1, .ascent = 8, .descent = 2, .semantic_span_index = index % 1000 };
+    const spans = try a.alloc(SemanticTextSpan, 1000);
+    defer a.free(spans);
+    for (spans, 0..) |*span, index| span.* = .{ .text = "replacement", .run_start = index, .run_end = runs.len, .multiple_scopes = true };
+    const Probe = struct {
+        calls: usize = 0,
+        fn canceled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return false;
+        }
+    };
+    var probe = Probe{};
+    const items = try semanticTextItemsAlloc(a, runs, spans, .source, .{ .context = &probe, .is_cancelled_fn = Probe.canceled });
+    defer a.free(items);
+    try std.testing.expectEqual(spans.len, items.len);
+    try std.testing.expect(probe.calls < 100);
+    for (spans, 0..) |span, index| {
+        try std.testing.expectEqual(index, span.entry_run.?);
+        try std.testing.expectEqual(4000 + index, span.exit_run.?);
+    }
+}
+
+test "reader structure metadata is reused across extractions and isolated in render forks" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "/Span << /MCID 0 >> BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC" });
+    defer a.free(sample);
+    var parsed = try Reader.init(a, sample);
+    defer parsed.deinit();
+    const first = try parsed.extractPageTextAlloc(1);
+    defer a.free(first);
+    try std.testing.expectEqualStrings("Label\n", first);
+    const cache = parsed.structure_cache.?;
+    const retained = cache.budget.cumulative_growth_bytes;
+    for (0..4) |_| {
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        try std.testing.expectEqualStrings(first, analysis.text);
+        try std.testing.expectEqual(retained, cache.budget.cumulative_growth_bytes);
+        try std.testing.expectEqual(cache.budget.live_bytes + @sizeOf(StructureMetadataCache), cache.shared_budget.live_bytes);
+    }
+    var template = try parsed.prepareRenderForkTemplate(a, .{});
+    defer template.deinit();
+    var fork = try template.instantiate(a, .{});
+    defer fork.deinit();
+    try std.testing.expect(fork.structure_cache == null);
+    const fork_text = try fork.extractPageTextAlloc(1);
+    defer a.free(fork_text);
+    try std.testing.expectEqualStrings(first, fork_text);
+    try std.testing.expect(fork.structure_cache.? != parsed.structure_cache.?);
+    try std.testing.expectEqual(retained, cache.budget.cumulative_growth_bytes);
+}
+
+test "reader decode limit changes reset structure metadata and unchanged limits retain it" {
+    const a = std.testing.allocator;
+    const label = try a.alloc(u8, 32 * 1024);
+    defer a.free(label);
+    @memset(label, 'X');
+    const element = try std.fmt.allocPrint(a, "/P 9 0 R /K 0 /ActualText ({s})", .{label});
+    defer a.free(element);
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "/Span /Tag BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC", .element = element });
+    defer a.free(sample);
+    const low_limits = DecodeLimits{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 8 * 1024 };
+    const high_limits = DecodeLimits{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 256 * 1024 };
+    var parsed = try Reader.initWithDecodeLimits(a, sample, low_limits);
+    defer parsed.deinit();
+    var low = try parsed.extractPageTextAnalysisAlloc(1);
+    defer low.deinit(a);
+    try std.testing.expectEqualStrings("SOURCE\n", low.text);
+    try std.testing.expect(low.diagnostics.actual_text_incomplete);
+
+    try parsed.setDecodeLimits(high_limits);
+    try std.testing.expect(parsed.structure_cache == null);
+    var high = try parsed.extractPageTextAnalysisAlloc(1);
+    defer high.deinit(a);
+    try std.testing.expectEqualStrings(label, std.mem.trimEnd(u8, high.text, "\n"));
+    try std.testing.expect(!high.diagnostics.actual_text_incomplete);
+    const cache = parsed.structure_cache.?;
+    const retained = cache.budget.cumulative_growth_bytes;
+    try parsed.setDecodeLimits(high_limits);
+    try std.testing.expectEqual(cache, parsed.structure_cache.?);
+    const plain = try parsed.extractPageTextAlloc(1);
+    defer a.free(plain);
+    try std.testing.expectEqualStrings(high.text, plain);
+    try std.testing.expectEqual(retained, cache.budget.cumulative_growth_bytes);
+    try std.testing.expectError(error.InvalidPdfDecodeLimits, parsed.setDecodeLimits(.{ .max_working_set_bytes = 0 }));
+    try std.testing.expectEqual(cache, parsed.structure_cache.?);
+    try std.testing.expectEqual(high_limits, parsed.decode_limits);
+
+    // Lowering a limit releases retained metadata before a fresh lookup.
+    try parsed.setDecodeLimits(low_limits);
+    try std.testing.expect(parsed.structure_cache == null);
+    var lowered = try parsed.extractPageTextAnalysisAlloc(1);
+    defer lowered.deinit(a);
+    try std.testing.expectEqualStrings(low.text, lowered.text);
+    try std.testing.expect(lowered.diagnostics.actual_text_incomplete);
+    try std.testing.expectEqual(low_limits.max_working_set_bytes, parsed.structure_cache.?.shared_budget.max_live_bytes);
+    try std.testing.expect(parsed.structure_cache.?.shared_budget.live_bytes <= low_limits.max_working_set_bytes);
+    // Returned analyses own their replacement bytes independently of the cache.
+    try std.testing.expectEqualStrings(label, high.semantic_spans[0].text);
+
+    // A stream ceiling change must also discard previously decoded metadata.
+    try parsed.setDecodeLimits(high_limits);
+    const recovered = try parsed.extractPageTextAlloc(1);
+    defer a.free(recovered);
+    try std.testing.expectEqualStrings(high.text, recovered);
+    try parsed.setDecodeLimits(.{ .max_decoded_stream_bytes = 32 * 1024, .max_working_set_bytes = high_limits.max_working_set_bytes });
+    try std.testing.expect(parsed.structure_cache == null);
+}
+
+test "reader bounded metadata resolution keeps encryption registry mutations local" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "" });
+    defer a.free(sample);
+    var parsed = try Reader.init(a, sample);
+    defer parsed.deinit();
+    // The Form header has no encrypted strings. A synthetic encryption context
+    // exercises stream registration without requiring pixel/stream decryption.
+    parsed.encryption = .{ .file_key = @splat(0), .file_key_len = 5, .method = .rc4 };
+    var budget = DecodeBudgetAllocator.init(a, 0, 1024 * 1024);
+    const context = StructureResolverContext{ .reader = &parsed, .budget = &budget };
+    const raw = syntax.Object{ .obj_ref = .{ .id = 10, .gen = 0 } };
+    // Metadata resolution has no payload range. Explicit full reads must
+    // still isolate their temporary encrypted-stream registry from the source.
+    inline for (.{ syntax.Projection.structure_metadata, .full }) |projection| {
+        var object = if (projection == .full)
+            try context.resolveProjected(budget.allocator(), &raw, .full)
+        else
+            try StructureResolverContext.resolve(&context, budget.allocator(), &raw);
+        defer object.deinit(budget.allocator());
+        try std.testing.expect(if (projection == .full) object == .stream else object == .stream_header);
+        if (projection != .full) try std.testing.expectError(error.NotAStream, parsed.readRawStreamData(&object));
+    }
+    try std.testing.expectEqual(@as(u64, 0), parsed.encrypted_stream_generation);
+    try std.testing.expectEqual(@as(usize, 0), parsed.encrypted_streams.count());
+    try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+}
+
+test "reader canonical scope state is constant time and cancellation crosses consumes" {
+    const a = std.testing.allocator;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(a);
+    var parser = TextContentParser.init(a, &out);
+    defer parser.deinit();
+    try parser.consume(&repeatBytesComptime("/Layer BMC ", 4096), &.{}, &.{}, &.{}, 0);
+    try parser.consume(&repeatBytesComptime("/Span << /ActualText (X) >> BDC EMC ", 256), &.{}, &.{}, &.{}, 0);
+    try std.testing.expectEqual(@as(usize, 256), out.items.len);
+    try std.testing.expect(!parser.active_actual_text);
+    try parser.consume("/Span << /ActualText (Outer) >> BDC", &.{}, &.{}, &.{}, 0);
+    try std.testing.expect(parser.active_actual_text);
+    try parser.consume("/Span << /ActualText (Inner) >> BDC EMC EMC " ++ repeatBytesComptime("EMC ", 4096), &.{}, &.{}, &.{}, 0);
+    try std.testing.expectEqualStrings("Outer", out.items[256..]);
+    try std.testing.expect(!parser.active_actual_text);
+    try std.testing.expectEqual(@as(usize, 0), parser.marked_content.items.len);
+    const Cancel = struct {
+        fn canceled(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    parser.cancellation = .{ .is_cancelled_fn = Cancel.canceled };
+    try std.testing.expectError(error.Canceled, parser.consume("BT (ignored) Tj ET", &.{}, &.{}, &.{}, 0));
+}
+
+test "reader inline LZW framing agrees with decoding across code widths and resets" {
+    const a = std.testing.allocator;
+    const Encoder = struct {
+        bytes: []u8,
+        bit: usize = 0,
+        fn code(self: *@This(), value: u16, width: u4) void {
+            var shift: usize = width;
+            while (shift > 0) {
+                shift -= 1;
+                const bit: u8 = @intCast((value >> @as(u4, @intCast(shift))) & 1);
+                self.bytes[self.bit / 8] |= bit << @as(u3, @intCast(7 - self.bit % 8));
+                self.bit += 1;
+            }
+        }
+    };
+    for ([_]i64{ 0, 1 }) |early_change| {
+        const count = 7000;
+        const encoded = try a.alloc(u8, (count + 4) * 12 / 8 + 1);
+        defer a.free(encoded);
+        @memset(encoded, 0);
+        var encoder = Encoder{ .bytes = encoded };
+        var width: u4 = 9;
+        var next: usize = 258;
+        var previous = false;
+        encoder.code(256, width);
+        for (0..count) |index| {
+            if (index == 1500) {
+                encoder.code(256, width);
+                width = 9;
+                next = 258;
+                previous = false;
+            }
+            encoder.code(@as(u8, @truncate(index)), width);
+            if (previous and next < 4096) {
+                next += 1;
+                if (width < 12 and next >= (@as(usize, 1) << width) - @as(usize, @intCast(early_change))) width += 1;
+            }
+            previous = true;
+        }
+        encoder.code(257, width);
+        const bytes = encoded[0 .. (encoder.bit + 7) / 8];
+        const entries = [_]syntax.DictEntry{.{ .key = @constCast("EarlyChange"), .value = .{ .integer = early_change } }};
+        const parameters = syntax.Object{ .dict = @constCast(&entries) };
+        const decoded = try lzwDecodeAlloc(a, bytes, &parameters, count, count, .{});
+        defer a.free(decoded);
+        try std.testing.expectEqual(@as(usize, count), decoded.len);
+        for (decoded, 0..) |byte, index| try std.testing.expectEqual(@as(u8, @truncate(index)), byte);
+        const content = try std.fmt.allocPrint(a, "BI /W {d} /H 1 /F /LZW /DP << /EarlyChange {d} >> ID {s} EI BT (After) Tj ET", .{ count, early_change, bytes });
+        defer a.free(content);
+        var scanner = syntax.Scanner.init(a, content);
+        defer scanner.deinit();
+        var bi = (try readContentLexeme(&scanner)).?;
+        defer syntax.Scanner.freeLexeme(a, &bi);
+        try std.testing.expectEqualStrings("BI", bi.keyword);
+        var after = (try readContentLexeme(&scanner)).?;
+        defer syntax.Scanner.freeLexeme(a, &after);
+        try std.testing.expectEqualStrings("BT", after.keyword);
+    }
+}
+
+test "reader optional null metadata matches omission and preserves intentional deletion" {
+    const a = std.testing.allocator;
+    const paint = "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET";
+    const content = "/Span /Tag BDC " ++ paint ++ " EMC";
+    const cases = [_]struct { fixture: TaggedTextFixture, expected: []const u8 = "Label\n" }{
+        .{ .fixture = .{ .content = content, .document = "/ActualText null" } },
+        .{ .fixture = .{ .content = content, .document = "/ActualText 11 0 R", .extra = &.{"11 0 obj\nnull\nendobj\n"} } },
+        .{ .fixture = .{ .content = content, .element = "/P 9 0 R /K 0 /ActualText null" }, .expected = "SOURCE\n" },
+        .{ .fixture = .{ .content = content, .element = "/P 9 0 R /K 0 /ActualText 11 0 R", .extra = &.{"11 0 obj\nnull\nendobj\n"} }, .expected = "SOURCE\n" },
+        .{ .fixture = .{ .content = content, .element_page = "null", .element = "/P 9 0 R /K << /Type /MCR /Pg 3 0 R /MCID 0 >> /ActualText (Label)" } },
+        .{ .fixture = .{ .content = content, .element_page = "11 0 R", .element = "/P 9 0 R /K << /Type /MCR /Pg 3 0 R /MCID 0 >> /ActualText (Label)", .extra = &.{"11 0 obj\nnull\nendobj\n"} } },
+        .{ .fixture = .{ .content = content, .element = "/P 9 0 R /K << /Type /MCR /Pg null /MCID 0 >> /ActualText (Label)" } },
+        .{ .fixture = .{ .content = content, .element = "/P 9 0 R /K << /Type /MCR /Pg 11 0 R /MCID 0 >> /ActualText (Label)", .extra = &.{"11 0 obj\nnull\nendobj\n"} } },
+        .{ .fixture = .{ .content = content, .element = "/P 9 0 R /K << /Type /MCR /Stm null /MCID 0 >> /ActualText (Label)" } },
+        .{ .fixture = .{ .content = content, .element = "/P 9 0 R /K << /Type /MCR /Stm 11 0 R /MCID 0 >> /ActualText (Label)", .extra = &.{"11 0 obj\nnull\nendobj\n"} } },
+        .{ .fixture = .{ .content = "/Span << /MCID null /ActualText (Label) >> BDC " ++ paint ++ " EMC" } },
+        .{ .fixture = .{ .content = content, .page_properties = "/Tag << /MCID null /ActualText (Label) >>" } },
+        .{ .fixture = .{ .content = content, .page_properties = "/Tag << /MCID 11 0 R /ActualText (Label) >>", .extra = &.{"11 0 obj\nnull\nendobj\n"} } },
+        .{ .fixture = .{ .content = "/Span << /ActualText null >> BDC " ++ paint ++ " EMC" }, .expected = "SOURCE\n" },
+        .{ .fixture = .{ .content = content, .page_properties = "/Tag << /ActualText null >>" }, .expected = "SOURCE\n" },
+        .{ .fixture = .{ .content = content, .page_properties = "/Tag << /ActualText 11 0 R >>", .extra = &.{"11 0 obj\nnull\nendobj\n"} }, .expected = "SOURCE\n" },
+        .{ .fixture = .{ .content = "/Span << /ActualText () >> BDC " ++ paint ++ " EMC" }, .expected = "" },
+        .{ .fixture = .{ .content = content, .element = "/P 9 0 R /K 0 /ActualText ()" }, .expected = "" },
+        .{ .fixture = .{ .content = content, .page_properties = "/Tag << /ActualText () >>" }, .expected = "" },
+        .{ .fixture = .{ .content = "/Span << /ActualText (Label) >> BDC " ++ paint, .contents = "[4 0 R 11 0 R]", .extra = &.{"11 0 obj\n<< /Length 3 >>\nstream\nEMC\nendstream\nendobj\n"} } },
+    };
+    for (cases) |case| {
+        const sample = try buildTaggedTextTestPdfAlloc(a, case.fixture);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer a.free(plain);
+            try std.testing.expectEqualStrings(case.expected, analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+    }
+}
+
+test "reader malformed inline replacements retain glyphs and report incomplete semantics" {
+    const a = std.testing.allocator;
+    const paint = "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET";
+    const cases = [_]TaggedTextFixture{
+        .{ .content = "/Span << /ActualText (Label) >> BDC " ++ paint },
+        .{ .content = "/Span /Tag BDC " ++ paint, .page_properties = "/Tag << /ActualText (Label) >>" },
+        .{ .content = "/Fm Do", .form_content = "/Span /Tag BDC " ++ paint, .form_properties = "/Tag << /ActualText (Label) >>" },
+        .{ .content = "/Span << /ActualText 123 >> BDC " ++ paint ++ " EMC" },
+        .{ .content = "/Span << /ActualText <FEFFD800> >> BDC " ++ paint ++ " EMC" },
+        .{ .content = "/Span << /ActualText <FEFF004100> >> BDC " ++ paint ++ " EMC" },
+        .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /ActualText <FEFF004100> >>" },
+        .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /ActualText 11 0 R >>", .extra = &.{"11 0 obj\n<FEFF004100>\nendobj\n"} },
+        .{ .content = "/Span << /MCID 0 >> BDC " ++ paint ++ " EMC", .element = "/P 9 0 R /K 0 /ActualText <FEFF004100>" },
+        .{ .content = "/Fm Do", .form_content = "/Span /Tag BDC " ++ paint ++ " EMC", .form_properties = "/Tag << /ActualText <FEFF004100> >>" },
+        .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /ActualText 123 >>" },
+        .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /ActualText <FEFFD800> >>" },
+        .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /ActualText 11 0 R >>", .extra = &.{"11 0 obj\n<FEFFD800>\nendobj\n"} },
+        .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /ActualText 11 0 R >>" },
+        .{ .content = "/Span /Tag BDC /Span << /ActualText (Inner) >> BDC " ++ paint ++ " EMC" },
+        .{ .content = "/Fm Do", .form_content = "/Span /Tag BDC " ++ paint ++ " EMC", .form_properties = "/Tag << /ActualText <FEFFD800> >>" },
+    };
+    for (cases) |fixture| {
+        const sample = try buildTaggedTextTestPdfAlloc(a, fixture);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("SOURCE\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(analysis.diagnostics.actual_text_incomplete);
+            try std.testing.expectEqual(@as(usize, 1), analysis.runs.len);
+            try std.testing.expectEqualStrings("SOURCE", analysis.runs[0].text);
+        }
+    }
+}
+
+fn exerciseDeferredPropertyText(a: Allocator, parsed: *Reader, use_document: bool) !void {
+    var no_remap = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    var budget = DecodeBudgetAllocator.initWithCumulativeLimit(no_remap.allocator(), 0, 1024 * 1024, 4 * 1024 * 1024);
+    const context = StructureResolverContext{ .reader = parsed, .budget = &budget };
+    var document = structure_text.Document{ .alloc = budget.allocator() };
+    defer document.deinit();
+    var lookup = structure_text.Lookup{
+        .alloc = budget.allocator(),
+        .document = if (use_document) &document else null,
+        .page = null,
+        .resolver = .{ .context = &context, .root = StructureResolverContext.root, .resolve = StructureResolverContext.resolve, .check = StructureResolverContext.check, .exhausted = StructureResolverContext.exhausted },
+    };
+    defer lookup.deinit();
+    const ref = syntax.Object{ .obj_ref = .{ .id = 11, .gen = 0 } };
+    const text = (try lookup.propertyText(&ref)).?;
+    try std.testing.expectEqualStrings("世界", text);
+    const retained = budget.cumulative_growth_bytes;
+    const work = lookup.work;
+    lookup.max_nodes = work;
+    for (0..4096) |_| {
+        const next = (try lookup.propertyText(&ref)).?;
+        try std.testing.expectEqual(text.ptr, next.ptr);
+    }
+    try std.testing.expectEqual(retained, budget.cumulative_growth_bytes);
+    try std.testing.expectEqual(@as(usize, 1), lookup.property_text.count());
+    try std.testing.expect(!lookup.incomplete);
+}
+
+test "reader deferred named replacements skip overrides and share decoded text with bounded ownership" {
+    const a = std.testing.allocator;
+    const paint = "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET";
+    for ([_][]const u8{ "<FEFFD800>", "123", "11 0 R" }) |value| {
+        const props = try std.fmt.allocPrint(a, "/Tag << /ActualText {s} >>", .{value});
+        defer a.free(props);
+        const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "/Span << /ActualText (Outer) >> BDC /Span /Tag BDC " ++ paint ++ " EMC EMC", .page_properties = props });
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            try std.testing.expectEqualStrings("Outer\n", analysis.text);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+            try std.testing.expectEqual(@as(usize, 0), parsed.structure_cache.?.document.objects.count());
+        }
+    }
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = paint, .extra = &.{"11 0 obj\n<FEFF4E16754C>\nendobj\n"} });
+    defer a.free(sample);
+    var parsed = try Reader.init(a, sample);
+    defer parsed.deinit();
+    inline for (.{ false, true }) |use_document| try std.testing.checkAllAllocationFailures(a, exerciseDeferredPropertyText, .{ &parsed, use_document });
+}
+
+test "reader selected malformed property dictionaries diagnose fallback while overrides stay clean" {
+    const a = std.testing.allocator;
+    const paint = "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET";
+    const content = "/Span /Tag BDC " ++ paint ++ " EMC";
+    const cases = [_]struct { properties: []const u8, extra: []const []const u8 = &.{}, incomplete: bool = true }{
+        .{ .properties = "" },
+        .{ .properties = "/Tag 11 0 R" },
+        .{ .properties = "/Tag 11 0 R", .extra = &.{"11 0 obj\n123\nendobj\n"} },
+        .{ .properties = "/Tag 11 0 R", .extra = &.{"11 0 obj\n11 0 R\nendobj\n"} },
+        .{ .properties = "/Tag null" },
+        .{ .properties = "/Tag 123" },
+        .{ .properties = "/Tag << /Lang (en) >>", .incomplete = false },
+        .{ .properties = "/Tag << /ActualText null /MCID null >>", .incomplete = false },
+    };
+    for (cases) |case| {
+        inline for (.{ false, true }) |form| inline for (.{ false, true }) |suppressed| {
+            const selected = if (suppressed) "/Span << /ActualText (Outer) >> BDC " ++ content ++ " EMC" else content;
+            const fixture = TaggedTextFixture{
+                .content = if (form) "/Fm Do" else selected,
+                .page_properties = if (form) "" else case.properties,
+                .form_content = if (form) selected else "",
+                .form_properties = if (form) case.properties else "",
+                .extra = case.extra,
+            };
+            const sample = try buildTaggedTextTestPdfAlloc(a, fixture);
+            defer a.free(sample);
+            var parsed = try Reader.init(a, sample);
+            defer parsed.deinit();
+            inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+                parsed.setTextExtractionPolicy(policy);
+                var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+                defer analysis.deinit(a);
+                const plain = try parsed.extractPageTextAlloc(1);
+                defer a.free(plain);
+                try std.testing.expectEqualStrings(if (suppressed) "Outer\n" else "SOURCE\n", analysis.text);
+                try std.testing.expectEqualStrings(analysis.text, plain);
+                try std.testing.expectEqual(case.incomplete and !suppressed, analysis.diagnostics.actual_text_incomplete);
+            }
+        };
+    }
+}
+
+fn exerciseSharedTextResources(a: Allocator, parsed: *Reader) !void {
+    var no_remap = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    var budget = DecodeBudgetAllocator.init(no_remap.allocator(), 0, 1024 * 1024);
+    var cache = TextResourceCache{ .budget = &budget };
+    defer cache.deinit();
+    const raw = syntax.Object{ .obj_ref = .{ .id = 11, .gen = 0 } };
+    const first = try cache.resources(parsed, &raw);
+    const first_properties = try cache.resolve(parsed, &raw, .resource_properties);
+    const expected = try cache.property(parsed, &first_properties, "Tag");
+    const pointer = expected.actual_text.?.string.ptr;
+    const retained = budget.cumulative_growth_bytes;
+    for (0..512) |_| {
+        _ = try cache.resources(parsed, &raw);
+        const property = try cache.property(parsed, &first_properties, "Tag");
+        try std.testing.expectEqual(pointer, property.actual_text.?.string.ptr);
+        try std.testing.expect(!property.invalid);
+        const invalid = try cache.property(parsed, &first_properties, "Bad");
+        try std.testing.expect(invalid.invalid);
+    }
+    try std.testing.expectEqual(@as(usize, 3), cache.objects.count());
+    try std.testing.expectEqual(@as(usize, 1), cache.scopes.count());
+    // The one invalid reference is memoized too. Repeated names never resolve,
+    // clone, or retain another copy of the resource or property dictionaries.
+    const after_invalid = budget.cumulative_growth_bytes;
+    _ = try cache.property(parsed, &first_properties, "Bad");
+    try std.testing.expectEqual(after_invalid, budget.cumulative_growth_bytes);
+    try std.testing.expect(after_invalid >= retained);
+    var scoped = parsed.*;
+    scoped.alloc = no_remap.allocator();
+    for ([_][]const u8{ "/Span /Tag BDC EMC", "/Span /Tag BDC EMC /Span /Missing BDC EMC /Span /Bad BDC EMC" }) |content| {
+        const properties = try scoped.collectTextPropertiesFromResourcesAlloc(&first, content, &cache);
+        defer {
+            for (properties) |*value| value.deinit(scoped.alloc);
+            scoped.alloc.free(properties);
+        }
+        const valid = findTextProperty(properties, "Tag").?;
+        try std.testing.expectEqual(pointer, (try valid.value()).actual_text.?.string.ptr);
+        try std.testing.expect(!(try valid.value()).invalid);
+        if (properties.len > 1) {
+            try std.testing.expect((try findTextProperty(properties, "Missing").?.value()).invalid);
+            try std.testing.expect((try findTextProperty(properties, "Bad").?.value()).invalid);
+        }
+    }
+    var fonts = try collectReferencedFontNamesAlloc(scoped.alloc, "/Tag /F1 10 Tf /F1 12 Tf");
+    defer fonts.deinit(scoped.alloc);
+    try std.testing.expectEqual(@as(usize, 1), fonts.names.count());
+    try std.testing.expect(fonts.contains("F1"));
+    const Probe = struct {
+        fn canceled(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    scoped.setCancellationProbe(.{ .is_cancelled_fn = Probe.canceled });
+    try std.testing.expectError(error.Canceled, cache.resources(&scoped, &raw));
+}
+
+test "reader shared resource cache owns borrows memoizes failures and releases allocation failures" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{
+        .content = "",
+        .extra = &.{"11 0 obj\n<< /Properties << /Tag << /ActualText (Shared) >> /Bad 12 0 R /Unused0 << >> /Unused1 << >> /Unused2 << >> /Unused3 << >> /Unused4 << >> /Unused5 << >> >> >>\nendobj\n"},
+    });
+    defer a.free(sample);
+    var parsed = try Reader.init(a, sample);
+    defer parsed.deinit();
+    try std.testing.checkAllAllocationFailures(a, exerciseSharedTextResources, .{&parsed});
+}
+
+fn buildSharedTextResourceTestPdfAlloc(a: Allocator, count: usize, label: []const u8) ![]u8 {
+    const objects = try a.alloc([]const u8, count + 6);
+    defer a.free(objects);
+    var initialized: usize = 0;
+    defer for (objects[0..initialized]) |object| a.free(object);
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(a);
+    var xobjects = std.ArrayList(u8).empty;
+    defer xobjects.deinit(a);
+    try content.appendSlice(a, "/Span << /ActualText (Outer) >> BDC ");
+    for (0..count) |index| {
+        try content.print(a, "/Fm{d} Do ", .{index});
+        try xobjects.print(a, "/Fm{d} {d} 0 R ", .{ index, index + 6 });
+    }
+    try content.appendSlice(a, "EMC");
+    for (objects, 0..) |*slot, index| {
+        slot.* = switch (index) {
+            0 => try a.dupe(u8, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"),
+            1 => try a.dupe(u8, "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n"),
+            2 => try std.fmt.allocPrint(a, "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources << /Font << /F1 5 0 R >> /XObject << {s} >> >> /Contents 4 0 R >>\nendobj\n", .{xobjects.items}),
+            3 => try std.fmt.allocPrint(a, "4 0 obj\n<< /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.items.len, content.items }),
+            4 => try a.dupe(u8, "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"),
+            else => if (index == count + 5)
+                try std.fmt.allocPrint(a, "{d} 0 obj\n<< /Font << /F1 5 0 R >> /Properties << /Tag << /ActualText ({s}) >> >> >>\nendobj\n", .{ index + 1, label })
+            else blk: {
+                const form = "/Span /Tag BDC BT /F1 10 Tf 10 100 Td (g) Tj ET EMC";
+                break :blk try std.fmt.allocPrint(a, "{d} 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 400 300] /Resources {d} 0 R /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ index + 1, count + 6, form.len, form });
+            },
+        };
+        initialized += 1;
+    }
+    return buildImageDecodeTestPdfAlloc(a, objects);
+}
+
+test "reader suppressed shared Form properties stay within a fixed live allocation budget" {
+    const a = std.testing.allocator;
+    const label = try a.alloc(u8, 256 * 1024);
+    defer a.free(label);
+    @memset(label, 'X');
+    const sample = try buildSharedTextResourceTestPdfAlloc(a, 128, label);
+    defer a.free(sample);
+    var budget = DecodeBudgetAllocator.init(a, 0, 8 * 1024 * 1024);
+    const bounded = budget.allocator();
+    {
+        var parsed = try Reader.init(bounded, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(bounded);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer bounded.free(plain);
+            try std.testing.expectEqualStrings("Outer\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expectEqual(@as(usize, 1), analysis.semantic_spans.len);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+    try std.testing.expect(!budget.limit_exceeded);
+}
+
+test "reader font fallback keeps byte strings distinct from strict replacement strings" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "BT /Missing 10 Tf 10 100 Td <FEFF004100> Tj ET" });
+    defer a.free(sample);
+    const expected = try text_encoding.decodeTableAlloc(a, &text_encoding.pdf_doc_encoding, &.{ 0xfe, 0xff, 0, 0x41, 0 });
+    defer a.free(expected);
+    var parsed = try Reader.init(a, sample);
+    defer parsed.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        parsed.setTextExtractionPolicy(policy);
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        const plain = try parsed.extractPageTextAlloc(1);
+        defer a.free(plain);
+        try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, analysis.text, "\n"));
+        try std.testing.expectEqualStrings(analysis.text, plain);
+        try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+    }
+}
+
+fn buildCompressedPropertyMetadataTestPdfAlloc(a: Allocator, count: usize, private_bytes: usize, overridden: bool, table_in_stream: bool) ![]u8 {
+    return buildCompressedPropertyMetadataAtLocationTestPdfAlloc(a, count, private_bytes, overridden, if (table_in_stream) .table else .dictionary);
+}
+
+const PropertyMetadataLocation = enum { dictionary, table, resources, parent };
+
+const CompressedPropertyMetadataFixture = struct {
+    count: usize = 1,
+    private_bytes: usize,
+    overridden: bool = false,
+    location: PropertyMetadataLocation = .dictionary,
+    reference_properties: bool = true,
+    flate: bool = true,
+    actual_text_payload: bool = false,
+    selected_name: ?[]const u8 = null,
+    additional_properties: ?[]const u8 = null,
+    payload: enum { automatic, literal, escaped, sequence, array, integer, integer_pair, dictionary, nested } = .automatic,
+};
+
+fn buildCompressedPropertyMetadataAtLocationTestPdfAlloc(a: Allocator, count: usize, private_bytes: usize, overridden: bool, location: PropertyMetadataLocation) ![]u8 {
+    return buildCompressedPropertyMetadataFixtureAlloc(a, .{ .count = count, .private_bytes = private_bytes, .overridden = overridden, .location = location });
+}
+
+fn buildCompressedPropertyMetadataFixtureAlloc(a: Allocator, fixture: CompressedPropertyMetadataFixture) ![]u8 {
+    const count = fixture.count;
+    const private_bytes = fixture.private_bytes;
+    const overridden = fixture.overridden;
+    const table_in_stream = fixture.location == .table;
+    const parent_resources = fixture.location == .parent;
+    const resource_in_stream = fixture.location == .resources or parent_resources;
+    std.debug.assert(!resource_in_stream or count == 1);
+    std.debug.assert(!table_in_stream or count == 1);
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(a);
+    var properties = std.ArrayList(u8).empty;
+    defer properties.deinit(a);
+    if (overridden) try content.appendSlice(a, "/Span << /ActualText (Outer) >> BDC ");
+    for (0..count) |i| {
+        if (fixture.reference_properties) {
+            if (fixture.selected_name) |name|
+                try content.print(a, "/Span /{s} BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC ", .{name})
+            else
+                try content.print(a, "/Span /Tag{d} BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC ", .{i});
+        } else try content.appendSlice(a, "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET ");
+        try properties.print(a, "/Tag{d} {d} 0 R ", .{ i, 6 + count + i });
+    }
+    if (overridden) try content.appendSlice(a, "EMC");
+    const table = if (table_in_stream) try a.dupe(u8, "7 0 R") else try std.fmt.allocPrint(a, "<< {s} >>", .{properties.items});
+    defer a.free(table);
+    const resource_source = if (resource_in_stream) try a.dupe(u8, "7 0 R") else try std.fmt.allocPrint(a, "<< /Font << /F1 5 0 R >> /Properties {s} >>", .{table});
+    defer a.free(resource_source);
+    const resource_field = if (parent_resources) try a.dupe(u8, "") else try std.fmt.allocPrint(a, "/Resources {s}", .{resource_source});
+    defer a.free(resource_field);
+    const page = try std.fmt.allocPrint(a, "3 0 obj\n<< /Type /Page /Parent {d} 0 R /MediaBox [0 0 400 300] {s} /Contents 4 0 R >>\nendobj\n", .{ @as(usize, if (parent_resources) 7 else 2), resource_field });
+    defer a.free(page);
+    const paint = try std.fmt.allocPrint(a, "4 0 obj\n<< /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.items.len, content.items });
+    defer a.free(paint);
+    const fixed = [_][]const u8{
+        if (parent_resources) "1 0 obj\n<< /Type /Catalog /Pages 7 0 R >>\nendobj\n" else "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        page,
+        paint,
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    };
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, "%PDF-1.7\n");
+    const xref_id = 6 + count * 2;
+    const offsets = try a.alloc(usize, xref_id + 1);
+    defer a.free(offsets);
+    @memset(offsets, 0);
+    for (fixed, 1..) |object, id| {
+        offsets[id] = out.items.len;
+        try out.appendSlice(a, object);
+    }
+    const padding = try a.alloc(u8, private_bytes);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    if (fixture.payload == .sequence) for (padding, 0..) |*byte, i| {
+        byte.* = if (i % 2 == 0) '0' else ' ';
+    };
+    for (0..count) |i| {
+        const header = try std.fmt.allocPrint(a, "{d} 0 ", .{6 + count + i});
+        defer a.free(header);
+        var compressed = try std.Io.Writer.Allocating.initCapacity(a, 256);
+        defer compressed.deinit();
+        var history: [std.compress.flate.max_window_len]u8 = undefined;
+        var compressor = try std.compress.flate.Compress.init(&compressed.writer, &history, .zlib, .default);
+        var raw = try std.Io.Writer.Allocating.initCapacity(a, 256);
+        defer raw.deinit();
+        const writer = if (fixture.flate) &compressor.writer else &raw.writer;
+        try writer.writeAll(header);
+        if (table_in_stream) try writer.writeAll("<< /Tag0 ");
+        if (parent_resources) try writer.writeAll("<< /Type /Pages /Count 1 /Kids [3 0 R] /Resources ");
+        if (resource_in_stream) try writer.writeAll("<< /Font << /F1 5 0 R >> /Properties << /Tag0 ");
+        try writer.writeAll(if (fixture.actual_text_payload or (resource_in_stream and fixture.payload == .automatic)) "<< /ActualText " else "<< /ActualText (Ignored) /Private ");
+        try writer.writeAll(switch (fixture.payload) {
+            .automatic, .literal => "(",
+            .escaped => "(\\n",
+            .sequence => "[",
+            .array => "[(",
+            .integer => "[0 (",
+            .integer_pair => "[0 1 (",
+            .dictionary => "[<< >> (",
+            .nested => "[<< /Deep [(",
+        });
+        try writer.writeAll(padding);
+        try writer.writeAll(switch (fixture.payload) {
+            .automatic, .literal, .escaped => ")",
+            .sequence => "]",
+            .array, .integer, .integer_pair, .dictionary => ")]",
+            .nested => ")] >>]",
+        });
+        try writer.writeAll(" >>");
+        if (fixture.additional_properties) |additional| try writer.writeAll(additional);
+        if (table_in_stream) try writer.writeAll(" >>");
+        if (resource_in_stream) try writer.writeAll(" >> >>");
+        if (parent_resources) try writer.writeAll(" >>");
+        if (fixture.flate) try compressor.finish();
+        const encoded = if (fixture.flate) compressed.written() else raw.written();
+        offsets[6 + i] = out.items.len;
+        try out.print(a, "{d} 0 obj\n<< /Type /ObjStm /N 1 /First {d} {s}/Length {d} >>\nstream\n", .{ 6 + i, header.len, if (fixture.flate) "/Filter /FlateDecode " else "", encoded.len });
+        try out.appendSlice(a, encoded);
+        try out.appendSlice(a, "\nendstream\nendobj\n");
+    }
+    offsets[xref_id] = out.items.len;
+    try out.print(a, "{d} 0 obj\n<< /Type /XRef /Size {d} /Root 1 0 R /W [1 4 2] /Length {d} >>\nstream\n", .{ xref_id, xref_id + 1, (xref_id + 1) * 7 });
+    for (0..xref_id + 1) |i| {
+        var record: [7]u8 = undefined;
+        const in_use = offsets[i] != 0;
+        record[0] = if (i == 0) 0 else if (in_use) 1 else 2;
+        std.mem.writeInt(u32, record[1..5], @intCast(if (in_use) offsets[i] else if (i == 0) 0 else i - count), .big);
+        std.mem.writeInt(u16, record[5..7], if (i == 0) 65535 else 0, .big);
+        try out.appendSlice(a, &record);
+    }
+    try out.print(a, "\nendstream\nendobj\nstartxref\n{d}\n%%EOF\n", .{offsets[xref_id]});
+    return out.toOwnedSlice(a);
+}
+
+test "reader property metadata retains only needed fields across compressed dictionaries" {
+    const a = std.testing.allocator;
+    inline for (.{ false, true }) |overridden| {
+        const sample = try buildCompressedPropertyMetadataTestPdfAlloc(a, 12, 128 * 1024, overridden, false);
+        defer a.free(sample);
+        var budget = DecodeBudgetAllocator.init(a, 0, 4 * 1024 * 1024);
+        const bounded = budget.allocator();
+        {
+            var parsed = try Reader.initWithDecodeLimits(bounded, sample, .{ .max_decoded_stream_bytes = 512 * 1024, .max_working_set_bytes = 1024 * 1024 });
+            defer parsed.deinit();
+            inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+                parsed.setTextExtractionPolicy(policy);
+                var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+                defer analysis.deinit(bounded);
+                const plain = try parsed.extractPageTextAlloc(1);
+                defer bounded.free(plain);
+                try std.testing.expectEqualStrings(if (overridden) "Outer\n" else "IgnoredIgnoredIgnoredIgnoredIgnoredIgnoredIgnoredIgnoredIgnoredIgnoredIgnoredIgnored\n", analysis.text);
+                try std.testing.expectEqualStrings(analysis.text, plain);
+                try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        try std.testing.expect(!budget.limit_exceeded);
+    }
+}
+
+test "reader property metadata defers ignored tables and dictionaries and diagnoses selected limits" {
+    const a = std.testing.allocator;
+    inline for (.{ false, true }) |table_in_stream| inline for (.{ false, true }) |overridden| {
+        const sample = try buildCompressedPropertyMetadataTestPdfAlloc(a, 1, 256 * 1024, overridden, table_in_stream);
+        defer a.free(sample);
+        for ([_]DecodeLimits{
+            .{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 1024 * 1024 },
+            .{ .max_decoded_stream_bytes = 512 * 1024, .max_working_set_bytes = 128 * 1024 },
+        }) |limits| {
+            var parsed = try Reader.initWithDecodeLimits(a, sample, limits);
+            defer parsed.deinit();
+            inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+                parsed.setTextExtractionPolicy(policy);
+                var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+                defer analysis.deinit(a);
+                const plain = try parsed.extractPageTextAlloc(1);
+                defer a.free(plain);
+                try std.testing.expectEqualStrings(if (overridden) "Outer\n" else "SOURCE\n", analysis.text);
+                try std.testing.expectEqualStrings(analysis.text, plain);
+                try std.testing.expectEqual(!overridden, analysis.diagnostics.actual_text_incomplete);
+            }
+        }
+    };
+}
+
+fn exerciseDeferredPropertyBindings(a: Allocator, parsed: *Reader) !void {
+    var no_remap = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    var live = DecodeBudgetAllocator.init(no_remap.allocator(), 0, 1024 * 1024);
+    var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, 1024 * 1024, 4 * 1024 * 1024);
+    var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+    defer cache.deinit();
+    var reader = parsed.*;
+    reader.alloc = no_remap.allocator();
+    const raw = syntax.Object{ .obj_ref = .{ .id = 11, .gen = 0 } };
+    const resources = try cache.resources(&reader, &raw);
+    const records = try reader.collectTextPropertiesFromResourcesAlloc(&resources, "/Span /Tag BDC EMC /Span /Bad BDC EMC /Span /Missing BDC EMC", &cache);
+    defer {
+        for (records) |*record| record.deinit(reader.alloc);
+        reader.alloc.free(records);
+    }
+    try std.testing.expectEqual(@as(usize, 1), cache.objects.count());
+    const value = try findTextProperty(records, "Tag").?.value();
+    try std.testing.expectEqualStrings("Shared", value.actual_text.?.string);
+    try std.testing.expectEqual(@as(usize, 4), cache.objects.count());
+    const compact = cache.objects.get(.{ .reference = @as(u64, 13) << 16, .purpose = .property }).?.object;
+    try std.testing.expect(compact.get("Private") == null);
+    try std.testing.expect((try findTextProperty(records, "Bad").?.value()).invalid);
+    try std.testing.expect((try findTextProperty(records, "Missing").?.value()).invalid);
+    const records2 = try reader.collectTextPropertiesFromResourcesAlloc(&resources, "/Span /Tag BDC EMC", &cache);
+    defer {
+        for (records2) |*record| record.deinit(reader.alloc);
+        reader.alloc.free(records2);
+    }
+    try std.testing.expectEqual(value.actual_text.?.string.ptr, (try records2[0].value()).actual_text.?.string.ptr);
+    try std.testing.expectEqual(@as(usize, 5), cache.objects.count());
+}
+
+test "reader property metadata lazy bindings preserve ownership under allocation failure" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{
+        .content = "",
+        .extra = &.{
+            "11 0 obj\n<< /Properties 12 0 R >>\nendobj\n",
+            "12 0 obj\n<< /Tag 13 0 R /Bad 14 0 R >>\nendobj\n",
+            "13 0 obj\n<< /ActualText (Shared) /Private (irrelevant metadata) >>\nendobj\n",
+        },
+    });
+    defer a.free(sample);
+    var parsed = try Reader.init(a, sample);
+    defer parsed.deinit();
+    try std.testing.checkAllAllocationFailures(a, exerciseDeferredPropertyBindings, .{&parsed});
+}
+
+test "reader property metadata optional direct tables preserve glyphs at budget limits" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const properties = try std.fmt.allocPrint(a, "/Tag << /ActualText ({s}) >> /Small << /ActualText (Kept) >>", .{padding});
+    defer a.free(properties);
+    for ([_][]const u8{
+        "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET",
+        "/Span /Tag BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC",
+        "/Span << /ActualText (Outer) >> BDC /Span /Tag BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC EMC",
+        "/Span /Small BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC",
+    }, 0..) |content, mode| {
+        const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = content, .page_properties = properties });
+        defer a.free(sample);
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 512 * 1024, .max_working_set_bytes = 128 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const text = try reader.extractPageTextAlloc(1);
+            defer a.free(text);
+            try std.testing.expectEqualStrings(if (mode == 2) "Outer\n" else if (mode == 3) "Kept\n" else "SOURCE\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, text);
+            try std.testing.expectEqual(mode == 1, analysis.diagnostics.actual_text_incomplete);
+        }
+    }
+}
+
+test "reader property metadata indirect resources defer direct replacement copies" {
+    const a = std.testing.allocator;
+    inline for (.{ false, true }) |overridden| {
+        const sample = try buildCompressedPropertyMetadataAtLocationTestPdfAlloc(a, 1, 55 * 1024, overridden, .resources);
+        defer a.free(sample);
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 128 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const text = try reader.extractPageTextAlloc(1);
+            defer a.free(text);
+            if (overridden) {
+                try std.testing.expectEqualStrings("Outer\n", analysis.text);
+            } else {
+                try std.testing.expectEqual(@as(usize, 55 * 1024 + 1), analysis.text.len);
+                try std.testing.expect(std.mem.allEqual(u8, analysis.text[0 .. analysis.text.len - 1], 'X'));
+            }
+            try std.testing.expectEqualStrings(analysis.text, text);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+    }
+}
+
+fn exerciseDistinctPropertyResources(a: Allocator, reader: *Reader) !void {
+    var budget = DecodeBudgetAllocator.init(a, 0, 1024 * 1024);
+    var cache = TextResourceCache{ .budget = &budget };
+    defer cache.deinit();
+    const content = "/Span /Tag BDC EMC";
+    for ([_][]const u8{ "First", "Second" }, 11..) |expected, id| {
+        const raw = syntax.Object{ .obj_ref = .{ .id = @intCast(id), .gen = 0 } };
+        const resources = try cache.resources(reader, &raw);
+        const records = try reader.collectTextPropertiesFromResourcesAlloc(&resources, content, &cache);
+        defer {
+            for (records) |*record| record.deinit(reader.alloc);
+            reader.alloc.free(records);
+        }
+        try std.testing.expectEqualStrings(expected, (try records[0].value()).actual_text.?.string);
+    }
+    try std.testing.expectEqual(@as(usize, 2), cache.property_resources.count());
+    try std.testing.expectEqual(@as(usize, 2), cache.scopes.count());
+}
+
+test "reader property metadata property-only resource identities remain distinct" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "", .extra = &.{
+        "11 0 obj\n<< /Properties << /Tag << /ActualText (First) >> >> >>\nendobj\n",
+        "12 0 obj\n<< /Properties << /Tag << /ActualText (Second) >> >> >>\nendobj\n",
+    } });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseDistinctPropertyResources, .{&reader});
+}
+
+test "reader property metadata inherited resource references preserve lazy scope resolution" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{
+        .content = "/Span /Tag BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC",
+        .inherit_resources = true,
+        .pages = "<< /Type /Pages /Count 1 /Kids [3 0 R] /Resources 11 0 R >>",
+        .extra = &.{"11 0 obj\n<< /Font << /F1 5 0 R >> /Properties << /Tag << /ActualText (Inherited) >> >> >>\nendobj\n"},
+    });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        reader.setTextExtractionPolicy(policy);
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        const text = try reader.extractPageTextAlloc(1);
+        defer a.free(text);
+        try std.testing.expectEqualStrings("Inherited\n", analysis.text);
+        try std.testing.expectEqualStrings(analysis.text, text);
+        try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+    }
+}
+
+test "reader property metadata limit failures are memoized across scopes" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const object = try std.fmt.allocPrint(a, "11 0 obj\n<< /Tag << /ActualText ({s}) >> >>\nendobj\n", .{padding});
+    defer a.free(object);
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "", .extra = &.{object} });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var budget = DecodeBudgetAllocator.init(a, 0, 128 * 1024);
+    var cache = TextResourceCache{ .budget = &budget };
+    defer cache.deinit();
+    const raw = syntax.Object{ .obj_ref = .{ .id = 11, .gen = 0 } };
+    try std.testing.expect((try cache.property(&reader, &raw, "Tag")).invalid);
+    // Indexing succeeds without materializing the oversized direct value;
+    // selecting it records a deterministic failure independently of siblings.
+    try std.testing.expectEqual(@as(usize, 2), cache.objects.count());
+    const retained = budget.cumulative_growth_bytes;
+    for (0..512) |_| try std.testing.expect((try cache.property(&reader, &raw, "Tag")).invalid);
+    try std.testing.expectEqual(retained, budget.cumulative_growth_bytes);
+}
+
+fn buildQuotaRecoveryTestPdfAlloc(a: Allocator, count: usize) ![]u8 {
+    var properties = std.ArrayList(u8).empty;
+    defer properties.deinit(a);
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(a);
+    for (0..count) |i| {
+        try properties.print(a, "/Tag{d} << /MCID {d} >> ", .{ i, i });
+        try content.print(a, "/Span /Tag{d} BDC EMC ", .{i});
+    }
+    try content.appendSlice(a, "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET");
+    return buildTaggedTextTestPdfAlloc(a, .{ .content = content.items, .page_properties = properties.items });
+}
+
+test "reader property metadata quota classification is consumed at allocation boundaries" {
+    const a = std.testing.allocator;
+    const sample = try buildQuotaRecoveryTestPdfAlloc(a, 128);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var page = try reader.readPageObject(1);
+    defer page.deinit(a);
+    inline for (.{ false, true }) |limit_live| {
+        var live = DecodeBudgetAllocator.init(a, 0, if (limit_live) 16 * 1024 else 32 * 1024);
+        var retained = DecodeBudgetAllocator.init(live.allocator(), 0, if (limit_live) 32 * 1024 else 16 * 1024);
+        var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+        defer cache.deinit();
+        const resources = try cache.resources(&reader, page.get("Resources").?);
+        try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, cache.entries(&reader, resources.get("Properties").?));
+        try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+        // Keep the rejection history observable while injecting a genuine
+        // backing failure; consuming classification must not erase accounting.
+        try std.testing.expect((if (limit_live) live.rejected_growth_charge else retained.rejected_growth_charge) > 0);
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        live.backing = failing.allocator();
+        defer live.backing = a;
+        try std.testing.expectError(error.OutOfMemory, cache.deferBindings(&reader, .{ .table = .null }, &.{}));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+    }
+}
+
+fn exerciseQuotaRecoveryAllocations(a: Allocator, sample: []const u8, policy: TextExtractionPolicy, analysis_api: bool) !void {
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 1280 });
+    defer reader.deinit();
+    reader.setTextExtractionPolicy(policy);
+    if (analysis_api) {
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        try std.testing.expectEqualStrings("SOURCE\n", analysis.text);
+        try std.testing.expect(analysis.diagnostics.actual_text_incomplete);
+    } else {
+        // The document API skips non-OOM page failures. The sweep must still
+        // propagate a real OOM rather than silently losing this page's text.
+        const text = try reader.extractPlainTextAlloc();
+        defer a.free(text);
+        try std.testing.expectEqualStrings("SOURCE\n", text);
+    }
+}
+
+test "reader property metadata recovered quotas preserve caller OOM through both APIs" {
+    const a = std.testing.allocator;
+    const sample = try buildQuotaRecoveryTestPdfAlloc(a, 4);
+    defer a.free(sample);
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| inline for (.{ false, true }) |analysis_api| {
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseQuotaRecoveryAllocations, .{ sample, policy, analysis_api });
+    };
+}
+
+test "reader lookahead payloads preserve native and selected text within resource limits" {
+    const a = std.testing.allocator;
+    inline for (.{ .literal, .escaped, .sequence, .array, .integer, .integer_pair, .dictionary, .nested }) |payload| {
+        inline for (.{ .unused, .selected, .overridden }) |selection| {
+            const sample = try buildCompressedPropertyMetadataFixtureAlloc(a, .{
+                .private_bytes = 55 * 1024,
+                .location = .resources,
+                .payload = payload,
+                .reference_properties = selection != .unused,
+                .overridden = selection == .overridden,
+            });
+            defer a.free(sample);
+            var caller = DecodeBudgetAllocator.init(a, 0, 2 * 1024 * 1024);
+            const alloc = caller.allocator();
+            {
+                var reader = try Reader.initWithDecodeLimits(alloc, sample, .{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 128 * 1024 });
+                defer reader.deinit();
+                inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+                    reader.setTextExtractionPolicy(policy);
+                    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+                    defer analysis.deinit(alloc);
+                    const plain = try reader.extractPlainTextAlloc();
+                    defer alloc.free(plain);
+                    try std.testing.expectEqualStrings(switch (selection) {
+                        .unused => "SOURCE\n",
+                        .selected => "Ignored\n",
+                        .overridden => "Outer\n",
+                        else => unreachable,
+                    }, analysis.text);
+                    try std.testing.expectEqualStrings(analysis.text, plain);
+                    try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 0), caller.live_bytes);
+            try std.testing.expect(!caller.limit_exceeded);
+        }
+    }
+}
+
+test "reader saturated object cache rejects before parsing and preserves retry semantics" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 512);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const object = try std.fmt.allocPrint(a, "11 0 obj\n<< /Tag << /ActualText (Label) /Private ({s}) >> >>\nendobj\n", .{padding});
+    defer a.free(object);
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "", .extra = &.{object} });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    inline for (.{ false, true }) |limit_live| {
+        var live = DecodeBudgetAllocator.init(a, 0, if (limit_live) 64 * 1024 else 128 * 1024);
+        var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, if (limit_live) 128 * 1024 else 64 * 1024, 512 * 1024);
+        var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+        defer cache.deinit();
+        // Fill the current map to its growth boundary, with enough remaining
+        // memory for parsing the object but not for doubling the map.
+        for (0..12) |i| try cache.objects.put(cache.allocator(), .{ .reference = (100 + i) << 16, .purpose = .property }, .invalid);
+        var filler: ?[]u8 = try cache.allocator().alloc(u8, @min(retained.max_live_bytes, live.max_live_bytes) - retained.live_bytes - 1536);
+        defer if (filler) |bytes| cache.allocator().free(bytes);
+        const raw = syntax.Object{ .obj_ref = .{ .id = 11, .gen = 0 } };
+        const before = live.cumulative_growth_bytes;
+        for (0..512) |_| try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, cache.resolve(&reader, &raw, .property_table));
+        try std.testing.expectEqual(before, live.cumulative_growth_bytes);
+        try std.testing.expectEqual(@as(usize, 12), cache.objects.count());
+        try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+
+        cache.allocator().free(filler.?);
+        filler = null;
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        live.backing = failing.allocator();
+        defer live.backing = a;
+        try std.testing.expectError(error.OutOfMemory, cache.resolve(&reader, &raw, .property_table));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 12), cache.objects.count());
+        live.backing = a;
+        const value = try cache.resolve(&reader, &raw, .property_table);
+        try std.testing.expect(value.get("Tag").?.* == .deferred);
+        try std.testing.expectEqual(@as(usize, 13), cache.objects.count());
+        const selected = try cache.property(&reader, &raw, "Tag");
+        try std.testing.expectEqualStrings("Label", selected.actual_text.?.string);
+        try std.testing.expectEqual(@as(usize, 14), cache.objects.count());
+        const cached = live.cumulative_growth_bytes;
+        _ = try cache.property(&reader, &raw, "Tag");
+        try std.testing.expectEqual(cached, live.cumulative_growth_bytes);
+    }
+}
+
+test "reader inherited direct properties skip large opaque payloads during metadata parsing" {
+    const a = std.testing.allocator;
+    inline for (.{ .escaped, .sequence }) |payload| inline for (.{ false, true }) |overridden| {
+        const sample = try buildCompressedPropertyMetadataFixtureAlloc(a, .{
+            .private_bytes = 55 * 1024,
+            .location = .parent,
+            .payload = payload,
+            .overridden = overridden,
+        });
+        defer a.free(sample);
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 128 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const text = try reader.extractPlainTextAlloc();
+            defer a.free(text);
+            try std.testing.expectEqualStrings(if (overridden) "Outer\n" else "Ignored\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, text);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+    };
+}
+
+fn buildObjectStreamBoundaryTestPdfAlloc(a: Allocator, objects: []const []const u8, header_override: ?[]const u8) ![]u8 {
+    return buildObjectStreamFixtureAlloc(a, .{ .objects = objects, .header_override = header_override });
+}
+
+const FixtureCompressedRef = struct { id: usize, stream: u32, index: u16 };
+
+const ObjectStreamFixture = struct {
+    objects: []const []const u8,
+    header_override: ?[]const u8 = null,
+    compressed_refs: []const FixtureCompressedRef = &.{},
+    content: []const u8 = "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET",
+    extra: []const []const u8 = &.{},
+    flate: bool = true,
+    indirect_length: bool = false,
+    length_reference: ?usize = null,
+    content_length_reference: ?usize = null,
+    object_stream_type: []const u8 = "ObjStm",
+    resources: []const u8 = "7 0 R",
+    page_fields: []const u8 = "",
+};
+
+fn buildObjectStreamFixtureAlloc(a: Allocator, fixture: ObjectStreamFixture) ![]u8 {
+    const objects = fixture.objects;
+    var header = std.ArrayList(u8).empty;
+    defer header.deinit(a);
+    var object_offset: usize = 0;
+    for (objects, 0..) |object, i| {
+        try header.print(a, "{d} {d} ", .{ 7 + i, object_offset });
+        object_offset += object.len + 1;
+    }
+    const header_bytes = fixture.header_override orelse header.items;
+    var compressed = try std.Io.Writer.Allocating.initCapacity(a, 256);
+    defer compressed.deinit();
+    var history: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&compressed.writer, &history, .zlib, .default);
+    var raw = try std.Io.Writer.Allocating.initCapacity(a, 256);
+    defer raw.deinit();
+    const writer = if (fixture.flate) &compressor.writer else &raw.writer;
+    try writer.writeAll(header_bytes);
+    for (objects) |object| {
+        try writer.writeAll(object);
+        try writer.writeByte(' ');
+    }
+    if (fixture.flate) try compressor.finish();
+    const encoded = if (fixture.flate) compressed.written() else raw.written();
+    const content = fixture.content;
+    const length_id = 7 + objects.len + fixture.extra.len;
+    const length = if (fixture.indirect_length) try std.fmt.allocPrint(a, "{d} 0 R", .{fixture.length_reference orelse length_id}) else try std.fmt.allocPrint(a, "{d}", .{encoded.len});
+    defer a.free(length);
+    const content_length = if (fixture.content_length_reference) |reference| try std.fmt.allocPrint(a, "{d} 0 R", .{reference}) else try std.fmt.allocPrint(a, "{d}", .{content.len});
+    defer a.free(content_length);
+    const paint = try std.fmt.allocPrint(a, "<< /Length {s} >>\nstream\n{s}\nendstream", .{ content_length, content });
+    defer a.free(paint);
+    const stream = try std.fmt.allocPrint(a, "<< /Type /{s} /N {d} /First {d} {s}/Length {s} >>\nstream\n{s}\nendstream", .{ fixture.object_stream_type, objects.len, header_bytes.len, if (fixture.flate) "/Filter /FlateDecode " else "", length, encoded });
+    defer a.free(stream);
+    const page = try std.fmt.allocPrint(a, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources {s} /Contents 4 0 R {s} >>", .{ fixture.resources, fixture.page_fields });
+    defer a.free(page);
+    const fixed = [_][]const u8{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+        page,
+        paint,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        stream,
+    };
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, "%PDF-1.7\n");
+    const xref_id = length_id + @intFromBool(fixture.indirect_length);
+    const offsets = try a.alloc(usize, xref_id + 1);
+    defer a.free(offsets);
+    @memset(offsets, 0);
+    for (fixed, 1..) |object, id| {
+        offsets[id] = out.items.len;
+        try out.print(a, "{d} 0 obj\n{s}\nendobj\n", .{ id, object });
+    }
+    for (fixture.extra, 7 + objects.len..) |object, id| {
+        offsets[id] = out.items.len;
+        try out.print(a, "{d} 0 obj\n{s}\nendobj\n", .{ id, object });
+    }
+    if (fixture.indirect_length) {
+        offsets[length_id] = out.items.len;
+        try out.print(a, "{d} 0 obj\n{d}\nendobj\n", .{ length_id, encoded.len });
+    }
+    const xref = out.items.len;
+    offsets[xref_id] = xref;
+    try out.print(a, "{d} 0 obj\n<< /Type /XRef /Size {d} /Root 1 0 R /W [1 4 2] /Length {d} >>\nstream\n", .{ xref_id, xref_id + 1, (xref_id + 1) * 7 });
+    for (0..xref_id + 1) |id| {
+        var record: [7]u8 = undefined;
+        const compressed_object = id >= 7 and id < 7 + objects.len;
+        record[0] = if (id == 0) 0 else if (compressed_object) 2 else 1;
+        std.mem.writeInt(u32, record[1..5], @intCast(if (compressed_object) 6 else offsets[id]), .big);
+        std.mem.writeInt(u16, record[5..7], @intCast(if (id == 0) 65535 else if (compressed_object) id - 7 else 0), .big);
+        for (fixture.compressed_refs) |override| if (override.id == id) {
+            record[0] = 2;
+            std.mem.writeInt(u32, record[1..5], override.stream, .big);
+            std.mem.writeInt(u16, record[5..7], override.index, .big);
+            break;
+        };
+        try out.appendSlice(a, &record);
+    }
+    try out.print(a, "\nendstream\nendobj\nstartxref\n{d}\n%%EOF\n", .{xref});
+    return out.toOwnedSlice(a);
+}
+
+test "reader compressed object lookahead never materializes adjacent payloads" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 63 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'A');
+    inline for (.{ "(\\n{s})", "/{s}", "<{s}>", "[({s})]" }) |format| {
+        const next = try std.fmt.allocPrint(a, format, .{padding});
+        defer a.free(next);
+        const sample = try buildObjectStreamBoundaryTestPdfAlloc(a, &.{ "<< /Font << /F1 5 0 R >> >>", next }, null);
+        defer a.free(sample);
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 128 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("SOURCE\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+        // The last object remains independently readable under the same limits.
+        var last = try reader.readIndirectObject(.{ .id = 8, .gen = 0 });
+        defer last.deinit(a);
+    }
+}
+
+test "reader validates compressed object boundaries before parsing" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "7 0 8 0 ", "7 1 8 0 ", "7 0 8 999999 ", "4294967296 0 8 4 ", "7 0 /Bad 4 " }) |header| {
+        const sample = try buildObjectStreamBoundaryTestPdfAlloc(a, &.{ "<< >>", "null" }, header);
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        try std.testing.expectError(error.InvalidObjectStream, reader.readIndirectObject(.{ .id = 7, .gen = 0 }));
+    }
+    const sample = try buildObjectStreamBoundaryTestPdfAlloc(a, &.{ "[ 1", "]" }, null);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    try std.testing.expectError(error.UnexpectedEof, reader.readIndirectObject(.{ .id = 7, .gen = 0 }));
+    const ordered = try buildObjectStreamBoundaryTestPdfAlloc(a, &.{ "null", "42", "true" }, null);
+    defer a.free(ordered);
+    var ordered_reader = try Reader.init(a, ordered);
+    defer ordered_reader.deinit();
+    var middle = try ordered_reader.readIndirectObject(.{ .id = 8, .gen = 0 });
+    defer middle.deinit(a);
+    try std.testing.expectEqual(@as(i64, 42), middle.integer);
+    var last = try ordered_reader.readIndirectObject(.{ .id = 9, .gen = 0 });
+    defer last.deinit(a);
+    try std.testing.expect(last.boolean);
+}
+
+test "reader inherited direct replacements remain deferred until selected" {
+    const a = std.testing.allocator;
+    inline for (.{ .unused, .selected, .overridden }) |selection| {
+        const sample = try buildCompressedPropertyMetadataFixtureAlloc(a, .{
+            .private_bytes = 63 * 1024,
+            .location = .parent,
+            .payload = .escaped,
+            .actual_text_payload = true,
+            .reference_properties = selection != .unused,
+            .overridden = selection == .overridden,
+        });
+        defer a.free(sample);
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 128 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings(if (selection == .overridden) "Outer\n" else "SOURCE\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expectEqual(selection == .selected, analysis.diagnostics.actual_text_incomplete);
+        }
+    }
+}
+
+test "reader saturated property index cache rejects before allocating and sorting" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "" });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    const fields = try a.alloc(syntax.DictEntry, 512);
+    var initialized: usize = 0;
+    defer {
+        for (fields[0..initialized]) |entry| a.free(entry.key);
+        a.free(fields);
+    }
+    for (fields, 0..) |*field, i| {
+        field.* = .{ .key = try std.fmt.allocPrint(a, "Tag{d:0>4}", .{511 - i}), .value = .null };
+        initialized += 1;
+    }
+    const raw = syntax.Object{ .dict = fields };
+    inline for (.{ false, true }) |limit_live| {
+        var live = DecodeBudgetAllocator.init(a, 0, if (limit_live) 64 * 1024 else 128 * 1024);
+        var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, if (limit_live) 128 * 1024 else 64 * 1024, 4 * 128 * 1024);
+        var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+        defer cache.deinit();
+        for (0..12) |i| try cache.scopes.put(cache.allocator(), 100 + i, &.{});
+        const index_bytes = fields.len * @sizeOf(TextResourceCache.PropertyEntry);
+        var filler: ?[]u8 = try cache.allocator().alloc(u8, @min(retained.max_live_bytes, live.max_live_bytes) - retained.live_bytes - index_bytes - 128);
+        defer if (filler) |bytes| cache.allocator().free(bytes);
+        // Leave room for the index, but not for both it and map growth.
+        // Previously every request allocated and sorted before failing to put.
+        const initial = live.cumulative_growth_bytes;
+        try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, cache.entries(&reader, &raw));
+        // Reserving the small map may succeed once, leaving too little room
+        // for the index. No index allocation or sorting may have occurred.
+        try std.testing.expect(live.cumulative_growth_bytes - initial < index_bytes);
+        const before = live.cumulative_growth_bytes;
+        for (0..512) |_| try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, cache.entries(&reader, &raw));
+        try std.testing.expectEqual(before, live.cumulative_growth_bytes);
+        try std.testing.expectEqual(@as(usize, 12), cache.scopes.count());
+        try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+        cache.allocator().free(filler.?);
+        filler = null;
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        live.backing = failing.allocator();
+        defer live.backing = a;
+        try std.testing.expectError(error.OutOfMemory, cache.entries(&reader, &raw));
+        try std.testing.expect(failing.has_induced_failure);
+        live.backing = a;
+        const index = (try cache.entries(&reader, &raw)).?;
+        try std.testing.expectEqualStrings("Tag0000", index[0].raw.key);
+        try std.testing.expectEqualStrings("Tag0511", index[index.len - 1].raw.key);
+        const cached = live.cumulative_growth_bytes;
+        _ = try cache.entries(&reader, &raw);
+        try std.testing.expectEqual(cached, live.cumulative_growth_bytes);
+    }
+}
+
+fn exerciseInheritedPropertySourceAllocations(a: Allocator, sample: []const u8, analysis_api: bool) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    if (analysis_api) {
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        try std.testing.expectEqualStrings("Ignored\n", analysis.text);
+        try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+    } else {
+        const plain = try reader.extractPlainTextAlloc();
+        defer a.free(plain);
+        try std.testing.expectEqualStrings("Ignored\n", plain);
+    }
+}
+
+test "reader inherited property source ownership survives every allocation failure" {
+    const a = std.testing.allocator;
+    const sample = try buildCompressedPropertyMetadataFixtureAlloc(a, .{ .private_bytes = 256, .location = .parent, .payload = .literal });
+    defer a.free(sample);
+    inline for (.{ false, true }) |analysis_api| {
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseInheritedPropertySourceAllocations, .{ sample, analysis_api });
+    }
+}
+
+test "reader deferred binding quotas preserve native fallback and backing OOM" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "", .extra = &.{"11 0 obj\n<< /Tag << /ActualText (Label) >> >>\nendobj\n"} });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var scanner = syntax.Scanner.init(a, "<< /Properties 11 0 R >>");
+    defer scanner.deinit();
+    var resources = try scanner.readObject();
+    defer resources.deinit(a);
+    inline for (.{ false, true }) |limit_live| {
+        var live = DecodeBudgetAllocator.init(a, 0, if (limit_live) 0 else 1024 * 1024);
+        var retained = DecodeBudgetAllocator.init(live.allocator(), 0, if (limit_live) 1024 * 1024 else 0);
+        var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+        defer cache.deinit();
+        inline for (.{ false, true }) |overridden| {
+            const paint = "/Span /Tag BDC BT /F1 10 Tf (SOURCE) Tj ET EMC";
+            const content = if (overridden) "/Span << /ActualText (Outer) >> BDC " ++ paint ++ " EMC" else paint;
+            const records = try reader.collectTextPropertiesFromResourcesAlloc(&resources, content, &cache);
+            defer {
+                for (records) |*record| record.deinit(a);
+                a.free(records);
+            }
+            try std.testing.expect((try findTextProperty(records, "Tag").?.value()).invalid);
+            const text = try extractTextFromContentAlloc(a, content, &.{}, &.{}, records, 0);
+            defer a.free(text);
+            try std.testing.expectEqualStrings(if (overridden) "Outer" else "SOURCE", std.mem.trimEnd(u8, text, "\n"));
+            try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+            try std.testing.expectEqual(@as(usize, 0), cache.bindings.items.len);
+        }
+        retained.max_live_bytes = 1024 * 1024;
+        live.max_live_bytes = 1024 * 1024;
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        live.backing = failing.allocator();
+        defer live.backing = a;
+        try std.testing.expectError(error.OutOfMemory, reader.collectTextPropertiesFromResourcesAlloc(&resources, "/Span /Tag BDC EMC", &cache));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+    }
+}
+
+test "reader unselected direct replacements cannot exhaust selected siblings" {
+    const a = std.testing.allocator;
+    inline for (.{ PropertyMetadataLocation.resources, .parent, .table }) |location| inline for (.{ false, true }) |overridden| {
+        const sample = try buildCompressedPropertyMetadataFixtureAlloc(a, .{
+            .private_bytes = 127 * 1024,
+            .location = location,
+            .payload = .escaped,
+            .actual_text_payload = true,
+            .flate = false,
+            .selected_name = "Small",
+            .additional_properties = " /Small << /ActualText (Label) >> ",
+            .overridden = overridden,
+        });
+        defer a.free(sample);
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 128 * 1024, .max_working_set_bytes = 256 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings(if (overridden) "Outer\n" else "Label\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+    };
+}
+
+test "reader deferred direct dictionaries share frame and index and survive eviction" {
+    const a = std.testing.allocator;
+    var properties = std.ArrayList(u8).empty;
+    defer properties.deinit(a);
+    try properties.appendSlice(a, "<< /Font << /F1 5 0 R >> /Properties << ");
+    const padding: [128]u8 = @splat('X');
+    for (0..1024) |i| try properties.print(a, "/Tag{d:0>4} << /ActualText (Label) /Private ({s}) >> ", .{ i, &padding });
+    try properties.appendSlice(a, ">> >>");
+    const sample = try buildObjectStreamBoundaryTestPdfAlloc(a, &.{properties.items}, null);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var live = DecodeBudgetAllocator.init(a, 0, 1024 * 1024);
+    var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, 1024 * 1024, 4 * 1024 * 1024);
+    {
+        var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+        defer cache.deinit();
+        const raw = syntax.Object{ .obj_ref = .{ .id = 7, .gen = 0 } };
+        const resources = try cache.resources(&reader, &raw);
+        const entries = (try cache.sourceEntries(&reader, cache.propertySource(&resources).?)).?;
+        try std.testing.expectEqual(@as(usize, 1024), entries.len);
+        for (entries[0 .. entries.len - 1]) |*entry| {
+            const value = try cache.entryProperty(&reader, entry);
+            try std.testing.expectEqualStrings("Label", value.actual_text.?.string);
+        }
+        try std.testing.expectEqual(@as(usize, 1), cache.frames.loads);
+        cache.frames.deinit();
+        const last = try cache.entryProperty(&reader, &entries[entries.len - 1]);
+        try std.testing.expectEqualStrings("Label", last.actual_text.?.string);
+        try std.testing.expectEqual(@as(usize, 2), cache.frames.loads);
+        const growth = live.cumulative_growth_bytes;
+        _ = try cache.entryProperty(&reader, &entries[0]);
+        try std.testing.expectEqual(growth, live.cumulative_growth_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), live.live_bytes);
+}
+
+test "decode budgets transfer retained ownership without duplicating live charges" {
+    const a = std.testing.allocator;
+    var live = DecodeBudgetAllocator.init(a, 0, 1024);
+    var temporary = DecodeBudgetAllocator.init(live.allocator(), 0, 1024);
+    var retained = DecodeBudgetAllocator.init(live.allocator(), 0, 16);
+    const bytes = try temporary.allocator().alloc(u8, 32);
+    try std.testing.expectError(error.OutOfMemory, retained.adopt(&temporary, bytes));
+    try std.testing.expectEqual(@as(usize, 32), temporary.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), retained.live_bytes);
+    retained.max_live_bytes = 1024;
+    retained.limit_exceeded = false;
+    try retained.adopt(&temporary, bytes);
+    try std.testing.expectEqual(@as(usize, 0), temporary.live_bytes);
+    try std.testing.expectEqual(@as(usize, 32), retained.live_bytes);
+    try std.testing.expectEqual(@as(usize, 32), live.live_bytes);
+    retained.allocator().free(bytes);
+    try std.testing.expectEqual(@as(usize, 0), live.live_bytes);
+}
+
+test "reader metadata scan cancellation and work exhaustion remain bounded and retryable" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 64 * 1024);
+    defer a.free(padding);
+    for (padding, 0..) |*byte, i| byte.* = if (i % 2 == 0) '0' else ' ';
+    const resource11 = try std.fmt.allocPrint(a, "11 0 obj\n<< /Font << /F1 5 0 R >> /Properties << /Unused << /Private [{s}] >> >> >>\nendobj\n", .{padding});
+    defer a.free(resource11);
+    const resource12 = try std.fmt.allocPrint(a, "12 0 obj\n<< /Font << /F1 5 0 R >> /Properties << /Unused << /Private [{s}] >> >> >>\nendobj\n", .{padding});
+    defer a.free(resource12);
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "", .extra = &.{ resource11, resource12 } });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    const Probe = struct {
+        calls: usize = 0,
+        active: bool = true,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.active and self.calls >= 4;
+        }
+    };
+    var probe = Probe{};
+    reader.cancellation = .{ .context = &probe, .is_cancelled_fn = Probe.cancelled };
+    var budget = DecodeBudgetAllocator.init(a, 0, 32 * 1024);
+    var cache = TextResourceCache{ .budget = &budget };
+    defer cache.deinit();
+    const raw11 = syntax.Object{ .obj_ref = .{ .id = 11, .gen = 0 } };
+    try std.testing.expectError(error.Canceled, cache.resolve(&reader, &raw11, .required_resources));
+    try std.testing.expectEqual(@as(usize, 0), cache.objects.count());
+    try std.testing.expect(2 * 1024 * 1024 * 1024 - cache.scan_control.remaining_work < 32 * 1024);
+    probe.active = false;
+    const value = try cache.resolve(&reader, &raw11, .required_resources);
+    try std.testing.expectEqual(@as(u32, 5), value.get("Font").?.get("F1").?.obj_ref.id);
+    cache.scan_control.remaining_work = 64;
+    const raw12 = syntax.Object{ .obj_ref = .{ .id = 12, .gen = 0 } };
+    try std.testing.expectError(error.PdfMetadataWorkLimit, cache.resolve(&reader, &raw12, .property_table));
+    const work = cache.scan_control.remaining_work;
+    const growth = budget.cumulative_growth_bytes;
+    for (0..512) |_| try std.testing.expectError(error.InvalidPdfStructure, cache.resolve(&reader, &raw12, .property_table));
+    try std.testing.expectEqual(work, cache.scan_control.remaining_work);
+    try std.testing.expectEqual(growth, budget.cumulative_growth_bytes);
+    _ = try cache.resolve(&reader, &raw11, .required_resources);
+}
+
+fn exerciseEncryptedDeferredProperties(a: Allocator, sample: []const u8, id: u32) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    var live = DecodeBudgetAllocator.init(a, 0, 1024 * 1024);
+    var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, 1024 * 1024, 4 * 1024 * 1024);
+    {
+        var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+        defer cache.deinit();
+        const raw = syntax.Object{ .obj_ref = .{ .id = id, .gen = 0 } };
+        const resources = try cache.resources(&reader, &raw);
+        const entries = (try cache.sourceEntries(&reader, cache.propertySource(&resources).?)).?;
+        const value = try cache.entryProperty(&reader, &entries[0]);
+        try std.testing.expectEqualStrings("Label", value.actual_text.?.string);
+        try std.testing.expectEqual(@as(u64, 0), reader.encrypted_stream_generation);
+        try std.testing.expectEqual(@as(usize, 0), reader.encrypted_streams.count());
+    }
+    try std.testing.expectEqual(@as(usize, 0), live.live_bytes);
+}
+
+test "reader deferred properties preserve encryption ownership through allocation failure" {
+    const a = std.testing.allocator;
+    const file_key: [16]u8 = @splat(3);
+    const key = objectEncryptionKey(file_key, 5, .{ .id = 11, .gen = 0 }, .rc4);
+    var encrypted: [5]u8 = "Label".*;
+    rc4Crypt(key.bytes[0..key.len], &encrypted);
+    var hex: std.ArrayList(u8) = .empty;
+    defer hex.deinit(a);
+    for (encrypted) |byte| try hex.print(a, "{x:0>2}", .{byte});
+    const object = try std.fmt.allocPrint(a, "11 0 obj\n<< /Properties << /Tag << /ActualText <{s}> /Private [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] >> >> >>\nendobj\n", .{hex.items});
+    defer a.free(object);
+    const direct = try buildTaggedTextTestPdfAlloc(a, .{ .content = "", .extra = &.{object} });
+    defer a.free(direct);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedDeferredProperties, .{ direct, @as(u32, 11) });
+
+    const compressed = try buildObjectStreamBoundaryTestPdfAlloc(a, &.{"<< /Properties << /Tag << /ActualText (Label) /Private [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] >> >> >>"}, null);
+    defer a.free(compressed);
+    {
+        var reader = try Reader.init(a, compressed);
+        defer reader.deinit();
+        var stream = try reader.readIndirectObject(.{ .id = 6, .gen = 0 });
+        defer stream.deinit(a);
+        const stream_key = objectEncryptionKey(file_key, 5, .{ .id = 6, .gen = 0 }, .rc4);
+        rc4Crypt(stream_key.bytes[0..stream_key.len], compressed[stream.stream.data_offset..][0..stream.stream.data_length]);
+    }
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedDeferredProperties, .{ compressed, @as(u32, 7) });
+}
+
+test "reader property index sorting observes cancellation without caching partial order" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "" });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    const fields = try a.alloc(syntax.DictEntry, 512);
+    var initialized: usize = 0;
+    defer {
+        for (fields[0..initialized]) |entry| a.free(entry.key);
+        a.free(fields);
+    }
+    for (fields, 0..) |*field, i| {
+        field.* = .{ .key = try std.fmt.allocPrint(a, "Tag{d:0>4}", .{511 - i}), .value = .null };
+        initialized += 1;
+    }
+    const Probe = struct {
+        calls: usize = 0,
+        active: bool = true,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.active and self.calls >= 6;
+        }
+    };
+    var probe = Probe{};
+    reader.cancellation = .{ .context = &probe, .is_cancelled_fn = Probe.cancelled };
+    var budget = DecodeBudgetAllocator.init(a, 0, 1024 * 1024);
+    var cache = TextResourceCache{ .budget = &budget };
+    defer cache.deinit();
+    const raw = syntax.Object{ .dict = fields };
+    try std.testing.expectError(error.Canceled, cache.entries(&reader, &raw));
+    try std.testing.expectEqual(@as(usize, 0), cache.scopes.count());
+    probe.active = false;
+    const index = (try cache.entries(&reader, &raw)).?;
+    try std.testing.expectEqualStrings("Tag0000", index[0].raw.key);
+    try std.testing.expectEqualStrings("Tag0511", index[index.len - 1].raw.key);
+}
+
+test "reader document and page text APIs propagate cancellation during extraction" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "BT /F1 10 Tf (SOURCE) Tj ET" });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    _ = try reader.pageCount();
+    const Probe = struct {
+        calls: usize = 0,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls >= 2;
+        }
+    };
+    inline for (.{ false, true }) |document_api| {
+        var probe = Probe{};
+        reader.cancellation = .{ .context = &probe, .is_cancelled_fn = Probe.cancelled };
+        if (document_api)
+            try std.testing.expectError(error.Canceled, reader.extractPlainTextAlloc())
+        else
+            try std.testing.expectError(error.Canceled, reader.extractPageTextAnalysisAlloc(1));
+    }
+}
+
+test "reader cancellable property introsort preserves ordering and permutation without allocations" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 0, 1, 2, 16, 17, 31, 1024 }) |count| for (0..6) |pattern| {
+        const fields = try a.alloc(syntax.DictEntry, count);
+        defer a.free(fields);
+        const index = try a.alloc(TextResourceCache.PropertyEntry, count);
+        defer a.free(index);
+        const seen = try a.alloc(bool, count);
+        defer a.free(seen);
+        @memset(seen, false);
+        var initialized: usize = 0;
+        defer for (fields[0..initialized]) |field| a.free(field.key);
+        var random: u64 = 17;
+        for (fields, index, 0..) |*field, *entry, i| {
+            random = random *% 6364136223846793005 +% 1;
+            const key = switch (pattern) {
+                0 => i,
+                1 => count - i,
+                2 => 0,
+                3 => @as(usize, @intCast(random % 4096)),
+                4 => @min(i, count - i),
+                else => @as(usize, @intCast(random % 17)),
+            };
+            field.* = .{ .key = try std.fmt.allocPrint(a, "K{d:0>6}", .{key}), .value = .{ .integer = @intCast(i) } };
+            initialized += 1;
+            entry.* = .{ .raw = field };
+        }
+        var budget = DecodeBudgetAllocator.init(a, 0, 0);
+        var cache = TextResourceCache{ .budget = &budget };
+        defer cache.deinit();
+        if (count > 16 and pattern == 4)
+            try cache.sortRange(index, 0)
+        else
+            try cache.sortEntries(index);
+        for (index, 0..) |entry, i| {
+            if (i > 0) try std.testing.expect(!std.mem.lessThan(u8, entry.raw.key, index[i - 1].raw.key));
+            const original: usize = @intCast(entry.raw.value.integer);
+            try std.testing.expect(!seen[original]);
+            seen[original] = true;
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.cumulative_growth_bytes);
+    };
+}
+
+fn buildMetadataFramePressureTestPdfAlloc(a: Allocator) ![]u8 {
+    const padding = try a.alloc(u8, 150 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const resources = try std.fmt.allocPrint(a, "<< /Font << /F1 5 0 R >> /Properties << /A 8 0 R /B 9 0 R /Unused << /Private ({s}) >> >> >>", .{padding});
+    defer a.free(resources);
+    const first = try std.fmt.allocPrint(a, "<< /ActualText ({s}) >>", .{padding[0 .. 60 * 1024]});
+    defer a.free(first);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{resources},
+        .extra = &.{ first, first },
+        .flate = false,
+        .content = "/Span /A BDC BT /F1 10 Tf (SOURCE) Tj ET EMC /Span /B BDC BT /F1 10 Tf (SOURCE) Tj ET EMC",
+    });
+}
+
+fn exerciseMetadataFramePressureAllocations(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 256 * 1024, .max_working_set_bytes = 256 * 1024 });
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+    try std.testing.expectEqual(@as(usize, 2), analysis.diagnostics.actual_text_replacements);
+    try std.testing.expectEqual(@as(usize, 120 * 1024 + 1), analysis.text.len);
+}
+
+test "reader optional frame pressure preserves both selected replacements and backing OOM" {
+    const a = std.testing.allocator;
+    const sample = try buildMetadataFramePressureTestPdfAlloc(a);
+    defer a.free(sample);
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 256 * 1024, .max_working_set_bytes = 256 * 1024 });
+    defer reader.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        reader.setTextExtractionPolicy(policy);
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        const plain = try reader.extractPlainTextAlloc();
+        defer a.free(plain);
+        try std.testing.expectEqual(@as(usize, 120 * 1024 + 1), analysis.text.len);
+        try std.testing.expectEqualStrings(analysis.text, plain);
+        try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        try std.testing.expectEqual(@as(usize, 2), analysis.diagnostics.actual_text_replacements);
+    }
+    for ([_]bool{ false, true }) |inject_oom| {
+        var live = DecodeBudgetAllocator.init(a, 0, 256 * 1024);
+        var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, 256 * 1024, 1024 * 1024);
+        {
+            var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+            defer cache.deinit();
+            const raw = syntax.Object{ .obj_ref = .{ .id = 7, .gen = 0 } };
+            const resources = try cache.resources(&reader, &raw);
+            const entries = (try cache.sourceEntries(&reader, cache.propertySource(&resources).?)).?;
+            const first = try cache.entryProperty(&reader, &entries[0]);
+            try std.testing.expectEqual(@as(usize, 60 * 1024), first.actual_text.?.string.len);
+            try std.testing.expect(cache.frames.hasFrames());
+            if (inject_oom) {
+                var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                live.backing = failing.allocator();
+                defer live.backing = a;
+                try std.testing.expectError(error.OutOfMemory, cache.entryProperty(&reader, &entries[1]));
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expect(cache.frames.hasFrames());
+                try std.testing.expect(entries[1].parsed == null);
+                try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+                live.backing = a;
+            }
+            const second = try cache.entryProperty(&reader, &entries[1]);
+            try std.testing.expectEqual(@as(usize, 60 * 1024), second.actual_text.?.string.len);
+            try std.testing.expect(!cache.frames.hasFrames());
+            try std.testing.expectEqual(@as(usize, 1), cache.frames.loads);
+        }
+        try std.testing.expectEqual(@as(usize, 0), live.live_bytes);
+        try std.testing.expect(retained.reclaimer == null and live.reclaimer == null);
+    }
+}
+
+test "reader optional frame pressure preserves ownership through every allocation failure" {
+    const a = std.testing.allocator;
+    const sample = try buildMetadataFramePressureTestPdfAlloc(a);
+    defer a.free(sample);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseMetadataFramePressureAllocations, .{sample});
+}
+
+test "reader pins source frames while selected dictionaries are parsed" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 80 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const resources = try std.fmt.allocPrint(a, "<< /Properties << /Tag << /ActualText ({s}) /Private ({s}) >> >> >>", .{ padding, padding[0 .. 40 * 1024] });
+    defer a.free(resources);
+    const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{resources}, .flate = false });
+    defer a.free(sample);
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 256 * 1024, .max_working_set_bytes = 256 * 1024 });
+    defer reader.deinit();
+    var live = DecodeBudgetAllocator.init(a, 0, 256 * 1024);
+    var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, 256 * 1024, 1024 * 1024);
+    var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+    defer cache.deinit();
+    const raw = syntax.Object{ .obj_ref = .{ .id = 7, .gen = 0 } };
+    const root = try cache.resources(&reader, &raw);
+    const entries = (try cache.sourceEntries(&reader, cache.propertySource(&root).?)).?;
+    const filler = try cache.allocator().alloc(u8, 80 * 1024);
+    defer cache.allocator().free(filler);
+    const selected = try cache.entryProperty(&reader, &entries[0]);
+    try std.testing.expect(selected.invalid);
+    try std.testing.expect(cache.frames.hasFrames());
+    try std.testing.expectEqual(@as(usize, 0), cache.frames.pins);
+}
+
+test "reader indirect object stream lengths preserve cancellation and retry semantics" {
+    const a = std.testing.allocator;
+    var resource: std.ArrayList(u8) = .empty;
+    defer resource.deinit(a);
+    try resource.appendSlice(a, "<< /Font << /F1 5 0 R >> >> %");
+    for (0..4096) |_| try resource.appendSlice(a, "xendstreamx");
+    const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{resource.items}, .flate = false, .indirect_length = true });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    const Probe = struct {
+        calls: usize = 0,
+        active: bool = true,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.active and self.calls >= 3;
+        }
+    };
+    var probe = Probe{};
+    reader.setCancellationProbe(.{ .context = &probe, .is_cancelled_fn = Probe.cancelled });
+    var live = DecodeBudgetAllocator.init(a, 0, 128 * 1024);
+    var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, 128 * 1024, 512 * 1024);
+    var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+    defer cache.deinit();
+    const raw = syntax.Object{ .obj_ref = .{ .id = 7, .gen = 0 } };
+    try std.testing.expectError(error.Canceled, cache.resolve(&reader, &raw, .required_resources));
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+    try std.testing.expectEqual(@as(usize, 0), cache.objects.count());
+    try std.testing.expect(2 * 1024 * 1024 * 1024 - cache.scan_control.remaining_work < 16 * 1024);
+    probe.active = false;
+    const value = try cache.resolve(&reader, &raw, .required_resources);
+    try std.testing.expectEqual(@as(u32, 5), value.get("Font").?.get("F1").?.obj_ref.id);
+}
+
+test "reader ordinary object reads cancel stream searches before allocating payloads" {
+    const a = std.testing.allocator;
+    var resource: std.ArrayList(u8) = .empty;
+    defer resource.deinit(a);
+    try resource.appendSlice(a, "<< /Font << /F1 5 0 R >> >> %");
+    for (0..4096) |_| try resource.appendSlice(a, "xendstreamx");
+    const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{resource.items}, .flate = false, .indirect_length = true });
+    defer a.free(sample);
+    var tracked = DecodeBudgetAllocator.init(a, 0, 256 * 1024);
+    var reader = try Reader.init(tracked.allocator(), sample);
+    defer reader.deinit();
+    const Probe = struct {
+        calls: usize = 0,
+        active: bool = true,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.active and self.calls >= 3;
+        }
+    };
+    var probe = Probe{};
+    reader.setCancellationProbe(.{ .context = &probe, .is_cancelled_fn = Probe.cancelled });
+    const growth = tracked.cumulative_growth_bytes;
+    try std.testing.expectError(error.Canceled, reader.readIndirectObject(.{ .id = 7, .gen = 0 }));
+    try std.testing.expect(tracked.cumulative_growth_bytes - growth < 16 * 1024);
+    probe.active = false;
+    var object = try reader.readIndirectObject(.{ .id = 7, .gen = 0 });
+    defer object.deinit(tracked.allocator());
+    try std.testing.expectEqual(@as(u32, 5), object.get("Font").?.get("F1").?.obj_ref.id);
+}
+
+fn exerciseIndirectLengthPayloadAllocations(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings("Label\n", analysis.text);
+    try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+    const plain = try reader.extractPlainTextAlloc();
+    defer a.free(plain);
+    try std.testing.expectEqualStrings(analysis.text, plain);
+}
+
+test "reader indirect lengths preserve endstream data and full payload boundaries" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "before\nendstream\nendobj\nafter", "before\rendstream\rafter", "before\r\nendstream\r\nafter" }) |private| {
+        const resources = try std.fmt.allocPrint(a, "<< /Font << /F1 5 0 R >> /Properties << /Tag << /ActualText (Label) >> >> /Private ({s}) >>", .{private});
+        defer a.free(resources);
+        const sample = try buildObjectStreamFixtureAlloc(a, .{
+            .objects = &.{resources},
+            .content = "/Span /Tag BDC BT /F1 10 Tf (SOURCE) Tj ET EMC",
+            .flate = false,
+            .indirect_length = true,
+        });
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        var stream = try reader.readIndirectObject(.{ .id = 6, .gen = 0 });
+        defer stream.deinit(a);
+        const raw = try reader.readRawStreamData(&stream);
+        defer a.free(raw);
+        try std.testing.expectEqualStrings(resources, raw[4 .. raw.len - 1]);
+        try std.testing.expectEqual(raw.len, stream.stream.data_length);
+        try std.testing.expectEqual(@as(i64, @intCast(raw.len)), stream.get("Length").?.integer);
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("Label\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+    }
+}
+
+test "reader indirect length ownership survives every allocation failure" {
+    const a = std.testing.allocator;
+    const sample = try buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{"<< /Font << /F1 5 0 R >> /Properties << /Tag << /ActualText (Label) >> >> /Private (before\nendstream\nafter) >>"},
+        .content = "/Span /Tag BDC BT /F1 10 Tf (SOURCE) Tj ET EMC",
+        .flate = false,
+        .indirect_length = true,
+    });
+    defer a.free(sample);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseIndirectLengthPayloadAllocations, .{sample});
+}
+
+test "reader indirect length references reject cycles and invalid lengths" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { extra: []const []const u8, reference: usize, expected: anyerror }{
+        .{ .extra = &.{"8 0 R"}, .reference = 8, .expected = error.InvalidStreamLength },
+        .{ .extra = &.{ "9 0 R", "8 0 R" }, .reference = 8, .expected = error.InvalidStreamLength },
+        .{ .extra = &.{"-1"}, .reference = 8, .expected = error.InvalidStreamLength },
+        .{ .extra = &.{"2"}, .reference = 8, .expected = error.MissingEndStream },
+        .{ .extra = &.{"9223372036854775807"}, .reference = 8, .expected = if (@bitSizeOf(usize) < 64) error.InvalidStreamLength else error.UnexpectedEof },
+        .{ .extra = &.{}, .reference = 7, .expected = error.InvalidStreamLength },
+        .{ .extra = &.{}, .reference = 400, .expected = error.ObjectNotFound },
+    };
+    for (cases) |case| {
+        const sample = try buildObjectStreamFixtureAlloc(a, .{
+            .objects = &.{"<< /Font << /F1 5 0 R >> >>"},
+            .extra = case.extra,
+            .flate = false,
+            .indirect_length = true,
+            .length_reference = case.reference,
+        });
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        try std.testing.expectError(case.expected, reader.readIndirectObject(.{ .id = 6, .gen = 0 }));
+    }
+    // Invalid scalar types retain bounded marker-search recovery.
+    for ([_][]const u8{ "null", "[1 2]", "<< /Ignored [0 1] >>" }) |value| {
+        const sample = try buildObjectStreamFixtureAlloc(a, .{
+            .objects = &.{"<< /Font << /F1 5 0 R >> >>"},
+            .extra = &.{value},
+            .flate = false,
+            .indirect_length = true,
+            .length_reference = 8,
+        });
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        var stream = try reader.readIndirectObject(.{ .id = 6, .gen = 0 });
+        defer stream.deinit(a);
+        const raw = try reader.readRawStreamData(&stream);
+        defer a.free(raw);
+        try std.testing.expectEqual(stream.stream.data_length, raw.len);
+    }
+}
+
+test "reader indirect length reference chains have a fixed resolution bound" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 1, 127, 128 }) |count| {
+        const extra = try a.alloc([]const u8, count);
+        var initialized: usize = 0;
+        defer {
+            for (extra[0..initialized]) |object| a.free(object);
+            a.free(extra);
+        }
+        for (extra, 0..) |*object, i| {
+            object.* = try std.fmt.allocPrint(a, "{d} 0 R", .{9 + i});
+            initialized += 1;
+        }
+        const sample = try buildObjectStreamFixtureAlloc(a, .{
+            .objects = &.{"<< /Font << /F1 5 0 R >> >>"},
+            .extra = extra,
+            .flate = false,
+            .indirect_length = true,
+            .length_reference = 8,
+        });
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        if (count == 128) {
+            try std.testing.expectError(error.InvalidStreamLength, reader.readIndirectObject(.{ .id = 6, .gen = 0 }));
+        } else {
+            var stream = try reader.readIndirectObject(.{ .id = 6, .gen = 0 });
+            defer stream.deinit(a);
+            try std.testing.expect(stream.stream.data_length > 0);
+        }
+    }
+}
+
+test "reader indirect length scalar parsing rejects excessive nesting" {
+    const a = std.testing.allocator;
+    var nested: std.ArrayList(u8) = .empty;
+    defer nested.deinit(a);
+    for (0..129) |_| try nested.appendSlice(a, "11 0 obj ");
+    try nested.appendSlice(a, "1 ");
+    for (0..129) |_| try nested.appendSlice(a, "endobj ");
+    const sample = try buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{"<< /Font << /F1 5 0 R >> >>"},
+        .extra = &.{nested.items},
+        .flate = false,
+        .indirect_length = true,
+        .length_reference = 8,
+    });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    try std.testing.expectError(error.PdfObjectNestingTooDeep, reader.readIndirectObject(.{ .id = 6, .gen = 0 }));
+}
+
+fn exerciseEncryptedIndirectStreamLengthAllocations(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    var resources = try reader.readIndirectObject(.{ .id = 7, .gen = 0 });
+    defer resources.deinit(a);
+    try std.testing.expectEqualStrings("Label", resources.get("Properties").?.get("Tag").?.get("ActualText").?.string);
+}
+
+test "reader indirect lengths preserve encrypted stream ownership through allocation failure" {
+    const a = std.testing.allocator;
+    const sample = try buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{"<< /Font << /F1 5 0 R >> /Properties << /Tag << /ActualText (Label) >> >> /Private (before\nendstream\nafter) >>"},
+        .flate = false,
+        .indirect_length = true,
+    });
+    defer a.free(sample);
+    {
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        var stream = try reader.readIndirectObject(.{ .id = 6, .gen = 0 });
+        defer stream.deinit(a);
+        const file_key: [16]u8 = @splat(3);
+        const key = objectEncryptionKey(file_key, 5, .{ .id = 6, .gen = 0 }, .rc4);
+        rc4Crypt(key.bytes[0..key.len], sample[stream.stream.data_offset..][0..stream.stream.data_length]);
+    }
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedIndirectStreamLengthAllocations, .{sample});
+}
+
+fn buildCompressedOrdinaryLengthTestPdfAlloc(a: Allocator, flate: bool) ![]u8 {
+    const content = "/Span /Tag BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC";
+    const length = try std.fmt.allocPrint(a, "{d}", .{content.len});
+    defer a.free(length);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "<< /Font << /F1 5 0 R >> /Properties << /Tag << /ActualText (Label) >> >> >>", length },
+        .content = content,
+        .content_length_reference = 8,
+        .flate = flate,
+    });
+}
+
+fn exerciseCompressedOrdinaryLength(a: Allocator, sample: []const u8, encrypted: bool) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    if (encrypted) reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    var stream = try reader.readIndirectObject(.{ .id = 4, .gen = 0 });
+    defer stream.deinit(a);
+    try std.testing.expect(stream.get("Length").?.* == .integer);
+    if (encrypted) {
+        // Length-container decryption uses a scoped registry; only the actual
+        // content stream may have changed the source reader's registry here.
+        try std.testing.expectEqual(@as(usize, 1), reader.encrypted_streams.count());
+        try std.testing.expectEqual(@as(u64, 1), reader.encrypted_stream_generation);
+    }
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings("Label\n", analysis.text);
+    try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+}
+
+test "reader ordinary stream lengths may be stored in object streams" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |flate| {
+        const sample = try buildCompressedOrdinaryLengthTestPdfAlloc(a, flate);
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("Label\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+    }
+}
+
+test "reader compressed ordinary lengths preserve ownership through allocation failure" {
+    const a = std.testing.allocator;
+    const sample = try buildCompressedOrdinaryLengthTestPdfAlloc(a, true);
+    defer a.free(sample);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseCompressedOrdinaryLength, .{ sample, false });
+    // Encrypt both payloads. Integer length objects are decrypted only as part
+    // of their enclosing object stream; they are not independently encrypted.
+    {
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        for ([_]u32{ 4, 6 }) |id| {
+            var stream = try reader.readIndirectObject(.{ .id = id, .gen = 0 });
+            defer stream.deinit(a);
+            const file_key: [16]u8 = @splat(3);
+            const key = objectEncryptionKey(file_key, 5, .{ .id = id, .gen = 0 }, .rc4);
+            rc4Crypt(key.bytes[0..key.len], sample[stream.stream.data_offset..][0..stream.stream.data_length]);
+        }
+    }
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseCompressedOrdinaryLength, .{ sample, true });
+}
+
+test "reader length dependencies reject reentrant container cycles" {
+    const a = std.testing.allocator;
+    const content = "BT /F1 10 Tf (SOURCE) Tj ET";
+    const length = try std.fmt.allocPrint(a, "{d}", .{content.len});
+    defer a.free(length);
+    // A malformed container without Type ObjStm must still be cycle-safe:
+    // resolving the ordinary length enters its owner, which references it again.
+    const sample = try buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "<< /Font << /F1 5 0 R >> >>", length },
+        .content = content,
+        .content_length_reference = 8,
+        .indirect_length = true,
+        .length_reference = 8,
+        .object_stream_type = "Other",
+    });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    try std.testing.expectError(error.InvalidStreamLength, reader.readIndirectObject(.{ .id = 4, .gen = 0 }));
+    try std.testing.expect(reader.length_resolution == null);
+}
+
+test "reader length dependency limit spans compressed container reads" {
+    const a = std.testing.allocator;
+    const content = "BT /F1 10 Tf (SOURCE) Tj ET";
+    const length = try std.fmt.allocPrint(a, "{d}", .{content.len});
+    defer a.free(length);
+    for ([_]usize{ 126, 127 }) |count| {
+        const extra = try a.alloc([]const u8, count);
+        var initialized: usize = 0;
+        defer {
+            for (extra[0..initialized]) |item| a.free(item);
+            a.free(extra);
+        }
+        for (extra, 0..) |*item, i| {
+            item.* = try std.fmt.allocPrint(a, "{d} 0 R", .{if (i + 1 == count) @as(usize, 8) else 10 + i});
+            initialized += 1;
+        }
+        const sample = try buildObjectStreamFixtureAlloc(a, .{
+            .objects = &.{ "<< /Font << /F1 5 0 R >> >>", length },
+            .extra = extra,
+            .content = content,
+            .content_length_reference = 9,
+            .indirect_length = true,
+        });
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        if (count == 127) {
+            try std.testing.expectError(error.InvalidStreamLength, reader.readIndirectObject(.{ .id = 4, .gen = 0 }));
+        } else {
+            var stream = try reader.readIndirectObject(.{ .id = 4, .gen = 0 });
+            defer stream.deinit(a);
+            try std.testing.expectEqual(content.len, stream.stream.data_length);
+        }
+    }
+}
+
+test "reader validated stream lengths do not allocate to resolve again" {
+    const a = std.testing.allocator;
+    const sample = try buildCompressedOrdinaryLengthTestPdfAlloc(a, true);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var stream = try reader.readIndirectObject(.{ .id = 4, .gen = 0 });
+    defer stream.deinit(a);
+    try std.testing.expectEqual(@as(i64, @intCast(stream.stream.data_length)), stream.get("Length").?.integer);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    var raw_reader = reader;
+    raw_reader.alloc = failing.allocator();
+    const raw = try raw_reader.readRawStreamData(&stream);
+    defer failing.allocator().free(raw);
+    try std.testing.expectEqual(@as(usize, 1), failing.alloc_index);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(stream.stream.data_length, raw.len);
+}
+
+fn buildDamagedTextImageTestPdfAlloc(a: Allocator, length: []const u8) ![]u8 {
+    const resources = "<< /Font << /F1 5 0 R >> /XObject << /Im 8 0 R >> >>";
+    const image = try std.fmt.allocPrint(a, "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {s} >>\nstream\nABC\nendstream", .{length});
+    defer a.free(image);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{resources},
+        .extra = &.{image},
+        .content = "BT /F1 10 Tf 10 100 Td (Hello) Tj ET /Im Do",
+    });
+}
+
+fn exerciseDamagedTextImage(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings("Hello\n", analysis.text);
+    try std.testing.expect(analysis.has_nontext_visual);
+    try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+}
+
+test "reader damaged image lengths preserve native text without relaxing payload reads" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "99 0 R", "-1" }, [_]anyerror{ error.ObjectNotFound, error.InvalidStreamLength }) |length, failure| {
+        const sample = try buildDamagedTextImageTestPdfAlloc(a, length);
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("Hello\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(analysis.has_nontext_visual);
+        }
+        try std.testing.expectError(failure, reader.readIndirectObject(.{ .id = 8, .gen = 0 }));
+        var header = try reader.readIndirectObjectProjected(.{ .id = 8, .gen = 0 }, .xobject_header);
+        defer header.deinit(a);
+        try std.testing.expect(header == .stream_header);
+        try std.testing.expectError(error.NotAStream, reader.readRawStreamData(&header));
+        var copy = try header.clone(a);
+        defer copy.deinit(a);
+        try std.testing.expectEqualStrings("Image", copy.get("Subtype").?.asName().?);
+    }
+}
+
+test "reader damaged image header recovery preserves allocation failures" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "99 0 R", "-1" }) |length| {
+        const sample = try buildDamagedTextImageTestPdfAlloc(a, length);
+        defer a.free(sample);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseDamagedTextImage, .{sample});
+    }
+}
+
+test "reader damaged image recovery propagates cancellation and work exhaustion" {
+    const a = std.testing.allocator;
+    const sample = try buildDamagedTextImageTestPdfAlloc(a, "99 0 R");
+    defer a.free(sample);
+    const Probe = struct {
+        calls: usize = 0,
+        cancel_at: usize = std.math.maxInt(usize),
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls >= self.cancel_at;
+        }
+    };
+    var baseline = try Reader.init(a, sample);
+    defer baseline.deinit();
+    _ = try baseline.pageCount();
+    var probe = Probe{};
+    baseline.setCancellationProbe(.{ .context = &probe, .is_cancelled_fn = Probe.cancelled });
+    var analysis = try baseline.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    const checkpoints = probe.calls;
+    try std.testing.expect(checkpoints > 0);
+    for (1..checkpoints + 1) |cancel_at| {
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        _ = try reader.pageCount();
+        var cancellation = Probe{ .cancel_at = cancel_at };
+        reader.setCancellationProbe(.{ .context = &cancellation, .is_cancelled_fn = Probe.cancelled });
+        try std.testing.expectError(error.Canceled, reader.extractPageTextAnalysisAlloc(1));
+    }
+    var work = syntax.ScanControl{ .remaining_work = 0 };
+    baseline.metadata_scan = &work;
+    const raw = syntax.Object{ .obj_ref = .{ .id = 8, .gen = 0 } };
+    try std.testing.expectError(error.PdfMetadataWorkLimit, baseline.textXObject(&raw));
+}
+
+test "stream filter cancellation owns the input before inspecting filters" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        fn cancelled(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    const name = syntax.Object{ .name = @constCast("FlateDecode") };
+    const empty = syntax.Object{ .array = &.{} };
+    for ([_]?*const syntax.Object{ null, &name, &empty }) |filter| {
+        const raw = try a.dupe(u8, "owned input");
+        try std.testing.expectError(error.Canceled, decodeStreamFiltersOwnedAlloc(a, raw, filter, null, .{}, .{ .is_cancelled_fn = Probe.cancelled }));
+    }
+}
+
+fn buildNativeImageLengthContainerTestPdfAlloc(a: Allocator, subtype_first: bool) ![]u8 {
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    padding[0] = '(';
+    padding[padding.len - 1] = ')';
+    const image = if (subtype_first)
+        "<< /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 7 0 R >>\nstream\nABC\nendstream"
+    else
+        "<< /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 7 0 R /Subtype /Image >>\nstream\nABC\nendstream";
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "3", padding },
+        .extra = &.{image},
+        .resources = "<< /Font << /F1 5 0 R >> /XObject << /A 9 0 R /B 9 0 R >> >>",
+        .content = "BT /F1 10 Tf 10 100 Td (Hello) Tj ET /A Do /B Do",
+    });
+}
+
+fn exerciseNativeImageLengthContainer(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 16 * 1024, .max_working_set_bytes = 32 * 1024 });
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings("Hello\n", analysis.text);
+    try std.testing.expect(analysis.has_nontext_visual);
+    try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+}
+
+test "reader native image inspection never decodes compressed length containers" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |subtype_first| {
+        const sample = try buildNativeImageLengthContainerTestPdfAlloc(a, subtype_first);
+        defer a.free(sample);
+        {
+            var tracked = DecodeBudgetAllocator.init(a, 0, 16 * 1024);
+            var reader = try Reader.initWithDecodeLimits(tracked.allocator(), sample, .{ .max_decoded_stream_bytes = 16 * 1024, .max_working_set_bytes = 32 * 1024 });
+            defer reader.deinit();
+            const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+            const before = tracked.cumulative_growth_bytes;
+            var image = try reader.textXObject(&reference);
+            defer image.deinit(tracked.allocator());
+            try std.testing.expect(image == .stream_header);
+            try std.testing.expect(tracked.cumulative_growth_bytes - before < 4096);
+            try std.testing.expect(!tracked.limit_exceeded);
+            // Payload consumers still resolve and enforce the container limits.
+            if (reader.readIndirectObject(reference.obj_ref)) |value| {
+                var owned = value;
+                defer owned.deinit(tracked.allocator());
+                return error.TestUnexpectedResult;
+            } else |err| try std.testing.expect(err == error.OutOfMemory or err == error.DecodedStreamTooLarge or err == error.PdfDecodeWorkingSetTooLarge);
+        }
+        // Font caches and output are unrelated to stream decoder allowances.
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 16 * 1024, .max_working_set_bytes = 32 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("Hello\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(analysis.has_nontext_visual);
+        }
+    }
+}
+
+test "reader native image header projection preserves allocation failures" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |subtype_first| {
+        const sample = try buildNativeImageLengthContainerTestPdfAlloc(a, subtype_first);
+        defer a.free(sample);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseNativeImageLengthContainer, .{sample});
+    }
+}
+
+fn exerciseEncryptedNativeFormProjection(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings("Label\n", analysis.text);
+    try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+}
+
+test "reader native Form projection decrypts deferred resources exactly once" {
+    const a = std.testing.allocator;
+    const file_key: [16]u8 = @splat(3);
+    const key = objectEncryptionKey(file_key, 5, .{ .id = 6, .gen = 0 }, .rc4);
+    var label: [5]u8 = "Label".*;
+    rc4Crypt(key.bytes[0..key.len], &label);
+    var hex: std.ArrayList(u8) = .empty;
+    defer hex.deinit(a);
+    for (label) |byte| try hex.print(a, "{x:0>2}", .{byte});
+    const paint = "/Span /Tag BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC";
+    const form = try std.fmt.allocPrint(a, "6 0 obj\n<< /Resources << /Font << /F1 5 0 R >> /Properties << /Tag << /ActualText <{s}> >> >> >> /BBox [0 0 400 300] /Filter [] /Subtype /Form /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ hex.items, paint.len, paint });
+    defer a.free(form);
+    const sample = try buildImageDecodeTestPdfAlloc(a, &.{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources << /XObject << /Fm 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "4 0 obj\n<< /Length 6 >>\nstream\n/Fm Do\nendstream\nendobj\n",
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        form,
+    });
+    defer a.free(sample);
+    {
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        for ([_]u32{ 4, 6 }) |id| {
+            var stream = try reader.readIndirectObject(.{ .id = id, .gen = 0 });
+            defer stream.deinit(a);
+            const stream_key = objectEncryptionKey(file_key, 5, .{ .id = id, .gen = 0 }, .rc4);
+            rc4Crypt(stream_key.bytes[0..stream_key.len], sample[stream.stream.data_offset..][0..stream.stream.data_length]);
+        }
+    }
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedNativeFormProjection, .{sample});
+}
+
+fn buildIgnoredTextXObjectTestPdfAlloc(a: Allocator, classification: []const u8, length: []const u8) ![]u8 {
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    padding[0] = '(';
+    padding[padding.len - 1] = ')';
+    // Deliberately put classification after decoder fields and resources.
+    const object = try std.fmt.allocPrint(a, "<< /Type /XObject /Resources << /Unused (ignored) >> /Filter /Unsupported /Length {s} {s} >>\nstream\n%PS\nendstream", .{ length, classification });
+    defer a.free(object);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "3", padding },
+        .extra = &.{object},
+        .resources = "<< /Font << /F1 5 0 R >> /XObject << /A 9 0 R /B 9 0 R >> >>",
+        .content = "BT /F1 10 Tf 10 100 Td (Hello) Tj ET /A Do /B Do",
+    });
+}
+
+fn exerciseIgnoredTextXObject(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+    var header = try reader.textXObject(&reference);
+    defer header.deinit(a);
+    try std.testing.expect(header == .stream_header);
+    try std.testing.expect(header.get("Length") == null);
+    try std.testing.expect(header.get("Resources") == null);
+    try std.testing.expectError(error.NotAStream, reader.readDecodedStreamData(&header));
+}
+
+test "reader ignored XObjects preserve native text independently of length and filters" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "/Subtype /PS", "/Subtype /Form /Subtype2 /PS", "/Subtype2 /PS /Subtype /Form", "/Subtype /Unknown", "" }) |classification| {
+        for ([_][]const u8{ "7 0 R", "99 0 R", "-1", "1" }) |length| {
+            const sample = try buildIgnoredTextXObjectTestPdfAlloc(a, classification, length);
+            defer a.free(sample);
+            var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 16 * 1024, .max_working_set_bytes = 32 * 1024 });
+            defer reader.deinit();
+            inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+                reader.setTextExtractionPolicy(policy);
+                var analysis = try reader.extractPageTextAnalysisAlloc(1);
+                defer analysis.deinit(a);
+                const plain = try reader.extractPlainTextAlloc();
+                defer a.free(plain);
+                try std.testing.expectEqualStrings("Hello\n", analysis.text);
+                try std.testing.expectEqualStrings(analysis.text, plain);
+                try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+            }
+            // Native-only projection must not relax ordinary stream reads.
+            const reference = syntax.ObjRef{ .id = 9, .gen = 0 };
+            if (std.mem.eql(u8, length, "99 0 R")) {
+                try std.testing.expectError(error.ObjectNotFound, reader.readIndirectObject(reference));
+            } else if (std.mem.eql(u8, length, "-1")) {
+                try std.testing.expectError(error.InvalidStreamLength, reader.readIndirectObject(reference));
+            } else if (std.mem.eql(u8, length, "1")) {
+                try std.testing.expectError(error.MissingEndStream, reader.readIndirectObject(reference));
+            }
+        }
+    }
+}
+
+test "reader ignored XObject header ownership preserves allocation failures" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "/Subtype /PS", "/Subtype /Form /Subtype2 /PS", "/Subtype2 /PS /Subtype /Form" }) |classification| {
+        const sample = try buildIgnoredTextXObjectTestPdfAlloc(a, classification, "7 0 R");
+        defer a.free(sample);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseIgnoredTextXObject, .{sample});
+    }
+}
+
+fn buildProfileMetadataTestPdfAlloc(a: Allocator, length: []const u8, alternate: []const u8) ![]u8 {
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    padding[0] = '(';
+    padding[padding.len - 1] = ')';
+    const profile = try std.fmt.allocPrint(a, "<< /N 3 /Alternate {s} /Range [0 1 0 1 0 1] /Length {s} >>\nstream\nICC\nendstream", .{ alternate, length });
+    defer a.free(profile);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "3", padding },
+        .extra = &.{profile},
+        .resources = "<< /Font << /F1 5 0 R >> /ColorSpace << /C [/ICCBased 9 0 R] >> >>",
+        .content = "/C cs BT /F1 10 Tf 10 100 Td (Hello) Tj ET",
+    });
+}
+
+test "reader ICC metadata probes preserve native text within decoder limits" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "7 0 R", "99 0 R", "-1" }) |length| {
+        const sample = try buildProfileMetadataTestPdfAlloc(a, length, "/DeviceRGB");
+        defer a.free(sample);
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 128 * 1024, .max_working_set_bytes = 64 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("Hello\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+        }
+        const name = syntax.Object{ .name = @constCast("ICCBased") };
+        const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+        var components = [_]syntax.Object{ name, reference };
+        const color_space = syntax.Object{ .array = &components };
+        try std.testing.expectEqual(@as(usize, 3), try reader.colorSpaceInputComponentCount(&color_space));
+        try std.testing.expectEqual(ColorSpaceKind.device_rgb, try reader.shadingColorSpaceKind(&color_space));
+        var rgba: [4]u8 = undefined;
+        try std.testing.expect(try reader.tryDecodeIccBasedImageToRgba(&rgba, 1, &.{ 10, 20, 30 }, &components, null));
+        try std.testing.expectEqualSlices(u8, &.{ 10, 20, 30, 255 }, &rgba);
+        var header = try reader.colorProfileMetadata(&reference);
+        defer header.deinit(a);
+        try std.testing.expect(header == .stream_header);
+        try std.testing.expectError(error.NotAStream, reader.readRawStreamData(&header));
+        if (std.mem.eql(u8, length, "99 0 R"))
+            try std.testing.expectError(error.ObjectNotFound, reader.readIndirectObject(reference.obj_ref));
+        if (std.mem.eql(u8, length, "-1"))
+            try std.testing.expectError(error.InvalidStreamLength, reader.readIndirectObject(reference.obj_ref));
+    }
+}
+
+fn exerciseEncryptedProfileMetadata(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+    var header = try reader.colorProfileMetadata(&reference);
+    defer header.deinit(a);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 20, 30 }, header.get("Alternate").?.array[3].string);
+    try std.testing.expectEqual(@as(usize, 0), reader.encrypted_streams.count());
+    try std.testing.expectEqual(@as(u64, 0), reader.encrypted_stream_generation);
+}
+
+test "reader color profile header views decrypt owned metadata without registering payloads" {
+    const a = std.testing.allocator;
+    var palette = [_]u8{ 10, 20, 30 };
+    const file_key: [16]u8 = @splat(3);
+    const key = objectEncryptionKey(file_key, 5, .{ .id = 9, .gen = 0 }, .rc4);
+    rc4Crypt(key.bytes[0..key.len], &palette);
+    const alternate = try std.fmt.allocPrint(a, "[/Indexed /DeviceRGB 0 <{x:0>2}{x:0>2}{x:0>2}>]", .{ palette[0], palette[1], palette[2] });
+    defer a.free(alternate);
+    const sample = try buildProfileMetadataTestPdfAlloc(a, "99 0 R", alternate);
+    defer a.free(sample);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedProfileMetadata, .{sample});
+}
+
+fn buildFormResourceViewTestPdfAlloc(a: Allocator, indirect_font: bool) ![]u8 {
+    const padding = try a.alloc(u8, 128 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const paint = "BT /F1 10 Tf 10 100 Td (Hello) Tj ET";
+    const form = try std.fmt.allocPrint(a, "<< /Subtype /Form /Resources << /Font {s}\n%{s}\n/Private ({s}) /Properties << /Unused << /ActualText ({s}) >> >> /XObject 99 0 R /ExtGState 99 0 R >> /Length {d} >>\nstream\n{s}\nendstream", .{ if (indirect_font) "10 0 R" else "<< /F1 5 0 R >>", padding, padding, padding, paint.len, paint });
+    defer a.free(form);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "null", "null" },
+        .extra = &.{ form, "<< /F1 5 0 R >>" },
+        .resources = "<< /XObject << /Fm 9 0 R >> >>",
+        .content = "/Fm Do",
+    });
+}
+
+fn exerciseFormResourceViewOwnership(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+    var form = try reader.textXObject(&reference);
+    defer form.deinit(a);
+    const resources = form.get("Resources").?;
+    try std.testing.expect(resources.get("Private") == null);
+    var fonts = try reader.resolveValue(resources.get("Font").?);
+    defer fonts.deinit(a);
+    try std.testing.expectEqual(@as(u32, 5), fonts.get("F1").?.obj_ref.id);
+}
+
+test "reader native Form resource views retain only needed metadata and resolve scalar references" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |indirect_font| {
+        const sample = try buildFormResourceViewTestPdfAlloc(a, indirect_font);
+        defer a.free(sample);
+        {
+            var budget = DecodeBudgetAllocator.init(a, 0, 16 * 1024);
+            var reader = try Reader.init(budget.allocator(), sample);
+            defer reader.deinit();
+            const before = budget.cumulative_growth_bytes;
+            const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+            var form = try reader.textXObject(&reference);
+            defer form.deinit(budget.allocator());
+            try std.testing.expect(budget.cumulative_growth_bytes - before < 8192);
+            try std.testing.expect(!budget.limit_exceeded);
+        }
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 128 * 1024, .max_working_set_bytes = 64 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const text = try reader.extractPlainTextAlloc();
+            defer a.free(text);
+            try std.testing.expectEqualStrings("Hello\n", text);
+            try std.testing.expectEqualStrings(text, analysis.text);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseFormResourceViewOwnership, .{sample});
+    }
+}
+
+// The same appearance can be probed many times without decoding its indirect
+// length container. Rendering must still resolve and validate that payload.
+test "reader annotation coverage ignores appearance payload lengths" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const opaque_object = try std.fmt.allocPrint(a, "null %{s}\n", .{padding});
+    defer a.free(opaque_object);
+    for ([_][]const u8{ "7 0 R", "99 0 R", "-1" }) |length| {
+        const appearance = try std.fmt.allocPrint(a, "<< /Subtype /Form /StructParents 1 /BBox [0 0 10 10] /Resources << /Unused ({s}) >> /Length {s} >>\nstream\nq Q\nendstream", .{ padding, length });
+        defer a.free(appearance);
+        const sample = try buildObjectStreamFixtureAlloc(a, .{
+            .objects = &.{ "3", opaque_object },
+            .extra = &.{appearance},
+            .resources = "<< /Font << /F1 5 0 R >> >>",
+            .page_fields = "/Annots [<< /Subtype /Stamp /F 4 /Rect [0 0 10 10] /AP << /N 9 0 R >> >> << /Subtype /Stamp /F 4 /Rect [0 0 10 10] /AS /On /AP << /N << /On 9 0 R >> >> >>]",
+            .content = "BT /F1 10 Tf 10 100 Td (Hello) Tj ET",
+        });
+        defer a.free(sample);
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 128 * 1024, .max_working_set_bytes = 64 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            try std.testing.expectEqualStrings("Hello\n", analysis.text);
+            try std.testing.expect(!analysis.has_unrendered_annotations);
+        }
+        try std.testing.expectEqual(@as(usize, 0), reader.encrypted_streams.count());
+        try std.testing.expectError(if (std.mem.eql(u8, length, "7 0 R")) error.PdfDecodeWorkingSetTooLarge else if (std.mem.eql(u8, length, "99 0 R")) error.ObjectNotFound else error.InvalidStreamLength, reader.extractPageRenderRunsAlloc(1));
+        var budget = DecodeBudgetAllocator.init(a, 0, 8192);
+        const context = StructureResolverContext{ .reader = &reader, .budget = &budget };
+        const raw = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+        var header = try StructureResolverContext.resolve(&context, budget.allocator(), &raw);
+        defer header.deinit(budget.allocator());
+        try std.testing.expect(header == .stream_header);
+        try std.testing.expectEqual(@as(i64, 1), header.get("StructParents").?.integer);
+        try std.testing.expectError(error.NotAStream, reader.readRawStreamData(&header));
+    }
+}
+
+fn exerciseResourceTableViews(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+    var form = try reader.textXObject(&reference);
+    defer form.deinit(a);
+    const resources = form.get("Resources").?;
+    for ([_][]const u8{ "Font", "XObject", "ExtGState", "ColorSpace" }) |name| {
+        var table = try reader.resourceTable(resources.get(name).?);
+        defer table.deinit(a);
+        const unused = table.get("Unused").?;
+        try std.testing.expect(unused.* == .deferred);
+        try std.testing.expectEqual(@as(u32, 9), unused.deferred.reference.id);
+    }
+    const fonts = try reader.collectFontsFromResourcesAlloc(resources, "BT /F1 10 Tf (Hello) Tj ET");
+    defer {
+        for (fonts) |*font| font.deinit(a);
+        a.free(fonts);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fonts.len);
+}
+
+test "reader resource tables skip unused inline definitions in one bounded scan" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const content = "BT /F1 10 Tf (Hello) Tj ET";
+    const form = try std.fmt.allocPrint(a, "<< /Subtype /Form /Resources << /Font << /F1 5 0 R %{s}\n /Unused << /Private ({s}) >> >> /XObject << /Unused << /Private ({s}) >> >> /ExtGState << /Unused << /Private ({s}) >> >> /ColorSpace << /Unused [/Private ({s})] >> >> /Length {d} >>\nstream\n{s}\nendstream", .{ padding, padding, padding, padding, padding, content.len, content });
+    defer a.free(form);
+    const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{ "null", "null" }, .extra = &.{form}, .resources = "<< /XObject << /Fm 9 0 R >> >>", .content = "/Fm Do" });
+    defer a.free(sample);
+    var budget = DecodeBudgetAllocator.init(a, 0, 512 * 1024);
+    // One scan of the large values plus small dictionary/lexical overhead.
+    var scan = syntax.ScanControl{ .remaining_work = form.len * 2 + 16384 };
+    var reader = try Reader.init(budget.allocator(), sample);
+    defer reader.deinit();
+    reader.metadata_scan = &scan;
+    try exerciseResourceTableViews(budget.allocator(), sample);
+    const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+    var view = try reader.textXObject(&reference);
+    defer view.deinit(budget.allocator());
+    const fonts = try reader.collectFontsFromResourcesAlloc(view.get("Resources").?, content);
+    defer {
+        for (fonts) |*font| font.deinit(budget.allocator());
+        budget.allocator().free(fonts);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fonts.len);
+    try std.testing.expect(scan.remaining_work > 0);
+    try std.testing.expect(!budget.limit_exceeded);
+    reader.metadata_scan = null;
+    const text = try reader.extractPlainTextAlloc();
+    defer budget.allocator().free(text);
+    try std.testing.expectEqualStrings("Hello\n", text);
+    // Exercise ownership and failure cleanup with the same shape at small size.
+    const small = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{ "null", "null" }, .extra = &.{"<< /Subtype /Form /Resources << /Font << /F1 5 0 R /Unused << /Private (ignored) >> >> /XObject << /Unused << >> >> /ExtGState << /Unused << >> >> /ColorSpace << /Unused [/Private] >> >> /Length 0 >>\nstream\n\nendstream"} });
+    defer a.free(small);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseResourceTableViews, .{small});
+}
+
+fn exerciseEncryptedResourceTable(a: Allocator, sample: []const u8, compressed: bool) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    const ref = syntax.ObjRef{ .id = if (compressed) 7 else 9, .gen = 0 };
+    var resources = try reader.readIndirectObjectProjected(ref, .required_resources);
+    defer resources.deinit(a);
+    var table = try reader.resourceTable(resources.get("Font").?);
+    defer table.deinit(a);
+    const selected = table.get("F1").?;
+    try std.testing.expect(selected.* == .deferred);
+    try std.testing.expectEqual(ref.id, selected.deferred.reference.id);
+    var font = try reader.resolveValue(selected);
+    defer font.deinit(a);
+    try std.testing.expectEqualStrings("Label", font.get("Private").?.string);
+}
+
+test "reader resource entry views decrypt selected strings exactly once" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |compressed| {
+        var label = "Label".*;
+        const file_key: [16]u8 = @splat(3);
+        if (!compressed) {
+            const key = objectEncryptionKey(file_key, 5, .{ .id = 9, .gen = 0 }, .rc4);
+            rc4Crypt(key.bytes[0..key.len], &label);
+        }
+        const resources = try std.fmt.allocPrint(a, "<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Private <{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}> >> /Unused << /Private (ignored) >> >> >>", .{ label[0], label[1], label[2], label[3], label[4] });
+        defer a.free(resources);
+        const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{ if (compressed) resources else "null", "null" }, .extra = &.{resources}, .flate = false });
+        defer a.free(sample);
+        if (compressed) {
+            var reader = try Reader.init(a, sample);
+            defer reader.deinit();
+            var stream = try reader.readIndirectObject(.{ .id = 6, .gen = 0 });
+            defer stream.deinit(a);
+            const key = objectEncryptionKey(file_key, 5, .{ .id = 6, .gen = 0 }, .rc4);
+            rc4Crypt(key.bytes[0..key.len], sample[stream.stream.data_offset..][0..stream.stream.data_length]);
+        }
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedResourceTable, .{ sample, compressed });
+    }
+}
+
+fn buildLargeUnusedResourceTableTestPdfAlloc(a: Allocator) ![]u8 {
+    var table: std.ArrayList(u8) = .empty;
+    defer table.deinit(a);
+    for (0..4096) |i| try table.print(a, "/Unused{d} 5 0 R ", .{i});
+    const form = try std.fmt.allocPrint(a, "<< /Subtype /Form /Resources << /Font << {s} >> /XObject << {s} >> /ExtGState << {s} >> >> /Length 3 >>\nstream\nq Q\nendstream", .{ table.items, table.items, table.items });
+    defer a.free(form);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "null", "null" },
+        .extra = &.{form},
+        .resources = "<< /Font << /F1 5 0 R >> /XObject << /Fm 9 0 R >> >>",
+        .content = "BT /F1 10 Tf (Hello) Tj ET /Fm Do",
+    });
+}
+
+test "reader unused large resource tables preserve native text within metadata limits" {
+    const a = std.testing.allocator;
+    const sample = try buildLargeUnusedResourceTableTestPdfAlloc(a);
+    defer a.free(sample);
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 128 * 1024, .max_working_set_bytes = 64 * 1024 });
+    defer reader.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        reader.setTextExtractionPolicy(policy);
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        const text = try reader.extractPlainTextAlloc();
+        defer a.free(text);
+        try std.testing.expectEqualStrings("Hello\n", analysis.text);
+        try std.testing.expectEqualStrings(analysis.text, text);
+    }
+}
+
+fn buildSharedInlineFontContainerTestPdfAlloc(a: Allocator, count: usize, padding_bytes: usize) ![]u8 {
+    var resources: std.ArrayList(u8) = .empty;
+    defer resources.deinit(a);
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(a);
+    try resources.appendSlice(a, "<< /Font << ");
+    try content.appendSlice(a, "BT 10 100 Td ");
+    for (0..count) |i| {
+        try resources.print(a, "/F{d} << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> ", .{i});
+        try content.print(a, "/F{d} 2 Tf (Hello) Tj ", .{i});
+    }
+    try resources.appendSlice(a, ">> /Private (");
+    try resources.appendNTimes(a, 'X', padding_bytes);
+    try resources.appendSlice(a, ") >>");
+    try content.appendSlice(a, "ET");
+    return buildObjectStreamFixtureAlloc(a, .{ .objects = &.{resources.items}, .content = content.items });
+}
+
+const LargeAllocationCounter = struct {
+    backing: Allocator,
+    large: usize = 0,
+    fn allocator(self: *@This()) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const result = self.backing.rawAlloc(len, alignment, ret) orelse return null;
+        if (len >= 256 * 1024) self.large += 1;
+        return result;
+    }
+    fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.backing.rawResize(memory, alignment, len, ret)) return false;
+        if (len >= 256 * 1024 and memory.len < 256 * 1024) self.large += 1;
+        return true;
+    }
+    fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const result = self.backing.rawRemap(memory, alignment, len, ret) orelse return null;
+        if (len >= 256 * 1024 and memory.len < 256 * 1024) self.large += 1;
+        return result;
+    }
+    fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.backing.rawFree(memory, alignment, ret);
+    }
+};
+
+test "reader native collectors share decoded containers across selected inline entries" {
+    const a = std.testing.allocator;
+    const sample = try buildSharedInlineFontContainerTestPdfAlloc(a, 64, 1024 * 1024);
+    defer a.free(sample);
+    var counter = LargeAllocationCounter{ .backing = a };
+    const counted = counter.allocator();
+    var reader = try Reader.init(counted, sample);
+    defer reader.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        reader.setTextExtractionPolicy(policy);
+        const before = counter.large;
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(counted);
+        try std.testing.expectEqual(@as(usize, 321), analysis.text.len);
+        // Decoding once and building the selected fonts takes only a handful
+        // of large allocations. A per-entry inflate needs at least 64.
+        try std.testing.expect(counter.large - before < 16);
+        try std.testing.expect(reader.metadata_frames == null);
+        try std.testing.expect(!reader.metadata_frame_fallback);
+    }
+}
+
+test "reader required resources tolerate frame retention quotas and preserve backing OOM" {
+    const a = std.testing.allocator;
+    const sample = try buildSharedInlineFontContainerTestPdfAlloc(a, 16, 4096);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var budget = DecodeBudgetAllocator.init(a, 0, 32);
+    var frames = MetadataObjectStreamCache{ .budget = &budget };
+    defer frames.deinit();
+    reader.metadata_frames = &frames;
+    reader.metadata_frame_fallback = true;
+    var resources = try reader.readIndirectObjectProjected(.{ .id = 7, .gen = 0 }, .required_resources);
+    defer resources.deinit(a);
+    try std.testing.expect(resources.get("Font").?.* == .deferred);
+    try std.testing.expect(!frames.hasFrames());
+    try std.testing.expect(!budget.limit_exceeded);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    budget = DecodeBudgetAllocator.init(failing.allocator(), 0, 64 * 1024);
+    try std.testing.expectError(error.OutOfMemory, reader.readIndirectObjectProjected(.{ .id = 7, .gen = 0 }, .required_resources));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(!frames.hasFrames());
+}
+
+fn exerciseNativeSharedContainerAllocations(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqual(@as(usize, 46), analysis.text.len);
+    try std.testing.expect(reader.metadata_frames == null);
+}
+
+test "reader shared required frames preserve native ownership through allocation failures" {
+    const a = std.testing.allocator;
+    const sample = try buildSharedInlineFontContainerTestPdfAlloc(a, 9, 2048);
+    defer a.free(sample);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseNativeSharedContainerAllocations, .{sample});
+}
+
+test "reader demanded large font tables retain only the selected escaped name" {
+    const a = std.testing.allocator;
+    var table: std.ArrayList(u8) = .empty;
+    defer table.deinit(a);
+    for (0..4096) |i| try table.print(a, "/Unused{d} << /Private (unused definition) >> ", .{i});
+    const paint = "BT /F1 2 Tf 10 100 Td (World) Tj ET";
+    const correct_form = try std.fmt.allocPrint(a, "<< /Subtype /Form /Resources << /Font << {s} /F#31 5 0 R >> >> /Length {d} >>\nstream\n{s}\nendstream", .{ table.items, paint.len, paint });
+    defer a.free(correct_form);
+    const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{ "null", "null" }, .extra = &.{correct_form}, .resources = "<< /Font << /F1 5 0 R >> /XObject << /Fm 9 0 R >> >>", .content = "BT /F1 2 Tf 10 50 Td (Hello) Tj ET /Fm Do" });
+    defer a.free(sample);
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 128 * 1024, .max_working_set_bytes = 64 * 1024 });
+    defer reader.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        reader.setTextExtractionPolicy(policy);
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        try std.testing.expect(std.mem.indexOf(u8, analysis.text, "Hello") != null);
+        try std.testing.expect(std.mem.indexOf(u8, analysis.text, "World") != null);
+    }
+}
+
+fn objectStreamBodyTestAlloc(a: Allocator, ids: []const u32, values: []const []const u8) ![]u8 {
+    var header: std.ArrayList(u8) = .empty;
+    defer header.deinit(a);
+    var offset: usize = 0;
+    for (ids, values) |id, value| {
+        try header.print(a, "{d} {d} ", .{ id, offset });
+        offset += value.len + 1;
+    }
+    var output = try std.Io.Writer.Allocating.initCapacity(a, 256);
+    defer output.deinit();
+    var history: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&output.writer, &history, .zlib, .default);
+    try compressor.writer.writeAll(header.items);
+    for (values) |value| {
+        try compressor.writer.writeAll(value);
+        try compressor.writer.writeByte(' ');
+    }
+    try compressor.finish();
+    return std.fmt.allocPrint(a, "<< /Type /ObjStm /N {d} /First {d} /Filter /FlateDecode /Length {d} >>\nstream\n{s}\nendstream", .{ values.len, header.items.len, output.written().len, output.written() });
+}
+
+fn buildNestedFontContainerTestAlloc(a: Allocator, count: usize, padding: usize) ![]u8 {
+    var resources: std.ArrayList(u8) = .empty;
+    defer resources.deinit(a);
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(a);
+    try resources.appendSlice(a, "<< /Font << ");
+    try content.appendSlice(a, "BT 10 100 Td ");
+    for (0..count) |i| {
+        try resources.print(a, "/F{d} << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FontDescriptor 8 0 R >> ", .{i});
+        try content.print(a, "/F{d} 2 Tf (Hello) Tj ", .{i});
+    }
+    try resources.appendSlice(a, ">> /Private (");
+    try resources.appendNTimes(a, 'X', padding);
+    try resources.appendSlice(a, ") >>");
+    try content.appendSlice(a, "ET");
+    const descriptor = try objectStreamBodyTestAlloc(a, &.{8}, &.{"<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /FontBBox [-166 -225 1000 931] /ItalicAngle 0 /Ascent 718 /Descent -207 /CapHeight 718 /StemV 88 /Probe (Label) >>"});
+    defer a.free(descriptor);
+    return buildObjectStreamFixtureAlloc(a, .{ .objects = &.{resources.items}, .extra = &.{ "null", descriptor }, .compressed_refs = &.{.{ .id = 8, .stream = 9, .index = 0 }}, .content = content.items });
+}
+
+test "reader native nested font dependencies preserve reusable source frames" {
+    const a = std.testing.allocator;
+    const sample = try buildNestedFontContainerTestAlloc(a, 64, 1024 * 1024);
+    defer a.free(sample);
+    var counter = LargeAllocationCounter{ .backing = a };
+    var reader = try Reader.init(counter.allocator(), sample);
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(counter.allocator());
+    try std.testing.expectEqual(@as(usize, 321), analysis.text.len);
+    try std.testing.expect(counter.large < 16);
+}
+
+test "reader frame LRU evicts only enough unpinned data for allocation pressure" {
+    const a = std.testing.allocator;
+    const sample = try buildNestedFontContainerTestAlloc(a, 2, 4096);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var budget = DecodeBudgetAllocator.init(a, 0, 32 * 1024);
+    var frames = MetadataObjectStreamCache{ .budget = &budget };
+    defer frames.deinit();
+    budget.reclaimer = .{ .context = &frames, .reclaim = MetadataObjectStreamCache.reclaim };
+    reader.metadata_frames = &frames;
+    reader.metadata_frame_fallback = true;
+    for ([_]u32{ 7, 8, 7 }) |id| {
+        var object = try reader.readIndirectObject(.{ .id = id, .gen = 0 });
+        defer object.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 2), frames.decodes);
+    try std.testing.expectEqual(@as(usize, 2), frames.retained.count());
+    try std.testing.expectEqual(@as(u32, 9), frames.oldest.?.id);
+    const filler = try budget.allocator().alloc(u8, budget.max_live_bytes - budget.live_bytes + 1);
+    defer budget.allocator().free(filler);
+    try std.testing.expect(frames.retained.contains(6));
+    try std.testing.expect(!frames.retained.contains(9));
+}
+
+test "reader completed decodes survive retention adoption failure without retry" {
+    const a = std.testing.allocator;
+    const sample = try buildSharedInlineFontContainerTestPdfAlloc(a, 16, 4096);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var budget = DecodeBudgetAllocator.initWithCumulativeLimit(a, 0, 32 * 1024, 1024);
+    var frames = MetadataObjectStreamCache{ .budget = &budget };
+    defer frames.deinit();
+    reader.metadata_frames = &frames;
+    reader.metadata_frame_fallback = true;
+    for (0..12) |i| {
+        var resources = try reader.readIndirectObjectProjected(.{ .id = 7, .gen = 0 }, .required_resources);
+        defer resources.deinit(a);
+        try std.testing.expect(resources.get("Font") != null);
+        try std.testing.expectEqual(i + 1, frames.decodes);
+        try std.testing.expectEqual(@as(usize, 0), frames.loads);
+        try std.testing.expect(!frames.hasFrames());
+        try std.testing.expect(!budget.limit_exceeded);
+    }
+}
+
+test "reader configured decoder limits propagate after exactly one decode attempt" {
+    const a = std.testing.allocator;
+    const sample = try buildSharedInlineFontContainerTestPdfAlloc(a, 16, 4096);
+    defer a.free(sample);
+    for ([_]DecodeLimits{
+        .{ .max_decoded_stream_bytes = 1024, .max_working_set_bytes = 32 * 1024 },
+        .{ .max_decoded_stream_bytes = 32 * 1024, .max_working_set_bytes = 512 },
+    }, [_]anyerror{ error.DecodedStreamTooLarge, error.PdfDecodeWorkingSetTooLarge }) |limits, expected| {
+        var reader = try Reader.initWithDecodeLimits(a, sample, limits);
+        defer reader.deinit();
+        var budget = DecodeBudgetAllocator.init(a, 0, 64 * 1024);
+        var frames = MetadataObjectStreamCache{ .budget = &budget };
+        defer frames.deinit();
+        reader.metadata_frames = &frames;
+        reader.metadata_frame_fallback = true;
+        try std.testing.expectError(expected, reader.readIndirectObjectProjected(.{ .id = 7, .gen = 0 }, .required_resources));
+        try std.testing.expectEqual(@as(usize, 1), frames.decodes);
+        try std.testing.expect(!frames.hasFrames());
+    }
+}
+
+fn buildDistinctFontContainersTestAlloc(a: Allocator, count: usize, padding_bytes: usize) ![]u8 {
+    var padding: std.ArrayList(u8) = .empty;
+    defer padding.deinit(a);
+    try padding.append(a, '(');
+    try padding.appendNTimes(a, 'X', padding_bytes);
+    try padding.append(a, ')');
+    var resources: std.ArrayList(u8) = .empty;
+    defer resources.deinit(a);
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(a);
+    var extra: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (extra.items) |object| a.free(object);
+        extra.deinit(a);
+    }
+    var refs: std.ArrayList(FixtureCompressedRef) = .empty;
+    defer refs.deinit(a);
+    try resources.appendSlice(a, "<< /Font << ");
+    try content.appendSlice(a, "BT 10 100 Td ");
+    for (0..count) |i| {
+        const font_id: u32 = @intCast(8 + count + i);
+        const sibling_id: u32 = @intCast(8 + count * 2 + i);
+        const stream_id: u32 = @intCast(8 + i);
+        const stream = try objectStreamBodyTestAlloc(a, &.{ font_id, sibling_id }, &.{ "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>", padding.items });
+        extra.append(a, stream) catch |err| {
+            a.free(stream);
+            return err;
+        };
+        try refs.append(a, .{ .id = font_id, .stream = stream_id, .index = 0 });
+        try refs.append(a, .{ .id = sibling_id, .stream = stream_id, .index = 1 });
+        try resources.print(a, "/F{d} {d} 0 R ", .{ i, font_id });
+        try content.print(a, "/F{d} 2 Tf (Hello) Tj ", .{i});
+    }
+    for (0..count * 2) |_| {
+        const placeholder = try a.dupe(u8, "null");
+        extra.append(a, placeholder) catch |err| {
+            a.free(placeholder);
+            return err;
+        };
+    }
+    try resources.appendSlice(a, ">> >>");
+    try content.appendSlice(a, "ET");
+    return buildObjectStreamFixtureAlloc(a, .{ .objects = &.{"null"}, .extra = extra.items, .compressed_refs = refs.items, .resources = resources.items, .content = content.items });
+}
+
+test "reader required collectors decode each distinct container once after cumulative exhaustion" {
+    const a = std.testing.allocator;
+    const sample = try buildDistinctFontContainersTestAlloc(a, 40, 256 * 1024);
+    defer a.free(sample);
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 1024 * 1024, .max_working_set_bytes = 1024 * 1024 });
+    defer reader.deinit();
+    var live = DecodeBudgetAllocator.init(a, 0, 1024 * 1024);
+    var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, 1024 * 1024, 4 * 1024 * 1024);
+    var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+    defer cache.deinit();
+    cache.prepareScan(&reader);
+    reader.metadata_frames = &cache.frames;
+    reader.metadata_frame_fallback = true;
+    var page = try reader.readPageObject(1);
+    defer page.deinit(a);
+    const resources = try cache.pageResources(&reader, &page);
+    const content = try reader.collectPageContentAlloc(&page);
+    defer a.free(content);
+    const fonts = try reader.collectFontsFromResourcesAlloc(&resources, content);
+    defer {
+        for (fonts) |*font| font.deinit(a);
+        a.free(fonts);
+    }
+    try std.testing.expectEqual(@as(usize, 40), fonts.len);
+    try std.testing.expectEqual(@as(usize, 40), cache.frames.decodes);
+    try std.testing.expect(cache.frames.loads < 40);
+    try std.testing.expect(retained.cumulative_growth_bytes <= retained.max_cumulative_growth_bytes);
+    try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+}
+
+fn exerciseNestedFrameOwnership(a: Allocator, sample: []const u8, encrypted: bool) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    if (encrypted) reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    var budget = DecodeBudgetAllocator.init(a, 0, 64 * 1024);
+    var frames = MetadataObjectStreamCache{ .budget = &budget };
+    defer frames.deinit();
+    budget.reclaimer = .{ .context = &frames, .reclaim = MetadataObjectStreamCache.reclaim };
+    reader.metadata_frames = &frames;
+    reader.metadata_frame_fallback = true;
+    for ([_]u32{ 7, 8, 7, 8 }) |id| {
+        var object = try reader.readIndirectObject(.{ .id = id, .gen = 0 });
+        defer object.deinit(a);
+        try std.testing.expect(object == .dict);
+        if (id == 8) try std.testing.expectEqualStrings("Label", object.get("Probe").?.string) else try std.testing.expectEqual(@as(u8, 'X'), object.get("Private").?.string[0]);
+    }
+    try std.testing.expectEqual(@as(usize, 2), frames.decodes);
+    try std.testing.expectEqual(@as(usize, 0), frames.pins);
+}
+
+test "reader LRU frame ownership survives every allocation failure" {
+    const a = std.testing.allocator;
+    const sample = try buildNestedFontContainerTestAlloc(a, 2, 2048);
+    defer a.free(sample);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseNestedFrameOwnership, .{ sample, false });
+}
+
+test "reader encrypted LRU frames preserve source keys and allocator ownership" {
+    const a = std.testing.allocator;
+    const sample = try buildNestedFontContainerTestAlloc(a, 2, 2048);
+    defer a.free(sample);
+    {
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        for ([_]u32{ 6, 9 }) |id| {
+            var stream = try reader.readIndirectObject(.{ .id = id, .gen = 0 });
+            defer stream.deinit(a);
+            const key = objectEncryptionKey(@splat(3), 5, .{ .id = id, .gen = 0 }, .rc4);
+            rc4Crypt(key.bytes[0..key.len], sample[stream.stream.data_offset..][0..stream.stream.data_length]);
+        }
+    }
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseNestedFrameOwnership, .{ sample, true });
+}
+
+fn buildSelectiveColorTableTestPdfAlloc(a: Allocator, unused: usize, forms: bool) ![]u8 {
+    var table: std.ArrayList(u8) = .empty;
+    defer table.deinit(a);
+    try table.appendSlice(a, "<< /C#53 /Alias /Alias /DeviceRGB /DefaultGray /Gray /Gray [/CalGray << /WhitePoint [0.9505 1 1.089] >>] /Cycle /Cycle /Dup /DeviceGray /Dup /DeviceRGB ");
+    for (0..unused) |i| try table.print(a, "/Unused{d} /DeviceRGB ", .{i});
+    try table.appendSlice(a, ">>");
+    const content = "/CS cs 0 0 0 sc BT /F1 10 Tf 10 100 Td (Hello) Tj ET";
+    const form = try std.fmt.allocPrint(a, "<< /Subtype /Form /BBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> /ColorSpace 9 0 R >> /Length {d} >>\nstream\n{s}\nendstream", .{ content.len, content });
+    defer a.free(form);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "<< /Font << /F1 5 0 R >> /ColorSpace 9 0 R /XObject << /A 10 0 R /B 11 0 R >> >>", "null" },
+        .extra = &.{ table.items, form, form },
+        .content = if (forms) "/A Do /B Do" else content,
+    });
+}
+
+test "reader selective color tables bound allocations independently of unused names" {
+    const a = std.testing.allocator;
+    const sample = try buildSelectiveColorTableTestPdfAlloc(a, 100000, false);
+    defer a.free(sample);
+    var tracked = DecodeBudgetAllocator.init(a, 0, 256 * 1024);
+    var reader = try Reader.initWithDecodeLimits(tracked.allocator(), sample, .{ .max_decoded_stream_bytes = 128 * 1024, .max_working_set_bytes = 64 * 1024 });
+    defer reader.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        reader.setTextExtractionPolicy(policy);
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(tracked.allocator());
+        try std.testing.expectEqualStrings("Hello\n", analysis.text);
+        try std.testing.expect(reader.resource_lookup_cache == null);
+    }
+}
+
+test "reader selective color tables preserve aliases defaults cycles and duplicate keys" {
+    const a = std.testing.allocator;
+    const sample = try buildSelectiveColorTableTestPdfAlloc(a, 4096, false);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var cache = ResourceLookupCache{};
+    defer cache.deinit(a);
+    reader.resource_lookup_cache = &cache;
+    const source = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+    const table = try cache.table(&reader, source);
+    const alias = (try table.get(&reader, "CS")).?;
+    var rgb = try reader.classifyColorSpaceResource(&alias, table, 0, true);
+    defer deinitColorSpaceSelection(&rgb, a);
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, rgb.kind);
+    const gray = (try table.get(&reader, "DefaultGray")).?;
+    var calibrated = try reader.classifyColorSpaceResource(&gray, table, 0, false);
+    defer deinitColorSpaceSelection(&calibrated, a);
+    try std.testing.expect(calibrated.value.calibrated != null);
+    const cycle = (try table.get(&reader, "Cycle")).?;
+    const cyclic = try reader.classifyColorSpaceResource(&cycle, table, 0, true);
+    try std.testing.expectEqual(ColorSpaceKind.unsupported, cyclic.kind);
+    const duplicate = (try table.get(&reader, "Dup")).?;
+    var resolved_duplicate = try reader.resolveValue(&duplicate);
+    defer resolved_duplicate.deinit(a);
+    try std.testing.expectEqualStrings("DeviceGray", resolved_duplicate.asName().?);
+    try std.testing.expect((try table.get(&reader, "Missing")) == null);
+    const scans = table.scans;
+    for (0..32) |_| {
+        try std.testing.expect((try table.get(&reader, "Missing")) == null);
+        const shared = try cache.table(&reader, source);
+        try std.testing.expect(shared == table);
+        _ = try shared.get(&reader, "CS");
+    }
+    try std.testing.expectEqual(scans, table.scans);
+    try std.testing.expect(table.selected.count() < 12);
+}
+
+fn exerciseSelectiveColorTableOwnership(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, analysis.text, "Hello") != null);
+    try std.testing.expect(reader.resource_lookup_cache == null);
+}
+
+test "reader shared Form color tables preserve ownership through allocation failures" {
+    const a = std.testing.allocator;
+    const sample = try buildSelectiveColorTableTestPdfAlloc(a, 16, true);
+    defer a.free(sample);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseSelectiveColorTableOwnership, .{sample});
+}
+
+fn exerciseEncryptedColorLookup(a: Allocator, sample: []const u8, compressed: bool) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    var cache = ResourceLookupCache{};
+    defer cache.deinit(a);
+    reader.resource_lookup_cache = &cache;
+    const reference = syntax.ObjRef{ .id = if (compressed) 7 else 9, .gen = 0 };
+    var resources = try reader.readIndirectObjectProjected(reference, .required_resources);
+    defer resources.deinit(a);
+    var local = ResourceTableLookup{ .source = .null };
+    defer local.deinit(a);
+    const table = try reader.resourceLookup(resources.get("ColorSpace").?, &local);
+    const raw = (try table.get(&reader, "CS")).?;
+    var resolved = try reader.resolveValue(&raw);
+    defer resolved.deinit(a);
+    try std.testing.expectEqualStrings("Label", resolved.get("Private").?.string);
+    const scans = table.scans;
+    _ = try table.get(&reader, "CS");
+    try std.testing.expectEqual(scans, table.scans);
+}
+
+test "reader selective color views preserve encrypted compressed and uncompressed ownership" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |compressed| {
+        var label = "Label".*;
+        const file_key: [16]u8 = @splat(3);
+        if (!compressed) {
+            const key = objectEncryptionKey(file_key, 5, .{ .id = 9, .gen = 0 }, .rc4);
+            rc4Crypt(key.bytes[0..key.len], &label);
+        }
+        const resources = try std.fmt.allocPrint(a, "<< /ColorSpace << /CS << /Private <{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}> >> /Unused /DeviceGray >> >>", .{ label[0], label[1], label[2], label[3], label[4] });
+        defer a.free(resources);
+        const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{ if (compressed) resources else "null", "null" }, .extra = &.{resources}, .flate = false });
+        defer a.free(sample);
+        if (compressed) {
+            var reader = try Reader.init(a, sample);
+            defer reader.deinit();
+            var stream = try reader.readIndirectObject(.{ .id = 6, .gen = 0 });
+            defer stream.deinit(a);
+            const key = objectEncryptionKey(file_key, 5, .{ .id = 6, .gen = 0 }, .rc4);
+            rc4Crypt(key.bytes[0..key.len], sample[stream.stream.data_offset..][0..stream.stream.data_length]);
+        }
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedColorLookup, .{ sample, compressed });
+    }
+}
+
+test "reader selective color lookup propagates cancellation and work exhaustion without caching misses" {
+    const a = std.testing.allocator;
+    const sample = try buildSelectiveColorTableTestPdfAlloc(a, 4096, false);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var lookup = ResourceTableLookup{ .source = .{ .obj_ref = .{ .id = 9, .gen = 0 } } };
+    defer lookup.deinit(a);
+    var control = syntax.ScanControl{ .remaining_work = 256 };
+    reader.metadata_scan = &control;
+    try std.testing.expectError(error.PdfMetadataWorkLimit, lookup.get(&reader, "Missing"));
+    try std.testing.expectEqual(@as(u32, 0), lookup.selected.count());
+    reader.metadata_scan = null;
+    const Probe = struct {
+        calls: usize = 0,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls >= 8;
+        }
+    };
+    var probe = Probe{};
+    reader.setCancellationProbe(.{ .context = &probe, .is_cancelled_fn = Probe.cancelled });
+    try std.testing.expectError(error.Canceled, lookup.get(&reader, "Missing"));
+    try std.testing.expectEqual(@as(u32, 0), lookup.selected.count());
+    reader.setCancellationProbe(.{});
+    try std.testing.expect((try lookup.get(&reader, "Missing")) == null);
+}
+
+test "reader standalone selective color aliases reuse compressed source frames" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 1024 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const table_bytes = try std.fmt.allocPrint(a, "<< /CS /Alias /Alias /DeviceRGB /Unused ({s}) >>", .{padding});
+    defer a.free(table_bytes);
+    const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{table_bytes} });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var lookup = ResourceTableLookup{ .source = .{ .obj_ref = .{ .id = 7, .gen = 0 } } };
+    defer lookup.deinit(a);
+    const raw = (try lookup.get(&reader, "CS")).?;
+    var selected = try reader.classifyColorSpaceResource(&raw, &lookup, 0, true);
+    defer deinitColorSpaceSelection(&selected, a);
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, selected.kind);
+    try std.testing.expectEqual(@as(usize, 1), lookup.frames.decodes);
+    try std.testing.expectEqual(@as(usize, 1), lookup.frames.loads);
+}
+
+fn buildColorFrontierTestPdfAlloc(a: Allocator, aliases: usize, links: usize, unused: usize, compressed: bool) ![]u8 {
+    var table: std.ArrayList(u8) = .empty;
+    defer table.deinit(a);
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(a);
+    try table.appendSlice(a, "<< ");
+    for (0..aliases) |i| {
+        for (0..links) |level| try table.print(a, "/C{d}_{d} /C{d}_{d} ", .{ level, i, level + 1, i });
+        try table.print(a, "/C{d}_{d} /DeviceRGB ", .{ links, i });
+        try content.print(a, "/C0_{d} cs 0 0 0 sc ", .{i});
+    }
+    for (0..unused) |i| try table.print(a, "/Unused{d} /DeviceRGB ", .{i});
+    try table.appendSlice(a, ">>");
+    try content.appendSlice(a, "BT /F1 10 Tf 10 100 Td (Hello) Tj ET");
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ if (compressed) "<< /Font << /F1 5 0 R >> /ColorSpace 8 0 R >>" else "<< /Font << /F1 5 0 R >> /ColorSpace 9 0 R >>", if (compressed) table.items else "null" },
+        .extra = if (compressed) &.{} else &.{table.items},
+        .content = content.items,
+    });
+}
+
+fn freePageColorSpaces(a: Allocator, spaces: []PageColorSpace) void {
+    for (spaces) |*space| space.deinit(a);
+    a.free(spaces);
+}
+
+test "reader color dependency frontier scans depend on depth rather than alias count" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 16, 64 }) |aliases| {
+        for ([_]usize{ 1, 3 }) |links| {
+            for ([_]bool{ false, true }) |compressed| {
+                const sample = try buildColorFrontierTestPdfAlloc(a, aliases, links, 4096, compressed);
+                defer a.free(sample);
+                var reader = try Reader.init(a, sample);
+                defer reader.deinit();
+                var cache = ResourceLookupCache{};
+                defer cache.deinit(a);
+                reader.resource_lookup_cache = &cache;
+                var resources = try reader.readIndirectObjectProjected(.{ .id = 7, .gen = 0 }, .required_resources);
+                defer resources.deinit(a);
+                try reader.ensurePageIndex();
+                const content = try reader.collectPageContentAlloc(&reader.page_index.?[0].object);
+                defer a.free(content);
+                const spaces = try reader.collectColorSpacesFromResourcesAlloc(&resources, content);
+                defer freePageColorSpaces(a, spaces);
+                try std.testing.expectEqual(aliases, spaces.len);
+                for (spaces) |space| try std.testing.expectEqual(ColorSpaceKind.device_rgb, space.selection.kind);
+                const lookup = try cache.table(&reader, resources.get("ColorSpace").?.*);
+                try std.testing.expectEqual(links + 2, lookup.scans);
+                try std.testing.expectEqual(aliases * (links + 1) + 2, lookup.selected.count());
+                try std.testing.expect(lookup.dependency_requests == null);
+                if (compressed) try std.testing.expectEqual(@as(usize, 1), lookup.frames.decodes);
+                const repeated = try reader.collectColorSpacesFromResourcesAlloc(&resources, content);
+                defer freePageColorSpaces(a, repeated);
+                try std.testing.expectEqual(aliases, repeated.len);
+                try std.testing.expectEqual(links + 2, lookup.scans);
+            }
+        }
+    }
+}
+
+fn exerciseColorFrontierAllocations(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings("Hello\n", analysis.text);
+    try std.testing.expect(reader.resource_lookup_cache == null);
+}
+
+test "reader color dependency frontiers preserve ownership at every allocation failure" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |compressed| {
+        const sample = try buildColorFrontierTestPdfAlloc(a, 4, 3, 16, compressed);
+        defer a.free(sample);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseColorFrontierAllocations, .{sample});
+    }
+}
+
+test "reader interrupted color frontiers clear discovery state and retry unresolved names" {
+    const a = std.testing.allocator;
+    const sample = try buildColorFrontierTestPdfAlloc(a, 16, 1, 256, false);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var resources = try reader.readIndirectObjectProjected(.{ .id = 7, .gen = 0 }, .required_resources);
+    defer resources.deinit(a);
+    var cache = ResourceLookupCache{};
+    defer cache.deinit(a);
+    reader.resource_lookup_cache = &cache;
+    const lookup = try cache.table(&reader, resources.get("ColorSpace").?.*);
+    var names = ReferencedResourceNames{};
+    defer names.deinit(a);
+    try names.add(a, "C0_0");
+    try names.add(a, "DefaultGray");
+    try lookup.prime(&reader, &names.names);
+    var control = syntax.ScanControl{ .remaining_work = 128 };
+    reader.metadata_scan = &control;
+    try std.testing.expectError(error.PdfMetadataWorkLimit, reader.collectColorSpacesFromResourcesAlloc(&resources, "/C0_0 cs"));
+    try std.testing.expect(lookup.dependency_requests == null);
+    try std.testing.expect(!lookup.selected.contains("C1_0"));
+    reader.metadata_scan = null;
+    const spaces = try reader.collectColorSpacesFromResourcesAlloc(&resources, "/C0_0 cs");
+    defer freePageColorSpaces(a, spaces);
+    try std.testing.expectEqual(@as(usize, 1), spaces.len);
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, spaces[0].selection.kind);
+}
+
+test "reader color frontiers preserve nested spaces default aliases ICC metadata and cycles" {
+    const a = std.testing.allocator;
+    const sample = try buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "<< /ColorSpace 9 0 R >>", "null" },
+        .extra = &.{
+            "<< /P [/Pattern /RGB] /S [/Separation /Ink /RGB << /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 1 1] /N 1 >>] /I [/ICCBased 10 0 R] /RGB /DeviceRGB /DefaultGray /G /G [/CalGray << /WhitePoint [0.9505 1 1.089] >>] /Loop /Loop >>",
+            "<< /N 3 /Alternate /RGB /Length 99 0 R >>\nstream\nx\nendstream",
+        },
+    });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var resources = try reader.readIndirectObjectProjected(.{ .id = 7, .gen = 0 }, .required_resources);
+    defer resources.deinit(a);
+    var cache = ResourceLookupCache{};
+    defer cache.deinit(a);
+    reader.resource_lookup_cache = &cache;
+    const spaces = try reader.collectColorSpacesFromResourcesAlloc(&resources, "/P cs /S cs /I cs /Loop cs");
+    defer freePageColorSpaces(a, spaces);
+    try std.testing.expectEqual(@as(usize, 5), spaces.len);
+    for (spaces) |space| {
+        if (std.mem.eql(u8, space.name, "P")) {
+            try std.testing.expectEqual(ColorSpaceKind.pattern, space.selection.kind);
+            try std.testing.expectEqual(ColorSpaceKind.device_rgb, space.selection.pattern_base.?.kind);
+        } else if (std.mem.eql(u8, space.name, "S")) {
+            try std.testing.expect(space.selection.value.tint != null);
+        } else if (std.mem.eql(u8, space.name, "I")) {
+            try std.testing.expectEqual(ColorSpaceKind.device_rgb, space.selection.kind);
+        } else if (std.mem.eql(u8, space.name, "Loop")) {
+            try std.testing.expectEqual(ColorSpaceKind.unsupported, space.selection.kind);
+        } else if (std.mem.eql(u8, space.name, "DefaultGray")) {
+            try std.testing.expect(space.selection.value.calibrated != null);
+        } else return error.TestUnexpectedResult;
+    }
+    const lookup = try cache.table(&reader, resources.get("ColorSpace").?.*);
+    try std.testing.expectEqual(@as(usize, 3), lookup.scans);
+    try std.testing.expect(lookup.dependency_requests == null);
 }

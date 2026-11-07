@@ -291,7 +291,7 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
         @backingInt(ErrorCode.intent_conflict) => "a transaction intent conflicts with the requested operation",
         @backingInt(ErrorCode.txn_not_found) => "the requested transaction was not found",
         @backingInt(ErrorCode.busy) => "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
-        @backingInt(ErrorCode.outcome_unknown) => "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
+        @backingInt(ErrorCode.outcome_unknown) => "the operation may have taken effect, but whether it applied or became durable could not be confirmed; inspect the affected data and do not retry automatically",
         @backingInt(ErrorCode.unsupported) => "the operation requires a capability that is not supported by this platform or filesystem",
         @backingInt(ErrorCode.stalled) => "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",
         @backingInt(ErrorCode.cancelled) => "the caller cancelled the operation",
@@ -312,6 +312,7 @@ pub fn clearLastError() void {
     if (comptime storage_engine.enabled) return antfly_storage_error_clear_v1();
     last_error_code = .ok;
     last_error_detail = "";
+    @import("outcome_receipts.zig").clearLast();
 }
 
 pub fn lastErrorDetail() [*:0]const u8 {
@@ -561,6 +562,13 @@ fn classifyError(err: anyerror) ErrorCode {
         error.CommitDecisionUnknown,
         => .outcome_unknown,
         error.RunUntilIdleNoProgress, error.EnrichmentWaitTimeout, error.AsyncWorkerFailed, error.CommitVisibilityNotSatisfied => .stalled,
+        // Refused before running because an earlier commit's outcome is
+        // unresolved. Not applied; Lite connections reconcile on their next
+        // call, other handles after reopening.
+        error.OutcomeReconciliationRequired, error.SqlReconciliationRequired => .stalled,
+        // Classified at a commit boundary: refused before the decision.
+        error.SqlMutationNotAppliedBusy => .busy,
+        error.SqlMutationNotApplied, error.SqlMutationNotAppliedNoSpace => .internal,
         // A dimension probe against a live embedder hit an operational
         // (network/transport) failure rather than a malformed request --
         // matches `managed_embedder.isOperationalEmbeddingProbeError`'s
@@ -607,6 +615,9 @@ test "bounded Lite retirement admission is retryable while uncertain publication
     inline for (.{ error.DurabilityOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.CommitDecisionUnknown }) |err| {
         try std.testing.expectEqual(ErrorCode.outcome_unknown, mapError(err));
     }
+    // A refusal caused by an earlier unknown outcome is not itself unknown.
+    try std.testing.expectEqual(ErrorCode.stalled, mapError(error.OutcomeReconciliationRequired));
+    try std.testing.expectEqual(ErrorCode.busy, mapError(error.SqlMutationNotAppliedBusy));
 }
 
 test "capi C ABI retains codes for generic failures and copies contextual diagnostics" {

@@ -10,8 +10,10 @@ Select a model explicitly. Canonical IDs include `generators/support`,
 `chains/interactive`, `deciders/triage`, `embedders/dense`, `readers/ocr`,
 `transcribers/speech`, `synthesizers/voice`, `predictors/risk`,
 `connections/gpu-east/models/owner/model` and `local/owner/model`. Bare aliases
-resolve within the endpoint's task namespace. A collision with a raw local model
-returns an ambiguity error. Existing raw model IDs remain valid.
+resolve within the endpoint's task namespace. Reading spans reader, transcriber,
+and generator bindings. Collisions across these bindings or with a raw local
+model return an ambiguity error; select a qualified identity to disambiguate.
+Existing raw model IDs remain valid.
 
 ```yaml
 public_inference:
@@ -138,6 +140,64 @@ redacted bytes before base64-encoding the completed block. Native tool adapters
 supply an empty object schema for parameterless functions and preserve explicit
 strict tool enforcement.
 
+## Source references in chat
+
+`/ai/v1/chat/completions` accepts a `source` content part naming a source record's
+`content.resource`, so an application can send an asset without handling its bytes:
+
+```json
+{"type": "source", "source": {
+  "type": "source",
+  "uri": "https://sources.example.com/v1/media/<id>/<signature>",
+  "mime_type": "video/mp4",
+  "version": "\"<strong-etag>\"",
+  "version_kind": "strong_etag",
+  "length": 12345
+}}
+```
+
+The gateway fetches that exact version, then replaces the part with inline media
+before choosing a provider. The source URL therefore never reaches a model vendor.
+It accepts PNG, JPEG, WebP and GIF images, and `audio/*` and `video/*` types. Only
+`http` and `https` URIs are accepted.
+
+- A URL must match `remote_content.security.source_media_base_urls` or a nonempty
+  `allowed_hosts`. Unlike template fetches, an omitted allowlist denies the request
+  (403).
+- A loopback or private source companion must be listed in `source_media_base_urls`,
+  such as `http://127.0.0.1:8082/v1/media/`, which matches scheme, host, port and path.
+  All other `source` URLs keep private-IP blocking even if `block_private_ips` is
+  `false`, because host-level policy would also expose that host's other ports.
+- A source whose current version differs fails with 409 rather than serving other
+  bytes.
+- Images are inlined, so an expanded request is limited to 16 MiB, or about 12 MiB of
+  images (413). Audio and video travel to local and Antfly models as binary attachments,
+  up to 256 MiB per request and `max_download_size_bytes`, which defaults to 100 MiB.
+  Hosted providers receive them inline and may impose smaller request limits.
+- Fetched media, native framing, and hosted base64/JSON copies share a 2 GiB
+  allocation budget across the server. Metadata parsing retains its separate
+  64 MiB budget. Each batch item releases its media before the next item runs.
+  A server at the shared media limit
+  returns 429 and the request can be retried.
+  Malformed image headers in pinned resources or table source references return
+  400 `InvalidInferenceMedia` before provider dispatch. Generation batches report
+  the failure on the affected item.
+
+Declare `video: supported` under `inference_capabilities` for a named target that
+accepts video. Without a declaration, video requests to that target are rejected.
+
+Local Gemma 4 generators with a projector accept one video per request, alongside
+text but not image or audio parts anywhere in that request. Earlier turns can contain
+text. `context_management` rejects video, because it only plans text. Generators
+sample one frame per second: CUDA takes
+H.264, HEVC, and AV1 MP4 up to 60 seconds, and CPU and Metal take the
+[portable codecs](../../zig/lib/video/VIDEO.md) up to 32 uniformly spaced frames.
+When CUDA rejects a clip, portable decoding reserves host scratch only for the
+fallback. Portable decoding charges the invocation's host, combined, and scratch
+budgets in both serving and the native CLI, and serving also holds shared session
+admission. Explicit memory caps remain authoritative; decoder failures release
+the reservations before returning.
+
 ## Direct Anthropic generation
 
 Use `provider: anthropic` for the native Claude Messages API. Named generators,
@@ -199,7 +259,7 @@ the total response ceiling is not a preallocated or whole-stream buffer.
 | `/ai/v1/embeddings`, `/embed` | Dense floats or little-endian float32 base64; sparse `{indices, values}` and ordered multimodal parts use the Antfly extensions |
 | `/ai/v1/generate`, `/generate/batch` | Existing generation envelopes; native options require an Antfly executor; batches share a deadline and preserve item IDs |
 | `/ai/v1/rerank`, `/chunk`, `/read`, `/extract`, `/rewrite` | Existing task envelopes, source indices, coordinates and schemas |
-| `/ai/v1/transcribe`, `/dictate`, `/transcription/sessions/...` | Existing audio and session contracts; native dictation cleanup options require an Antfly runtime |
+| `/ai/v1/read`, `/dictate`, `/transcription/sessions/...` | Unified media reading, dictation and session contracts; native dictation cleanup options require an Antfly runtime |
 | `/ai/v1/synthesize` | `{model, text, voice?, format?, speed?}`; returns audio bytes |
 | `/ml/v1/predict`, `/models`, `/predictors` | Existing ordered feature-vector requests and predictor schemas |
 
@@ -208,6 +268,9 @@ binary payloads while the gateway resolves and adapts metadata. Generation batch
 validate attachment ownership before dispatch and give each item its own rebased
 envelope. Typed hosted media adapters resolve attachment references into their
 existing inline media formats within the request memory budget.
+Each chain attempt releases its adaptation and upstream response buffers before
+retrying or falling back. Pinned source bytes remain available for reuse across
+attempts, so retries do not download the source again or accumulate encoded copies.
 
 Generated decision and extraction requests select their generator through
 `generator.model`, with no top-level `model`. Native generator IDs and configured
@@ -397,12 +460,40 @@ meaning. There is no cross-model embedding or decision fallback.
 
 Named transcription defaults apply to language, timestamp-aware decoding and
 diarization. Request values take precedence, including explicit `false`.
-Native timestamp decoding retains its historical defaults when omitted: off for
-`transcribe`, on for `dictate`. The TypeScript transcription helper forwards the
-same options as the public request contract. Named transcribers retain their
+Audio reads request temporal segments with `audio_options.timestamps` or
+`audio_options.diarization`; dictation keeps timestamp decoding enabled by
+default. The TypeScript `readAudio` helper forwards the typed audio options. Named transcribers retain their
 credentials when inheriting the runtime URL: `bearer_token` takes precedence
 over `api_key`, followed by the default runtime credential. Sessions preserve
 the selected alias and its credential policy for every follow-up.
+
+Hosted OpenAI, Cloudflare, Vertex, and Apple recognizers are audio leaves in the
+same document service as local ASR. Configure the named `transcribers` on the
+inference host (standalone forwards these configs to its embedded runtime).
+Reads accept audio document sources and `retain_artifact`, preserving source
+IDs and temporal evidence. Composed readers bind `transcribers/<name>` with
+`input: audio`; hosted network calls require `allow_remote: true` throughout
+the composition. Provider credentials stay in deployment configuration.
+
+Durable `/read/jobs` submissions use the same model resolution and recognition
+defaults as synchronous `/read`, including `readers/`, `transcribers/`, and
+`generators/` targets. Request options, including explicit `false`, override
+configured defaults. Both read and extraction jobs accept typed `audio_options`.
+The effective backend selector and request options are persisted before dispatch.
+Hosted provider configurations stay runtime-owned, and the document executor pins
+model identities for replay. Non-audio read results carry `audio: null`; audio
+reads carry metadata with nullable duration and optional temporal evidence.
+
+Hosted recognition does not currently provide token measurements. Configure
+`max_total_tokens` on each hosted transcriber (or its document binding) using the
+provider/deployment's hard per-call token bound. A missing or zero bound rejects
+reading before provider I/O. Each call spends that full allowance against the
+shared document budget, including refinement and verification. Responses report
+this capacity as `usage.unmeasured_tokens`; `usage.total_tokens` includes it,
+while `prompt_tokens` and `completion_tokens` contain only measurements. This is
+budget accounting, not a billing estimate. Durable checkpoints preserve and
+restore these charges once without invoking the provider again. Unknown duration
+remains `audio.duration_ms: null`.
 
 Synthesis uses existing `text_to_speech` configs. OpenAI supports its configured
 speech formats; Vertex supports MP3, WAV and Ogg Opus; ElevenLabs currently
@@ -563,7 +654,7 @@ when owner-affinity routing is unavailable.
 
 The proxy serves canonical `/ai/v1/decisions`; `/ai/v1/decide` remains a legacy
 alias using the same scoped `decide` policy operation. Operator operations also
-include read, rewrite, transcribe, dictate, transcription sessions, synthesis and
+include read, rewrite, dictate, transcription sessions, synthesis and
 prediction. Capability leases remain bound to authorization, operation, route
 generation and endpoint incarnation.
 

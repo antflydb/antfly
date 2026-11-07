@@ -17,8 +17,8 @@
 //! The query dispatcher sees only an owner-issued whole-operation capability.
 //! Legacy physical callers validate their DB borrow at the owner-side issuer.
 const failure_abi = @import("runtime_failure_abi");
-// Initial independent query contract preserves the existing diagnostic version.
-pub const abi_version: u32 = 86;
+// Share the diagnostic version while retaining an independent query layout.
+pub const abi_version: u32 = failure_abi.abi_version;
 pub const Status = failure_abi.Status;
 pub const FailureIdentity = failure_abi.FailureIdentity;
 pub const CancellationCheckFn = *const fn (?*anyopaque) callconv(.c) u8;

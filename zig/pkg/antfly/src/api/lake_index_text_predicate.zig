@@ -969,7 +969,7 @@ fn PredicateResolver(comptime Set: type) type {
         context: local.api_operation.RequestContext,
         identities: Identities = .{ .offsets = &.{} },
         store: @import("../serverless/artifacts/store.zig").ArtifactStore,
-        store_identity: [32]u8,
+        cache_scope: [32]u8,
         read_context: local.serverless_query_lake_read_context.Context,
         pinned: ?rows.PredicateContext = null,
         allow_partial: bool = true,
@@ -1295,7 +1295,7 @@ fn PredicateResolver(comptime Set: type) type {
                     if (Set == PhysicalSet) {
                         result = try self.scanSelected(a, partial.residual orelse compiled, &partial.bitmap);
                     } else {
-                        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store_identity, .context = self.read_context };
+                        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.cache_scope, .context = self.read_context };
                         var selected = try self.identities.physicalSelection(a, &partial.bitmap, self.store, cached);
                         defer selected.deinit();
                         result = try self.scanSelected(a, partial.residual orelse compiled, &selected);
@@ -1386,7 +1386,7 @@ fn PredicateResolver(comptime Set: type) type {
                         var tile_budget: local.sql_memory_budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a), .limit = 4 * 1024 * 1024 };
                         var scratch = std.heap.ArenaAllocator.init(tile_budget.allocator());
                         defer scratch.deinit();
-                        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.resolver.server.lake_read_cache, .scope = self.resolver.store_identity, .context = self.resolver.read_context };
+                        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.resolver.server.lake_read_cache, .scope = self.resolver.cache_scope, .context = self.resolver.read_context };
                         const admitted = tile: {
                             self.probe(scratch.allocator(), ordinals, allowed, cached) catch |err| {
                                 if (err == error.ArtifactReadBudgetExceeded or err == error.QueryCandidateBudgetExceeded or (err == error.OutOfMemory and tile_budget.isExhausted())) break :tile false;
@@ -1409,7 +1409,7 @@ fn PredicateResolver(comptime Set: type) type {
                         self.spent_work +|= work;
                         var result = Bitmap.init(a);
                         errdefer result.deinit();
-                        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.resolver.server.lake_read_cache, .scope = self.resolver.store_identity, .context = self.resolver.read_context };
+                        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.resolver.server.lake_read_cache, .scope = self.resolver.cache_scope, .context = self.resolver.read_context };
                         var iterator = candidates.?.iterator();
                         var tile_budget: local.sql_memory_budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a), .limit = 4 * 1024 * 1024 };
                         var scratch = std.heap.ArenaAllocator.init(tile_budget.allocator());
@@ -1681,7 +1681,7 @@ fn PredicateResolver(comptime Set: type) type {
                                 try physical.addBlock(block);
                                 continue;
                             }
-                            const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store_identity, .context = self.read_context };
+                            const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.cache_scope, .context = self.read_context };
                             var identities = self.identities;
                             if (direct_blocks) identities.row_resolver = null;
                             try identities.addBlock(a, window.allocator(), &bitmap_cache, self.store, cached, block, &result);
@@ -1689,7 +1689,7 @@ fn PredicateResolver(comptime Set: type) type {
                     }
                 }
                 if (comptime Set == Bitmap) if (mixed_blocks) {
-                    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store_identity, .context = self.read_context };
+                    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.cache_scope, .context = self.read_context };
                     return self.identities.bitmapForPhysical(a, &physical, self.store, cached);
                 };
                 return result;
@@ -1711,7 +1711,7 @@ fn PredicateResolver(comptime Set: type) type {
                 try result.addRow(row.file_id, row.row_group_ordinal, row.row_ordinal);
                 return;
             }
-            const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store_identity, .context = self.read_context };
+            const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.cache_scope, .context = self.read_context };
             if (try self.identities.ordinal(a, cache, self.store, cached, ref)) |number| try result.add(number);
         }
         fn scanExpression(self: Self, a: A, input: Compiled) !?PredicateResult {
@@ -1810,7 +1810,7 @@ fn PredicateResolver(comptime Set: type) type {
 fn columnEvaluable(input: Compiled) bool {
     return switch (input) {
         .match_all, .match_none => true,
-        .doc_id => false,
+        .doc_id, .logical_value => false,
         .field_matcher => |field| column(field.path) != null,
         .conjuncts, .disjuncts => |children| blk: {
             for (children) |child| if (!columnEvaluable(child)) break :blk false;
@@ -1873,7 +1873,7 @@ fn evaluateColumns(a: A, input: Compiled, page: local.sql_catalog.ColumnPage, ma
             match.* = if (active) |lanes| lanes[row] else true;
         },
         .match_none => @memset(mask, false),
-        .doc_id => unreachable,
+        .doc_id, .logical_value => unreachable,
         .field_matcher => |field| {
             const name = column(field.path).?;
             if (page.native == null) if (page.batch.findColumn(name)) |vector| {

@@ -19,9 +19,9 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-// Version 86 checks native DB borrows before independently compiled queries.
+// Version 87 combines checked query DB borrows with privacy policy fences.
 // Older owners must reject their operation identifiers before dispatch.
-pub const abi_version: u32 = 86;
+pub const abi_version: u32 = 87;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1604,6 +1604,13 @@ pub extern fn antfly_storage_context_attach_inference_provider(
 /// opening any table owner; the caller retains ownership and controls its lifetime.
 pub extern fn antfly_storage_context_configure_secrets(context: ?*anyopaque, store: ?*anyopaque) callconv(.c) Status;
 pub extern fn antfly_storage_context_configure_native_queries(context: ?*anyopaque, setup: BorrowedBytes) callconv(.c) Status;
+
+/// Copies the node-level default inference endpoint and credential that
+/// storage-owned enrichment inherits when an index names neither. The key is
+/// kept as given (normally a `${secret:...}` reference) and resolved through
+/// the configured secret facade per request. Configure before opening any
+/// table owner; empty values clear the defaults.
+pub extern fn antfly_storage_context_configure_inference_defaults(context: ?*anyopaque, api_url: BorrowedBytes, api_key: BorrowedBytes) callconv(.c) Status;
 
 /// Replaces the context-owned remote-content security snapshot before any
 /// table owner opens. The payload is a ContentSecurityConfig JSON object.

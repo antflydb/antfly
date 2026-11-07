@@ -132,6 +132,7 @@ pub const RasterBatch = struct {
     }
 };
 pub const Methods = struct {
+    setPolicy: *const fn (doc: *Document, policy: pdf.reader.TextExtractionPolicy) anyerror!void,
     renderRuns: *const fn (doc: *Document, page: usize, width: u32, height: u32) anyerror!pdf.reader.PageRenderRuns,
     open: *const fn (a: A, bytes: []const u8, limits: Limits, probe: Probe) anyerror!*Document,
     close: *const fn (doc: *Document) anyerror!void,
@@ -171,9 +172,9 @@ pub fn Wire(comptime name: []const u8) type {
 }
 pub fn signature(comptime name: []const u8) native.CallContract {
     @setEvalBranchQuota(100_000);
-    return .of("pdf_native_v2." ++ name, Function(name), Args(name), Wire(name));
+    return .of("pdf_native_v4." ++ name, Function(name), Args(name), Wire(name));
 }
-const layout_types = .{ Failure, WorkBorrow, work.Control, pdf.reader.PageRenderRuns, pdf.reader.ImageRun, pdf.reader.ShadingRun, pdf.reader.PatternRun, pdf.GraphicsMatrix, pdf.SharedImageRgba, pdf.ShadingKind, pdf.PatternKind, pdf.PatternMode, pdf.FillRule, pdf.BlendMode, pdf.PageRotation, pdf.reader.ShapeRun, pdf.reader.ShapeKind, pdf.reader.ShapeLineCap, pdf.reader.ShapeLineJoin, Options, Executor, Plan, PngBatch, RasterBatch, PngResult, RasterResult, pdf.PreparedPageRenderPlan, @FieldType(pdf.PreparedPageRenderPlan, "_geometry"), pdf.PageRenderRequest, pdf.PageRenderGeometry, pdf.RenderedPagePng, pdf.RenderedPageRaster, pdf.reader.PageTextAnalysis, pdf.reader.TextRun, pdf.reader.PageRenderDiagnostics, Probe, Limits, Box, A.VTable, pdf.RenderProfile, pdf.RenderQuality, pdf.PixelFormat, pdf.RenderBatchOutputKind };
+const layout_types = .{ Failure, WorkBorrow, work.Control, pdf.reader.PageRenderRuns, pdf.reader.ImageRun, pdf.reader.ShadingRun, pdf.reader.PatternRun, pdf.GraphicsMatrix, pdf.SharedImageRgba, pdf.ShadingKind, pdf.PatternKind, pdf.PatternMode, pdf.FillRule, pdf.BlendMode, pdf.PageRotation, pdf.reader.ShapeRun, pdf.reader.ShapeKind, pdf.reader.ShapeLineCap, pdf.reader.ShapeLineJoin, Options, Executor, Plan, PngBatch, RasterBatch, PngResult, RasterResult, pdf.PreparedPageRenderPlan, @FieldType(pdf.PreparedPageRenderPlan, "_geometry"), pdf.PageRenderRequest, pdf.PageRenderGeometry, pdf.RenderedPagePng, pdf.RenderedPageRaster, pdf.reader.PageTextAnalysis, pdf.reader.SemanticTextSpan, @FieldType(pdf.reader.SemanticTextSpan, "paint"), pdf.reader.NativeTextDiagnostics, pdf.reader.TextExtractionPolicy, pdf.reader.TextRun, pdf.reader.PageRenderDiagnostics, Probe, Limits, Box, A.VTable, pdf.RenderProfile, pdf.RenderQuality, pdf.PixelFormat, pdf.RenderBatchOutputKind };
 pub const layouts = blk: {
     @setEvalBranchQuota(100_000);
     var result: [layout_types.len]native.TypeContract = undefined;
@@ -181,21 +182,21 @@ pub const layouts = blk: {
     break :blk result;
 };
 pub const Endpoint = extern struct {
-    version: u32 = 3,
+    version: u32 = 4,
     layout_count: u32 = layouts.len,
     contract: native.CallContract,
     layout: *const [layouts.len]native.TypeContract = &layouts,
     invoke: *const fn (*const anyopaque, *anyopaque, WorkBorrow) callconv(.c) void,
 };
 pub fn validate(comptime name: []const u8, endpoint: *const Endpoint) !void {
-    if (endpoint.version != 3 or endpoint.layout_count != layouts.len or !endpoint.contract.matches(signature(name))) return error.InvalidArgument;
+    if (endpoint.version != 4 or endpoint.layout_count != layouts.len or !endpoint.contract.matches(signature(name))) return error.InvalidArgument;
     for (endpoint.layout.*, layouts, 0..) |actual, expected, index| if (!actual.matches(expected)) {
         std.debug.print("PDF native layout mismatch op={s} index={d} actual={any} expected={any}\n", .{ name, index, actual, expected });
         return error.InvalidArgument;
     };
 }
 pub fn call(comptime name: []const u8, args: Args(name)) !Value(name) {
-    const getter = @extern(*const fn () callconv(.c) *const Endpoint, .{ .name = "antfly_pdf_native_" ++ name ++ "_v3" });
+    const getter = @extern(*const fn () callconv(.c) *const Endpoint, .{ .name = "antfly_pdf_native_" ++ name ++ "_v4" });
     const endpoint = getter();
     try validate(name, endpoint);
     var out: Wire(name) = undefined;

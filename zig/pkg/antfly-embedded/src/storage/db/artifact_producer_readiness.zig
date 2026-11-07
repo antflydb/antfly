@@ -22,10 +22,18 @@ const publication = @import("artifact_publication.zig");
 const completion = @import("artifact_completion_progress.zig");
 const keys = @import("../internal_keys.zig");
 const Manager = @import("catalog/index_manager.zig").IndexManager;
-const registry_key = "\x00\x00__artifact_publication__:producer-readiness:registry";
-const pending_prefix = "\x00\x00__artifact_publication__:producer-readiness:pending:";
-const count_prefix = "\x00\x00__artifact_publication__:producer-readiness:count:";
-const max_bytes = 1024 * 1024;
+// v2 rebuilds summaries that older unfenced maintenance could undercount.
+// These are derived caches; primary obligations and publication receipts stay authoritative.
+const legacy_registry_key = "\x00\x00__artifact_publication__:producer-readiness:registry";
+const legacy_pending_prefix = "\x00\x00__artifact_publication__:producer-readiness:pending:";
+const legacy_count_prefix = "\x00\x00__artifact_publication__:producer-readiness:count:";
+const registry_key = "\x00\x00__artifact_publication__:producer-readiness:v2:registry";
+const enrollment_key = "\x00\x00__artifact_publication__:producer-readiness:v2:enrollment";
+const revision_prefix = "\x00\x00__artifact_publication__:producer-readiness:v2:revision:";
+const pending_prefix = "\x00\x00__artifact_publication__:producer-readiness:v2:pending:";
+const count_prefix = "\x00\x00__artifact_publication__:producer-readiness:v2:count:";
+const max_requirement_bytes = 1024 * 1024;
+const max_cursor_bytes = publication.max_cursor_bytes;
 
 const State = struct {
     raw: []u8,
@@ -42,8 +50,13 @@ const State = struct {
     }
 };
 fn load(alloc: std.mem.Allocator, txn: anytype) !?State {
-    const borrowed = txn.get(registry_key) catch |err| if (err == error.NotFound) return null else return err;
-    if (borrowed.len < 144 or borrowed.len > 4 * max_bytes or !std.mem.eql(u8, borrowed[0..4], "APR1") or borrowed[76] > 1) return error.ArtifactCatalogCorrupt;
+    return loadAt(alloc, txn, registry_key);
+}
+fn loadAt(alloc: std.mem.Allocator, txn: anytype, key: []const u8) !?State {
+    const borrowed = txn.get(key) catch |err| if (err == error.NotFound) return null else return err;
+    const compact = std.mem.eql(u8, key, enrollment_key);
+    const maximum = 144 + max_requirement_bytes + (if (compact) @as(usize, 0) else 3 * max_cursor_bytes);
+    if (borrowed.len < 144 or borrowed.len > maximum or !std.mem.eql(u8, borrowed[0..4], "APR1") or borrowed[76] > 1) return error.ArtifactCatalogCorrupt;
     var checksum: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(borrowed[0 .. borrowed.len - 32], &checksum, .{});
     if (!std.mem.eql(u8, &checksum, borrowed[borrowed.len - 32 ..])) return error.ArtifactCatalogCorrupt;
@@ -51,12 +64,25 @@ fn load(alloc: std.mem.Allocator, txn: anytype) !?State {
     const c: usize = std.mem.readInt(u32, borrowed[84..88], .little);
     const w: usize = std.mem.readInt(u32, borrowed[88..92], .little);
     const b: usize = std.mem.readInt(u32, borrowed[92..96], .little);
-    if (n > max_bytes / 32 or c > max_bytes or w > max_bytes or b > max_bytes or borrowed.len != 144 + n * 32 + c + w + b) return error.ArtifactCatalogCorrupt;
+    if (compact and (c != 0 or w != 0 or b != 0 or std.mem.readInt(u64, borrowed[68..76], .little) != 0)) return error.ArtifactCatalogCorrupt;
+    if (n > max_requirement_bytes / 32 or c > max_cursor_bytes or w > max_cursor_bytes or b > max_cursor_bytes or borrowed.len != 144 + n * 32 + c + w + b) return error.ArtifactCatalogCorrupt;
     const raw = try alloc.dupe(u8, borrowed);
     const end = 112 + n * 32;
     return .{ .raw = raw, .authority = .{ .namespace = raw[4..28].*, .epoch = std.mem.readInt(u64, raw[28..36], .little), .catalog_digest = raw[36..68].* }, .revision = std.mem.readInt(u64, raw[68..76], .little), .baseline = raw[76] == 1, .root = std.mem.readInt(u128, raw[96..112], .little), .requirements = raw[112..end], .cursor = raw[end .. end + c], .work_cursor = raw[end + c .. end + c + w], .bound = raw[end + c + w .. end + c + w + b] };
 }
 fn store(alloc: std.mem.Allocator, txn: anytype, state: State) !void {
+    return storeAt(alloc, txn, registry_key, state);
+}
+fn storeEnrollment(alloc: std.mem.Allocator, txn: anytype, state: State) !void {
+    var compact = state;
+    compact.revision = 0;
+    compact.cursor = "";
+    compact.work_cursor = "";
+    compact.bound = "";
+    return storeAt(alloc, txn, enrollment_key, compact);
+}
+fn storeAt(alloc: std.mem.Allocator, txn: anytype, key: []const u8, state: State) !void {
+    if (state.requirements.len > max_requirement_bytes or state.cursor.len > max_cursor_bytes or state.work_cursor.len > max_cursor_bytes or state.bound.len > max_cursor_bytes) return error.InvalidBatchRequest;
     const raw = try alloc.alloc(u8, 144 + state.requirements.len + state.cursor.len + state.work_cursor.len + state.bound.len);
     defer alloc.free(raw);
     @memset(raw, 0);
@@ -77,7 +103,7 @@ fn store(alloc: std.mem.Allocator, txn: anytype, state: State) !void {
         offset += part.len;
     }
     std.crypto.hash.sha2.Sha256.hash(raw[0..offset], raw[offset..][0..32], .{});
-    try txn.put(registry_key, raw);
+    try txn.put(key, raw);
 }
 fn scopedPrefix(comptime prefix: []const u8, authority: publication.Authority, root: u128) [prefix.len + 48]u8 {
     var out: [prefix.len + 48]u8 = undefined;
@@ -111,11 +137,13 @@ fn optionalRevision(txn: anytype, key: []const u8) !?u64 {
 
 /// Called from the same mutation transaction as the existing work registry.
 pub fn mark(alloc: std.mem.Allocator, txn: anytype, authority: publication.Authority, document: []const u8) !void {
-    var state = (try load(alloc, txn)) orelse return;
+    const state = (try loadAt(alloc, txn, enrollment_key)) orelse return;
     defer state.deinit(alloc);
     if (!std.meta.eql(state.authority, authority)) return; // Next epoch needs its own baseline.
-    state.revision = std.math.add(u64, state.revision, 1) catch return error.ResourceLimitExceeded;
-    try store(alloc, txn, state);
+    // Enrollment never reads or rewrites potentially huge scan checkpoints.
+    const revision_key = scopedPrefix(revision_prefix, authority, state.root);
+    const revision = std.math.add(u64, try count(txn, &revision_key), 1) catch return error.ResourceLimitExceeded;
+    try putNumber(txn, &revision_key, revision);
     const prefix = scopedPrefix(pending_prefix, authority, state.root);
     var i: usize = 0;
     while (i < state.requirements.len) : (i += 32) {
@@ -126,7 +154,7 @@ pub fn mark(alloc: std.mem.Allocator, txn: anytype, authority: publication.Autho
             const counter = counterKey(authority, state.root, id);
             try putNumber(txn, &counter, std.math.add(u64, try count(txn, &counter), 1) catch return error.ResourceLimitExceeded);
         }
-        try putNumber(txn, selected, state.revision);
+        try putNumber(txn, selected, revision);
     }
 }
 
@@ -147,7 +175,7 @@ fn register(alloc: std.mem.Allocator, store_handle: anytype, root: u128, plan: *
         return;
     };
     if (!try matchesDurableCatalog(&txn, plan, authority)) return error.ArtifactCatalogDrift;
-    if (try load(alloc, &txn)) |current| {
+    if (try loadAt(alloc, &txn, enrollment_key)) |current| {
         defer current.deinit(alloc);
         if (std.meta.eql(current.authority, authority) and current.root == root) {
             txn.abort();
@@ -174,7 +202,10 @@ fn register(alloc: std.mem.Allocator, store_handle: anytype, root: u128, plan: *
         break :blk try alloc.dupe(u8, borrowed);
     };
     defer alloc.free(bound);
-    try store(alloc, &txn, .{ .raw = &.{}, .authority = authority, .root = root, .revision = 0, .baseline = ids.items.len == 0 or bound.len == 0, .requirements = ids.items, .cursor = "", .work_cursor = "", .bound = bound });
+    const initial: State = .{ .raw = &.{}, .authority = authority, .root = root, .revision = 0, .baseline = ids.items.len == 0 or bound.len == 0, .requirements = ids.items, .cursor = "", .work_cursor = "", .bound = bound };
+    try store(alloc, &txn, initial);
+    try storeEnrollment(alloc, &txn, initial);
+    try putNumber(&txn, &scopedPrefix(revision_prefix, authority, root), 0);
     try txn.commit();
 }
 
@@ -221,7 +252,50 @@ fn baselinePage(alloc: std.mem.Allocator, store_handle: anytype) !void {
     current.cursor = if (entry == null) "" else next;
     current.baseline = entry == null;
     try store(a, &txn, current);
+    if (current.baseline) try storeEnrollment(a, &txn, current);
     try txn.commit();
+}
+
+/// Retire obsolete derived summaries in bounded pages, including one oversized
+/// identity. The caller supplies the same write admission as primary enrollment.
+pub fn collectLegacyPage(alloc: std.mem.Allocator, store_handle: anytype) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var retired: std.ArrayList([]const u8) = .empty;
+    {
+        var read = try store_handle.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer read.abort();
+        const registry_exists = if (read.get(legacy_registry_key)) |_| true else |err| switch (err) {
+            error.NotFound => false,
+            else => return err,
+        };
+        if (registry_exists) try retired.append(a, legacy_registry_key);
+        var bytes: usize = 0;
+        var visited: usize = 0;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        for ([_][]const u8{ legacy_pending_prefix, legacy_count_prefix }) |prefix| {
+            var cursor = try read.openPhysicalCursorAdapter();
+            defer cursor.close();
+            var entry = try cursor.seekAtOrAfter(prefix);
+            while (entry) |row| {
+                if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                if (visited != 0 and (visited >= 128 or bytes >= 64 * 1024 or row.key.len > 64 * 1024 - bytes or @import("antfly_platform").time.monotonicNs() >= deadline)) break;
+                try retired.append(a, try a.dupe(u8, row.key));
+                bytes +|= row.key.len;
+                visited += 1;
+                entry = try cursor.next();
+            }
+        }
+    }
+    if (retired.items.len == 0) return;
+    var write = try store_handle.beginWriteTxn();
+    errdefer write.abort();
+    for (retired.items) |key| write.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+    try write.commit();
 }
 
 pub fn advance(alloc: std.mem.Allocator, store_handle: anytype, root: u128, plan: *const Manager.WritePlanSnapshot) !bool {
@@ -230,10 +304,12 @@ pub fn advance(alloc: std.mem.Allocator, store_handle: anytype, root: u128, plan
         defer read.abort();
         if (try publication.authority(&read) == null) return false;
     }
+    try collectLegacyPage(alloc, store_handle);
     var identity: [16]u8 = undefined;
     std.mem.writeInt(u128, &identity, root, .big);
-    _ = try @import("artifact_producer_obligations.zig").collectObsoleteEpochPageForIdentity(alloc, store_handle, pending_prefix, 48, max_bytes + 48, &identity);
+    _ = try @import("artifact_producer_obligations.zig").collectObsoleteEpochPageForIdentity(alloc, store_handle, pending_prefix, 48, max_cursor_bytes + 48, &identity);
     _ = try @import("artifact_producer_obligations.zig").collectObsoleteEpochPageForIdentity(alloc, store_handle, count_prefix, 48, 48, &identity);
+    _ = try @import("artifact_producer_obligations.zig").collectObsoleteEpochPageForIdentity(alloc, store_handle, revision_prefix, 16, 16, &identity);
     try register(alloc, store_handle, root, plan);
     try baselinePage(alloc, store_handle);
     const requirements = if (plan.completion_plan) |*value| value else return false;
@@ -265,7 +341,7 @@ pub fn advance(alloc: std.mem.Allocator, store_handle: anytype, root: u128, plan
                 break;
             }
             if (items.items.len != 0 and (items.items.len >= 32 or bytes >= 64 * 1024 or @import("antfly_platform").time.monotonicNs() >= deadline)) break;
-            if (row.key.len <= prefix.len + 32) return error.ArtifactCatalogCorrupt;
+            if (row.key.len < prefix.len + 32) return error.ArtifactCatalogCorrupt;
             const id = row.key[prefix.len..][0..32];
             const node = for (requirements.nodes) |*node| {
                 if (std.mem.eql(u8, &node.id, id)) break node;
@@ -307,7 +383,7 @@ pub fn pending(alloc: std.mem.Allocator, store_handle: anytype, root: u128) !boo
     var txn = try store_handle.beginReadTxn();
     defer txn.abort();
     const authority = (try publication.authority(&txn)) orelse return false;
-    const state = (try load(alloc, &txn)) orelse return true;
+    const state = (try loadAt(alloc, &txn, enrollment_key)) orelse return true;
     defer state.deinit(alloc);
     if (!std.meta.eql(state.authority, authority) or state.root != root or !state.baseline) return true;
     var i: usize = 0;
@@ -321,7 +397,7 @@ pub fn pending(alloc: std.mem.Allocator, store_handle: anytype, root: u128) !boo
 fn settle(txn: anytype, authority: publication.Authority, root: u128, selected: []const u8, revision: u64) !bool {
     if (try optionalRevision(txn, selected) != revision) return false;
     const prefix = scopedPrefix(pending_prefix, authority, root);
-    if (!std.mem.startsWith(u8, selected, &prefix) or selected.len <= prefix.len + 32) return error.ArtifactCatalogCorrupt;
+    if (!std.mem.startsWith(u8, selected, &prefix) or selected.len < prefix.len + 32) return error.ArtifactCatalogCorrupt;
     const counter = counterKey(authority, root, selected[prefix.len..][0..32].*);
     try putNumber(txn, &counter, std.math.sub(u64, try count(txn, &counter), 1) catch return error.ArtifactCatalogCorrupt);
     try txn.delete(selected);
@@ -330,7 +406,7 @@ fn settle(txn: anytype, authority: publication.Authority, root: u128, selected: 
 
 /// Dependency closure comes from the pinned completion plan. A graph failure
 /// cannot block text whose producer requirements have already settled.
-pub fn sourceComplete(alloc: std.mem.Allocator, txn: anytype, plan: *const Manager.WritePlanSnapshot, root: u128, artifact: []const u8) !bool {
+pub fn sourceComplete(alloc: std.mem.Allocator, txn: anytype, plan: *const Manager.WritePlanSnapshot, root: u128, artifact: []const u8, inputs_empty: bool) !bool {
     const requirements = if (plan.completion_plan) |*value| value else return false;
     var relevant: std.StringHashMapUnmanaged(void) = .empty;
     defer relevant.deinit(alloc);
@@ -343,8 +419,12 @@ pub fn sourceComplete(alloc: std.mem.Allocator, txn: anytype, plan: *const Manag
             changed = true;
         };
     }
-    const state = try load(alloc, txn);
+    const state = try loadAt(alloc, txn, enrollment_key);
     defer if (state) |value| value.deinit(alloc);
+    // A new empty owner has no registry until its first primary mutation.
+    // The caller proves absence through this same pinned transaction; a
+    // missing registry on any populated/unknown owner remains incomplete.
+    if (state == null and inputs_empty) return true;
     for (requirements.nodes) |node| {
         if ((node.kind != .generated and node.kind != .unit_children) or (!relevant.contains(node.artifact) and !relevant.contains(node.embedding))) continue;
         const current = state orelse return false;
@@ -444,7 +524,7 @@ const TestStore = struct {
     }
 };
 
-test "ordered artifact inventory producer readiness isolates streams and fences duplicate stale completion" {
+test "privacy ordered artifact inventory producer readiness isolates streams and fences duplicate stale completion" {
     const a = std.testing.allocator;
     const authority: publication.Authority = .{ .namespace = @splat(1), .epoch = 1, .catalog_digest = (@import("artifact_inventory.zig").Catalogs{}).digest() };
     const ids = [_][32]u8{ @splat(3), @splat(4) };
@@ -452,15 +532,17 @@ test "ordered artifact inventory producer readiness isolates streams and fences 
     defer memory.deinit();
     try publication.stageAuthority(&memory, .{ .mode = .activate, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
     try store(a, &memory, .{ .raw = &.{}, .authority = authority, .root = 1, .revision = 0, .baseline = true, .requirements = std.mem.asBytes(&ids), .cursor = "", .work_cursor = "", .bound = "" });
+    try storeEnrollment(a, &memory, .{ .raw = &.{}, .authority = authority, .root = 1, .revision = 0, .baseline = true, .requirements = std.mem.asBytes(&ids), .cursor = "", .work_cursor = "", .bound = "" });
+    try putNumber(&memory, &scopedPrefix(revision_prefix, authority, 1), 0);
     for (ids) |id| try putNumber(&memory, &counterKey(authority, 1, id), 0);
     const prefix = scopedPrefix(pending_prefix, authority, 1);
-    const text = try std.mem.concat(a, u8, &.{ &prefix, &ids[0], "doc" });
+    const text = try std.mem.concat(a, u8, &.{ &prefix, &ids[0], "" });
     defer a.free(text);
-    const graph = try std.mem.concat(a, u8, &.{ &prefix, &ids[1], "doc" });
+    const graph = try std.mem.concat(a, u8, &.{ &prefix, &ids[1], "" });
     defer a.free(graph);
-    try mark(a, &memory, authority, "doc");
+    try mark(a, &memory, authority, "");
     const first = (try optionalRevision(&memory, text)).?;
-    try mark(a, &memory, authority, "doc");
+    try mark(a, &memory, authority, "");
     try std.testing.expectEqual(@as(u64, 1), try count(&memory, &counterKey(authority, 1, ids[0])));
     try std.testing.expect(!try settle(&memory, authority, 1, text, first));
     const current = (try optionalRevision(&memory, text)).?;
@@ -476,12 +558,12 @@ test "ordered artifact inventory producer readiness isolates streams and fences 
     };
     var plan: Manager.WritePlanSnapshot = .{ .alloc = a, .generation = 1, .dense_fields = &.{}, .sparse_fields = &.{}, .graph_fields = &.{}, .generated_templates = &.{}, .chunk_dependents = &.{}, .artifact_catalogs = .{}, .catalog_empty = @splat(true), .completion_plan = .{ .arena = std.heap.ArenaAllocator.init(a), .catalog = authority.catalog_digest, .digest = authority.catalog_digest, .nodes = &nodes, .providers = &.{}, .definitions = .empty } };
     defer plan.completion_plan.?.deinit();
-    try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "text"));
-    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "relations"));
-    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 2, "text"));
-    try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "authored"));
-    try mark(a, &memory, authority, "doc");
-    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "text"));
+    try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "text", false));
+    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "relations", false));
+    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 2, "text", false));
+    try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "authored", false));
+    try mark(a, &memory, authority, "");
+    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "text", false));
     try std.testing.expectEqual(@as(u64, 1), try count(&memory, &counterKey(authority, 1, ids[0])));
     try std.testing.expectEqual(@as(u64, 1), try count(&memory, &counterKey(authority, 1, ids[1])));
     try std.testing.expect(!try settle(&memory, authority, 1, graph, current));
@@ -489,10 +571,16 @@ test "ordered artifact inventory producer readiness isolates streams and fences 
     const reloaded = (try load(a, &memory)).?;
     defer reloaded.deinit(a);
     try std.testing.expect(reloaded.baseline);
-    try std.testing.expectEqual(@as(u64, 3), reloaded.revision);
+    try std.testing.expectEqual(@as(u64, 0), reloaded.revision);
+    try std.testing.expectEqual(@as(u64, 3), try count(&memory, &scopedPrefix(revision_prefix, authority, 1)));
+    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "text", true));
+    try memory.delete(registry_key);
+    try memory.delete(enrollment_key);
+    try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "text", false));
+    try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "text", true));
 }
 
-test "producer readiness local source receipts exclude upstream and sibling graph outputs" {
+test "privacy producer readiness local source receipts exclude upstream and sibling graph outputs" {
     const alloc = std.testing.allocator;
     var templates = [_]@import("enrichment/enrichment_types.zig").GeneratedEnrichmentRequest{
         .{ .kind = .asset, .index_name = "", .artifact_name = "units", .doc_key = "", .source_field = "url" },
@@ -529,4 +617,49 @@ test "producer readiness local source receipts exclude upstream and sibling grap
     defer alloc.free(unchanged_graph);
     try std.testing.expect(!std.mem.eql(u8, text, changed_text));
     try std.testing.expectEqualSlices(u8, graph, unchanged_graph);
+}
+
+test "privacy producer readiness round trips large persisted cursors in APR1" {
+    const a = std.testing.allocator;
+    const cursor = try a.alloc(u8, 1_100_000);
+    defer a.free(cursor);
+    @memset(cursor, 'x');
+    var memory: TestStore = .{};
+    defer memory.deinit();
+    const requirements: [32]u8 = @splat(9);
+    try store(a, &memory, .{ .raw = &.{}, .authority = .{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) }, .root = 1, .revision = 3, .baseline = false, .requirements = &requirements, .cursor = cursor, .work_cursor = cursor, .bound = cursor });
+    const restored = (try load(a, &memory)).?;
+    defer restored.deinit(a);
+    try std.testing.expectEqualSlices(u8, "APR1", restored.raw[0..4]);
+    try std.testing.expectEqualSlices(u8, cursor, restored.cursor);
+    try std.testing.expectEqualSlices(u8, cursor, restored.work_cursor);
+    try std.testing.expectEqualSlices(u8, cursor, restored.bound);
+    try std.testing.expectEqualSlices(u8, &requirements, restored.requirements);
+    try std.testing.expectEqual(@as(u64, 3), restored.revision);
+}
+
+test "privacy readiness enrollment leaves large checkpoints unchanged and status descriptors small" {
+    const a = std.testing.allocator;
+    var memory: TestStore = .{};
+    defer memory.deinit();
+    const authority: publication.Authority = .{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) };
+    const ids = [_][32]u8{@splat(3)};
+    const cursor = try a.alloc(u8, 1_100_000);
+    defer a.free(cursor);
+    @memset(cursor, 'x');
+    const initial: State = .{ .raw = &.{}, .authority = authority, .root = 1, .revision = 0, .baseline = true, .requirements = std.mem.asBytes(&ids), .cursor = cursor, .work_cursor = cursor, .bound = cursor };
+    try store(a, &memory, initial);
+    try storeEnrollment(a, &memory, initial);
+    try putNumber(&memory, &scopedPrefix(revision_prefix, authority, 1), 0);
+    try putNumber(&memory, &counterKey(authority, 1, ids[0]), 0);
+    const before = try a.dupe(u8, try memory.get(registry_key));
+    defer a.free(before);
+    for (0..100) |_| try mark(a, &memory, authority, "doc");
+    try std.testing.expectEqualSlices(u8, before, try memory.get(registry_key));
+    try std.testing.expect((try memory.get(enrollment_key)).len < 1024);
+    try std.testing.expectEqual(@as(u64, 100), try count(&memory, &scopedPrefix(revision_prefix, authority, 1)));
+    try std.testing.expectEqual(@as(u64, 1), try count(&memory, &counterKey(authority, 1, ids[0])));
+    try memory.put(enrollment_key, before);
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, mark(a, &memory, authority, "doc"));
+    try std.testing.expectEqual(@as(u64, 100), try count(&memory, &scopedPrefix(revision_prefix, authority, 1)));
 }

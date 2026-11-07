@@ -570,6 +570,8 @@ pub const ArtifactRef = struct {
     window_index: ?u32 = null,
     unit_id: ?[]u8 = null,
     source: ?ArtifactSourceRef = null,
+    revision: ?[]u8 = null,
+    derivation_revision: ?[]u8 = null,
 
     pub fn clone(self: ArtifactRef, alloc: Allocator) !ArtifactRef {
         const document_id = try alloc.dupe(u8, self.document_id);
@@ -578,7 +580,13 @@ pub const ArtifactRef = struct {
         errdefer alloc.free(name);
         const unit_id = if (self.unit_id) |id| try alloc.dupe(u8, id) else null;
         errdefer if (unit_id) |id| alloc.free(id);
+        const revision = if (self.revision) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (revision) |value| alloc.free(value);
+        const derivation_revision = if (self.derivation_revision) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (derivation_revision) |value| alloc.free(value);
         return .{
+            .revision = revision,
+            .derivation_revision = derivation_revision,
             .document_id = document_id,
             .name = name,
             .kind = self.kind,
@@ -592,6 +600,8 @@ pub const ArtifactRef = struct {
     pub fn deinit(self: *ArtifactRef, alloc: Allocator) void {
         alloc.free(self.document_id);
         alloc.free(self.name);
+        if (self.revision) |value| alloc.free(value);
+        if (self.derivation_revision) |value| alloc.free(value);
         if (self.unit_id) |unit_id| alloc.free(unit_id);
         if (self.source) |*source| source.deinit(alloc);
         self.* = undefined;
@@ -1341,6 +1351,11 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    /// Private authoritative metadata assertion. Zero means no active masking;
+    /// a nonzero value must match the installed policy before reading data.
+    privacy_policy_version: ?[64]u8 = null,
+    /// Private table-admin privacy inspection. Never accepted by public parsers.
+    privacy_original: bool = false,
     /// Local output allocation policy; never parsed from public requests.
     /// Raw copies and flat native projections already allocate exact bodies.
     output_exact: bool = false,
@@ -1471,6 +1486,13 @@ pub const RelationalRowQuery = struct {
 };
 
 pub const ScanOptions = struct {
+    /// Private authoritative metadata assertion. Zero means no active masking;
+    /// a nonzero value must match the installed policy before reading data.
+    privacy_policy_version: ?[64]u8 = null,
+    /// Private table-admin privacy inspection. Never accepted by public parsers.
+    privacy_original: bool = false,
+    /// Private administration census; emits value-free inspection status.
+    privacy_status: bool = false,
     /// Retain the full document only for a version-fenced SQL mutation.
     sql_document_preimage: bool = false,
     /// Collect durable logical range guards only for explicitly guarded SQL.
@@ -1507,6 +1529,10 @@ pub const ScanOptions = struct {
     /// scan lifetime.
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
+
+    /// Private maintenance continuation: exclude from_key even when empty.
+    /// Only trusted internal transports preserve this marker.
+    resume_from_key: bool = false,
 
     pub fn isRelational(self: ScanOptions) bool {
         return self.relational_query != null or self.relational_query_json.len != 0;
@@ -1595,6 +1621,23 @@ pub const DocumentArtifactTableReprocessRequest = struct {
     to_key: []const u8 = "",
     limit: u32 = 100,
     shard_cursors: []const DocumentArtifactReprocessShardResume = &.{},
+    /// Private continuation marker: from_key is the last admitted identifier,
+    /// even when empty. Keep the identifier in one place on the owner wire.
+    resume_from_key: bool = false,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        // Preserve the legacy initial-request envelope. Only actual resumes
+        // add the marker; an empty cursor remains distinct from an open bound.
+        inline for (comptime std.meta.fieldNames(@This())) |name| {
+            const emit = if (comptime std.mem.eql(u8, name, "resume_from_key")) self.resume_from_key else true;
+            if (emit) {
+                try writer.objectField(name);
+                try writer.write(@field(self, name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const DocumentArtifactReprocessFailure = struct {
@@ -1853,10 +1896,16 @@ pub const SearchRequest = struct {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
+    /// Private authoritative metadata assertion. Zero means no active masking;
+    /// a nonzero value must match the installed policy before reading data.
+    privacy_policy_version: ?[64]u8 = null,
     /// Trusted graph admission workspace; never part of the public wire DSL.
     graph_work_budget: ?*@import("../../graph/work_budget.zig").WorkBudget = null,
     /// Trusted request-local preparation, never decoded from public input.
     value_search_execution: @import("../../search/value_query.zig").Policy = .{},
+    /// Borrowed, request-local proof of an already selected bounded key set.
+    /// Retained after native filters are consumed; never encoded on the wire.
+    value_search_candidate_keys: []const []const u8 = &.{},
     value_search_work: ?*@import("../../search/value_query.zig").Work = null,
     value_search_scope: ?@import("../../search/value_membership.zig").Scope = null,
     native_text_tie_rank: ?@import("../../search/scorer.zig").TieRank = null,
@@ -1894,6 +1943,8 @@ pub const SearchRequest = struct {
     document_lookup_groups: []const u64 = &.{},
     /// Borrowed coordinator label; routing and storage continue using immutable identities.
     response_table_name: ?[]const u8 = null,
+    /// Trusted coordinator response annotation. Never accepted from public JSON.
+    response_live_read: bool = false,
     /// Borrowed physical name of the queried table, set by the API read
     /// source together with `graph_index_complete_snapshot`. Graph executors
     /// canonicalize a `target_table` tag naming this table to the local
@@ -1987,6 +2038,9 @@ pub const SearchRequest = struct {
     /// Internal distributed-planning control. Parent-owned navigation and
     /// globally merged unit groups may return identity-only hits for payloads
     /// routed elsewhere; direct callers fail closed when payload is absent.
+    /// Private coordinator proof: source predicates were evaluated on the
+    /// same retained table cut before fanout to independent member owners.
+    hierarchy_parent_admitted: bool = false,
     defer_hierarchy_child_hydration: bool = false,
     hierarchy_source_fields: []const []const u8 = &.{},
     hierarchy_source_include_all_fields: bool = true,
@@ -2067,11 +2121,13 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "privacy_policy_version",
     "graph_work_budget",
     // Conditional delivery runs after child authorization and retrieval.
     "field_projection_json",
     "field_projection_plan",
     "field_projection_transport",
+    "value_search_candidate_keys",
     "value_search_work",
     "value_search_scope",
     "document_authority_mode",
@@ -2080,6 +2136,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "document_output_exact",
     "document_projection_plan",
     "response_table_name",
+    "response_live_read",
     "prepared_read_table_id",
     "native_query_cut",
     // The public retained capability accompanies the authenticated physical cut.
@@ -2088,6 +2145,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "filter_query_json",
     "exclusion_query_json",
     "authorization_filter_query_json",
+    "hierarchy_parent_admitted",
     "defer_hierarchy_child_hydration",
     "defer_stored_projection",
     "filter_doc_ids",
@@ -2196,9 +2254,17 @@ fn auditHierarchyChildrenSearchRequestFields() void {
 pub fn canonicalHierarchyChildrenRequestIsValid(req: SearchRequest) bool {
     @setEvalBranchQuota(100_000);
     comptime auditHierarchyChildrenSearchRequestFields();
-    const children = req.hierarchy_children orelse return true;
-    if (children.parent_id.len == 0 or children.parent_level != .source or children.level != .unit) return false;
-    if (req.return_mode != .unit or req.hierarchy_grouped_matches or req.max_chunks_per_parent != 0) return false;
+    const children = req.hierarchy_children orelse return !req.hierarchy_parent_admitted;
+    if (req.hierarchy_parent_admitted and children.artifact_name == null) return false;
+    if (children.parent_level != .source or children.level != .unit) return false;
+    if (children.parent_ids.len != 0) {
+        if (children.parent_id.len != 0 or children.artifact_name == null or children.parent_ids.len > 100) return false;
+        for (children.parent_ids, 0..) |id, i| {
+            if (id.len == 0) return false;
+            for (children.parent_ids[0..i]) |prior| if (std.mem.eql(u8, id, prior)) return false;
+        }
+    } else if (children.parent_id.len == 0) return false;
+    if (req.return_mode != (if (children.artifact_name != null) ReturnMode.member else ReturnMode.unit) or req.hierarchy_grouped_matches or req.max_chunks_per_parent != 0) return false;
     // Traversal is deliberately not a retrieval operation. Reject every
     // scoring, ranking, or transform control at this final typed boundary so
     // embedded callers and worker envelopes cannot receive plausible-looking
@@ -2210,7 +2276,7 @@ pub fn canonicalHierarchyChildrenRequestIsValid(req: SearchRequest) bool {
     }
     if (req.limit == 0 or req.limit > max_canonical_hierarchy_groups) return false;
     if (req.offset != 0 or req.count_only or req.aggregations_json.len > 0) return false;
-    if (req.search_before.len > 0 or req.include_all_fields) return false;
+    if (req.search_before.len > 0 or (req.include_all_fields and children.artifact_name == null)) return false;
     if (req.order_by.len != 2 or
         !std.mem.eql(u8, req.order_by[0].field, "_hierarchy.position") or
         req.order_by[0].desc or
@@ -2378,7 +2444,9 @@ pub const HierarchyGroupLevel = enum {
 };
 
 pub const HierarchyChildrenRequest = struct {
-    parent_id: []const u8,
+    artifact_name: ?[]const u8 = null,
+    parent_id: []const u8 = "",
+    parent_ids: []const []const u8 = &.{},
     parent_level: HierarchyGroupLevel = .source,
     level: HierarchyGroupLevel = .unit,
 };

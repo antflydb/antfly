@@ -3357,6 +3357,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
     if (req.order_by.len > 0) try appendQueryOrderByField(alloc, &out, &first, req.order_by);
     if (req.search_after.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_after", req.search_after);
     if (req.search_before.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_before", req.search_before);
+    if (req.privacy_policy_version) |version| try appendJsonFieldString(alloc, &out, &first, "_privacy_policy_version", if (std.mem.allEqual(u8, &version, 0)) "none" else &version);
     if (req.document_authority_mode != .none) {
         try appendJsonFieldName(alloc, &out, &first, "_document_authority");
         const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .mode = req.document_authority_mode, .group = req.document_authority_group, .defer_stored_projection = req.defer_stored_projection }, .{});
@@ -3370,6 +3371,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
         try out.appendSlice(alloc, encoded);
     }
     if (req.remote_snapshot) |snapshot| try appendJsonFieldString(alloc, &out, &first, "remote_snapshot", snapshot);
+    if (req.response_live_read) try appendJsonFieldBool(alloc, &out, &first, "_response_live_read", true);
     if (req.count_only) {
         try appendJsonFieldBool(alloc, &out, &first, "count", true);
     }
@@ -3417,6 +3419,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
     if (req.identity_read_generation) |generation| {
         try appendJsonFieldU64(alloc, &out, &first, "_identity_read_generation", generation);
     }
+    if (req.hierarchy_parent_admitted) try appendJsonFieldBool(alloc, &out, &first, "_hierarchy_parent_admitted", true);
     if (req.hierarchy_children != null or req.defer_hierarchy_child_hydration) {
         try appendJsonFieldBool(alloc, &out, &first, "_defer_hierarchy_child_hydration", true);
     }
@@ -3547,6 +3550,8 @@ pub fn encodeStorageKernelQueryRequestForExecution(alloc: std.mem.Allocator, req
 }
 
 pub const StorageKernelLookupWireRequest = struct {
+    privacy_policy_version: ?[64]u8 = null,
+    privacy_original: bool = false,
     key: []const u8,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
@@ -3569,6 +3574,8 @@ pub const StorageKernelLookupWireRequest = struct {
 
     pub fn options(self: StorageKernelLookupWireRequest) db_mod.types.LookupOptions {
         return .{
+            .privacy_policy_version = self.privacy_policy_version,
+            .privacy_original = self.privacy_original,
             .row_policy_principal_proof = self.row_policy_principal_proof,
             .row_policy_database = self.row_policy_database,
             .row_policy_receipt = if (self.row_policy_receipt) |receipt| .{ .generation = receipt.generation, .phase = receipt.phase } else null,
@@ -3653,6 +3660,8 @@ pub fn encodeStorageKernelLookupRequest(
     opts: db_mod.types.LookupOptions,
 ) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, StorageKernelLookupWireRequest{
+        .privacy_policy_version = opts.privacy_policy_version,
+        .privacy_original = opts.privacy_original,
         .key = key,
         .row_policy_principal_proof = opts.row_policy_principal_proof,
         .row_policy_database = opts.row_policy_database,
@@ -3716,6 +3725,10 @@ pub fn encodeStorageKernelDocumentArtifactManifestsResponse(
 }
 
 pub const StorageKernelScanWireRequest = struct {
+    privacy_policy_version: ?[64]u8 = null,
+    privacy_original: bool = false,
+    privacy_status: bool = false,
+    resume_from_key: bool = false,
     from_key: []const u8 = "",
     to_key: []const u8 = "",
     inclusive_from: bool = false,
@@ -3733,6 +3746,10 @@ pub const StorageKernelScanWireRequest = struct {
 
     pub fn options(self: StorageKernelScanWireRequest) db_mod.types.ScanOptions {
         return .{
+            .privacy_policy_version = self.privacy_policy_version,
+            .privacy_original = self.privacy_original,
+            .privacy_status = self.privacy_status,
+            .resume_from_key = self.resume_from_key,
             .inclusive_from = self.inclusive_from,
             .exclusive_to = self.exclusive_to,
             .include_documents = self.include_documents,
@@ -3767,6 +3784,10 @@ pub fn encodeStorageKernelScanRequest(
     opts: db_mod.types.ScanOptions,
 ) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, StorageKernelScanWireRequest{
+        .privacy_policy_version = opts.privacy_policy_version,
+        .privacy_original = opts.privacy_original,
+        .privacy_status = opts.privacy_status,
+        .resume_from_key = opts.resume_from_key,
         .from_key = from_key,
         .to_key = to_key,
         .inclusive_from = opts.inclusive_from,
@@ -3905,9 +3926,21 @@ pub fn appendQueryHierarchyField(
     try appendJsonFieldName(alloc, out, first, "hierarchy");
     try out.append(alloc, '{');
     if (req.hierarchy_children) |children| {
-        try out.appendSlice(alloc, "\"children\":{\"parent\":{\"level\":\"source\",\"id\":");
-        try appendJsonString(alloc, out, children.parent_id);
-        try out.appendSlice(alloc, "},\"level\":\"unit\"}");
+        try out.appendSlice(alloc, "\"children\":{\"parent\":{\"level\":\"source\",");
+        if (children.parent_ids.len != 0) {
+            try out.appendSlice(alloc, "\"ids\":");
+            const ids_json = try std.json.Stringify.valueAlloc(alloc, children.parent_ids, .{});
+            defer alloc.free(ids_json);
+            try out.appendSlice(alloc, ids_json);
+        } else {
+            try out.appendSlice(alloc, "\"id\":");
+            try appendJsonString(alloc, out, children.parent_id);
+        }
+        if (children.artifact_name) |name| {
+            try out.appendSlice(alloc, "},\"level\":\"member\",\"artifact\":");
+            try appendJsonString(alloc, out, name);
+            try out.append(alloc, '}');
+        } else try out.appendSlice(alloc, "},\"level\":\"unit\"}");
     } else {
         // `group_by` is its own opt-in control (grouped matches, or explicit
         // unit-level grouping); `ancestors` (hydrating a chunk hit's source/
@@ -5257,8 +5290,15 @@ pub fn parseRemoteHierarchyArtifactRefAlloc(
     errdefer alloc.free(owned_name);
     const owned_unit_id = if (artifact.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null;
     errdefer if (owned_unit_id) |unit_id| alloc.free(unit_id);
-    const source = if (artifact.source) |source| try parseRemoteArtifactSourceRefAlloc(alloc, source) else null;
+    var source = if (artifact.source) |source| try parseRemoteArtifactSourceRefAlloc(alloc, source) else null;
+    errdefer if (source) |*value| value.deinit(alloc);
+    const revision = if (artifact.revision) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (revision) |value| alloc.free(value);
+    const derivation_revision = if (artifact.derivation_revision) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (derivation_revision) |value| alloc.free(value);
     return db_mod.types.ArtifactRef{
+        .revision = revision,
+        .derivation_revision = derivation_revision,
         .document_id = owned_document_id,
         .name = owned_name,
         .kind = kind,

@@ -5,6 +5,10 @@ pub const types = @import("types.zig");
 
 pub const A4bResidencyMode = types.A4bResidencyMode;
 pub const AudioChunkConfig = types.AudioChunkConfig;
+pub const AudioReadCapabilities = types.AudioReadCapabilities;
+pub const AudioReadMetadata = types.AudioReadMetadata;
+pub const AudioReadOptions = types.AudioReadOptions;
+pub const AudioReadSegment = types.AudioReadSegment;
 pub const BackendRuntimes = types.BackendRuntimes;
 pub const ChatMessage = types.ChatMessage;
 pub const ChatMessageContent = types.ChatMessageContent;
@@ -64,6 +68,4 @@ pub const Tool = types.Tool;
 pub const ToolCallDelta = types.ToolCallDelta;
 pub const ToolCallFunctionDelta = types.ToolCallFunctionDelta;
 pub const ToolChoice = types.ToolChoice;
-pub const TranscribeRequest = types.TranscribeRequest;
-pub const TranscribeResponse = types.TranscribeResponse;
 pub const VADOptions = types.VADOptions;

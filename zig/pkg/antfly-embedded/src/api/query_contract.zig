@@ -14,6 +14,42 @@
 // limitations under the License.
 
 const std = @import("std");
+
+/// Literal-only validation details, owned by the public request. Bindings are
+/// stackable so nested calls and reused executor threads cannot leak failures.
+pub const ValidationDiagnostic = struct {
+    pointer: []const u8,
+    message: []const u8,
+};
+pub const ValidationDiagnosticStorage = struct {
+    diagnostic: ?ValidationDiagnostic = null,
+};
+threadlocal var validation_diagnostic_storage: ?*ValidationDiagnosticStorage = null;
+pub const ValidationDiagnosticBinding = struct {
+    previous: ?*ValidationDiagnosticStorage,
+    pub fn deinit(self: @This()) void {
+        validation_diagnostic_storage = self.previous;
+    }
+};
+pub fn bindValidationDiagnostic(storage: *ValidationDiagnosticStorage) ValidationDiagnosticBinding {
+    const previous = validation_diagnostic_storage;
+    validation_diagnostic_storage = storage;
+    return .{ .previous = previous };
+}
+pub fn resetValidationDiagnostic() void {
+    if (validation_diagnostic_storage) |storage| storage.diagnostic = null;
+}
+pub fn takeValidationDiagnostic() ?ValidationDiagnostic {
+    const storage = validation_diagnostic_storage orelse return null;
+    const diagnostic = storage.diagnostic;
+    storage.diagnostic = null;
+    return diagnostic;
+}
+fn invalidQueryField(comptime pointer: []const u8, comptime message: []const u8) error{InvalidQueryRequest} {
+    if (validation_diagnostic_storage) |storage| storage.diagnostic = .{ .pointer = pointer, .message = message };
+    return error.InvalidQueryRequest;
+}
+
 const relationship_filter = @import("../graph/relationship_filter.zig");
 const builtin = @import("builtin");
 const ant_json = @import("antfly-json");
@@ -2990,13 +3026,17 @@ pub fn parseQueryRequestWithDeadline(
     // generated public contract strips private shard fields. Public admission
     // rejects this control before entering the shared parser. Escaped member
     // names still receive semantic parsing rather than bypassing retention.
-    if (std.mem.indexOf(u8, body, "_native_cut") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
+    if (std.mem.indexOf(u8, body, "_native_cut") != null or std.mem.indexOf(u8, body, "_response_live_read") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
         var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
         defer raw.deinit();
         if (raw.value == .object) if (raw.value.object.get("_native_cut")) |value| {
             owned.native_cut = try std.json.parseFromValue(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child, alloc, value, .{ .allocate = .alloc_always });
             try owned.native_cut.?.value.validate(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
             owned.req.native_query_cut = owned.native_cut.?.value;
+        };
+        if (raw.value == .object) if (raw.value.object.get("_response_live_read")) |value| {
+            if (value != .bool) return error.InvalidQueryRequest;
+            owned.req.response_live_read = value.bool;
         };
     }
     if (std.mem.indexOf(u8, body, "_document_authority") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
@@ -3010,6 +3050,20 @@ pub fn parseQueryRequestWithDeadline(
             owned.req.document_authority_mode = control.value.mode;
             owned.req.document_authority_group = control.value.group;
             owned.req.defer_stored_projection = control.value.defer_stored_projection;
+        };
+    }
+    if (std.mem.indexOf(u8, body, "_privacy_policy_version") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer raw.deinit();
+        if (raw.value == .object) if (raw.value.object.get("_privacy_policy_version")) |value| {
+            if (value != .string) return error.InvalidQueryRequest;
+            var version: [64]u8 = @splat(0);
+            if (!std.mem.eql(u8, value.string, "none")) {
+                if (value.string.len != 64) return error.InvalidQueryRequest;
+                for (value.string) |byte| if (!std.ascii.isHex(byte)) return error.InvalidQueryRequest;
+                @memcpy(&version, value.string);
+            }
+            owned.req.privacy_policy_version = version;
         };
     }
     return owned;
@@ -3124,6 +3178,22 @@ fn parseQueryRequestWithDeadlineCore(
     errdefer normalized_query.deinit(alloc);
     try ensureQueryDeadline(execution_deadline_ns);
 
+    // Navigation admits a bounded set of source rows, without a text-index
+    // retrieval relation. Lower logical field predicates into the existing
+    // stored-value matcher rather than leaving a text-filter carrier behind.
+    if (req.hierarchy_children != null) if (normalized_query.filter_text) |predicate| {
+        var encoded: std.ArrayListUnmanaged(u8) = .empty;
+        defer encoded.deinit(alloc);
+        try appendPatternFilterQueryValue(alloc, &encoded, predicate, true);
+        const value = try std.json.parseFromSlice(std.json.Value, alloc, encoded.items, .{});
+        defer value.deinit();
+        try db_mod.validateStructuredFilterValueAlloc(alloc, value.value);
+        const owned = try encoded.toOwnedSlice(alloc);
+        normalized_query.filter_query_json = try mergeInternalFilterJsonAlloc(alloc, normalized_query.filter_query_json, owned, .all);
+        freeTextQuery(alloc, predicate);
+        normalized_query.filter_text = null;
+    };
+
     if (req.reranker != null) {
         req.reranker_query_text = try buildRerankerQueryText(alloc, request);
     }
@@ -3137,10 +3207,10 @@ fn parseQueryRequestWithDeadlineCore(
         normalized_query.full_text = null;
     } else if (request.full_text_index != null) {
         return error.InvalidQueryRequest;
-    } else if (normalized_query.filter_text != null or
+    } else if (req.hierarchy_children == null and (normalized_query.filter_text != null or
         normalized_query.exclusion_text != null or
         normalized_query.filter_query_json.len > 0 or
-        normalized_query.exclusion_query_json.len > 0)
+        normalized_query.exclusion_query_json.len > 0))
     {
         req.full_text = .{ .match_all = {} };
     }
@@ -3227,6 +3297,60 @@ test "api query contract storage public consumers reject evaluation before execu
     }) |body| try std.testing.expectError(error.UnsupportedQueryRequest, validateStoragePublicQueryRequest(alloc, body));
     try validateStoragePublicQueryRequest(alloc, "{\"evaluate\":null}");
     try validateStoragePublicQueryRequest(alloc, "{\"full_text_search\":{\"match_all\":{}}}");
+}
+
+test "api query contract live read annotation is trusted and survives worker transport" {
+    const a = std.testing.allocator;
+    var parsed = try parsePublicQueryRequest(a, null, "docs", "{}");
+    defer parsed.deinit(a);
+    try std.testing.expect(!parsed.req.response_live_read);
+    parsed.req.response_live_read = true;
+    const wire = try @import("query_execution_contract.zig").encodeQueryRequest(a, parsed.req);
+    defer a.free(wire);
+    var worker = try parseQueryRequest(a, null, "docs", wire);
+    defer worker.deinit(a);
+    try std.testing.expect(worker.req.response_live_read);
+    for ([_][]const u8{ "{\"_response_live_read\":true}", "{\"_response_liv\\u0065_read\":true}" }) |body| {
+        try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(a, null, "docs", body));
+    }
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs", "{\"_response_live_read\":1}"));
+}
+
+fn liveReadEncodingScenario(a: std.mem.Allocator) !void {
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
+    for ([_]bool{ false, true }) |live| {
+        const req: db_mod.types.SearchRequest = .{ .response_live_read = live };
+        var response = try encodeQueryResponses(a, "docs", req, .{}, result);
+        defer response.deinit(a);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.json, .{});
+        defer parsed.deinit();
+        const value = parsed.value.object.get("responses").?.array.items[0].object.get("live_read");
+        if (live) try std.testing.expect(value.?.bool) else try std.testing.expect(value == null);
+    }
+    const Sink = struct {
+        called: bool = false,
+        fn start(_: *anyopaque, _: usize) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn write(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn consume(raw: *anyopaque, view: @import("query_response.zig").ResultView) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(?bool, true), view.result.live_read);
+            self.called = true;
+        }
+    };
+    var sink: Sink = .{};
+    var delivered = try encodeQueryResponsesWithDelivery(a, "docs", .{ .response_live_read = true }, .{}, result, .{ .ptr = &sink, .start_fn = Sink.start, .write_fn = Sink.write, .typed_result = .{ .ptr = &sink, .consume = Sink.consume } });
+    defer delivered.deinit(a);
+    try std.testing.expect(sink.called);
+    try std.testing.expectEqual(@as(?usize, 0), delivered.delivered_bytes);
+}
+
+test "api query contract live read encoding owns failures and annotates typed delivery" {
+    try liveReadEncodingScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, liveReadEncodingScenario, .{});
 }
 
 test "api query contract hierarchy worker wire preserves explicit deferred projection" {
@@ -4473,6 +4597,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
+                .live_read = if (req.response_live_read) true else null,
             };
             if (graph_results == null and typed_delivery) if (delivery) |sink| if (sink.typed_result) |target| {
                 if (sink.hydrator != null) return error.InvalidArgument;
@@ -4512,6 +4637,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
+                .live_read = if (req.response_live_read) true else null,
             };
             break :blk if (hasColumnSources(emitted_hits) or hasFinalizedWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered, projection) else try std.json.Stringify.valueAlloc(
                 alloc,
@@ -4805,7 +4931,12 @@ fn searchHitHierarchyJsonValue(alloc: std.mem.Allocator, req: db_mod.types.Searc
     // Positions and revisions are traversal state, not durable unit fields.
     // Relevance grouping deliberately omits them so re-extraction cannot leak
     // a cursor from an older artifact generation.
-    if (req.hierarchy_children != null) try appendHierarchyNavigationMetadata(alloc, &obj, hit);
+    if (req.hierarchy_children) |children| {
+        if (children.artifact_name != null) {
+            if (hit.sort_values.len != 2 or hit.sort_values[0] != .string) return error.InvalidQueryRequest;
+            try putJsonString(alloc, &obj, "position", hit.sort_values[0].string);
+        } else try appendHierarchyNavigationMetadata(alloc, &obj, hit);
+    }
 
     if (hit.chunk_hits.len > 0) {
         var chunks = try std.json.Array.initCapacity(alloc, hit.chunk_hits.len);
@@ -5077,6 +5208,8 @@ fn artifactRefJsonValue(alloc: std.mem.Allocator, artifact_ref: db_mod.types.Art
 
     try putJsonString(alloc, &obj, "name", artifact_ref.name);
     try putJsonString(alloc, &obj, "kind", artifactKindString(artifact_ref.kind));
+    if (artifact_ref.revision) |revision| try putJsonString(alloc, &obj, "revision", revision);
+    if (artifact_ref.derivation_revision) |revision| try putJsonString(alloc, &obj, "derivation_revision", revision);
     if (artifact_ref.chunk_id) |chunk_id| {
         try obj.put(alloc, try alloc.dupe(u8, "chunk_id"), .{ .integer = @intCast(chunk_id) });
     }
@@ -8918,7 +9051,7 @@ fn normalizeGeneratedBleveQuery(alloc: std.mem.Allocator, query: std.json.Value)
 fn encodePatternFilterQuery(alloc: std.mem.Allocator, query: db_mod.types.TextQuery) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try appendPatternFilterQueryValue(alloc, &out, query);
+    try appendPatternFilterQueryValue(alloc, &out, query, false);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -8966,8 +9099,15 @@ fn appendPatternFilterQueryValue(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     query: db_mod.types.TextQuery,
+    allow_logical_values: bool,
 ) !void {
     switch (query) {
+        .value => |spec| {
+            if (!allow_logical_values) return error.UnsupportedQueryRequest;
+            const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .value = spec }, .{});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        },
         .match_all => try out.appendSlice(alloc, "{\"match_all\":{}}"),
         .match_none => try out.appendSlice(alloc, "{\"match_none\":{}}"),
         .term => |term| {
@@ -9103,7 +9243,7 @@ fn appendPatternFilterQueryValue(
                 try out.append(alloc, '[');
                 for (bool_query.must, 0..) |item, i| {
                     if (i > 0) try out.append(alloc, ',');
-                    try appendPatternFilterQueryValue(alloc, out, item);
+                    try appendPatternFilterQueryValue(alloc, out, item, allow_logical_values);
                 }
                 try out.append(alloc, ']');
             }
@@ -9112,7 +9252,7 @@ fn appendPatternFilterQueryValue(
                 try out.append(alloc, '[');
                 for (bool_query.should, 0..) |item, i| {
                     if (i > 0) try out.append(alloc, ',');
-                    try appendPatternFilterQueryValue(alloc, out, item);
+                    try appendPatternFilterQueryValue(alloc, out, item, allow_logical_values);
                 }
                 try out.append(alloc, ']');
             }
@@ -9121,7 +9261,7 @@ fn appendPatternFilterQueryValue(
                 try out.append(alloc, '[');
                 for (bool_query.must_not, 0..) |item, i| {
                     if (i > 0) try out.append(alloc, ',');
-                    try appendPatternFilterQueryValue(alloc, out, item);
+                    try appendPatternFilterQueryValue(alloc, out, item, allow_logical_values);
                 }
                 try out.append(alloc, ']');
             }
@@ -11605,7 +11745,11 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     freeOwnedStringSlice(alloc, req.hierarchy_match_fields);
     freeOwnedStringSlice(alloc, req.hierarchy_source_fields);
     freeOwnedStringSlice(alloc, req.hierarchy_unit_fields);
-    if (req.hierarchy_children) |children| alloc.free(@constCast(children.parent_id));
+    if (req.hierarchy_children) |children| {
+        if (children.parent_id.len != 0) alloc.free(@constCast(children.parent_id));
+        freeOwnedStringSlice(alloc, children.parent_ids);
+        if (children.artifact_name) |name| alloc.free(@constCast(name));
+    }
     if (req.resolved_doc_filter_owned) {
         if (req.resolved_doc_filter) |ptr| db_mod.doc_filter_wire.destroyResolvedDocFilter(alloc, ptr);
     }
@@ -12570,10 +12714,13 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_exclusion_query_json",
         "_identity_read_generation",
         "_native_cut",
+        "_response_live_read",
         "_document_authority",
+        "_privacy_policy_version",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
+        "_hierarchy_parent_admitted",
         "_defer_hierarchy_child_hydration",
         "_require_algebraic_filter_resolution",
         db_mod.doc_filter_wire.field_name,
@@ -12753,7 +12900,7 @@ fn applyPublicHierarchyControls(
                             return error.InvalidQueryRequest;
                         }
                     }
-                    if (!fields_set) return error.InvalidQueryRequest;
+                    if (!fields_set) return invalidQueryField("/hierarchy/group_by/matches/fields", "fields is required when hierarchy.group_by.matches is configured; use an explicit field array (which may be empty)");
                 } else {
                     return error.InvalidQueryRequest;
                 }
@@ -12764,18 +12911,40 @@ fn applyPublicHierarchyControls(
             if (value != .object or req.hierarchy_children != null) return error.InvalidQueryRequest;
             const parent = value.object.get("parent") orelse return error.InvalidQueryRequest;
             const level = value.object.get("level") orelse return error.InvalidQueryRequest;
-            if (value.object.count() != 2 or parent != .object or level != .string) return error.InvalidQueryRequest;
-            if (!std.mem.eql(u8, level.string, "unit")) return error.UnsupportedQueryRequest;
+            if (parent != .object or level != .string) return error.InvalidQueryRequest;
+            const member = std.mem.eql(u8, level.string, "member");
+            if (!member and !std.mem.eql(u8, level.string, "unit")) return error.UnsupportedQueryRequest;
+            const artifact = value.object.get("artifact");
+            if (member) {
+                if (value.object.count() != 3 or artifact == null or artifact.? != .string or artifact.?.string.len == 0) return error.InvalidQueryRequest;
+            } else if (value.object.count() != 2) return error.InvalidQueryRequest;
             const parent_level = parent.object.get("level") orelse return error.InvalidQueryRequest;
-            const parent_id = parent.object.get("id") orelse return error.InvalidQueryRequest;
-            if (parent.object.count() != 2 or parent_level != .string or parent_id != .string or parent_id.string.len == 0) {
-                return error.InvalidQueryRequest;
-            }
+            const parent_id = parent.object.get("id");
+            const parent_ids = parent.object.get("ids");
+            if (parent.object.count() != 2 or parent_level != .string or (parent_id == null) == (parent_ids == null)) return error.InvalidQueryRequest;
             if (!std.mem.eql(u8, parent_level.string, "source")) return error.UnsupportedQueryRequest;
-            req.hierarchy_children = .{
-                .parent_id = try alloc.dupe(u8, parent_id.string),
-                .parent_level = .source,
-                .level = .unit,
+            if (parent_id) |id| {
+                if (id != .string or id.string.len == 0) return error.InvalidQueryRequest;
+            }
+            if (parent_ids) |ids| {
+                if (!member or ids != .array or ids.array.items.len == 0 or ids.array.items.len > 100) return error.InvalidQueryRequest;
+                for (ids.array.items, 0..) |id, i| {
+                    if (id != .string or id.string.len == 0) return error.InvalidQueryRequest;
+                    for (ids.array.items[0..i]) |prior| if (std.mem.eql(u8, prior.string, id.string)) return error.InvalidQueryRequest;
+                }
+            }
+            req.hierarchy_children = blk: {
+                const owned_parent = if (parent_id) |id| try alloc.dupe(u8, id.string) else "";
+                errdefer if (owned_parent.len != 0) alloc.free(owned_parent);
+                const owned_ids = if (parent_ids) |ids| try parseStringArrayJsonAlloc(alloc, ids) else &.{};
+                errdefer freeOwnedStringSlice(alloc, owned_ids);
+                break :blk .{
+                    .parent_id = owned_parent,
+                    .parent_ids = owned_ids,
+                    .artifact_name = if (member) try alloc.dupe(u8, artifact.?.string) else null,
+                    .parent_level = .source,
+                    .level = .unit,
+                };
             };
         } else if (std.mem.eql(u8, key, "ancestors")) {
             if (value != .object or value.object.count() == 0) return error.InvalidQueryRequest;
@@ -12813,7 +12982,7 @@ fn applyPublicHierarchyControls(
     if (has_new_controls) {
         if (children_set) {
             if (group_by_set or hierarchy.object.get("ancestors") != null) return error.InvalidQueryRequest;
-            if (!objectHasNonNullField(parsed.value.object, "fields")) return error.InvalidQueryRequest;
+            if (!objectHasNonNullField(parsed.value.object, "fields") and req.hierarchy_children.?.artifact_name == null) return error.InvalidQueryRequest;
             var root_it = parsed.value.object.iterator();
             while (root_it.next()) |entry| {
                 if (entry.value_ptr.* == .null) continue;
@@ -12828,6 +12997,8 @@ fn applyPublicHierarchyControls(
                     // The retained cut is required to resume child traversal;
                     // it is capability metadata, not a relevance/filter knob.
                     !std.mem.eql(u8, root_key, "remote_snapshot") and
+                    // A member filter admits source parents before paging their artifacts.
+                    !(std.mem.eql(u8, root_key, "filter_query") and req.hierarchy_children.?.artifact_name != null) and
                     !isInternalShardFieldName(root_key))
                 {
                     // Sequential traversal has no relevance/filter execution
@@ -12844,7 +13015,7 @@ fn applyPublicHierarchyControls(
                 !std.mem.eql(u8, req.order_by[1].field, "_id") or
                 req.order_by[1].desc)
             {
-                return error.InvalidQueryRequest;
+                return invalidQueryField("/order_by", "hierarchy.children requires order_by with _hierarchy.position ascending followed by _id ascending");
             }
             if (req.search_after.len > 0 and
                 (req.search_after.len != 2 or req.search_after[0] != .string or req.search_after[1] != .string))
@@ -12852,7 +13023,7 @@ fn applyPublicHierarchyControls(
                 return error.InvalidQueryRequest;
             }
             if (req.search_before.len > 0) return error.InvalidQueryRequest;
-            req.return_mode = .unit;
+            req.return_mode = if (req.hierarchy_children.?.artifact_name != null) .member else .unit;
         } else if (group_by_set) {
             // Group hits hydrate source documents, which may contain large
             // stored child materializations. Require an explicit projection
@@ -12924,10 +13095,13 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_exclusion_query_json",
         "_identity_read_generation",
         "_native_cut",
+        "_response_live_read",
         "_document_authority",
+        "_privacy_policy_version",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
+        "_hierarchy_parent_admitted",
         "_defer_hierarchy_child_hydration",
         "_require_algebraic_filter_resolution",
         db_mod.doc_filter_wire.field_name,
@@ -13368,6 +13542,10 @@ fn parseInternalDocIdConstraintsAlloc(
             return error.InvalidQueryRequest;
         }
         req.primary_text_index_name = try alloc.dupe(u8, value.string);
+    }
+    if (parsed.value.object.get("_hierarchy_parent_admitted")) |value| {
+        if (value != .bool or !value.bool or req.hierarchy_children == null or req.hierarchy_children.?.artifact_name == null) return error.InvalidQueryRequest;
+        req.hierarchy_parent_admitted = true;
     }
     if (parsed.value.object.get("_defer_hierarchy_child_hydration")) |value| {
         const is_unit_group = req.hierarchy_group_level == .unit and
@@ -20674,4 +20852,59 @@ test "api query contract source only column delivery keeps payload outside metad
     try std.testing.expect(counter.bytes > body.len);
     try std.testing.expectEqual(@as(?usize, counter.bytes), response.delivered_bytes);
     try std.testing.expect(hits[0].column_source == null);
+}
+
+test "hierarchy validation diagnostics name required fields and stay request scoped" {
+    const a = std.testing.allocator;
+    var outer: ValidationDiagnosticStorage = .{};
+    const outer_binding = bindValidationDiagnostic(&outer);
+    defer outer_binding.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs",
+        \\{"fields":[],"hierarchy":{"group_by":{"level":"source","matches":{}}}}
+    ));
+    var inner: ValidationDiagnosticStorage = .{};
+    const inner_binding = bindValidationDiagnostic(&inner);
+    try std.testing.expect(takeValidationDiagnostic() == null);
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs",
+        \\{"fields":[],"hierarchy":{"children":{"parent":{"level":"source","id":"doc"},"level":"unit"}}}
+    ));
+    try std.testing.expectEqualStrings("/order_by", takeValidationDiagnostic().?.pointer);
+    try std.testing.expect(takeValidationDiagnostic() == null);
+    inner_binding.deinit();
+    try std.testing.expectEqualStrings("/hierarchy/group_by/matches/fields", takeValidationDiagnostic().?.pointer);
+    try std.testing.expect(takeValidationDiagnostic() == null);
+}
+
+test "native member traversal requires producer and private parent admission" {
+    const alloc = std.testing.allocator;
+    const body = "{\"hierarchy\":{\"children\":{\"parent\":{\"level\":\"source\",\"id\":\"doc:a\"},\"level\":\"member\",\"artifact\":\"summary\"}},\"order_by\":[{\"field\":\"_hierarchy.position\"}],\"limit\":1}";
+    var parsed = try parseQueryRequest(alloc, null, "docs", body);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqualStrings("summary", parsed.req.hierarchy_children.?.artifact_name.?);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.member, parsed.req.return_mode);
+    try std.testing.expect(!parsed.req.hierarchy_parent_admitted);
+    for ([_][]const u8{
+        "{\"equals\":\"selected\",\"field\":\"source_id\"}",
+        "{\"bool\":{\"must\":[{\"equals\":\"selected\",\"field\":\"source_id\"},{\"bool\":{\"should\":[{\"bool\":true,\"field\":\"permissions.public\"},{\"equals\":\"user:alice\",\"field\":\"permissions.readers\"}],\"minimum_should_match\":1}}]}}",
+        "{\"bool\":true,\"field\":\"permissions.public\"}",
+    }) |predicate| {
+        const filtered_body = try std.mem.concat(alloc, u8, &.{ "{\"filter_query\":", predicate, ",", body[1..] });
+        defer alloc.free(filtered_body);
+        var filtered = try parseQueryRequest(alloc, null, "docs", filtered_body);
+        defer filtered.deinit(alloc);
+        try std.testing.expect(filtered.req.filter_query_json.len != 0);
+        try std.testing.expect(filtered.req.full_text == null and filtered.req.filter_text == null);
+        try std.testing.expect(db_mod.types.canonicalHierarchyExecutionWithinBudget(filtered.req));
+        const wire = try @import("query_execution_contract.zig").encodeQueryRequest(alloc, filtered.req);
+        defer alloc.free(wire);
+        var worker = try parseQueryRequest(alloc, null, "docs", wire);
+        defer worker.deinit(alloc);
+        try std.testing.expect(worker.req.filter_query_json.len != 0);
+        try std.testing.expect(worker.req.full_text == null and worker.req.filter_text == null);
+        try std.testing.expect(db_mod.types.canonicalHierarchyExecutionWithinBudget(worker.req));
+    }
+    var json = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer json.deinit();
+    try json.value.object.put(json.arena.allocator(), "_hierarchy_parent_admitted", .{ .bool = true });
+    try std.testing.expect(objectHasInternalShardField(json.value.object));
 }

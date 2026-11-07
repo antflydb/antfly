@@ -65,6 +65,168 @@ pub const AudioContext = enum {
     }
 };
 
+pub const AudioReadCapabilities = struct {
+    forced_language: bool,
+    detected_language: bool,
+    timestamps: bool,
+    diarization: bool,
+    windowing: bool,
+    /// Maximum duration for this backend in milliseconds. Null means windowed recognition bounded by source and execution budgets.
+    max_duration_ms: OpenApiOptionalNullable(i64) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("forced_language");
+        try jw.write(self.forced_language);
+        try jw.objectField("detected_language");
+        try jw.write(self.detected_language);
+        try jw.objectField("timestamps");
+        try jw.write(self.timestamps);
+        try jw.objectField("diarization");
+        try jw.write(self.diarization);
+        try jw.objectField("windowing");
+        try jw.write(self.windowing);
+        switch (self.max_duration_ms) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max_duration_ms");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max_duration_ms");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+/// Recognition evidence for the audio track only. Video frames are not captioned. Absent segments and speakers make no alignment or speaker claim.
+pub const AudioReadMetadata = struct {
+    /// Decoded recording duration in milliseconds. Null when a remote recognition provider does not report duration.
+    duration_ms: ?i64,
+    language: OpenApiOptionalNullable([]const u8) = .absent,
+    language_source: ?[]const u8 = null,
+    segments: OpenApiOptionalNullable([]const AudioReadSegment) = .absent,
+    speakers: OpenApiOptionalNullable([]const []const u8) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "duration_ms", "duration_ms", false },
+        .{ "language", "language", false },
+        .{ "language_source", "language_source", true },
+        .{ "segments", "segments", false },
+        .{ "speakers", "speakers", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("duration_ms");
+        try jw.write(self.duration_ms);
+        switch (self.language) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("language");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("language");
+                try jw.write(value);
+            },
+        }
+        if (self.language_source) |value| {
+            try jw.objectField("language_source");
+            try jw.write(value);
+        }
+        switch (self.segments) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("segments");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("segments");
+                try jw.write(value);
+            },
+        }
+        switch (self.speakers) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("speakers");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("speakers");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const AudioReadOptions = antfly_extraction_openapi.AudioReadOptions;
+
+pub const AudioReadSegment = struct {
+    text: []const u8,
+    /// phrase uses recognizer-supplied phrase clocks; window provides only the original recognition-window bounds. Neither claims word alignment. Absent means unspecified.
+    granularity: OpenApiOptionalNullable([]const u8) = .absent,
+    /// Start in milliseconds relative to the original recording.
+    start_ms: i64,
+    /// Exclusive end in milliseconds relative to the original recording.
+    end_ms: i64,
+    /// Start UTF-8 byte offset in the containing read result text.
+    text_start: i64,
+    /// Exclusive end UTF-8 byte offset in the containing read result text.
+    text_end: i64,
+    /// Speaker label when diarization was requested and established.
+    speaker: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        switch (self.granularity) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("granularity");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("granularity");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("start_ms");
+        try jw.write(self.start_ms);
+        try jw.objectField("end_ms");
+        try jw.write(self.end_ms);
+        try jw.objectField("text_start");
+        try jw.write(self.text_start);
+        try jw.objectField("text_end");
+        try jw.write(self.text_end);
+        switch (self.speaker) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("speaker");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("speaker");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 /// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
 pub const BackendPriorityEntry = []const u8;
 
@@ -1056,7 +1218,7 @@ pub const DictateRequest = struct {
     audio: []const u8,
     /// Force the transcript language (ISO 639-1). Omit for automatic detection.
     language: ?[]const u8 = null,
-    /// Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
+    /// Enable timestamp-aware decoding. Omitted preserves the dictation default (on).
     timestamps: ?bool = null,
     /// Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
     cleanup_model: ?[]const u8 = null,
@@ -1653,6 +1815,8 @@ pub const DocumentTokenClassificationResult = struct {
 
 /// OpenAI-compatible embedding request with inference multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized vectors.
 pub const EmbedRequest = struct {
+    /// Optional immutable execution revision from model capabilities. Every acquired model, including recovery attempts, must match before inference. A mismatch returns 409 with X-Antfly-Capability-Stale true. Successful execution acknowledges the pin in X-Antfly-Model-Revision for JSON and numeric responses; callers requiring a pin must reject missing or different acknowledgements.
+    model_revision: ?[]const u8 = null,
     /// Optional exact asset identity pin. A mismatch returns 409 before inference.
     model_identity: ?[]const u8 = null,
     /// Model name to use for embedding generation
@@ -1674,6 +1838,7 @@ pub const EmbedRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "model_revision", "model_revision", true },
         .{ "model_identity", "model_identity", true },
         .{ "model", "model", false },
         .{ "input", "input", false },
@@ -1695,6 +1860,10 @@ pub const EmbedRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.model_revision) |value| {
+            try jw.objectField("model_revision");
+            try jw.write(value);
+        }
         if (self.model_identity) |value| {
             try jw.objectField("model_identity");
             try jw.write(value);
@@ -3053,8 +3222,10 @@ pub const GenerateUsage = struct {
     prompt_tokens: i64,
     /// Number of tokens in the completion
     completion_tokens: i64,
-    /// Total tokens used (prompt + completion)
+    /// Total token budget consumed (measured prompt and completion tokens plus unmeasured allowances).
     total_tokens: i64,
+    /// Conservative provider-declared token allowance spent on document calls without measurements. Included in total_tokens; not measured or billable usage.
+    unmeasured_tokens: ?i64 = null,
     /// Cumulative logical child invocations for a document run.
     model_calls: ?i64 = null,
     /// Physical child operation invocations, separate from logical composite calls.
@@ -3075,6 +3246,7 @@ pub const GenerateUsage = struct {
         .{ "prompt_tokens", "prompt_tokens", false },
         .{ "completion_tokens", "completion_tokens", false },
         .{ "total_tokens", "total_tokens", false },
+        .{ "unmeasured_tokens", "unmeasured_tokens", true },
         .{ "model_calls", "model_calls", true },
         .{ "physical_model_calls", "physical_model_calls", true },
         .{ "rendered_pixels", "rendered_pixels", true },
@@ -3100,6 +3272,10 @@ pub const GenerateUsage = struct {
         try jw.write(self.completion_tokens);
         try jw.objectField("total_tokens");
         try jw.write(self.total_tokens);
+        if (self.unmeasured_tokens) |value| {
+            try jw.objectField("unmeasured_tokens");
+            try jw.write(value);
+        }
         if (self.model_calls) |value| {
             try jw.objectField("model_calls");
             try jw.write(value);
@@ -3279,12 +3455,15 @@ pub const ModelFormat = enum {
 
 /// Information about a model including its capabilities
 pub const ModelInfo = struct {
+    audio_read: ?AudioReadCapabilities = null,
     /// Effective model-aware chunk operational ceilings for working/output/event bytes, chunk/dependency/index counts and remote fetched bytes, requests and cache bytes. Independent of model token limits and object length. Configure through NodeConfig.chunking_limits or ANTFLY_CHUNK_<NAME>. Scoped and unscoped embedding discovery expose the same values.
     chunking_limits: ?std.json.ArrayHashMap(i64) = null,
     /// Resolved executor/task facts; generation bits are false when the selected executor does not implement them.
     inference_capabilities: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Proven native dense output width and inclusive supported truncation range, read from resolved metadata without loading weights. Omitted when unknown or for non-embedding tasks.
     dense_output: ?std.json.Value = null,
+    /// The embedding endpoint enforces model_revision and acknowledges successful execution in X-Antfly-Model-Revision for both JSON and numeric responses. An observed model_revision alone does not establish this support.
+    model_revision_pinning: ?bool = null,
     /// Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights.
     model_revision: ?[]const u8 = null,
     /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
@@ -3302,9 +3481,11 @@ pub const ModelInfo = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "audio_read", "audio_read", true },
         .{ "chunking_limits", "chunking_limits", true },
         .{ "inference_capabilities", "inference_capabilities", true },
         .{ "dense_output", "dense_output", true },
+        .{ "model_revision_pinning", "model_revision_pinning", true },
         .{ "model_revision", "model_revision", true },
         .{ "qualified_limits", "qualified_limits", true },
         .{ "compatibility", "compatibility", true },
@@ -3324,6 +3505,10 @@ pub const ModelInfo = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.audio_read) |value| {
+            try jw.objectField("audio_read");
+            try jw.write(value);
+        }
         if (self.chunking_limits) |value| {
             try jw.objectField("chunking_limits");
             try jw.write(value);
@@ -3334,6 +3519,10 @@ pub const ModelInfo = struct {
         }
         if (self.dense_output) |value| {
             try jw.objectField("dense_output");
+            try jw.write(value);
+        }
+        if (self.model_revision_pinning) |value| {
+            try jw.objectField("model_revision_pinning");
             try jw.write(value);
         }
         if (self.model_revision) |value| {
@@ -3995,6 +4184,7 @@ pub const PromptCacheConfig = struct {
 };
 
 pub const ReadObject = struct {
+    audio: OpenApiOptionalNullable(AudioReadMetadata) = .absent,
     /// Original document source ID.
     source_id: ?[]const u8 = null,
     /// One-based original page or slide number.
@@ -4029,6 +4219,7 @@ pub const ReadObject = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "audio", "audio", false },
         .{ "source_id", "source_id", true },
         .{ "number", "number", true },
         .{ "kind", "kind", true },
@@ -4059,6 +4250,17 @@ pub const ReadObject = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        switch (self.audio) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("audio");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("audio");
+                try jw.write(value);
+            },
+        }
         if (self.source_id) |value| {
             try jw.objectField("source_id");
             try jw.write(value);
@@ -4143,10 +4345,13 @@ pub const ReadObject = struct {
     }
 };
 
-/// Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
+/// Read exactly one of images, documents, or audio using capability-aware reader dispatch, with provenance and completion status. Supported video containers are read from their audio track only.
 pub const ReadRequest = struct {
-    /// Name of reader model from models_dir/readers/
+    /// Explicit reader, ASR, audio-capable generator, named target, or composed document model. ASR storage remains models_dir/transcribers/.
     model: []const u8,
+    audio_options: ?AudioReadOptions = null,
+    /// Base64-encoded audio, a data URI, or a supported source URL, mutually exclusive with images and documents. Audio tracks in supported video containers are transcribed; frames are not captioned. Whisper preserves long-recording windowing; Gemma is bounded to 30 seconds. All audio reads use document orchestration, artifacts and durable jobs.
+    audio: ?[]const u8 = null,
     /// Request an opaque, process-local reading handle for extraction reuse. Retention is best effort; inspect document.artifact_id and artifact_ttl_ms.
     retain_artifact: ?bool = null,
     /// Complete documents, mutually exclusive with images. Each source is independent; selected pages are read in original source order.
@@ -4155,12 +4360,14 @@ pub const ReadRequest = struct {
     images: ?[]const ImageURL = null,
     /// Optional task prompt for document understanding models. - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
     prompt: ?[]const u8 = null,
-    /// Maximum output tokens per page. When omitted, the selected reader model supplies its default, bounded by deployment limits. Explicit values override the model default and must fit model and server limits.
+    /// Maximum output tokens per page. When omitted, the selected reader model supplies its default, bounded by deployment limits. Explicit values override the model default and must fit model and server limits. Audio generator backends accept this option; Whisper uses its recognition and execution budgets and rejects an explicit max_tokens.
     max_tokens: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
+        .{ "audio_options", "audio_options", false },
+        .{ "audio", "audio", true },
         .{ "retain_artifact", "retain_artifact", true },
         .{ "documents", "documents", true },
         .{ "images", "images", true },
@@ -4180,6 +4387,17 @@ pub const ReadRequest = struct {
         try jw.beginObject();
         try jw.objectField("model");
         try jw.write(self.model);
+        if (self.audio_options) |value| {
+            try jw.objectField("audio_options");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("audio_options");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
         if (self.retain_artifact) |value| {
             try jw.objectField("retain_artifact");
             try jw.write(value);
@@ -4215,7 +4433,8 @@ pub const ReadResponse = struct {
     events: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
     /// Name of model used for reading
     model: []const u8,
-    usage: GenerateUsage,
+    /// Token measurements and any explicit unmeasured document allowances, or null when neither is available.
+    usage: ?GenerateUsage,
     /// Observed execution path. Omitted by older compatible servers.
     execution: ?BatchExecutionReport = null,
 
@@ -4265,6 +4484,7 @@ pub const ReadResponse = struct {
 };
 
 pub const ReadResult = struct {
+    audio: OpenApiOptionalNullable(AudioReadMetadata) = .absent,
     /// Original document source ID.
     source_id: ?[]const u8 = null,
     /// One-based original page or slide number.
@@ -4296,6 +4516,7 @@ pub const ReadResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "audio", "audio", false },
         .{ "source_id", "source_id", true },
         .{ "number", "number", true },
         .{ "kind", "kind", true },
@@ -4324,6 +4545,17 @@ pub const ReadResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        switch (self.audio) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("audio");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("audio");
+                try jw.write(value);
+            },
+        }
         if (self.source_id) |value| {
             try jw.objectField("source_id");
             try jw.write(value);
@@ -4832,129 +5064,6 @@ pub const ToolChoice = std.json.Value;
 pub const ToolChoiceFunction = struct {
     /// The name of the function to call
     name: []const u8,
-};
-
-pub const TranscribeObject = struct {
-    object: []const u8,
-    /// Input audio index.
-    index: i64,
-    /// Transcribed text from the audio
-    text: []const u8,
-    /// Detected or forced language
-    language: ?[]const u8 = null,
-    /// Decoded clip duration in milliseconds.
-    duration_ms: ?i64 = null,
-    /// Timestamped phrases in clip order, so a transcript can be indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets are relative to the whole clip.
-    segments: ?[]const DictationSegment = null,
-    /// Speaker labels found by diarization, in order of first appearance. Present only when `diarization` was requested.
-    speakers: ?[]const []const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "object", "object", false },
-        .{ "index", "index", false },
-        .{ "text", "text", false },
-        .{ "language", "language", true },
-        .{ "duration_ms", "duration_ms", true },
-        .{ "segments", "segments", true },
-        .{ "speakers", "speakers", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("object");
-        try jw.write(self.object);
-        try jw.objectField("index");
-        try jw.write(self.index);
-        try jw.objectField("text");
-        try jw.write(self.text);
-        if (self.language) |value| {
-            try jw.objectField("language");
-            try jw.write(value);
-        }
-        if (self.duration_ms) |value| {
-            try jw.objectField("duration_ms");
-            try jw.write(value);
-        }
-        if (self.segments) |value| {
-            try jw.objectField("segments");
-            try jw.write(value);
-        }
-        if (self.speakers) |value| {
-            try jw.objectField("speakers");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const TranscribeRequest = struct {
-    /// Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
-    model: []const u8,
-    /// Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
-    audio: []const u8,
-    /// Force specific language for transcription (optional, model-dependent)
-    language: ?[]const u8 = null,
-    /// Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
-    timestamps: ?bool = null,
-    /// Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance.
-    diarization: ?bool = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "audio", "audio", false },
-        .{ "language", "language", true },
-        .{ "timestamps", "timestamps", true },
-        .{ "diarization", "diarization", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        try jw.objectField("audio");
-        try jw.write(self.audio);
-        if (self.language) |value| {
-            try jw.objectField("language");
-            try jw.write(value);
-        }
-        if (self.timestamps) |value| {
-            try jw.objectField("timestamps");
-            try jw.write(value);
-        }
-        if (self.diarization) |value| {
-            try jw.objectField("diarization");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const TranscribeResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Transcription result objects.
-    data: []const TranscribeObject,
-    /// Name of model used for transcription
-    model: []const u8,
-    usage: GenerateUsage,
 };
 
 pub const TranscriptionAudioAppend = struct {

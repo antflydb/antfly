@@ -44,9 +44,11 @@ pub fn create(ctx: Context) Suite {
         // Zig 0.17's focused CUDA serving suite reached 19.57 GB on aarch64
         // Linux. Reserve 24 GiB so the scheduler admits its measured compiler
         // footprint and leaves room for the socket/reference coverage.
+        // Native aarch64 Linux CPU document orchestration (Zig 0.17,
+        // ReleaseFast) peaked at 14.26 GB. Reserve 16 GiB for this closure.
         // The focused native CPU ReleaseFast suite peaked at 10,032,644,096
         // bytes. Its old 9 GiB declaration rejected a successful compilation.
-        .max_rss = if (native_cpu and ctx.optimize == .debug) 12_672 * 1024 * 1024 else @as(usize, if (native_cpu) 11 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
+        .max_rss = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) 16 * 1024 * 1024 * 1024 else if (native_cpu and ctx.optimize == .debug) 12_672 * 1024 * 1024 else @as(usize, if (native_cpu) 11 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
@@ -55,6 +57,24 @@ pub fn create(ctx: Context) Suite {
         .filters = main_test_filters,
         .test_runner = runtime_filter_test_runner,
     });
+    if (ctx.backend.enable_pjrt) {
+        const fixture = b.addLibrary(.{
+            .name = "pjrt-admission-fixture",
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/pjrt/src/test_plugin.zig" })),
+                .target = ctx.target,
+                .optimize = ctx.optimize,
+                .link_libc = true,
+            }),
+        });
+        // Embed the provider so tests remain runnable from any working
+        // directory (including zig build --build-file from the repo root).
+        const fixture_files = b.addWriteFiles();
+        _ = fixture_files.addCopyFile(fixture.getEmittedBin(), "plugin");
+        const fixture_module = fixture_files.add("fixture.zig", "pub const bytes = @embedFile(\"plugin\");\n");
+        tests.root_module.addAnonymousImport("pjrt_admission_fixture", .{ .root_source_file = fixture_module });
+    }
     tests.root_module.strip = ctx.strip;
     tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
     tests.root_module.addImport("antfly_cloudflare", ctx.graph.inference_mod.import_table.get("antfly_cloudflare").?);
@@ -253,7 +273,45 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
         media_step.dependOn(&ctx.addRunArtifact(callbacks).step);
     }
     test_step.dependOn(media_step);
-    ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites").dependOn(&run_tests.step);
+    const cooperative_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cooperative_admission.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var cooperative_imports = suite.tests.root_module.import_table.iterator();
+    while (cooperative_imports.next()) |entry| cooperative_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    cooperative_root.link_libc = true;
+    const cooperative_tests = b.addTest(.{ .root_module = cooperative_root, .filters = &.{"cooperative sustained"} });
+    const run_cooperative_tests = ctx.addRunArtifact(cooperative_tests);
+    test_step.dependOn(&run_cooperative_tests.step);
+    ctx.step("test-cooperative-admission", "Verify sustained cooperative/exclusive turnover and queued deadlines").dependOn(&run_cooperative_tests.step);
+    const batch_root = b.createModule(.{ .root_source_file = ctx.path("src/test_execution_batch.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var batch_imports = suite.tests.root_module.import_table.iterator();
+    while (batch_imports.next()) |entry| batch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    batch_root.link_libc = true;
+    // Focused aarch64 CPU/CUDA builds peak at 1 GiB; reserve 2 GiB for cold CI.
+    const batch_tests = b.addTest(.{ .max_rss = 2 * 1024 * 1024 * 1024, .root_module = batch_root, .filters = &.{ "execution scope", "execution owner transitions", "execution resource release", "execution batch", "cooperative decode batches", "cooperative decode publication", "runtime.scheduler.native_generate", "test_0" } });
+    const run_batch_tests = ctx.addRunArtifact(batch_tests);
+    test_step.dependOn(&run_batch_tests.step);
+    ctx.step("test-execution-batch", "Verify cohort budgets, scope retirement and decode arithmetic without a GPU").dependOn(&run_batch_tests.step);
+    const lifecycle_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_allocation_lifecycle.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var lifecycle_imports = suite.tests.root_module.import_table.iterator();
+    while (lifecycle_imports.next()) |entry| lifecycle_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    lifecycle_root.link_libc = true;
+    const lifecycle_tests = b.addTest(.{ .root_module = lifecycle_root, .filters = &.{ "CUDA quarantine", "CUDA allocation", "CUDA retired", "CUDA physical OOM", "CUDA boundary", "test_0" } });
+    const run_lifecycle_tests = ctx.addRunArtifact(lifecycle_tests);
+    test_step.dependOn(&run_lifecycle_tests.step);
+    ctx.step("test-cuda-allocation-lifecycle", "Verify failed-free quarantine across primary-context lifetimes without a GPU").dependOn(&run_lifecycle_tests.step);
+    const read_batch_root = b.createModule(.{ .root_source_file = ctx.path("src/test_read_pool_microbatch.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var read_batch_imports = suite.tests.root_module.import_table.iterator();
+    while (read_batch_imports.next()) |entry| read_batch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    read_batch_root.link_libc = true;
+    const read_batch_tests = b.addTest(.{ .max_rss = 4 * 1024 * 1024 * 1024, .root_module = read_batch_root, .filters = &.{ "read pool microbatch", "executor_microbatch.test.", "embedding text batch", "gliner span v2 batch admission", "test_0" } });
+    const run_read_batch_tests = ctx.addRunArtifact(read_batch_tests);
+    test_step.dependOn(&run_read_batch_tests.step);
+    ctx.step("test-read-pool-microbatch", "Verify read-model row ownership, capacity and cancellation").dependOn(&run_read_batch_tests.step);
+    const inference_unit = ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites");
+    inference_unit.dependOn(&run_tests.step);
+    inference_unit.dependOn(&run_read_batch_tests.step);
+    inference_unit.dependOn(&run_lifecycle_tests.step);
+    inference_unit.dependOn(&run_batch_tests.step);
+    inference_unit.dependOn(&run_cooperative_tests.step);
     const cancellation_e2e_step = ctx.step("test-cancellation-e2e", "Run HTTP inference cancellation and worker recovery E2E tests");
     if (ctx.target.result.os.tag == .linux or ctx.target.result.os.tag == .macos) {
         const fixture = b.addExecutable(.{

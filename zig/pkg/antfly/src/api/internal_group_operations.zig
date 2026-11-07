@@ -57,6 +57,7 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     GenerationTransitionActive,
     HierarchyCursorStale,
     DocumentArtifactPublicationFailed,
+    ArtifactPublicationPending,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
     ReadIndexTimeout,
@@ -968,6 +969,7 @@ pub const Operations = struct {
             input,
         ) catch |err| switch (err) {
             error.InvalidBatchRequest, error.InvalidArgument => return error.InvalidArgument,
+            error.ArtifactPublicationPending => return error.ArtifactPublicationPending,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
@@ -1086,8 +1088,7 @@ pub const Operations = struct {
                     context: operation.RequestContext,
                     fn canceled(ptr: *const anyopaque) bool {
                         const deadline_context: *const @This() = @ptrCast(@alignCast(ptr));
-                        deadline_context.context.ensureActive() catch return true;
-                        return false;
+                        return deadline_context.context.isCancellationRequested();
                     }
                 };
                 const deadline: Deadline = .{ .context = request };
@@ -1137,9 +1138,9 @@ pub const Operations = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
     ) Error!db_mod.types.DocumentArtifactManifest {
-        try request.ensureActive();
+        const control = try request.platformDeadline();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .read_index) catch |err| {
+        return (reads.documentArtifactManifestGroupLocalControlled(alloc, group_id, table_name, doc_key, artifact_name, .read_index, .{ .execution_deadline_ns = control.deadline_ns, .cancellation = control.cancellation }) catch |err| {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
                 error.UnknownGroup, error.TableNotFound, error.NotFound => error.NotFound,

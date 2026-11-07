@@ -991,6 +991,11 @@ or a production latency qualification.
 
 ### Qualification after #1063
 
+For the current matched local/GCS investigation, source-storage settings, tail
+samples and the resumable comparison matrix, see
+[Remote serving performance qualification](../../docs/operations/hackernews/remote-serving-performance.md)
+and [issue #1471](https://github.com/antflydb/antfly/issues/1471).
+
 Rebuild publications with the merged routing/statistics formats before comparing
 against the earlier results. Use `--build-only` first, and run query measurements
 after the qualification compilers finish. Repeat each scenario twice on the same
@@ -1157,5 +1162,9 @@ and its retained disk are not prerequisites for the managed deployment.
 For the managed Cloud deployment, staged provider/table plans, authenticated gateway,
 resumable initial seed and supervised Lite producer, see [DEPLOYMENT.md](DEPLOYMENT.md).
 The production target reuses Colony’s `antfly-showcases` hosting foundation; the
-standalone renderer is a qualification tool. Managed RC.5 and archive-scale
+standalone renderer is a qualification tool. Managed deployment and archive-scale
 acceptance remain deployment gates.
+
+For continuous writable Iceberg changes, publication visibility, catalog-history
+growth and concurrent vacuum, see [Continuous writable-lake qualification](CONTINUOUS_LAKE.md).
+This is a separate bounded workload from the static archive search timings.

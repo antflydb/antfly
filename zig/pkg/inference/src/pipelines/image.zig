@@ -65,6 +65,15 @@ pub const Pix2StructPatches = struct {
     }
 };
 
+/// Conservative source-decode peak before model resizing. RGBA decoder
+/// storage, RGB conversion and codec intermediates overlap. Frontends share
+/// this estimate; model tensors and fixed control margins are accounted apart.
+pub fn sourceDecodeWorkingBytes(width: u32, height: u32) !usize {
+    try DecodeLimits.inference_default.validate(width, height);
+    const pixels = try std.math.mul(usize, width, height);
+    return std.math.mul(usize, pixels, 12);
+}
+
 /// Decode a JPEG/PNG/GIF/BMP/WebP from raw bytes. Always returns 3-channel RGB.
 pub fn decode(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
     try validateEncodedImageDimensions(image_bytes);
@@ -336,6 +345,7 @@ test "decode bmp fixture returns rgb image" {
 
 test "decode rejects oversized image dimensions before full decode" {
     var png = red_png_2x2;
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 100_000, .big);
     std.mem.writeInt(u32, png[20..24], 100_000, .big);
     try std.testing.expectError(error.ImageDecodeFailed, decode(std.testing.allocator, &png));
@@ -351,11 +361,14 @@ test "encoded image inspection distinguishes malformed and configured limits" {
     try std.testing.expectError(error.ImageDecodeFailed, inspectEncodedForInference(red_png_2x2[0..20], null));
 
     var png = red_png_2x2;
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 2049, .big);
     try std.testing.expectError(error.ImageTooLarge, inspectEncodedForInference(&png, 2048));
 
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 0, .big);
     try std.testing.expectError(error.ImageDecodeFailed, inspectEncodedForInference(&png, null));
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], std.math.maxInt(u32), .big);
     std.mem.writeInt(u32, png[20..24], std.math.maxInt(u32), .big);
     try std.testing.expectError(error.ImageTooLarge, inspectEncodedForInference(&png, null));

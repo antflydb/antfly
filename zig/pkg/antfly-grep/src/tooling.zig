@@ -39,6 +39,7 @@ const values = [_]ValueSpec{
     .{ .name = "--dictionary", .path = true },
     .{ .name = "--cloud-cli", .path = true },
     .{ .name = "--source" },
+    .{ .name = "--artifact" },
     .{ .name = "--source-catalog", .path = true },
     .{ .name = "--source-endpoint" },
     .{ .name = "--source-table" },

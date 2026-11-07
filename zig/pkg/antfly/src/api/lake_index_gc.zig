@@ -29,7 +29,7 @@ pub const Collector = struct {
     // Artifact membership and dependency expansion have independent lifetimes.
     // Keep expansion bits beside the owned reference, within max_marked.
     const Marked = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, expanded: u16 = 0 };
-    const Expansion = enum(u4) { directory, maintenance, manifest, seekable_manifest, text_root, artifact, ordered_page, native_page, page, contribution_page, generation_page, chunk_page, cover_directory };
+    const Expansion = enum(u4) { directory, maintenance, manifest, seekable_manifest, artifact, ordered_page, native_page, page, contribution_page, generation_page, chunk_page, cover_directory };
 
     a: A,
     table: u64,
@@ -262,33 +262,10 @@ pub const Collector = struct {
     }
     fn retainedNativeRoot(self: *Collector, a: A, comptime native: type, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !native.Root {
         const current = if (@hasDecl(native, "supportsBuildMetadata")) native.supportsBuildMetadata(ref.metadata_version) else if (@hasDecl(native, "supportsMetadata")) native.supportsMetadata(ref.metadata_version) else ref.metadata_version == native.metadata_version;
-        if (current) {
-            if (@hasDecl(native, "loadRootLazy")) return native.loadRootLazy(a, self.store, ref, self.cancellation(), null);
-            if (@hasDecl(native, "loadRootDirectory")) return native.loadRootDirectory(a, self.store, ref, self.cancellation(), null);
-            return native.loadRoot(a, self.store, ref, self.cancellation(), null);
-        }
-        const supported_old = if (@hasField(native.Root, "seekable")) ref.metadata_version >= 1 and ref.metadata_version < native.metadata_version else if (@hasField(native.Root, "tuple_encoding")) ref.metadata_version >= 2 and ref.metadata_version < native.metadata_version else if (@hasField(native.Root, "file_directory")) ref.metadata_version == 1 else ref.metadata_version +| 1 == native.metadata_version;
-        if (!supported_old) return error.InvalidNativeLakeGcReference;
-        const limit = if (@hasDecl(native, "max_root_bytes")) native.max_root_bytes else @import("lake_index_native_files.zig").max_root_bytes;
-        if (ref.byte_len > limit) return error.InvalidNativeLakeGcReference;
-        const bytes = try artifacts.readArtifact(a, self.store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, self.cancellation(), null);
-        defer a.free(bytes);
-        var root = try std.json.parseFromSliceLeaky(native.Root, a, bytes, .{ .allocate = .alloc_always });
-        if (root.version != ref.metadata_version) return error.InvalidNativeLakeGcReference;
-        root.version = native.metadata_version;
-        if (@hasField(native.Root, "tuple_encoding")) {
-            if (root.tuple_encoding == 0 or root.tuple_encoding > local.storage_db_relational_index_keys.encoding_version) return error.InvalidNativeLakeGcReference;
-            root.tuple_encoding = local.storage_db_relational_index_keys.encoding_version;
-        }
-        if (@hasDecl(native.Root, "validate")) try root.validate() else {
-            try root.binding.validate();
-            try root.generation.validate();
-            try @import("lake_index_native_state.zig").validate(root.file_states, root.generation.domain);
-        }
-        const domain = if (@hasField(native.Root, "domain")) root.domain else root.generation.domain;
-        const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeGcReference;
-        if (!std.mem.eql(u8, &domain, &scope.domain)) return error.InvalidNativeLakeGcReference;
-        return root;
+        if (!current) return error.InvalidNativeLakeGcReference;
+        if (@hasDecl(native, "loadRootLazy")) return native.loadRootLazy(a, self.store, ref, self.cancellation(), null);
+        if (@hasDecl(native, "loadRootDirectory")) return native.loadRootDirectory(a, self.store, ref, self.cancellation(), null);
+        return native.loadRoot(a, self.store, ref, self.cancellation(), null);
     }
     fn markContributionIndex(self: *Collector, a: A, root: @import("../serverless/graph_segment/page_tree.zig").Ref) anyerror!void {
         const page_store = @import("../serverless/graph_segment/page_store.zig");
@@ -354,23 +331,14 @@ pub const Collector = struct {
             } else _ = try self.mark(segment);
         }
     }
-    pub fn markTextRootAuto(self: *Collector, a: A, ref: artifacts.ChunkRef) anyerror!void {
-        const fresh = try self.expand(ref, .text_root, "text_segment");
-        if (!fresh) return;
-        try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
-        const decoded = try @import("lake_index_native_text.zig").loadRootDirectoryAuto(a, self.store, ref, self.cancellation(), null);
-        try self.markTextRoot(a, decoded.root, decoded.metadata_version);
-    }
-    fn markTextRoot(self: *Collector, a: A, root: @import("lake_index_native_text.zig").Root, metadata_version: u16) anyerror!void {
+    fn markTextRoot(self: *Collector, a: A, root: @import("lake_index_native_text.zig").Root) anyerror!void {
         if (root.checkpoint_base) |base| {
             const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = base.artifact_id, .checksum = base.checksum, .byte_len = base.byte_len };
             if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
         }
-        if (root.serving orelse root.compacted) |serving| {
-            if (root.serving != null) {
-                const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = serving.artifact_id, .checksum = serving.checksum, .byte_len = serving.byte_len };
-                if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
-            } else if (self.progress) |progress| try progress.enqueue(.{ .text_root = serving }) else try self.markTextRootAuto(a, serving);
+        if (root.serving) |serving| {
+            const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = serving.artifact_id, .checksum = serving.checksum, .byte_len = serving.byte_len };
+            if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
         }
         try self.markPages(a, root.domain, root.checkpoint_removed_files, false);
         if (root.checkpoint_files) |files| {
@@ -388,7 +356,7 @@ pub const Collector = struct {
         try self.markPages(a, root.domain, root.serving_inventory, false);
         try self.markPages(a, root.domain, root.serving_routes, false);
         try self.markPages(a, root.domain, root.segment_files, false);
-        const paged_text_files = self.progress != null and root.inventory_version == 3 and metadata_version >= 11;
+        const paged_text_files = self.progress != null and root.inventory_version == 3;
         if (paged_text_files) {
             if (root.directories.files) |files| try self.progress.?.enqueue(.{ .page = .{ .ref = files, .ordered_rows = false, .text_files = .{ .seekable = root.seekable, .maintenance_only = root.serving != null } } });
         } else try self.markPages(a, root.domain, root.directories.files, false);
@@ -485,14 +453,14 @@ pub const Collector = struct {
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
             .text_segment => {
-                if (ref.metadata_version >= 1 and ref.metadata_version <= @import("lake_index_native_text.zig").metadata_version) {
+                if (@import("lake_index_native_text.zig").supportsBuildMetadata(ref.metadata_version)) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
-                    try self.markTextRoot(a, root, ref.metadata_version);
+                    try self.markTextRoot(a, root);
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
             .sparse_segment => {
-                if ((@import("lake_index_native_sparse.zig").supportsMetadata(ref.metadata_version) or ref.metadata_version == 1)) {
+                if ((@import("lake_index_native_sparse.zig").supportsMetadata(ref.metadata_version))) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_sparse.zig"), ref);
                     if (root.file_directory) |directory| try self.markNativeFiles(a, root.generation.domain, directory);
@@ -503,7 +471,7 @@ pub const Collector = struct {
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
             .vector_segment => {
-                if ((@import("lake_index_native_dense.zig").supportsMetadata(ref.metadata_version) or ref.metadata_version == 1)) {
+                if ((@import("lake_index_native_dense.zig").supportsMetadata(ref.metadata_version))) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_dense.zig"), ref);
                     if (root.file_directory) |directory| try self.markNativeFiles(a, root.generation.domain, directory);
@@ -652,6 +620,9 @@ test "external lake global frontier native GC retains shared aggregate blocks na
     nav_source.verified_files = null;
     nav_source.prepared_deletes = null;
     nav_source.scanner.iceberg_delete_plan = null;
+    // catalog() reads these; leaving them undefined is illegal behavior.
+    nav_source.selected_catalog_view = false;
+    nav_source.plan_lease = null;
     var nav_provider: @import("lake_index_row_source.zig").Provider = .{ .source = &nav_source, .context = .{ .io = std.testing.io } };
     const nav_old = try navigation_api.build(a, ca, &store, &nav_provider, null, .none);
     const nav_old_root = try navigation_api.load(ca, store, nav_old.ref, .none, null);

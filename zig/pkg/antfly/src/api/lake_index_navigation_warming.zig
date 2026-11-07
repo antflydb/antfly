@@ -33,6 +33,9 @@ pub const Cache = struct {
     pages: std.atomic.Value(u64) = .init(0),
     nanoseconds: std.atomic.Value(u64) = .init(0),
     active: [4]?[32]u8 = @splat(null),
+    // Retry history belongs to publications, independently of reusable lanes.
+    failed: [256]?struct { key: [32]u8, retry_ns: u64 } = @splat(null),
+    failed_next: usize = 0,
     mutex: std.atomic.Mutex = .unlocked,
     keys: [256]?[32]u8 = @splat(null),
     next: usize = 0,
@@ -40,9 +43,13 @@ pub const Cache = struct {
         return .{ .attempts = self.attempts.load(.monotonic), .failures = self.failures.load(.monotonic), .pages = self.pages.load(.monotonic), .nanoseconds = self.nanoseconds.load(.monotonic) };
     }
     fn begin(self: *Cache, key: [32]u8) !?usize {
+        return self.beginAt(key, @import("antfly_platform").time.monotonicNs());
+    }
+    fn beginAt(self: *Cache, key: [32]u8, now_ns: u64) !?usize {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         for (self.keys) |item| if (item) |old| if (std.mem.eql(u8, &old, &key)) return null;
+        for (self.failed) |item| if (item) |failure| if (std.mem.eql(u8, &failure.key, &key) and now_ns < failure.retry_ns) return null;
         for (self.active) |item| if (item) |old| if (std.mem.eql(u8, &old, &key)) return error.NavigationWarmupInProgress;
         for (&self.active, 0..) |*item, index| if (item.* == null) {
             item.* = key;
@@ -50,10 +57,28 @@ pub const Cache = struct {
         };
         return error.NavigationWarmupInProgress;
     }
-    fn finish(self: *Cache, slot: usize, key: [32]u8) void {
+    fn finish(self: *Cache, slot: usize, key: [32]u8, completed: bool) void {
+        self.finishAt(slot, key, completed, @import("antfly_platform").time.monotonicNs());
+    }
+    fn finishAt(self: *Cache, slot: usize, key: [32]u8, completed: bool, now_ns: u64) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         self.active[slot] = null;
+        if (!completed) {
+            const retry = now_ns +| 5 * std.time.ns_per_s;
+            for (&self.failed) |*item| if (item.*) |*failure| {
+                if (std.mem.eql(u8, &failure.key, &key)) {
+                    failure.retry_ns = retry;
+                    return;
+                }
+            };
+            self.failed[self.failed_next] = .{ .key = key, .retry_ns = retry };
+            self.failed_next = (self.failed_next + 1) % self.failed.len;
+            return;
+        }
+        for (&self.failed) |*item| if (item.*) |failure| {
+            if (std.mem.eql(u8, &failure.key, &key)) item.* = null;
+        };
         self.keys[self.next] = key;
         self.next = (self.next + 1) % self.keys.len;
     }
@@ -86,18 +111,13 @@ const PageWarm = struct {
         self.count += 1;
     }
     pub fn record(_: *PageWarm, _: []const u8, _: []const u8) !void {}
-    fn read(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, digest: [32]u8, token: Token, budget: *u64) ![]u8 {
-        const self: *PageWarm = @ptrCast(@alignCast(raw));
-        try self.cached.context.ensureActive();
-        try stores.chargeReadBudget(budget, length);
-        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, token, self.cached);
-    }
+
     fn run(self: *PageWarm) anyerror!void {
         try self.cached.context.ensureActive();
         var memory: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = page_workspace };
         var reads: u64 = tree.max_page_bytes;
         var writes: u64 = 0;
-        var pages: page_store.PageStore = .{ .domain = self.navigation.domain, .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .read_cache = .{ .ptr = self, .read = read } };
+        var pages: page_store.PageStore = .{ .domain = self.navigation.domain, .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .read_cache = @import("lake_index_navigation_pages.zig").cacheBinding(&self.cached) };
         try tree.walkPage(memory.allocator(), pages.store(), self.navigation.ref, self);
         try self.cached.context.ensureActive();
     }
@@ -162,7 +182,7 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
     defer store.deinit();
     if (!std.mem.eql(u8, &publication.signature.store, &store.identity)) return error.ExternalLakeIndexStoreChanged;
     var hash = std.crypto.hash.Blake3.init(.{});
-    hash.update(&store.identity);
+    hash.update(&store.cache_identity);
     var table_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &table_bytes, table.table_id, .little);
     hash.update(&table_bytes);
@@ -177,7 +197,8 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
     // Warming is best effort: readiness waits for a bounded attempt, not for
     // every page to become cached. Generation/read authority is checked again
     // by ordinary readiness and every query, independently of this hint.
-    defer server.lake_navigation_warming.finish(slot, key);
+    var completed = false;
+    defer server.lake_navigation_warming.finish(slot, key, completed);
     const started = @import("antfly_platform").time.monotonicNs();
     _ = server.lake_navigation_warming.attempts.fetchAdd(1, .monotonic);
     defer _ = server.lake_navigation_warming.nanoseconds.fetchAdd(@import("antfly_platform").time.monotonicNs() -| started, .monotonic);
@@ -188,8 +209,7 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
         fn canceled(raw: *const anyopaque) bool {
             const stop: *const @This() = @ptrCast(@alignCast(raw));
             if (stop.owner.index_installation_closing.load(.acquire)) return true;
-            stop.context.ensureActive() catch return true;
-            return false;
+            return stop.context.isCancellationRequested();
         }
     };
     var stop: Stop = .{ .owner = server, .context = try caller.platformDeadline() };
@@ -206,7 +226,7 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
     try server.prepareLakeCache();
     store.implementation.cloud_io = context.io;
     try store.bindPublication(publication, token);
-    const cached: artifacts.CachedRead = .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context };
+    const cached: artifacts.CachedRead = .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context };
     // Published metadata can hold only the directory reference. Read the small
     // authenticated declaration document; never expand maintenance contributions.
     const declarations = if (publication.directory != null and publication.declarations.len == 0) blk: {
@@ -255,6 +275,7 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
     }
     const pages = try warmRoots(store.artifactStore(), cached, roots[0..count], token);
     _ = server.lake_navigation_warming.pages.fetchAdd(pages, .monotonic);
+    completed = true;
 }
 
 test "external lake navigation warming coalesces readiness and bounds publication concurrency" {
@@ -262,9 +283,29 @@ test "external lake navigation warming coalesces readiness and bounds publicatio
     const key: [32]u8 = @splat(1);
     const slot = (try cache.begin(key)).?;
     try std.testing.expectError(error.NavigationWarmupInProgress, cache.begin(key));
-    cache.finish(slot, key);
+    cache.finish(slot, key, true);
     try std.testing.expect(try cache.begin(key) == null);
     for (2..6) |value| _ = (try cache.begin(@splat(@intCast(value)))).?;
     try std.testing.expectError(error.NavigationWarmupInProgress, cache.begin(@splat(6)));
     try std.testing.expect(cache.contains(key));
+}
+
+test "external lake navigation warming retries failed hints after bounded backoff" {
+    var cache: Cache = .{};
+    const key: [32]u8 = @splat(1);
+    const slot = (try cache.beginAt(key, 1)).?;
+    cache.finishAt(slot, key, false, 2);
+    try std.testing.expect(!cache.contains(key));
+    try std.testing.expect(try cache.beginAt(key, 3) == null);
+    const other: [32]u8 = @splat(2);
+    const reused = (try cache.beginAt(other, 3)).?;
+    try std.testing.expectEqual(slot, reused);
+    cache.finishAt(reused, other, false, 4);
+    // Reusing an execution slot cannot erase another publication's backoff.
+    try std.testing.expect(try cache.beginAt(key, 5) == null);
+    const retried = (try cache.beginAt(key, 2 + 5 * std.time.ns_per_s)).?;
+    cache.finishAt(retried, key, true, 3 + 5 * std.time.ns_per_s);
+    try std.testing.expect(cache.contains(key));
+    try std.testing.expect(try cache.beginAt(other, 3 + 5 * std.time.ns_per_s) == null);
+    try std.testing.expect(try cache.beginAt(key, 10 * std.time.ns_per_s) == null);
 }

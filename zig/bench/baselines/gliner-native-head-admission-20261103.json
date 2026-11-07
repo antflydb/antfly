@@ -1,0 +1,91 @@
+{
+  "date": "2026-11-03",
+  "scope": "Native shared-head scalar admission before encoder dispatch, exact cumulative NativeMath charging, and full-context learned head validation. No new throughput or GPU measurements.",
+  "source": {
+    "base_commit": "0b7801ce8a3037c10b83cd4c26f99133b5a1470b",
+    "files_sha256": {
+      "zig/pkg/inference/src/architectures/gliner/boundary_head.zig": "d547a8e5c803f96eb38799c317829bf0bd1f27a8b530448a05568709a1e9720d",
+      "zig/pkg/inference/src/extractors/gliner_boundary_executor.zig": "7299d97e435b59647217ad9f1ba8ca34deb2586450f469c4a24ee7fde33575d5",
+      "zig/pkg/inference/src/extractors/gliner_boundary_long_executor.zig": "2c89493725f66bc3a6de01b5f970461352c7e885ad0a4c0cd05a420e5b0914fd"
+    }
+  },
+  "behavior": {
+    "long_document_groups": "Check encoder and native head resource plans, shrinking physical groups on ResourceLimitExceeded before encoder dispatch.",
+    "single_native_inputs": "Check the same scalar head plan before encoding.",
+    "full_window_context_preserved": true,
+    "head_budget_bytes": 268435456,
+    "planner": "Exact cumulative NativeMath charges plus shared-pool scratch element checks; no allocations, tensor reads or backend dispatch.",
+    "runtime_guard": "Planner and runtime share checked byte charging. Debug forwardNative asserts exact equality between planned and observed charges.",
+    "cache": "Recheck current head limits on cached samples; recovery after a refused cache-hit admission is covered.",
+    "model_free_fixtures": "Geometry fixtures now use a supported shared head rather than training defaults with unsupported candidate/query attention."
+  },
+  "regression": {
+    "model": "Pinned fastino/gliner2.5-base-v1",
+    "requested_windows": 4,
+    "words_per_window": 4096,
+    "requested_batch": 4,
+    "admitted_batch": 2,
+    "admitted_head_bytes": 221478338,
+    "new_groups": 2,
+    "schema": "One concept entity with a description, exercising the expanded composed-window path.",
+    "pre_dispatch_refusal": "An impossible head cap returns ResourceLimitExceeded with an empty native weight store, before any encoder weight read. Both cached long-document and single-input planning are covered."
+  },
+  "learned_head_validation": {
+    "backend": "native",
+    "model": "Pinned fastino/gliner2.5-base-v1",
+    "weight_sha256": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+    "full_context": {
+      "batch": 2,
+      "text_words": 4096,
+      "queries": 1,
+      "planned_and_observed_charged_bytes": 221478338,
+      "input": "Zero pooled states; real published head weights. The full-context encoder was not executed by this head-only test."
+    },
+    "optional_paths": {
+      "combinations": 16,
+      "flags": [
+        "span content",
+        "record states",
+        "abstention",
+        "count head"
+      ],
+      "ragged_text_lengths": [
+        3,
+        1
+      ],
+      "padded_queries": 2,
+      "tight_budget": "Each learned forward uses exactly its planned intermediate byte limit."
+    },
+    "base_pipeline_reference_parity": "All inference-task fixtures in the pinned base pipeline parity test passed."
+  },
+  "validation": {
+    "optimize": "Debug",
+    "selected": 67,
+    "passed": 67,
+    "skipped": 0,
+    "log_sha256": "b32cbcf8482608a044a59d3a0969853df8b292c6e79deced1aee7c6ddbd60294",
+    "filters": [
+      "boundary qualification",
+      "native boundary head",
+      "gliner boundary pipeline Python parity pinned base",
+      "pipelines.gliner_boundary_processor.test.",
+      "pipelines.gliner_boundary_long_document.test."
+    ],
+    "coverage": [
+      "Four full-context windows are admitted in groups of two with unchanged window width.",
+      "A too-small head budget fails before encoder dispatch and successful admission recovers afterward.",
+      "Exact-byte budget boundary, shared-pool cap and overflow checks.",
+      "Learned full-context head execution at its exact planned budget.",
+      "All 16 optional head allocation paths match runtime charges.",
+      "Pinned base all-task pipeline reference parity.",
+      "Existing token/fragment fitting, cache reuse, cancellation, work accounting and allocation-failure checks."
+    ]
+  },
+  "reproduce": {
+    "environment": {
+      "ANTFLY_GLINER25_BASE_MODEL_DIR": "Path to pinned fastino/gliner2.5-base-v1."
+    },
+    "command_from_zig": "ZIG_GLOBAL_CACHE_DIR=\"$PWD/../.zig-cache/global\" zig build inference-test -Doptimize=debug -j1 --cache-dir ../.zig-cache -Dtest-filter=\"boundary qualification\" -Dtest-filter=\"native boundary head\" -Dtest-filter=\"gliner boundary pipeline Python parity pinned base\" -Dtest-filter=pipelines.gliner_boundary_processor.test. -Dtest-filter=pipelines.gliner_boundary_long_document.test."
+  },
+  "limits": "This change preflights the native shared head. Task decoders retain their independent resource limits. GPU execution, optimized service performance and repository-wide aggregate CI are separate qualification."
+}

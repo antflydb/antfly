@@ -4594,3 +4594,35 @@ test "metadata durable job facade preserves state owner counts and bounded scan 
     try std.testing.expectEqual(limit, try store.getJobOwnerCount(a, 41, "alice"));
     try std.testing.expectError(error.TooManyActiveJobs, error_identity.statusToError(error_identity.statusFromError(error.TooManyActiveJobs)));
 }
+
+test "privacy indexed metadata reads cross the compiled owner boundary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = root, .no_sync = true });
+    defer store.deinit();
+    const group = 7302;
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    resource.coverage.retry_after_millis = 20;
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 100) == null);
+    try std.testing.expect(try store.tableByName(a, group, "private") == null);
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 50, .name = "private", .indexes_json = try privacy.install(a, "{}", resource) } });
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 19) == null);
+    try std.testing.expectEqualStrings("private", (try store.nextPrivacyTable(a, group, 20)).?.name);
+    const before = (try store.tableByName(a, group, "private")).?;
+    resource.coverage.retry_after_millis = 200;
+    var replacement = before;
+    replacement.indexes_json = try privacy.replaceResource(a, before.indexes_json, resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = replacement } });
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 100) == null);
+    try store.rebuildDerivedCatalogIndexes(group);
+    try std.testing.expectEqual(@as(u64, 50), (try store.nextPrivacyTable(a, group, 200)).?.table_id);
+    const fence = try store.getTableTransitionFence(group, 50);
+    try store.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = 50, .expected_transition_generation = fence.generation } });
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 1000) == null);
+    try std.testing.expect(try store.tableByName(a, group, "private") == null);
+}

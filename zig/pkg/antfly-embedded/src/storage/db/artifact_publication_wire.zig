@@ -27,6 +27,7 @@ const Wire = struct {
     catalog_digest: publication.Digest,
     producer_name: []const u8,
     producer_generation: u64,
+    execution_identity: ?publication.Digest = null,
     producer_artifact_name: []const u8 = "",
     producer_scope_key: []const u8 = "",
     sources: []const publication.Source,
@@ -44,8 +45,23 @@ comptime {
     if (@typeInfo(Wire).@"struct".field_names.len != @typeInfo(publication.Command).@"struct".field_names.len) @compileError("update publication wire projection");
 }
 pub fn write(command: publication.Command, stream: anytype) @TypeOf(stream.*).Error!void {
+    return writeMode(command, stream, false);
+}
+
+/// Batch transport accepts UTF-8 identities as strings while retaining byte
+/// arrays for arbitrary binary keys. The canonical writer remains unchanged.
+pub fn writeCompact(command: publication.Command, stream: anytype) @TypeOf(stream.*).Error!void {
+    return writeMode(command, stream, true);
+}
+
+fn writeMode(command: publication.Command, stream: anytype, comptime compact: bool) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
+    if (command.execution_identity) |identity| {
+        try stream.objectField("execution_identity");
+        try binary.write(identity, stream);
+    }
     inline for (comptime std.meta.fieldNames(publication.Command)) |reflected_name| {
+        if (comptime std.mem.eql(u8, reflected_name, "execution_identity")) continue;
         try stream.objectField(reflected_name);
         if (comptime std.mem.eql(u8, reflected_name, "mutations")) {
             try stream.beginArray();
@@ -54,7 +70,7 @@ pub fn write(command: publication.Command, stream: anytype) @TypeOf(stream.*).Er
                 try stream.objectField("family");
                 try stream.write(@tagName(effect.family));
                 try stream.objectField("key");
-                try binary.write(effect.key, stream);
+                if (comptime compact) try binary.writeCompact(effect.key, stream) else try binary.write(effect.key, stream);
                 try stream.objectField("source_index");
                 try stream.write(effect.source_index);
                 try stream.objectField("value_base64");
@@ -74,7 +90,7 @@ pub fn write(command: publication.Command, stream: anytype) @TypeOf(stream.*).Er
                 try stream.endObject();
             }
             try stream.endArray();
-        } else try binary.write(@field(command, reflected_name), stream);
+        } else if (comptime compact) try binary.writeCompact(@field(command, reflected_name), stream) else try binary.write(@field(command, reflected_name), stream);
     }
     try stream.endObject();
 }
@@ -88,19 +104,20 @@ fn fromWire(alloc: std.mem.Allocator, wire: Wire) std.json.ParseFromValueError!p
     if (wire.sources.len > publication.max_source_documents or wire.artifact_sources.len > publication.max_source_documents or wire.mutations.len > publication.max_mutations) return error.LengthMismatch;
     if (wire.mutation_preconditions.len > publication.max_source_documents - wire.artifact_sources.len) return error.LengthMismatch;
     var remaining: usize = publication.max_payload_bytes;
+    var identities: usize = publication.max_identity_bytes;
     if (wire.baseline) |page| page.validate() catch return error.LengthMismatch;
     if (wire.validation) |page| page.validate() catch return error.LengthMismatch;
     if (wire.census) |page| page.validate() catch return error.LengthMismatch;
     if (wire.completion) |page| page.validate() catch return error.LengthMismatch;
-    remaining = std.math.sub(usize, remaining, wire.producer_name.len) catch return error.LengthMismatch;
-    remaining = std.math.sub(usize, remaining, wire.producer_artifact_name.len) catch return error.LengthMismatch;
-    remaining = std.math.sub(usize, remaining, wire.producer_scope_key.len) catch return error.LengthMismatch;
-    for (wire.sources) |source| remaining = std.math.sub(usize, remaining, source.document_key.len) catch return error.LengthMismatch;
-    for (wire.artifact_sources) |source| remaining = std.math.sub(usize, remaining, source.key.len) catch return error.LengthMismatch;
-    for (wire.mutation_preconditions) |source| remaining = std.math.sub(usize, remaining, source.key.len) catch return error.LengthMismatch;
+    identities = std.math.sub(usize, identities, wire.producer_name.len) catch return error.LengthMismatch;
+    identities = std.math.sub(usize, identities, wire.producer_artifact_name.len) catch return error.LengthMismatch;
+    identities = std.math.sub(usize, identities, wire.producer_scope_key.len) catch return error.LengthMismatch;
+    for (wire.sources) |source| identities = std.math.sub(usize, identities, source.document_key.len) catch return error.LengthMismatch;
+    for (wire.artifact_sources) |source| identities = std.math.sub(usize, identities, source.key.len) catch return error.LengthMismatch;
+    for (wire.mutation_preconditions) |source| identities = std.math.sub(usize, identities, source.key.len) catch return error.LengthMismatch;
     const effects = try alloc.alloc(publication.Mutation, wire.mutations.len);
     for (wire.mutations, effects) |effect, *out| {
-        remaining = std.math.sub(usize, remaining, effect.key.len) catch return error.LengthMismatch;
+        identities = std.math.sub(usize, identities, effect.key.len) catch return error.LengthMismatch;
         out.* = .{ .family = effect.family, .key = effect.key, .source_index = effect.source_index, .value = null };
         if (effect.value_base64) |encoded| {
             if (encoded.len > std.base64.standard.Encoder.calcSize(remaining)) return error.LengthMismatch;
@@ -359,4 +376,26 @@ test "ordered artifact inventory baseline control binds binary cursors rows and 
     changed.mode = .publish;
     changed.publication_digest = changed.digest();
     try std.testing.expectError(error.InvalidBatchRequest, changed.validate(alloc));
+}
+
+test "privacy batch publication transport keeps large UTF8 identities compact and binary identities exact" {
+    const a = std.testing.allocator;
+    const batch = @import("../../api/batch.zig");
+    const document = try a.alloc(u8, 1_100_000);
+    defer a.free(document);
+    @memset(document, 'x');
+    for ([_][]const u8{ document, "doc\x00\xff" }) |key| {
+        var command: publication.Command = .{ .mode = .complete_streams, .namespace = @splat(1), .authority_epoch = 2, .catalog_digest = @splat(3), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0), .completion = .{ .document_key = key, .visits = 3, .bytes = 4096, .before = @splat(4), .after = @splat(5) } };
+        command.publication_digest = command.digest();
+        for ([_]bool{ false, true }) |owner| {
+            const request = @import("types.zig").BatchRequest{ .artifact_publication = command };
+            const encoded = if (owner) try batch.encodeOwnerBatchRequest(a, request) else try batch.encodeBatchRequest(a, request);
+            defer a.free(encoded);
+            try std.testing.expect(encoded.len < key.len + 8192);
+            var parsed = try batch.parseInternalBatchRequest(a, encoded);
+            defer parsed.deinit(a);
+            try std.testing.expectEqualSlices(u8, key, parsed.req.artifact_publication.?.completion.?.document_key);
+            try std.testing.expectEqualSlices(u8, &command.publication_digest, &parsed.req.artifact_publication.?.publication_digest);
+        }
+    }
 }

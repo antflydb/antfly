@@ -304,7 +304,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     try contribution_index.init(a, scoped, previous_root, cancellation);
     const previous_ownership = if (current.value.published) |previous| previous.contribution_ownership_version else 0;
     contribution_index.counted = true;
-    contribution_index.migrating = previous_root != null and previous_ownership == 0;
+    if (previous_root != null and previous_ownership != 1) return error.InvalidLakeIndexCatalog;
     contribution_index.prior_roots = if (previous_root != null and previous_ownership == 1) current.value.published.?.contribution_roots else &.{};
     defer contribution_index.deinit();
     if (prior_navigation) |prior| {
@@ -398,7 +398,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
             const root = if (previous.contribution_index) |bytes| try std.json.parseFromSliceLeaky(@import("../serverless/graph_segment/page_tree.zig").Ref, na, bytes, .{}) else null;
             try contribution_index.init(a, scoped, root, cancellation);
             contribution_index.counted = true;
-            contribution_index.migrating = root != null and previous.contribution_ownership_version == 0;
+            if (root != null and previous.contribution_ownership_version != 1) return error.InvalidLakeIndexCatalog;
             contribution_index.prior_roots = previous.contribution_roots;
             // Bind each reduction to its original authenticated input census.
             // Retained aggregates can legitimately own different older cuts.

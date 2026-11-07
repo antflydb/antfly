@@ -35,8 +35,9 @@ typedef enum antfly_error_code {
     ANTFLY_INTENT_CONFLICT = 4,
     ANTFLY_TXN_NOT_FOUND = 5,
     ANTFLY_BUSY = 6,
-    /* The operation crossed its publication point, but crash durability could
-     * not be confirmed. Inspect the destination; do not retry automatically. */
+    /* The operation may have taken effect: it was published but crash
+     * durability could not be confirmed, or a failure left it unknown whether
+     * it applied. Inspect the affected data; do not retry automatically. */
     ANTFLY_OUTCOME_UNKNOWN = 7,
     /* The operation requires a capability unavailable on this platform or
      * filesystem. Retrying unchanged will not succeed. */
@@ -62,9 +63,11 @@ typedef enum antfly_error_code {
  * - Functions return ANTFLY_OK on success. Any other antfly_error_code is an
  *   error and should be handled with the stable strings returned by
  *   antfly_error_code_name and antfly_error_code_description.
- * - ANTFLY_OUTCOME_UNKNOWN is not safe to retry automatically: publication
- *   completed in the running process, but crash durability was not confirmed.
- *   Inspect the caller-supplied destination before deciding how to proceed.
+ * - ANTFLY_OUTCOME_UNKNOWN is not safe to retry automatically: the operation
+ *   may have taken effect. Either it was published in the running process but
+ *   crash durability was not confirmed, or a failure left it unknown whether
+ *   it applied. Inspect the affected data (or the caller-supplied destination)
+ *   before deciding how to proceed.
  * - ANTFLY_UNSUPPORTED is not transient. For file restore operations it can
  *   mean the source filesystem lacks required advisory locking; copy the
  *   archive to a supported local filesystem before retrying.
@@ -417,6 +420,50 @@ antfly_error_code antfly_db_batch_json(
     antfly_slice request_json,
     antfly_buffer *out
 );
+/*
+ * Outcome receipts. When an autocommit SQL write or a batch export returns
+ * ANTFLY_OUTCOME_UNKNOWN, antfly_last_error_outcome_receipt (same thread,
+ * before another call) returns a receipt string; SQL error bodies also carry
+ * it as "outcome_receipt". antfly_db_outcome_receipt_status later resolves it
+ * on any handle for the same database: *out_status is
+ * ANTFLY_OUTCOME_RECEIPT_APPLIED or ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED.
+ * It returns ANTFLY_STALLED until the uncertain commit is reconciled: a Lite
+ * connection reconciles on its next call; a directory database must first be
+ * closed by the handle that issued the receipt and reopened. Forget a receipt
+ * once resolved; afterwards it can no longer be resolved.
+ */
+#define ANTFLY_OUTCOME_RECEIPT_APPLIED 1
+#define ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED 2
+antfly_error_code antfly_last_error_outcome_receipt(antfly_buffer *out);
+/* antfly_db_batch_json that also returns the receipt (only on
+ * ANTFLY_OUTCOME_UNKNOWN) in receipt_out, for bindings whose consecutive calls
+ * may run on different threads. The caller frees receipt_out. */
+antfly_error_code antfly_db_batch_json_with_receipt(
+    antfly_db *db,
+    antfly_slice request_json,
+    antfly_buffer *out,
+    antfly_buffer *receipt_out
+);
+/* antfly_db_batch with the same-call receipt, as above. */
+antfly_error_code antfly_db_batch_with_receipt(
+    antfly_db *db,
+    const antfly_write_intent *writes,
+    size_t write_count,
+    const antfly_version_predicate *predicates,
+    size_t predicate_count,
+    uint64_t timestamp_ns,
+    uint8_t sync_level,
+    antfly_buffer *receipt_out
+);
+antfly_error_code antfly_db_outcome_receipt_status(
+    antfly_db *db,
+    antfly_slice receipt,
+    uint8_t *out_status
+);
+antfly_error_code antfly_db_outcome_receipt_forget(
+    antfly_db *db,
+    antfly_slice receipt
+);
 antfly_error_code antfly_db_begin_transaction_with_id(
     antfly_db *db,
     const uint8_t (*txn_id)[16],
@@ -688,8 +735,8 @@ antfly_error_code antfly_db_match_pattern_json(antfly_db *db, antfly_slice reque
  * use and stay cached until the handle closes. Each call takes the request
  * JSON and returns the response JSON of the matching /ai/v1 route of the
  * Antfly inference HTTP API (see specs/openapi/inference/api.yaml): embed,
- * rerank, chunk, generate, generate/batch, rewrite, decide, extract, read (OCR),
- * transcribe, and models. Binary inputs such as images and audio are passed inline, as base64
+ * rerank, chunk, generate, generate/batch, rewrite, decide, extract, read (images, documents, audio),
+ * and models. Binary inputs such as images and audio are passed inline, as base64
  * or data: URIs. The _json calls return complete responses: a generate
  * request with "stream": true fails with ANTFLY_INVALID_ARGUMENT; use
  * antfly_inference_generate_stream_json to stream.
@@ -783,7 +830,6 @@ antfly_error_code antfly_inference_rewrite_json(antfly_inference *inference, ant
 antfly_error_code antfly_inference_decide_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_extract_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_read_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
-antfly_error_code antfly_inference_transcribe_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 /* The installed models, as returned by GET /ai/v1/models. */
 antfly_error_code antfly_inference_list_models_json(antfly_inference *inference, antfly_buffer *out);
 

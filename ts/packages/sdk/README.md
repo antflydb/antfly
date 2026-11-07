@@ -458,3 +458,36 @@ Unsafe integer numbers are rejected because their original value is already lost
 `parseMemoryJSON` and `stringifyMemoryJSON` provide the same codec for external
 persistence or logging. The ordinary `client.api` surface retains its existing
 number types; native memory endpoints live on `client.memoryApi`.
+
+## Optional source management
+
+Import from `@antfly/sdk/sources`. The explicit base URL points to the Go source
+server or Colony's instance-scoped management mount, not the database listener.
+
+```typescript
+import { SourcesClient } from "@antfly/sdk/sources";
+const sources = new SourcesClient({
+  baseUrl: "https://sources.example.com/sources/v1",
+  token: sourceManagementToken,
+});
+const run = await sources.startRun(sourceId, submissionKey);
+const receipt = await sources.run(sourceId, run.id);
+```
+
+Reuse a submission key after an ambiguous response; use a new key for new work.
+Inspect both execution state and publication outcome. Provider credentials and
+media delivery stay in the selected runtime. `StandaloneSourcesClient` exposes
+standalone-only credential installation and legacy whole-profile operations.
+
+## Kysely
+
+The optional `@antfly/sdk/kysely` subpath includes `createAntflyPostgres`, which
+owns the server pool, parser policy, scoped introspection/type generation, and
+migration lifecycle. Named databases, ordered namespace lookup, qualified table
+types, and migration history in separate schemas follow Antfly's native catalog.
+
+Low-level dialect, introspection, type generation, bootstrap, and exact NUMERIC
+parser/cursor helpers remain available, alongside `antflySearch` for embedded
+SQL search composition. Install Kysely 0.29.6+ separately. See the
+[Kysely reference](docs/kysely.md) for setup, scopes, migrations, integer mappings,
+and native backend capabilities.

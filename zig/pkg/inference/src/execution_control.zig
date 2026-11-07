@@ -125,6 +125,17 @@ pub const UninterruptibleGuard = struct {
 /// monotonic clock domain. The legacy check hook is retained so existing
 /// callers can migrate without weakening cancellation coverage.
 pub const InferenceExecutionControl = struct {
+    /// False only for Node-owned startup/offline work with no request waiter.
+    request_owned: bool = true,
+    /// Verified selection carried by value through async admission/loading.
+    model_selection: ?@import("registry/model_selection.zig").Constraint = null,
+    /// The HTTP route owns a request slot; audio leaves reserve only work units.
+    /// Internal execution policy, never decoded from a public request.
+    http_request_admitted: bool = false,
+    /// Trusted document orchestration pin; never decoded from public input.
+    audio_execution: ?@import("documents/audio.zig").ExecutionSnapshot = null,
+    /// Trusted document allowance, consumed by every Whisper decode attempt.
+    audio_output_token_limit: ?usize = null,
     document_store: @import("antfly_runtime_abi").document_abi.View = .{},
     document_session: ?*@import("antfly_document_runs").Session = null,
     document_dispatch_meter: ?*@import("antfly_document_runs").DispatchMeter = null,
@@ -147,6 +158,16 @@ pub const InferenceExecutionControl = struct {
     /// A cancelled request may finish an in-flight native call before the
     /// watchdog replaces the worker. Checks outside native calls stay immediate.
     cancellation_grace_ns: ?u64 = null,
+
+    /// Request-owned readers can construct sessions outside ModelManager.
+    /// Their outer acquisition must preserve the same selected publication.
+    pub fn verifyModelSelection(self: InferenceExecutionControl, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+        try self.check();
+        if (self.model_selection) |selected| {
+            const publication = try @import("registry/managed_receipt.zig").publicationGeneration(allocator, io, path);
+            if (!selected.matches(path) or !std.meta.eql(selected.publication, publication)) return error.ModelArtifactsChanging;
+        }
+    }
 
     /// Borrow this control for structured image work. The caller must retain
     /// it until all preprocessing workers have joined.

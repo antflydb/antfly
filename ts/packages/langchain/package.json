@@ -57,6 +57,10 @@
     "url": "git+https://github.com/antflydb/antfly.git",
     "directory": "ts/packages/langchain"
   },
+  "homepage": "https://github.com/antflydb/antfly/tree/main/ts/packages/langchain#readme",
+  "bugs": {
+    "url": "https://github.com/antflydb/antfly/issues"
+  },
   "publishConfig": {
     "access": "public"
   }

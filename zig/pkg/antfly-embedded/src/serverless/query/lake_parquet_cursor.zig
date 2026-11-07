@@ -32,6 +32,7 @@ pub const Cursor = struct {
     limits: parquet.MaterializationLimits,
     columns: []Column,
     position: u64 = 0,
+    row_end: ?u64 = null,
     selected: []const bool = &.{},
     selected_values_decoded: usize = 0,
     encoded_predicate_pages: usize = 0,
@@ -758,12 +759,12 @@ pub const Cursor = struct {
         return @as(usize, fetched.parsed.header.uncompressed_page_size) *| 2 +|
             @as(usize, fetched.parsed.header.value_count) *| 32 +| 64 * 1024;
     }
-    fn submitDecode(self: *Cursor, io: std.Io, changed: *std.Io.Event, column: *Column, fetched: Fetched) ?Scheduler.Task(anyerror!DecodedStep) {
+    fn submitDecode(self: *Cursor, io: std.Io, changed: *Scheduler.Completion, column: *Column, fetched: Fetched) ?Scheduler.Task(anyerror!DecodedStep) {
         const scheduler = self.scheduler orelse Scheduler.global();
         if (self.speculative) return scheduler.submitNotifiedWithIoReserve(io, decodeWorkspace(fetched), changed, decodeWorker, .{ self.*, column, fetched });
         return scheduler.submitNotified(io, decodeWorkspace(fetched), changed, decodeWorker, .{ self.*, column, fetched });
     }
-    fn queueDecode(self: *Cursor, io: std.Io, changed: *std.Io.Event, slot: *?Pending, column: *Column, fetched: Fetched) !bool {
+    fn queueDecode(self: *Cursor, io: std.Io, changed: *Scheduler.Completion, slot: *?Pending, column: *Column, fetched: Fetched) !bool {
         if (self.submitDecode(io, changed, column, fetched)) |task| {
             slot.* = .{ .decode = .{ .task = task, .input = fetched } };
             return false;
@@ -837,7 +838,7 @@ pub const Cursor = struct {
         }
         var pending: [4]?Pending = @splat(null);
         var columns: [4]?*Column = @splat(null);
-        var changed: std.Io.Event = .unset;
+        var changed: Scheduler.Completion = .{};
         // Cancel and join before releasing any request metadata. A finished
         // but unjoined fetch still owns its input credit and must be drained.
         defer for (&pending) |*slot| if (slot.*) |*task| {
@@ -859,7 +860,8 @@ pub const Cursor = struct {
         };
         var next_column: usize = 0;
         while (true) {
-            changed.reset();
+            if (self.shared_reader) |reader| try reader.context.ensureActive();
+            const observed = changed.observe();
             var active_count: usize = 0;
             var progressed = false;
             for (&pending, &columns) |*slot, *column_slot| {
@@ -989,7 +991,7 @@ pub const Cursor = struct {
                 }
                 break;
             }
-            if (!progressed) try changed.wait(io.?);
+            if (!progressed) try changed.waitChecked(io.?, observed, self.shared_reader.?.context);
         }
         for (self.columns) |*column| if (!required_only or column.required) {
             column.consumed = @intCast(self.position - column.first);
@@ -1036,11 +1038,12 @@ pub const Cursor = struct {
         return .{ .snapshot = binding.snapshot(), .external_span = .{ .first = first.external, .count = count }, .columns = vectors.items };
     }
     pub fn next(self: *Cursor) !?types.ColumnBatch {
-        while (self.position < self.group.row_count) {
+        const end = @min(self.group.row_count, self.row_end orelse self.group.row_count);
+        while (self.position < end) {
             _ = self.output.reset(.free_all);
             self.selected = &.{};
             if (self.columns.len == 0) {
-                const count: usize = @intCast(@min(@as(u64, 4096), self.group.row_count - self.position));
+                const count: usize = @intCast(@min(@as(u64, 4096), end - self.position));
                 const result = try self.batch(count, false);
                 self.position += count;
                 if (self.filter) |filter| if (!try filter.any_match(filter.ptr, result)) continue;
@@ -1048,7 +1051,7 @@ pub const Cursor = struct {
             }
             if (self.filter) |filter| {
                 try self.advanceColumns(true);
-                var count: usize = 4096;
+                var count: usize = @intCast(@min(@as(u64, 4096), end - self.position));
                 for (self.columns) |column| if (column.required) {
                     count = @min(count, column.count - column.consumed);
                 };
@@ -1076,7 +1079,7 @@ pub const Cursor = struct {
                 }
             }
             try self.advanceColumns(false);
-            var count: usize = 4096;
+            var count: usize = @intCast(@min(@as(u64, 4096), end - self.position));
             for (self.columns) |column| count = @min(count, column.count - column.consumed);
             if (count == 0 or self.columns.len == 0) return error.InvalidParquetPage;
             const result = try self.batch(count, false);

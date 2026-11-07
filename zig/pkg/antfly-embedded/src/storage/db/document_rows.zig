@@ -33,6 +33,7 @@ const View = Types.view;
 pub const Session = Implementation;
 
 pub const Implementation = struct {
+    privacy: ?Source.privacy_read.PolicySnapshot = null,
     row_policy_lease: ?Source.row_policy_gate.Gate.Lease = null,
     range_proofs: ?[]const Types.range_protection.Proof = null,
     alloc: std.mem.Allocator,
@@ -165,6 +166,7 @@ pub const Implementation = struct {
     /// does not implement a second defaults/coercion/generated-value engine.
     /// All output belongs to the bounded caller arena.
     pub fn normalizeRows(self: *Implementation, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
+        if (self.privacy) |policy| if (policy.prepared.policy.mode != .monitor) return error.UnsupportedSqlExecution;
         if (writes.len > 4096) return error.InvalidArgument;
         const result = try alloc.alloc(types.BatchWrite, writes.len);
         // Parse/validator scratch is row-local, not retained for the batch.
@@ -273,7 +275,8 @@ pub const Implementation = struct {
                     }
                     break :version 0;
                 };
-                const root = try std.json.parseFromSliceLeaky(std.json.Value, temporary, bytes, .{ .parse_numbers = false });
+                const visible = if (session.privacy) |policy| try Source.privacy_read.project(temporary, policy, key, bytes, &session.txn) else bytes;
+                const root = try std.json.parseFromSliceLeaky(std.json.Value, temporary, visible, .{ .parse_numbers = false });
                 if (session.filter) |*filter| if (!try filter.matchesJson(temporary, key, root)) return .@"continue";
                 if (session.conditions.len != 0) {
                     const condition_row = try session.condition_projection.projectValue(temporary, key, 0, root);

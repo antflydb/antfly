@@ -596,6 +596,10 @@ pub const ServingSource = struct {
     }
     fn openCachedMode(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: ?*@import("lake_serving_cache.zig").Cache, lazy: bool, navigation: ?SnapshotNavigation) !ServingSource {
         try context.ensureActive();
+        // Native cache scopes bind credential identity below. Hosted callers
+        // keep decode state private and may cache immutable bytes in the host,
+        // where physical bucket bindings can be scoped explicitly.
+        if (comptime @import("builtin").os.tag == .freestanding) if (cache != null) return error.UnsupportedHostedLakeCache;
         const binding = (schema.external_base_source orelse return error.InvalidExternalTableBinding).binding;
         const identity_version = options.row_identity_version orelse binding.row_identity_version;
         var store = try options.open(alloc, binding);
@@ -1179,6 +1183,15 @@ pub const ServingSource = struct {
     }
 
     fn cacheScope(alloc: std.mem.Allocator, store: object_store_support.OpenedObjectStore, binding: @import("../external_source/catalog_binding.zig").Binding) ![32]u8 {
+        if (comptime @import("builtin").os.tag == .freestanding) {
+            // Hosted sources use invocation-private caches. The binding resolver
+            // admits the physical client; native credential SDKs are absent.
+            const bytes = try std.json.Stringify.valueAlloc(alloc, .{ binding, store.bucket, store.prefix }, .{});
+            defer alloc.free(bytes);
+            var scope: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &scope, .{});
+            return scope;
+        }
         const scope_bytes = try std.json.Stringify.valueAlloc(alloc, .{
             .credentials = binding.credential_ref,
             .source_id = binding.table_id,
@@ -1215,9 +1228,30 @@ pub const ServingSource = struct {
         }
         return parent;
     }
+    fn bindingIdentity(alloc: std.mem.Allocator, store: object_store_support.OpenedObjectStore, binding: @import("../external_source/catalog_binding.zig").Binding) ![32]u8 {
+        // Persist configured authority and physical location, not a transient
+        // bearer/session token. cacheScope remains credential-material scoped.
+        const bytes = try std.json.Stringify.valueAlloc(alloc, .{
+            .format = "lake-source-authority-v2",
+            .credentials = binding.credential_ref,
+            .source_id = binding.table_id,
+            .source_uri = binding.source_uri,
+            .bucket = store.bucket,
+            .prefix = store.prefix,
+            .filesystem_root = if (store.fs_client) |fs| @as(?[]const u8, fs.root_dir) else null,
+            .s3_endpoint = if (store.s3_client) |s3| @as(?[]const u8, s3.cfg.credentials.endpoint) else null,
+            .s3_region = if (store.s3_client) |s3| @as(?[]const u8, s3.cfg.credentials.region) else null,
+            .s3_ssl = if (store.s3_client) |s3| @as(?bool, s3.cfg.credentials.use_ssl) else null,
+            .gcs_endpoint = if (store.gcs_client) |gcs| @as(?[]const u8, gcs.cfg.endpoint) else null,
+        }, .{});
+        defer alloc.free(bytes);
+        var identity: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &identity, .{});
+        return identity;
+    }
     pub fn credentialIdentity(self: *ServingSource, binding: @import("../external_source/catalog_binding.zig").Binding) ![32]u8 {
         try self.validateBinding(binding);
-        return cacheScope(self.alloc, self.store, binding);
+        return bindingIdentity(self.alloc, self.store, binding);
     }
     pub fn attachCache(self: *ServingSource, cache: *@import("lake_serving_cache.zig").Cache, binding: @import("../external_source/catalog_binding.zig").Binding, context: @import("lake_read_context.zig").Context) !void {
         const reader = try self.alloc.create(@import("lake_serving_cache.zig").Reader);
@@ -1506,4 +1540,21 @@ test "external lake metadata navigation full scans share frozen plans and empty 
     try private.ensureInventory(.{});
     try private.ownInventory();
     try std.testing.checkAllAllocationFailures(a, Fixture.checked, .{ memory.client(), &constrained, metadata });
+}
+
+test "external lake native source binding survives token refresh without crossing cache authority" {
+    const a = std.testing.allocator;
+    var first = try object_store_support.OpenedObjectStore.initGcsUriWithBearerTokenAndOptions(a, "bucket", "source", "test-token-before", .{ .ensure_bucket = false });
+    defer first.deinit();
+    var next = try object_store_support.OpenedObjectStore.initGcsUriWithBearerTokenAndOptions(a, "bucket", "source", "test-token-after", .{ .ensure_bucket = false });
+    defer next.deinit();
+    const Binding = @import("../external_source/catalog_binding.zig").Binding;
+    const binding: Binding = .{ .table_id = "hn", .format = .parquet, .source_uri = "gs://bucket/source/archive", .schema_fingerprint = "schema", .credential_ref = .{ .ref_id = "lake" } };
+    try std.testing.expectEqual(try ServingSource.bindingIdentity(a, first, binding), try ServingSource.bindingIdentity(a, next, binding));
+    const first_cache = try ServingSource.cacheScope(a, first, binding);
+    const next_cache = try ServingSource.cacheScope(a, next, binding);
+    try std.testing.expect(!std.mem.eql(u8, &first_cache, &next_cache));
+    var changed = binding;
+    changed.credential_ref = .{ .ref_id = "other-policy" };
+    try std.testing.expect(!std.mem.eql(u8, &try ServingSource.bindingIdentity(a, first, binding), &try ServingSource.bindingIdentity(a, next, changed)));
 }

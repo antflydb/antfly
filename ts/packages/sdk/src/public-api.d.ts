@@ -4,6 +4,107 @@
  */
 
 export interface paths {
+    "/db/v1/tables/{tableName}/privacy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** Read table privacy policy and coverage */
+        get: operations["getTablePrivacy"];
+        /** Apply table privacy policy */
+        put: operations["putTablePrivacy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/privacy/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Inspect a bounded sample without saving the policy */
+        post: operations["previewTablePrivacy"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/privacy/scans": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Start a durable privacy rescan */
+        post: operations["startTablePrivacyScan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/privacy/scans/{scanId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                scanId: string;
+            };
+            cookie?: never;
+        };
+        /** Read privacy scan progress */
+        get: operations["getTablePrivacyScan"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/privacy/findings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** List current privacy findings */
+        get: operations["listTablePrivacyFindings"];
+        put?: never;
+        /**
+         * List current privacy findings with body filters
+         * @description Equivalent to GET findings, with filters and continuation in JSON so large document identifiers do not exceed URL limits.
+         */
+        post: operations["queryTablePrivacyFindings"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/lake/catalog": {
         parameters: {
             query?: never;
@@ -4364,6 +4465,117 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** Read table privacy policy and coverage */
+        get: operations["getNamespaceTablePrivacy"];
+        /** Apply table privacy policy */
+        put: operations["putNamespaceTablePrivacy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Inspect a bounded sample without saving the policy */
+        post: operations["previewNamespaceTablePrivacy"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Start a durable privacy rescan */
+        post: operations["startNamespaceTablePrivacyScan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans/{scanId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                scanId: string;
+            };
+            cookie?: never;
+        };
+        /** Read privacy scan progress */
+        get: operations["getNamespaceTablePrivacyScan"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/findings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** List current privacy findings */
+        get: operations["listNamespaceTablePrivacyFindings"];
+        put?: never;
+        /**
+         * List current privacy findings with body filters
+         * @description Equivalent to GET findings, with filters and continuation in JSON so large document identifiers do not exceed URL limits.
+         */
+        post: operations["queryNamespaceTablePrivacyFindings"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/v1/me": {
         parameters: {
             query?: never;
@@ -5136,8 +5348,12 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Read text from images (OCR/document understanding)
+         * Read text from images, documents, or audio
          * @description Reads text from images and documents with a local reader model. OCR and document-reading tasks can also run on a vision-capable generator or a connected provider.
+         *
+         *     Audio input dispatches to Whisper ASR or an audio-capable generator such as Gemma 4 using the same document service and read envelope. Whisper supports language control, timestamps, diarization and long-recording windowing. Gemma supports recordings up to 30 seconds and rejects unsupported audio options. Supported video
+         *     containers are transcribed from their audio track. Results report truncation;
+         *     generated text does not imply word alignment or speaker identification.
          *
          *     ## Models
          *
@@ -5181,61 +5397,6 @@ export interface paths {
          *     execution, and rejects malformed or unsupported parts before dispatch.
          */
         post: operations["readImages"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/ai/v1/transcribe": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Transcribe audio to text (speech-to-text)
-         * @description Transcribes audio to text using Speech2Seq models like Whisper, Wav2Vec2, or HuBERT.
-         *
-         *     ## Models
-         *
-         *     Models are auto-discovered from `models_dir/transcribers/` at startup.
-         *     Use the `/api/models` endpoint to list available models.
-         *
-         *     - **Whisper**: OpenAI's Whisper models (multilingual, automatic language detection)
-         *     - **Wav2Vec2**: Facebook's Wav2Vec 2.0 models (English-focused)
-         *     - **HuBERT**: Facebook's HuBERT models (self-supervised)
-         *
-         *     ## Audio Input
-         *
-         *     Audio data should be base64-encoded. Supported formats depend on the model:
-         *     - WAV (recommended - raw PCM)
-         *     - MP3
-         *     - FLAC
-         *     - M4A/AAC
-         *
-         *     ## Example
-         *
-         *     ```json
-         *     {
-         *       "model": "openai/whisper-tiny",
-         *       "audio": "UklGRi..."
-         *     }
-         *     ```
-         *
-         *     With language hint:
-         *     ```json
-         *     {
-         *       "model": "openai/whisper-tiny",
-         *       "audio": "UklGRi...",
-         *       "language": "en"
-         *     }
-         *     ```
-         */
-        post: operations["transcribeAudio"];
         delete?: never;
         options?: never;
         head?: never;
@@ -6919,6 +7080,215 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        PrivacyProducer: {
+            /** @enum {string} */
+            type: "extractor" | "generator";
+            /** @description Immutable provider/model deployment revision. The qualified default native model resolves its pinned revision automatically. */
+            revision?: string;
+            /** @description Shared artifact producer configuration; privacy owns required categories and literal source spans. Credentials must use secret references or environment defaults. */
+            config: components["schemas"]["ExtractionConfig"] | components["schemas"]["GeneratedExtractorConfig"] | components["schemas"]["ConstrainedGeneratorProducerConfig"];
+        };
+        PrivacyCategory: {
+            name: string;
+            description?: string;
+            /** Format: float */
+            threshold?: number;
+        };
+        PrivacyPolicy: {
+            /**
+             * @description Policies, previews, and rescans require document storage without an external base source. Unsupported storage or modes fail with a typed 422 response; pre-storage protection is never substituted with asynchronous inspection.
+             * @enum {string}
+             */
+            mode: "monitor" | "redact_for_search_and_ai" | "redact_before_storage";
+            /** @description Literal source document field names, matching artifact source field semantics. */
+            fields: string[];
+            category_groups?: ("contact_details" | "personal_identifiers" | "financial" | "credentials")[];
+            /** @description Add categories or override group categories. The union of explicit and expanded group categories must contain at most 128 distinct names. */
+            categories?: components["schemas"]["PrivacyCategory"][];
+            /**
+             * @default balanced
+             * @enum {string}
+             */
+            sensitivity?: "conservative" | "balanced" | "thorough";
+            /**
+             * @default category
+             * @enum {string}
+             */
+            replacement?: "category" | "mask" | "remove";
+            producer?: components["schemas"]["PrivacyProducer"];
+            execution?: {
+                /** @default 8 */
+                batch_items?: number;
+                /** @default 3 */
+                max_attempts?: number;
+            };
+        };
+        /** @description Half-open UTF-8 byte offsets into the immutable source field. Matched values are not persisted in findings. Confidence is omitted when unavailable. */
+        PrivacyFinding: {
+            document: string;
+            field: string;
+            category: string;
+            start: number;
+            end: number;
+            /** Format: float */
+            confidence?: number;
+            policy_version: string;
+            source_fingerprint?: string;
+            producer_revision?: string;
+        };
+        PrivacyStatus: {
+            configured: boolean;
+            policy?: components["schemas"]["PrivacyPolicy"];
+            policy_version?: string;
+            /** Format: uint64 */
+            resource_version?: number;
+            /** Format: uint64 */
+            generation?: number;
+            scan_id?: string;
+            etag?: string;
+            resolved_producer?: components["schemas"]["PrivacyProducer"];
+            external_processing?: boolean;
+            coverage?: {
+                available?: boolean;
+                /** @description A bounded background census is building the next complete result. */
+                refreshing?: boolean;
+                /**
+                 * Format: int64
+                 * @description Start of the published observation interval; counts are informational and are not an atomic cross-shard snapshot.
+                 */
+                started_at_millis?: number;
+                /**
+                 * Format: int64
+                 * @description Completion of the published census. Counts refresh asynchronously as documents change and never authorize protected serving.
+                 */
+                completed_at_millis?: number;
+                /** Format: uint64 */
+                total?: number | null;
+                /** Format: uint64 */
+                current?: number | null;
+                /** Format: uint64 */
+                pending?: number | null;
+                /** Format: uint64 */
+                failed?: number | null;
+                /** Format: uint64 */
+                with_findings?: number | null;
+                /** Format: uint64 */
+                protected_ready?: number | null;
+                /** Format: uint64 */
+                protected_blocked?: number | null;
+                categories?: {
+                    [key: string]: number;
+                };
+                /** @description Findings by field across current inspections; pending and failed sources contribute no counts. */
+                fields?: {
+                    [key: string]: number;
+                };
+                /**
+                 * Format: uint64
+                 * @description Source-bound failures observed so far; failed remains null while other work is unclassified.
+                 */
+                failed_known?: number;
+                /** @description Optional failure examples, limited to 100 entries and 1 MiB of serialized JSON. Failure counts include rows whose identifiers exceed this detail budget. */
+                failures?: {
+                    [key: string]: unknown;
+                }[];
+                /** @description Reserved for bounded internal census pages; omitted from public coverage snapshots. */
+                next_key?: string | null;
+            };
+        };
+        PrivacyPreviewRequest: {
+            policy: components["schemas"]["PrivacyPolicy"];
+            sample?: {
+                keys?: string[];
+                /** @default 10 */
+                limit?: number;
+            };
+        };
+        PrivacyPreview: {
+            policy_version: string;
+            sampled: number;
+            /** @enum {boolean} */
+            complete_table_scan: false;
+            external_processing?: boolean;
+            documents: {
+                document: string;
+                fields: {
+                    field: string;
+                    original: string;
+                    text: string;
+                    findings: components["schemas"]["PrivacyFinding"][];
+                }[];
+            }[];
+        };
+        PrivacyScanRequest: {
+            from_key?: string;
+            to_key?: string;
+            /** @default 100 */
+            limit?: number;
+        };
+        PrivacyScan: {
+            scan_id: string;
+            policy_version: string;
+            /** @enum {string} */
+            phase: "queued" | "running" | "processing" | "succeeded" | "failed" | "superseded";
+            /** Format: uint64 */
+            scanned?: number;
+            /**
+             * Format: uint64
+             * @description Documents scheduled for inspection; processing verifies current receipts and publication before success.
+             */
+            reprocessed?: number;
+            /** Format: uint64 */
+            failed?: number;
+            /**
+             * @deprecated
+             * @description Reserved internal checkpoint; omitted from public scan status.
+             */
+            next_key?: string | null;
+            /** Format: uint64 */
+            skipped?: number;
+            last_error?: string | null;
+            consecutive_errors?: number;
+            /** Format: int64 */
+            retry_after_millis?: number;
+            /** Format: int64 */
+            updated_at_millis?: number;
+            /**
+             * @deprecated
+             * @description Reserved internal checkpoint; omitted from public scan status.
+             */
+            verification_cursor?: string | null;
+            /** Format: uint64 */
+            verification_current?: number;
+            /** Format: uint64 */
+            verification_pending?: number;
+            /** Format: uint64 */
+            verification_failed?: number;
+            /** Format: uint64 */
+            verification_blocked?: number;
+            /** @description Optional failure examples, limited to 100 entries and 1 MiB of serialized JSON. Failure counts include rows whose identifiers exceed this detail budget. */
+            failures?: {
+                [key: string]: unknown;
+            }[] | null;
+        };
+        /** @description Findings filters and opaque continuation in the request body, avoiding URL limits for large document identifiers. */
+        PrivacyFindingsRequest: {
+            cursor?: string;
+            document?: string;
+            field?: string;
+            category?: string;
+            policy_version?: string;
+            /** @default 100 */
+            limit?: number;
+        };
+        PrivacyFindingsPage: {
+            policy_version: string;
+            findings: components["schemas"]["PrivacyFinding"][];
+            /** @description Opaque continuation bound to the table, policy version, and filters. Pass it unchanged; its size depends on the document identifier. */
+            next_cursor?: string | null;
+            examined_documents?: number;
+            pending_documents?: number;
+        };
         LakeCatalogCreateRequest: {
             /** @description Stable identifier reused with exactly the same request after timeout or restart. */
             commit_id: string;
@@ -7385,6 +7755,8 @@ export interface components {
             error: string;
             /** @description Human-readable error description when supplied by the endpoint. */
             message?: string;
+            /** @description Optional RFC 6901 JSON Pointer identifying the invalid request field. */
+            pointer?: string;
             /** @description Whether retrying the operation may succeed without changing the request. */
             retryable?: boolean;
             /**
@@ -12709,16 +13081,26 @@ export interface components {
         HierarchyChildParent: {
             /** @enum {string} */
             level: "source";
-            id: string;
+            id?: string;
+            /** @description Bounded source selection for member traversal; unit traversal requires id. */
+            ids?: string[];
         };
         HierarchyChildren: {
             parent: components["schemas"]["HierarchyChildParent"];
             /**
              * @description Child level to enumerate. Unit traversal reads the versioned extraction
              *     hierarchy rather than a relevance index, so empty and failed units are included.
+             *     Member traversal requires artifact and seeks that producer's native storage
+             *     prefixes within the selected source or parent.ids batch (up to 100).
+             *     One global cursor orders the selected members; it includes generic assets and chunks.
+             *     Scalar member payloads are returned as {"$": value} in _source so
+             *     every query hit retains an object-shaped projection. Continuation
+             *     requires the remote_snapshot returned with the first page.
              * @enum {string}
              */
-            level: "unit";
+            level: "unit" | "member";
+            /** @description Producer name; required for member traversal and omitted for unit traversal. */
+            artifact?: string;
         };
         /**
          * @description The required public order for sequential hierarchy traversal. Specify
@@ -12748,7 +13130,9 @@ export interface components {
          *
          *     `children` is a separate sequential-browsing operation. It enumerates every unit
          *     in the selected source revision, including units with no searchable chunk, and uses
-         *     the top-level `_sort`/`search_after` cursor contract.
+         *     the top-level `_sort`/`search_after` cursor contract. For member traversal,
+         *     `filter_query` applies to source parents before any artifact enumeration;
+         *     it never filters member payloads or changes the member pagination order.
          *
          *     Ancestor and nested-match field projections are always explicit to keep response
          *     size predictable. The presence of this object selects the canonical contract:
@@ -14029,6 +14413,10 @@ export interface components {
              */
             window_index?: number;
             unit_id?: string;
+            /** @description Opaque fingerprint of this member's native content and captured producer/input state; independent of hierarchy traversal cursors. */
+            revision?: string;
+            /** @description Opaque fingerprint of the captured producer/input state, when available. Changes to producer configuration or acquired input reopen this identity. */
+            derivation_revision?: string;
             source?: components["schemas"]["HierarchyArtifactSource"];
         };
         HierarchyAncestor: {
@@ -14365,6 +14753,8 @@ export interface components {
             next_source_cursor?: string;
             /** @description Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409. */
             remote_snapshot?: string;
+            /** @description True when an ordered query read live state because this deployment's storage (Lite) cannot retain a snapshot. No remote_snapshot is returned, so the page cannot be continued with search_after or search_before. */
+            live_read?: boolean;
             /** @description Function evaluation scope, population, usage, and scoped aggregations. */
             evaluation?: {
                 [key: string]: unknown;
@@ -15205,6 +15595,1006 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        /** @enum {string} */
+        ExtractionProvider: "antfly" | "pioneer" | "cloudflare" | "openai" | "gemini" | "vertex" | "anthropic" | "bedrock" | "mock";
+        /**
+         * @description Omission preserves the legacy extraction contract. Version 2 opts into strict mixed-task schemas, per-input replacements and explicit offsets; the selected model/runtime must support every requested feature.
+         * @default 1
+         * @enum {integer}
+         */
+        ExtractionSchemaVersion: 1 | 2;
+        /** Format: double */
+        ExtractionProbability: number;
+        /** @description Optional source and target labels constrain relation endpoints. A target requires a source. */
+        ExtractionRelationSchema: {
+            type: string;
+            source?: string;
+            target?: string;
+            /** @description Version 2 model-facing relation description. */
+            description?: string;
+            threshold?: components["schemas"]["ExtractionProbability"];
+        };
+        ExtractionLabelDefinition: {
+            /** @description Model-facing label description. */
+            description?: string;
+        };
+        /**
+         * Format: double
+         * @description Finite centered-logit decisions require a threshold strictly between zero and one.
+         */
+        ExtractionClassificationThreshold: number;
+        ExtractionClassificationExample: {
+            input: string;
+            label: string;
+        } | string[];
+        ExtractionClassificationSchema: {
+            name: string;
+            labels: string[];
+            /** @description The server uses false when omitted. Version 1: return highest-ranked labels up to top_k when false, or labels meeting options.threshold when true. Version 2: selects ordinary single or multi classification unless mode is specified; classification.threshold controls the decision threshold. */
+            multi_label?: boolean;
+            /** @description Version 1 NLI hypothesis template with {} as the label placeholder; the server uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit hypothesis_template; use prompt/instruction and label_definitions for model conditioning. */
+            hypothesis_template?: string;
+            /** @description Maximum labels for ordinary single-label classification; the server uses 1 when omitted. Version 2 constrained classification uses min_labels/max_labels. Advanced set-selection options or cross-task constraints on any classification in the collection reject every explicit top_k in that collection, including 1. Omit top_k when using these options. */
+            top_k?: number;
+            /**
+             * @description Version 2 ordinary classification mode. Standalone ordinal scores use the decision API.
+             *     Each model rejects modes it does not support.
+             * @enum {string}
+             */
+            mode?: "single" | "multi";
+            label_definitions?: {
+                [key: string]: components["schemas"]["ExtractionLabelDefinition"];
+            };
+            min_labels?: number;
+            /** @description Version 2 maximum selected labels. Explicit null means no maximum; omission preserves mode defaults. */
+            max_labels?: number | null;
+            ordered?: boolean;
+            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            /** @enum {string} */
+            activation?: "auto" | "sigmoid" | "softmax";
+            /** Format: double */
+            temperature?: number;
+            /** @description Version 2 fallback label; must be declared in labels. */
+            default?: string;
+            /** @description Version 2 model-facing task instruction. Mutually exclusive with instruction. */
+            prompt?: string;
+            /** @description Alias of prompt. */
+            instruction?: string;
+            examples?: components["schemas"]["ExtractionClassificationExample"][];
+        };
+        ExtractionRegexValidator: {
+            /** @enum {string} */
+            type?: "regex";
+            pattern: string;
+            /**
+             * @default full
+             * @enum {string}
+             */
+            mode?: "full" | "partial";
+            /** @default false */
+            exclude?: boolean;
+            /**
+             * @description Python-compatible regex flags supported by the active bounded validator engine; unsupported flags or syntax fail validation.
+             * @default 2
+             */
+            flags?: number;
+        };
+        ExtractionStructureField: string | ({
+            /** @enum {string} */
+            type?: "str" | "string" | "list" | "array" | "text" | "number" | "date" | "estimate";
+            /** @description Decimal precision for compatible hosted number fields. */
+            decimals?: number;
+            unit?: string;
+            /** @description Minimum of a hosted estimate distribution. */
+            min?: number;
+            max?: number;
+            step?: number;
+            enum?: string[];
+            /** @enum {string} */
+            dtype?: "str" | "list";
+            choices?: string[];
+            description?: string;
+            threshold?: components["schemas"]["ExtractionProbability"];
+            /**
+             * @description Version 2 explicit cardinality. Required fields are validated after record assignment.
+             * @enum {string}
+             */
+            cardinality?: "optional_one" | "required_one" | "zero_or_more" | "one_or_more";
+            /** @description Version 2 field spans cannot be assigned to multiple record instances. */
+            exclusive?: boolean;
+            validators?: components["schemas"]["ExtractionRegexValidator"][];
+        } & {
+            [key: string]: unknown;
+        });
+        ExtractionStructureSchema: {
+            fields: {
+                [key: string]: components["schemas"]["ExtractionStructureField"];
+            };
+            /**
+             * @description Version 2 record grouping. Omission preserves one-record extraction.
+             * @enum {string}
+             */
+            mode?: "natural" | "latent" | "anchorless";
+            /** @description Natural mode only; defaults to the first declared field. */
+            anchor?: string;
+            /** @enum {string} */
+            occurrence_policy?: "all" | "first" | "error_on_ambiguous" | "latent_all";
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionEntityDefinition: {
+            description?: string;
+            /** @enum {string} */
+            dtype?: "str" | "list";
+            /** @enum {string} */
+            type?: "str" | "string" | "list" | "array";
+            threshold?: components["schemas"]["ExtractionProbability"];
+            validators?: components["schemas"]["ExtractionRegexValidator"][];
+        };
+        /** @description Version 2 attributes are scored on retained entity spans using shared encoded states. Omitted applies_to selects all entities; [] selects none. Raw labels must be unique across groups, including when qualify_labels is true. Group names text,confidence,start,end are reserved. */
+        ExtractionAttributeGroup: {
+            labels: string[];
+            /** @default false */
+            multi_label?: boolean;
+            threshold?: components["schemas"]["ExtractionProbability"];
+            applies_to?: string[];
+            /** @default false */
+            qualify_labels?: boolean;
+        };
+        ExtractionConstraintLabelRef: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "LabelRef";
+            task: string;
+            label: string;
+        };
+        ExtractionConstraintAnySelected: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AnySelected";
+            task: string;
+        };
+        ExtractionConstraintAnyOtherSelected: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AnyOtherSelected";
+            task: string;
+        };
+        ExtractionConstraintIsDefault: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "IsDefault";
+            task: string;
+        };
+        ExtractionConstraintCardinality: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Cardinality";
+            task: string;
+            minimum?: number;
+            maximum?: number | null;
+        };
+        ExtractionConstraintMinLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MinLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintMaxLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintAtLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AtLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintNot: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Not";
+            child: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintAnd: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "And";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintOr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Or";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintExactlyOneOf: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "ExactlyOneOf";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintImplies: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Implies";
+            cond: components["schemas"]["ExtractionClassificationConstraint"];
+            then: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintIff: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Iff";
+            left: components["schemas"]["ExtractionClassificationConstraint"];
+            right: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintExcludes: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Excludes";
+            left: components["schemas"]["ExtractionClassificationConstraint"];
+            right: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        /** @description Declarative, bounded constraint AST. Task and label references are validated before inference. Nesting is bounded by the server schema limit. */
+        ExtractionClassificationConstraint: components["schemas"]["ExtractionConstraintLabelRef"] | components["schemas"]["ExtractionConstraintAnySelected"] | components["schemas"]["ExtractionConstraintAnyOtherSelected"] | components["schemas"]["ExtractionConstraintIsDefault"] | components["schemas"]["ExtractionConstraintCardinality"] | components["schemas"]["ExtractionConstraintMinLevel"] | components["schemas"]["ExtractionConstraintMaxLevel"] | components["schemas"]["ExtractionConstraintAtLevel"] | components["schemas"]["ExtractionConstraintNot"] | components["schemas"]["ExtractionConstraintAnd"] | components["schemas"]["ExtractionConstraintOr"] | components["schemas"]["ExtractionConstraintExactlyOneOf"] | components["schemas"]["ExtractionConstraintImplies"] | components["schemas"]["ExtractionConstraintIff"] | components["schemas"]["ExtractionConstraintExcludes"];
+        ExtractionJointEntity: {
+            description?: string;
+            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            max_candidates?: number;
+            allow_nested?: boolean;
+        };
+        ExtractionJointRelation: {
+            head: string[];
+            tail: string[];
+            /** @description Retained declarative metadata; model conditioning follows the pinned JointIE compiler. */
+            description?: string;
+            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            /** @default true */
+            directed?: boolean;
+            /** @default false */
+            symmetric?: boolean;
+            inverse?: string;
+            /** @default false */
+            allow_self?: boolean;
+            max_per_head?: number;
+            max_per_tail?: number;
+        };
+        ExtractionJointConstraintTypedEndpoints: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "TypedEndpoints";
+            relation?: string;
+            head_types?: string[];
+            tail_types?: string[];
+        };
+        ExtractionJointConstraintNoSelfLoops: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "NoSelfLoops";
+            relation?: string;
+        };
+        ExtractionJointConstraintUniqueRelationPair: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "UniqueRelationPair";
+            relation?: string;
+            /** @default true */
+            directed?: boolean;
+        };
+        ExtractionJointConstraintUniqueRelationSlot: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "UniqueRelationSlot";
+            relation?: string;
+            /**
+             * @default head
+             * @enum {string}
+             */
+            slot?: "head" | "tail" | "slot";
+        };
+        ExtractionJointConstraintEntityOverlapPolicy: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "EntityOverlapPolicy";
+            /** @enum {string} */
+            policy?: "allow" | "disallow" | "nested";
+        };
+        ExtractionJointConstraintMaxRelationsPerHead: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxRelationsPerHead";
+            relation?: string;
+            limit: number;
+        };
+        ExtractionJointConstraintMaxRelationsPerTail: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxRelationsPerTail";
+            relation?: string;
+            limit: number;
+        };
+        ExtractionJointConstraintSymmetricRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "SymmetricRelation";
+            relation: string;
+        };
+        ExtractionJointConstraintAcyclicRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AcyclicRelation";
+            relation: string;
+        };
+        ExtractionJointConstraintInverseRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "InverseRelation";
+            relation: string;
+            inverse: string;
+        };
+        ExtractionJointConstraint: components["schemas"]["ExtractionJointConstraintTypedEndpoints"] | components["schemas"]["ExtractionJointConstraintNoSelfLoops"] | components["schemas"]["ExtractionJointConstraintUniqueRelationPair"] | components["schemas"]["ExtractionJointConstraintUniqueRelationSlot"] | components["schemas"]["ExtractionJointConstraintEntityOverlapPolicy"] | components["schemas"]["ExtractionJointConstraintMaxRelationsPerHead"] | components["schemas"]["ExtractionJointConstraintMaxRelationsPerTail"] | components["schemas"]["ExtractionJointConstraintSymmetricRelation"] | components["schemas"]["ExtractionJointConstraintAcyclicRelation"] | components["schemas"]["ExtractionJointConstraintInverseRelation"];
+        /** @description Separate typed graph schema, mutually exclusive with ordinary extraction families. Hard typed endpoints, overlap, uniqueness and declared graph constraints apply to every returned edge, including derived companions. */
+        ExtractionJointSchema: {
+            entities: {
+                [key: string]: string | components["schemas"]["ExtractionJointEntity"];
+            };
+            relations?: {
+                [key: string]: components["schemas"]["ExtractionJointRelation"];
+            };
+            constraints?: components["schemas"]["ExtractionJointConstraint"][];
+        };
+        /**
+         * @description Version 1 selects one extraction family; entities may accompany relations.
+         *     With schema_version 2, entities, attributes, classifications, structures,
+         *     and ordinary relations may share one encoded input. joint_ie is a separate,
+         *     mutually exclusive typed graph schema. The version 2 compiler rejects
+         *     unknown fields and validates all references before model execution.
+         */
+        ExtractionSchema: {
+            entities?: string[];
+            relations?: components["schemas"]["ExtractionRelationSchema"][];
+            classifications?: components["schemas"]["ExtractionClassificationSchema"][];
+            structures?: {
+                [key: string]: components["schemas"]["ExtractionStructureSchema"];
+            };
+            entity_definitions?: {
+                [key: string]: components["schemas"]["ExtractionEntityDefinition"];
+            };
+            entity_attributes?: {
+                [key: string]: components["schemas"]["ExtractionAttributeGroup"];
+            };
+            classification_constraints?: components["schemas"]["ExtractionClassificationConstraint"][];
+            joint_ie?: components["schemas"]["ExtractionJointSchema"];
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * @description Half-open offsets into the immutable caller text. Version 2 defaults to utf8_bytes. No normalization, lowercasing or synthetic suffix is included in these coordinates.
+         * @enum {string}
+         */
+        ExtractionOffsetUnit: "utf8_bytes" | "unicode_codepoints" | "utf16_codeunits";
+        /** @description Version 2 never silently truncates. Reject is the default. Windowing requires an enabled runtime capability, reconstructs document-global offsets and revalidates all hard graph constraints after merging. */
+        ExtractionLongDocumentOptions: {
+            /**
+             * @default reject
+             * @enum {string}
+             */
+            mode?: "reject" | "window";
+            /** @description Maximum body words per window; also bounded by the checkpoint and encoded token limits. */
+            window_words?: number;
+            overlap_words?: number;
+            max_windows?: number;
+            /**
+             * @description Identity of latent, anchorless and legacy records across windows. Occurrence uses exact source spans; semantic explicitly merges equal field values. Natural records always use their exact source anchor. This is independent of annotation occurrence_policy.
+             * @default occurrence
+             * @enum {string}
+             */
+            record_identity?: "occurrence" | "semantic";
+        };
+        /** @description Bounded classification and JointIE selection. Exact optimality is with respect to admitted candidates. A completed beam may be feasible without an optimality proof. By default exhausted search is an error; best_effort permits only a validated feasible witness and reports exhausted:true. */
+        ExtractionDecoderOptions: {
+            /**
+             * @description Omit to use the model's per-task default. GLiNER2.5 uses source-compatible beam selection for single-window JointIE and automatic selection for classification. Windowed JointIE uses the native automatic global solver with independent window resources. Explicit values select the native bounded search algorithm.
+             * @enum {string}
+             */
+            algorithm?: "auto" | "exact" | "beam";
+            beam_width?: number;
+            max_search_nodes?: number;
+            max_local_assignments?: number;
+            /** @default false */
+            best_effort?: boolean;
+        };
+        /** @description JointIE proposal admission and utility calibration. Entity candidate caps are bypassed for endpoints of retained relation proposals, subject to server hard bounds. entity_threshold overrides candidate admission, not entity decision thresholds. */
+        ExtractionJointOptions: {
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            entity_threshold?: components["schemas"]["ExtractionProbability"];
+            relation_role_threshold?: components["schemas"]["ExtractionProbability"];
+            top_k_entities?: number;
+            top_k_roles?: number;
+            relation_pair_cap?: number;
+            max_edges_per_type?: number;
+            /** Format: double */
+            entity_weight?: number;
+            /** Format: double */
+            relation_weight?: number;
+        };
+        ExtractionReaderOptions: {
+            provider?: string;
+            model?: string;
+            url?: string;
+            api_url?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        /** @description Optional cross-input entity and relation deduplication. */
+        ExtractionResolverOptions: {
+            /**
+             * Format: float
+             * @default 0.85
+             */
+            similarity_threshold?: number;
+            /** @default true */
+            type_must_match?: boolean;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_entity_confidence?: number;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_relation_confidence?: number;
+            /** @default true */
+            deduplicate_relations?: boolean;
+            /** @default true */
+            track_provenance?: boolean;
+        };
+        ExtractionOptions: {
+            /** Format: float */
+            threshold?: number;
+            flat_ner?: boolean;
+            include_confidence?: boolean;
+            include_spans?: boolean;
+            /**
+             * @description Version 2 source word splitting. char keeps ASCII alphanumeric and @._-+ runs together and splits other non-whitespace codepoints, preserving original source offsets. An input's options replace the shared options in full; omitted word_splitter uses whitespace. Explicit word_splitter is rejected by version 1.
+             * @enum {string}
+             */
+            word_splitter?: "whitespace" | "char";
+            /**
+             * @description Version 2 overlap selection. flat/disallow prohibit overlap, nested permits containment, longest removes strictly contained spans.
+             * @enum {string}
+             */
+            overlap?: "allow" | "nested" | "flat" | "disallow" | "longest";
+            offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
+            long_document?: components["schemas"]["ExtractionLongDocumentOptions"];
+            decoder?: components["schemas"]["ExtractionDecoderOptions"];
+            joint_ie?: components["schemas"]["ExtractionJointOptions"];
+            reader?: components["schemas"]["ExtractionReaderOptions"];
+            resolver?: components["schemas"]["ExtractionResolverOptions"];
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionConfig: {
+            provider: components["schemas"]["ExtractionProvider"];
+            model?: string;
+            schema_version?: components["schemas"]["ExtractionSchemaVersion"];
+            url?: string;
+            api_url?: string;
+            /** @description Google Cloud project for the vertex provider. */
+            project_id?: string;
+            /** @description Vertex AI location. */
+            location?: string;
+            /** @description AWS region for the bedrock provider. */
+            region?: string;
+            /** @description Path to Google service account credentials for the vertex provider. */
+            credentials_path?: string;
+            /** @description Cloudflare Workers AI account identifier. */
+            account_id?: string;
+            /** @description Optional Cloudflare AI Gateway identifier. */
+            gateway_id?: string;
+            api_key?: string;
+            bearer_token?: string;
+            schema?: components["schemas"]["ExtractionSchema"];
+            options?: components["schemas"]["ExtractionOptions"];
+        };
+        /** @description Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference. */
+        CloudflareGeneratorConfig: {
+            /** @enum {string} */
+            provider: "cloudflare";
+            account_id: string;
+            /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
+            gateway_id?: string;
+            /** @default @cf/meta/llama-3.3-70b-instruct-fp8-fast */
+            model: string;
+            api_key?: string;
+            /** @description Optional deployment-owned endpoint override. */
+            url?: string;
+            max_tokens?: number;
+            /** Format: float */
+            temperature?: number;
+            /** Format: float */
+            top_p?: number;
+            /** Format: float */
+            frequency_penalty?: number;
+            /** Format: float */
+            presence_penalty?: number;
+        };
+        /** @description Configuration for the Google generative AI provider (Gemini). */
+        GoogleGeneratorConfig: {
+            /** @enum {string} */
+            provider: "gemini";
+            /** @description The Google Cloud project ID. */
+            project_id?: string;
+            /** @description The Google Cloud location (e.g., 'us-central1'). */
+            location?: string;
+            /**
+             * @description The name of the generative model to use.
+             * @default gemini-2.5-flash
+             * @example gemini-2.5-flash
+             */
+            model: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+            /** @description Top-k sampling parameter. */
+            top_k?: number;
+            /** @description The Google API key. */
+            api_key?: string;
+            /**
+             * Format: uri
+             * @description The URL of the Google API endpoint.
+             */
+            url?: string;
+        };
+        /** @description Configuration for Google Cloud Vertex AI generative models. */
+        VertexGeneratorConfig: {
+            /** @enum {string} */
+            provider: "vertex";
+            /**
+             * @description The name of the Vertex AI model to use.
+             * @default gemini-2.5-flash
+             * @example gemini-2.5-flash
+             */
+            model: string;
+            /** @description Google Cloud project ID. */
+            project_id?: string;
+            /**
+             * @description Google Cloud region for Vertex AI API.
+             * @default us-central1
+             */
+            location?: string;
+            /** @description Path to service account JSON key file. */
+            credentials_path?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate in the response. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter (0.0-1.0).
+             */
+            top_p?: number;
+            /** @description Top-k sampling parameter. */
+            top_k?: number;
+        };
+        /**
+         * @description AWS Bedrock Converse generation, including image inputs and tools for
+         *     models that support them. Uses the AWS default credential chain unless
+         *     an explicit Bedrock API key is configured. Image capability is declared
+         *     per target through inference_capabilities; model IDs are not allowlisted.
+         */
+        BedrockGeneratorConfig: {
+            /** @enum {string} */
+            provider: "bedrock";
+            /** @description Optional Bedrock Runtime endpoint override. Defaults to the regional AWS endpoint. */
+            url?: string;
+            /** @description Optional Bedrock bearer API key or secret reference. Omit to use signed AWS requests and the default credential chain. */
+            api_key?: string;
+            /**
+             * @description The Bedrock model ID to use.
+             * @example anthropic.claude-sonnet-4-5-20250929-v1:0
+             */
+            model: string;
+            /** @description AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1. */
+            region?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-1.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+        };
+        /** @description Configuration for the Anthropic generative AI provider. */
+        AnthropicGeneratorConfig: {
+            /** @enum {string} */
+            provider: "anthropic";
+            /** @description Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID. */
+            workspace_id?: string;
+            /**
+             * @description The full model ID of the Anthropic model to use.
+             * @default claude-sonnet-4-5-20250929
+             * @example claude-sonnet-4-5-20250929
+             */
+            model: string;
+            /** @description Anthropic API key or secret reference. Defaults to ANTHROPIC_API_KEY. */
+            api_key?: string;
+            /**
+             * Format: uri
+             * @description Messages API base URL. Defaults to https://api.anthropic.com/v1.
+             */
+            url?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-1.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate in the response. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter (0.0-1.0).
+             */
+            top_p?: number;
+            /** @description Top-k sampling parameter. */
+            top_k?: number;
+        };
+        /**
+         * @description OpenAI reasoning effort; model support varies. Omit to use the model default.
+         * @enum {string}
+         */
+        OpenAIReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+        /** @description Configuration for the Ollama generative AI provider. */
+        OllamaGeneratorConfig: {
+            /** @enum {string} */
+            provider: "ollama";
+            /**
+             * @description The name of the Ollama model to use.
+             * @example llama3.3:70b
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the Ollama API endpoint.
+             */
+            url?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate, including reasoning tokens for thinking models. */
+            max_tokens?: number;
+            /** @description Optional reasoning effort for Ollama's OpenAI-compatible endpoint. Use none to disable thinking on models that support it; supported values depend on the model. */
+            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+            /** @description Top-k sampling parameter. */
+            top_k?: number;
+            /** @description HTTP response timeout in seconds for Ollama API calls. */
+            timeout?: number;
+        };
+        /** @description Configuration for the Antfly inference generative AI provider. */
+        AntflyGeneratorConfig: {
+            /** @enum {string} */
+            provider: "antfly";
+            /**
+             * @description The name of the generator model.
+             * @example ggml-org/gemma-4-E4B-it-GGUF
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+             */
+            api_url?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+            /** @description Top-k sampling parameter. */
+            top_k?: number;
+            /** @description HTTP response timeout in seconds for Inference API calls. */
+            timeout?: number;
+        };
+        /** @description Personal ChatGPT plan for interactive generation. Credentials stay in the local runtime. */
+        ChatGPTGeneratorConfig: {
+            /** @enum {string} */
+            provider: "chatgpt";
+            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
+            model: string;
+            /** @description Opaque personal registration owned by the authenticated caller. */
+            connection_id: string;
+        };
+        /** @description Configuration for the OpenAI generative AI provider. */
+        OpenAIGeneratorConfig: {
+            /** @enum {string} */
+            provider: "openai";
+            /**
+             * @description The name of the OpenAI model to use.
+             * @default gpt-4.1
+             * @example gpt-4.1
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the OpenAI API endpoint.
+             */
+            url?: string;
+            /** @description The OpenAI API key. */
+            api_key?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate. */
+            max_tokens?: number;
+            /**
+             * @description OpenAI completion budget, including visible output and reasoning tokens.
+             *     Use for reasoning models instead of max_tokens; the two are mutually exclusive.
+             */
+            max_completion_tokens?: number;
+            /** @description Optional reasoning effort. Supported values depend on the selected OpenAI model. */
+            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+            /**
+             * Format: float
+             * @description Penalty for token frequency (-2.0 to 2.0).
+             */
+            frequency_penalty?: number;
+            /**
+             * Format: float
+             * @description Penalty for token presence (-2.0 to 2.0).
+             */
+            presence_penalty?: number;
+        };
+        /** @description Configuration for the OpenRouter generative AI provider. */
+        OpenRouterGeneratorConfig: {
+            /** @enum {string} */
+            provider: "openrouter";
+            /**
+             * @description The OpenRouter model identifier to use.
+             * @example openai/gpt-4.1
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the OpenRouter API endpoint.
+             * @default https://openrouter.ai/api/v1
+             */
+            url?: string;
+            /** @description The OpenRouter API key. */
+            api_key?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate in the response. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter (0.0-1.0).
+             */
+            top_p?: number;
+            /**
+             * Format: float
+             * @description Penalty for token frequency (-2.0 to 2.0).
+             */
+            frequency_penalty?: number;
+            /**
+             * Format: float
+             * @description Penalty for token presence (-2.0 to 2.0).
+             */
+            presence_penalty?: number;
+        };
+        /** @description On-device Apple Foundation Models generation. Requires a macOS Apple provider build, Apple Intelligence enabled, and its system model ready. Supports text conversations; tool calling and media attachments are not supported. */
+        AppleGeneratorConfig: {
+            /** @enum {string} */
+            provider?: "apple";
+            /** @default 256 */
+            max_tokens?: number;
+            temperature?: number;
+        };
+        /**
+         * @description token_bucket limits admission rate while allowing overlapping attempts.
+         *     completion serializes attempts and waits one RPM interval after each
+         *     attempt finishes, including streamed writes and transport failures.
+         *     This prevents delayed connection setup from compressing successful
+         *     request spacing, at the cost of response latency plus one interval per
+         *     request. Requires requests_per_minute and burst=1. Neither mode can
+         *     guarantee zero upstream 429s or coordinate other processes.
+         * @enum {string}
+         */
+        RequestPacing: "token_bucket" | "completion";
+        /**
+         * @description Outbound provider limits shared within one Antfly process by effective
+         *     endpoint, operation, model, credential source, project and region/location.
+         *     Conflicting policies for an active scope are rejected. These limits do
+         *     not coordinate across replicas or infer the provider's account quota.
+         */
+        RateLimitConfig: {
+            /** @description Request pacing mode. Defaults to token_bucket. Legacy flat embedder RPM with burst=1 uses completion pacing. */
+            pacing?: components["schemas"]["RequestPacing"];
+            /** Format: int64 */
+            requests_per_minute?: number;
+            /**
+             * Format: int64
+             * @default 1
+             */
+            burst?: number;
+            /**
+             * Format: int64
+             * @description Conservative text budget: each HTTP attempt reserves its serialized
+             *     UTF-8 body byte count plus the configured generation output cap.
+             *     Reservations are not refunded. A request larger than this budget
+             *     is rejected. This is not provider billing token accounting; media
+             *     requests are not supported with this limit.
+             */
+            tokens_per_minute?: number;
+            /**
+             * Format: int64
+             * @description Maximum in-flight HTTP attempts, held through response completion.
+             */
+            max_concurrency?: number;
+        };
+        /**
+         * @description Generator providers implemented by Antfly's generation runtime.
+         * @enum {string}
+         */
+        GeneratorProvider: "cloudflare" | "gemini" | "vertex" | "bedrock" | "anthropic" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly" | "apple";
+        /**
+         * @description A unified configuration for a generative AI provider.
+         * @example {
+         *       "provider": "openai",
+         *       "model": "gpt-4.1",
+         *       "temperature": 0.7,
+         *       "max_tokens": 2048
+         *     }
+         */
+        GeneratorConfig: (components["schemas"]["CloudflareGeneratorConfig"] | components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["AnthropicGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
+            /**
+             * Format: int64
+             * @description Conservative input-token ceiling per image. Required for image calls when tokens_per_minute is configured; choose a bound valid for the model and image policy.
+             */
+            max_image_input_tokens?: number;
+            rate_limit?: components["schemas"]["RateLimitConfig"];
+            provider: components["schemas"]["GeneratorProvider"];
+        };
+        /**
+         * @description Provider and model admission selects a supported constrained mechanism. Auto prefers forced tools, then provider JSON schema, then native grammar. Free-text parsing is not a mode.
+         * @default auto
+         * @enum {string}
+         */
+        ConstrainedOutput: "auto" | "tool_call" | "json_schema" | "grammar";
+        /**
+         * @description Token probabilities require complete decoder evidence for the allowed values. Verdict-only is explicit opt-in; model-reported confidence is never used.
+         * @default token_logprobs
+         * @enum {string}
+         */
+        ConstrainedProbabilities: "token_logprobs" | "verdict_only";
+        ConstrainedGenerationBatch: {
+            /** @default 8 */
+            max_items_per_call?: number;
+            /** @default 65536 */
+            max_input_bytes?: number;
+        };
+        GeneratedExtractorConfig: {
+            /** @enum {string} */
+            method: "generated";
+            generator: components["schemas"]["GeneratorConfig"];
+            schema: components["schemas"]["ExtractionSchema"];
+            entity_definitions?: {
+                [key: string]: string;
+            };
+            instructions?: string;
+            output?: components["schemas"]["ConstrainedOutput"];
+            probabilities?: components["schemas"]["ConstrainedProbabilities"];
+            batch?: components["schemas"]["ConstrainedGenerationBatch"];
+            options?: components["schemas"]["ExtractionOptions"];
+        };
+        ConstrainedGeneratorProducerConfig: {
+            generator: components["schemas"]["GeneratorConfig"];
+            instructions?: string;
+            /** @description JSON schema enforced before artifact publication. Unsupported schema vocabulary fails admission. Invalid or missing batch items receive one validation retry; successful siblings are retained. */
+            output_schema: {
+                [key: string]: unknown;
+            };
+            output?: components["schemas"]["ConstrainedOutput"];
+            batch?: components["schemas"]["ConstrainedGenerationBatch"];
+        };
         /** @description PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC. */
         SQLNumericModifier: {
             precision: number;
@@ -15645,48 +17035,6 @@ export interface components {
             retrieval?: components["schemas"]["EmbeddingRetrievalConfig"];
         };
         /**
-         * @description token_bucket limits admission rate while allowing overlapping attempts.
-         *     completion serializes attempts and waits one RPM interval after each
-         *     attempt finishes, including streamed writes and transport failures.
-         *     This prevents delayed connection setup from compressing successful
-         *     request spacing, at the cost of response latency plus one interval per
-         *     request. Requires requests_per_minute and burst=1. Neither mode can
-         *     guarantee zero upstream 429s or coordinate other processes.
-         * @enum {string}
-         */
-        RequestPacing: "token_bucket" | "completion";
-        /**
-         * @description Outbound provider limits shared within one Antfly process by effective
-         *     endpoint, operation, model, credential source, project and region/location.
-         *     Conflicting policies for an active scope are rejected. These limits do
-         *     not coordinate across replicas or infer the provider's account quota.
-         */
-        RateLimitConfig: {
-            /** @description Request pacing mode. Defaults to token_bucket. Legacy flat embedder RPM with burst=1 uses completion pacing. */
-            pacing?: components["schemas"]["RequestPacing"];
-            /** Format: int64 */
-            requests_per_minute?: number;
-            /**
-             * Format: int64
-             * @default 1
-             */
-            burst?: number;
-            /**
-             * Format: int64
-             * @description Conservative text budget: each HTTP attempt reserves its serialized
-             *     UTF-8 body byte count plus the configured generation output cap.
-             *     Reservations are not refunded. A request larger than this budget
-             *     is rejected. This is not provider billing token accounting; media
-             *     requests are not supported with this limit.
-             */
-            tokens_per_minute?: number;
-            /**
-             * Format: int64
-             * @description Maximum in-flight HTTP attempts, held through response completion.
-             */
-            max_concurrency?: number;
-        };
-        /**
          * @description Managed generated artifact kind.
          * @enum {string}
          */
@@ -15738,6 +17086,11 @@ export interface components {
             target_tokens?: number;
             /** @description Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers. */
             overlap_tokens?: number;
+            /**
+             * @description Minimum non-whitespace Unicode scalar values in a fixed text chunk. Shorter chunks are omitted before storage and embedding; original source offsets are preserved. Zero disables filtering (default). Does not filter model-aware media windows or image/audio chunks.
+             * @default 0
+             */
+            min_chars?: number;
             /** @description Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers. */
             separator?: string;
         };
@@ -15998,933 +17351,6 @@ export interface components {
             outputs?: components["schemas"]["ChunkOutputs"];
             policy?: components["schemas"]["MediaChunkPolicy"];
         };
-        /** @description Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference. */
-        CloudflareGeneratorConfig: {
-            /** @enum {string} */
-            provider: "cloudflare";
-            account_id: string;
-            /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
-            gateway_id?: string;
-            /** @default @cf/meta/llama-3.3-70b-instruct-fp8-fast */
-            model: string;
-            api_key?: string;
-            /** @description Optional deployment-owned endpoint override. */
-            url?: string;
-            max_tokens?: number;
-            /** Format: float */
-            temperature?: number;
-            /** Format: float */
-            top_p?: number;
-            /** Format: float */
-            frequency_penalty?: number;
-            /** Format: float */
-            presence_penalty?: number;
-        };
-        /** @description Configuration for the Google generative AI provider (Gemini). */
-        GoogleGeneratorConfig: {
-            /** @enum {string} */
-            provider: "gemini";
-            /** @description The Google Cloud project ID. */
-            project_id?: string;
-            /** @description The Google Cloud location (e.g., 'us-central1'). */
-            location?: string;
-            /**
-             * @description The name of the generative model to use.
-             * @default gemini-2.5-flash
-             * @example gemini-2.5-flash
-             */
-            model: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-            /** @description The Google API key. */
-            api_key?: string;
-            /**
-             * Format: uri
-             * @description The URL of the Google API endpoint.
-             */
-            url?: string;
-        };
-        /** @description Configuration for Google Cloud Vertex AI generative models. */
-        VertexGeneratorConfig: {
-            /** @enum {string} */
-            provider: "vertex";
-            /**
-             * @description The name of the Vertex AI model to use.
-             * @default gemini-2.5-flash
-             * @example gemini-2.5-flash
-             */
-            model: string;
-            /** @description Google Cloud project ID. */
-            project_id?: string;
-            /**
-             * @description Google Cloud region for Vertex AI API.
-             * @default us-central1
-             */
-            location?: string;
-            /** @description Path to service account JSON key file. */
-            credentials_path?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate in the response. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0).
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-        };
-        /**
-         * @description AWS Bedrock Converse generation, including image inputs and tools for
-         *     models that support them. Uses the AWS default credential chain unless
-         *     an explicit Bedrock API key is configured. Image capability is declared
-         *     per target through inference_capabilities; model IDs are not allowlisted.
-         */
-        BedrockGeneratorConfig: {
-            /** @enum {string} */
-            provider: "bedrock";
-            /** @description Optional Bedrock Runtime endpoint override. Defaults to the regional AWS endpoint. */
-            url?: string;
-            /** @description Optional Bedrock bearer API key or secret reference. Omit to use signed AWS requests and the default credential chain. */
-            api_key?: string;
-            /**
-             * @description The Bedrock model ID to use.
-             * @example anthropic.claude-sonnet-4-5-20250929-v1:0
-             */
-            model: string;
-            /** @description AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1. */
-            region?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-1.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-        };
-        /** @description Configuration for the Anthropic generative AI provider. */
-        AnthropicGeneratorConfig: {
-            /** @enum {string} */
-            provider: "anthropic";
-            /** @description Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID. */
-            workspace_id?: string;
-            /**
-             * @description The full model ID of the Anthropic model to use.
-             * @default claude-sonnet-4-5-20250929
-             * @example claude-sonnet-4-5-20250929
-             */
-            model: string;
-            /** @description Anthropic API key or secret reference. Defaults to ANTHROPIC_API_KEY. */
-            api_key?: string;
-            /**
-             * Format: uri
-             * @description Messages API base URL. Defaults to https://api.anthropic.com/v1.
-             */
-            url?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-1.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate in the response. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0).
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-        };
-        /**
-         * @description OpenAI reasoning effort; model support varies. Omit to use the model default.
-         * @enum {string}
-         */
-        OpenAIReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-        /** @description Configuration for the Ollama generative AI provider. */
-        OllamaGeneratorConfig: {
-            /** @enum {string} */
-            provider: "ollama";
-            /**
-             * @description The name of the Ollama model to use.
-             * @example llama3.3:70b
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the Ollama API endpoint.
-             */
-            url?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate, including reasoning tokens for thinking models. */
-            max_tokens?: number;
-            /** @description Optional reasoning effort for Ollama's OpenAI-compatible endpoint. Use none to disable thinking on models that support it; supported values depend on the model. */
-            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-            /** @description HTTP response timeout in seconds for Ollama API calls. */
-            timeout?: number;
-        };
-        /** @description Configuration for the Antfly inference generative AI provider. */
-        AntflyGeneratorConfig: {
-            /** @enum {string} */
-            provider: "antfly";
-            /**
-             * @description The name of the generator model.
-             * @example ggml-org/gemma-4-E4B-it-GGUF
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-             */
-            api_url?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-            /** @description HTTP response timeout in seconds for Inference API calls. */
-            timeout?: number;
-        };
-        /** @description Personal ChatGPT plan for interactive generation. Credentials stay in the local runtime. */
-        ChatGPTGeneratorConfig: {
-            /** @enum {string} */
-            provider: "chatgpt";
-            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
-            model: string;
-            /** @description Opaque personal registration owned by the authenticated caller. */
-            connection_id: string;
-        };
-        /** @description Configuration for the OpenAI generative AI provider. */
-        OpenAIGeneratorConfig: {
-            /** @enum {string} */
-            provider: "openai";
-            /**
-             * @description The name of the OpenAI model to use.
-             * @default gpt-4.1
-             * @example gpt-4.1
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the OpenAI API endpoint.
-             */
-            url?: string;
-            /** @description The OpenAI API key. */
-            api_key?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate. */
-            max_tokens?: number;
-            /**
-             * @description OpenAI completion budget, including visible output and reasoning tokens.
-             *     Use for reasoning models instead of max_tokens; the two are mutually exclusive.
-             */
-            max_completion_tokens?: number;
-            /** @description Optional reasoning effort. Supported values depend on the selected OpenAI model. */
-            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-            /**
-             * Format: float
-             * @description Penalty for token frequency (-2.0 to 2.0).
-             */
-            frequency_penalty?: number;
-            /**
-             * Format: float
-             * @description Penalty for token presence (-2.0 to 2.0).
-             */
-            presence_penalty?: number;
-        };
-        /** @description Configuration for the OpenRouter generative AI provider. */
-        OpenRouterGeneratorConfig: {
-            /** @enum {string} */
-            provider: "openrouter";
-            /**
-             * @description The OpenRouter model identifier to use.
-             * @example openai/gpt-4.1
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the OpenRouter API endpoint.
-             * @default https://openrouter.ai/api/v1
-             */
-            url?: string;
-            /** @description The OpenRouter API key. */
-            api_key?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate in the response. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0).
-             */
-            top_p?: number;
-            /**
-             * Format: float
-             * @description Penalty for token frequency (-2.0 to 2.0).
-             */
-            frequency_penalty?: number;
-            /**
-             * Format: float
-             * @description Penalty for token presence (-2.0 to 2.0).
-             */
-            presence_penalty?: number;
-        };
-        /** @description On-device Apple Foundation Models generation. Requires a macOS Apple provider build, Apple Intelligence enabled, and its system model ready. Supports text conversations; tool calling and media attachments are not supported. */
-        AppleGeneratorConfig: {
-            /** @enum {string} */
-            provider?: "apple";
-            /** @default 256 */
-            max_tokens?: number;
-            temperature?: number;
-        };
-        /**
-         * @description Generator providers implemented by Antfly's generation runtime.
-         * @enum {string}
-         */
-        GeneratorProvider: "cloudflare" | "gemini" | "vertex" | "bedrock" | "anthropic" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly" | "apple";
-        /**
-         * @description A unified configuration for a generative AI provider.
-         * @example {
-         *       "provider": "openai",
-         *       "model": "gpt-4.1",
-         *       "temperature": 0.7,
-         *       "max_tokens": 2048
-         *     }
-         */
-        GeneratorConfig: (components["schemas"]["CloudflareGeneratorConfig"] | components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["AnthropicGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
-            /**
-             * Format: int64
-             * @description Conservative input-token ceiling per image. Required for image calls when tokens_per_minute is configured; choose a bound valid for the model and image policy.
-             */
-            max_image_input_tokens?: number;
-            rate_limit?: components["schemas"]["RateLimitConfig"];
-            provider: components["schemas"]["GeneratorProvider"];
-        };
-        /**
-         * @description Provider and model admission selects a supported constrained mechanism. Auto prefers forced tools, then provider JSON schema, then native grammar. Free-text parsing is not a mode.
-         * @default auto
-         * @enum {string}
-         */
-        ConstrainedOutput: "auto" | "tool_call" | "json_schema" | "grammar";
-        ConstrainedGenerationBatch: {
-            /** @default 8 */
-            max_items_per_call?: number;
-            /** @default 65536 */
-            max_input_bytes?: number;
-        };
-        ConstrainedGeneratorProducerConfig: {
-            generator: components["schemas"]["GeneratorConfig"];
-            instructions?: string;
-            /** @description JSON schema enforced before artifact publication. Unsupported schema vocabulary fails admission. Invalid or missing batch items receive one validation retry; successful siblings are retained. */
-            output_schema: {
-                [key: string]: unknown;
-            };
-            output?: components["schemas"]["ConstrainedOutput"];
-            batch?: components["schemas"]["ConstrainedGenerationBatch"];
-        };
-        /** Format: double */
-        ExtractionProbability: number;
-        /** @description Optional source and target labels constrain relation endpoints. A target requires a source. */
-        ExtractionRelationSchema: {
-            type: string;
-            source?: string;
-            target?: string;
-            /** @description Version 2 model-facing relation description. */
-            description?: string;
-            threshold?: components["schemas"]["ExtractionProbability"];
-        };
-        ExtractionLabelDefinition: {
-            /** @description Model-facing label description. */
-            description?: string;
-        };
-        /**
-         * Format: double
-         * @description Finite centered-logit decisions require a threshold strictly between zero and one.
-         */
-        ExtractionClassificationThreshold: number;
-        ExtractionClassificationExample: {
-            input: string;
-            label: string;
-        } | string[];
-        ExtractionClassificationSchema: {
-            name: string;
-            labels: string[];
-            /** @description The server uses false when omitted. Version 1: return highest-ranked labels up to top_k when false, or labels meeting options.threshold when true. Version 2: selects ordinary single or multi classification unless mode is specified; classification.threshold controls the decision threshold. */
-            multi_label?: boolean;
-            /** @description Version 1 NLI hypothesis template with {} as the label placeholder; the server uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit hypothesis_template; use prompt/instruction and label_definitions for model conditioning. */
-            hypothesis_template?: string;
-            /** @description Maximum labels for ordinary single-label classification; the server uses 1 when omitted. Version 2 constrained classification uses min_labels/max_labels. Advanced set-selection options or cross-task constraints on any classification in the collection reject every explicit top_k in that collection, including 1. Omit top_k when using these options. */
-            top_k?: number;
-            /**
-             * @description Version 2 ordinary classification mode. Standalone ordinal scores use the decision API.
-             *     Each model rejects modes it does not support.
-             * @enum {string}
-             */
-            mode?: "single" | "multi";
-            label_definitions?: {
-                [key: string]: components["schemas"]["ExtractionLabelDefinition"];
-            };
-            min_labels?: number;
-            /** @description Version 2 maximum selected labels. Explicit null means no maximum; omission preserves mode defaults. */
-            max_labels?: number | null;
-            ordered?: boolean;
-            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
-            candidate_threshold?: components["schemas"]["ExtractionProbability"];
-            /** @enum {string} */
-            activation?: "auto" | "sigmoid" | "softmax";
-            /** Format: double */
-            temperature?: number;
-            /** @description Version 2 fallback label; must be declared in labels. */
-            default?: string;
-            /** @description Version 2 model-facing task instruction. Mutually exclusive with instruction. */
-            prompt?: string;
-            /** @description Alias of prompt. */
-            instruction?: string;
-            examples?: components["schemas"]["ExtractionClassificationExample"][];
-        };
-        ExtractionRegexValidator: {
-            /** @enum {string} */
-            type?: "regex";
-            pattern: string;
-            /**
-             * @default full
-             * @enum {string}
-             */
-            mode?: "full" | "partial";
-            /** @default false */
-            exclude?: boolean;
-            /**
-             * @description Python-compatible regex flags supported by the active bounded validator engine; unsupported flags or syntax fail validation.
-             * @default 2
-             */
-            flags?: number;
-        };
-        ExtractionStructureField: string | ({
-            /** @enum {string} */
-            type?: "str" | "string" | "list" | "array" | "text" | "number" | "date" | "estimate";
-            /** @description Decimal precision for compatible hosted number fields. */
-            decimals?: number;
-            unit?: string;
-            /** @description Minimum of a hosted estimate distribution. */
-            min?: number;
-            max?: number;
-            step?: number;
-            enum?: string[];
-            /** @enum {string} */
-            dtype?: "str" | "list";
-            choices?: string[];
-            description?: string;
-            threshold?: components["schemas"]["ExtractionProbability"];
-            /**
-             * @description Version 2 explicit cardinality. Required fields are validated after record assignment.
-             * @enum {string}
-             */
-            cardinality?: "optional_one" | "required_one" | "zero_or_more" | "one_or_more";
-            /** @description Version 2 field spans cannot be assigned to multiple record instances. */
-            exclusive?: boolean;
-            validators?: components["schemas"]["ExtractionRegexValidator"][];
-        } & {
-            [key: string]: unknown;
-        });
-        ExtractionStructureSchema: {
-            fields: {
-                [key: string]: components["schemas"]["ExtractionStructureField"];
-            };
-            /**
-             * @description Version 2 record grouping. Omission preserves one-record extraction.
-             * @enum {string}
-             */
-            mode?: "natural" | "latent" | "anchorless";
-            /** @description Natural mode only; defaults to the first declared field. */
-            anchor?: string;
-            /** @enum {string} */
-            occurrence_policy?: "all" | "first" | "error_on_ambiguous" | "latent_all";
-        } & {
-            [key: string]: unknown;
-        };
-        ExtractionEntityDefinition: {
-            description?: string;
-            /** @enum {string} */
-            dtype?: "str" | "list";
-            /** @enum {string} */
-            type?: "str" | "string" | "list" | "array";
-            threshold?: components["schemas"]["ExtractionProbability"];
-            validators?: components["schemas"]["ExtractionRegexValidator"][];
-        };
-        /** @description Version 2 attributes are scored on retained entity spans using shared encoded states. Omitted applies_to selects all entities; [] selects none. Raw labels must be unique across groups, including when qualify_labels is true. Group names text,confidence,start,end are reserved. */
-        ExtractionAttributeGroup: {
-            labels: string[];
-            /** @default false */
-            multi_label?: boolean;
-            threshold?: components["schemas"]["ExtractionProbability"];
-            applies_to?: string[];
-            /** @default false */
-            qualify_labels?: boolean;
-        };
-        ExtractionConstraintLabelRef: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "LabelRef";
-            task: string;
-            label: string;
-        };
-        ExtractionConstraintAnySelected: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "AnySelected";
-            task: string;
-        };
-        ExtractionConstraintAnyOtherSelected: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "AnyOtherSelected";
-            task: string;
-        };
-        ExtractionConstraintIsDefault: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "IsDefault";
-            task: string;
-        };
-        ExtractionConstraintCardinality: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "Cardinality";
-            task: string;
-            minimum?: number;
-            maximum?: number | null;
-        };
-        ExtractionConstraintMinLevel: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "MinLevel";
-            task: string;
-            level: string | number;
-        };
-        ExtractionConstraintMaxLevel: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "MaxLevel";
-            task: string;
-            level: string | number;
-        };
-        ExtractionConstraintAtLevel: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "AtLevel";
-            task: string;
-            level: string | number;
-        };
-        ExtractionConstraintNot: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "Not";
-            child: components["schemas"]["ExtractionClassificationConstraint"];
-        };
-        ExtractionConstraintAnd: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "And";
-            children: components["schemas"]["ExtractionClassificationConstraint"][];
-        };
-        ExtractionConstraintOr: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "Or";
-            children: components["schemas"]["ExtractionClassificationConstraint"][];
-        };
-        ExtractionConstraintExactlyOneOf: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "ExactlyOneOf";
-            children: components["schemas"]["ExtractionClassificationConstraint"][];
-        };
-        ExtractionConstraintImplies: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "Implies";
-            cond: components["schemas"]["ExtractionClassificationConstraint"];
-            then: components["schemas"]["ExtractionClassificationConstraint"];
-        };
-        ExtractionConstraintIff: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "Iff";
-            left: components["schemas"]["ExtractionClassificationConstraint"];
-            right: components["schemas"]["ExtractionClassificationConstraint"];
-        };
-        ExtractionConstraintExcludes: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "Excludes";
-            left: components["schemas"]["ExtractionClassificationConstraint"];
-            right: components["schemas"]["ExtractionClassificationConstraint"];
-        };
-        /** @description Declarative, bounded constraint AST. Task and label references are validated before inference. Nesting is bounded by the server schema limit. */
-        ExtractionClassificationConstraint: components["schemas"]["ExtractionConstraintLabelRef"] | components["schemas"]["ExtractionConstraintAnySelected"] | components["schemas"]["ExtractionConstraintAnyOtherSelected"] | components["schemas"]["ExtractionConstraintIsDefault"] | components["schemas"]["ExtractionConstraintCardinality"] | components["schemas"]["ExtractionConstraintMinLevel"] | components["schemas"]["ExtractionConstraintMaxLevel"] | components["schemas"]["ExtractionConstraintAtLevel"] | components["schemas"]["ExtractionConstraintNot"] | components["schemas"]["ExtractionConstraintAnd"] | components["schemas"]["ExtractionConstraintOr"] | components["schemas"]["ExtractionConstraintExactlyOneOf"] | components["schemas"]["ExtractionConstraintImplies"] | components["schemas"]["ExtractionConstraintIff"] | components["schemas"]["ExtractionConstraintExcludes"];
-        ExtractionJointEntity: {
-            description?: string;
-            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
-            candidate_threshold?: components["schemas"]["ExtractionProbability"];
-            max_candidates?: number;
-            allow_nested?: boolean;
-        };
-        ExtractionJointRelation: {
-            head: string[];
-            tail: string[];
-            /** @description Retained declarative metadata; model conditioning follows the pinned JointIE compiler. */
-            description?: string;
-            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
-            candidate_threshold?: components["schemas"]["ExtractionProbability"];
-            /** @default true */
-            directed?: boolean;
-            /** @default false */
-            symmetric?: boolean;
-            inverse?: string;
-            /** @default false */
-            allow_self?: boolean;
-            max_per_head?: number;
-            max_per_tail?: number;
-        };
-        ExtractionJointConstraintTypedEndpoints: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "TypedEndpoints";
-            relation?: string;
-            head_types?: string[];
-            tail_types?: string[];
-        };
-        ExtractionJointConstraintNoSelfLoops: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "NoSelfLoops";
-            relation?: string;
-        };
-        ExtractionJointConstraintUniqueRelationPair: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "UniqueRelationPair";
-            relation?: string;
-            /** @default true */
-            directed?: boolean;
-        };
-        ExtractionJointConstraintUniqueRelationSlot: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "UniqueRelationSlot";
-            relation?: string;
-            /**
-             * @default head
-             * @enum {string}
-             */
-            slot?: "head" | "tail" | "slot";
-        };
-        ExtractionJointConstraintEntityOverlapPolicy: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "EntityOverlapPolicy";
-            /** @enum {string} */
-            policy?: "allow" | "disallow" | "nested";
-        };
-        ExtractionJointConstraintMaxRelationsPerHead: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "MaxRelationsPerHead";
-            relation?: string;
-            limit: number;
-        };
-        ExtractionJointConstraintMaxRelationsPerTail: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "MaxRelationsPerTail";
-            relation?: string;
-            limit: number;
-        };
-        ExtractionJointConstraintSymmetricRelation: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "SymmetricRelation";
-            relation: string;
-        };
-        ExtractionJointConstraintAcyclicRelation: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "AcyclicRelation";
-            relation: string;
-        };
-        ExtractionJointConstraintInverseRelation: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "InverseRelation";
-            relation: string;
-            inverse: string;
-        };
-        ExtractionJointConstraint: components["schemas"]["ExtractionJointConstraintTypedEndpoints"] | components["schemas"]["ExtractionJointConstraintNoSelfLoops"] | components["schemas"]["ExtractionJointConstraintUniqueRelationPair"] | components["schemas"]["ExtractionJointConstraintUniqueRelationSlot"] | components["schemas"]["ExtractionJointConstraintEntityOverlapPolicy"] | components["schemas"]["ExtractionJointConstraintMaxRelationsPerHead"] | components["schemas"]["ExtractionJointConstraintMaxRelationsPerTail"] | components["schemas"]["ExtractionJointConstraintSymmetricRelation"] | components["schemas"]["ExtractionJointConstraintAcyclicRelation"] | components["schemas"]["ExtractionJointConstraintInverseRelation"];
-        /** @description Separate typed graph schema, mutually exclusive with ordinary extraction families. Hard typed endpoints, overlap, uniqueness and declared graph constraints apply to every returned edge, including derived companions. */
-        ExtractionJointSchema: {
-            entities: {
-                [key: string]: string | components["schemas"]["ExtractionJointEntity"];
-            };
-            relations?: {
-                [key: string]: components["schemas"]["ExtractionJointRelation"];
-            };
-            constraints?: components["schemas"]["ExtractionJointConstraint"][];
-        };
-        /**
-         * @description Version 1 selects one extraction family; entities may accompany relations.
-         *     With schema_version 2, entities, attributes, classifications, structures,
-         *     and ordinary relations may share one encoded input. joint_ie is a separate,
-         *     mutually exclusive typed graph schema. The version 2 compiler rejects
-         *     unknown fields and validates all references before model execution.
-         */
-        ExtractionSchema: {
-            entities?: string[];
-            relations?: components["schemas"]["ExtractionRelationSchema"][];
-            classifications?: components["schemas"]["ExtractionClassificationSchema"][];
-            structures?: {
-                [key: string]: components["schemas"]["ExtractionStructureSchema"];
-            };
-            entity_definitions?: {
-                [key: string]: components["schemas"]["ExtractionEntityDefinition"];
-            };
-            entity_attributes?: {
-                [key: string]: components["schemas"]["ExtractionAttributeGroup"];
-            };
-            classification_constraints?: components["schemas"]["ExtractionClassificationConstraint"][];
-            joint_ie?: components["schemas"]["ExtractionJointSchema"];
-        } & {
-            [key: string]: unknown;
-        };
-        /**
-         * @description Token probabilities require complete decoder evidence for the allowed values. Verdict-only is explicit opt-in; model-reported confidence is never used.
-         * @default token_logprobs
-         * @enum {string}
-         */
-        ConstrainedProbabilities: "token_logprobs" | "verdict_only";
-        /**
-         * @description Half-open offsets into the immutable caller text. Version 2 defaults to utf8_bytes. No normalization, lowercasing or synthetic suffix is included in these coordinates.
-         * @enum {string}
-         */
-        ExtractionOffsetUnit: "utf8_bytes" | "unicode_codepoints" | "utf16_codeunits";
-        /** @description Version 2 never silently truncates. Reject is the default. Windowing requires an enabled runtime capability, reconstructs document-global offsets and revalidates all hard graph constraints after merging. */
-        ExtractionLongDocumentOptions: {
-            /**
-             * @default reject
-             * @enum {string}
-             */
-            mode?: "reject" | "window";
-            /** @description Maximum body words per window; also bounded by the checkpoint and encoded token limits. */
-            window_words?: number;
-            overlap_words?: number;
-            max_windows?: number;
-            /**
-             * @description Identity of latent, anchorless and legacy records across windows. Occurrence uses exact source spans; semantic explicitly merges equal field values. Natural records always use their exact source anchor. This is independent of annotation occurrence_policy.
-             * @default occurrence
-             * @enum {string}
-             */
-            record_identity?: "occurrence" | "semantic";
-        };
-        /** @description Bounded classification and JointIE selection. Exact optimality is with respect to admitted candidates. A completed beam may be feasible without an optimality proof. By default exhausted search is an error; best_effort permits only a validated feasible witness and reports exhausted:true. */
-        ExtractionDecoderOptions: {
-            /**
-             * @description Omit to use the model's per-task default. GLiNER2.5 uses source-compatible beam selection for single-window JointIE and automatic selection for classification. Windowed JointIE uses the native automatic global solver with independent window resources. Explicit values select the native bounded search algorithm.
-             * @enum {string}
-             */
-            algorithm?: "auto" | "exact" | "beam";
-            beam_width?: number;
-            max_search_nodes?: number;
-            max_local_assignments?: number;
-            /** @default false */
-            best_effort?: boolean;
-        };
-        /** @description JointIE proposal admission and utility calibration. Entity candidate caps are bypassed for endpoints of retained relation proposals, subject to server hard bounds. entity_threshold overrides candidate admission, not entity decision thresholds. */
-        ExtractionJointOptions: {
-            candidate_threshold?: components["schemas"]["ExtractionProbability"];
-            entity_threshold?: components["schemas"]["ExtractionProbability"];
-            relation_role_threshold?: components["schemas"]["ExtractionProbability"];
-            top_k_entities?: number;
-            top_k_roles?: number;
-            relation_pair_cap?: number;
-            max_edges_per_type?: number;
-            /** Format: double */
-            entity_weight?: number;
-            /** Format: double */
-            relation_weight?: number;
-        };
-        ExtractionReaderOptions: {
-            provider?: string;
-            model?: string;
-            url?: string;
-            api_url?: string;
-        } & {
-            [key: string]: unknown;
-        };
-        /** @description Optional cross-input entity and relation deduplication. */
-        ExtractionResolverOptions: {
-            /**
-             * Format: float
-             * @default 0.85
-             */
-            similarity_threshold?: number;
-            /** @default true */
-            type_must_match?: boolean;
-            /**
-             * Format: float
-             * @default 0
-             */
-            min_entity_confidence?: number;
-            /**
-             * Format: float
-             * @default 0
-             */
-            min_relation_confidence?: number;
-            /** @default true */
-            deduplicate_relations?: boolean;
-            /** @default true */
-            track_provenance?: boolean;
-        };
-        ExtractionOptions: {
-            /** Format: float */
-            threshold?: number;
-            flat_ner?: boolean;
-            include_confidence?: boolean;
-            include_spans?: boolean;
-            /**
-             * @description Version 2 source word splitting. char keeps ASCII alphanumeric and @._-+ runs together and splits other non-whitespace codepoints, preserving original source offsets. An input's options replace the shared options in full; omitted word_splitter uses whitespace. Explicit word_splitter is rejected by version 1.
-             * @enum {string}
-             */
-            word_splitter?: "whitespace" | "char";
-            /**
-             * @description Version 2 overlap selection. flat/disallow prohibit overlap, nested permits containment, longest removes strictly contained spans.
-             * @enum {string}
-             */
-            overlap?: "allow" | "nested" | "flat" | "disallow" | "longest";
-            offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
-            long_document?: components["schemas"]["ExtractionLongDocumentOptions"];
-            decoder?: components["schemas"]["ExtractionDecoderOptions"];
-            joint_ie?: components["schemas"]["ExtractionJointOptions"];
-            reader?: components["schemas"]["ExtractionReaderOptions"];
-            resolver?: components["schemas"]["ExtractionResolverOptions"];
-        } & {
-            [key: string]: unknown;
-        };
-        GeneratedExtractorConfig: {
-            /** @enum {string} */
-            method: "generated";
-            generator: components["schemas"]["GeneratorConfig"];
-            schema: components["schemas"]["ExtractionSchema"];
-            entity_definitions?: {
-                [key: string]: string;
-            };
-            instructions?: string;
-            output?: components["schemas"]["ConstrainedOutput"];
-            probabilities?: components["schemas"]["ConstrainedProbabilities"];
-            batch?: components["schemas"]["ConstrainedGenerationBatch"];
-            options?: components["schemas"]["ExtractionOptions"];
-        };
         /** @description Zero-shot label stage over accepted dense embedding artifacts. Label prompts use the source embedding producer; changing this vocabulary rebuilds labels without reading or decoding media. Scores are raw dot products, not probabilities. The asset enrichment must name a dense embedding enrichment in source_artifact_name. */
         VectorLabelsConfig: {
             labels: {
@@ -16954,6 +17380,63 @@ export interface components {
             version_field?: string;
             /** @description Row field holding the source last-modified timestamp. */
             last_modified_field?: string;
+        };
+        /** @description Text-quality thresholds. `native_text.quality` assesses native document text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality flags are not guarantees of correct reading order or complete document semantics. */
+        DocumentExtractionTextQualityConfig: {
+            /**
+             * @description Minimum non-whitespace Unicode characters before text passes the length check.
+             * @default 50
+             */
+            min_chars?: number;
+            /**
+             * @description Minimum words before the garbled-text check applies.
+             * @default 20
+             */
+            garbled_min_words?: number;
+            /**
+             * @description Words sampled by the garbled-text check.
+             * @default 50
+             */
+            garbled_sample_words?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of single-character words before text counts as garbled.
+             * @default 0.4
+             */
+            max_single_char_word_ratio?: number;
+            /**
+             * @description Minimum non-whitespace Unicode characters for a line to count in the corrupted-line check.
+             * @default 15
+             */
+            min_line_chars?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of corrupted lines.
+             * @default 0.2
+             */
+            max_corrupted_line_ratio?: number;
+            /**
+             * Format: double
+             * @description Font corruption score above which a substantial line counts as corrupted.
+             * @default 0.5
+             */
+            max_font_corruption?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of Unicode replacement characters.
+             * @default 0.05
+             */
+            max_replacement_ratio?: number;
+        };
+        /** @description Native document text policy and quality assessment. No OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR availability. */
+        DocumentExtractionNativeTextConfig: {
+            /**
+             * @description `source` retains decoded source text, including off-page runs, for auditing. `page` excludes runs wholly outside the page or a known clipping box while retaining hidden OCR/accessibility text. `visible` additionally excludes nonpainting and fully transparent text. These policies do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.
+             * @default page
+             * @enum {string}
+             */
+            policy?: "source" | "page" | "visible";
+            quality?: components["schemas"]["DocumentExtractionTextQualityConfig"];
         };
         /** @description Reader provider for OCR. Every provider except `apple` requires `model`; Apple uses Vision text recognition and accepts no model, credentials, or prompt. */
         DocumentExtractionReaderConfig: {
@@ -17031,59 +17514,12 @@ export interface components {
              */
             max_dimension?: number;
         };
-        /** @description Thresholds that decide when a PDF page's native text is too poor to keep, in `auto` mode. */
-        DocumentExtractionOcrQualityConfig: {
-            /**
-             * @description Pages with fewer meaningful characters are read with OCR.
-             * @default 50
-             */
-            min_content_chars?: number;
-            /**
-             * @description Minimum words before the garbled-text check applies.
-             * @default 20
-             */
-            garbled_min_words?: number;
-            /**
-             * @description Words sampled by the garbled-text check.
-             * @default 50
-             */
-            garbled_sample_words?: number;
-            /**
-             * Format: double
-             * @description Maximum ratio of single-character words before text counts as garbled.
-             * @default 0.4
-             */
-            max_single_char_word_ratio?: number;
-            /**
-             * @description Minimum characters for a line to count in the corrupted-line check.
-             * @default 15
-             */
-            substantial_line_min_chars?: number;
-            /**
-             * Format: double
-             * @description Maximum ratio of corrupted lines.
-             * @default 0.2
-             */
-            max_corrupted_line_ratio?: number;
-            /**
-             * Format: double
-             * @description Font corruption score at which text is replaced by OCR.
-             * @default 0.5
-             */
-            font_corruption_score_threshold?: number;
-            /**
-             * Format: double
-             * @description Maximum ratio of Unicode replacement characters.
-             * @default 0.05
-             */
-            max_replacement_char_ratio?: number;
-        };
         /** @description Reads scanned pages and images. Name exactly one of `reader` or `generator`. Readers run their own OCR task; generators receive a transcription instruction. */
         DocumentExtractionOcrConfig: {
             reader?: components["schemas"]["DocumentExtractionReaderConfig"];
             generator?: components["schemas"]["GeneratorConfig"];
             /**
-             * @description `auto` reads PDF pages whose native text fails the `quality` checks, and images. `always` reads every page.
+             * @description `auto` reads PDF pages whose native text fails `native_text.quality`, and images. `always` reads every page.
              * @default auto
              * @enum {string}
              */
@@ -17091,7 +17527,7 @@ export interface components {
             /** @description Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts. */
             prompt?: string;
             render?: components["schemas"]["DocumentExtractionRenderConfig"];
-            quality?: components["schemas"]["DocumentExtractionOcrQualityConfig"];
+            quality?: components["schemas"]["DocumentExtractionTextQualityConfig"];
         };
         /** @description Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN. */
         CloudflareSTTConfig: {
@@ -17245,6 +17681,8 @@ export interface components {
          */
         STTConfig: (components["schemas"]["CloudflareSTTConfig"] | components["schemas"]["OpenAISTTConfig"] | components["schemas"]["VertexSTTConfig"] | components["schemas"]["AntflySTTConfig"] | components["schemas"]["AppleSTTConfig"]) & {
             provider: components["schemas"]["STTProvider"];
+            /** @description Provider-declared hard per-call token bound. Required for hosted document reading when measurements are unavailable; the full allowance is charged against the document budget, never as measured usage. */
+            max_total_tokens?: number;
         };
         /** @description Transcribes audio units. */
         DocumentExtractionTranscriptionConfig: {
@@ -17308,6 +17746,7 @@ export interface components {
              * @default true
              */
             html_strip_tags?: boolean;
+            native_text?: components["schemas"]["DocumentExtractionNativeTextConfig"];
             ocr?: components["schemas"]["DocumentExtractionOcrConfig"];
             transcription?: components["schemas"]["DocumentExtractionTranscriptionConfig"];
             /**
@@ -21167,8 +21606,33 @@ export interface components {
             mime_type: string;
             sampling?: components["schemas"]["VideoSamplingPolicy"];
         };
-        /** @description A content part for multimodal input (text, image URL, or inline media). */
-        ContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["ImageURLContentPart"] | components["schemas"]["MediaContentPart"];
+        /** @description Image, audio, or video named by a source record's `content.resource`. Accepted only on the Antfly gateway's generate and chat routes, which fetch the pinned version under `remote_content.security` and replace this part with inline media, so the source URL never reaches a model vendor. Fetching requires a nonempty `allowed_hosts`. Images are inlined within a 16 MiB expanded request. Audio and video travel as binary attachments, up to 256 MiB per request and `max_download_size_bytes`. Hosted providers receive them inline and may reject large requests. Models that do not support the media type reject the request. */
+        SourceContentPart: {
+            /** @enum {string} */
+            type: "source";
+            source: {
+                /** @enum {string} */
+                type: "source";
+                /** @description HTTP(S) URL. Treat source media URLs as private. */
+                uri: string;
+                /** @description image/png, image/jpeg, image/webp, image/gif, or an audio/* or video/* type. */
+                mime_type: string;
+                /** @description Quoted strong ETag. The fetch fails if the source no longer has this version. */
+                version: string;
+                /**
+                 * @default strong_etag
+                 * @enum {string}
+                 */
+                version_kind?: "strong_etag";
+                /**
+                 * Format: int64
+                 * @description Exact object length. Images are limited by the 16 MiB request size.
+                 */
+                length: number;
+            };
+        };
+        /** @description A content part for multimodal input (text, image URL, inline media, or a pinned source reference). */
+        ContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["ImageURLContentPart"] | components["schemas"]["MediaContentPart"] | components["schemas"]["SourceContentPart"];
         /**
          * @description Message content. Supports two formats:
          *     - Simple string: "Hello, how are you?"
@@ -23414,6 +23878,8 @@ export interface components {
         };
         /** @description OpenAI-compatible embedding request with inference multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized vectors. */
         InferenceEmbedRequest: {
+            /** @description Optional immutable execution revision from model capabilities. Every acquired model, including recovery attempts, must match before inference. A mismatch returns 409 with X-Antfly-Capability-Stale true. Successful execution acknowledges the pin in X-Antfly-Model-Revision for JSON and numeric responses; callers requiring a pin must reject missing or different acknowledgements. */
+            model_revision?: string;
             /** @description Optional exact asset identity pin. A mismatch returns 409 before inference. */
             model_identity?: string;
             /** @description Model name to use for embedding generation */
@@ -23711,13 +24177,72 @@ export interface components {
             /** @description Rewritten texts for this input, one per beam. */
             texts: string[];
         };
-        /** @description Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference. */
+        InferenceAudioReadCapabilities: {
+            forced_language: boolean;
+            detected_language: boolean;
+            timestamps: boolean;
+            diarization: boolean;
+            windowing: boolean;
+            /**
+             * Format: int64
+             * @description Maximum duration for this backend in milliseconds. Null means windowed recognition bounded by source and execution budgets.
+             */
+            max_duration_ms?: number | null;
+        };
+        InferenceAudioReadOptions: components["schemas"]["AudioReadOptions"];
+        InferenceAudioReadSegment: {
+            text: string;
+            /**
+             * @description phrase uses recognizer-supplied phrase clocks; window provides only the original recognition-window bounds. Neither claims word alignment. Absent means unspecified.
+             * @enum {string|null}
+             */
+            granularity?: "phrase" | "window" | null;
+            /**
+             * Format: int64
+             * @description Start in milliseconds relative to the original recording.
+             */
+            start_ms: number;
+            /**
+             * Format: int64
+             * @description Exclusive end in milliseconds relative to the original recording.
+             */
+            end_ms: number;
+            /**
+             * Format: int64
+             * @description Start UTF-8 byte offset in the containing read result text.
+             */
+            text_start: number;
+            /**
+             * Format: int64
+             * @description Exclusive end UTF-8 byte offset in the containing read result text.
+             */
+            text_end: number;
+            /** @description Speaker label when diarization was requested and established. */
+            speaker?: string | null;
+        };
+        /** @description Recognition evidence for the audio track only. Video frames are not captioned. Absent segments and speakers make no alignment or speaker claim. */
+        InferenceAudioReadMetadata: {
+            /**
+             * Format: int64
+             * @description Decoded recording duration in milliseconds. Null when a remote recognition provider does not report duration.
+             */
+            duration_ms: number | null;
+            language?: string | null;
+            /** @enum {string} */
+            language_source?: "forced" | "detected" | "unknown";
+            segments?: components["schemas"]["InferenceAudioReadSegment"][] | null;
+            speakers?: string[] | null;
+        };
+        /** @description Read exactly one of images, documents, or audio using capability-aware reader dispatch, with provenance and completion status. Supported video containers are read from their audio track only. */
         InferenceReadRequest: {
             /**
-             * @description Name of reader model from models_dir/readers/
+             * @description Explicit reader, ASR, audio-capable generator, named target, or composed document model. ASR storage remains models_dir/transcribers/.
              * @example lightonai/LightOnOCR-3-0.8B
              */
             model: string;
+            audio_options?: components["schemas"]["InferenceAudioReadOptions"];
+            /** @description Base64-encoded audio, a data URI, or a supported source URL, mutually exclusive with images and documents. Audio tracks in supported video containers are transcribed; frames are not captioned. Whisper preserves long-recording windowing; Gemma is bounded to 30 seconds. All audio reads use document orchestration, artifacts and durable jobs. */
+            audio?: string;
             /**
              * @description Request an opaque, process-local reading handle for extraction reuse. Retention is best effort; inspect document.artifact_id and artifact_ttl_ms.
              * @default false
@@ -23750,6 +24275,8 @@ export interface components {
              * @description Maximum output tokens per page. When omitted, the selected reader
              *     model supplies its default, bounded by deployment limits. Explicit
              *     values override the model default and must fit model and server limits.
+             *     Audio generator backends accept this option; Whisper uses its recognition
+             *     and execution budgets and rejects an explicit max_tokens.
              * @example 256
              */
             max_tokens?: number;
@@ -23794,12 +24321,13 @@ export interface components {
             label?: string;
         };
         InferenceReadResult: {
+            audio?: components["schemas"]["InferenceAudioReadMetadata"] | null;
             /** @description Original document source ID. */
             source_id?: string;
             /** @description One-based original page or slide number. */
             number?: number;
             /** @enum {string} */
-            kind?: "page" | "slide" | "image";
+            kind?: "page" | "slide" | "image" | "audio";
             /** @description Native layout/master content, source part identity, and visibility/coverage metadata; unsupported composition remains unresolved. */
             inherited_parts?: {
                 [key: string]: unknown;
@@ -23871,7 +24399,8 @@ export interface components {
             }[];
             /** @description Name of model used for reading */
             model: string;
-            usage?: components["schemas"]["InferenceGenerateUsage"];
+            /** @description Token measurements and any explicit unmeasured document allowances, or null when neither is available. */
+            usage?: components["schemas"]["InferenceGenerateUsage"] | null;
             /** @description Observed execution path. Omitted by older compatible servers. */
             execution?: components["schemas"]["InferenceBatchExecutionReport"];
         };
@@ -23880,61 +24409,6 @@ export interface components {
             object: "read";
             /** @description Original input image index. */
             index: number;
-        };
-        InferenceTranscribeRequest: {
-            /**
-             * @description Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
-             * @example openai/whisper-tiny
-             */
-            model: string;
-            /**
-             * Format: byte
-             * @description Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
-             */
-            audio: string;
-            /**
-             * @description Force specific language for transcription (optional, model-dependent)
-             * @example en
-             */
-            language?: string;
-            /** @description Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate). */
-            timestamps?: boolean;
-            /** @description Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance. */
-            diarization?: boolean;
-        };
-        InferenceTranscribeResponse: {
-            /**
-             * @description Object type, always "list"
-             * @enum {string}
-             */
-            object: "list";
-            /** @description Transcription result objects. */
-            data: components["schemas"]["InferenceTranscribeObject"][];
-            /** @description Name of model used for transcription */
-            model: string;
-            usage?: components["schemas"]["InferenceGenerateUsage"];
-        };
-        InferenceTranscribeObject: {
-            /** @enum {string} */
-            object: "transcription";
-            /** @description Input audio index. */
-            index: number;
-            /**
-             * @description Transcribed text from the audio
-             * @example Hello, how are you today?
-             */
-            text: string;
-            /**
-             * @description Detected or forced language
-             * @example en
-             */
-            language?: string;
-            /** @description Decoded clip duration in milliseconds. */
-            duration_ms?: number;
-            /** @description Timestamped phrases in clip order, so a transcript can be indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets are relative to the whole clip. */
-            segments?: components["schemas"]["InferenceDictationSegment"][];
-            /** @description Speaker labels found by diarization, in order of first appearance. Present only when `diarization` was requested. */
-            speakers?: string[];
         };
         /**
          * @description How the cleanup pass rewrites the transcript. `clean` removes fillers
@@ -23960,7 +24434,7 @@ export interface components {
              * @example en
              */
             language?: string;
-            /** @description Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate). */
+            /** @description Enable timestamp-aware decoding. Omitted preserves the dictation default (on). */
             timestamps?: boolean;
             /**
              * @description Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
@@ -24200,6 +24674,7 @@ export interface components {
         };
         /** @description Information about a model including its capabilities */
         InferenceModelInfo: {
+            audio_read?: components["schemas"]["InferenceAudioReadCapabilities"];
             /**
              * @description Effective model-aware chunk operational ceilings for working/output/event
              *     bytes, chunk/dependency/index counts and remote fetched bytes, requests
@@ -24226,6 +24701,11 @@ export interface components {
                 /** Format: int64 */
                 minimum_dimensions: number;
             };
+            /**
+             * @description The embedding endpoint enforces model_revision and acknowledges successful execution in X-Antfly-Model-Revision for both JSON and numeric responses. An observed model_revision alone does not establish this support.
+             * @default false
+             */
+            model_revision_pinning?: boolean;
             /** @description Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights. */
             model_revision?: string;
             /**
@@ -24919,8 +25399,10 @@ export interface components {
             prompt_tokens: number;
             /** @description Number of tokens in the completion */
             completion_tokens: number;
-            /** @description Total tokens used (prompt + completion) */
+            /** @description Total token budget consumed (measured prompt and completion tokens plus unmeasured allowances). */
             total_tokens: number;
+            /** @description Conservative provider-declared token allowance spent on document calls without measurements. Included in total_tokens; not measured or billable usage. */
+            unmeasured_tokens?: number;
             /** @description Cumulative logical child invocations for a document run. */
             model_calls?: number;
             /** @description Physical child operation invocations, separate from logical composite calls. */
@@ -29867,12 +30349,15 @@ export interface components {
         };
         /** @description A trained decider request or a constrained generator request. */
         DecisionRequest: components["schemas"]["InferenceDecideRequest"] | components["schemas"]["GeneratedDecideRequest"];
-        /**
-         * @description Omission preserves the legacy extraction contract. Version 2 opts into strict mixed-task schemas, per-input replacements and explicit offsets; the selected model/runtime must support every requested feature.
-         * @default 1
-         * @enum {integer}
-         */
-        ExtractionSchemaVersion: 1 | 2;
+        /** @description Recognition options, checked against every selected backend and fallback before inference. Whisper supports all options and pause-aware windowing of long recordings. Gemma supports transcription up to 30 seconds and rejects language, timestamps and diarization requests. No backend is substituted to satisfy an option. */
+        AudioReadOptions: {
+            /** @description Force recognition in this language (e.g. en). Omitted means detect language where supported; this is not a translation or cleanup request. Gemma does not support language control or detection metadata. */
+            language?: string;
+            /** @description Request phrase timestamps in milliseconds relative to the original source recording. Defaults to false. Does not imply word alignment. */
+            timestamps?: boolean;
+            /** @description Request speaker labels and temporal segments. Defaults to false. Whisper requires the local speaker embedding model; unavailable models cause an explicit error. Implies timestamp decoding. */
+            diarization?: boolean;
+        };
         DocumentSource: {
             /** @description Image-only perspective correction. Four clockwise corners in original image-edge pixels, ordered top-left, top-right, bottom-right, bottom-left. OCR evidence remains in original source coordinates. */
             quadrilateral?: number[][];
@@ -29881,8 +30366,8 @@ export interface components {
             /** @description Inline data URI or location allowed by the deployment content security policy. */
             url: string;
             /** @enum {string} */
-            media_type: "application/pdf" | "application/vnd.openxmlformats-officedocument.presentationml.presentation" | "image/png" | "image/jpeg" | "image/webp";
-            /** @description Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide. */
+            media_type: "application/pdf" | "application/vnd.openxmlformats-officedocument.presentationml.presentation" | "image/png" | "image/jpeg" | "image/webp" | "audio/wav" | "audio/mpeg" | "audio/aac" | "audio/mp4" | "audio/ogg" | "audio/flac" | "audio/webm" | "video/mp4" | "video/quicktime" | "video/webm";
+            /** @description Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide. Audio/video recordings are one source unit and do not accept page selection. */
             pages?: number[];
             /**
              * @description Include slide speaker notes as separate evidence, never silently as visible slide text.
@@ -29913,11 +30398,12 @@ export interface components {
         };
         /** @description Atomic extraction request. Supply exactly one of inputs, documents or read_artifact. Every input is validated before inference; failures return no partial data. */
         ExtractionRequest: {
+            audio_options?: components["schemas"]["AudioReadOptions"];
             model: string;
             schema_version?: components["schemas"]["ExtractionSchemaVersion"];
             /** @description Opaque handle returned by read with retain_artifact. Mutually exclusive with inputs and documents. Reuses the immutable complete reading without downloading or running OCR again. Handles expire and are local to the serving process. */
             read_artifact?: string;
-            /** @description Complete PDF/PPTX/image sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping. */
+            /** @description Complete PDF/PPTX/image/audio sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping. */
             documents?: components["schemas"]["DocumentSource"][];
             inputs?: components["schemas"]["ExtractionInput"][];
             schema: components["schemas"]["ExtractionSchema"];
@@ -30489,6 +30975,13 @@ export interface components {
              */
             allowed_paths?: string[];
             /**
+             * @description Exact source companion base URLs that a chat `source` part may fetch, matched on scheme, host, port and path. This is how a loopback or private companion is allowed; such URLs need no `allowed_hosts` entry. Every other `source` URL needs `allowed_hosts` and always keeps private-IP blocking, whatever `block_private_ips` says. Template fetches ignore this setting.
+             * @example [
+             *       "http://127.0.0.1:8082/v1/media/"
+             *     ]
+             */
+            source_media_base_urls?: string[];
+            /**
              * @description User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
              * @example AntflyDB/1.0
              */
@@ -30718,7 +31211,21 @@ export interface components {
             content_security?: components["schemas"]["ContentSecurityConfig"];
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
             s3_credentials?: components["schemas"]["Credentials"];
-            /** @description Experimental execution batching; mode on explicitly enables qualified CUDA scheduling. Resource and request ceilings still apply. */
+            /** @description Opt-in interleaving of independently owned requests on backends declaring safe step sharing. Independent of row batching; graph, prefix-cache, speculative and multimodal routes remain exclusive. Currently qualified for at most two active E4B CUDA requests with one row per step. */
+            cooperative_execution?: {
+                /**
+                 * @default off
+                 * @enum {string}
+                 */
+                mode?: "off" | "on";
+                /** @default 2 */
+                max_active_requests?: number;
+                /** @default 8 */
+                short_context_burst?: number;
+                /** @default 5000 */
+                decode_handoff_wait_us?: number;
+            };
+            /** @description Experimental row batching; independent from cooperative_execution. Mode on explicitly enables qualified CUDA row scheduling. Resource and request ceilings still apply. */
             generation_batching?: {
                 /**
                  * @default off
@@ -31171,6 +31678,570 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    getTablePrivacy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Read table privacy policy and coverage */
+            200: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    putTablePrivacy: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Required exact ETag when replacing an existing policy. */
+                "If-Match"?: string;
+            };
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrivacyPolicy"];
+            };
+        };
+        responses: {
+            /** @description Apply table privacy policy */
+            202: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    previewTablePrivacy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrivacyPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Inspect a bounded sample without saving the policy */
+            200: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyPreview"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    startTablePrivacyScan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrivacyScanRequest"];
+            };
+        };
+        responses: {
+            /** @description Start a durable privacy rescan */
+            202: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyScan"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Sixteen scans are active; retry after one finishes. Active scans are never evicted to admit a later request. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getTablePrivacyScan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                scanId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Read privacy scan progress */
+            200: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyScan"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listTablePrivacyFindings: {
+        parameters: {
+            query?: {
+                cursor?: string;
+                document?: string;
+                field?: string;
+                category?: string;
+                policy_version?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List current privacy findings */
+            200: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyFindingsPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    queryTablePrivacyFindings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrivacyFindingsRequest"];
+            };
+        };
+        responses: {
+            /** @description List current privacy findings */
+            200: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyFindingsPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
     getLakeCatalog: {
         parameters: {
             query?: never;
@@ -31946,7 +33017,7 @@ export interface operations {
             path: {
                 connection_id: string;
                 /** @description Requires the connection capability `models.<operation>`. */
-                operation: "embed" | "generate" | "rerank" | "chunk" | "extract" | "rewrite" | "read" | "transcribe";
+                operation: "embed" | "generate" | "rerank" | "chunk" | "extract" | "rewrite" | "read" | "dictate";
             };
             cookie?: never;
         };
@@ -40215,6 +41286,584 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    getNamespaceTablePrivacy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Read table privacy policy and coverage */
+            200: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    putNamespaceTablePrivacy: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Required exact ETag when replacing an existing policy. */
+                "If-Match"?: string;
+            };
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrivacyPolicy"];
+            };
+        };
+        responses: {
+            /** @description Apply table privacy policy */
+            202: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    previewNamespaceTablePrivacy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrivacyPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Inspect a bounded sample without saving the policy */
+            200: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyPreview"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    startNamespaceTablePrivacyScan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrivacyScanRequest"];
+            };
+        };
+        responses: {
+            /** @description Start a durable privacy rescan */
+            202: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyScan"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Sixteen scans are active; retry after one finishes. Active scans are never evicted to admit a later request. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getNamespaceTablePrivacyScan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                scanId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Read privacy scan progress */
+            200: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyScan"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listNamespaceTablePrivacyFindings: {
+        parameters: {
+            query?: {
+                cursor?: string;
+                document?: string;
+                field?: string;
+                category?: string;
+                policy_version?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List current privacy findings */
+            200: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyFindingsPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    queryNamespaceTablePrivacyFindings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrivacyFindingsRequest"];
+            };
+        };
+        responses: {
+            /** @description List current privacy findings */
+            200: {
+                headers: {
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyFindingsPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Table privacy administration permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Policy ETag no longer matches */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Unsupported policy or invalid privacy producer contract */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description Policy replacement requires If-Match */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        message: string;
+                    };
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
     getCurrentUser: {
         parameters: {
             query?: never;
@@ -41645,6 +43294,8 @@ export interface operations {
             /** @description Embeddings generated successfully */
             200: {
                 headers: {
+                    /** @description The acquired model revision, acknowledging model_revision after successful execution. Present for pinned JSON and numeric responses. */
+                    "X-Antfly-Model-Revision"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -41682,6 +43333,17 @@ export interface operations {
             /** @description Model not found */
             404: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The model identity or immutable revision pin does not match the acquired model. */
+            409: {
+                headers: {
+                    /** @description Present with value true for a stale model revision. Refresh capabilities and replan before retrying. */
+                    "X-Antfly-Capability-Stale"?: "true";
                     [name: string]: unknown;
                 };
                 content: {
@@ -42347,68 +44009,6 @@ export interface operations {
             };
             /** @description Remote content fetch failed */
             502: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: components["responses"]["TransientCapacity"];
-        };
-    };
-    transcribeAudio: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["InferenceTranscribeRequest"];
-            };
-        };
-        responses: {
-            /** @description Audio transcribed successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceTranscribeResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Authentication is enabled and valid credentials were not supplied */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Model not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Internal server error */
-            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -43263,6 +44863,8 @@ export interface operations {
             /** @description Embedding response */
             200: {
                 headers: {
+                    /** @description The acquired model revision, acknowledging model_revision after successful execution. Present for pinned JSON and numeric responses. */
+                    "X-Antfly-Model-Revision"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -43300,6 +44902,17 @@ export interface operations {
             /** @description Model not found */
             404: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The model identity or immutable revision pin does not match the acquired model. */
+            409: {
+                headers: {
+                    /** @description Present with value true for a stale model revision. Refresh capabilities and replan before retrying. */
+                    "X-Antfly-Capability-Stale"?: "true";
                     [name: string]: unknown;
                 };
                 content: {

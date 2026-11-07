@@ -63,6 +63,14 @@ const row_policy_bundle_mod = @import("row_policy_bundle.zig");
 const runtime_failure_abi = @import("runtime_failure_abi");
 const schema_registry_mod = @import("schema_registry.zig");
 const std = @import("std");
+/// Fails the next primary batch just after it became durable, then disarms.
+/// Exercises every caller's committed-but-failed classification.
+pub var test_fail_after_primary_commit: if (@import("builtin").is_test) ?anyerror else void = if (@import("builtin").is_test) null else {};
+/// Runs once just before the next primary batch's durable store write
+/// (including transaction resolution), then disarms. Returning an error fails
+/// the batch before its decision; a hook may instead arm a storage fault.
+pub const TestHook = struct { ptr: *anyopaque, run: *const fn (*anyopaque) anyerror!void };
+pub var test_before_primary_commit: if (@import("builtin").is_test) ?TestHook else void = if (@import("builtin").is_test) null else {};
 const table_catalog_mod = @import("table_catalog.zig");
 const transactions_mod = @import("../transactions.zig");
 const types = @import("types.zig");
@@ -923,7 +931,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or opts.group_source_command != null))
                 preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
             const apply_lock_wait_start_ns = monotonicTimeNs();
-            try self.lockApplyForPortableRuntime();
+            if (opts.ordered_apply_receipt != null) {
+                // A committed Raft entry must yield its progress mutex when
+                // apply is busy, including a reader arriving after preflight.
+                try tryLockApplyForPortableRuntime(self);
+            } else {
+                try self.lockApplyForPortableRuntime();
+            }
             if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
             if (S.ownerField(self, "local_execution").*.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
             var filtered_cleanup_edges: ?[]types.GraphEdgeDelete = null;
@@ -2323,7 +2337,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     matched_entry = entry;
                     break;
                 };
-                if (!matched and command.action != .retire and command.action != .activate) return error.PreparedGenerationChanged;
+                if (!matched and command.action != .retire and !command.isActivation()) return error.PreparedGenerationChanged;
                 const table = try group_mutations.tableIdentity(&group_overlay, S.ownerField(self, "core").*.identity_namespace.table_id, S.ownerField(self, "root_incarnation").*);
                 if (table != command.definition.table_incarnation) return error.InvalidGroupedSourceCommand;
                 var namespace: [24]u8 = undefined;
@@ -2334,17 +2348,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 const route = try command.routeAlloc(group_alloc);
                 if (!S.ownerField(self, "core").*.byteRange().contains(route)) return error.KeyOutOfRange;
-                if (command.action == .activate) {
+                if (command.isActivation()) {
                     const entry = opts.ordered_apply_receipt orelse return error.InvalidGroupedSourceCommand;
                     const inventory = @import("artifact_inventory.zig");
                     const publication = @import("artifact_publication.zig");
                     const catalogs = try inventory.catalogs(&group_overlay);
                     const active = try publication.authority(&group_overlay);
                     const status = try inventory.status(group_alloc, &group_overlay, namespace);
-                    const ready = if (active) |value| status.ready and status.ordered != null and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
+                    const planned: ?inventory.Command = if (command.action == .activate_catalog) try inventory.desiredCommand(group_alloc, &group_overlay, namespace, catalogs, status, 16) else null;
+                    const required_protocol: u16 = if (planned) |current| current.binding.effect_protocol else 0;
+                    const ready = if (active) |value| status.ready and status.ordered != null and status.ordered.?.effect_protocol >= required_protocol and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
                     if (!ready) {
                         try @import("artifact_catalog_mutability.zig").requireMutable(group_alloc, &group_overlay, namespace, null);
-                        const ordered = if (status.ready and status.ordered.?.effect_protocol == 16) blk: {
+                        // Legacy controls keep their original deterministic
+                        // replay behavior. The versioned action shares normal
+                        // inventory planning, including monotonic protocol floors.
+                        const ordered = if (planned) |current| current else if (status.ready and status.ordered.?.effect_protocol >= 16) blk: {
                             var installed = (try inventory.load(group_alloc, &group_overlay)).?;
                             defer installed.deinit();
                             var current = installed.value.command;
@@ -2932,6 +2951,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &write_buffers.owned_store_values,
             );
             try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_writes);
+            if (opts.outcome_marker_write) |marker| try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, marker);
             if (req.merge_page) |page| if (page.integrity.len != 0) {
                 // Private page shape, exact generation/ownership and replay cursor
                 // have been checked under this same apply fence. The physical
@@ -3039,6 +3059,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             defer authored_acceptance.deinit();
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            if (comptime @import("builtin").is_test) if (test_before_primary_commit) |hook| {
+                test_before_primary_commit = null;
+                try hook.run(hook.ptr);
+            };
             const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
                 const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
                     resolution.txn_id,
@@ -3078,6 +3102,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.primary_committed) |committed| committed.* = true;
             if (opts.prepared_commit_disposition) |disposition| disposition.markPrimaryCommitted();
             if (graph_publication) |*lease| lease.release();
+            if (comptime @import("builtin").is_test) if (test_fail_after_primary_commit) |err| {
+                test_fail_after_primary_commit = null;
+                return err;
+            };
             if (!transaction_applied.applied) {
                 // Recovery may have committed this participant before the
                 // requesting owner retries it. Its visibility wait must yield
@@ -3687,6 +3715,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 std.mem.startsWith(u8, key, protection.index_writer_prefix);
         }
 
+        pub fn tryLockApplyForPortableRuntime(self: anytype) !void {
+            try self.enforcePortableRuntimeGate();
+            if (!S.ownerField(self, "core").*.tryLockApplyExclusive()) return error.WriterLocked;
+            errdefer S.ownerField(self, "core").*.unlockApply();
+            try self.enforcePortableRuntimeGate();
+        }
+
         pub fn lockApplyForPortableRuntime(self: anytype) !void {
             try self.enforcePortableRuntimeGate();
             lockApply(self);
@@ -3919,6 +3954,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         }
                         break :blk &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
                     } else &.{};
+                    if (comptime @import("builtin").is_test) if (test_before_primary_commit) |hook| {
+                        test_before_primary_commit = null;
+                        hook.run(hook.ptr) catch |err| {
+                            S.ownerField(self, "core").*.unlockApply();
+                            return err;
+                        };
+                    };
                     const outcome = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
                         txn_id,
                         status,

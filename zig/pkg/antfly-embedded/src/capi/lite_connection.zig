@@ -205,6 +205,8 @@ pub const PreparedPublication = struct {
             self.owner.publication_stats.generated_refused +|= 1;
         }
         var lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
+        const held_from = nowNs();
+        defer MaintenanceHoldSites.record(&self.owner.publication_stats.maintenance_hold_sites.generated_commit, held_from);
         defer lease.close();
         const database = try self.current();
         // Namespace and catalog are stable under the owner fence. The native
@@ -223,12 +225,14 @@ pub const PreparedPublication = struct {
         path_lease: native.PathWriterLock,
         database: *h.db_mod.DB,
         refusal_recorded: bool = false,
+        held_from: i96 = 0,
 
         fn release(ptr: *anyopaque) void {
             const held: *@This() = @ptrCast(@alignCast(ptr));
             const p = held.publication;
             p.refreshSnapshotCheckpoint();
             held.path_lease.close();
+            MaintenanceHoldSites.record(&p.owner.publication_stats.maintenance_hold_sites.generated_store, held.held_from);
             p.owner.gate.mutex.unlock(h.handleLockIo());
             alloc.destroy(held);
         }
@@ -340,6 +344,8 @@ pub const PreparedPublication = struct {
             self.owner.publication_stats.replay_refused +|= 1;
         }
         var lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
+        const held_from = nowNs();
+        defer MaintenanceHoldSites.record(&self.owner.publication_stats.maintenance_hold_sites.publish_replay, held_from);
         defer lease.close();
         const database = try self.current();
         // Computed resolver effects must explicitly carry their read set.
@@ -404,7 +410,7 @@ pub const PreparedPublication = struct {
         }
         if (database.enrichment_runtime == null) try database.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
         const held = try alloc.create(HeldStore);
-        held.* = .{ .publication = self, .path_lease = lease, .database = database };
+        held.* = .{ .publication = self, .path_lease = lease, .database = database, .held_from = nowNs() };
         return .{ .store = database.enrichment_runtime.?.store, .ptr = held, .release = HeldStore.release, .guard_key = HeldStore.guardKey };
     }
 
@@ -415,6 +421,8 @@ pub const PreparedPublication = struct {
         defer self.owner.gate.mutex.unlock(io);
         if (self.owner.stopping.load(.acquire)) return error.Canceled;
         var path_lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
+        const held_from = nowNs();
+        defer MaintenanceHoldSites.record(&self.owner.publication_stats.maintenance_hold_sites.heartbeat, held_from);
         defer path_lease.close();
         const database = try self.current();
         var lease = try ProducerLease.init(alloc, database.core.store, fence.lease_key);
@@ -430,6 +438,63 @@ const QueuedMutex = struct {
     ready: @import("antfly_platform").sync.BroadcastCondition = .init,
     next: u64 = 0,
     serving: u64 = 0,
+    /// A writer lease handed from one holder to the next queued thread so
+    /// back-to-back calls skip the release/reacquire and the queue round trip.
+    /// Owned by the current holder. `unlock` closes it once nobody is
+    /// waiting, so it can never outlive the threads it was kept for.
+    retained: ?native.PathWriterLock = null,
+    /// Tickets of queued threads that will take the path lease as soon as
+    /// they hold the gate (see `lockForLease`). Bounded; overflow only means
+    /// a handoff is skipped.
+    lease_tickets: [16]u64 = undefined,
+    lease_ticket_count: usize = 0,
+
+    /// Upper bound on one chain of handoffs. Readers in other processes are
+    /// not queued, so this is what bounds their wait behind a busy process.
+    pub const retain_quantum_ns: i96 = 50 * std.time.ns_per_ms;
+    /// Turn length when a writer in another process is queued. Each handoff
+    /// between processes makes the next holder refresh its runtime, so a short
+    /// turn amortizes that cost while keeping every queued wait bounded.
+    pub const contended_quantum_ns: i96 = 20 * std.time.ns_per_ms;
+
+    /// Caller holds the mutex. Keeps `lease` for the next queued thread when
+    /// that is cheaper and fair; otherwise returns false and the caller closes.
+    pub fn retainForWaiter(self: *QueuedMutex, io: std.Io, lease: *native.PathWriterLock) bool {
+        if (self.retained != null) return false;
+        const age = std.Io.Clock.awake.now(io).nanoseconds - lease.acquired_ns;
+        if (age >= retain_quantum_ns) return false;
+        {
+            self.state.lockUncancelable(io);
+            defer self.state.unlock(io);
+            // Hand off only to the very next holder, and only if it is about
+            // to take the lease. Anyone else might need the kernel lock free.
+            const next_holder = self.serving +% 1;
+            if (self.next == next_holder) return false;
+            if (std.mem.indexOfScalar(u64, self.lease_tickets[0..self.lease_ticket_count], next_holder) == null) return false;
+        }
+        if (age >= contended_quantum_ns and lease.othersWaiting()) return false;
+        if (lease.reader_registration_batch) |batch| batch.end();
+        lease.reader_registration_batch = null;
+        lease.endHold();
+        self.retained = lease.*;
+        return true;
+    }
+
+    /// Caller holds the mutex.
+    pub fn takeRetained(self: *QueuedMutex) ?native.PathWriterLock {
+        const lease = self.retained orelse return null;
+        self.retained = null;
+        return lease;
+    }
+
+    /// Caller holds the mutex and needs the kernel lease free for itself
+    /// (for example a reader or a nonblocking writer attempt).
+    pub fn dropRetained(self: *QueuedMutex) void {
+        if (self.takeRetained()) |lease| {
+            var owned = lease;
+            owned.close();
+        }
+    }
 
     pub fn lockUncancelable(self: *QueuedMutex, io: std.Io) void {
         self.state.lockUncancelable(io);
@@ -437,6 +502,27 @@ const QueuedMutex = struct {
         const ticket = self.next;
         self.next +%= 1;
         while (ticket != self.serving) self.ready.waitUncancelable(io, &self.state);
+    }
+
+    /// Like `lockUncancelable`, for a caller that takes the path lease next,
+    /// so the current holder may hand its lease over directly.
+    pub fn lockForLease(self: *QueuedMutex, io: std.Io) void {
+        self.state.lockUncancelable(io);
+        defer self.state.unlock(io);
+        const ticket = self.next;
+        self.next +%= 1;
+        const marked = self.lease_ticket_count < self.lease_tickets.len;
+        if (marked) {
+            self.lease_tickets[self.lease_ticket_count] = ticket;
+            self.lease_ticket_count += 1;
+        }
+        while (ticket != self.serving) self.ready.waitUncancelable(io, &self.state);
+        if (marked) {
+            const tickets = self.lease_tickets[0..self.lease_ticket_count];
+            const at = std.mem.indexOfScalar(u64, tickets, ticket).?;
+            tickets[at] = tickets[tickets.len - 1];
+            self.lease_ticket_count -= 1;
+        }
     }
 
     pub fn tryLock(self: *QueuedMutex) bool {
@@ -450,6 +536,8 @@ const QueuedMutex = struct {
     pub fn unlock(self: *QueuedMutex, io: std.Io) void {
         self.state.lockUncancelable(io);
         self.serving +%= 1;
+        // Close before any new holder can run, so it finds the sidecar free.
+        if (self.next == self.serving) self.dropRetained();
         self.ready.broadcast(io);
         self.state.unlock(io);
     }
@@ -505,6 +593,89 @@ pub fn testMaintenanceCaptureAdmission() !void {
     try std.testing.expectEqual(@as(u8, 0), misses);
 }
 
+test "capi path gate hands a writer lease to the next queued thread and drops it when idle" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+    defer threaded.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/handoff.aflite", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const io = h.handleLockIo();
+    var gate: QueuedMutex = .{};
+
+    // Nobody queued: the lease is not kept.
+    gate.lockUncancelable(io);
+    var lone = try native.fairWriterLockWithIo(alloc, io, threaded.io(), path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+    try std.testing.expect(!gate.retainForWaiter(io, &lone));
+    lone.close();
+    gate.unlock(io);
+
+    const Plain = struct {
+        fn run(g: *QueuedMutex) void {
+            const wio = h.handleLockIo();
+            g.lockUncancelable(wio);
+            g.unlock(wio);
+        }
+    };
+    {
+        // The next holder will not take a lease: no handoff.
+        gate.lockUncancelable(io);
+        var lease = try native.fairWriterLockWithIo(alloc, io, threaded.io(), path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+        const plain = try std.Thread.spawn(.{}, Plain.run, .{&gate});
+        while (true) {
+            gate.state.lockUncancelable(io);
+            const queued = gate.next -% gate.serving;
+            gate.state.unlock(io);
+            if (queued > 1) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(!gate.retainForWaiter(io, &lease));
+        lease.close();
+        gate.unlock(io);
+        plain.join();
+    }
+
+    const Waiter = struct {
+        gate: *QueuedMutex,
+        took: bool = false,
+        fn run(self: *@This()) void {
+            const wio = h.handleLockIo();
+            self.gate.lockForLease(wio);
+            defer self.gate.unlock(wio);
+            if (self.gate.takeRetained()) |kept| {
+                var lease = kept;
+                self.took = true;
+                lease.close();
+            }
+        }
+    };
+    gate.lockUncancelable(io);
+    var lease = try native.fairWriterLockWithIo(alloc, io, threaded.io(), path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+    var waiter: Waiter = .{ .gate = &gate };
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    while (true) {
+        gate.state.lockUncancelable(io);
+        const queued = gate.next -% gate.serving;
+        gate.state.unlock(io);
+        if (queued > 1) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(gate.retainForWaiter(io, &lease));
+    gate.unlock(io);
+    thread.join();
+    try std.testing.expect(waiter.took);
+    try std.testing.expect(gate.retained == null);
+
+    // A kept lease nobody claims is closed by the last unlock.
+    gate.lockUncancelable(io);
+    gate.retained = try native.fairWriterLockWithIo(alloc, io, threaded.io(), path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+    gate.unlock(io);
+    try std.testing.expect(gate.retained == null);
+    var probe = try native.tryFairWriterLockWithIo(alloc, io, path);
+    probe.close();
+}
+
 // Connections in one process queue on a canonical file gate. The kernel
 // sidecar remains the authority between processes and with CLI/server owners.
 const PathGate = struct {
@@ -542,6 +713,9 @@ pub fn acquirePathReplacement(path: []const u8) !PathReplacementGuard {
     defer alloc.free(canonical);
     const gate = try retainGate(canonical);
     gate.mutex.lockUncancelable(io);
+    // Replacement takes the kernel lease itself; a lease kept for this
+    // thread would otherwise block it.
+    gate.mutex.dropRetained();
     return .{ .gate = gate };
 }
 
@@ -631,6 +805,68 @@ fn releaseGate(gate: *PathGate) void {
 
 // Compatible connections borrow one persistent generation and one maintenance
 // worker. SQL sessions, cursor IDs, and child handles remain connection-local.
+/// Where a background turn holds the writer lease.
+pub const MaintenanceHoldSites = struct {
+    pub const Site = struct { count: u64 = 0, ns: u64 = 0, max_ns: u64 = 0 };
+    writer_primary: Site = .{},
+    writer_index: Site = .{},
+    writer_reclamation: Site = .{},
+    writer_artifact_lease: Site = .{},
+    writer_allocator_service: Site = .{},
+    publish_replay: Site = .{},
+    generated_commit: Site = .{},
+    generated_store: Site = .{},
+    heartbeat: Site = .{},
+    /// A maintenance turn's capture under the lease, until it is released.
+    turn_capture: Site = .{},
+    /// Time inside `turn_capture`, by step (total ns).
+    capture_steps: CaptureSteps = .{},
+    storage_turn: Site = .{},
+    idle_adopt: Site = .{},
+
+    pub fn record(site: *Site, started_ns: i96) void {
+        const elapsed: u64 = @intCast(@max(0, std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds - started_ns));
+        site.count +|= 1;
+        site.ns +|= elapsed;
+        site.max_ns = @max(site.max_ns, elapsed);
+    }
+
+    pub fn writer(self: *MaintenanceHoldSites, scope: PublicationScope) *Site {
+        return switch (scope) {
+            .primary => &self.writer_primary,
+            .index => &self.writer_index,
+            .reclamation => &self.writer_reclamation,
+            .artifact_lease => &self.writer_artifact_lease,
+            .allocator_service => &self.writer_allocator_service,
+        };
+    }
+};
+
+pub const CaptureSteps = struct {
+    refresh_ns: u64 = 0,
+    marker_sweep_ns: u64 = 0,
+    recover_ns: u64 = 0,
+    catalog_ns: u64 = 0,
+    debt_checks_ns: u64 = 0,
+    schedule_ns: u64 = 0,
+    snapshot_ns: u64 = 0,
+    publication_catalog_ns: u64 = 0,
+};
+
+/// Splits one held interval into consecutive steps.
+const StepClock = struct {
+    last: i96,
+    fn mark(self: *StepClock, total: *u64) void {
+        const now = nowNs();
+        total.* +|= @intCast(@max(0, now - self.last));
+        self.last = now;
+    }
+};
+
+fn nowNs() i96 {
+    return std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds;
+}
+
 pub const Owner = struct {
     // Only bootstrap small files at close. Large files must finish their
     // existing worker proof; shutdown never starts another whole-file walk.
@@ -683,6 +919,9 @@ pub const Owner = struct {
     // One graph walk per owner. Admission waits without the foreground gate;
     // the worker only try-locks under that gate and yields to an active proof.
     allocator_proof_mutex: std.Io.Mutex = .init,
+    /// A proof that completed but could not be transferred because the
+    /// writer lease was busy. Guarded by the proof mutex.
+    allocator_proof_receipt: ?native.NativeFile.AllocatorProofReceipt = null,
     verification_cancel: @FieldType(NativeStore, "maintenance_cancel") = .{},
     allocator_certificate_pending: bool = false,
     // Historical attempts suppress close-time retries; only active work is
@@ -738,6 +977,9 @@ pub const Owner = struct {
         // Detached graph-walk totals, including foreground and maintenance.
         // These survive runtime refresh and exclude lease/queue wait time.
         allocator_proof_walks: u64 = 0,
+        /// Proofs completed on an earlier attempt that yielded busy, reused
+        /// without repeating the walk.
+        allocator_proof_receipt_reuses: u64 = 0,
         allocator_proof_failures: u64 = 0,
         allocator_proof_ns: u64 = 0,
         allocator_proof_max_ns: u64 = 0,
@@ -748,6 +990,18 @@ pub const Owner = struct {
         mutation_admission_ns: u64 = 0,
         mutation_admission_max_ns: u64 = 0,
         mutation_admission_log2_ns: [64]u64 = @splat(0),
+        // Cross-process writer lease: wait from the start of acquisition
+        // (FIFO queue plus kernel lock, excluding the in-process gate) and
+        // hold until release or handoff. Foreground covers exported calls;
+        // maintenance covers background publication, replay and reclamation.
+        foreground_lease: native.LeaseTiming = .{},
+        maintenance_lease: native.LeaseTiming = .{},
+        // Time foreground calls spent queued on this process's path gate.
+        gate_wait_ns: u64 = 0,
+        gate_wait_max_ns: u64 = 0,
+        /// Background writer-lease holds by site (count, total and max ns),
+        /// to attribute `maintenance_lease` hold time.
+        maintenance_hold_sites: MaintenanceHoldSites = .{},
         last_maintenance_error: ?[]const u8 = null,
     } = .{},
     test_runtime_snapshot_opens: if (h.builtin.is_test) u64 else void = if (h.builtin.is_test) 0 else {},
@@ -776,7 +1030,10 @@ pub const Owner = struct {
             // Existing readers of an unknown peer publication remain poisoned.
             self.reader_coordinator.observeCurrent(probe_inode, probe.headerFingerprint());
             const same_inode = probe_inode == (try file.file.stat(file.runtime())).inode;
-            if (current.maintenance_references == 0 and same_inode and std.meta.eql(probe.header, file.header)) {
+            // An uncertain publication can fail before writing anything, so an
+            // unchanged header does not prove the runtime is reusable: reopen
+            // to reconcile from durable state.
+            if (current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and std.meta.eql(probe.header, file.header)) {
                 if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 return current;
@@ -789,8 +1046,10 @@ pub const Owner = struct {
                 // for every immutable input while foreground traffic waits.
                 try current.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(probe.header);
                 if (self.maintenance_snapshot) |snapshot| try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
-                if (self.options.profile == .native and self.options.open_mode == .writer and !file.free_pages_verified)
+                if (self.options.profile == .native and self.options.open_mode == .writer and !file.free_pages_verified) {
+                    _ = try self.copyIdleSnapshotLedger(file);
                     _ = try file.inheritAllocatorCertificate();
+                }
                 return current;
             }
             if (self.maintenance_snapshot) |snapshot| {
@@ -818,6 +1077,7 @@ pub const Owner = struct {
                     previous.allocator_verification_references == 0 and previous.sql_cursors.count() == 0)
                     _ = try certified.?.takeAllocatorRebaseBase(&previous.owned_lite_backend.?.native_docstore.?.file);
             }
+            _ = try self.copyIdleSnapshotLedger(&certified.?);
             if (try certified.?.inheritAllocatorCertificate()) {
                 options.allocator_verification_owner = &certified.?;
                 options.allocator_state_donor = &certified.?;
@@ -1072,25 +1332,48 @@ pub const Owner = struct {
     fn acquireMaintenancePathLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
         if (self.stopping.load(.acquire)) return error.Canceled;
         const io = h.handleLockIo();
-        if (native.lockWriterPathWithIo(alloc, io, self.path)) |held| return self.withReadRegistrationBatch(held) else |err| {
-            if (err != error.WouldBlock and err != error.FileBusy) return err;
-            // A full foreground queue can exceed one second while each caller
-            // remains inside its normal admission budget. Give publications
-            // the same default window, while bounding close-time gate waits.
-            const default_budget = 5 * std.time.ns_per_s;
-            const budget = if (h.builtin.is_test) self.test_maintenance_wait_ns orelse default_budget else default_budget;
-            var held = native.waitPathLockWithIo(alloc, self.path_lock_io.io(), self.path, true, std.Io.Clock.awake.now(io).nanoseconds + budget) catch |wait_err| switch (wait_err) {
-                error.FileBusy => {
-                    self.publication_stats.maintenance_queue_timeouts +|= 1;
-                    return wait_err;
-                },
-                error.FileNotFound, error.ConcurrencyUnavailable => return err,
-                else => return wait_err,
-            };
-            errdefer held.close();
-            if (self.stopping.load(.acquire)) return error.Canceled;
-            return self.withReadRegistrationBatch(held);
+        const stats = &self.publication_stats.maintenance_lease;
+        if (self.gate.mutex.takeRetained()) |held| {
+            var lease = held;
+            stats.recordAcquired(.handoff, 0);
+            lease.startHold(stats);
+            return self.withReadRegistrationBatch(lease);
         }
+        const started = std.Io.Clock.awake.now(io).nanoseconds;
+        // Maintenance joins the same FIFO as foreground writers, so a
+        // continuously busy foreground can delay it by at most one round of
+        // queued turns instead of starving it.
+        const default_budget = 5 * std.time.ns_per_s;
+        const budget = if (h.builtin.is_test) self.test_maintenance_wait_ns orelse default_budget else default_budget;
+        var held = native.fairWriterLockWithIo(alloc, io, self.path_lock_io.io(), self.path, std.Io.Clock.awake.now(io).nanoseconds + budget) catch |err| switch (err) {
+            error.FileBusy => {
+                self.publication_stats.maintenance_queue_timeouts +|= 1;
+                stats.recordBusy(@intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+                return err;
+            },
+            else => return err,
+        };
+        errdefer held.close();
+        stats.recordAcquired(if (held.queue_turn != null) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+        held.startHold(stats);
+        if (self.stopping.load(.acquire)) return error.Canceled;
+        return self.withReadRegistrationBatch(held);
+    }
+
+    /// Caller holds the gate. Nonblocking: reuses a lease kept for a queued
+    /// thread, otherwise refuses while another process is queued.
+    fn tryWriterLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
+        const stats = &self.publication_stats.maintenance_lease;
+        var lease = if (self.gate.mutex.takeRetained()) |held| blk: {
+            stats.recordAcquired(.handoff, 0);
+            break :blk held;
+        } else blk: {
+            const held = try native.tryFairWriterLockWithIo(alloc, h.handleLockIo(), self.path);
+            stats.recordAcquired(.uncontended, 0);
+            break :blk held;
+        };
+        lease.startHold(stats);
+        return lease;
     }
 
     fn hasPendingReplay(database: *h.db_mod.DB) !bool {
@@ -1172,11 +1455,13 @@ pub const Owner = struct {
             return error.EnrichmentWaitCanceled;
         };
         if (self.current) |current| if (needsOutcomeReconciliation(current)) return error.EnrichmentWaitCanceled;
-        var lease = (if (scope == .reclamation) native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) else self.acquireMaintenancePathLeaseAssumeLocked()) catch |err| switch (err) {
+        var lease = (if (scope == .reclamation) self.tryWriterLeaseAssumeLocked() else self.acquireMaintenancePathLeaseAssumeLocked()) catch |err| switch (err) {
             error.FileBusy, error.WouldBlock => return error.EnrichmentWaitCanceled,
             else => return err,
         };
         errdefer lease.close();
+        // The hold starts here: admission checks and rebases run under it.
+        const held_from = nowNs();
         var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         const file = &root.owned_lite_backend.?.native_docstore.?.file;
@@ -1199,6 +1484,9 @@ pub const Owner = struct {
             // and publication. Unchanged physical index inputs and catalog
             // identity keep detached computations valid; transactions opened
             // after this admission read the current primary checkpoint.
+            // Validation can itself commit under this lease (runtime refresh,
+            // SQL recovery, immutable-reader leases), so the probe above may
+            // be stale. Compare and rebase against the header it produced.
             var latest = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             defer latest.close();
             if ((try latest.file.stat(latest.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
@@ -1224,6 +1512,8 @@ pub const Owner = struct {
         if (scope == .allocator_service) self.publication_stats.allocator_service_admissions +|= 1;
         root.maintenance_writer_lease = lease;
         root.maintenance_writer_references = 1;
+        root.maintenance_writer_scope = @backingInt(scope);
+        root.maintenance_writer_held_from = held_from;
     }
 
     fn leaveMaintenanceWriter(ptr: *anyopaque) void {
@@ -1240,6 +1530,9 @@ pub const Owner = struct {
         // this lease; waking replay here makes each idle turn schedule itself.
         // Generated and replay publications notify at their commit boundary.
         lease.close();
+        // Status readers serialize publication_stats under the gate; record
+        // before releasing it.
+        MaintenanceHoldSites.record(self.publication_stats.maintenance_hold_sites.writer(@fromBackingInt(@intCast(root.maintenance_writer_scope))), root.maintenance_writer_held_from);
         self.gate.mutex.unlock(h.handleLockIo());
     }
 
@@ -1251,7 +1544,7 @@ pub const Owner = struct {
         h.closeHandle(root);
     }
 
-    fn needsOutcomeReconciliation(root: *h.Handle) bool {
+    pub fn needsOutcomeReconciliation(root: *h.Handle) bool {
         const store = root.owned_lite_backend.?.native_docstore.?;
         return root.sql_decision_uncertain or store.file.checkpoint_publication_uncertain or store.secret_store_uncertain;
     }
@@ -1268,6 +1561,21 @@ pub const Owner = struct {
     fn configureRetirementBudget(self: *Owner, store: *NativeStore) void {
         store.file.retirement_work_pages = self.publication_stats.retirement_work_pages;
         store.maintenance_policy.options.retirement_work_pages = self.publication_stats.retirement_work_pages;
+    }
+
+    /// A serving runtime whose allocator cache no other thread can touch.
+    fn idleServingRuntime(handle: *h.Handle) bool {
+        return handle.query_borrows == 0 and handle.maintenance_references == 0 and
+            handle.allocator_verification_references == 0 and handle.sql_cursors.count() == 0;
+    }
+
+    /// Copy an idle maintenance snapshot's warm ledger into a cold `file` as
+    /// a rebase base. Detached work mutates a referenced snapshot's ledger
+    /// without the gate, so only an unreferenced snapshot may donate.
+    fn copyIdleSnapshotLedger(self: *Owner, file: *native.NativeFile) !bool {
+        const snapshot = self.maintenance_snapshot orelse return false;
+        if (snapshot.maintenance_references != 0 or snapshot.allocator_verification_references != 0) return false;
+        return file.copyAllocatorRebaseBase(&snapshot.owned_lite_backend.?.native_docstore.?.file);
     }
 
     fn refreshMaintenanceSnapshot(self: *Owner, foreground: *h.Handle, need_database: bool) !*h.Handle {
@@ -1288,6 +1596,26 @@ pub const Owner = struct {
         // detached computation, even when it touches unrelated pages.
         options.artifact_reader_fence = false;
         options.allocator_verification_owner = file;
+        // Opening a database runtime commits (root incarnation, index
+        // admissions), which loads the allocator. Hand it a certified warm
+        // ledger first, as the serving refresh does, so the open rebases
+        // instead of loading and hashing the whole ledger under the lease.
+        var certified: ?native.NativeFile = null;
+        defer if (certified) |*donor| donor.close();
+        if (need_database and file.header.indexed_reclamation) {
+            certified = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
+            certified.?.allocator_cancel_token = &self.verification_cancel;
+            certified.?.allocator_certificate_on_commit = true;
+            if (self.maintenance_snapshot) |old| if (old.maintenance_references == 0 and old.allocator_verification_references == 0) {
+                _ = try certified.?.takeAllocatorRebaseBase(&old.owned_lite_backend.?.native_docstore.?.file);
+            };
+            if (certified.?.ledger == null and idleServingRuntime(foreground))
+                _ = try certified.?.copyAllocatorRebaseBase(&foreground.owned_lite_backend.?.native_docstore.?.file);
+            if (certified.?.ledger != null and try certified.?.inheritAllocatorCertificate()) {
+                options.allocator_verification_owner = &certified.?;
+                options.allocator_state_donor = &certified.?;
+            }
+        }
         const snapshot = if (need_database) blk: {
             const opened = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, foreground);
             if (comptime h.builtin.is_test) self.test_runtime_snapshot_opens += 1;
@@ -1312,9 +1640,26 @@ pub const Owner = struct {
         snapshot.sql_ddl_recovery_generation = foreground.sql_ddl_recovery_generation;
         const store = snapshot.owned_lite_backend.?.native_docstore.?;
         store.file.reader_coordinator = self.reader_coordinator;
+        if (self.maintenance_snapshot) |old| {
+            // Carry the old snapshot's warm, verified ledger as a rebase base,
+            // as the serving-runtime refresh does. Otherwise every replacement
+            // starts cold, and the first allocator use under the lease pays a
+            // full ledger load and digest. The base grants no authority: the
+            // certificate check authenticates the rebased ledger. Take it
+            // before inheriting verification flags, which it resets.
+            if (old.maintenance_references == 0 and old.allocator_verification_references == 0) {
+                if (try store.file.takeAllocatorRebaseBase(&old.owned_lite_backend.?.native_docstore.?.file))
+                    _ = try store.file.inheritAllocatorCertificate();
+            }
+        }
+        if (store.file.ledger == null and !store.file.free_pages_verified and idleServingRuntime(foreground)) {
+            if (try store.file.copyAllocatorRebaseBase(&foreground.owned_lite_backend.?.native_docstore.?.file))
+                _ = try store.file.inheritAllocatorCertificate();
+        }
         try store.file.inheritAllocatorVerification(file);
         if (self.maintenance_snapshot) |old| {
-            try store.file.inheritAllocatorVerification(&old.owned_lite_backend.?.native_docstore.?.file);
+            const old_file = &old.owned_lite_backend.?.native_docstore.?.file;
+            try store.file.inheritAllocatorVerification(old_file);
             // Policy scheduling and telemetry belong to this connection;
             // assessment caches and page roots belong to the new generation.
             store.maintenance_policy = old.owned_lite_backend.?.native_docstore.?.maintenance_policy;
@@ -1349,10 +1694,12 @@ pub const Owner = struct {
         if (self.current != foreground or foreground.maintenance_references != 0 or needsOutcomeReconciliation(foreground)) return;
         const store = foreground.owned_lite_backend.?.native_docstore.?;
         if (!std.meta.eql(store.file.header, entry_header)) return;
-        var lease = native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) catch |err| switch (err) {
+        var lease = self.tryWriterLeaseAssumeLocked() catch |err| switch (err) {
             error.FileBusy, error.WouldBlock => return,
             else => return err,
         };
+        const held_from = nowNs();
+        defer MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.idle_adopt, held_from);
         defer lease.close();
         var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
@@ -1469,9 +1816,15 @@ pub const Owner = struct {
         // a runtime. The gate protects this flag through the capture boundary.
         if (self.allocator_verification_active) return true;
         var lease = try self.acquireMaintenancePathLeaseAssumeLocked();
+        const turn_held_from = nowNs();
+        var clock: StepClock = .{ .last = turn_held_from };
         var lease_held = true;
-        defer if (lease_held) lease.close();
+        defer if (lease_held) {
+            lease.close();
+            MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.turn_capture, turn_held_from);
+        };
         const foreground = try self.refresh();
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.refresh_ns);
         if (needsOutcomeReconciliation(foreground)) return false;
         const foreground_file = &foreground.owned_lite_backend.?.native_docstore.?.file;
         // Marker service is directory-bounded and needs no allocator proof.
@@ -1479,6 +1832,7 @@ pub const Owner = struct {
         // canceled before its detached graph walk can finish.
         if (self.options.open_mode == .writer)
             try self.artifact_marker_sweep.run(foreground_file);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.marker_sweep_ns);
         if (self.options.open_mode == .writer and !foreground_file.free_pages_verified) {
             if (!self.allocator_proof_mutex.tryLock()) return true;
             defer self.allocator_proof_mutex.unlock(io);
@@ -1490,6 +1844,7 @@ pub const Owner = struct {
         }
         try @import("sql_commit.zig").recover(foreground);
         try @import("sql_ddl.zig").recover(foreground);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.recover_ns);
         // Catalog identities suffice for rotation and dropped-table pruning.
         // Opening every runtime here makes each bounded turn O(all indexes),
         // delaying the next group lease observation behind unrelated opens.
@@ -1521,11 +1876,13 @@ pub const Owner = struct {
             database = @import("tables.zig").get(foreground, name) catch return true;
             selected = foreground.embedded_tables.get(name).?;
         }
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.catalog_ns);
         if (self.options.open_mode == .writer and try hasPendingReplay(database)) self.maintenance_pending = true;
         var authority_arena = std.heap.ArenaAllocator.init(alloc);
         defer authority_arena.deinit();
         if (self.options.open_mode == .writer and try @import("resolver_authority.zig").hasProjectionDebt(foreground, database, authority_arena.allocator())) self.maintenance_pending = true;
         const group_state = try self.groupSourceState(database);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.debt_checks_ns);
         if (foreground_file.ledger) |ledger| {
             group_state.replay_budget.updatePressure(ledger.data_pending, ledger.free_pages, foreground_file.allocator_work.reuse_blocked_append_pages);
             // Bound each service publication independently, increasing useful
@@ -1639,6 +1996,7 @@ pub const Owner = struct {
         // merely because inference or segment construction is still running.
         // Hosted/manual runtimes retain their caller-supplied provider borrow.
         const independent = self.options.profile == .native;
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.schedule_ns);
         const root = if (independent) try self.refreshMaintenanceSnapshot(foreground, run_database) else foreground;
         if (independent and run_database) {
             database = if (selected) |table| try @import("tables.zig").get(root, table.name) else &root.db;
@@ -1655,8 +2013,10 @@ pub const Owner = struct {
         // leases and catalog fingerprints do not protect these primary roots.
         var source_read = if (run_database) try database.core.store.runtime_store.beginRead() else null;
         defer if (source_read) |*read| read.abort();
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.snapshot_ns);
         var catalog = if (run_database) try PublicationCatalog.capture(turn_alloc, root, database) else null;
         defer if (catalog) |*proof| proof.deinit();
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.publication_catalog_ns);
         var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (catalog) |*proof| proof else null, .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
         root.maintenance_references += 1;
         root.maintenance_owner = self;
@@ -1673,6 +2033,7 @@ pub const Owner = struct {
         if (run_database) database.async_context.replay_publication = .{ .ptr = &publication, .publish = PreparedPublication.publishReplay };
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
         lease.close();
+        MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.turn_capture, turn_held_from);
         lease_held = false;
         self.gate.mutex.unlock(io);
         gate_locked = false;
@@ -1786,8 +2147,12 @@ pub const Owner = struct {
         // proves the tip; even its runtime refresh can publish index leases.
         if (self.allocator_verification_active) return false;
         var lease = try self.acquireMaintenancePathLeaseAssumeLocked();
+        const turn_held_from = nowNs();
         var lease_held = true;
-        defer if (lease_held) lease.close();
+        defer if (lease_held) {
+            lease.close();
+            MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.storage_turn, turn_held_from);
+        };
         const foreground = try self.refresh();
         if (needsOutcomeReconciliation(foreground)) return true;
         // A changed tip can invalidate a previously scheduled storage turn.
@@ -1803,6 +2168,7 @@ pub const Owner = struct {
         root.maintenance_publication = null;
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
         lease.close();
+        MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.storage_turn, turn_held_from);
         lease_held = false;
         self.gate.mutex.unlock(io);
         gate_locked = false;
@@ -1882,9 +2248,30 @@ pub const Owner = struct {
         defer self.releaseMaintenanceTurnAssumeLocked();
         const foreground = try self.refresh();
         const file = &foreground.owned_lite_backend.?.native_docstore.?.file;
-        if (needsOutcomeReconciliation(foreground)) return error.OutcomeUnknown;
+        if (needsOutcomeReconciliation(foreground)) return error.OutcomeReconciliationRequired;
         if (file.transaction_header != null or file.durable_header != null) return error.FileBusy;
         if (file.free_pages_verified) return;
+        if (self.allocator_proof_receipt) |receipt| {
+            self.allocator_proof_receipt = null;
+            // The same fence as the transfer below: under the writer lease,
+            // the on-disk header and inode must still be the live ones.
+            var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
+            defer probe.close();
+            if (std.meta.eql(file.header, probe.header) and
+                (try file.file.stat(file.runtime())).inode == (try probe.file.stat(probe.runtime())).inode)
+            {
+                try file.inheritAllocatorProofReceipt(receipt);
+                if (file.free_pages_verified) {
+                    self.publication_stats.allocator_proof_receipt_reuses +|= 1;
+                    return;
+                }
+            }
+        }
+        // An idle maintenance snapshot usually holds a warm, verified ledger
+        // for an ancestor of this tip. Copying it turns the proof walk the
+        // caller would wait on into a journal rebase plus certificate check.
+        if (try self.copyIdleSnapshotLedger(file) and try file.inheritAllocatorCertificate() and file.free_pages_verified)
+            return;
         foreground.allocator_verification_references += 1;
         defer {
             foreground.allocator_verification_references -= 1;
@@ -1919,27 +2306,39 @@ pub const Owner = struct {
         self.publication_stats.allocator_proof_walks +|= 1;
         self.publication_stats.allocator_proof_ns +|= proof_ns;
         self.publication_stats.allocator_proof_max_ns = @max(self.publication_stats.allocator_proof_max_ns, proof_ns);
+        // The proof is this call's own work, not waiting: it does not use up
+        // the busy budget carried to later re-entries of the same call.
+        if (connection) |caller| {
+            if (caller.admission_active_sink) |sink| sink.* +|= proof_ns;
+            // Credit it now, before reacquiring the lease below, so the walk
+            // does not shorten this attempt's own wait either.
+            if (caller.admission_deadline_ns) |*deadline| deadline.* +|= proof_ns;
+        }
         if (verified) |_| {} else |_| {
             self.publication_stats.allocator_proof_failures +|= 1;
         }
         try verified;
+        // If reacquiring the lease below yields busy, the next attempt reuses
+        // this proof instead of repeating the walk.
+        self.allocator_proof_receipt = try reader.allocatorProofReceipt();
         // A foreground operation has not started its mutation yet. Preserve
         // its connection-local busy policy when another process wins the
         // writer lease during the detached proof. Background turns stay
         // nonblocking and yield to that writer instead of consuming its budget.
-        lease.* = if (connection) |caller| try caller.acquirePathLeaseAssumeLocked() else self.withReadRegistrationBatch(try native.lockWriterPathWithIo(alloc, io, self.path));
+        lease.* = if (connection) |caller| try caller.acquirePathLeaseAssumeLocked() else self.withReadRegistrationBatch(try self.tryWriterLeaseAssumeLocked());
         var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         if (self.current) |current| {
             // A foreground publication may have failed while the walk ran.
             // Retrying the same immutable proof cannot reconcile that outcome.
-            if (needsOutcomeReconciliation(current)) return error.OutcomeUnknown;
+            if (needsOutcomeReconciliation(current)) return error.OutcomeReconciliationRequired;
             const live = &current.owned_lite_backend.?.native_docstore.?.file;
             if (live.transaction_header != null or live.durable_header != null) return error.FileBusy;
             if (std.meta.eql(live.header, probe.header) and
                 (try live.file.stat(live.runtime())).inode == (try probe.file.stat(probe.runtime())).inode)
                 try live.inheritAllocatorVerification(reader);
         }
+        self.allocator_proof_receipt = null;
     }
 
     fn deinitMaintenanceSchedules(self: *Owner) void {
@@ -1956,7 +2355,7 @@ pub const Owner = struct {
         const io = h.handleLockIo();
         self.gate.mutex.lockUncancelable(io);
         defer self.gate.mutex.unlock(io);
-        var lease: ?native.PathWriterLock = try native.lockWriterPathWithIo(alloc, io, self.path);
+        var lease: ?native.PathWriterLock = try self.tryWriterLeaseAssumeLocked();
         defer if (lease) |*held| held.close();
         for (0..2) |attempt| {
             var proof_bytes: u64 = 0;
@@ -2001,7 +2400,7 @@ pub const Owner = struct {
             self.allocator_proof_mutex.lockUncancelable(io);
             defer self.allocator_proof_mutex.unlock(io);
             try self.verifyAllocatorAssumeLocked(&lease, null);
-            if (lease == null) lease = try native.lockWriterPathWithIo(alloc, io, self.path);
+            if (lease == null) lease = try self.tryWriterLeaseAssumeLocked();
         }
     }
 
@@ -2064,6 +2463,11 @@ pub const Connection = struct {
     // Scoped to C API admission while mutex is held. Reacquisition after a
     // detached allocator proof consumes the same request budget.
     admission_deadline_ns: ?i96 = null,
+    /// Where the admitting call accumulates its own active work (allocator
+    /// proof), excluded from the waiting budget carried to re-entries. Set
+    /// only while that call holds `mutex`, like `admission_deadline_ns`, so
+    /// one call's work is never credited to another.
+    admission_active_sink: ?*u64 = null,
     current: ?*h.Handle = null,
     attached: bool = false,
     sql_sessions: @FieldType(h.Handle, "sql_sessions") = .empty,
@@ -2077,24 +2481,76 @@ pub const Connection = struct {
 
     pub fn acquire(self: *Connection) !native.PathWriterLock {
         const io = h.handleLockIo();
-        self.gate.mutex.lockUncancelable(io);
+        const gate_started = std.Io.Clock.awake.now(io).nanoseconds;
+        self.gate.mutex.lockForLease(io);
+        {
+            const waited: u64 = @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - gate_started));
+            const stats = &self.owner.publication_stats;
+            stats.gate_wait_ns +|= waited;
+            stats.gate_wait_max_ns = @max(stats.gate_wait_max_ns, waited);
+        }
         errdefer self.gate.mutex.unlock(io);
         return self.acquirePathLeaseAssumeLocked();
     }
 
+    fn admissionDeadline(self: *const Connection) i96 {
+        return self.admission_deadline_ns orelse (std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds + @as(i96, self.options.busy_timeout_ms) * std.time.ns_per_ms);
+    }
+
+    /// Polls rather than blocking so the wait honors the deadline. Proofs
+    /// run for seconds, so a millisecond poll costs nothing measurable.
+    fn lockAllocatorProofBefore(self: *Connection, deadline: i96) bool {
+        const io = h.handleLockIo();
+        var backoff_ns: i96 = 100 * std.time.ns_per_us;
+        while (!self.owner.allocator_proof_mutex.tryLock()) {
+            const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+            if (remaining <= 0) return false;
+            io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake) catch return false;
+            backoff_ns = @min(backoff_ns * 2, 5 * std.time.ns_per_ms);
+        }
+        return true;
+    }
+
     fn acquirePathLeaseAssumeLocked(self: *Connection) !native.PathWriterLock {
         const io = h.handleLockIo();
-        const deadline = self.admission_deadline_ns orelse (std.Io.Clock.awake.now(io).nanoseconds + @as(i96, self.options.busy_timeout_ms) * std.time.ns_per_ms);
+        const deadline = self.admissionDeadline();
+        // Writers take FIFO turns across processes. An expired budget still
+        // permits an immediate acquisition when nobody is queued.
+        if (h.liteOpenModeCanWrite(self.options.open_mode)) {
+            const stats = &self.owner.publication_stats.foreground_lease;
+            if (self.gate.mutex.takeRetained()) |held| {
+                var lease = held;
+                stats.recordAcquired(.handoff, 0);
+                lease.startHold(stats);
+                return self.owner.withReadRegistrationBatch(lease);
+            }
+            const started = std.Io.Clock.awake.now(io).nanoseconds;
+            if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| {
+                // Tests observe the point where admission would start waiting:
+                // only after a failed attempt with budget left.
+                if (native.lockWriterPathWithIo(alloc, io, self.path)) |held| return self.owner.withReadRegistrationBatch(held) else |err| {
+                    if (err != error.WouldBlock and err != error.FileBusy) return err;
+                    if (deadline - std.Io.Clock.awake.now(io).nanoseconds <= 0) return error.FileBusy;
+                    hook.notify(hook.ptr);
+                }
+            };
+            var lease = native.fairWriterLockWithIo(alloc, io, self.owner.path_lock_io.io(), self.path, deadline) catch |err| {
+                if (err == error.FileBusy) stats.recordBusy(@intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+                return err;
+            };
+            stats.recordAcquired(if (lease.queue_turn != null) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+            lease.startHold(stats);
+            return self.owner.withReadRegistrationBatch(lease);
+        }
+        // Our own retained exclusive lease would block this shared lock.
+        self.gate.mutex.dropRetained();
         var backoff: i96 = std.time.ns_per_ms;
         while (true) {
             // A slow detached proof may outlast the retry budget. Always try
             // the lease once: a stable verified tip must still be admitted if
             // no contention wait is needed. An expired budget forbids waiting,
             // not an uncontended acquisition.
-            const lease = if (h.liteOpenModeCanWrite(self.options.open_mode))
-                native.lockWriterPathWithIo(alloc, io, self.path)
-            else
-                native.lockReaderPathWithIo(alloc, io, self.path);
+            const lease = native.lockReaderPathWithIo(alloc, io, self.path);
             if (lease) |held| return self.owner.withReadRegistrationBatch(held) else |err| {
                 if (err != error.WouldBlock and err != error.FileBusy) return err;
                 const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
@@ -2141,7 +2597,15 @@ pub const Connection = struct {
                 lease.* = null;
                 self.gate.mutex.unlock(io);
                 if (comptime h.builtin.is_test) if (self.owner.test_allocator_wait) |hook| hook.notify(hook.ptr);
-                self.owner.allocator_proof_mutex.lockUncancelable(io);
+                // Another thread's proof can take far longer than this call's
+                // busy timeout. Waiting for it counts against that budget.
+                if (self.admission_deadline_ns == null and self.options.busy_timeout_ms == 0) {
+                    // No busy timeout configured: keep waiting for the proof.
+                    self.owner.allocator_proof_mutex.lockUncancelable(io);
+                } else if (!self.lockAllocatorProofBefore(self.admissionDeadline())) {
+                    self.gate.mutex.lockUncancelable(io);
+                    return error.FileBusy;
+                }
                 self.gate.mutex.lockUncancelable(io);
             }
             defer self.owner.allocator_proof_mutex.unlock(io);
@@ -2372,8 +2836,9 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     if (existing == null) {
         try gate.owners.ensureUnusedCapacity(alloc, 1);
         if (!create) {
+            if (!h.liteOpenModeCanWrite(options.open_mode)) gate.mutex.dropRetained();
             const attempt = if (h.liteOpenModeCanWrite(options.open_mode))
-                native.lockWriterPathWithIo(alloc, io, gate.path)
+                (if (gate.mutex.takeRetained()) |kept| kept else native.tryFairWriterLockWithIo(alloc, io, gate.path))
             else
                 native.lockReaderPathWithIo(alloc, io, gate.path);
             if (attempt) |held| {
@@ -2638,13 +3103,21 @@ test "capi native unbounded writer admits reusable pool before a large request" 
                 const file = &owner.current.?.owned_lite_backend.?.native_docstore.?.file;
                 try std.testing.expectEqual(@as(u64, 0), (try file.allocatorStats()).?.reusable_pages);
             }
-            if (scenario == .uncertain or scenario == .uncertain_during) {
+            if (scenario == .uncertain) {
+                // An uncertain runtime is never reused: refresh reopens and
+                // reconciles from durable state before admitting the request.
+                const poisoned = owner.current.?;
+                poisoned.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = true;
+                const reconciled = try connection.refresh(&lease, .mutation);
+                try std.testing.expect(reconciled != poisoned);
+                try std.testing.expect(!reconciled.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain);
+                try std.testing.expect(!owner.allocator_verification_active);
+                continue;
+            }
+            if (scenario == .uncertain_during) {
                 owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
-                if (scenario == .uncertain) {
-                    owner.current.?.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = true;
-                }
-                try std.testing.expectError(error.OutcomeUnknown, connection.refresh(&lease, .mutation));
-                try std.testing.expectEqual(@as(usize, if (scenario == .uncertain) 0 else 1), probe.captures);
+                try std.testing.expectError(error.OutcomeReconciliationRequired, connection.refresh(&lease, .mutation));
+                try std.testing.expectEqual(@as(usize, 1), probe.captures);
                 try std.testing.expect(!owner.allocator_verification_active);
                 try std.testing.expect(!owner.verification_cancel.requested.load(.acquire));
                 continue;
@@ -2882,6 +3355,18 @@ test "capi native allocator proof reacquisition honors per-connection busy admis
                 try std.testing.expectError(error.WouldBlock, result);
                 try std.testing.expectEqual(@as(usize, 0), probe.retries);
             },
+        }
+        if (scenario != .foreground) {
+            // The proof completed before the busy yield. The next attempt
+            // transfers it under the lease instead of walking again.
+            probe.release();
+            owner.test_after_allocator_capture = null;
+            if (lease == null) lease = try owner.tryWriterLeaseAssumeLocked();
+            const walks = owner.publication_stats.allocator_proof_walks;
+            try owner.verifyAllocatorAssumeLocked(&lease, if (scenario == .background) null else connection);
+            try std.testing.expectEqual(walks, owner.publication_stats.allocator_proof_walks);
+            try std.testing.expectEqual(@as(u64, 1), owner.publication_stats.allocator_proof_receipt_reuses);
+            try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
         }
     }
 }
@@ -4425,6 +4910,54 @@ test "capi native allocator proof issue1431 bounded allocator service rebases a 
     try std.testing.expect((try file.check()).valid);
     Owner.leaveMaintenanceWriter(detached);
     held = false;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.read));
+    try fixture.expectWritten(.batch, true);
+}
+
+test "capi native logical generations maintenance snapshot replacement carries the warm allocator ledger" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("snapshot-ledger-handoff", 1000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    const refreshSnapshot = struct {
+        fn run(f: *AdmissionFollowupFixture) !*h.Handle {
+            var lease = try f.connection.acquire();
+            defer {
+                lease.close();
+                f.connection.gate.mutex.unlock(h.handleLockIo());
+            }
+            return f.connection.owner.refreshMaintenanceSnapshot(f.connection.owner.current.?, false);
+        }
+    }.run;
+    const first = try refreshSnapshot(&fixture);
+    first.maintenance_owner = owner;
+    // Warm and verify the first snapshot's ledger under allocator service.
+    try Owner.enterMaintenanceWriter(first, .allocator_service);
+    _ = try first.owned_lite_backend.?.native_docstore.?.file.reclaimPagesForMaintenanceWithCancel(8, null);
+    Owner.leaveMaintenanceWriter(first);
+    first.maintenance_owner = null;
+    const first_file = &first.owned_lite_backend.?.native_docstore.?.file;
+    try std.testing.expect(first_file.free_pages_verified and first_file.ledger != null);
+    const full_loads = first_file.allocator_work.full_loads;
+    const transfers = first_file.allocator_work.cache_transfers;
+
+    // A foreground write moves the tip, so the next capture replaces the
+    // snapshot. Its allocator must rebase the donated ledger, not reload it.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const second = try refreshSnapshot(&fixture);
+    try std.testing.expect(second != first);
+    const file = &second.owned_lite_backend.?.native_docstore.?.file;
+    try std.testing.expect(file.free_pages_verified);
+    try std.testing.expectEqual(transfers + 1, file.allocator_work.cache_transfers);
+    try std.testing.expectEqual(full_loads, file.allocator_work.full_loads);
+    second.maintenance_owner = owner;
+    defer second.maintenance_owner = null;
+    try Owner.enterMaintenanceWriter(second, .allocator_service);
+    _ = try file.reclaimPagesForMaintenanceWithCancel(8, null);
+    try std.testing.expect((try file.check()).valid);
+    Owner.leaveMaintenanceWriter(second);
+    try std.testing.expectEqual(full_loads, file.allocator_work.full_loads);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.read));
     try fixture.expectWritten(.batch, true);
 }

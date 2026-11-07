@@ -669,12 +669,16 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         },
     );
 
+    const audio_readers = if (loaded_config) |*config| try config.transcribers.hostedReaders(alloc) else &.{};
+    defer alloc.free(audio_readers);
     var node = try InferenceNode.init(alloc, .{
+        .audio_readers = audio_readers,
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .max_loaded_models = model_settings.max_loaded_models,
         .max_concurrent_requests = max_concurrent_requests,
         .generation_budget_overrides = resource_policy.inference.memory.limits(inference.server.BudgetOverrides),
+        .cooperative_execution = inference.server.CooperativeExecutionConfig.fromSettings(if (loaded_config) |cfg| cfg.inference.cooperative_execution else .{}),
         .generation_batching = inference.server.GenerationBatchingConfig.fromSettings(if (loaded_config) |cfg| cfg.inference.generation_batching else .{}),
         .max_work_units = resource_policy.inference.admission.workCapacity(),
         .request_limits = resource_policy.inference.request_limits,

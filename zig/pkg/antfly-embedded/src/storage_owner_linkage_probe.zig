@@ -418,7 +418,7 @@ fn exerciseRelationalLifetime(alloc: std.mem.Allocator, root: []const u8, io: st
 
 fn exerciseFactoryAggregationBackup(alloc: std.mem.Allocator, database: *db_mod.DB, root: []const u8, physical: []const u8, io: std.Io) !void {
     const write = client.antfly_sources.local_write;
-    var enrichment = try write.createManagedDbEnrichments(alloc, "{}", database.backend_runtime, null, null, null, "", null, null);
+    var enrichment = try write.createManagedDbEnrichments(alloc, "{}", database.backend_runtime, null, null, null, null, "", null, null);
     defer enrichment.deinit(alloc);
     if (enrichment.generated) return error.SharedStorageInvalidBatchAccepted;
     var result = try database.search(alloc, .{ .include_stored = true });

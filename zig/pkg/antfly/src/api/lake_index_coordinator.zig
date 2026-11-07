@@ -139,6 +139,8 @@ fn executePhysical(a: A, io: std.Io, table: local.common_topology_records.TableR
         return @import("lake_execution_backend").implementation.build(a, io, table, source_options, try store.executionDescriptor(), context, cancellation, clock, lease, options.embedding_options, policy, options.build_limits, artifact_cause);
     } else {
         var artifact_reads = @import("lake_index_artifact_recovery.zig").Reads.init(store.artifactStore());
+        artifact_reads.enableWriteCache(a, 8 * 1024 * 1024);
+        defer artifact_reads.close();
         var handle = artifact_reads.store();
         return publication.buildWithReuse(a, &handle, table, source, store.identity, context, cancellation, clock, lease, options.embedding_options, .{ .store = store, .table_id = table.table_id, .recipe = catalog.desiredFingerprint(table), .context = context }, policy) catch |err| {
             artifact_cause.* = artifact_reads.cause();
@@ -182,8 +184,8 @@ fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, ca
         };
     }
     if (document.declarations.len != directory.count) return error.InvalidLakeIndexCatalog;
-    // Definition/source signatures do not change when reader formats advance.
-    // An intact obsolete directory is not a reason to skip the required build.
+    // An intact directory cannot prove that its text declarations are usable.
+    // Unsupported declarations remain an explicit repair obligation.
     for (document.declarations) |declaration| {
         if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version != @import("lake_index_native_text.zig").metadata_version) return false;
     }
@@ -573,56 +575,12 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     try std.testing.expectEqual(@as(u64, 5), recovered.value.published.?.generation);
     try std.testing.expectEqual(published.value.namespace, recovered.value.namespace);
     try std.testing.expect(try durableDirectoryAvailable(a, &store, recovered.value.published.?, .none));
-    // A complete older directory is still a refresh obligation after a
-    // reader-format upgrade, even when every source signature is unchanged.
-    const legacy_inventory_bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(a, source.inventory);
-    defer a.free(legacy_inventory_bytes);
-    var legacy_store = store.artifactStore();
-    legacy_store.upload_scope = try @import("../serverless/artifacts/store.zig").uploadScopeFromArtifactId(recovered.value.published.?.inventory.artifact_id);
-    var legacy_inventory = try legacy_store.putWithCancellation(legacy_inventory_bytes, .none);
-    defer legacy_inventory.deinit(a);
-    recovered.value.published.?.inventory = .{ .kind = .external_base_source, .artifact_id = legacy_inventory.artifact_id, .checksum = legacy_inventory.checksum, .byte_len = legacy_inventory.byte_len };
-    recovered.value.published.?.base_source.external_parquet.file_inventory_artifact = legacy_inventory.artifact_id;
-    recovered.value.published.?.reader_protocol = 33;
-    recovered.value.published.?.source_navigation = null;
-    const historical = try catalog.encode(a, recovered.value);
-    if (mock.owned) |bytes| a.free(bytes);
-    mock.owned = historical;
-    mock.table.lake_index_catalog_json = historical;
-    try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
-    try std.testing.expect(mock.commits > committed_build);
-    var upgraded = try catalog.parse(a, mock.table.lake_index_catalog_json);
-    defer upgraded.deinit();
-    try std.testing.expectEqual(catalog.native_reader_protocol, upgraded.value.published.?.reader_protocol);
-    try std.testing.expectEqual(@as(u64, 6), upgraded.value.published.?.generation);
-    // A text format refresh must also rebuild when the reader protocol and
-    // every source/definition signature are current and the directory exists.
-    var old_text = upgraded.value.published.?;
-    var scratch = std.heap.ArenaAllocator.init(a);
-    defer scratch.deinit();
-    var scoped = store.artifactStore();
-    scoped.upload_scope = try @import("../serverless/artifacts/store.zig").UploadScope.forPublication(publication.uploadDomainWithNamespace(mock.table.table_id, store.identity, old_text.namespace), old_text.generation, std.testing.io);
-    try @import("lake_index_directory.zig").hydrateLazy(scratch.allocator(), scoped, &old_text, .none, null);
-    const old_declarations = try scratch.allocator().dupe(local.serverless_segment_sidecar_manifest.DeclaredArtifact, old_text.declarations);
-    for (old_declarations) |*declaration| if (declaration.artifact.kind == .text_segment) {
-        declaration.artifact.metadata_version = @import("lake_index_native_text.zig").metadata_version - 1;
-    };
-    const old_directory = try @import("lake_index_directory.zig").publish(a, &scoped, old_declarations, .none);
-    defer a.free(old_directory.artifact_id);
-    defer a.free(old_directory.checksum);
-    old_text.directory = old_directory;
-    upgraded.value.published = old_text;
-    const old_catalog = try catalog.encode(a, upgraded.value);
-    if (mock.owned) |bytes| a.free(bytes);
-    mock.owned = old_catalog;
-    mock.table.lake_index_catalog_json = old_catalog;
-    try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
-    try std.testing.expect(mock.commits > committed_build);
     var refreshed = try catalog.parse(a, mock.table.lake_index_catalog_json);
     defer refreshed.deinit();
-    try std.testing.expectEqual(@as(u64, 7), refreshed.value.published.?.generation);
     try std.testing.expect(try durableDirectoryAvailable(a, &store, refreshed.value.published.?, .none));
-    // A format refresh must recover even if only a published root or one of
+    var repair_options = options;
+    repair_options.force_rebuild = true;
+    // An explicit repair must recover even if only a published root or one of
     // its retained packs disappeared. No checkpoint invalidation alone can
     // remove these candidates; serving authority remains until replacement.
     const healthy_catalog = try a.dupe(u8, mock.table.lake_index_catalog_json);
@@ -640,12 +598,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         const saved_bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, artifacts, target, .none, null);
         defer a.free(saved_bytes);
         try artifacts.delete(target.artifact_id);
-        var forced = refreshed.value;
-        forced.published.?.reader_protocol = 31;
-        forced.published.?.source_navigation = null;
-        forced.published.?.inventory = .{ .kind = .external_base_source, .artifact_id = legacy_inventory.artifact_id, .checksum = legacy_inventory.checksum, .byte_len = legacy_inventory.byte_len };
-        forced.published.?.base_source.external_parquet.file_inventory_artifact = legacy_inventory.artifact_id;
-        const forced_catalog = try catalog.encode(a, forced);
+        const forced_catalog = try catalog.encode(a, refreshed.value);
         a.free(mock.owned.?);
         mock.owned = forced_catalog;
         mock.table.lake_index_catalog_json = forced_catalog;
@@ -653,7 +606,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         // must resume that checkpoint without probing the unavailable serving
         // publication or clearing completed work a second time.
         mock.cancel_checkpoint = true;
-        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options));
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, repair_options));
         var interrupted = try catalog.parse(a, mock.table.lake_index_catalog_json);
         defer interrupted.deinit();
         try std.testing.expect(!interrupted.value.checkpoint.?.reuse_published);
@@ -666,7 +619,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         try std.testing.expectEqual(prior_discards, mock.discards);
         var repaired_publication = try catalog.parse(a, mock.table.lake_index_catalog_json);
         defer repaired_publication.deinit();
-        try std.testing.expectEqual(@as(u64, 9), repaired_publication.value.published.?.generation);
+        try std.testing.expectEqual(@as(u64, 7), repaired_publication.value.published.?.generation);
         try std.testing.expect(repaired_publication.value.pending == null and repaired_publication.value.failure == null);
         try @import("lake_index_directory.zig").hydrateLazy(repaired_publication.arena.allocator(), artifacts, &repaired_publication.value.published.?, .none, null);
         const repaired_root = try @import("lake_index_native_text.zig").loadRoot(repaired_publication.arena.allocator(), artifacts, repaired_publication.value.published.?.declarations[0].artifact, .none, null);
@@ -762,19 +715,14 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
             try std.testing.expectEqualStrings("indexed value", value.value.string);
         }
         if (mode == .cover) {
-            // Whole-index reuse during a format refresh needs the same proof;
+            // Whole-index reuse during explicit repair needs the same proof;
             // clearing a checkpoint alone cannot retire a damaged publication.
-            var forced = ordered_resumed.value;
-            forced.published.?.reader_protocol = 31;
-            forced.published.?.source_navigation = null;
-            forced.published.?.inventory = .{ .kind = .external_base_source, .artifact_id = legacy_inventory.artifact_id, .checksum = legacy_inventory.checksum, .byte_len = legacy_inventory.byte_len };
-            forced.published.?.base_source.external_parquet.file_inventory_artifact = legacy_inventory.artifact_id;
-            const forced_catalog = try catalog.encode(a, forced);
+            const forced_catalog = try catalog.encode(a, ordered_resumed.value);
             a.free(mock.owned.?);
             mock.owned = forced_catalog;
             mock.table.lake_index_catalog_json = forced_catalog;
             try artifacts.delete(final_entries[0].cover.?.block.artifact_id);
-            try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
+            try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, repair_options);
             var refreshed_ordered = try catalog.parse(a, mock.table.lake_index_catalog_json);
             defer refreshed_ordered.deinit();
             try std.testing.expect(refreshed_ordered.value.checkpoint == null and refreshed_ordered.value.pending == null);
@@ -846,7 +794,7 @@ test "external lake global frontier coordinator rebuilds missing cloud map direc
     defer provider.deinit();
     var client = provider.client();
     try client.makeBucket("bucket");
-    var store: Store = .{ .opened = undefined, .implementation = try @import("../serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, client, "bucket", "native"), .identity = @splat(3), .locator = .{ .protocol = .s3, .connection = "test", .bucket = "bucket", .prefix = "native", .root = "test" } };
+    var store: Store = .{ .opened = undefined, .implementation = try @import("../serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, client, "bucket", "native"), .identity = @splat(3), .cache_identity = @splat(4), .locator = .{ .protocol = .s3, .connection = "test", .bucket = "bucket", .prefix = "native", .root = "test" } };
     defer store.implementation.deinit();
     const scope = try @import("../serverless/artifacts/store.zig").UploadScope.forPublication(@splat(4), 1, std.testing.io);
     var writer: maps.Writer = .{ .a = a, .io = std.testing.io, .scope = scope, .reader = .{ .client = client, .bucket = "bucket", .prefix = "native" }, .complete = true };

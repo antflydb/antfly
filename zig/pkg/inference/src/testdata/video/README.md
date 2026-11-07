@@ -64,3 +64,6 @@ duration, size, sync and encoded SHA-256 agree with all 60 source packets.
 `ll-parent-2s.json` records commands, tool, source/fixture hashes and packet
 provenance. The checkpoint gate consumes the part before a complete parent,
 then compares six streamed window vectors with buffered full-clip HLS inference.
+
+`anamorphic-2x1.mp4` and `anamorphic-2x1.webm` are 64x48 test patterns with a 2:1 sample
+aspect ratio, generated with FFmpeg (`testsrc`, `setsar=2/1`, H.264 Baseline and VP9).

@@ -149,6 +149,9 @@ const UnsupportedTextMergeRuntime = struct {
     pub fn acquireProducerPermit(_: *@This(), _: []const u8, _: u64, _: u64) !ProducerPermit {
         return .{};
     }
+    pub fn acquireProducerPermitAssumeApply(_: *@This(), _: []const u8, _: u64, _: u64) !ProducerPermit {
+        return .{};
+    }
 
     pub fn producerSegmentReservationLimit(_: *const @This()) usize {
         return std.math.maxInt(usize);
@@ -765,6 +768,16 @@ const PlatformTextMergeRuntime = struct {
         segment_count: u64,
         byte_count: u64,
     ) !ProducerPermit {
+        return self.acquireProducerPermitWithApplyOwnership(index_name, segment_count, byte_count, false);
+    }
+
+    /// Inline replay already owns apply-exclusive. Never reacquire it or wait
+    /// for a merger that needs it; leave durable replay debt for the next pass.
+    pub fn acquireProducerPermitAssumeApply(self: *TextMergeRuntime, index_name: []const u8, segment_count: u64, byte_count: u64) !ProducerPermit {
+        return self.acquireProducerPermitWithApplyOwnership(index_name, segment_count, byte_count, true);
+    }
+
+    fn acquireProducerPermitWithApplyOwnership(self: *TextMergeRuntime, index_name: []const u8, segment_count: u64, byte_count: u64, apply_owned: bool) !ProducerPermit {
         const producer_io = self.io;
         if (producer_io) |io| {
             self.mutex.lockUncancelable(io);
@@ -828,6 +841,10 @@ const PlatformTextMergeRuntime = struct {
             // blocked on the shared byte budget. A segment-blocked producer on
             // index A must not stall independent index B.
             if (self.hasEarlierProducerAdmissionConflict(&waiter)) {
+                if (apply_owned) {
+                    self.mutex.unlock(io);
+                    return error.EnrichmentRetryInProgress;
+                }
                 if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
                 if (!recorded_wait) {
                     self.backpressure_events += 1;
@@ -846,7 +863,7 @@ const PlatformTextMergeRuntime = struct {
             const snapshot_wait_epoch = self.producer_wait_epoch.load(.acquire);
             self.mutex.unlock(io);
 
-            lockApplyShared(self.apply_mutex);
+            if (!apply_owned) lockApplyShared(self.apply_mutex);
             const stats_snapshot = self.index_manager.textMergeStatsSnapshot();
             const active_segments = self.index_manager.textActiveSegmentCountSnapshot(index_name);
             // Quarantine is exceptional, so keep the common admission path to
@@ -857,7 +874,7 @@ const PlatformTextMergeRuntime = struct {
                 quarantineBlocks(self.index_manager.textMergeStatsSnapshotForIndex(index_name))
             else
                 false;
-            self.apply_mutex.unlockShared();
+            if (!apply_owned) self.apply_mutex.unlockShared();
 
             self.mutex.lockUncancelable(io);
             if (self.admission_closed) {
@@ -921,6 +938,10 @@ const PlatformTextMergeRuntime = struct {
                 self.recordBackpressureTerminal(.merge_failed);
                 return error.TextMergeBackpressureUnavailable;
             }
+            if (apply_owned) {
+                self.mutex.unlock(io);
+                return error.EnrichmentRetryInProgress;
+            }
             if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
             // The shared byte dimension imposes cross-index FIFO whenever it
             // blocks this request, including when the per-index segment
@@ -937,6 +958,7 @@ const PlatformTextMergeRuntime = struct {
                     switch (err) {
                         error.OutOfMemory,
                         error.OutcomeUnknown,
+                        error.OutcomeReconciliationRequired,
                         error.DurabilityOutcomeUnknown,
                         error.WriteOutcomeUnknown,
                         error.SqlTransactionOutcomeUnknown,

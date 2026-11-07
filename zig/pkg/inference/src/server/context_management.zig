@@ -339,7 +339,8 @@ pub fn viewMessages(allocator: std.mem.Allocator, messages: []const generation.M
 
 fn requireTextOnly(message: generation.Message) !void {
     if ((message.image_bytes != null and message.image_bytes.?.len > 0) or
-        (message.audio_bytes != null and message.audio_bytes.?.len > 0)) return error.ContextManagementTextOnly;
+        (message.audio_bytes != null and message.audio_bytes.?.len > 0) or
+        message.video_bytes != null) return error.ContextManagementTextOnly;
     if (message.content_parts) |parts| for (parts) |part| switch (part) {
         .text => {},
         .image, .audio => return error.ContextManagementTextOnly,
@@ -1154,6 +1155,8 @@ test "message views accept text part arrays and reject media parts" {
         .content_parts = &image_parts,
     }};
     try std.testing.expectError(error.ContextManagementTextOnly, viewMessages(std.testing.allocator, &image_messages));
+    const video_messages = [_]generation.Message{.{ .role = "user", .content = "describe", .video_bytes = "clip" }};
+    try std.testing.expectError(error.ContextManagementTextOnly, viewMessages(std.testing.allocator, &video_messages));
 }
 
 test "KV protected prefix requires exact rendered and token prefixes" {

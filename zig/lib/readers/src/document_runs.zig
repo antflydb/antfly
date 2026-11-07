@@ -698,6 +698,8 @@ pub const DispatchMeter = struct {
 /// Measured work is identified independently of aggregate page/row checkpoints.
 /// Watermarks allow a pixel grant's receipt to grow before its final flush.
 pub const Measurement = struct {
+    /// Provider-declared capacity spent without a token measurement.
+    unmeasured_tokens: u64 = 0,
     prompt_tokens: u64 = 0,
     completion_tokens: u64 = 0,
     rendered_pixels: u64 = 0,
@@ -770,7 +772,7 @@ pub const Session = struct {
             self.complete = true;
         }
     };
-    pub const Output = struct { bytes: []const u8, events: []const u8 = "", actual: Charge };
+    pub const Output = struct { bytes: []const u8, events: []const u8 = "", actual: Charge, tokens_measured: bool = true };
     pub const Result = struct { bytes: []u8, replayed: bool };
     pub const Clock = struct {
         ptr: ?*anyopaque = null,
@@ -1106,7 +1108,7 @@ pub const Session = struct {
             self.settleMeter(stage, null);
             return err;
         };
-        self.settleMeter(stage, output.actual.tokens);
+        self.settleMeter(stage, if (output.tokens_measured) output.actual.tokens else null);
         if (output.bytes.len > max_payload_bytes) return error.DocumentOutputTooLarge;
         const committed = try self.store.completeWithEvents(work, self.lease, stage, output.actual, output.bytes, output.events, self.clock.now());
         self.lock();

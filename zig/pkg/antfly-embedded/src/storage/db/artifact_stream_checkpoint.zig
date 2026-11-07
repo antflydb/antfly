@@ -20,7 +20,7 @@ const publication = @import("artifact_publication.zig");
 const Observation = @import("artifact_stream_observation.zig").Observation;
 const logical_position = @import("artifact_chunk_scan_position.zig");
 const prefix = "\x00\x00__artifact_publication__:stream-checkpoint:";
-pub const max_cursor_bytes = 1024 * 1024;
+pub const max_cursor_bytes = publication.max_cursor_bytes;
 pub const Key = [prefix.len + 24 + 8 + 16 + 32]u8;
 pub const Identity = struct { root_incarnation: u128, kind: @FieldType(publication.Command, "producer_kind"), name: []const u8, generation: u64, artifact: []const u8, scope: []const u8 = "" };
 

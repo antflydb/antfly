@@ -215,6 +215,7 @@ SOURCE_MODULES = {
     "pdf_values": ("zig/lib/pdf/src/values.zig",),
     "pdf_syntax": ("zig/lib/pdf/src/syntax.zig",),
     "pdf_text_encoding": ("zig/lib/pdf/src/text_encoding.zig",),
+    "pdf_text_structure": ("zig/lib/pdf/src/text_structure.zig",),
     "pdf_native_contract": (
         "zig/pkg/antfly-embedded/src/storage/pdf_native_contract.zig",
     ),
@@ -274,6 +275,9 @@ SOURCE_MODULES = {
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_logging_openapi/root.zig",
     ),
     "antfly_matcher": ("zig/pkg/antfly-embedded/matcher/src/mod.zig",),
+    "antfly_privacy_openapi": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_privacy_openapi/root.zig",
+    ),
     "antfly_metadata_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_metadata_openapi/root.zig",
     ),

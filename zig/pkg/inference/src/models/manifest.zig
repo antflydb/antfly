@@ -302,6 +302,7 @@ pub const listing_compatibility_sidecars = [_][]const u8{
 
 /// Resolved model configuration loaded from a model directory.
 pub const ModelManifest = struct {
+    managed_publication: ?[32]u8 = null,
     allocator: std.mem.Allocator,
 
     // Identity
@@ -356,6 +357,8 @@ pub const ModelManifest = struct {
     bert_pad_token_id: i64 = 0,
     bert_position_embedding_offset: u32 = 0,
     config_model_arch: []const u8 = "",
+    /// Set by listing for GGUF generators with a projector, without a full parse.
+    gguf_generator_gemma4: bool = false,
 
     // Pipeline config
     pooling: PoolingStrategy = .mean,
@@ -944,7 +947,7 @@ const onnx_subdirs = [_][]const u8{ "", "onnx" };
 fn ignoreNonResourceMetadataError(result: anytype) !void {
     const metadata_result: anyerror!void = result;
     metadata_result catch |err| switch (err) {
-        error.OutOfMemory => return err,
+        error.OutOfMemory, error.ChecksumMismatch, error.InvalidManagedDownload => return err,
         error.InvalidGlinerBoundaryConfig,
         error.UnsupportedGlinerArchitecture,
         error.UnsupportedGlinerBoundaryVersion,
@@ -1090,7 +1093,10 @@ const ArtifactCatalog = struct {
     fn readOptionalUnchecked(self: *const ArtifactCatalog, name: []const u8) !?[]u8 {
         if (self.receipt != null) {
             const artifact = self.find(name) orelse return null;
-            return try c_file.readFile(self.allocator, artifact.canonical_path);
+            const bytes = try c_file.readFile(self.allocator, artifact.canonical_path);
+            errdefer self.allocator.free(bytes);
+            try managed_receipt.verifyArtifactBytes(artifact, bytes);
+            return bytes;
         }
         return c_file.readFileFromDir(self.allocator, self.model_dir_path, name) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -1186,6 +1192,15 @@ const DirectGgufArtifact = struct {
             ancestor = parent;
         }
 
+        // An alias outside the installation still inherits the target's
+        // receipt. Check requested ancestors first so an unlisted/escaping
+        // file inside a managed directory cannot become an unmanaged alias.
+        if (!std.mem.eql(u8, resolved_requested_path, canonical_path)) {
+            const target = try DirectGgufArtifact.init(allocator, canonical_path);
+            allocator.free(canonical_path);
+            allocator.free(resolved_requested_path);
+            return target;
+        }
         return .{
             .allocator = allocator,
             .path = canonical_path,
@@ -1246,7 +1261,7 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     if (std.mem.endsWith(u8, model_dir_path, ".gguf")) {
         var direct = try DirectGgufArtifact.init(allocator, model_dir_path);
         defer direct.deinit();
-        var manifest = ModelManifest{ .allocator = allocator };
+        var manifest = ModelManifest{ .allocator = allocator, .managed_publication = if (direct.catalog.receipt) |receipt| receipt.publication_generation else null };
         errdefer manifest.deinit();
         manifest.gguf_path = direct.takePath();
         try ignoreNonResourceMetadataError(applyGgufTokenizerMetadata(
@@ -1264,6 +1279,19 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     var catalog = try ArtifactCatalog.initPublished(allocator, model_dir_path);
     defer catalog.deinit();
     return loadFromCatalog(allocator, &catalog);
+}
+
+/// Parse execution/admission metadata under the same construction fence as
+/// weights. A receipt captured before a rename cannot authenticate sidecars
+/// reopened from the replacement installation.
+pub fn loadBoundFromDir(a: std.mem.Allocator, io: std.Io, path: []const u8, expected: ?[32]u8, comptime listing: bool) !ModelManifest {
+    var lease = try @import("../registry/publication_lease.zig").Lease.shared(a, io, path);
+    defer lease.deinit(io);
+    if (!std.meta.eql(expected, try managed_receipt.publicationGeneration(a, io, path))) return error.ModelArtifactsChanging;
+    var manifest = if (listing) try loadListingFromDir(a, path) else try loadFromDir(a, path);
+    errdefer manifest.deinit();
+    if (!std.meta.eql(expected, manifest.managed_publication) or !std.meta.eql(expected, try managed_receipt.publicationGeneration(a, io, path))) return error.ModelArtifactsChanging;
+    return manifest;
 }
 
 /// Probe an explicit Antfly capability without opening architecture or tokenizer
@@ -1460,7 +1488,7 @@ fn validateGlinerSpecialtySidecars(manifest: *const ModelManifest) !void {
 
 fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !ModelManifest {
     const model_dir_path = catalog.model_dir_path;
-    var manifest = ModelManifest{ .allocator = allocator };
+    var manifest = ModelManifest{ .allocator = allocator, .managed_publication = if (catalog.receipt) |value| value.publication_generation else null };
     errdefer manifest.deinit();
     manifest.gliner_specialty_artifact_hint = try catalog.specialtyArtifactHint();
 
@@ -1627,11 +1655,13 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
         var direct = try DirectGgufArtifact.init(allocator, model_dir_path);
         defer direct.deinit();
         manifest.gguf_path = direct.takePath();
+        manifest.managed_publication = if (direct.catalog.receipt) |receipt| receipt.publication_generation else null;
         return manifest;
     }
 
     var catalog = try ArtifactCatalog.initPublished(allocator, model_dir_path);
     defer catalog.deinit();
+    manifest.managed_publication = if (catalog.receipt) |value| value.publication_generation else null;
     manifest.gliner_specialty_artifact_hint = try catalog.specialtyArtifactHint();
 
     if (inferModelTypeFromPath(model_dir_path)) |model_type| {
@@ -1735,6 +1765,9 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     if (manifest.preprocessor_config_path == null) manifest.preprocessor_config_path = try findFileInSubdirs(allocator, &catalog, &.{"preprocessor_config.json"}, &.{""});
     if (manifest.processor_config_path == null) manifest.processor_config_path = try findFileInSubdirs(allocator, &catalog, &.{"processor_config.json"}, &.{""});
     try fillAutoDetectedGgufPaths(&manifest, allocator, &catalog);
+    if (manifest.gguf_path != null and manifest.gguf_projector_path != null and manifest.config_model_arch.len == 0) {
+        manifest.gguf_generator_gemma4 = ggufMetadataIsGemma4(manifest.gguf_path.?);
+    }
 
     try applyImplicitSparseOutputLayout(&manifest, &catalog);
     try applySentenceTransformersTaskSidecars(&manifest, allocator, &catalog);
@@ -2385,6 +2418,17 @@ fn artifactExists(
 ) !bool {
     if (catalog) |value| return value.exists(relative_path);
     return c_file.fileExistsInDirChecked(allocator, model_dir_path, relative_path);
+}
+
+fn ggufMetadataIsGemma4(path: []const u8) bool {
+    // Architecture metadata has no prescribed position. Skip unrelated values
+    // without materializing them; stop before tensor data, even for large files.
+    var region = c_file.MmapRegion.init(std.heap.smp_allocator, path) catch return false;
+    // Listing runs beside loaded models, whose pages must stay cached.
+    region.preserveFileCacheOnDeinit();
+    defer region.deinit();
+    const architecture = gguf_format.readArchitectureFromPrefix(region.data) orelse return false;
+    return std.mem.eql(u8, architecture, "gemma4");
 }
 
 fn supportsGgufSentencePieceFallback(model_name: []const u8) bool {
@@ -8027,6 +8071,52 @@ fn buildTestGgufWithGemma4Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_bos_token", true);
 
     return data.toOwnedSlice(allocator);
+}
+
+test "listing recognizes Gemma 4 GGUF generators from a header prefix" {
+    const allocator = std.testing.allocator;
+    const gguf = try buildTestGgufWithGemma4Tokenizer(allocator);
+    defer allocator.free(gguf);
+    try std.testing.expectEqualStrings("gemma4", gguf_format.readArchitectureFromPrefix(gguf).?);
+    try std.testing.expect(gguf_format.readArchitectureFromPrefix(gguf[0..12]) == null);
+    try std.testing.expect(gguf_format.readArchitectureFromPrefix("not a gguf file at all!") == null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = gguf });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "mmproj-model.gguf", .data = gguf });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"image\"]}" });
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(dir);
+    var manifest = try loadListingFromDir(allocator, dir);
+    defer manifest.deinit();
+    try std.testing.expect(manifest.gguf_projector_path != null);
+    try std.testing.expect(manifest.gguf_generator_gemma4);
+}
+
+test "listing recognizes Gemma 4 architecture after large unrelated GGUF metadata" {
+    const a = std.testing.allocator;
+    var data: std.ArrayListUnmanaged(u8) = .empty;
+    defer data.deinit(a);
+    try data.appendSlice(a, gguf_format.magic);
+    try appendTestLe(u32, a, &data, 3);
+    try appendTestLe(u64, a, &data, 0);
+    try appendTestLe(u64, a, &data, 2);
+    const description = try a.alloc(u8, 70 * 1024);
+    defer a.free(description);
+    @memset(description, 'x');
+    try appendTestMetadataString(a, &data, "general.description", description);
+    try appendTestMetadataString(a, &data, "general.architecture", "gemma4");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = data.items });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "mmproj-model.gguf", .data = data.items });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"image\"]}" });
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(dir);
+    var manifest = try loadListingFromDir(a, dir);
+    defer manifest.deinit();
+    try std.testing.expect(manifest.gguf_generator_gemma4);
 }
 
 fn buildTestGgufWithBertT5Tokenizer(allocator: std.mem.Allocator) ![]u8 {

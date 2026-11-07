@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const inference_validation_errors = @import("inference_validation_errors.zig");
 const index_metadata = @import("antfly_local_sources").api_index_metadata;
 const join_planning = @import("join_planning.zig");
 const system_catalog = @import("antfly_local_sources").system_catalog_domain;
@@ -1624,6 +1625,11 @@ test "session maintenance activation follows current range leadership without fo
 }
 
 pub const ApiHttpServerConfig = struct {
+    /// Optional query-role distributed SQL service; scoped by authenticated capabilities.
+    distributed_sql: ?@import("../serverless/sql/runtime.zig").Factory = null,
+    sql_deployment: ?@import("../serverless/sql/deployment.zig").Config = null,
+    distributed_sql_scope_seed: ?[64]u8 = null,
+    distributed_sql_join: ?@import("antfly_local_sources").sql_catalog.DistributedJoin = null,
     /// Node-local personal connection owner; never populated by distributed configuration.
     chatgpt: ?*@import("antfly_local_sources").chatgpt_manager.Manager = null,
     pgwire: ?common_config.Config.PgwireConfig = null,
@@ -1673,6 +1679,8 @@ pub const ApiHttpServerConfig = struct {
     /// grant. Distributed runtimes explicitly clear this when their distinct
     /// trusted authority is unconfigured; internal RPC identity is not a substitute.
     catalog_publication_authority_available: bool = true,
+    /// Only the metadata leader and standalone local authority advance scans.
+    privacy_scan_coordinator: bool = false,
     /// Dedicated node-to-node signing identity. Distributed runtimes validate
     /// both values before opening a listener; they must never share the public
     /// trusted-principal signing domain.
@@ -1719,6 +1727,9 @@ pub const ApiHttpServerConfig = struct {
     /// Loaded node config, used by /connections to enumerate configured
     /// providers and object stores. Must outlive the server.
     node_config: ?*const common_config.Config = null,
+    /// Lite storage cannot publish the directory snapshot behind a retained
+    /// native cut, so its ordered first pages read live state instead.
+    native_retained_cuts: bool = true,
     /// Borrowed engine-owned local durability root for standalone/embedded
     /// native lake artifacts. Distributed serving requires storage.artifacts.
     native_lake_artifact_base_dir: ?[]const u8 = null,
@@ -2030,6 +2041,10 @@ pub const StatusSource = struct {
         tracks_sql_submission: bool = false,
         system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 = null,
 
+        privacy_mutation: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, ?[]const u8, bool, api_operation.RequestContext) anyerror!@import("privacy.zig").Response = null,
+        privacy_authority_term: ?*const fn (*anyopaque) anyerror!?u64 = null,
+        privacy_work: ?*const fn (*anyopaque, std.mem.Allocator, i64) anyerror!?metadata_table_manager.PrivacyWork = null,
+        table_record: ?*const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?metadata_table_manager.TableRecord = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         /// Complete catalog and store capabilities without detailed inventories.
@@ -2105,6 +2120,27 @@ pub const StatusSource = struct {
 
     /// The shared public data-admission boundary. Ownership is captured with
     /// catalog identity, so every HTTP/MCP/SQL resolver gets the same decision.
+    pub fn forwardPrivacyMutation(self: StatusSource, a: std.mem.Allocator, table: []const u8, body: []const u8, if_match: ?[]const u8, scan: bool, request: api_operation.RequestContext) !?@import("privacy.zig").Response {
+        const call = self.vtable.privacy_mutation orelse return null;
+        return try BoundaryAbi.call("privacy_mutation", self.boundary_dispatch, call, .{ self.ptr, a, table, body, if_match, scan, request });
+    }
+
+    pub fn privacyAuthorityTerm(self: StatusSource) !?u64 {
+        const call = self.vtable.privacy_authority_term orelse return null;
+        return BoundaryAbi.call("privacy_authority_term", self.boundary_dispatch, call, .{self.ptr});
+    }
+    pub fn nextPrivacyWork(self: StatusSource, a: std.mem.Allocator, now: i64) !?metadata_table_manager.PrivacyWork {
+        const call = self.vtable.privacy_work orelse return null;
+        return BoundaryAbi.call("privacy_work", self.boundary_dispatch, call, .{ self.ptr, a, now });
+    }
+    pub fn tableRecord(self: StatusSource, a: std.mem.Allocator, name: []const u8) !?metadata_table_manager.TableRecord {
+        if (self.vtable.table_record) |call| return BoundaryAbi.call("table_record", self.boundary_dispatch, call, .{ self.ptr, a, name });
+        var snapshot = (try self.adminSnapshot()) orelse return null;
+        defer self.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, name) orelse return null;
+        return try metadata_table_manager.cloneTable(a, table.*);
+    }
+
     pub fn systemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         switch (input) {
             .native_memory_create => |request| {
@@ -2757,6 +2793,16 @@ pub const StatusSource = struct {
                 });
             }
 
+            fn privacyAuthorityTerm(ptr: *anyopaque) anyerror!?u64 {
+                return cast(ptr).privacyAuthorityTerm();
+            }
+            fn nextPrivacyWork(ptr: *anyopaque, a: std.mem.Allocator, now: i64) anyerror!?metadata_table_manager.PrivacyWork {
+                return cast(ptr).nextPrivacyWork(a, now);
+            }
+            fn tableRecord(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) anyerror!?metadata_table_manager.TableRecord {
+                return cast(ptr).tableRecord(a, name);
+            }
+
             fn waitTableProjection(ptr: *anyopaque, table_name: []const u8, schema_json: ?[]const u8, indexes_json: ?[]const u8) anyerror!void {
                 return try cast(ptr).waitForTableProjection(table_name, .{
                     .schema_json = schema_json,
@@ -2858,6 +2904,9 @@ pub const StatusSource = struct {
             .put_artifact_enrichment = Gen.putArtifactEnrichment,
             .delete_artifact_enrichment = Gen.deleteArtifactEnrichment,
             .wait_table_lifecycle = Gen.waitTableLifecycle,
+            .privacy_authority_term = if (@hasDecl(T, "privacyAuthorityTerm")) Gen.privacyAuthorityTerm else null,
+            .privacy_work = if (@hasDecl(T, "nextPrivacyWork")) Gen.nextPrivacyWork else null,
+            .table_record = if (@hasDecl(T, "tableRecord")) Gen.tableRecord else null,
             .wait_table_projection = Gen.waitTableProjection,
             .run_round = Gen.runRound,
             .get_join_shuffle_lease = Gen.getJoinShuffleLease,
@@ -3418,21 +3467,21 @@ fn replaceTableDefinitionOnService(
     expected: metadata_table_manager.TableRecord,
     replacement: metadata_table_manager.TableRecord,
 ) !void {
-    try validateTableDefinitionReplacementOnService(svc, expected, replacement);
+    const progress_only = try validateTableDefinitionReplacementOnService(svc, expected, replacement);
     try svc.replaceTableDefinition(expected, replacement);
-    runPostCommitMutationRound(svc, "replace_table_definition_legacy");
+    if (!progress_only) runPostCommitMutationRound(svc, "replace_table_definition_legacy");
 }
 
 fn validateTableDefinitionReplacementOnService(
     svc: anytype,
     expected: metadata_table_manager.TableRecord,
     replacement: metadata_table_manager.TableRecord,
-) !void {
+) !bool {
     try metadata_service.ensureCoordinatedDecoderWithContext(svc, .{ .compare_and_replace_table = .{ .expected = expected, .replacement = replacement } }, .{});
+    if (try metadata_service.admitPrivacyProgressOnService(svc, expected, replacement)) return true;
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
-    const current = tables_api.findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
-    if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
+    try metadata_service.validateCurrentTableDefinitionOnService(svc, &snapshot, expected, replacement);
     try metadata_table_manager.validateObjectTableMutation(std.heap.page_allocator, expected, replacement);
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(std.heap.page_allocator, replacement.indexes_json);
     try managed_embedder.validateEmbeddingProducerOwnershipJson(std.heap.page_allocator, replacement.indexes_json);
@@ -3442,6 +3491,7 @@ fn validateTableDefinitionReplacementOnService(
         expected,
         replacement,
     )) return error.ExtensionOwnedObject;
+    return false;
 }
 
 fn replaceTableDefinitionOnServiceStamped(
@@ -3449,9 +3499,9 @@ fn replaceTableDefinitionOnServiceStamped(
     expected: metadata_table_manager.TableRecord,
     replacement: metadata_table_manager.TableRecord,
 ) !metadata_api.CatalogMutationStamp {
-    try validateTableDefinitionReplacementOnService(svc, expected, replacement);
+    const progress_only = try validateTableDefinitionReplacementOnService(svc, expected, replacement);
     const stamp = try svc.replaceTableDefinitionStamped(expected, replacement);
-    runPostCommitMutationRound(svc, "replace_table_definition");
+    if (!progress_only) runPostCommitMutationRound(svc, "replace_table_definition");
     return stamp;
 }
 
@@ -4092,6 +4142,8 @@ pub const ApiHttpServer = struct {
     backup_maintenance_owner_id: u64 = 0,
     index_installation_owner_id: u64 = 0,
     index_installation_closing: std.atomic.Value(bool) = .init(false),
+    privacy_scan_in_flight: std.atomic.Value(bool) = .init(false),
+    privacy_checkpoint_gc: @import("privacy_checkpoints.zig").GC = .{},
     index_installation_worker_in_flight: std.atomic.Value(bool) = .init(false),
     index_installation_mutex: std.atomic.Mutex = .unlocked,
     index_installation_apply_mutex: std.atomic.Mutex = .unlocked,
@@ -4119,6 +4171,7 @@ pub const ApiHttpServer = struct {
     /// parameter state; every execution still binds against its own snapshot.
     sql_plan_cache: sql_plan_cache.Cache,
     sql_schema_cache: sql_schema_cache.Cache,
+    owned_sql_deployment: ?*@import("../serverless/sql/deployment.zig").Owned = null,
     lake_read_cache: @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache,
     // A persistent worker must not consume the last request executor slot or
     // inherit the single-threaded provider fallback. Allocate at a stable
@@ -4626,6 +4679,22 @@ pub const ApiHttpServer = struct {
             return error.ArtifactIndexSourcesTemporarilyUnavailable;
     }
 
+    pub fn ensurePrivacyAdmission(self: *ApiHttpServer, request: api_operation.RequestContext) !void {
+        const reads = self.table_reads orelse return error.PrivacyProtectiveInstallationRequired;
+        if (reads.vtable.privacy_policy_version == null or self.cfg.deployment_mode == .serverless) return error.PrivacyProtectiveInstallationRequired;
+        if (self.cfg.deployment_mode != .distributed) return;
+        if (self.cfg.internal_service_secret == null) return error.PrivacyInternalAuthRequired;
+        var snapshot = (try self.source.linearizableSnapshot(request)) orelse return error.PrivacyProtocolUpgradeRequired;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        var found = false;
+        for (snapshot.stores) |store| {
+            if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
+            found = true;
+            if (!metadata_table_manager.privacyProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)) return error.PrivacyProtocolUpgradeRequired;
+        }
+        if (!found) return error.PrivacyProtocolUpgradeRequired;
+    }
+
     fn loadClusterStatusWithSnapshot(
         self: *ApiHttpServer,
         alloc: std.mem.Allocator,
@@ -4870,6 +4939,7 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.restore_job_store.attach(opened);
         }
+        try server.initializeDistributedSql();
         return server;
     }
 
@@ -4889,6 +4959,17 @@ pub const ApiHttpServer = struct {
         self.foreign_registry = registry;
         self.cfg.foreign_registry = registry;
         return registry;
+    }
+
+    /// Construct inside the API kernel after its config crosses the ABI. No
+    /// SQL planner callbacks or allocator vtables cross a codegen boundary.
+    pub fn initializeDistributedSql(self: *ApiHttpServer) !void {
+        if (self.owned_sql_deployment != null) return;
+        const config = self.cfg.sql_deployment orelse return;
+        try @import("internal_service_auth.zig").validateCredentialIsolation(config.authentication.secret, self.cfg.trusted_principal_secret);
+        const owned = try @import("../serverless/sql/deployment.zig").Owned.init(self.alloc, self.embedding_provider_runtime.io, config, .api_only, self.cfg.node_config, self.cfg.secret_store, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
+        self.owned_sql_deployment = owned;
+        owned.attachApi(self);
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
@@ -4967,6 +5048,7 @@ pub const ApiHttpServer = struct {
             state.deinit();
             self.alloc.destroy(state);
         }
+        if (self.owned_sql_deployment) |owned| owned.deinit();
         self.lake_search_metadata.deinit();
         self.lake_reader_leases.deinit(self.embedding_provider_runtime.io);
         self.lake_read_cache.deinit();
@@ -5425,7 +5507,7 @@ pub const ApiHttpServer = struct {
 
     fn joinCtxBuildOwnedSearchRequest(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror!query_api.OwnedQueryRequest {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        try ensureRequestActive(cancellation);
         return try self.buildOwnedSearchRequestFromQueryValue(
             alloc,
             table_name,
@@ -5537,6 +5619,9 @@ pub const ApiHttpServer = struct {
         // to retry admission.
         self.resumeNativeLakeIndexPublication() catch |err| {
             std.log.warn("failed to resume native lake index publication err={s}", .{@errorName(err)});
+        };
+        self.schedulePrivacyScans() catch |err| {
+            std.log.warn("privacy scan admission deferred err={s}", .{@errorName(err)});
         };
         self.ensurePendingIndexInstallationWorker() catch |err| {
             std.log.warn("failed to resume pending index installation reconciliation err={s}", .{@errorName(err)});
@@ -6575,6 +6660,7 @@ pub const ApiHttpServer = struct {
         } else {
             var repository = try @import("native_query_repository.zig").Repository.init(a, config, self.cfg.secret_store, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
             defer repository.deinit();
+            repository.attachResources(self.shared_resource_manager orelse &self.local_resource_manager);
             const control: @import("antfly_local_sources").storage_db_native_query_cut.Control = .{ .parent = cancel, .deadline_ns = request.deadline_ns.? };
             if (self.native_query_gc_collection == null) {
                 const runtime = self.cfg.backend_runtime orelse return;
@@ -10427,10 +10513,7 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
     ) !?metadata_table_manager.TableRecord {
-        var snapshot = (try self.source.adminSnapshot()) orelse return null;
-        defer self.source.freeAdminSnapshot(&snapshot);
-        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
-        return try metadata_table_manager.cloneTable(alloc, table.*);
+        return self.source.tableRecord(alloc, table_name);
     }
 
     pub fn docMatchesRowFilter(
@@ -13236,14 +13319,21 @@ pub const ApiHttpServer = struct {
         defer if (previous_definition) |definition| metadata_table_manager.freeTable(self.alloc, definition);
         var definition_publication: RestoreDefinitionPublication = undefined;
         var publication_hook: ?backups_api.RestorePublicationHook = null;
+        var replacement_indexes: ?[]u8 = null;
+        defer if (replacement_indexes) |value| self.alloc.free(value);
         if (replace_existing) {
             previous_definition = (try self.loadOwnedTableRecord(self.alloc, table_name)) orelse return error.TableNotFound;
-            if (!try tableDefinitionMatchesManifest(self.alloc, previous_definition.?, &manifest)) {
+            // Keep authenticated source bytes for storage validation. Only the
+            // destination definition loses source-owned operational checkpoints.
+            replacement_indexes = try @import("antfly_local_sources").privacy_catalog.prepareRestore(self.alloc, manifest.indexes_json);
+            var destination_manifest = manifest;
+            destination_manifest.indexes_json = replacement_indexes.?;
+            if (!try tableDefinitionMatchesManifest(self.alloc, previous_definition.?, &destination_manifest)) {
                 var replacement = previous_definition.?;
                 replacement.description = manifest.description;
                 replacement.schema_json = manifest.schema_json;
                 replacement.read_schema_json = "";
-                replacement.indexes_json = manifest.indexes_json;
+                replacement.indexes_json = replacement_indexes.?;
                 replacement.replication_sources_json = manifest.replication_sources_json;
                 replacement.restore_backup_id = "";
                 replacement.restore_location = "";
@@ -14890,6 +14980,12 @@ pub const ApiHttpServer = struct {
                     try sleepNsCancellable(retry_io, sleep_ns, cancellation);
                     continue;
                 },
+                error.Cancelled, error.Canceled => {
+                    // Provider adapters can expose cancellation as a boolean.
+                    // Recheck the owning token before classifying the failure.
+                    try ensureRequestActive(cancellation);
+                    return err;
+                },
                 error.Timeout => {
                     return error.Timeout;
                 },
@@ -15830,14 +15926,16 @@ pub const ApiHttpServer = struct {
         // Hierarchy traversal owns its source-revision cursor. Capturing a
         // whole-table native cut here both bypasses its stale-revision check
         // and rejects Lite, whose storage cannot publish a directory snapshot.
-        // Explicit retained tokens from existing callers still follow their
-        // normal validation path; ordinary sorted search continues to pin.
-        if (query_req.req.hierarchy_children == null and query_req.req.remote_snapshot == null and (query_req.req.order_by.len != 0 or query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0)) {
+        // Producer member traversal has no unit-revision cursor: it pins a
+        // native cut from its first page, just like ordinary sorted search.
+        if ((query_req.req.hierarchy_children == null or query_req.req.hierarchy_children.?.artifact_name != null) and query_req.req.remote_snapshot == null and (query_req.req.order_by.len != 0 or query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0)) {
             if (query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0) return error.CatalogGenerationChanged;
             const context: api_operation.RequestContext = .{ .deadline_ns = request_deadline_ns, .cancellation = cancellation orelse .none };
             if (try self.queryTableDefinition(resolver.arena, resolver, table_name, context)) |table| {
                 const external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(resolver.arena, table.schema_json);
-                if (external == null and table.storage.engine != .object) {
+                if (external == null and table.storage.engine != .object and !self.cfg.native_retained_cuts) {
+                    query_req.req.response_live_read = true;
+                } else if (external == null and table.storage.engine != .object) {
                     var store = try @import("lake_index_store.zig").Store.openNative(resolver.arena, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
                     var capture = (try self.source.linearizableSnapshot(context)) orelse return error.CatalogGenerationChanged;
@@ -15898,7 +15996,7 @@ pub const ApiHttpServer = struct {
             // happen to be present.
             error.InvalidArgument => return error.InvalidQueryRequest,
             else => return err,
-        }) orelse error.TableNotFound;
+        }) orelse return error.TableNotFound;
     }
 
     const CatalogGraphReadContext = struct {
@@ -16974,6 +17072,34 @@ pub const ApiHttpServer = struct {
         }) catch |err| return err;
     }
 
+    pub fn schedulePrivacyScans(self: *ApiHttpServer) !void {
+        if (self.cfg.deployment_mode != .standalone and !self.cfg.privacy_scan_coordinator) return;
+        if (!self.cfg.catalog_publication_authority_available or self.index_installation_closing.load(.acquire)) return;
+        const runtime = self.cfg.backend_runtime orelse return;
+        if (runtime.threaded_jobs == null or self.index_installation_owner_id == 0) return;
+        if (self.privacy_scan_in_flight.swap(true, .acq_rel)) return;
+        errdefer self.privacy_scan_in_flight.store(false, .release);
+        const Work = struct {
+            server: *ApiHttpServer,
+            fn run(ptr: *anyopaque) !void {
+                const work: *@This() = @ptrCast(@alignCast(ptr));
+                defer work.server.privacy_scan_in_flight.store(false, .release);
+                if (work.server.index_installation_closing.load(.acquire)) return;
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer arena.deinit();
+                try @import("privacy.zig").advanceOnce(work.server, arena.allocator());
+            }
+            fn deinit(ptr: *anyopaque) void {
+                const work: *@This() = @ptrCast(@alignCast(ptr));
+                std.heap.page_allocator.destroy(work);
+            }
+        };
+        const work = try std.heap.page_allocator.create(Work);
+        errdefer std.heap.page_allocator.destroy(work);
+        work.* = .{ .server = self };
+        try runtime.durable_jobs.submit(.{ .owner_id = self.index_installation_owner_id, .class = .maintenance, .ptr = work, .run = Work.run, .deinit = Work.deinit });
+    }
+
     fn ensurePendingIndexInstallationWorker(self: *ApiHttpServer) !void {
         const runtime = self.cfg.backend_runtime orelse return;
         if (runtime.threaded_jobs == null or self.index_installation_owner_id == 0) return;
@@ -17404,6 +17530,8 @@ pub const ApiHttpServer = struct {
             error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
             error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => {
@@ -17423,6 +17551,8 @@ pub const ApiHttpServer = struct {
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => {
@@ -17478,6 +17608,8 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.ModelNotFound => return error.ModelNotFound,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
@@ -17502,6 +17634,8 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.ModelNotFound => return error.ModelNotFound,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.InvalidCreateTableRequest => return error.InvalidIndexRequest,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
@@ -18068,9 +18202,13 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecutePutArtifactEnrichmentError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
-        const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
+        const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=load_table table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            return metadataAccessFailure(err);
+        }) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
-        const enrichment_json = table_contract.parseArtifactEnrichmentRequest(alloc, artifact_name, body) catch {
+        const enrichment_json = table_contract.parseArtifactEnrichmentRequest(alloc, artifact_name, body) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=request table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
             return error.InvalidEnrichmentRequest;
         };
         defer alloc.free(enrichment_json);
@@ -18085,17 +18223,23 @@ pub const ApiHttpServer = struct {
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
             },
-        ) catch |err| switch (err) {
-            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
-            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
-            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
-            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
-            else => return error.InternalFailure,
+        ) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=producer table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+                error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+                error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+                error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+                else => return error.InternalFailure,
+            }
         };
 
-        const assembled_indexes_json = indexes_api.addEnrichmentToTableIndexesJson(alloc, table_before.indexes_json, artifact_name, enrichment_json) catch |err| switch (err) {
-            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
-            else => return error.InternalFailure,
+        const assembled_indexes_json = indexes_api.addEnrichmentToTableIndexesJson(alloc, table_before.indexes_json, artifact_name, enrichment_json) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=assemble_table table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
+                else => return error.InternalFailure,
+            }
         };
         defer alloc.free(assembled_indexes_json);
         const expected_indexes_json = table_index_config.normalizeAdmittedManagedEmbeddingIndexDimensionsJsonWithOptions(
@@ -18109,13 +18253,22 @@ pub const ApiHttpServer = struct {
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
             },
-        ) catch |err| switch (err) {
-            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
-            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
-            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
-            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
-            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
-            else => return error.InvalidEnrichmentRequest,
+        ) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=normalize_table_embeddings table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+                error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
+                error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+                error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
+                error.ModelNotFound => return error.ModelNotFound,
+                error.AmbiguousModelIdentifier => return error.AmbiguousModelIdentifier,
+                error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+                error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+                error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+                error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+                error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+                else => return error.InvalidEnrichmentRequest,
+            }
         };
         defer alloc.free(expected_indexes_json);
         table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
@@ -18129,18 +18282,30 @@ pub const ApiHttpServer = struct {
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
             },
-        ) catch |err| switch (err) {
-            error.ModelNotFound, error.EmbeddingProbeUnavailable, error.InvalidCreateTableRequest, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
-            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
-            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
-            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
-            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
-            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
-            else => return error.InternalFailure,
+        ) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=validate_table_runtime table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.InvalidCreateTableRequest, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
+                error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+                error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
+                error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+                error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
+                error.ModelNotFound => return error.ModelNotFound,
+                error.AmbiguousModelIdentifier => return error.AmbiguousModelIdentifier,
+                error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+                error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+                error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+                error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+                error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+                else => return error.InternalFailure,
+            }
         };
-        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
-            error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
-            else => return error.InternalFailure,
+        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=validate_table_artifacts table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
+                else => return error.InternalFailure,
+            }
         };
 
         try ensureTableOperationActive(request);
@@ -18153,6 +18318,12 @@ pub const ApiHttpServer = struct {
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
+            error.ModelNotFound => return error.ModelNotFound,
+            error.AmbiguousModelIdentifier => return error.AmbiguousModelIdentifier,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
             error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
@@ -18160,19 +18331,19 @@ pub const ApiHttpServer = struct {
             error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
             else => {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-                std.log.err("public artifact enrichment metadata update failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                std.log.err("public artifact enrichment metadata update failed table={s} artifact={s} err={} request_id={s}", .{ table_name, artifact_name, err, request.request_id });
                 return error.InternalFailure;
             },
         };
         self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
             if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-            std.log.err("public artifact enrichment metadata projection wait failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+            std.log.err("public artifact enrichment metadata projection wait failed table={s} artifact={s} err={} request_id={s}", .{ table_name, artifact_name, err, request.request_id });
             return error.InternalFailure;
         };
         if (self.table_writes) |table_writes_source| {
             _ = table_writes_source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
                 else => {
-                    std.log.err("public artifact enrichment local apply failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                    std.log.err("public artifact enrichment local apply failed table={s} artifact={s} err={} request_id={s}", .{ table_name, artifact_name, err, request.request_id });
                     _ = table_writes_source.requestTableStructuralReconcile(alloc, table_name) catch |reconcile_err| {
                         std.log.warn("public artifact enrichment structural reconcile enqueue failed table={s} artifact={s} err={}", .{ table_name, artifact_name, reconcile_err });
                     };
@@ -22326,7 +22497,7 @@ pub const ApiHttpServer = struct {
             },
         ) catch |err| return switch (err) {
             error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
-            error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
+            error.ResourceLimitExceeded, error.MemoryBudgetExceeded, error.EmbeddingProbeUnavailable => try contextualInferenceValidationFailureResponse(self.alloc, err),
             error.InferenceEndpointAccessDenied => try contextualJsonResponse(self.alloc, 400, .{ .@"error" = "invalid_index_request", .message = public_table_http.inference_endpoint_access_denied_message, .retryable = false }),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
             error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(self.alloc, 400, "embedding index source has no matching embedding enrichment"),
@@ -22352,7 +22523,7 @@ pub const ApiHttpServer = struct {
             },
         ) catch |err| return switch (err) {
             error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
-            error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
+            error.ResourceLimitExceeded, error.MemoryBudgetExceeded, error.EmbeddingProbeUnavailable => try contextualInferenceValidationFailureResponse(self.alloc, err),
             error.InferenceEndpointAccessDenied => try contextualJsonResponse(self.alloc, 400, .{ .@"error" = "invalid_index_request", .message = public_table_http.inference_endpoint_access_denied_message, .retryable = false }),
             error.InvalidCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
             error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(self.alloc, 400, "embedding index source has no matching embedding enrichment"),
@@ -22687,6 +22858,13 @@ pub const ApiHttpServer = struct {
         delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
     ) !contextual_operations.OwnedResponse {
         if (isNdjsonContentType(content_type)) return self.handlePublicTableMultiQueryWithCancellation(table_name, body, borrowed_identity, cancellation, null, null);
+        const public_started = platform_time.monotonicNs();
+        const public_active = self.lake_query_metrics.beginPublic(public_started);
+        defer public_active.deinit();
+        var public_profile: @import("lake_query_metrics.zig").ComposedProfile = .{};
+        // Enclose catalog binding and all request-owned cleanup, including
+        // failures before the lake executor can create its narrower profile.
+        defer public_profile.finishPublic(&self.lake_query_metrics, public_started);
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*owned| owned.deinit(self.alloc);
         const deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
@@ -22714,9 +22892,17 @@ pub const ApiHttpServer = struct {
         };
         var bridge: ?Bridge = if (delivery) |target| .{ .server = self, .table_name = table_name, .target = target } else null;
         var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .delivery = if (bridge) |*value| .{ .ptr = value, .typed_result = if (value.target.typed_result != null) .{ .ptr = value, .consume = Bridge.consume } else null, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes, .preparation_bytes = value.target.preparation_bytes, .spill_io = self.embedding_provider_runtime.io, .consume_columns = value.target.typed_result == null } else null };
-        var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
+        var binding = bind: {
+            const started = platform_time.monotonicNs();
+            defer public_profile.record(&self.lake_query_metrics, .public_binding, started);
+            break :bind self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
+        };
         defer binding.deinit();
+        defer public_active.enter(.cleanup);
         if (bridge) |*value| value.table_name = binding.physical;
+        const dispatch_started = platform_time.monotonicNs();
+        public_active.enter(.dispatch);
+        defer public_profile.record(&self.lake_query_metrics, .public_dispatch, dispatch_started);
         return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, binding.bound_body orelse body, content_type, identity, cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
     }
 
@@ -22944,7 +23130,7 @@ pub const ApiHttpServer = struct {
                 cancellation: ?*const http_common.RequestCancellation,
                 fn checkpoint(raw: *anyopaque) !void {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
-                    if (runner.cancellation) |cancel| if (cancel.isCancelled()) return error.Cancelled;
+                    try ensureRequestActive(if (runner.cancellation) |cancel| cancel.token() else null);
                     try ensureRequestDeadline(runner.deadline);
                 }
                 fn execute(raw: *anyopaque, a: std.mem.Allocator, name: []const u8, query: []const u8) !contextual_operations.OwnedResponse {
@@ -23013,10 +23199,6 @@ pub const ApiHttpServer = struct {
                     response.body = encoded;
                     return response;
                 }
-                fn cursorCancelled(raw: *const anyopaque) bool {
-                    const cancel: *const http_common.RequestCancellation = @ptrCast(@alignCast(raw));
-                    return cancel.isCancelled();
-                }
                 fn saveCursor(raw: *anyopaque, a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
                     const started = @import("antfly_platform").time.monotonicNs();
@@ -23025,7 +23207,7 @@ pub const ApiHttpServer = struct {
                     var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
                     var artifacts = store.artifactStore();
-                    return @import("lake_retained_cut.zig").saveCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), runner.server.embedding_provider_runtime.io, bytes, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| .{ .ptr = cancel, .is_cancelled_fn = cursorCancelled } else .none);
+                    return @import("lake_retained_cut.zig").saveCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), runner.server.embedding_provider_runtime.io, bytes, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| cancel.token() else .none);
                 }
                 fn loadCursor(raw: *anyopaque, a: std.mem.Allocator, token: []const u8) ![]const u8 {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
@@ -23035,7 +23217,7 @@ pub const ApiHttpServer = struct {
                     var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, true, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
                     var artifacts = store.artifactStore();
-                    return @import("lake_retained_cut.zig").loadCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), token, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| .{ .ptr = cancel, .is_cancelled_fn = cursorCancelled } else .none);
+                    return @import("lake_retained_cut.zig").loadCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), token, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| cancel.token() else .none);
                 }
                 fn localDigest(bytes: []const u8) [64]u8 {
                     return @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.digestHex(bytes);
@@ -23060,6 +23242,8 @@ pub const ApiHttpServer = struct {
             error.InvalidCatalogName => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid table target"),
             error.InvalidComposedGraphIdentity, error.InvalidQueryRequest => if (db_mod.peekLastSortRejectionDiagnostic() != null)
                 try contextualUnsupportedExactSortResponse(self.alloc)
+            else if (try query_request_diagnostics.validationErrorBodyForRequest(self.alloc, table_name, body)) |error_body|
+                contextual_operations.jsonWithStatus(400, error_body, false)
             else
                 try contextual_operations.textAlloc(self.alloc, 400, "invalid query request"),
             // Seeded personalization contract failures (seeds without fresh
@@ -23284,15 +23468,9 @@ pub const ApiHttpServer = struct {
 
         var lines = std.mem.splitScalar(u8, body, '\n');
         while (lines.next()) |raw_line| {
-            if (cancellation) |value| {
-                if (value.isCancelled()) {
-                    return try self.publicQueryOperationErrorResponse(
-                        route_table_name orelse "",
-                        raw_line,
-                        error.Cancelled,
-                    );
-                }
-            }
+            ensureRequestActive(if (cancellation) |value| value.token() else null) catch |err| {
+                return try self.publicQueryOperationErrorResponse(route_table_name orelse "", raw_line, err);
+            };
             const line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0) continue;
 
@@ -24564,6 +24742,9 @@ pub const ApiHttpServer = struct {
     /// not O(retained history). It retries transient dispatch failures without
     /// requiring another client request.
     pub fn pollRestoreJobsOnce(self: *ApiHttpServer) !void {
+        // The metadata supervisor invokes this only on its current leader.
+        // Data coordinators have privacy_scan_coordinator disabled.
+        try self.schedulePrivacyScans();
         if (self.cfg.restore_owner_progress_generation) |generation| {
             const current = generation.load(.acquire);
             if (self.observed_restore_owner_progress_generation.swap(current, .acq_rel) != current) {
@@ -26661,9 +26842,10 @@ fn ensureRequestDeadline(deadline_ns: ?u64) !void {
 }
 
 fn ensureRequestActive(cancellation: ?CancellationToken) !void {
-    if (cancellation) |value| {
-        if (value.isCancelled()) return error.Cancelled;
-    }
+    if (cancellation) |value| value.check() catch |err| return switch (err) {
+        error.DeadlineExceeded => error.DeadlineExceeded,
+        else => error.Cancelled,
+    };
 }
 
 fn ensureTableOperationActive(request: api_operation.RequestContext) error{ Canceled, DeadlineExceeded }!void {
@@ -27555,18 +27737,23 @@ fn contextualArtifactSourcesUpgradePendingResponse(alloc: std.mem.Allocator) !co
     return response;
 }
 
-fn contextualIndexProbeUnavailableResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
-    var response = try contextualJsonResponse(alloc, 503, .{
-        .@"error" = "index_probe_unavailable",
-        .message = "index validation probe unavailable",
-        .retryable = true,
-    });
+fn contextualInferenceValidationFailureResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
+    const failure = inference_validation_errors.classify(err) orelse return error.InvalidArgument;
+    var response = contextual_operations.jsonWithStatus(failure.status, try failure.bodyAlloc(alloc), false);
     errdefer response.deinit(alloc);
-    var retry_after = try ownedContextualHeader(alloc, "Retry-After", "1");
-    errdefer retry_after.deinit(alloc);
-    response.headers = try alloc.alloc(contextual_operations.Header, 1);
-    response.headers[0] = retry_after;
+    if (failure.retry_after_seconds) |seconds| {
+        const value = try std.fmt.allocPrint(alloc, "{d}", .{seconds});
+        defer alloc.free(value);
+        var header = try ownedContextualHeader(alloc, "Retry-After", value);
+        errdefer header.deinit(alloc);
+        response.headers = try alloc.alloc(contextual_operations.Header, 1);
+        response.headers[0] = header;
+    }
     return response;
+}
+
+fn contextualIndexProbeUnavailableResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    return contextualInferenceValidationFailureResponse(alloc, error.EmbeddingProbeUnavailable);
 }
 
 fn contextualPublicFilterQueryErrorResponseForBody(
@@ -61959,4 +62146,153 @@ test "SQL pgwire native shared resource routing checks persisted ownership" {
         try std.testing.expectEqual(@as(?contextual_operations.OwnedResponse, null), try peer.forwardSQLResourceOperation(&id, kind, .{ .method = .DELETE, .uri = "/db/v1/sql/resource", .body = "" }, &forwarded));
         try std.testing.expect(!forwarded and !fixture.called);
     }
+}
+
+test "admission routing standalone query preserves hierarchy pointers over HTTP" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeReads = struct {
+        query_error: anyerror,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .document_artifact_manifest = artifactManifest,
+                    .document_artifact_manifests = artifactManifests,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            return self.query_error;
+        }
+
+        fn artifactManifest(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.query_error;
+        }
+
+        fn artifactManifests(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.query_error;
+        }
+    };
+
+    var reads = FakeReads{ .query_error = error.TestUnexpectedResult };
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
+    defer server.deinit();
+    var response = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/db/v1/tables/docs/query",
+        .content_type = "application/json",
+        .body = "{\"fields\":[],\"hierarchy\":{\"group_by\":{\"level\":\"source\",\"matches\":{}}}}",
+    });
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), response.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("/hierarchy/group_by/matches/fields", parsed.value.object.get("pointer").?.string);
+    try std.testing.expectEqualStrings("invalid_query_request", parsed.value.object.get("error").?.string);
+    try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
+}
+
+test "admission routing table creation preserves permanent validation refusals over HTTP" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        failure: anyerror = error.ResourceLimitExceeded,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn dense(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+        fn sparse(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]managed_embedder.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+    };
+    var fake = Fake{};
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status } }, null, null);
+    defer server.deinit();
+    server.antfly_provider = .{ .ptr = &fake, .owns_invocation_admission = true, .embed_dense_texts = Fake.dense, .embed_sparse_texts = Fake.sparse };
+    for ([_]anyerror{ error.ResourceLimitExceeded, error.MemoryBudgetExceeded }) |failure| {
+        fake.failure = failure;
+        for ([_][]const u8{
+            "{\"indexes\":{\"semantic\":{\"type\":\"embeddings\",\"field\":\"body\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"local-model\"}}}}",
+            "{\"indexes\":{\"semantic\":{\"type\":\"embeddings\",\"field\":\"body\",\"sparse\":true,\"embedder\":{\"provider\":\"antfly\",\"model\":\"local-model\"}}}}",
+        }) |body| {
+            var response = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = "/tables/docs", .content_type = "application/json", .body = body });
+            defer response.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 400), response.status);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", parsed.value.object.get("error").?.string);
+            try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
+        }
+    }
+}
+
+test "public execution native query checkpoints preserve scoped deadline errors" {
+    const Check = struct {
+        fn expired(_: *const anyopaque) !void {
+            return error.DeadlineExceeded;
+        }
+        fn probe(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    var state: u8 = 0;
+    try std.testing.expectError(error.DeadlineExceeded, ensureRequestActive(.{ .ptr = &state, .is_cancelled_fn = Check.probe, .check_fn = Check.expired }));
+    var disconnected = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, ensureRequestActive(CancellationToken.fromAtomic(&disconnected)));
 }

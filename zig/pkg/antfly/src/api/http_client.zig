@@ -505,7 +505,7 @@ pub const ApiHttpClient = struct {
         timeout_ms: ?u32,
         cancellation: ?*const http_common.RequestCancellation,
     ) !LookupResponse {
-        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "", "", "", "", null, null, false);
+        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "", "", "", "", null, null, false, false, null);
     }
 
     pub fn fetchGroupLookupWithMode(
@@ -528,6 +528,8 @@ pub const ApiHttpClient = struct {
         restore_staging_scope: ?[32]u8,
         restore_staging_plan_id: ?[16]u8,
         include_primary_digest: bool,
+        privacy_original: bool,
+        privacy_policy_version: ?[64]u8,
     ) !LookupResponse {
         // Group lookups are also used for routed derived-artifact hydration.
         // Those storage keys are binary and contain namespace bytes and NUL
@@ -540,7 +542,8 @@ pub const ApiHttpClient = struct {
         const special = group_source_query_json.len != 0 or relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0 or relational_index_status_json.len != 0;
         // Routing uses the actual logical key, including empty first-range
         // boundaries. Only the already-routed HTTP path needs a placeholder.
-        const encoded_key = try percentEncodePathComponent(self.alloc, if (special and key.len == 0) "\x00relational_control" else key);
+        const key_in_body = documentKeyNeedsBody(key);
+        const encoded_key = try percentEncodePathComponent(self.alloc, if (key_in_body) "" else if (special and key.len == 0) "\x00relational_control" else key);
         defer self.alloc.free(encoded_key);
         const encoded_consistency = try percentEncodePathComponent(self.alloc, read_consistency);
         defer self.alloc.free(encoded_consistency);
@@ -594,18 +597,29 @@ pub const ApiHttpClient = struct {
         defer if (group_source.len != 0) self.alloc.free(group_source);
         const group_path = if (group_source.len != 0) try std.fmt.allocPrint(self.alloc, "{s}&_group_source={s}", .{ index_path orelse observation_path orelse path, group_source }) else null;
         defer if (group_path) |value| self.alloc.free(value);
-        const uri = try self.joinRoute(base_uri, group_path orelse index_path orelse observation_path orelse path);
+        const ordinary_path = group_path orelse index_path orelse observation_path orelse path;
+        const privacy_path = if (privacy_original) try std.fmt.allocPrint(self.alloc, "{s}&_privacy_original=true", .{ordinary_path}) else null;
+        defer if (privacy_path) |value| self.alloc.free(value);
+        const policy_path = if (privacy_policy_version) |version| try std.fmt.allocPrint(self.alloc, "{s}&_privacy_policy_version={s}", .{ privacy_path orelse ordinary_path, if (std.mem.allEqual(u8, &version, 0)) "none" else &version }) else null;
+        defer if (policy_path) |value| self.alloc.free(value);
+        const legacy_path = policy_path orelse privacy_path orelse ordinary_path;
+        const body = if (key_in_body) try @import("http_routes.zig").DocumentReadRequest.encode(self.alloc, .lookup, key, legacy_path[(std.mem.indexOfScalar(u8, legacy_path, '?') orelse return error.InvalidArgument) + 1 ..], "") else null;
+        defer if (body) |value| self.alloc.free(value);
+        const target = if (key_in_body) try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}/document-read", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_table_name }) else null;
+        defer if (target) |value| self.alloc.free(value);
+        const uri = try self.joinRoute(base_uri, target orelse legacy_path);
         defer self.alloc.free(uri);
 
         var resp = try self.executeRequest(.{
-            .method = .GET,
+            .method = if (key_in_body) .POST else .GET,
             .uri = uri,
+            .body = body orelse "",
             .timeout_ms = timeout_ms,
             .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, privacy_policy_version),
             404 => {
                 if (std.mem.eql(u8, read_consistency, "read_index") and
                     std.mem.eql(u8, resp.header(route_metadata_api.catalog_route_fence_ack_header) orelse "", route_metadata_api.catalog_route_fence_ack_value) and
@@ -1165,6 +1179,18 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: ?[]const u8,
     ) !ScanResponse {
+        return self.fetchGroupScanControlled(base_uri, group_id, table_name, body, null, null);
+    }
+
+    pub fn fetchGroupScanControlled(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: ?[]const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !ScanResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -1181,11 +1207,13 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = if (body != null) "application/json" else null,
             .body = body orelse "",
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         if (remoteRelationalRowError(resp.status, resp.body)) |err| return err;
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, try privacyVersionFromBody(self.alloc, body)),
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
@@ -1218,6 +1246,7 @@ pub const ApiHttpClient = struct {
             alloc: std.mem.Allocator,
             downstream: http_common.StreamWriter,
             status: u16 = 0,
+            privacy_version: ?[64]u8 = null,
             error_body: std.ArrayListUnmanaged(u8) = .empty,
 
             pub fn deinit(adapter: *@This()) void {
@@ -1227,7 +1256,10 @@ pub const ApiHttpClient = struct {
             fn start(raw: *anyopaque, response_alloc: std.mem.Allocator, response: http_common.StreamingResponse) anyerror!void {
                 const adapter: *@This() = @ptrCast(@alignCast(raw));
                 adapter.status = response.status;
-                if (response.status == 200) try adapter.downstream.start(response_alloc, response);
+                if (response.status == 200) {
+                    try requirePrivacyAck(response, adapter.privacy_version);
+                    try adapter.downstream.start(response_alloc, response);
+                }
             }
 
             fn writeAll(raw: *anyopaque, bytes: []const u8) anyerror!void {
@@ -1251,7 +1283,7 @@ pub const ApiHttpClient = struct {
                 } };
             }
         };
-        var status_writer = StatusWriter{ .alloc = self.alloc, .downstream = downstream };
+        var status_writer = StatusWriter{ .alloc = self.alloc, .downstream = downstream, .privacy_version = try privacyVersionFromBody(self.alloc, body) };
         defer status_writer.deinit();
         const handled = (try self.executeRequestStream(.{
             .method = .POST,
@@ -1413,7 +1445,7 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, try privacyVersionFromBody(self.alloc, body)),
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
@@ -1482,7 +1514,7 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, try privacyVersionFromBody(self.alloc, body)),
             408 => return error.Timeout,
             400 => return remotePreflightError(resp.body),
             404 => return remotePreflightError(resp.body),
@@ -1746,7 +1778,7 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, try privacyVersionFromBody(self.alloc, body)),
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
@@ -2809,6 +2841,58 @@ pub const ApiHttpClient = struct {
         return response;
     }
 
+    fn fetchDocumentRead(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, op: @import("http_routes.zig").DocumentReadRequest.Operation, key: []const u8, artifact: []const u8) !QueryResponse {
+        const encoded_table = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}/document-read", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_table });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try @import("http_routes.zig").DocumentReadRequest.encode(self.alloc, op, key, "", artifact);
+        defer self.alloc.free(body);
+        var resp = try self.executeRequest(.{ .method = .POST, .uri = uri, .body = body });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
+            404 => return error.NotFound,
+            408, 504 => return error.Timeout,
+            409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
+    pub fn fetchGroupDocumentArtifactManifestControlled(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, key: []const u8, artifact: []const u8, opts: db_mod.types.LookupOptions) !QueryResponse {
+        if (opts.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        const now = opts.executionNowNs();
+        const timeout: ?u32 = if (opts.execution_deadline_ns) |deadline| blk: {
+            if (now >= deadline) return error.Timeout;
+            break :blk @intCast(@min(@as(u64, std.math.maxInt(u32)), @max(@as(u64, 1), std.math.divCeil(u64, deadline - now, std.time.ns_per_ms) catch 1)));
+        } else null;
+        const encoded_table = try percentEncodePathComponent(self.alloc, table);
+        defer self.alloc.free(encoded_table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}/document-read", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_table });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try @import("http_routes.zig").DocumentReadRequest.encode(self.alloc, .manifest, key, "", artifact);
+        defer self.alloc.free(body);
+        var cancellation = if (opts.cancellation) |token| http_common.RequestCancellation.fromToken(token) else http_common.RequestCancellation{};
+        var buffer: [20]u8 = undefined;
+        const budget = if (timeout) |milliseconds| try std.fmt.bufPrint(&buffer, "{d}", .{@min(milliseconds, @import("antfly_public_limits").Execution.max_timeout_ms)}) else "";
+        const headers = [_]http_common.RequestHeader{.{ .name = @import("antfly_public_limits").Execution.timeout_header, .value = budget }};
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .headers = if (timeout != null) &headers else &.{}, .timeout_ms = timeout, .cancellation = if (opts.cancellation != null) &cancellation else null });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => return .{ .body = try self.alloc.dupe(u8, response.body) },
+            404 => return error.NotFound,
+            408, 504 => return error.Timeout,
+            409 => return remoteGroupConflictError(response.body),
+            503 => return remoteStorageReadUnavailableError(response.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
     pub fn fetchGroupDocumentArtifactManifest(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -2817,6 +2901,10 @@ pub const ApiHttpClient = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
     ) !QueryResponse {
+        if (documentKeyNeedsBody(doc_key)) {
+            const response = try self.fetchDocumentRead(base_uri, group_id, table_name, .manifest, doc_key, artifact_name);
+            return response;
+        }
         const escaped_key = try percentEncodePathComponent(self.alloc, doc_key);
         defer self.alloc.free(escaped_key);
         const escaped_artifact_name = try percentEncodePathComponent(self.alloc, artifact_name);
@@ -2856,6 +2944,10 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         doc_key: []const u8,
     ) !QueryResponse {
+        if (documentKeyNeedsBody(doc_key)) {
+            const response = try self.fetchDocumentRead(base_uri, group_id, table_name, .manifests, doc_key, "");
+            return response;
+        }
         const escaped_key = try percentEncodePathComponent(self.alloc, doc_key);
         defer self.alloc.free(escaped_key);
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}{s}", .{
@@ -2961,7 +3053,7 @@ pub const ApiHttpClient = struct {
             200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
-            else => return error.UnexpectedHttpStatus,
+            else => return remoteArtifactReprocessError(resp.status, resp.body),
         }
     }
 
@@ -3893,6 +3985,13 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
+            if (resp.status == 400) {
+                const failure = std.json.parseFromSlice(struct { @"error": []const u8 = "" }, self.alloc, resp.body, .{ .ignore_unknown_fields = true }) catch null;
+                if (failure) |parsed| {
+                    defer parsed.deinit();
+                    if (std.mem.eql(u8, parsed.value.@"error", "MODEL_RESOURCE_LIMIT")) return error.ResourceLimitExceeded;
+                }
+            }
             if (resp.status == 503 and std.mem.indexOf(
                 u8,
                 resp.body,
@@ -4297,6 +4396,32 @@ fn remoteStorageReadUnavailableError(body: []const u8) anyerror {
         return error.StorageReadTemporarilyUnavailable;
     }
     return error.UnexpectedHttpStatus;
+}
+
+const privacy_ack_header = "X-Antfly-Privacy-Fence";
+
+pub fn privacyVersionFromBody(a: std.mem.Allocator, body: ?[]const u8) !?[64]u8 {
+    const bytes = body orelse return null;
+    if (bytes.len == 0) return null;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const envelope = parsed.value.object.get("query_request") orelse parsed.value;
+    if (envelope != .object) return null;
+    const value = parsed.value.object.get("_privacy_policy_version") orelse envelope.object.get("_privacy_policy_version") orelse return null;
+    if (value != .string) return error.InvalidResponse;
+    if (std.mem.eql(u8, value.string, "none")) return null;
+    if (value.string.len != 64) return error.InvalidResponse;
+    return value.string[0..64].*;
+}
+
+fn requirePrivacyAck(response: anytype, expected: ?[64]u8) !void {
+    const version = expected orelse return;
+    if (std.mem.allEqual(u8, &version, 0)) return;
+    for (response.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, privacy_ack_header) and std.mem.eql(u8, header.value, &version)) return;
+    }
+    return error.StorageReadTemporarilyUnavailable;
 }
 
 fn parseIdentityReadGenerationHeader(resp: http_common.HttpResponse) !?u64 {
@@ -6652,4 +6777,26 @@ test "public graph metric borrowed wire edge batch endpoint capability" {
     var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
     try std.testing.expectError(error.GraphEdgesBatchUnsupported, client.fetchGroupGraphEdgesBatchWithControl("http://example.test", 7, "docs", "{}", null, null));
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+/// Stop counting early and avoid constructing a potentially enormous escaped
+/// URL. Small keys retain the legacy GET transport during rolling upgrades.
+fn documentKeyNeedsBody(key: []const u8) bool {
+    var bytes: usize = 0;
+    for (key) |c| {
+        bytes += if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') @as(usize, 1) else 3;
+        if (bytes > 1024) return true;
+    }
+    return false;
+}
+
+fn remoteArtifactReprocessError(status: u16, body: []const u8) anyerror {
+    if (status == 503 and std.mem.eql(u8, body, "artifact publication pending")) return error.ArtifactPublicationPending;
+    return error.UnexpectedHttpStatus;
+}
+
+test "privacy reprocess transport preserves pending catalog retries without accepting unrelated failures" {
+    try std.testing.expectEqual(error.ArtifactPublicationPending, remoteArtifactReprocessError(503, "artifact publication pending"));
+    try std.testing.expectEqual(error.UnexpectedHttpStatus, remoteArtifactReprocessError(500, "artifact publication pending"));
+    try std.testing.expectEqual(error.UnexpectedHttpStatus, remoteArtifactReprocessError(503, "internal server error"));
 }

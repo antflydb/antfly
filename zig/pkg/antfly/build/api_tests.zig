@@ -67,6 +67,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_usermgr_tests = options.run_lib_usermgr_tests;
+    const privacy_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/privacy_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, privacy_mod, true, true);
+    const privacy_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{ "privacy", "artifact publication upload", "ordered artifact inventory publication queue", "snappy", "lsm.table_file", "vector replay coalescing cancels and revives" } });
+    const privacy_step = b.step("antfly-privacy-test", "Run privacy scan, evidence and transport fence contracts");
+    privacy_step.dependOn(&b.addRunArtifact(privacy_tests).step);
     const public_api_parity_default_filters = [_][]const u8{
         "empty activation page validates source catalog without probing external parents",
         "SQL API cross-table MERGE retains both source and target range proofs",
@@ -177,6 +186,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api query contract serializes derived hierarchy ancestry",
         "api query contract serializes mention evidence hierarchy",
         "api query contract validates canonical hierarchy controls",
+        "native member traversal requires producer and private parent admission",
+        "native member ancestry ignores payload source and unit identities",
+        "reshapeChunkBackedResult hydrates direct chunk ancestors",
+        "native member parent admission uses exact source candidates",
+        "native member value verification retains scan policy and work budgets",
+        "native member verification preserves candidate provenance after native filtering",
         "query max score preserves negative relevance scores",
         "query hit exposes relevance score and raw vector distance separately",
         "query merge orders pure dense results by descending relevance score",
@@ -1154,6 +1169,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "retained read owner",
             "retained read RPC",
             "retained read client",
+            "privacy source vtables retain static lifetime",
             "api http client preserves public batch retry safety classifications",
             "relational row query response budget",
             "relational statement retries unavailable capture and releases fences before pages or deadline",
@@ -1165,6 +1181,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "table reads translate request deadlines into the routing clock",
             "api query contract graph evaluation preserves base hit paging and shard windows",
             "distributed reranking widens retrieval and stays coordinator owned",
+            "retained single-carrier window moves short and empty cursor pages without merging",
+            "hosted retained local and remote carriers finalize short cursor windows once",
             "reranker candidate and output windows have distinct bounds",
             "reranker paging preserves the underlying retrieval total",
             "coordinator prunes the final score domain before paging",
@@ -1263,6 +1281,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_public_table_http_docid_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{
+            "public artifact enrichment",
             "public table batch handler maps doc identity unavailable errors",
             "public table batch handler maps write unavailable errors",
             "public table batch handler exposes pending HA durability without claiming rollback",
@@ -2166,11 +2185,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     pk_failure_identity_mod.addImport("runtime_failure_abi", pk_failure_abi_mod);
     const pk_failure_identity_tests = b.addTest(.{
         .root_module = pk_failure_identity_mod,
-        .filters = &.{"registered storage-kernel errors are unique and round trip without losing identity"},
+        .filters = &.{ "registered storage-kernel errors are unique and round trip without losing identity", "privacy committed Raft contention survives the active storage owner ABI" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const pk_failure_identity_run = addFilteredTestRunArtifact(b, pk_failure_identity_tests);
     b.step("antfly-api-pk-restore-error-identity-test", "Run exact native invalid-row restore error identity regression")
-        .dependOn(&addFilteredTestRunArtifact(b, pk_failure_identity_tests).step);
+        .dependOn(&pk_failure_identity_run.step);
+    privacy_step.dependOn(&pk_failure_identity_run.step);
     const sql_primary_key_rewrite_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_sql_primary_key_rewrite_test_root.zig"),
         .target = target,

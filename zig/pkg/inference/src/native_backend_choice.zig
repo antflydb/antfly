@@ -65,10 +65,8 @@ pub fn configureSessionPreference(session_manager: *backends.SessionManager, cho
     session_manager.preferred_backends = switch (choice) {
         .auto => if (build_options.enable_wasm)
             &.{backends.BackendType.wasm}
-        else if (build_options.enable_metal)
-            &.{ backends.BackendType.metal, backends.BackendType.native }
         else
-            &.{backends.BackendType.native},
+            backends.automaticBackends(),
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{},
         .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{},
@@ -228,10 +226,10 @@ test "explicit session preferences never silently fall back" {
 test "automatic native session selection retains safe fallback" {
     var manager = backends.SessionManager.init(std.testing.allocator);
     configureSessionPreference(&manager, .auto);
-    if (build_options.enable_metal and !build_options.enable_wasm) {
+    if (!build_options.enable_wasm) {
         try std.testing.expectEqualSlices(
             backends.BackendType,
-            &.{ .metal, .native },
+            backends.automaticBackends(),
             manager.preferred_backends,
         );
     } else {

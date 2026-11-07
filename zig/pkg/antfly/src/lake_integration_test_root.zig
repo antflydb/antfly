@@ -14,6 +14,7 @@
 // limitations under the License.
 
 pub const antfly_sources = @import("source_owner_physical.zig");
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
 
 test {
     _ = @import("serverless/configured_object_store_support.zig");
@@ -55,6 +56,7 @@ test {
     _ = @import("api/lake_index_selection.zig");
     _ = @import("api/lake_index_reader_lease.zig");
     _ = @import("api/lake_index_gc.zig");
+    _ = @import("api/lake_index_gc_progress.zig");
     _ = @import("api/lake_index_ordered_rows.zig");
     _ = @import("api/lake_index_native_files.zig");
     _ = @import("api/lake_index_native_text.zig");
@@ -94,7 +96,6 @@ test {
     _ = @import("api/lake_index_sort_stream.zig");
     _ = @import("api/lake_artifact_ranges.zig");
     _ = @import("api/lake_index_text_best_first.zig");
-    _ = @import("api/lake_index_text_compaction.zig");
     _ = @import("api/lake_index_text_statistics.zig");
     _ = @import("api/lake_query_metrics.zig");
     _ = @import("api/lake_index_search_filter.zig");
@@ -118,8 +119,26 @@ test {
 }
 
 comptime {
+    _ = @import("serverless/sql/expression.zig");
+    _ = @import("serverless/sql/state.zig");
+    _ = @import("serverless/sql/plan.zig");
+    _ = @import("serverless/sql/bridge.zig");
+    _ = @import("serverless/sql/lake_source.zig");
+    _ = @import("serverless/sql/runner.zig");
+    _ = @import("serverless/sql/runtime.zig");
+    _ = @import("serverless/sql/runtime_test.zig");
+    _ = @import("serverless/sql/cancellation.zig");
+    _ = @import("serverless/sql/transport.zig");
+    _ = @import("serverless/sql/discovery.zig");
+    _ = @import("common/http/std_http_executor.zig");
+    _ = @import("serverless/sql/routing.zig");
+    _ = @import("serverless/sql/scheduler.zig");
+    _ = @import("serverless/sql/driver.zig");
+    _ = @import("serverless/sql/exchange.zig");
     _ = @import("serverless/lake_snapshot_pins.zig");
     _ = @import("serverless/lake_compaction.zig");
     _ = @import("serverless/lake_vacuum.zig");
+    _ = @import("serverless/lake_vacuum_plan.zig");
+    _ = @import("serverless/lake_vacuum_inputs.zig");
     _ = @import("api/lake_search_overlay.zig");
 }

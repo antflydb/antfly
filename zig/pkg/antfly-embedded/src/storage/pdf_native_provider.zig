@@ -75,6 +75,9 @@ fn plansLocal(a: A, plans: []const c.Plan) ![]pdf.PreparedPageRenderPlan {
     return result;
 }
 pub const Ops = struct {
+    pub fn setPolicy(doc: *c.Document, policy: pdf.reader.TextExtractionPolicy) void {
+        reader(doc).value.setTextExtractionPolicy(policy);
+    }
     pub fn renderRuns(doc: *c.Document, page: usize, width: u32, height: u32) !pdf.reader.PageRenderRuns {
         return reader(doc).value.extractPageRenderRunsForRasterAlloc(page, width, height);
     }
@@ -228,5 +231,5 @@ fn Bridge(comptime name: []const u8) type {
 }
 pub fn exportOperations() void {
     inline for (@typeInfo(c.Methods).@"struct".field_names) |name|
-        @export(&Bridge(name).get, .{ .name = "antfly_pdf_native_" ++ name ++ "_v3", .visibility = .hidden });
+        @export(&Bridge(name).get, .{ .name = "antfly_pdf_native_" ++ name ++ "_v4", .visibility = .hidden });
 }

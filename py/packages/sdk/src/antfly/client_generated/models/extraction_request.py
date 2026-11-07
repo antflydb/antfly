@@ -10,6 +10,7 @@ from ..models.extraction_schema_version import ExtractionSchemaVersion
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.audio_read_options import AudioReadOptions
     from ..models.document_source import DocumentSource
     from ..models.extraction_input import ExtractionInput
     from ..models.extraction_options import ExtractionOptions
@@ -31,13 +32,17 @@ class ExtractionRequest:
                 and ordinary relations may share one encoded input. joint_ie is a separate,
                 mutually exclusive typed graph schema. The version 2 compiler rejects
                 unknown fields and validates all references before model execution.
+            audio_options (AudioReadOptions | Unset): Recognition options, checked against every selected backend and
+                fallback before inference. Whisper supports all options and pause-aware windowing of long recordings. Gemma
+                supports transcription up to 30 seconds and rejects language, timestamps and diarization requests. No backend is
+                substituted to satisfy an option.
             schema_version (ExtractionSchemaVersion | Unset): Omission preserves the legacy extraction contract. Version 2
                 opts into strict mixed-task schemas, per-input replacements and explicit offsets; the selected model/runtime
                 must support every requested feature.
             read_artifact (str | Unset): Opaque handle returned by read with retain_artifact. Mutually exclusive with inputs
                 and documents. Reuses the immutable complete reading without downloading or running OCR again. Handles expire
                 and are local to the serving process.
-            documents (list[DocumentSource] | Unset): Complete PDF/PPTX/image sources. Mutually exclusive with inputs.
+            documents (list[DocumentSource] | Unset): Complete PDF/PPTX/image/audio sources. Mutually exclusive with inputs.
                 Reading and extraction share document adapters and preserve independent source grouping.
             inputs (list[ExtractionInput] | Unset):
             options (ExtractionOptions | Unset):
@@ -45,6 +50,7 @@ class ExtractionRequest:
 
     model: str
     schema: ExtractionSchema
+    audio_options: AudioReadOptions | Unset = UNSET
     schema_version: ExtractionSchemaVersion | Unset = UNSET
     read_artifact: str | Unset = UNSET
     documents: list[DocumentSource] | Unset = UNSET
@@ -56,6 +62,10 @@ class ExtractionRequest:
         model = self.model
 
         schema = self.schema.to_dict()
+
+        audio_options: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.audio_options, Unset):
+            audio_options = self.audio_options.to_dict()
 
         schema_version: int | Unset = UNSET
         if not isinstance(self.schema_version, Unset):
@@ -89,6 +99,8 @@ class ExtractionRequest:
                 "schema": schema,
             }
         )
+        if audio_options is not UNSET:
+            field_dict["audio_options"] = audio_options
         if schema_version is not UNSET:
             field_dict["schema_version"] = schema_version
         if read_artifact is not UNSET:
@@ -104,6 +116,7 @@ class ExtractionRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.audio_read_options import AudioReadOptions
         from ..models.document_source import DocumentSource
         from ..models.extraction_input import ExtractionInput
         from ..models.extraction_options import ExtractionOptions
@@ -113,6 +126,13 @@ class ExtractionRequest:
         model = d.pop("model")
 
         schema = ExtractionSchema.from_dict(d.pop("schema"))
+
+        _audio_options = d.pop("audio_options", UNSET)
+        audio_options: AudioReadOptions | Unset
+        if isinstance(_audio_options, Unset):
+            audio_options = UNSET
+        else:
+            audio_options = AudioReadOptions.from_dict(_audio_options)
 
         _schema_version = d.pop("schema_version", UNSET)
         schema_version: ExtractionSchemaVersion | Unset
@@ -151,6 +171,7 @@ class ExtractionRequest:
         extraction_request = cls(
             model=model,
             schema=schema,
+            audio_options=audio_options,
             schema_version=schema_version,
             read_artifact=read_artifact,
             documents=documents,

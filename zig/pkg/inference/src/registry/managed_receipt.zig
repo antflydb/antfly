@@ -50,6 +50,7 @@ pub const ValidatedArtifact = struct {
 };
 
 pub const ValidatedReceipt = struct {
+    publication_generation: [32]u8 = @splat(0),
     allocator: std.mem.Allocator,
     parsed: std.json.Parsed(DownloadReceipt),
     artifacts: []ValidatedArtifact,
@@ -69,6 +70,20 @@ pub const ValidatedReceipt = struct {
     }
 };
 
+/// Authenticate the bytes actually consumed by a metadata/tokenizer parser.
+/// Canonical aliases inherit the strongest consistent checksum at validation.
+pub fn verifyArtifactBytes(artifact: *const ValidatedArtifact, bytes: []const u8) !void {
+    if (artifact.size != bytes.len) return error.InvalidManagedDownload;
+    if (artifact.sha256) |expected| {
+        if (expected.len != 64) return error.ChecksumMismatch;
+        var decoded: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&decoded, expected) catch return error.ChecksumMismatch;
+        var actual: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+        if (!std.mem.eql(u8, &decoded, &actual)) return error.ChecksumMismatch;
+    }
+}
+
 /// Re-hash an artifact that has already passed receipt path and size
 /// validation against a pinned SHA-256 identity.
 ///
@@ -81,7 +96,26 @@ pub fn verifyValidatedArtifactSha256(
     artifact: *const ValidatedArtifact,
     expected_hex: []const u8,
 ) !void {
+    _ = try verifyValidatedArtifactSha256AndStamp(io, artifact, expected_hex);
+}
+
+/// Filesystem identity of the opened, hashed bytes. Access time is excluded:
+/// reading a file must not invalidate verification within the same acquisition.
+pub const ArtifactStamp = struct {
+    inode: @FieldType(std.Io.File.Stat, "inode"),
+    size: u64,
+    kind: std.Io.File.Kind,
+    modified: std.Io.Timestamp,
+    changed: std.Io.Timestamp,
+    pub fn fromStat(stat: std.Io.File.Stat) ArtifactStamp {
+        return .{ .inode = stat.inode, .size = stat.size, .kind = stat.kind, .modified = stat.mtime, .changed = stat.ctime };
+    }
+};
+
+pub fn verifyValidatedArtifactSha256AndStamp(io: std.Io, artifact: *const ValidatedArtifact, expected_hex: []const u8) !ArtifactStamp {
     if (expected_hex.len != 64) return error.ChecksumMismatch;
+    var expected: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&expected, expected_hex) catch return error.ChecksumMismatch;
 
     var file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
     defer file.close(io);
@@ -101,8 +135,10 @@ pub fn verifyValidatedArtifactSha256(
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
-    const actual_hex = std.fmt.bytesToHex(digest, .lower);
-    if (!std.mem.eql(u8, &actual_hex, expected_hex)) return error.ChecksumMismatch;
+    if (!std.mem.eql(u8, &digest, &expected)) return error.ChecksumMismatch;
+    const verified = ArtifactStamp.fromStat(try file.stat(io));
+    if (!std.meta.eql(ArtifactStamp.fromStat(stat), verified)) return error.ModelArtifactsChanging;
+    return verified;
 }
 
 const ReceiptSource = enum {
@@ -163,7 +199,8 @@ pub fn artifactPathIsSafe(path: []const u8) bool {
     return true;
 }
 
-fn pathIsWithinRoot(root: []const u8, path: []const u8) bool {
+pub fn pathIsWithinRoot(root: []const u8, path: []const u8) bool {
+    if (root.len == 0) return false;
     if (!std.mem.startsWith(u8, path, root) or path.len <= root.len) return false;
     if (std.fs.path.isSep(root[root.len - 1])) return true;
     return std.fs.path.isSep(path[root.len]);
@@ -322,6 +359,11 @@ fn loadValidatedSource(
     try path_index.ensureTotalCapacity(allocator, @intCast(parsed.value.artifacts.len));
     var initialized: usize = 0;
     errdefer for (artifacts[0..initialized]) |artifact| allocator.free(artifact.canonical_path);
+    // Relative names may alias one physical file. They must agree on its
+    // digest, and a checksum-free alias must not weaken a checked sibling.
+    var canonical_groups: std.StringHashMapUnmanaged(usize) = .empty;
+    defer canonical_groups.deinit(allocator);
+    try canonical_groups.ensureTotalCapacity(allocator, @intCast(parsed.value.artifacts.len));
 
     var has_supported_payload = false;
     for (parsed.value.artifacts, 0..) |artifact, index| {
@@ -341,6 +383,15 @@ fn loadValidatedSource(
         errdefer allocator.free(canonical_path);
         const stat = try cwd.statFile(io, canonical_path, .{ .follow_symlinks = false });
         if (stat.kind != .file or stat.size != artifact.size) return error.InvalidManagedDownload;
+        const canonical = canonical_groups.getOrPutAssumeCapacity(canonical_path);
+        if (canonical.found_existing) {
+            const prior = &artifacts[canonical.value_ptr.*];
+            if (prior.sha256) |left| {
+                if (artifact.sha256) |right| {
+                    if (!std.ascii.eqlIgnoreCase(left, right)) return error.InvalidManagedDownload;
+                }
+            } else prior.sha256 = artifact.sha256;
+        } else canonical.value_ptr.* = index;
 
         artifacts[index] = .{
             .path = artifact.path,
@@ -357,6 +408,10 @@ fn loadValidatedSource(
         }
     }
     if (!has_supported_payload) return error.InvalidManagedDownload;
+    // A linear second pass also covers aliases encountered before a digest.
+    for (artifacts) |*artifact| {
+        artifact.sha256 = artifacts[canonical_groups.get(artifact.canonical_path).?].sha256;
+    }
     switch (source) {
         .completion => if (try publicationBlockedPaths(cwd, io, in_progress_path, plan_path)) {
             return error.IncompleteManagedDownload;
@@ -368,7 +423,10 @@ fn loadValidatedSource(
         },
     }
 
+    var publication_generation: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(receipt_json, &publication_generation, .{});
     return .{
+        .publication_generation = publication_generation,
         .allocator = allocator,
         .parsed = parsed,
         .artifacts = artifacts,
@@ -543,4 +601,53 @@ test "validated managed receipt cleans up every allocation failure" {
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Runner.run, .{model_dir});
+}
+
+/// Direct GGUF files belong to the nearest managed installation, including
+/// files reached through symlinks. Preserve the original path for unmanaged
+/// standalone files; callers still fence their own pathname separately.
+pub fn publicationRootAlloc(a: std.mem.Allocator, io: std.Io, model: []const u8) ![]u8 {
+    if (!std.mem.endsWith(u8, model, ".gguf")) return a.dupe(u8, model);
+    // Requested ancestors own rejection obligations too: a symlink inside a
+    // managed installation cannot borrow a foreign target's publication.
+    const requested = try resolveRequestedFilePath(a, io, model);
+    defer a.free(requested);
+    const canonical = try resolveRegularFilePath(a, io, requested);
+    defer a.free(canonical);
+    for ([_][]const u8{ requested, canonical }) |path| {
+        var ancestor = std.fs.path.dirname(path);
+        while (ancestor) |root| : (ancestor = std.fs.path.dirname(root)) {
+            for ([_][]const u8{ complete_filename, in_progress_filename, plan_filename }) |name| {
+                const marker = try managedPath(a, root, name);
+                defer a.free(marker);
+                if (try pathPresent(std.Io.Dir.cwd(), io, marker)) return a.dupe(u8, root);
+            }
+        }
+    }
+    return a.dupe(u8, model);
+}
+
+/// Cheap publication identity for resident sessions and load flights. Receipt
+/// validation still owns artifact integrity; this token binds its source and
+/// artifact manifest to the generation actually loaded, without hashing weights.
+pub fn publicationGeneration(allocator: std.mem.Allocator, io: std.Io, model: []const u8) !?[32]u8 {
+    const owned_root = if (std.mem.endsWith(u8, model, ".gguf")) try publicationRootAlloc(allocator, io, model) else null;
+    defer if (owned_root) |path| allocator.free(path);
+    const root = owned_root orelse model;
+    const progress = try managedPath(allocator, root, in_progress_filename);
+    defer allocator.free(progress);
+    const plan = try managedPath(allocator, root, plan_filename);
+    defer allocator.free(plan);
+    const complete = try managedPath(allocator, root, complete_filename);
+    defer allocator.free(complete);
+    if (try publicationBlockedPaths(std.Io.Dir.cwd(), io, progress, plan)) return error.IncompleteManagedDownload;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, complete, allocator, .limited(max_receipt_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    if (try publicationBlockedPaths(std.Io.Dir.cwd(), io, progress, plan)) return error.IncompleteManagedDownload;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
 }

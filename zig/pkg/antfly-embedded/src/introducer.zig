@@ -26,6 +26,7 @@ const segment_mod = @import("segment.zig");
 const inverted = @import("section/inverted.zig");
 const typed_dv = @import("section/typed_doc_values.zig");
 const analysis_mod = @import("search/analysis.zig");
+const input_aliases = @import("section/input_aliases.zig");
 pub const AnalyzedContributionCache = @import("search/analyzed_contribution_cache.zig").Cache;
 const contribution_cache_mod = @import("search/analyzed_contribution_cache.zig");
 const geo_mod = @import("search/geo.zig");
@@ -691,10 +692,10 @@ const TextBuildResourceTracker = struct {
     }
 };
 
-fn estimateTextDocInputBytes(docs: []const TextDocument) u64 {
+fn estimateTextDocInputBytes(alloc: Allocator, docs: []const TextDocument) !u64 {
     var total: u64 = 0;
     for (docs) |doc| {
-        total +|= estimateTextDocumentInputBytes(doc);
+        total +|= try estimateTextDocumentInputBytes(alloc, doc);
     }
     return total;
 }
@@ -705,32 +706,20 @@ pub fn textBuildScratchAllocator() Allocator {
     return if (comptime @import("builtin").link_libc) std.heap.c_allocator else std.heap.page_allocator;
 }
 
-fn aliasesInput(doc: TextDocument, bytes: []const u8) bool {
-    if (bytes.len == 0) return true;
-    const start = @intFromPtr(bytes.ptr);
-    const stored = @intFromPtr(doc.stored_data.ptr);
-    if (start >= stored and start - stored <= doc.stored_data.len and bytes.len <= doc.stored_data.len - (start - stored)) return true;
-    for (doc.text_fields) |field| {
-        const text = @intFromPtr(field.text.ptr);
-        if (start >= text and start - text <= field.text.len and bytes.len <= field.text.len - (start - text)) return true;
-    }
-    return false;
-}
-
-fn estimateTypedSourceBytes(doc: TextDocument, value: std.json.Value, include_aliases: bool) u64 {
+fn estimateTypedSourceBytes(value: std.json.Value, aliases: ?*input_aliases.Index) u64 {
     return switch (value) {
-        .string, .number_string => |bytes| if (!include_aliases and aliasesInput(doc, bytes)) 0 else @intCast(bytes.len),
+        .string, .number_string => |bytes| if (aliases != null and aliases.?.contains(bytes)) 0 else @intCast(bytes.len),
         .array => |array| blk: {
             var total: u64 = @as(u64, @intCast(array.capacity)) *| @sizeOf(std.json.Value);
-            for (array.items) |child| total +|= estimateTypedSourceBytes(doc, child, include_aliases);
+            for (array.items) |child| total +|= estimateTypedSourceBytes(child, aliases);
             break :blk total;
         },
         .object => |object| blk: {
             var total: u64 = @as(u64, @intCast(object.capacity())) *| (@sizeOf(std.json.Value) + @sizeOf([]const u8) + 16);
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (include_aliases or !aliasesInput(doc, entry.key_ptr.*)) total +|= @intCast(entry.key_ptr.*.len);
-                total +|= estimateTypedSourceBytes(doc, entry.value_ptr.*, include_aliases);
+                if (aliases == null or !aliases.?.contains(entry.key_ptr.*)) total +|= @intCast(entry.key_ptr.*.len);
+                total +|= estimateTypedSourceBytes(entry.value_ptr.*, aliases);
             }
             break :blk total;
         },
@@ -738,9 +727,29 @@ fn estimateTypedSourceBytes(doc: TextDocument, value: std.json.Value, include_al
     };
 }
 
-fn estimateTextDocumentInputBytes(doc: TextDocument) u64 {
+fn estimateTextDocumentInputBytes(alloc: Allocator, doc: TextDocument) !u64 {
+    // Source keys/values may alias any projected text field. Index those ranges
+    // once instead of doing a fields-by-source-nodes containment scan. Keep
+    // ordinary documents allocation-free; wide inputs borrow bounded scratch.
+    var need_aliases = doc.stored_source_bytes != 0;
+    if (!need_aliases) {
+        if (doc.typed_fields) |fields| {
+            for (fields) |field| if (field.value == .bytes_val and field.value.bytes_val.len != 0) {
+                need_aliases = true;
+                break;
+            };
+        } else need_aliases = doc.typed_source != null;
+    }
+    var small: [16]input_aliases.Range = undefined;
+    var aliases = try input_aliases.Index.init(alloc, &small, if (need_aliases) try std.math.add(usize, doc.text_fields.len, 1) else 0);
+    defer aliases.deinit(alloc);
+    if (need_aliases) {
+        aliases.ranges[0] = input_aliases.Range.from(doc.stored_data);
+        for (doc.text_fields, 1..) |field, i| aliases.ranges[i] = input_aliases.Range.from(field.text);
+        aliases.finish();
+    }
     var total: u64 = @intCast(doc.id.len + doc.stored_data.len);
-    if (doc.stored_source_bytes != 0) total +|= estimateTypedSourceBytes(doc, doc.stored_source.?, false);
+    if (doc.stored_source_bytes != 0) total +|= estimateTypedSourceBytes(doc.stored_source.?, &aliases);
     total +|= @as(u64, @intCast(doc.text_fields.len)) * (@sizeOf(TextField) + 16);
     for (doc.text_fields) |field| {
         total +|= @intCast(field.field_name.len + field.text.len);
@@ -749,10 +758,10 @@ fn estimateTextDocumentInputBytes(doc: TextDocument) u64 {
         total +|= @as(u64, @intCast(typed_fields.len)) * (@sizeOf(TypedFieldValue) + 16);
         for (typed_fields) |field| {
             total +|= @intCast(field.field_name.len);
-            if (field.value == .bytes_val and !aliasesInput(doc, field.value.bytes_val)) total +|= @intCast(field.value.bytes_val.len);
+            if (field.value == .bytes_val and !aliases.contains(field.value.bytes_val)) total +|= @intCast(field.value.bytes_val.len);
         }
     } else if (doc.stored_source_bytes == 0) {
-        if (doc.typed_source) |source| total +|= estimateTypedSourceBytes(doc, source, false);
+        if (doc.typed_source) |source| total +|= estimateTypedSourceBytes(source, &aliases);
     }
     return total;
 }
@@ -768,18 +777,18 @@ pub fn estimateTextDocumentSegmentBytes(doc: TextDocument) u64 {
             total +|= @intCast(field.field_name.len);
             if (field.value == .bytes_val) total +|= @intCast(field.value.bytes_val.len);
         }
-    } else if (doc.typed_source) |source| total +|= estimateTypedSourceBytes(doc, source, true);
+    } else if (doc.typed_source) |source| total +|= estimateTypedSourceBytes(source, null);
     return total;
 }
 
-pub fn estimateTextDocumentBuildMemoryBytes(doc: TextDocument) u64 {
+pub fn estimateTextDocumentBuildMemoryBytes(alloc: Allocator, doc: TextDocument) !u64 {
     var text_bytes: u64 = 0;
     for (doc.text_fields) |field| {
         text_bytes +|= @intCast(field.field_name.len + field.text.len);
     }
     const typed_count: u64 = if (doc.typed_fields) |typed_fields| @intCast(typed_fields.len) else 0;
     const field_count: u64 = @intCast(doc.text_fields.len);
-    return estimateTextDocumentInputBytes(doc) +
+    return (try estimateTextDocumentInputBytes(alloc, doc)) +
         estimateStoredDocBytes(&.{doc}) +
         text_bytes * 4 +
         field_count * 384 +
@@ -807,17 +816,18 @@ pub const TextBuildSplit = struct {
 };
 
 pub fn splitTextDocumentsForBuildBudget(
+    alloc: Allocator,
     docs: []const TextDocument,
     start: usize,
     options: TextBuildSplitOptions,
-) TextBuildSplit {
+) !TextBuildSplit {
     const target_build: u64 = @max(@as(u64, 1), @as(u64, @intCast(options.target_build_memory_bytes)));
     const target_segment: u64 = @max(@as(u64, 1), @as(u64, @intCast(options.target_segment_bytes)));
     var end = start;
     var build_bytes: u64 = 0;
     var segment_bytes: u64 = 0;
     while (end < docs.len) {
-        const doc_build_bytes = estimateTextDocumentBuildMemoryBytes(docs[end]);
+        const doc_build_bytes = try estimateTextDocumentBuildMemoryBytes(alloc, docs[end]);
         const doc_segment_bytes = estimateTextDocumentSegmentBytes(docs[end]);
         const next_build_bytes = build_bytes +| doc_build_bytes;
         const next_segment_bytes = segment_bytes +| doc_segment_bytes;
@@ -941,14 +951,20 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
     // scratch, rather than subtracting logical frees from an outer arena.
     var input_tracker = TextBuildResourceTracker.init(options.resource_manager, null);
     defer input_tracker.release();
-    const input_estimated_bytes = estimateTextDocInputBytes(docs);
-    try input_tracker.adjust(input_estimated_bytes);
     var build_budget: ?resource_manager_mod.BudgetedAllocator = if (options.resource_manager) |manager|
         resource_manager_mod.BudgetedAllocator.init(manager, .full_text_build_working_set, backing_alloc, 1)
     else
         null;
     defer if (build_budget) |*budget| budget.deinit();
     const alloc = if (build_budget) |*budget| budget.allocator() else backing_alloc;
+    // Wide-input accounting needs temporary range descriptors. Charge that
+    // scratch through the same allocator as construction, before reserving the
+    // completed borrowed-input estimate. The descriptors are already released.
+    const input_estimated_bytes = estimateTextDocInputBytes(alloc, docs) catch |err| {
+        if (build_budget) |*budget| if (err == error.OutOfMemory and budget.budget_denied) return error.ResourceBudgetExceeded;
+        return err;
+    };
+    try input_tracker.adjust(input_estimated_bytes);
     writeTextSegmentWithScratch(alloc, docs, default_analyzer, text_analysis, options, sink) catch |err| {
         if (build_budget) |*budget| if (err == error.OutOfMemory and budget.budget_denied) return error.ResourceBudgetExceeded;
         return err;
@@ -1010,7 +1026,7 @@ fn writeTextSegmentWithScratch(
     }
     noteBuildMemorySample(profile, profile_working_set, "rss_before");
 
-    const input_estimated_bytes = estimateTextDocInputBytes(docs);
+    const input_estimated_bytes = try estimateTextDocInputBytes(alloc, docs);
     // Estimates remain useful for diagnostics; they never charge the same
     // scratch a second time or impose a fictitious admission bound.
     var resource_tracker = TextBuildResourceTracker.init(null, profile);
@@ -3866,8 +3882,8 @@ test "splitTextDocumentsForBuildBudget flushes on build memory before segment by
             .text_fields = &.{.{ .field_name = "body", .text = "lambda mu nu xi omicron" }},
         },
     };
-    const first_estimate = estimateTextDocumentBuildMemoryBytes(docs[0]);
-    const split = splitTextDocumentsForBuildBudget(&docs, 0, .{
+    const first_estimate = try estimateTextDocumentBuildMemoryBytes(std.testing.allocator, docs[0]);
+    const split = try splitTextDocumentsForBuildBudget(std.testing.allocator, &docs, 0, .{
         .target_build_memory_bytes = @intCast(first_estimate + 1),
         .target_segment_bytes = std.math.maxInt(usize),
     });
@@ -3886,7 +3902,7 @@ test "splitTextDocumentsForBuildBudget keeps oversized single document" {
             .text_fields = &.{.{ .field_name = "body", .text = "alpha beta gamma delta epsilon" }},
         },
     };
-    const split = splitTextDocumentsForBuildBudget(&docs, 0, .{
+    const split = try splitTextDocumentsForBuildBudget(std.testing.allocator, &docs, 0, .{
         .target_build_memory_bytes = 1,
         .target_segment_bytes = std.math.maxInt(usize),
     });
@@ -4364,6 +4380,45 @@ test "initial typed streaming reduces heap staging across large projected column
     std.debug.print("LITE_INITIAL_STREAM input_bytes={d} baseline_peak={d} streamed_peak={d} baseline_allocs={d} streamed_allocs={d} baseline_ns={d} streamed_ns={d}\n", .{ input.len, reference.peak, streamed.peak, reference.alloc_calls, streamed.alloc_calls, baseline_ns, streamed_ns });
 }
 
+test "input accounting indexes wide borrowed source ranges and propagates scratch failure" {
+    const a = std.testing.allocator;
+    const count = 256;
+    var bytes: [count * 4]u8 = @splat('x');
+    var extra: [7]u8 = @splat('x');
+    var names: [count][16]u8 = undefined;
+    var fields: [count]TextField = undefined;
+    var source: std.json.ObjectMap = .empty;
+    defer source.deinit(a);
+    var name_bytes: u64 = 0;
+    for (&fields, &names, 0..) |*field, *name_buffer, i| {
+        const name = try std.fmt.bufPrint(name_buffer, "field-{d}", .{i});
+        // Reverse pointer order to exercise sorting without reordering inputs.
+        const text = bytes[(count - i - 1) * 4 ..][0..4];
+        field.* = .{ .field_name = name, .text = text };
+        try source.put(a, name, .{ .string = text });
+        name_bytes += name.len;
+    }
+    try source.put(a, "unbound", .{ .string = &extra });
+    // Adjacent borrowed fields do not contain this complete source slice.
+    try source.put(a, "across", .{ .string = bytes[0..8] });
+    const doc: TextDocument = .{ .id = "row", .stored_data = "{}", .text_fields = &fields, .typed_source = .{ .object = source } };
+    const expected = doc.id.len + doc.stored_data.len +
+        count * (@sizeOf(TextField) + 16 + 4) + name_bytes +
+        @as(u64, @intCast(source.capacity())) * (@sizeOf(std.json.Value) + @sizeOf([]const u8) + 16) +
+        name_bytes + "unbound".len + extra.len + "across".len + 8;
+    try std.testing.expectEqual(expected, try estimateTextDocumentInputBytes(a, doc));
+    try std.testing.expect(fields[0].text.ptr == bytes[count * 4 - 4 ..].ptr);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, estimateTextDocumentBuildMemoryBytes(failing.allocator(), doc));
+    var plain = doc;
+    plain.typed_source = null;
+    var no_scratch = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectEqual(
+        doc.id.len + doc.stored_data.len + count * (@sizeOf(TextField) + 16 + 4) + name_bytes,
+        try estimateTextDocumentInputBytes(no_scratch.allocator(), plain),
+    );
+}
+
 test "large typed inputs split and reclaim production scratch between rows" {
     const a = std.testing.allocator;
     const Budget = @import("storage/lite/test_allocator.zig").BudgetAllocator;
@@ -4379,9 +4434,9 @@ test "large typed inputs split and reclaim production scratch between rows" {
         field.* = .{ .field_name = "payload", .value_type = .bytes_val, .value = .{ .bytes_val = input[i * width ..][0..width] } };
         doc.* = .{ .id = "doc", .stored_data = "{}", .text_fields = &.{}, .typed_fields = fields[i..][0..1] };
     }
-    const split = splitTextDocumentsForBuildBudget(&docs, 0, .{ .target_build_memory_bytes = 1024 * 1024, .target_segment_bytes = 1024 * 1024 });
+    const split = try splitTextDocumentsForBuildBudget(std.testing.allocator, &docs, 0, .{ .target_build_memory_bytes = 1024 * 1024, .target_segment_bytes = 1024 * 1024 });
     try std.testing.expectEqual(@as(usize, 1), split.end);
-    try std.testing.expect(estimateTextDocumentInputBytes(docs[0]) >= width);
+    try std.testing.expect((try estimateTextDocumentInputBytes(a, docs[0])) >= width);
     try std.testing.expect(estimateTextDocumentSegmentBytes(docs[0]) >= width);
     // Borrowed aliases count once in input memory, but every encoded typed
     // payload still counts toward artifact splitting even when shared with text.
@@ -4389,7 +4444,7 @@ test "large typed inputs split and reclaim production scratch between rows" {
     defer source.deinit(a);
     try source.put(a, "payload", .{ .string = input[0..width] });
     const aliased = TextDocument{ .id = "row", .stored_data = "{}", .text_fields = &.{.{ .field_name = "body", .text = input[0..width] }}, .typed_source = .{ .object = source } };
-    try std.testing.expect(estimateTextDocumentInputBytes(aliased) < 2 * width);
+    try std.testing.expect((try estimateTextDocumentInputBytes(a, aliased)) < 2 * width);
     try std.testing.expect(estimateTextDocumentSegmentBytes(aliased) >= 2 * width);
     var output = segment_mod.MemorySegmentSink.init(a);
     defer output.deinit();

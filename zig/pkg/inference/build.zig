@@ -600,6 +600,12 @@ pub fn build(b: *std.Build) void {
     });
     const cuda_artifacts_check_step = b.step("cuda-artifacts-check", "Verify checked-in CUDA artifacts with CUDA 13.2");
     cuda_artifacts_check_step.dependOn(&cuda_artifacts_freshness_check.step);
+    const whisper_artifacts_check = b.addSystemCommand(&.{
+        "bash",
+        "scripts/whisper/regen-kernels.sh",
+        "--check",
+    });
+    cuda_artifacts_check_step.dependOn(&whisper_artifacts_check.step);
 
     const quant_kernel_cuda_attention_diff_step = b.step(
         "quant-kernel-cuda-attention-diff",
@@ -656,9 +662,15 @@ pub fn build(b: *std.Build) void {
             }),
         });
         quant_kernel_cuda_paged_attention_diff_exe.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
+        quant_kernel_cuda_paged_attention_diff_exe.root_module.addImport("antfly_platform", configured_platform_mod);
         runtime_graph.identities.addImports(quant_kernel_cuda_paged_attention_diff_exe.root_module);
         quant_kernel_cuda_paged_attention_diff_exe.root_module.link_libc = true;
+        // Build the diagnostic tool independently of the pinned SM89 candidate
+        // compiler so other CUDA targets can supply their own explicit cubins.
+        const install_paged_attention_diff = b.addInstallArtifact(quant_kernel_cuda_paged_attention_diff_exe, .{});
+        b.step("quant-kernel-cuda-paged-attention-diff-tool", "Build paged attention differential tool without compiling SM89 candidates").dependOn(&install_paged_attention_diff.step);
         const quant_kernel_cuda_paged_attention_diff_tests = b.addTest(.{
+            .filters = &.{ "paged attention", "CUDA production dense primitive smoke" },
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/quant_kernel_cuda_paged_attention_diff.zig"),
                 .target = target,
@@ -666,9 +678,12 @@ pub fn build(b: *std.Build) void {
             }),
         });
         quant_kernel_cuda_paged_attention_diff_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
+        quant_kernel_cuda_paged_attention_diff_tests.root_module.addImport("antfly_platform", configured_platform_mod);
+        quant_kernel_cuda_paged_attention_diff_tests.root_module.addImport("ml", ml_mod);
         runtime_graph.identities.addImports(quant_kernel_cuda_paged_attention_diff_tests.root_module);
         quant_kernel_cuda_paged_attention_diff_tests.root_module.link_libc = true;
         const run_quant_kernel_cuda_paged_attention_diff_tests = b.addRunArtifact(quant_kernel_cuda_paged_attention_diff_tests);
+        b.step("test-cuda-paged-attention-diff-tool", "Run paged attention differential harness unit tests").dependOn(&run_quant_kernel_cuda_paged_attention_diff_tests.step);
         const run_quant_kernel_cuda_paged_attention_diff = b.addRunArtifact(quant_kernel_cuda_paged_attention_diff_exe);
         run_quant_kernel_cuda_paged_attention_diff.addArg("--candidate-hd256");
         run_quant_kernel_cuda_paged_attention_diff.addFileArg2(score_prework_hd256_cubin, .{ .make_absolute = true });
@@ -1598,6 +1613,20 @@ pub fn build(b: *std.Build) void {
     // Tests
     const suite = workflows_tests.create(workflow_ctx);
     const tests = suite.tests;
+    const memory_admission_root = b.createModule(.{
+        .root_source_file = b.path("src/test_memory_admission.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    var memory_admission_imports = tests.root_module.import_table.iterator();
+    while (memory_admission_imports.next()) |entry| memory_admission_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    memory_admission_root.link_libc = true;
+    const memory_admission_tests = b.addTest(.{
+        .root_module = memory_admission_root,
+        .filters = &.{"admission"},
+        .test_runner = .{ .path = b.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    b.step("test-memory-admission", "Run memory-policy, contention and recovery contracts without server discovery").dependOn(&b.addRunArtifact(memory_admission_tests).step);
     b.step("test-embeddinggemma2", "Run the filtered inference suite for EmbeddingGemma 2 qualification").dependOn(&suite.run_tests.step);
     b.step("install-embeddinggemma2-tests", "Install the filtered EmbeddingGemma2 suite for execution on another host").dependOn(&b.addInstallArtifact(tests, .{ .dest_sub_path = "embeddinggemma2-tests" }).step);
     const video_model_root = b.createModule(.{ .root_source_file = b.path("src/inference_internal.zig"), .target = target, .optimize = optimize });
@@ -2255,6 +2284,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const chunker_tests = b.addTest(.{
+        .filters = selectTestFilters(b, &.{}),
         .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("{s}/lib/chunker/src/mod.zig", .{shared_lib_root})),
             .target = target,

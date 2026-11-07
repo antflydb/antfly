@@ -717,7 +717,7 @@ fn primaryOperationSuffix(task: work.Task) []const u8 {
         .chunk => "/chunk",
         .extract => "/extract",
         .rewrite => "/rewrite",
-        .transcribe => "/transcribe",
+        .transcribe => "/read",
     };
 }
 
@@ -1198,6 +1198,10 @@ pub fn parseModelCapabilities(
             if (value == .string) try result.batch.applyManifestCapability(value.string);
         }
     };
+    if (info.object.get("model_revision_pinning")) |pinning| {
+        if (pinning != .bool) return error.InvalidInferenceCapabilities;
+        result.model_revision_pinning = pinning.bool;
+    }
     if (info.object.get("model_revision")) |revision| {
         if (revision != .string or revision.string.len != 64) return error.InvalidInferenceCapabilities;
         var digest: [32]u8 = undefined;
@@ -1263,6 +1267,7 @@ fn discoverOnce(
     const url = try scopedModelsUrlAlloc(alloc, inference_url, model, operation);
     defer alloc.free(url);
     var response = http.get(url, .{
+        .follow_redirects = false,
         .headers = headers,
         .max_response_size = capability_catalog_response_bytes,
     }) catch |err| {
@@ -1382,6 +1387,7 @@ fn discoverWithContextOnce(
     const url = try scopedModelsUrlAlloc(alloc, inference_url, model, operation);
     defer alloc.free(url);
     var response = http.get(url, .{
+        .follow_redirects = false,
         .headers = headers,
         .timeout_ms = timeout_ms,
         .cancellation = httpx.CancellationToken.fromCallback(

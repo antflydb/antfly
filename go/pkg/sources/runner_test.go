@@ -16,10 +16,12 @@
 package sources
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/gofrs/flock"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -52,6 +54,20 @@ func (c *fixtureConnector) CheckAccess(context.Context, Request, Item) error    
 func (c *fixtureConnector) ValidateInventory(context.Context, Request, Inventory) error { return nil }
 func (c *fixtureConnector) ValidateAbsentSources(context.Context, Request, []string) error {
 	return c.absenceErr
+}
+
+func (c *fixtureConnector) CheckMedia(ctx context.Context, r Request, item Item) error {
+	return c.CheckAccess(ctx, r, item)
+}
+func (c *fixtureConnector) OpenMedia(ctx context.Context, r Request, item Item, span MediaRange) (io.ReadCloser, error) {
+	if err := span.validate(item.Size); err != nil {
+		return nil, err
+	}
+	data := c.data[item.ID]
+	if int64(len(data)) < span.Offset+span.Length {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return io.NopCloser(bytes.NewReader(data[span.Offset : span.Offset+span.Length])), nil
 }
 
 type publicationFixture struct {
@@ -91,8 +107,8 @@ func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasSuffix(r.URL.Path, "/batch") {
-		if body["sync_level"] != "write" {
-			http.Error(w, "missing write barrier", 400)
+		if body["sync_level"] != "full_index" {
+			http.Error(w, "missing index visibility barrier", 400)
 			return
 		}
 		if inserts, ok := body["inserts"].(map[string]any); ok {

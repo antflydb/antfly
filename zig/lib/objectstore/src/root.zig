@@ -21,6 +21,7 @@ pub const immutable_log = @import("immutable_log.zig");
 pub const conditional_root = @import("conditional_root.zig");
 pub const wasm_host = @import("wasm_host.zig");
 pub const types = @import("types.zig");
+pub const operation_metrics = @import("operation_metrics.zig");
 pub const client = @import("client.zig");
 pub const filesystem = @import("filesystem.zig");
 pub const durable_directory = @import("durable_directory.zig");
@@ -131,3 +132,6 @@ test "objectstore module compiles" {
     _ = s3ObjectUriAlloc;
     _ = s3PutObjectShapeAlloc;
 }
+
+/// Shared strict HTTP/provider timestamp parsing.
+pub const retention_time = @import("retention_time.zig");

@@ -116,7 +116,17 @@ func TestLocalAntflySourcePipeline(t *testing.T) {
 	run(true)
 	initial := proxy.counts()
 	require.Equal(t, count+1, initial.content)
-	require.Zero(t, initial.cleanup)
+	proof, err := publisher.Query(ctx, table, []byte(`{"limit":1,"order_by":[{"field":"_id","desc":false}]}`))
+	require.NoError(t, err)
+	_, freshness, err := decodeSyncPage(proof)
+	require.NoError(t, err)
+	// Live indexes cannot prove absence, even on an unchanged inventory.
+	// Each source therefore reconciles primary storage on every full Lite run.
+	cleanupPerRun := 0
+	if freshness.LiveRead {
+		cleanupPerRun = len(profile.Sources)
+	}
+	require.Equal(t, cleanupPerRun, initial.cleanup)
 	require.Equal(t, 1, initial.queryDrops)
 	raw, err := os.ReadFile(catalog)
 	require.NoError(t, err)
@@ -132,8 +142,8 @@ func TestLocalAntflySourcePipeline(t *testing.T) {
 	run(true)
 	unchanged := proxy.counts()
 	require.Equal(t, initial.content, unchanged.content)
-	require.Equal(t, initial.cleanup, unchanged.cleanup)
-	t.Log("unchanged synchronization issued no content or cleanup merges")
+	require.Equal(t, initial.cleanup+cleanupPerRun, unchanged.cleanup)
+	t.Logf("unchanged synchronization issued no content merges and %d required primary reconciliations", cleanupPerRun)
 	if grep := os.Getenv("ANTFLY_GREP_TEST_BINARY"); grep != "" {
 		for _, selector := range [][]string{{"--source-catalog", catalog}, {"--source-endpoint", profile.Endpoint}} {
 			args := append(append([]string{}, selector...), "--source", alias, "native_e2e_budget")
@@ -159,7 +169,7 @@ func TestLocalAntflySourcePipeline(t *testing.T) {
 	run(true)
 	recovered := proxy.counts()
 	require.Equal(t, failedContent.content, recovered.content)
-	require.Equal(t, failedContent.cleanup, recovered.cleanup)
+	require.Equal(t, failedContent.cleanup+cleanupPerRun, recovered.cleanup)
 	t.Log("committed content with lost acknowledgement recovered without a replay")
 	removedKey, err := RecordKey(sourceID, localPublishedItem(t, root, sourceID, fmt.Sprintf("docs/event-%04d.txt", count-1)).ID)
 	require.NoError(t, err)
@@ -173,12 +183,12 @@ func TestLocalAntflySourcePipeline(t *testing.T) {
 	run(true)
 	cleaned := proxy.counts()
 	require.Equal(t, failedCleanup.content, cleaned.content)
-	require.Equal(t, failedCleanup.cleanup, cleaned.cleanup)
+	require.Equal(t, failedCleanup.cleanup+cleanupPerRun, cleaned.cleanup)
 	_, err = publisher.call(ctx, "GET", tablePath(table)+"/documents/"+url.PathEscape(removedKey), nil)
 	var absent *PublishHTTPError
 	require.ErrorAs(t, err, &absent)
 	require.Equal(t, http.StatusNotFound, absent.Status)
-	t.Log("committed cleanup with lost acknowledgement recovered without a replay")
+	t.Log("committed cleanup with lost acknowledgement recovered with required freshness reconciliation")
 	// The source reader must not reconcile anything when upstream access fails.
 	upstream.mu.Lock()
 	upstream.denied = "docs/event-0000.txt"
@@ -202,14 +212,14 @@ func TestLocalAntflySourcePipeline(t *testing.T) {
 		keys = append(keys, key)
 		providers = append(providers, providerID)
 	}
-	query, _ := json.Marshal(map[string]any{"query": documentIDsQuery(keys), "fields": append(sourceRowFields(), "grep.content"), "limit": len(keys), "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
+	query, _ := json.Marshal(map[string]any{"query": documentIDsQuery(keys), "fields": append(sourceRowFields(), "content.text"), "limit": len(keys), "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
 	response, err := publisher.Query(ctx, table, query)
 	require.NoError(t, err)
 	hits, err := decodeSyncHits(response)
 	require.NoError(t, err)
 	require.Len(t, hits, 3)
 	for _, hit := range hits {
-		doc := hit.Source.Grep
+		doc := hit.Source.Document
 		doc.IndexedAt += 100
 		docs[hit.ID] = doc
 	}

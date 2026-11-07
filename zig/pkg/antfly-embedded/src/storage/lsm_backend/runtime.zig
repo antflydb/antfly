@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const byte_copy = @import("../../common/byte_copy.zig");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const bloom = @import("bloom");
@@ -454,6 +455,17 @@ pub fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
 }
 
+/// Lets the backend fence or repair after a commit failed past its WAL
+/// append; see `Backend.noteFailedAppliedCommit`.
+fn noteFailedAppliedCommit(backend: anytype) void {
+    if (@hasDecl(@TypeOf(backend.*), "noteFailedAppliedCommit")) backend.noteFailedAppliedCommit();
+}
+
+/// WAL appends and direct ingests a backend has started; see `commit`.
+fn writePublicationAttempts(backend: anytype) u64 {
+    return if (@hasField(@TypeOf(backend.*), "write_publication_attempts")) backend.write_publication_attempts else 0;
+}
+
 fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable) !void {
     if (incoming.entryCount() == 0) return;
     if (comptime @TypeOf(backend.mutable) == ActiveMemTable) {
@@ -537,14 +549,14 @@ pub fn recordBlockPrefixBloomNegative(backend: anytype) void {
 fn compareTableEntryTo(entry: lsm_table_file.Entry, namespace: backend_types.Namespace, key: []const u8) std.math.Order {
     const namespace_order = compareNamespace(.{ .name = entry.namespace_name }, namespace);
     if (namespace_order != .eq) return namespace_order;
-    return std.mem.order(u8, entry.key, key);
+    return byte_copy.orderBytes(entry.key, key);
 }
 
 fn blockBeforeScanLower(block: lsm_table_file.TableIndex.BlockMeta, namespace: backend_types.Namespace, lower: []const u8) bool {
     return switch (compareNamespace(.{ .name = block.largest_namespace_name }, namespace)) {
         .lt => true,
         .gt => false,
-        .eq => std.mem.order(u8, block.largest_key, lower) == .lt,
+        .eq => byte_copy.orderBytes(block.largest_key, lower) == .lt,
     };
 }
 
@@ -758,7 +770,7 @@ pub fn BoundStore(comptime BackendType: type) type {
             var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
             var entry = try cursor.seekAtOrAfter(lower[0..]);
             while (entry) |kv| {
-                if (std.mem.order(u8, kv.key, upper[0..]) != .lt) break;
+                if (byte_copy.orderBytes(kv.key, upper[0..]) != .lt) break;
                 const sequence = internal_keys.parseReplayEntrySequence(kv.key, lane_ordinal) orelse break;
                 try callback(ctx, sequence, kv.value);
                 stats.scanned_entries += 1;
@@ -864,7 +876,7 @@ fn forEachReplayLaneFromRangeSnapshot(
     var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
     var entry = try cursor.seekAtOrAfter(lower[0..]);
     while (entry) |kv| {
-        if (std.mem.order(u8, kv.key, upper[0..]) != .lt) break;
+        if (byte_copy.orderBytes(kv.key, upper[0..]) != .lt) break;
         const sequence = internal_keys.parseReplayEntrySequence(kv.key, lane_ordinal) orelse break;
         try callback(ctx, sequence, kv.value);
         stats.scanned_entries += 1;
@@ -980,7 +992,7 @@ pub fn BoundCursor(comptime StateType: type) type {
 
         fn keyBeforeUpper(self: *const @This(), key: []const u8) bool {
             const upper = self.upper_bound orelse return true;
-            return std.mem.order(u8, key, upper) == .lt;
+            return byte_copy.orderBytes(key, upper) == .lt;
         }
     };
 }
@@ -1355,7 +1367,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             const restart = if (comptime builtin.is_test) self.test_full_forward_seek else false;
             if (!restart and self.current_key != null) {
                 const current = self.current_key.?;
-                if (std.mem.order(u8, key, current) != .lt) {
+                if (byte_copy.orderBytes(key, current) != .lt) {
                     try self.skipForwardTo(key);
                 } else {
                     try self.initForwardPositions(key, true);
@@ -1374,12 +1386,12 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         /// Stabilize the target because it may alias a source's borrowed key.
         fn skipForwardTo(self: *@This(), target: []const u8) !void {
             if (self.source_heap_len == 0) return;
-            if (std.mem.order(u8, self.source_entries[self.source_heap[0]].?.key, target) != .lt) return;
+            if (byte_copy.orderBytes(self.source_entries[self.source_heap[0]].?.key, target) != .lt) return;
             const stable_target = try self.allocator.dupe(u8, target);
             defer self.allocator.free(stable_target);
             while (self.source_heap_len != 0) {
                 const source = self.source_heap[0];
-                if (std.mem.order(u8, self.source_entries[source].?.key, stable_target) != .lt) break;
+                if (byte_copy.orderBytes(self.source_entries[source].?.key, stable_target) != .lt) break;
                 try self.setSourceAtOrAfter(source, stable_target, true);
                 self.updateForwardHeapSource(source);
             }
@@ -1571,7 +1583,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         fn sourceBeats(self: *const @This(), lhs_source: usize, rhs_source: usize) bool {
             const lhs = self.source_entries[lhs_source].?;
             const rhs = self.source_entries[rhs_source].?;
-            return switch (std.mem.order(u8, lhs.key, rhs.key)) {
+            return switch (byte_copy.orderBytes(lhs.key, rhs.key)) {
                 .lt => true,
                 .eq => lhs_source < rhs_source,
                 .gt => false,
@@ -1606,7 +1618,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
                 const source_index = self.source_heap[heap_index];
                 const entry = self.source_entries[source_index] orelse continue;
-                const order = std.mem.order(u8, entry.key, key);
+                const order = byte_copy.orderBytes(entry.key, key);
                 if (order == .eq) {
                     self.advance_sources[match_count] = source_index;
                     match_count += 1;
@@ -1939,7 +1951,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             var owned_probe: ?[]u8 = null;
             defer if (owned_probe) |bytes| self.allocator.free(bytes);
             var include_probe = inclusive;
-            if (self.upper_bound) |upper| if (std.mem.order(u8, probe, upper) != .lt) {
+            if (self.upper_bound) |upper| if (byte_copy.orderBytes(probe, upper) != .lt) {
                 probe = upper;
                 include_probe = false;
             };
@@ -1967,11 +1979,11 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             var best: ?[]const u8 = try self.mutableLastKeyStable();
             for (self.immutable_memtables) |state| {
                 const concrete = mutableLastKey(state, self.namespace) orelse continue;
-                if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
+                if (best == null or byte_copy.orderBytes(concrete, best.?) == .gt) best = concrete;
             }
             for (self.runSourceOffset()..self.positions.len) |source_index| {
                 const concrete = (try self.spanPrevKey(source_index, null, true)) orelse continue;
-                if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
+                if (best == null or byte_copy.orderBytes(concrete, best.?) == .gt) best = concrete;
             }
             const key = best orelse return null;
             const stable_key = try self.allocator.dupe(u8, key);
@@ -1983,11 +1995,11 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             var best: ?[]const u8 = try self.mutablePrevStateKeyStable(target, inclusive);
             for (self.immutable_memtables) |state| {
                 const concrete = prevStateKey(state, self.namespace, target, inclusive) orelse continue;
-                if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
+                if (best == null or byte_copy.orderBytes(concrete, best.?) == .gt) best = concrete;
             }
             for (self.runSourceOffset()..self.positions.len) |source_index| {
                 const concrete = (try self.spanPrevKey(source_index, target, inclusive)) orelse continue;
-                if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
+                if (best == null or byte_copy.orderBytes(concrete, best.?) == .gt) best = concrete;
             }
             return best;
         }
@@ -2526,7 +2538,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         fn keyBeforeUpper(self: *const @This(), key: []const u8) bool {
             const upper = self.upper_bound orelse return true;
-            return std.mem.order(u8, key, upper) == .lt;
+            return byte_copy.orderBytes(key, upper) == .lt;
         }
 
         fn boundedScanPrefix(self: *const @This(), index: *const lsm_table_file.TableIndex, key: []const u8) ?[]const u8 {
@@ -2543,7 +2555,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 .gt => true,
                 .eq => blk: {
                     const upper = self.upper_bound orelse break :blk false;
-                    break :blk std.mem.order(u8, smallest_key, upper) != .lt;
+                    break :blk byte_copy.orderBytes(smallest_key, upper) != .lt;
                 },
             };
         }
@@ -2605,7 +2617,7 @@ fn isCursorFriendlyExactBatch(keys: []const []const u8) bool {
 
     for (keys[1..], 1..) |key, i| {
         const prev = keys[i - 1];
-        if (std.mem.order(u8, prev, key) != .lt) return false;
+        if (byte_copy.orderBytes(prev, key) != .lt) return false;
         if (prev.len != key.len) return false;
         var common_prefix: usize = 0;
         while (common_prefix < prev.len and prev[common_prefix] == key[common_prefix]) : (common_prefix += 1) {}
@@ -2618,7 +2630,7 @@ fn advanceSortedBatchCursorToKey(cursor: anytype, current: ?backend_adapter.Entr
     const max_linear_skips: usize = 64;
     var entry = current orelse return null;
     var skipped: usize = 0;
-    while (std.mem.order(u8, entry.key, target) == .lt) {
+    while (byte_copy.orderBytes(entry.key, target) == .lt) {
         if (skipped >= max_linear_skips) return try cursor.seekAtOrAfter(target);
         entry = (try cursor.next()) orelse return null;
         skipped += 1;
@@ -3272,7 +3284,7 @@ fn readManyCurrentSortedPointByRunLocked(
 fn keysAreSorted(keys: []const []const u8) bool {
     if (keys.len < 2) return true;
     for (keys[1..], 1..) |key, i| {
-        if (std.mem.order(u8, keys[i - 1], key) == .gt) return false;
+        if (byte_copy.orderBytes(keys[i - 1], key) == .gt) return false;
     }
     return true;
 }
@@ -3280,7 +3292,7 @@ fn keysAreSorted(keys: []const []const u8) bool {
 fn keysAreStrictlySorted(keys: []const []const u8) bool {
     if (keys.len < 2) return true;
     for (keys[1..], 1..) |key, i| {
-        if (std.mem.order(u8, keys[i - 1], key) != .lt) return false;
+        if (byte_copy.orderBytes(keys[i - 1], key) != .lt) return false;
     }
     return true;
 }
@@ -4768,7 +4780,25 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             self.* = undefined;
         }
 
+        /// A failure after the write may have been applied (a WAL append or
+        /// direct ingest was attempted, or the memtable was published) keeps
+        /// its original error, so internal callers still see causes such as
+        /// cancellation, and is recorded in `backend_types.commit_progress`.
+        /// Later steps (flush, rotation, manifest persist) can fail while the
+        /// write is already durable or visible; public callers classify such
+        /// failures as unknown rather than "not applied".
         pub fn commit(self: *@This()) !void {
+            var maybe_applied = false;
+            self.commitTracked(&maybe_applied) catch |err| {
+                if (maybe_applied) {
+                    if (backend_types.commit_progress) |progress| progress.maybe_applied = true;
+                    noteFailedAppliedCommit(self.backend);
+                }
+                return err;
+            };
+        }
+
+        fn commitTracked(self: *@This(), maybe_applied: *bool) !void {
             if (self.closed) return error.TransactionClosed;
             defer if (self.closed) {
                 self.bulk_index.deinit(self.allocator);
@@ -4777,6 +4807,13 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
+            // Pressure relief inside the append can unlock the backend, so a
+            // concurrent commit may also move this counter. That only makes
+            // an early failure read as unknown, never the reverse.
+            const publication_attempts_before = writePublicationAttempts(self.backend);
+            errdefer if (writePublicationAttempts(self.backend) != publication_attempts_before) {
+                maybe_applied.* = true;
+            };
             var release_on_error = true;
             errdefer if (release_on_error) {
                 self.mutable.deinit(self.allocator);
@@ -4820,6 +4857,8 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
                     try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
                 }
+                // Published to the memtable: visible, and durable when WAL is on.
+                if (mutated) maybe_applied.* = true;
                 if (mutated or direct_ingested_bulk_appends) notePotentialMaintenanceDebtLocked(self.backend);
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
                 if (!self.batch_options.defer_commit_flush) {
@@ -7614,7 +7653,7 @@ fn getFromRunIndices(
         const positioned = if (read_hint.*) |hint|
             if (hint.run_index == run_index and
                 compareNamespace(namespace, .{ .name = hint.namespace_name }) == .eq and
-                std.mem.order(u8, key, hint.key) != .lt)
+                byte_copy.orderBytes(key, hint.key) != .lt)
             blk: {
                 read_hint_attempted = true;
                 backend.recordReadHintAttempt();
@@ -9080,7 +9119,7 @@ fn runMayContainAtOrAfter(run: Run, namespace: backend_types.Namespace, key: []c
 fn compareRunBound(lhs_namespace_name: ?[]const u8, lhs_key: []const u8, rhs_namespace_name: ?[]const u8, rhs_key: []const u8) std.math.Order {
     const namespace_order = compareNamespace(.{ .name = lhs_namespace_name }, .{ .name = rhs_namespace_name });
     if (namespace_order != .eq) return namespace_order;
-    return std.mem.order(u8, lhs_key, rhs_key);
+    return byte_copy.orderBytes(lhs_key, rhs_key);
 }
 
 fn nextStateKey(state: *const State, namespace: backend_types.Namespace, target: []const u8, inclusive: bool) ?[]const u8 {
@@ -9100,12 +9139,12 @@ fn nextStateIndex(state: anytype, namespace: backend_types.Namespace, target: []
         var best: ?usize = null;
         for (state.entries.items, 0..) |entry, idx| {
             if (compareNamespace(namespaceOf(entry), namespace) != .eq) continue;
-            switch (std.mem.order(u8, entry.key, target)) {
+            switch (byte_copy.orderBytes(entry.key, target)) {
                 .lt => continue,
                 .eq => if (!inclusive) continue,
                 .gt => {},
             }
-            if (best == null or std.mem.order(u8, entry.key, state.entryAt(best.?).key) == .lt) {
+            if (best == null or byte_copy.orderBytes(entry.key, state.entryAt(best.?).key) == .lt) {
                 best = idx;
             }
         }
@@ -9131,8 +9170,8 @@ fn nextIndexFrom(state: anytype, namespace: backend_types.Namespace, current: us
         for (state.entries.items, 0..) |entry, idx| {
             if (idx == current) continue;
             if (compareNamespace(namespaceOf(entry), namespace) != .eq) continue;
-            if (std.mem.order(u8, entry.key, current_entry.key) != .gt) continue;
-            if (best == null or std.mem.order(u8, entry.key, state.entryAt(best.?).key) == .lt) {
+            if (byte_copy.orderBytes(entry.key, current_entry.key) != .gt) continue;
+            if (best == null or byte_copy.orderBytes(entry.key, state.entryAt(best.?).key) == .lt) {
                 best = idx;
             }
         }
@@ -9153,12 +9192,12 @@ fn prevStateKey(state: anytype, namespace: backend_types.Namespace, target: []co
         var best: ?[]const u8 = null;
         for (state.entries.items) |entry| {
             if (compareNamespace(namespaceOf(entry), namespace) != .eq) continue;
-            switch (std.mem.order(u8, entry.key, target)) {
+            switch (byte_copy.orderBytes(entry.key, target)) {
                 .gt => continue,
                 .eq => if (!inclusive) continue,
                 .lt => {},
             }
-            if (best == null or std.mem.order(u8, entry.key, best.?) == .gt) {
+            if (best == null or byte_copy.orderBytes(entry.key, best.?) == .gt) {
                 best = entry.key;
             }
         }
@@ -9269,7 +9308,25 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             self.* = undefined;
         }
 
+        /// A failure after the write may have been applied (a WAL append or
+        /// direct ingest was attempted, or the memtable was published) keeps
+        /// its original error, so internal callers still see causes such as
+        /// cancellation, and is recorded in `backend_types.commit_progress`.
+        /// Later steps (flush, rotation, manifest persist) can fail while the
+        /// write is already durable or visible; public callers classify such
+        /// failures as unknown rather than "not applied".
         pub fn commit(self: *@This()) !void {
+            var maybe_applied = false;
+            self.commitTracked(&maybe_applied) catch |err| {
+                if (maybe_applied) {
+                    if (backend_types.commit_progress) |progress| progress.maybe_applied = true;
+                    noteFailedAppliedCommit(self.backend);
+                }
+                return err;
+            };
+        }
+
+        fn commitTracked(self: *@This(), maybe_applied: *bool) !void {
             if (self.closed) return error.TransactionClosed;
             defer if (self.closed) {
                 self.bulk_index.deinit(self.allocator);
@@ -9280,6 +9337,13 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
+            // Pressure relief inside the append can unlock the backend, so a
+            // concurrent commit may also move this counter. That only makes
+            // an early failure read as unknown, never the reverse.
+            const publication_attempts_before = writePublicationAttempts(self.backend);
+            errdefer if (writePublicationAttempts(self.backend) != publication_attempts_before) {
+                maybe_applied.* = true;
+            };
             var release_on_error = true;
             errdefer if (release_on_error) {
                 self.mutable.deinit(self.allocator);
@@ -9324,6 +9388,8 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
                     try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
                 }
+                // Published to the memtable: visible, and durable when WAL is on.
+                if (mutated) maybe_applied.* = true;
                 if (mutated or direct_ingested_bulk_appends) notePotentialMaintenanceDebtLocked(self.backend);
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
                 if (!self.batch_options.defer_commit_flush) {
@@ -9801,7 +9867,13 @@ test "lsm namespace write txn keeps merged mutable state when flush fails after 
     var txn = try NamespaceWriteTxn(TestBackend).open(&backend);
     errdefer txn.abort();
     try txn.put(.{ .name = "docs" }, "doc:a", "A");
+    // The write is merged and visible before the flush fails: the cause is
+    // kept, and the commit records that it may have applied.
+    var progress: backend_types.CommitProgress = .{};
+    backend_types.commit_progress = &progress;
+    defer backend_types.commit_progress = null;
     try std.testing.expectError(error.InjectedFlushFailure, txn.commit());
+    try std.testing.expect(progress.maybe_applied);
 
     try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
     try std.testing.expectEqualStrings("docs", backend.mutable.entryAt(0).namespace_name.?);

@@ -519,6 +519,10 @@ fn transcribeAudioHelper(ctx: HelperContext) anyerror!Value {
     };
     defer transcribing.deinitResponse(ctx.arena, &response);
 
+    transcribing.requireComplete(response) catch |err| {
+        return .{ .safe_string = try formatErrorDirective(ctx.arena, 0, @errorName(err)) };
+    };
+
     return .{ .string = try ctx.arena.dupe(u8, response.text orelse "") };
 }
 
@@ -713,12 +717,12 @@ test "containsErrorDirective" {
 }
 
 test "ErrorDirective isPermanent" {
-    const permanent = [_]u16{ 401, 403, 404, 410 };
+    const permanent = [_]u16{ 400, 401, 403, 404, 410, 413, 415, 422 };
     for (permanent) |code| {
         const d = ErrorDirective{ .status = code, .message = "test" };
         try std.testing.expect(d.isPermanent());
     }
-    const transient = [_]u16{ 0, 200, 301, 400, 429, 500, 503 };
+    const transient = [_]u16{ 0, 200, 301, 408, 425, 429, 500, 503 };
     for (transient) |code| {
         const d = ErrorDirective{ .status = code, .message = "test" };
         try std.testing.expect(!d.isPermanent());

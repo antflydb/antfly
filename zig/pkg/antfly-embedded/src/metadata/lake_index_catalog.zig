@@ -28,10 +28,9 @@ pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8,
 pub const max_directory_artifacts: usize = 4096;
 pub const native_reader_protocol: u16 = 97;
 
-// Catalog envelopes must remain readable so reconciliation can replace older
-// derived formats. Serving still requires the current reader protocol.
+// Lake publications and build attempts use one current reader contract.
 fn validateReaderProtocol(protocol: u16) !void {
-    if (protocol != 0 and (protocol < 24 or protocol > native_reader_protocol)) return error.InvalidLakeIndexCatalog;
+    if (protocol != native_reader_protocol) return error.InvalidLakeIndexCatalog;
 }
 pub const max_contributions: usize = 1024 * 1024;
 pub const max_directory_bytes: usize = 16 * 1024 * 1024;
@@ -64,7 +63,7 @@ pub const Signature = struct {
     }
 };
 pub const Attempt = struct {
-    reader_protocol: u16 = 0,
+    reader_protocol: u16 = native_reader_protocol,
     store_locator: ?StoreLocator = null,
     generation: u64,
     token: Token,
@@ -108,9 +107,7 @@ pub const CloudGenerations = struct {
     certificate: ?CloudRetentionCertificate = null,
 };
 pub const Publication = struct {
-    /// Zero denotes legacy consumers without renewable reader authority.
-    /// Older strict decoders reject this field and fall back to source scans.
-    reader_protocol: u16 = 0,
+    reader_protocol: u16 = native_reader_protocol,
     /// Recovery checkpoints exclude the unavailable serving publication from
     /// subsequent attempts while retaining its authority until replacement.
     reuse_published: bool = true,
@@ -143,7 +140,6 @@ pub const Publication = struct {
     pub fn validate(self: Publication) !void {
         try validateReaderProtocol(self.reader_protocol);
         if (self.cloud_generations) |cloud| {
-            if (self.reader_protocol < 36) return error.InvalidLakeIndexCatalog;
             try cloud.root.validate();
             if (cloud.certificate) |certificate| {
                 if (!cloud.complete or certificate.version != 1 or certificate.until_ms == 0 or certificate.until_ms > cloud.root.retention_until_ms or certificate.roots.len == 0 or certificate.roots.len > 4096 or std.mem.allEqual(u8, &certificate.binding, 0)) return error.InvalidLakeIndexCatalog;
@@ -169,22 +165,18 @@ pub const Publication = struct {
             else => return error.InvalidLakeIndexCatalog,
         }
         if (self.source_navigation) |navigation| {
-            if (self.reader_protocol < 46 or navigation.kind != .doc_values or (navigation.metadata_version != 1 and navigation.metadata_version != 2 and navigation.metadata_version != 3 and navigation.metadata_version != 4)) return error.InvalidLakeIndexCatalog;
-            if (navigation.metadata_version == 2 and self.reader_protocol < 47) return error.InvalidLakeIndexCatalog;
-            if (navigation.metadata_version == 4 and self.reader_protocol < 51) return error.InvalidLakeIndexCatalog;
-            if (navigation.metadata_version == 3 and self.reader_protocol < 50) return error.InvalidLakeIndexCatalog;
+            if (navigation.kind != .doc_values or (navigation.metadata_version != 2 and navigation.metadata_version != 3 and navigation.metadata_version != 4)) return error.InvalidLakeIndexCatalog;
             try artifactValid(navigation);
         }
         if (self.row_identity) |identity| {
-            if (self.reader_protocol < 66 or self.source_navigation == null or identity.kind != .doc_values or (identity.metadata_version != 1 and identity.metadata_version != 2)) return error.InvalidLakeIndexCatalog;
-            if (identity.metadata_version == 2 and self.reader_protocol < 70) return error.InvalidLakeIndexCatalog;
+            if (self.source_navigation == null or identity.kind != .doc_values or identity.metadata_version != 2) return error.InvalidLakeIndexCatalog;
             try artifactValid(identity);
         }
         try artifactValid(self.inventory);
         if (self.inventory.kind != .external_base_source) return error.InvalidLakeIndexCatalog;
         // Paged inventory closure is reachable through the mandatory source
-        // navigation root. Older readers cannot interpret its descriptor.
-        if (self.inventory.metadata_version > 1 or (self.inventory.metadata_version == 1 and (self.reader_protocol < 53 or self.source_navigation == null))) return error.InvalidLakeIndexCatalog;
+        // navigation root.
+        if (self.inventory.metadata_version > 1 or (self.inventory.metadata_version == 1 and self.source_navigation == null)) return error.InvalidLakeIndexCatalog;
         const source = switch (self.base_source) {
             .external_parquet, .external_iceberg => |v| v,
             else => unreachable,
@@ -475,32 +467,17 @@ test "metadata.lake index publication preserves ready roots and fences changed d
     try paged.validate();
     paged.reader_protocol = 52;
     try std.testing.expectError(error.InvalidLakeIndexCatalog, paged.validate());
-    // A reader upgrade must parse both historical pending attempts and ready
-    // publications before it can rebuild them under the current protocol.
-    for (24..native_reader_protocol + 1) |protocol| {
-        var historical_attempt = attempt;
-        historical_attempt.pending.?.reader_protocol = @intCast(protocol);
-        const pending_bytes = try encode(a, historical_attempt);
-        defer a.free(pending_bytes);
-        var pending = try parse(a, pending_bytes);
-        defer pending.deinit();
-        try std.testing.expectEqual(protocol, pending.value.pending.?.reader_protocol);
-        var historical_publication = publication;
-        historical_publication.reader_protocol = @intCast(protocol);
-        const published_bytes = try encode(a, .{ .generation = 1, .published = historical_publication });
-        defer a.free(published_bytes);
-        var published_history = try parse(a, published_bytes);
-        defer published_history.deinit();
-        try std.testing.expectEqual(protocol, published_history.value.published.?.reader_protocol);
-    }
-    for ([_]u16{ 23, native_reader_protocol + 1 }) |protocol| {
+    for (0..native_reader_protocol) |protocol| {
         var invalid_attempt = attempt.pending.?;
-        invalid_attempt.reader_protocol = protocol;
+        invalid_attempt.reader_protocol = @intCast(protocol);
         try std.testing.expectError(error.InvalidLakeIndexCatalog, invalid_attempt.validate());
         var invalid_reader = publication;
-        invalid_reader.reader_protocol = protocol;
+        invalid_reader.reader_protocol = @intCast(protocol);
         try std.testing.expectError(error.InvalidLakeIndexCatalog, invalid_reader.validate());
     }
+    var future = publication;
+    future.reader_protocol = native_reader_protocol + 1;
+    try std.testing.expectError(error.InvalidLakeIndexCatalog, future.validate());
     const building_bytes = try encode(a, attempt);
     defer a.free(building_bytes);
     var building = table;

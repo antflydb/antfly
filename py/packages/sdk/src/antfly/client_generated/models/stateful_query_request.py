@@ -250,7 +250,9 @@ class StatefulQueryRequest:
 
                 `children` is a separate sequential-browsing operation. It enumerates every unit
                 in the selected source revision, including units with no searchable chunk, and uses
-                the top-level `_sort`/`search_after` cursor contract.
+                the top-level `_sort`/`search_after` cursor contract. For member traversal,
+                `filter_query` applies to source parents before any artifact enumeration;
+                it never filters member payloads or changes the member pagination order.
 
                 Ancestor and nested-match field projections are always explicit to keep response
                 size predictable. The presence of this object selects the canonical contract:

@@ -123,7 +123,7 @@ pub const Step = union(enum) { closed, pending, page: Prepared };
 pub fn prepare(alloc: std.mem.Allocator, txn: anytype, root: u128, document: []const u8, plan: *const Plan, limits: Limits) !Step {
     try limits.validate();
     if (root == 0) return error.DurableRootIncarnationUnavailable;
-    if (document.len == 0 or document.len > checkpoint.max_cursor_bytes) return error.InvalidBatchRequest;
+    if (document.len > checkpoint.max_cursor_bytes) return error.InvalidBatchRequest;
     _ = try authorize(alloc, txn, plan);
     const completion = if (plan.completion_plan) |*value| value else return error.ArtifactCatalogDrift;
     const requirement = (try completion.nativeEffects()).id;
@@ -252,7 +252,7 @@ pub const Closure = struct {
 
 pub fn prepareClosure(alloc: std.mem.Allocator, txn: anytype, root: u128, document: []const u8, plan: *const Plan) !Closure {
     if (root == 0) return error.DurableRootIncarnationUnavailable;
-    if (document.len == 0 or document.len > checkpoint.max_cursor_bytes) return error.InvalidBatchRequest;
+    if (document.len > checkpoint.max_cursor_bytes) return error.InvalidBatchRequest;
     _ = try authorize(alloc, txn, plan);
     const completion = if (plan.completion_plan) |*value| value else return error.ArtifactCatalogDrift;
     const requirement = (try completion.nativeEffects()).id;

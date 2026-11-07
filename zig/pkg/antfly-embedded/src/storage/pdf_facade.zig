@@ -72,7 +72,11 @@ pub const syntax = @import("pdf_syntax");
 pub const text_encoding = @import("pdf_text_encoding");
 pub const PageRenderDiagnostics = pdf_values.reader.PageRenderDiagnostics;
 pub const nativeRasterBboxToPagePoints = pdf_values.nativeRasterBboxToPagePoints;
+pub const text_structure = @import("pdf_text_structure");
 pub const reader = struct {
+    pub const TextExtractionPolicy = pdf_values.reader.TextExtractionPolicy;
+    pub const SemanticTextSpan = pdf_values.reader.SemanticTextSpan;
+    pub const NativeTextDiagnostics = pdf_values.reader.NativeTextDiagnostics;
     pub const PageRenderRuns = pdf_values.reader.PageRenderRuns;
     pub const ShapeRun = pdf_values.reader.ShapeRun;
     pub const ImageRun = pdf_values.reader.ImageRun;
@@ -122,6 +126,9 @@ pub const reader = struct {
         pub fn setCancellationProbe(self: *Reader, probe: CancellationProbe) void {
             c.call("setProbe", .{ self.handle, probe }) catch @panic("PDF probe contract mismatch");
             self.probe = probe;
+        }
+        pub fn setTextExtractionPolicy(self: *Reader, policy: TextExtractionPolicy) void {
+            c.call("setPolicy", .{ self.handle, policy }) catch @panic("PDF text policy contract mismatch");
         }
         pub fn setDecodeLimits(self: *Reader, limits: DecodeLimits) !void {
             try c.call("setLimits", .{ self.handle, limits });

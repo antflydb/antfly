@@ -118,13 +118,34 @@ fn cloneUnit(alloc: Allocator, unit: extraction.Unit) !extraction.Unit {
     errdefer if (out.extraction_status) |value| alloc.free(value);
     out.source_sha256 = try dupeOptional(alloc, unit.source_sha256);
     errdefer if (out.source_sha256) |value| alloc.free(value);
+    out.ocr_failure_stage = try dupeOptional(alloc, unit.ocr_failure_stage);
+    errdefer if (out.ocr_failure_stage) |value| alloc.free(value);
+    out.ocr_trigger_reasons = try dupeOptional(alloc, unit.ocr_trigger_reasons);
+    errdefer if (out.ocr_trigger_reasons) |value| alloc.free(value);
+    out.ocr_embedded_quality = try dupeOptional(alloc, unit.ocr_embedded_quality);
+    errdefer if (out.ocr_embedded_quality) |value| alloc.free(value);
+    out.ocr_output_quality = try dupeOptional(alloc, unit.ocr_output_quality);
+    errdefer if (out.ocr_output_quality) |value| alloc.free(value);
     out.extraction_warning = try dupeOptional(alloc, unit.extraction_warning);
     errdefer if (out.extraction_warning) |value| alloc.free(value);
     out.page_label = try dupeOptional(alloc, unit.page_label);
     errdefer if (out.page_label) |value| alloc.free(value);
+    out.transcript_spans = if (unit.transcript_spans.len == 0) &.{} else try alloc.dupe(extraction.TranscriptSpan, unit.transcript_spans);
+    errdefer if (out.transcript_spans.len > 0) alloc.free(out.transcript_spans);
     out.text_regions = if (unit.text_regions.len == 0) &.{} else try alloc.dupe(extraction.TextRegion, unit.text_regions);
+    errdefer if (out.text_regions.len > 0) alloc.free(out.text_regions);
+    out.text_blocks = if (unit.text_blocks.len == 0) &.{} else try alloc.dupe(extraction.TextBlock, unit.text_blocks);
     out.byte_length = unit.byte_length;
+    out.native_text_quality = unit.native_text_quality;
+    out.native_text_diagnostics = unit.native_text_diagnostics;
     out.ocr_used = unit.ocr_used;
+    out.ocr_attempted = unit.ocr_attempted;
+    out.ocr_render_dpi = unit.ocr_render_dpi;
+    out.ocr_effective_render_dpi = unit.ocr_effective_render_dpi;
+    out.ocr_rendered_width = unit.ocr_rendered_width;
+    out.ocr_rendered_height = unit.ocr_rendered_height;
+    out.ocr_rendered_bytes = unit.ocr_rendered_bytes;
+    out.ocr_failure_retryable = unit.ocr_failure_retryable;
     out.ocr_confidence = unit.ocr_confidence;
     out.ocr_bbox = unit.ocr_bbox;
     out.transcript_used = unit.transcript_used;
@@ -142,9 +163,15 @@ fn unitBytes(unit: extraction.Unit) usize {
         (if (unit.source_path) |v| v.len else 0) +
         (if (unit.extraction_status) |v| v.len else 0) +
         (if (unit.source_sha256) |v| v.len else 0) +
+        (if (unit.ocr_failure_stage) |v| v.len else 0) +
+        (if (unit.ocr_trigger_reasons) |v| v.len else 0) +
+        (if (unit.ocr_embedded_quality) |v| v.len else 0) +
+        (if (unit.ocr_output_quality) |v| v.len else 0) +
         (if (unit.extraction_warning) |v| v.len else 0) +
         (if (unit.page_label) |v| v.len else 0) +
-        unit.text_regions.len * @sizeOf(extraction.TextRegion);
+        unit.transcript_spans.len * @sizeOf(extraction.TranscriptSpan) +
+        unit.text_regions.len * @sizeOf(extraction.TextRegion) +
+        unit.text_blocks.len * @sizeOf(extraction.TextBlock);
 }
 
 pub fn extractStream(

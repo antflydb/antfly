@@ -20,8 +20,9 @@ const std = @import("std");
 const publication = @import("artifact_publication.zig");
 const Position = publication.Position;
 pub const key = "\x00\x00__artifact_publication__:obligations";
+pub const metadata_key = key ++ ":metadata";
 pub const document_prefix = "\x00\x00__artifact_publication__:dirty:";
-pub const max_cursor_bytes = 1024 * 1024;
+pub const max_cursor_bytes = publication.max_cursor_bytes;
 
 pub const State = struct {
     namespace: publication.Namespace,
@@ -41,12 +42,51 @@ pub const State = struct {
     }
 };
 
-pub fn load(txn: anytype) !?State {
+/// The immutable-size metadata is authoritative for counts and fences. APO2
+/// remains readable until the first write migrates both rows atomically.
+pub fn loadMetadata(txn: anytype) !?State {
+    const hot = txn.get(metadata_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (hot) |raw| {
+        if (raw.len != 122) return error.ArtifactCatalogCorrupt;
+        return try decode(raw, "APM1");
+    }
     const raw = txn.get(key) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };
-    if (raw.len < 122 or raw.len > 122 + max_cursor_bytes or !std.mem.eql(u8, raw[0..4], "APO2") or raw[44] > 1 or raw[45] > 1) return error.ArtifactCatalogCorrupt;
+    // APO3 with a missing metadata row must never resurrect stale counts.
+    return try decode(raw, "APO2");
+}
+
+pub fn load(txn: anytype) !?State {
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => {
+            if (try loadMetadata(txn) != null) return error.ArtifactCatalogCorrupt;
+            return null;
+        },
+        else => return err,
+    };
+    if (raw.len >= 4 and std.mem.eql(u8, raw[0..4], "APO2")) {
+        const legacy = try decode(raw, "APO2");
+        const unexpected = txn.get(metadata_key) catch |err| switch (err) {
+            error.NotFound => return legacy,
+            else => return err,
+        };
+        _ = unexpected;
+        return error.ArtifactCatalogCorrupt;
+    }
+    const checkpoint = try decode(raw, "APO3");
+    var state = (try loadMetadata(txn)) orelse return error.ArtifactCatalogCorrupt;
+    if (state.epoch != checkpoint.epoch or !std.mem.eql(u8, &state.namespace, &checkpoint.namespace)) return error.ArtifactCatalogCorrupt;
+    state.cursor = checkpoint.cursor;
+    return state;
+}
+
+fn decode(raw: []const u8, magic: *const [4]u8) !State {
+    if (raw.len < 122 or raw.len > 122 + max_cursor_bytes or !std.mem.eql(u8, raw[0..4], magic) or raw[44] > 1 or raw[45] > 1) return error.ArtifactCatalogCorrupt;
     const cursor_len = std.mem.readInt(u32, raw[78..82], .little);
     if (raw.len != 122 + @as(usize, cursor_len)) return error.ArtifactCatalogCorrupt;
     var digest: [32]u8 = undefined;
@@ -59,12 +99,40 @@ pub fn load(txn: anytype) !?State {
     return result;
 }
 
+/// Baseline checkpoints replace the cold cursor and hot metadata together.
 pub fn store(alloc: std.mem.Allocator, txn: anytype, state: State) !void {
+    // Encode both borrowed inputs before replacing either backend value.
+    var metadata = state;
+    metadata.cursor = "";
+    const cold = try encodeState(alloc, "APO3", state);
+    defer alloc.free(cold);
+    const hot = try encodeState(alloc, "APM1", metadata);
+    defer alloc.free(hot);
+    try txn.put(key, cold);
+    try txn.put(metadata_key, hot);
+}
+
+/// Normal document work must not hash/copy a potentially 65 MiB scan cursor.
+pub fn storeMetadata(alloc: std.mem.Allocator, txn: anytype, state: State) !void {
+    const existing = txn.get(metadata_key) catch |err| switch (err) {
+        error.NotFound => return store(alloc, txn, state),
+        else => return err,
+    };
+    if (existing.len != 122) return error.ArtifactCatalogCorrupt;
+    _ = try decode(existing, "APM1");
+    var metadata = state;
+    metadata.cursor = "";
+    const hot = try encodeState(alloc, "APM1", metadata);
+    defer alloc.free(hot);
+    try txn.put(metadata_key, hot);
+}
+
+fn encodeState(alloc: std.mem.Allocator, magic: *const [4]u8, state: State) ![]u8 {
     if (state.cursor.len > max_cursor_bytes or state.epoch == 0) return error.InvalidBatchRequest;
     const raw = try alloc.alloc(u8, 122 + state.cursor.len);
-    defer alloc.free(raw);
+    errdefer alloc.free(raw);
     @memset(raw, 0);
-    @memcpy(raw[0..4], "APO2");
+    @memcpy(raw[0..4], magic);
     @memcpy(raw[4..28], &state.namespace);
     std.mem.writeInt(u64, raw[28..36], state.epoch, .little);
     std.mem.writeInt(u64, raw[36..44], state.pending_documents, .little);
@@ -77,11 +145,11 @@ pub fn store(alloc: std.mem.Allocator, txn: anytype, state: State) !void {
     std.mem.writeInt(u64, raw[82..90], state.work_revision, .little);
     @memcpy(raw[90 .. 90 + state.cursor.len], state.cursor);
     std.crypto.hash.sha2.Sha256.hash(raw[0 .. raw.len - 32], raw[raw.len - 32 ..][0..32], .{});
-    try txn.put(key, raw);
+    return raw;
 }
 
 pub fn begin(alloc: std.mem.Allocator, txn: anytype, authority: publication.Authority) !void {
-    if (try load(txn)) |existing| {
+    if (try loadMetadata(txn)) |existing| {
         if (existing.epoch == authority.epoch and std.mem.eql(u8, &existing.namespace, &authority.namespace)) return;
         if (existing.sealed_attempt != null) return error.ArtifactCatalogDrift;
     }
@@ -138,7 +206,7 @@ fn encodeRecord(record: Record) ![116]u8 {
 /// Returns false only when this owner has not activated obligation capture.
 /// No old value/artifact scan is performed; one document causes two point IOs.
 pub fn mark(alloc: std.mem.Allocator, txn: anytype, authority: publication.Authority, document: []const u8, position: ?Position) !bool {
-    var state = (try load(txn)) orelse return false;
+    var state = (try loadMetadata(txn)) orelse return false;
     try state.requireAuthority(authority);
     if (state.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
     const dirty = try documentKey(alloc, authority, document);
@@ -152,7 +220,7 @@ pub fn mark(alloc: std.mem.Allocator, txn: anytype, authority: publication.Autho
     state.work_revision = std.math.add(u64, state.work_revision, 1) catch return error.ResourceLimitExceeded;
     const record = try encodeRecord(.{ .epoch = authority.epoch, .position = position, .revision = state.work_revision });
     // Serialize the borrowed state before replacing any backend values.
-    try store(alloc, txn, state);
+    try storeMetadata(alloc, txn, state);
     try txn.put(dirty, &record);
     try @import("artifact_producer_readiness.zig").mark(alloc, txn, authority, document);
     return true;
@@ -195,7 +263,7 @@ pub fn beginRetryRound(txn: anytype, authority: publication.Authority) !u64 {
 
 pub fn beginRetryRoundAt(txn: anytype, authority: publication.Authority, now_ns: u64) !u64 {
     if (!std.meta.eql((try publication.authority(txn)) orelse return error.ArtifactCatalogDrift, authority)) return error.ArtifactCatalogDrift;
-    const state = (try load(txn)) orelse return error.ArtifactCatalogCorrupt;
+    const state = (try loadMetadata(txn)) orelse return error.ArtifactCatalogCorrupt;
     try state.requireAuthority(authority);
     if (state.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
     const previous = try retryRoundState(txn, authority);
@@ -238,7 +306,7 @@ pub fn stageDispatch(alloc: std.mem.Allocator, txn: anytype, authority: publicat
     if (sequence == 0 or page.next_template <= item.next_template) return error.InvalidBatchRequest;
     const current = (try publication.authority(txn)) orelse return error.ArtifactCatalogDrift;
     if (!std.meta.eql(current, authority)) return error.ArtifactCatalogDrift;
-    const state = (try load(txn)) orelse return error.ArtifactCatalogCorrupt;
+    const state = (try loadMetadata(txn)) orelse return error.ArtifactCatalogCorrupt;
     try state.requireAuthority(authority);
     if (state.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
     const dirty = try documentKey(alloc, authority, item.document);
@@ -264,7 +332,7 @@ pub fn stageDispatch(alloc: std.mem.Allocator, txn: anytype, authority: publicat
 pub fn complete(alloc: std.mem.Allocator, txn: anytype, authority: publication.Authority, item: WorkPage.Item) !void {
     const active = (try publication.authority(txn)) orelse return error.ArtifactCatalogDrift;
     if (!std.meta.eql(active, authority)) return error.ArtifactCatalogDrift;
-    var state = (try load(txn)) orelse return error.ArtifactCatalogDrift;
+    var state = (try loadMetadata(txn)) orelse return error.ArtifactCatalogDrift;
     try state.requireAuthority(authority);
     if (state.sealed_attempt != null) return error.ArtifactCatalogDrift;
     const dirty = try documentKey(alloc, authority, item.document);
@@ -276,12 +344,12 @@ pub fn complete(alloc: std.mem.Allocator, txn: anytype, authority: publication.A
     const record = try decodeRecord(raw);
     if (record.epoch != authority.epoch or record.revision != item.revision or !std.meta.eql(record.position, item.position)) return;
     state.pending_documents = std.math.sub(u64, state.pending_documents, 1) catch return error.ArtifactCatalogCorrupt;
-    try store(alloc, txn, state);
+    try storeMetadata(alloc, txn, state);
     try txn.delete(dirty);
 }
 
 pub fn requireDrained(txn: anytype, authority: publication.Authority) !State {
-    const state = (try load(txn)) orelse return error.ArtifactCatalogDrift;
+    const state = (try loadMetadata(txn)) orelse return error.ArtifactCatalogDrift;
     try state.requireAuthority(authority);
     if (!state.baseline_complete or state.pending_documents != 0) return error.ArtifactCatalogDrift;
     return state;
@@ -312,7 +380,7 @@ pub const WorkCursor = struct { authority: publication.Authority, document: []co
 pub fn lookupWork(alloc: std.mem.Allocator, txn: anytype, authority: publication.Authority, document: []const u8) !?WorkPage.Item {
     const active = (try publication.authority(txn)) orelse return error.ArtifactCatalogDrift;
     if (!std.meta.eql(active, authority)) return error.ArtifactCatalogDrift;
-    const state = (try load(txn)) orelse return error.ArtifactCatalogDrift;
+    const state = (try loadMetadata(txn)) orelse return error.ArtifactCatalogDrift;
     try state.requireAuthority(authority);
     if (state.sealed_attempt != null) return error.ArtifactCatalogDrift;
     const selected = try documentKey(alloc, authority, document);
@@ -345,6 +413,15 @@ pub fn collectObsoleteEpochPage(alloc: std.mem.Allocator, store_handle: anytype,
 /// it on every cleanup page. Registries without local identity keep all current
 /// epoch rows, preserving the ordinary obligation-GC contract.
 pub fn collectObsoleteEpochPageForIdentity(alloc: std.mem.Allocator, store_handle: anytype, comptime registry_prefix: []const u8, comptime min_identity_bytes: usize, comptime max_identity_bytes: usize, active_identity: ?[]const u8) !bool {
+    return collectObsoleteEpochPageForIdentityWithRetention(alloc, store_handle, registry_prefix, min_identity_bytes, max_identity_bytes, active_identity, struct {
+        pub fn epoch(_: anytype, authority: publication.Authority) !u64 {
+            return authority.epoch;
+        }
+    });
+}
+
+pub fn collectObsoleteEpochPageForIdentityWithRetention(alloc: std.mem.Allocator, store_handle: anytype, comptime registry_prefix: []const u8, comptime min_identity_bytes: usize, comptime max_identity_bytes: usize, active_identity: ?[]const u8, comptime Retention: type) !bool {
+    var retained_epoch: u64 = 0;
     comptime std.debug.assert(std.mem.startsWith(u8, registry_prefix, "\x00\x00__artifact_publication__:"));
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -355,6 +432,7 @@ pub fn collectObsoleteEpochPageForIdentity(alloc: std.mem.Allocator, store_handl
         var read = try store_handle.beginReadTxnWithBlockCacheAdmission(.transient);
         defer read.abort();
         const authority = (try publication.authority(&read)) orelse return true;
+        retained_epoch = try Retention.epoch(&read, authority);
         const prefix = try std.mem.concat(scratch, u8, &.{ registry_prefix, &authority.namespace });
         var cursor = try read.openPhysicalCursorAdapter();
         defer cursor.close();
@@ -369,11 +447,11 @@ pub fn collectObsoleteEpochPageForIdentity(alloc: std.mem.Allocator, store_handl
             if (item.key.len < prefix.len + 8 + min_identity_bytes or item.key.len > prefix.len + 8 + max_identity_bytes) return error.ArtifactCatalogCorrupt;
             const epoch = std.mem.readInt(u64, item.key[prefix.len..][0..8], .big);
             if (epoch == 0) return error.ArtifactCatalogCorrupt;
-            if (epoch > authority.epoch or (epoch == authority.epoch and active_identity == null)) {
+            if (epoch > authority.epoch or (epoch == retained_epoch and active_identity == null)) {
                 entry = null;
                 break;
             }
-            if (epoch == authority.epoch) if (active_identity) |identity| {
+            if (epoch == retained_epoch) if (active_identity) |identity| {
                 if (identity.len == 0 or identity.len > min_identity_bytes) return error.InvalidArgument;
                 if (std.mem.startsWith(u8, item.key[prefix.len + 8 ..], identity)) {
                     const upper = try @import("../internal_keys.zig").nextPrefixAlloc(scratch, item.key[0 .. prefix.len + 8 + identity.len]);
@@ -393,7 +471,7 @@ pub fn collectObsoleteEpochPageForIdentity(alloc: std.mem.Allocator, store_handl
     var write = try store_handle.beginWriteTxn();
     errdefer write.abort();
     const current = (try publication.authority(&write)) orelse return error.ArtifactCatalogDrift;
-    if (!std.meta.eql(current, authority)) return error.ArtifactCatalogDrift;
+    if (!std.meta.eql(current, authority) or try Retention.epoch(&write, current) != retained_epoch) return error.ArtifactCatalogDrift;
     for (retired.items) |retired_key| write.delete(retired_key) catch |err| switch (err) {
         error.NotFound => {},
         else => return err,
@@ -410,7 +488,7 @@ pub fn collectObsoleteEpochPageForIdentity(alloc: std.mem.Allocator, store_handl
 pub fn scanWork(alloc: std.mem.Allocator, txn: anytype, authority: publication.Authority, after: ?WorkCursor) !WorkPage {
     const active = (try publication.authority(txn)) orelse return error.ArtifactCatalogDrift;
     if (!std.meta.eql(active, authority)) return error.ArtifactCatalogDrift;
-    const state = (try load(txn)) orelse return error.ArtifactCatalogCorrupt;
+    const state = (try loadMetadata(txn)) orelse return error.ArtifactCatalogCorrupt;
     try state.requireAuthority(authority);
     if (after) |value| {
         if (!std.meta.eql(value.authority, authority)) return error.ArtifactCatalogDrift;
@@ -468,17 +546,17 @@ pub fn stageSeal(alloc: std.mem.Allocator, txn: anytype, authority: publication.
     try @import("artifact_producer_validation.zig").requireComplete(txn, authority);
     if (state.sealed_attempt) |previous| if (!std.mem.eql(u8, &previous, &attempt)) return error.ArtifactCatalogDrift;
     state.sealed_attempt = attempt;
-    try store(alloc, txn, state);
+    try storeMetadata(alloc, txn, state);
 }
 
 /// Only an authenticated cancellation of the same attempt may reopen writes.
 pub fn cancelSeal(alloc: std.mem.Allocator, txn: anytype, authority: publication.Authority, attempt: [32]u8) !void {
-    var state = (try load(txn)) orelse return error.ArtifactCatalogDrift;
+    var state = (try loadMetadata(txn)) orelse return error.ArtifactCatalogDrift;
     try state.requireAuthority(authority);
     const previous = state.sealed_attempt orelse return;
     if (!std.mem.eql(u8, &previous, &attempt)) return error.ArtifactCatalogDrift;
     state.sealed_attempt = null;
-    try store(alloc, txn, state);
+    try storeMetadata(alloc, txn, state);
 }
 
 test "ordered artifact inventory retry records authenticate every cursor and sequence byte" {
@@ -499,40 +577,9 @@ test "ordered artifact inventory retry records authenticate every cursor and seq
     try std.testing.expectError(error.ArtifactCatalogCorrupt, decodeRecord(&try encodeRecord(invalid)));
 }
 
-test "ordered artifact inventory obligations survive stale completion and seal only the drained exact attempt" {
+test "privacy ordered artifact inventory obligations survive stale completion and seal only the drained exact attempt" {
     const alloc = std.testing.allocator;
-    const Txn = struct {
-        values: std.StringHashMap([]u8),
-        pub fn get(self: *@This(), k: []const u8) anyerror![]const u8 {
-            return self.values.get(k) orelse error.NotFound;
-        }
-        pub fn put(self: *@This(), k: []const u8, value: []const u8) !void {
-            const owned = try std.testing.allocator.dupe(u8, value);
-            errdefer std.testing.allocator.free(owned);
-            if (self.values.getPtr(k)) |old| {
-                std.testing.allocator.free(old.*);
-                old.* = owned;
-            } else {
-                const owned_key = try std.testing.allocator.dupe(u8, k);
-                errdefer std.testing.allocator.free(owned_key);
-                try self.values.put(owned_key, owned);
-            }
-        }
-        pub fn delete(self: *@This(), k: []const u8) !void {
-            const removed = self.values.fetchRemove(k) orelse return error.NotFound;
-            std.testing.allocator.free(removed.key);
-            std.testing.allocator.free(removed.value);
-        }
-        pub fn deinit(self: *@This()) void {
-            var iterator = self.values.iterator();
-            while (iterator.next()) |entry| {
-                std.testing.allocator.free(entry.key_ptr.*);
-                std.testing.allocator.free(entry.value_ptr.*);
-            }
-            self.values.deinit();
-        }
-    };
-    var txn: Txn = .{ .values = std.StringHashMap([]u8).init(alloc) };
+    var txn: TestTxn = .{ .values = std.StringHashMap([]u8).init(alloc) };
     defer txn.deinit();
     const authority: publication.Authority = .{ .namespace = @splat(1), .epoch = 2, .catalog_digest = @splat(3) };
     const first: Position = .{ .raft = .{ .term = 1, .index = 8 } };
@@ -618,4 +665,71 @@ test "ordered artifact inventory obligations survive stale completion and seal o
     try std.testing.expectError(error.ResourceLimitExceeded, mark(alloc, &txn, authority, "overflow", later));
     try std.testing.expectEqual(@as(u64, 1), (try load(&txn)).?.pending_documents);
     try std.testing.expectEqual(std.math.maxInt(u64), (try load(&txn)).?.work_revision);
+}
+
+const TestTxn = struct {
+    values: std.StringHashMap([]u8),
+    pub fn get(self: *@This(), k: []const u8) anyerror![]const u8 {
+        return self.values.get(k) orelse error.NotFound;
+    }
+    pub fn put(self: *@This(), k: []const u8, value: []const u8) !void {
+        const owned = try std.testing.allocator.dupe(u8, value);
+        errdefer std.testing.allocator.free(owned);
+        if (self.values.getPtr(k)) |old| {
+            std.testing.allocator.free(old.*);
+            old.* = owned;
+        } else {
+            const owned_key = try std.testing.allocator.dupe(u8, k);
+            errdefer std.testing.allocator.free(owned_key);
+            try self.values.put(owned_key, owned);
+        }
+    }
+    pub fn delete(self: *@This(), k: []const u8) !void {
+        const removed = self.values.fetchRemove(k) orelse return error.NotFound;
+        std.testing.allocator.free(removed.key);
+        std.testing.allocator.free(removed.value);
+    }
+    pub fn deinit(self: *@This()) void {
+        var iterator = self.values.iterator();
+        while (iterator.next()) |entry| {
+            std.testing.allocator.free(entry.key_ptr.*);
+            std.testing.allocator.free(entry.value_ptr.*);
+        }
+        self.values.deinit();
+    }
+};
+
+test "privacy obligations keep hot work metadata bounded and migrate legacy cursors atomically" {
+    const alloc = std.testing.allocator;
+    var txn: TestTxn = .{ .values = std.StringHashMap([]u8).init(alloc) };
+    defer txn.deinit();
+    const authority: publication.Authority = .{ .namespace = @splat(1), .epoch = 2, .catalog_digest = @splat(3) };
+    const cursor = try alloc.alloc(u8, 1_100_000);
+    defer alloc.free(cursor);
+    @memset(cursor, 'x');
+    const initial: State = .{ .namespace = authority.namespace, .epoch = authority.epoch, .cursor = cursor };
+    // An actual APO2 image without a metadata row, as written before upgrade.
+    const legacy = try encodeState(alloc, "APO2", initial);
+    defer alloc.free(legacy);
+    try txn.put(key, legacy);
+    try std.testing.expectEqualStrings(cursor, (try loadMetadata(&txn)).?.cursor);
+    try std.testing.expect(try mark(alloc, &txn, authority, "doc", null));
+    const checkpoint = try alloc.dupe(u8, try txn.get(key));
+    defer alloc.free(checkpoint);
+    try std.testing.expectEqualStrings("APO3", checkpoint[0..4]);
+    for (1..100) |_| try std.testing.expect(try mark(alloc, &txn, authority, "doc", null));
+    try std.testing.expectEqualStrings(checkpoint, try txn.get(key));
+    try std.testing.expectEqual(@as(usize, 122), (try txn.get(metadata_key)).len);
+    const loaded = (try load(&txn)).?;
+    try std.testing.expectEqualStrings(cursor, loaded.cursor);
+    try std.testing.expectEqual(@as(u64, 1), loaded.pending_documents);
+    try std.testing.expectEqual(@as(u64, 100), loaded.work_revision);
+    // A stale completion may not discharge the newest work revision.
+    try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+    try complete(alloc, &txn, authority, .{ .document = "doc", .position = null, .revision = 1 });
+    try std.testing.expectEqual(@as(u64, 1), (try loadMetadata(&txn)).?.pending_documents);
+    try txn.delete(metadata_key);
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, loadMetadata(&txn));
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, load(&txn));
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, mark(alloc, &txn, authority, "doc", null));
 }

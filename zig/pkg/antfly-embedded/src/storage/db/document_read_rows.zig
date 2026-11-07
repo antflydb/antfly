@@ -27,6 +27,10 @@ pub fn For(comptime DB: type) type {
         policy: Physical.row_policy_gate.Gate.Lease,
         window: Window,
         metadata: std.heap.ArenaAllocator,
+        // Heap-owned to keep parser allocator pointers stable if this reader
+        // moves into a SQL cursor. The query lease fences this catalog cut.
+        privacy_arena: *std.heap.ArenaAllocator,
+        privacy_policy: ?Physical.privacy_read.PolicySnapshot,
         keys: [64][]const u8 = undefined,
         ids: [64][]const u8 = undefined,
         sizes: [64]?u64 = undefined,
@@ -99,6 +103,12 @@ pub fn For(comptime DB: type) type {
             if (documents.len == 0 or documents.len > 64 or max_bytes == 0) return error.InvalidBatch;
             self.window.retire();
             errdefer self.window.retire();
+            const policy = self.privacy_policy;
+            if (policy != null and policy.?.prepared.policy.mode != .monitor) {
+                self.values[0] = try self.lookup(documents[0]);
+                self.sources[0] = .{ .bytes = self.values[0].? };
+                return .{ .values = self.sources[0..1], .consumed = 1 };
+            }
             if (documents.len == 1 and fields.len == 0) {
                 self.values[0] = try self.lookup(documents[0]);
                 self.sources[0] = .{ .bytes = self.values[0].? };
@@ -263,10 +273,13 @@ pub fn For(comptime DB: type) type {
             const physical = try self.db.queryDocumentKeyOwned(a, key, self.schema);
             // Ranking already applied visibility/TTL at the captured cut.
             // Never fall back to a fresh read if the captured row is absent.
-            return self.window.get(&self.read, physical, 0) catch |err| switch (err) {
-                error.NotFound => error.StorageReadTemporarilyUnavailable,
-                else => err,
+            const raw = self.window.get(&self.read, physical, 0) catch |err| switch (err) {
+                error.NotFound => return error.StorageReadTemporarilyUnavailable,
+                else => return err,
             };
+            const privacy = Physical.privacy_read;
+            const policy = self.privacy_policy orelse return raw;
+            return privacy.project(a, policy, key, raw, &self.read);
         }
         /// Page cells already own their selected payloads. Retire the last
         /// source scope before a portal suspends, keeping only the snapshot.
@@ -282,6 +295,9 @@ pub fn For(comptime DB: type) type {
             self.retireDirectories();
             self.directory_arena.deinit();
             self.metadata.deinit();
+            const privacy_backing = self.privacy_arena.child_allocator;
+            self.privacy_arena.deinit();
+            privacy_backing.destroy(self.privacy_arena);
             self.read.abort();
             self.schema.release();
             self.policy.release();

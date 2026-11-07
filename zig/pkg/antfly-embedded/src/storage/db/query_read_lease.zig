@@ -43,9 +43,17 @@ pub fn For(comptime DB: type, comptime SearchResult: type) type {
             var view = self.db.core.acquireSchemaView() orelse return error.PreparedGenerationChanged;
             errdefer view.release();
             if (view.storageMode() != .document or view.version() != schema_version) return error.PreparedGenerationChanged;
+            const privacy_backing = Source.platform.allocator.reclaimingScratch(alloc);
+            const privacy_arena = try privacy_backing.create(std.heap.ArenaAllocator);
+            privacy_arena.* = .init(privacy_backing);
+            errdefer {
+                privacy_arena.deinit();
+                privacy_backing.destroy(privacy_arena);
+            }
+            const privacy_policy = try Source.privacy_read.capture(self.db, privacy_arena.allocator());
             var read = try self.db.core.store.beginReadTxn();
             errdefer read.abort();
-            return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .window = .init(alloc), .directory_arena = .init(Source.platform.allocator.reclaimingScratch(alloc)), .metadata = .init(Source.platform.allocator.reclaimingScratch(alloc)) };
+            return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .privacy_arena = privacy_arena, .privacy_policy = privacy_policy, .window = .init(alloc), .directory_arena = .init(Source.platform.allocator.reclaimingScratch(alloc)), .metadata = .init(Source.platform.allocator.reclaimingScratch(alloc)) };
         }
 
         pub fn search(self: QueryReadLease, alloc: std.mem.Allocator, req: types.SearchRequest) !SearchResult {

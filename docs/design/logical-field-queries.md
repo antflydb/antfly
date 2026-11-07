@@ -257,7 +257,10 @@ missing values do not change.
 MCP raw-query discovery exposes the same `execution.value_verification` budgets and
 `remote_snapshot` cursor control as REST. Sequential `hierarchy.children`
 traversal accepts its retained snapshot token and rejects value-search policy,
-because that mode performs no relevance/filter verification phase.
+because that mode performs no relevance retrieval phase. Member traversal accepts
+`filter_query` as a source-parent admission predicate. The coordinator checks the
+selected parents before enumerating their artifacts; the predicate never runs
+against member payloads or changes pagination order.
 Declared named search-as-you-type roots retain their configured
 analyzers; shorthand mappings may additionally resolve declared generated shingle
 representations. Conflicting roots are rejected rather than selected arbitrarily.

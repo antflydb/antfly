@@ -27,6 +27,12 @@ pub const ModelSource = union(enum) {
     media: struct { mime_type: []const u8, data: []const u8 },
 };
 
+/// Model-aware source fields may contain plain media locators. Keep this
+/// recognition shared with offline backup inspection; parsing never fetches.
+pub fn isRemoteModelLocator(value: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(value, "https://") or std.ascii.startsWithIgnoreCase(value, "http://") or std.ascii.startsWithIgnoreCase(value, "s3://") or std.ascii.startsWithIgnoreCase(value, "gs://");
+}
+
 pub fn modelSourceFromValue(field: std.json.Value) !ModelSource {
     if (field == .null) return .none;
     if (field == .string) return .{ .text = field.string };
@@ -108,6 +114,38 @@ pub const ProvenanceScope = enum {
     unit,
 };
 
+pub const NativeTextQualityProvenance = struct {
+    too_short: bool,
+    garbled: bool,
+    font_corrupted: bool,
+    replacement_corrupted: bool,
+    single_char_word_ratio: f64,
+    corrupted_line_ratio: f64,
+    replacement_char_ratio: f64,
+    trimmed_len: usize,
+    non_whitespace_chars: usize,
+};
+
+pub const NativeTextDiagnosticsProvenance = struct {
+    policy: []const u8,
+    extraction_complete: bool,
+    semantic_coverage: []const u8,
+    actual_text_replacements: usize,
+    outside_page_runs: usize,
+    invisible_runs: usize,
+    unaligned_runs: usize,
+    unsupported_ordering_runs: usize,
+    source_run_count: usize,
+    emitted_run_count: usize,
+    outside_page_spans: usize = 0,
+    invisible_spans: usize = 0,
+    unpositioned_spans: usize = 0,
+    actual_text_incomplete: bool = false,
+    outline_fallback: bool,
+    has_nontext_visual: bool,
+    has_unrendered_annotations: bool,
+};
+
 pub const ProvenanceOptions = struct {
     scope: ProvenanceScope = .document,
     parent_doc_key: ?[]const u8 = null,
@@ -122,6 +160,8 @@ pub const ProvenanceOptions = struct {
     extraction_method: ?[]const u8 = null,
     extraction_status: ?[]const u8 = null,
     confidence: ?f64 = null,
+    native_text_quality: ?NativeTextQualityProvenance = null,
+    native_text_diagnostics: ?NativeTextDiagnosticsProvenance = null,
     ocr_used: bool = false,
     ocr_attempted: bool = false,
     ocr_render_dpi: ?u16 = null,
@@ -276,6 +316,8 @@ fn appendProvenanceFields(
     if (options.page_rotation) |value| try provenance.put(alloc, try alloc.dupe(u8, "page_rotation"), .{ .integer = value });
     if (options.extraction_status) |value| try putString(alloc, &provenance, "extraction_status", value);
     if (options.confidence) |value| try provenance.put(alloc, try alloc.dupe(u8, "confidence"), .{ .float = value });
+    if (options.native_text_quality) |value| try putStructJsonValue(alloc, &provenance, "native_text_quality", value);
+    if (options.native_text_diagnostics) |value| try putStructJsonValue(alloc, &provenance, "native_text_diagnostics", value);
     try provenance.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
     try provenance.put(alloc, try alloc.dupe(u8, "ocr_attempted"), .{ .bool = options.ocr_attempted });
     if (options.ocr_render_dpi) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_render_dpi"), .{ .integer = value });
@@ -328,7 +370,7 @@ fn appendFormatProvenance(
     provenance: *std.json.ObjectMap,
     options: ProvenanceOptions,
 ) !void {
-    if (options.page_number == null and options.page_label == null and options.page_bbox == null and options.page_rotation == null and options.extraction_status == null and options.confidence == null and !options.ocr_used and !options.ocr_attempted and options.ocr_confidence == null and options.ocr_bbox == null and options.ocr_failure_stage == null and options.ocr_failure_retryable == null and !options.transcript_used and options.transcript_confidence == null and options.extraction_warning == null) return;
+    if (options.page_number == null and options.page_label == null and options.page_bbox == null and options.page_rotation == null and options.extraction_status == null and options.confidence == null and options.native_text_quality == null and options.native_text_diagnostics == null and !options.ocr_used and !options.ocr_attempted and options.ocr_confidence == null and options.ocr_bbox == null and options.ocr_failure_stage == null and options.ocr_failure_retryable == null and !options.transcript_used and options.transcript_confidence == null and options.extraction_warning == null) return;
 
     var format = std.json.ObjectMap.empty;
     errdefer {
@@ -345,6 +387,8 @@ fn appendFormatProvenance(
     try putString(alloc, &format, "extraction_method", options.extraction_method orelse "mechanical_text");
     if (options.extraction_status) |value| try putString(alloc, &format, "extraction_status", value);
     if (options.confidence) |value| try format.put(alloc, try alloc.dupe(u8, "confidence"), .{ .float = value });
+    if (options.native_text_quality) |value| try putStructJsonValue(alloc, &format, "native_text_quality", value);
+    if (options.native_text_diagnostics) |value| try putStructJsonValue(alloc, &format, "native_text_diagnostics", value);
     try format.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
     try format.put(alloc, try alloc.dupe(u8, "ocr_attempted"), .{ .bool = options.ocr_attempted });
     if (options.ocr_render_dpi) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_render_dpi"), .{ .integer = value });
@@ -368,6 +412,49 @@ fn appendFormatProvenance(
     if (options.page_rotation) |value| try format.put(alloc, try alloc.dupe(u8, "page_rotation"), .{ .integer = value });
 
     try provenance.put(alloc, try alloc.dupe(u8, "format_provenance"), .{ .object = format });
+}
+
+fn putStructJsonValue(alloc: Allocator, object: *std.json.ObjectMap, key: []const u8, value: anytype) !void {
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const encoded = try structJsonValueAlloc(alloc, value);
+    errdefer freeJsonValue(alloc, encoded);
+    try object.put(alloc, owned_key, encoded);
+}
+
+fn structJsonValueAlloc(alloc: Allocator, value: anytype) !std.json.Value {
+    const T = @TypeOf(value);
+    const info = switch (@typeInfo(T)) {
+        .@"struct" => |struct_info| struct_info,
+        else => @compileError("expected provenance struct"),
+    };
+    var object = std.json.ObjectMap.empty;
+    errdefer {
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            freeJsonValue(alloc, entry.value_ptr.*);
+        }
+        object.deinit(alloc);
+    }
+    inline for (info.field_names, info.field_types) |field_name, Field| {
+        const item = @field(value, field_name);
+        const encoded: std.json.Value = switch (@typeInfo(Field)) {
+            .bool => .{ .bool = item },
+            .int => .{ .integer = std.math.cast(i64, item) orelse return error.Overflow },
+            .float => .{ .float = item },
+            .pointer => |pointer| blk: {
+                if (pointer.size != .slice or pointer.child != u8) @compileError("unsupported provenance field");
+                break :blk .{ .string = try alloc.dupe(u8, item) };
+            },
+            else => @compileError("unsupported provenance field"),
+        };
+        errdefer freeJsonValue(alloc, encoded);
+        const key = try alloc.dupe(u8, field_name);
+        errdefer alloc.free(key);
+        try object.put(alloc, key, encoded);
+    }
+    return .{ .object = object };
 }
 
 fn putString(alloc: Allocator, obj: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
@@ -486,6 +573,32 @@ test "append artifact fields stores unit-local and document-global provenance" {
         .page_rotation = 90,
         .extraction_method = "pdf_text",
         .confidence = 0.94,
+        .native_text_quality = .{
+            .too_short = false,
+            .garbled = false,
+            .font_corrupted = false,
+            .replacement_corrupted = false,
+            .single_char_word_ratio = 0.1,
+            .corrupted_line_ratio = 0,
+            .replacement_char_ratio = 0,
+            .trimmed_len = 5,
+            .non_whitespace_chars = 5,
+        },
+        .native_text_diagnostics = .{
+            .policy = "page",
+            .extraction_complete = true,
+            .semantic_coverage = "partial",
+            .actual_text_replacements = 1,
+            .outside_page_runs = 2,
+            .invisible_runs = 3,
+            .unaligned_runs = 1,
+            .unsupported_ordering_runs = 4,
+            .source_run_count = 5,
+            .emitted_run_count = 4,
+            .outline_fallback = false,
+            .has_nontext_visual = true,
+            .has_unrendered_annotations = false,
+        },
     });
     const provenance = obj.get("provenance").?.object;
     try std.testing.expectEqualStrings("unit", provenance.get("offset_basis").?.string);
@@ -504,11 +617,60 @@ test "append artifact fields stores unit-local and document-global provenance" {
     try std.testing.expectEqualStrings("pdf_text", format_provenance.get("extraction_method").?.string);
     try std.testing.expectEqual(@as(f64, 0.94), provenance.get("confidence").?.float);
     try std.testing.expectEqual(@as(f64, 0.94), format_provenance.get("confidence").?.float);
+    try std.testing.expectEqualStrings("page", provenance.get("native_text_diagnostics").?.object.get("policy").?.string);
+    try std.testing.expectEqual(@as(i64, 2), format_provenance.get("native_text_diagnostics").?.object.get("outside_page_runs").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), provenance.get("native_text_quality").?.object.get("trimmed_len").?.integer);
     try std.testing.expect(!format_provenance.get("ocr_used").?.bool);
     try std.testing.expectEqual(@as(i64, 5), provenance.get("unit_char_start").?.integer);
     try std.testing.expectEqual(@as(i64, 10), provenance.get("unit_char_end").?.integer);
     try std.testing.expectEqual(@as(i64, 105), provenance.get("document_char_start").?.integer);
     try std.testing.expectEqual(@as(i64, 110), provenance.get("document_char_end").?.integer);
+}
+
+fn exerciseNativeTextProvenanceOwnership(alloc: Allocator) !void {
+    var object = std.json.ObjectMap.empty;
+    defer {
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            freeJsonValue(alloc, entry.value_ptr.*);
+        }
+        object.deinit(alloc);
+    }
+    try putStructJsonValue(alloc, &object, "native_text_quality", NativeTextQualityProvenance{
+        .too_short = false,
+        .garbled = false,
+        .font_corrupted = false,
+        .replacement_corrupted = false,
+        .single_char_word_ratio = 0.1,
+        .corrupted_line_ratio = 0,
+        .replacement_char_ratio = 0,
+        .trimmed_len = 5,
+        .non_whitespace_chars = 5,
+    });
+    try putStructJsonValue(alloc, &object, "native_text_diagnostics", NativeTextDiagnosticsProvenance{
+        .policy = "visible",
+        .extraction_complete = true,
+        .semantic_coverage = "text_only",
+        .actual_text_replacements = 2,
+        .outside_page_runs = 1,
+        .invisible_runs = 3,
+        .unaligned_runs = 0,
+        .unsupported_ordering_runs = 0,
+        .source_run_count = 6,
+        .emitted_run_count = 5,
+        .outside_page_spans = 2,
+        .invisible_spans = 3,
+        .unpositioned_spans = 4,
+        .outline_fallback = false,
+        .has_nontext_visual = false,
+        .has_unrendered_annotations = false,
+    });
+}
+
+test "native text neutral provenance owns nested JSON through allocation failure" {
+    try exerciseNativeTextProvenanceOwnership(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseNativeTextProvenanceOwnership, .{});
 }
 
 test "append artifact fields stores binary metadata and base64 payload" {

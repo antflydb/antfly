@@ -304,8 +304,18 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     const boundary = if (resolved_outputs) |value| try value.value.boundary() else null;
     const model = if (boundary) |value| value.model else if (cfg.embedding) |target| target.model else if (cfg.model.len > 0) cfg.model else "fixed";
     const capability_task: inference_work.Operation = if (boundary) |value| if (value.kind == .transcribe) .transcribe else .embed else if (cfg.embedding != null) .embed else .chunk;
-    var routing_header_storage: [1][2][]const u8 = undefined;
-    const routing_header_count = try execution.routing.appendHeaders(&routing_header_storage, 0);
+    // The node default credential accompanies only the node default endpoint
+    // (chunkers carry no credential of their own); discovery and the chunk
+    // call authenticate identically.
+    const authorization = try execution.defaultAuthorizationAlloc(alloc, endpoint_raw);
+    defer if (authorization) |value| alloc.free(value);
+    var routing_header_storage: [2][2][]const u8 = undefined;
+    var routing_header_count: usize = 0;
+    if (authorization) |value| {
+        routing_header_storage[0] = .{ "Authorization", value };
+        routing_header_count = 1;
+    }
+    routing_header_count = try execution.routing.appendHeaders(&routing_header_storage, routing_header_count);
     const routing_headers = routing_header_storage[0..routing_header_count];
     var capability_lease = try capability_cache.?.getOrDiscoverLeaseWithContext(
         http,
@@ -350,7 +360,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     var body = try encodeChunkRequest(alloc, cfg, input, attachment_transport);
     defer body.deinit(alloc);
 
-    var header_storage: [4][2][]const u8 = undefined;
+    var header_storage: [5][2][]const u8 = undefined;
     var header_count: usize = 0;
     for (routing_headers) |header| {
         header_storage[header_count] = header;
@@ -369,6 +379,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         header_count += 1;
     }
     var resp = try http.post(url, .{
+        .follow_redirects = false,
         .json = if (attachment_transport == .segmented_framed_binary) null else body.metadata_or_json,
         .borrowed_body_segments = if (body.envelope) |envelope| envelope.segments else null,
         .headers = header_storage[0..header_count],
@@ -502,6 +513,7 @@ fn chunkInputDirect(alloc: Allocator, cfg: chunking_types.Config, input: RemoteI
     if (cfg.model.len > 0) fixed_cfg.model = cfg.model;
     if (cfg.max_chunks > 0) fixed_cfg.max_chunks = @intCast(cfg.max_chunks);
     fixed_cfg.threshold = cfg.threshold;
+    fixed_cfg.text.min_chars = cfg.text.min_chars;
     if (cfg.text.target_tokens > 0) fixed_cfg.text.target_tokens = @intCast(cfg.text.target_tokens);
     if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0) fixed_cfg.text.overlap_tokens = @intCast(cfg.text.overlap_tokens);
     if (cfg.text.separator.len > 0) fixed_cfg.text.separator = cfg.text.separator;
@@ -588,9 +600,10 @@ fn encodeChunkRequest(
         .model = cfg.model,
         .max_chunks = if (cfg.replay != null and !cfg.page) 1 else if (cfg.max_chunks > 0) cfg.max_chunks else null,
         .threshold = cfg.threshold,
-        .text = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0 or cfg.text.separator.len > 0) .{
+        .text = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0 or cfg.text.min_chars > 0 or cfg.text.separator.len > 0) .{
             .target_tokens = if (cfg.text.target_tokens > 0) cfg.text.target_tokens else null,
             .overlap_tokens = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0) cfg.text.overlap_tokens else null,
+            .min_chars = if (cfg.text.min_chars > 0) cfg.text.min_chars else null,
             .separator = if (cfg.text.separator.len > 0) cfg.text.separator else null,
         } else null,
         .audio = if (cfg.audio.window_duration_ms > 0 or cfg.audio.overlap_duration_ms > 0) .{

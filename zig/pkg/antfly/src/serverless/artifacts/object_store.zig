@@ -199,10 +199,18 @@ pub const ObjectStore = struct {
 
     /// Borrow a configured client without widening its provisioning authority.
     /// Readers and require-existing writers must not create missing buckets.
-    pub fn initWithClientOptions(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8, options: struct { ensure_bucket: bool = false, read_only: bool = false, filesystem: ?*objectstore.FilesystemClient = null }) !ObjectStore {
+    pub fn initWithClientOptions(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8, options: struct {
+        ensure_bucket: bool = false,
+        read_only: bool = false,
+        /// Configured query adapters need object permissions, not permission to
+        /// inspect the bucket. Provisioning still probes before creating it;
+        /// otherwise the first object operation reports absence/access errors.
+        skip_bucket_probe: bool = false,
+        filesystem: ?*objectstore.FilesystemClient = null,
+    }) !ObjectStore {
         if (options.read_only and options.ensure_bucket) return error.InvalidArtifactStoreOptions;
         var owned_client = client;
-        if (!(try owned_client.bucketExists(bucket))) {
+        if ((options.ensure_bucket or !options.skip_bucket_probe) and !(try owned_client.bucketExists(bucket))) {
             if (!options.ensure_bucket) return error.ArtifactBucketNotFound;
             try owned_client.makeBucket(bucket);
         }
@@ -672,7 +680,7 @@ pub const ObjectStore = struct {
     pub fn deleteWithCancellation(self: *ObjectStore, artifact_id: []const u8, token: CancellationToken) !void {
         try token.check();
         if (self.read_only) return error.ArtifactStoreReadOnly;
-        if (self.local_inventory) |*fs| if (try artifact_store.uploadScopeFromArtifactId(artifact_id)) |scope| try @import("retained_closure.zig").invalidate(fs, scope, .none);
+        if (self.local_inventory) |*fs| if (try artifact_store.uploadScopeFromArtifactId(artifact_id)) |scope| try @import("retained_closure.zig").invalidate(fs, scope, token);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         if (try self.usesObjectVersions(token)) {
@@ -1266,6 +1274,37 @@ test "objectstore-backed artifact readers preserve bucket provisioning authority
     defer reader.deinit();
     try std.testing.expectError(error.ArtifactStoreReadOnly, reader.put(alloc, "denied"));
     try std.testing.expectError(error.ArtifactStoreReadOnly, reader.delete("sha256:abcd"));
+}
+
+test "objectstore-backed configured adapters need object access without bucket metadata probes" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("objects-only");
+    const Probe = struct {
+        fn denied(_: *anyopaque, _: []const u8, _: objectstore.BucketOptions) anyerror!bool {
+            return error.AccessDenied;
+        }
+    };
+    var vtable = client.vtable.*;
+    vtable.bucket_exists = Probe.denied;
+    client.vtable = &vtable;
+    try std.testing.expectError(error.AccessDenied, ObjectStore.initWithClientOptions(a, client, "objects-only", "tenant", .{}));
+    // A provisioning request must still run its explicit existence check.
+    try std.testing.expectError(error.AccessDenied, ObjectStore.initWithClientOptions(a, client, "missing", "tenant", .{ .ensure_bucket = true, .skip_bucket_probe = true }));
+    var writer = try ObjectStore.initWithClientOptions(a, client, "objects-only", "tenant", .{ .skip_bucket_probe = true });
+    defer writer.deinit();
+    var write_store = writer.artifactStore();
+    var ref = try write_store.put("object-scoped access");
+    defer ref.deinit(a);
+    var reader = try ObjectStore.initWithClientOptions(a, client, "objects-only", "tenant", .{ .skip_bucket_probe = true, .read_only = true });
+    defer reader.deinit();
+    var read_store = reader.artifactStore();
+    const bytes = try read_store.getVerifiedAllocWithCancellation(ref.artifact_id, @intCast(ref.byte_len), ref.checksum, .none);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("object-scoped access", bytes);
+    try std.testing.expectError(error.ArtifactStoreReadOnly, read_store.put("denied"));
 }
 
 test "objectstore-backed artifacts reject malformed content addresses before I/O" {

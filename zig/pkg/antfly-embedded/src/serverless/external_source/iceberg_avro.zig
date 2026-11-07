@@ -30,6 +30,17 @@ const snappy = @import("../../encoding/snappy.zig");
 /// both ordinary parsing work and decompression of user-owned manifest files.
 pub const max_decoded_block_bytes: usize = 64 * 1024 * 1024;
 
+/// Inspect the bounded OCF header without allocating or decoding blocks.
+/// Admission uses this only to account for compression; callers must still
+/// parse and validate the complete container before trusting its contents.
+pub fn isUncompressedContainer(bytes: []const u8) !bool {
+    var reader = Reader.init(bytes);
+    try reader.expectBytes("Obj\x01");
+    const metadata = try readMetadataMapView(&reader);
+    _ = try reader.readSlice(16);
+    return metadata.codec == .null;
+}
+
 pub const ManifestContent = enum(u8) {
     data = 0,
     deletes = 1,
@@ -380,26 +391,31 @@ const DecodedBlock = struct {
 };
 
 fn readMetadataMapAlloc(alloc: Allocator, reader: *Reader) !OcfMetadata {
-    var schema_json: ?[]u8 = null;
-    errdefer if (schema_json) |schema| alloc.free(schema);
+    const metadata = try readMetadataMapView(reader);
+    return .{ .schema_json = try alloc.dupe(u8, metadata.schema_json), .codec = metadata.codec };
+}
+
+const OcfMetadataView = struct { schema_json: []const u8, codec: AvroCodec };
+fn readMetadataMapView(reader: *Reader) !OcfMetadataView {
+    var schema_json: ?[]const u8 = null;
     var codec: AvroCodec = .null;
 
     while (true) {
         var block_count = try reader.readLong();
         if (block_count == 0) break;
         if (block_count < 0) {
+            if (block_count == std.math.minInt(i64)) return error.InvalidAvroContainer;
             block_count = -block_count;
             const block_size = try reader.readLong();
             if (block_size < 0) return error.InvalidAvroContainer;
         }
         const count = std.math.cast(usize, block_count) orelse return error.InvalidAvroContainer;
         for (0..count) |_| {
-            const key = try reader.readStringAlloc(alloc);
-            defer alloc.free(key);
+            const key = try reader.readBytes();
             const value = try reader.readBytes();
             if (std.mem.eql(u8, key, "avro.schema")) {
                 if (schema_json != null) return error.InvalidAvroContainer;
-                schema_json = try alloc.dupe(u8, value);
+                schema_json = value;
             } else if (std.mem.eql(u8, key, "avro.codec")) {
                 codec = try parseAvroCodec(value);
             }
@@ -998,24 +1014,20 @@ fn readJsonAvroIntArrayAlloc(alloc: Allocator, reader: *Reader, schema: std.json
 }
 
 fn readJsonAvroPartitionStringAlloc(alloc: Allocator, reader: *Reader, schema: std.json.Value) !?[]u8 {
-    switch (schema) {
-        .array => |branches| {
-            const tag = try reader.readLong();
-            if (tag < 0) return error.InvalidIcebergDataManifest;
-            const tag_index = std.math.cast(usize, tag) orelse return error.InvalidIcebergDataManifest;
-            if (tag_index >= branches.items.len) return error.InvalidIcebergDataManifest;
-            const branch = branches.items[tag_index];
-            if (jsonTypeNameEql(branch, "null")) return null;
-            if (jsonTypeNameEql(branch, "string")) return try reader.readStringAlloc(alloc);
-            try skipJsonAvroValueAfterUnionTag(reader, branch);
-            return null;
-        },
-        else => {
-            if (jsonTypeNameEql(schema, "string")) return try reader.readStringAlloc(alloc);
-            try skipJsonAvroValue(reader, schema);
-            return null;
-        },
+    const value_schema = try readJsonUnionTagForValue(reader, schema) orelse return null;
+    if (jsonTypeNameEql(value_schema, "string")) return try reader.readStringAlloc(alloc);
+    if (jsonTypeNameEql(value_schema, "int") or jsonTypeNameEql(value_schema, "long")) {
+        const value = try reader.readLong();
+        if (jsonTypeNameEql(value_schema, "int") and std.math.cast(i32, value) == null) return error.InvalidIcebergDataManifest;
+        return try std.fmt.allocPrint(alloc, "{d}", .{value});
     }
+    if (jsonTypeNameEql(value_schema, "boolean")) {
+        const value = try reader.readByte();
+        if (value > 1) return error.InvalidIcebergDataManifest;
+        return try alloc.dupe(u8, if (value == 1) "true" else "false");
+    }
+    try skipJsonAvroValueAfterUnionTag(reader, value_schema);
+    return null;
 }
 
 fn readJsonAvroStringAlloc(alloc: Allocator, reader: *Reader, schema: std.json.Value) ![]u8 {
@@ -1862,4 +1874,18 @@ test "iceberg avro manifest decoding fits a bounded worker stack" {
     const thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, Worker.run, .{&worker});
     thread.join();
     if (worker.failure) |err| return err;
+}
+
+test "iceberg avro bootstrap inspection checks codec and header without decoding blocks" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "null", "deflate", "snappy", "zstandard" }) |codec| {
+        var bytes = try buildEqualityDeleteManifestFixture(a, codec, &.{1});
+        defer bytes.deinit(a);
+        try std.testing.expectEqual(std.mem.eql(u8, codec, "null"), try isUncompressedContainer(bytes.items));
+        const sync = std.mem.indexOf(u8, bytes.items, "fedcba9876543210").?;
+        try std.testing.expectError(error.InvalidAvroContainer, isUncompressedContainer(bytes.items[0 .. sync + 15]));
+    }
+    const minimum_count = "Obj\x01" ++ "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01";
+    try std.testing.expectError(error.InvalidAvroContainer, isUncompressedContainer(minimum_count));
+    try std.testing.expectError(error.InvalidAvroContainer, parseManifestListAlloc(a, minimum_count));
 }

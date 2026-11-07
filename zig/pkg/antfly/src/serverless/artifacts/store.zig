@@ -320,6 +320,13 @@ pub const ArtifactStore = struct {
     pub fn providerStore(self: ArtifactStore) ?*@import("object_store.zig").ObjectStore {
         return if (self.vtable.object_store) |call| call(self.ptr) else null;
     }
+    /// Credential-scoped residency is distinct from durable publication domains.
+    pub fn cacheScope(self: ArtifactStore, fallback: [32]u8) [32]u8 {
+        if (self.providerStore()) |provider| {
+            if (!std.mem.allEqual(u8, &provider.cloud_cache_scope, 0)) return provider.cloud_cache_scope;
+        }
+        return fallback;
+    }
     pub fn retentionWitness(self: *ArtifactStore, scope: UploadScope, cancellation: CancellationToken) !?RetentionWitness {
         try scope.validate();
         try cancellation.check();

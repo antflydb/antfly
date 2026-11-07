@@ -33,7 +33,7 @@ test "external lake native cursor repository setup retains policy and location" 
     defer repository.deinit();
     try std.testing.expectEqual(@as(usize, 12), repository.capability().limits.max_cuts);
     try std.testing.expectEqual(@as(u64, 1048576), repository.capability().limits.max_bytes);
-    try std.testing.expectEqual(@as(u64, 900000), @import("lake_retained_cut.zig").configuredTtl(&repository.owned_config.?));
+    try std.testing.expectEqual(@as(u64, 900000), @import("lake_retained_cut.zig").configuredTtl(repository.owned_config));
 }
 
 test "external lake native capture releases local capacity after publication admission fails" {

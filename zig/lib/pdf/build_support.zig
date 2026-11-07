@@ -121,4 +121,7 @@ fn addSharedNamespaces(b: *std.Build, module: *std.Build.Module, root: std.Build
     text.addImport("pdf_standard_fonts", standard_fonts);
     module.addImport("pdf_syntax", syntax);
     module.addImport("pdf_text_encoding", text);
+    const structure = b.createModule(.{ .root_source_file = root.path(b, "src/text_structure.zig"), .target = target, .optimize = optimize });
+    structure.addImport("pdf_values", module.import_table.get("pdf_values").?);
+    module.addImport("pdf_text_structure", structure);
 }

@@ -16,7 +16,7 @@ and pinned detailed records are in the [qualification summary](history/productio
 | Image operations | `-Dshared-image-operations=true` selects whole encoded-image operations and retained CPU VP8 sessions on supported native 64-bit macOS/Linux profiles; it also enables retained PDF sessions. Default remains off. |
 | Lake execution | `-Dshared-lake-execution=true` moves complete index attempts to the serverless owner. Coordinator publication/lease authority stays in the caller. Default remains off. |
 | Query execution | Parsing, execution and encoding live beside private DB state. The dispatcher consumes a checked operation capability. |
-| Read/restore ownership | Owner-issued relational/document readers, statement handles and boxed query leases preserve typed values and explicit page release. Disposable restore materialization stays inside its owner. |
+| Read/restore ownership | Owner-issued relational/document readers, statement handles, statement capture fences and boxed query leases preserve typed values and explicit page release. Disposable restore materialization stays inside its owner. |
 | Commit disposition | Retry-shaped errors can retry preparation only before primary commit, preventing duplicate non-idempotent application. |
 | Disabled CUDA | Compile-time capability checks prevent CPU-only owners from instantiating concrete CUDA cleanup/execution paths. |
 
@@ -48,7 +48,7 @@ through lossy JSON numbers. Private spill/pattern/page metadata cannot escape.
 
 The engine still has concrete lifecycle/layout checks outside the migrated
 operation families. Do not delete those checks while their private borrows
-remain. Statement capture fences, retained covers/query cuts and general DB
+remain. Retained covers/query cuts and general DB
 lifecycle coupling are follow-up work, not completed redesign claims.
 
 For mutation cleanup, preserve acquire/release order, lock fences, durable

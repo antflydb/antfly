@@ -26,9 +26,14 @@ test "compiled PDF native retained analysis and fork cache" {
     var doc = try pdf.reader.Reader.init(a, bytes);
     defer doc.deinit();
     try std.testing.expectEqual(@as(usize, 1), try doc.pageCount());
+    doc.setTextExtractionPolicy(.visible);
     var text = try doc.extractPageTextAnalysisAlloc(1);
     defer text.deinit(a);
     try std.testing.expect(std.mem.indexOf(u8, text.text, "Hello Fixture") != null);
+    try std.testing.expectEqual(text.runs.len, text.diagnostics.source_run_count);
+    const blocks = try pdf.text_structure.blocksFromAnalysisAlloc(a, text.text, text.runs, text.semantic_spans, .{});
+    defer a.free(blocks);
+    try std.testing.expect(blocks.len != 0);
     var fork = try doc.prepareRenderForkTemplate(a, .{});
     defer fork.deinit();
     var child = try fork.instantiate(a, .{});
@@ -69,7 +74,7 @@ test "compiled PDF native rejects incompatible operation layout" {
     endpoint.layout = @ptrFromInt(@alignOf(@TypeOf(c.layouts)));
     endpoint.version = 2;
     try std.testing.expectError(error.InvalidArgument, c.validate("count", &endpoint));
-    endpoint.version = 3;
+    endpoint.version = 4;
     endpoint.layout_count = c.layouts.len - 1;
     try std.testing.expectError(error.InvalidArgument, c.validate("count", &endpoint));
     endpoint.layout_count = c.layouts.len + 1;

@@ -102,6 +102,8 @@ pub const TextRun = struct {
     x: f64,
     y: f64,
     font_size: f64,
+    bold: ?bool = null,
+    italic: ?bool = null,
     a: f64 = 1,
     b: f64 = 0,
     c: f64 = 0,
@@ -124,11 +126,21 @@ pub const TextRun = struct {
     ascent: f64 = 0,
     descent: f64 = 0,
     paint_order: usize = 0,
+    /// Opening BT paint position; null for caller-constructed runs.
+    text_object_id: ?usize = null,
     /// Consistent TJ positioning measured on both sides of authored whitespace.
     /// Only matching local gaps between glyph fragments count as tracking.
     text_show_tracking_gap: ?f64 = null,
     paint_phase: usize = 0,
     output_span: ?TextOutputSpan = null,
+    /// Policy filtering leaves source text and geometry intact for auditing.
+    /// Reconstruction skips these runs and leaves `output_span` null.
+    policy_excluded: bool = false,
+    /// Index into PageTextAnalysis.semantic_spans; source glyphs stay intact.
+    semantic_span_index: usize = no_semantic_span,
+    /// Extraction-only ancestry evidence; group_alpha belongs to the immediate
+    /// render group and must retain its original compositing semantics.
+    ancestor_groups_visible: bool = true,
 
     blend_mode: BlendMode = .normal,
     group_id: ?u32 = null,
@@ -169,14 +181,18 @@ pub const TextRun = struct {
 pub const PageTextAnalysis = struct {
     text: []u8,
     runs: []TextRun,
+    semantic_spans: []SemanticTextSpan = &.{},
     outline_fallback: bool = false,
     has_nontext_visual: bool = false,
     has_unrendered_annotations: bool = false,
+    diagnostics: NativeTextDiagnostics = .{},
 
     pub fn deinit(self: *PageTextAnalysis, alloc: Allocator) void {
         alloc.free(self.text);
         for (self.runs) |*run| run.deinit(alloc);
         if (self.runs.len > 0) alloc.free(self.runs);
+        for (self.semantic_spans) |*span| span.deinit(alloc);
+        if (self.semantic_spans.len > 0) alloc.free(self.semantic_spans);
         self.* = undefined;
     }
 };
@@ -815,6 +831,9 @@ pub fn effectiveRunDescent(run: TextRun) f64 {
 
 const Self = @This();
 pub const reader = struct {
+    pub const TextExtractionPolicy = Self.TextExtractionPolicy;
+    pub const NativeTextDiagnostics = Self.NativeTextDiagnostics;
+    pub const SemanticTextSpan = Self.SemanticTextSpan;
     pub const default_max_decoded_stream_bytes = Self.default_max_decoded_stream_bytes;
     pub const default_max_decode_working_set_bytes = Self.default_max_decode_working_set_bytes;
     pub const DecodeLimits = Self.DecodeLimits;
@@ -935,4 +954,104 @@ pub fn nativeRasterBboxToPagePoints(
     };
     if (!(clipped[0] < clipped[2]) or !(clipped[1] < clipped[3])) return null;
     return clipped;
+}
+
+pub const TextExtractionPolicy = enum {
+    source,
+    page,
+    visible,
+};
+
+pub const NativeTextDiagnostics = struct {
+    actual_text_incomplete: bool = false,
+    actual_text_replacements: usize = 0,
+    outside_page_runs: usize = 0,
+    invisible_runs: usize = 0,
+    unaligned_runs: usize = 0,
+    unsupported_ordering_runs: usize = 0,
+    source_run_count: usize = 0,
+    emitted_run_count: usize = 0,
+    outside_page_spans: usize = 0,
+    invisible_spans: usize = 0,
+    unpositioned_spans: usize = 0,
+};
+
+pub const SemanticPaint = struct {
+    has_paint: bool = false,
+    any_visible: bool = false,
+    page_eligible: bool = false,
+    visible_eligible: bool = false,
+    source_unknown: bool = false,
+    page_unknown: bool = false,
+    visible_unknown: bool = false,
+    source_bounds: ?PageBox = null,
+    page_bounds: ?PageBox = null,
+    visible_bounds: ?PageBox = null,
+
+    pub fn merge(self: *@This(), other: @This()) void {
+        inline for (.{ "has_paint", "any_visible", "page_eligible", "visible_eligible", "source_unknown", "page_unknown", "visible_unknown" }) |field|
+            @field(self, field) = @field(self, field) or @field(other, field);
+        inline for (.{ "source_bounds", "page_bounds", "visible_bounds" }) |field|
+            if (@field(other, field)) |box| {
+                @field(self, field) = unionTextBox(@field(self, field), box);
+            };
+    }
+
+    pub fn add(self: *@This(), bounds: ?PageBox, clip: ?PageBox, visible: bool, page: ?PageBox) void {
+        self.has_paint = true;
+        self.any_visible = self.any_visible or visible;
+        if (bounds) |box| self.source_bounds = unionTextBox(self.source_bounds, box) else self.source_unknown = true;
+        if (clip) |box| if (page) |page_box| if (!pageBoxesOverlap(box, page_box)) return;
+        if (clip) |box| if (box.min_x >= box.max_x or box.min_y >= box.max_y) return;
+        if (bounds) |box| {
+            if (page) |page_box| if (!pageBoxesOverlap(box, page_box)) return;
+            if (clip) |clip_box| if (!pageBoxesOverlap(box, clip_box)) return;
+            self.page_bounds = unionTextBox(self.page_bounds, box);
+            if (visible) self.visible_bounds = unionTextBox(self.visible_bounds, box);
+        } else {
+            self.page_unknown = true;
+            self.visible_unknown = self.visible_unknown or visible;
+        }
+        self.page_eligible = true;
+        self.visible_eligible = self.visible_eligible or visible;
+    }
+};
+
+pub const SemanticTextSpan = struct {
+    /// Several marked-content sequences can share one structure replacement.
+    /// run_start/end enclose them; TextRun.semantic_span_index is membership.
+    multiple_scopes: bool = false,
+    text: []const u8,
+    run_start: usize,
+    run_end: usize,
+    paint: SemanticPaint = .{},
+    output_span: ?TextOutputSpan = null,
+    output_bounds: ?PageBox = null,
+    entry_run: ?usize = null,
+    exit_run: ?usize = null,
+    policy_excluded: bool = false,
+    font_size: ?f64 = null,
+    bold: ?bool = null,
+    italic: ?bool = null,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.text);
+        self.* = undefined;
+    }
+};
+
+pub const no_semantic_span = std.math.maxInt(usize);
+
+fn unionTextBox(left: ?PageBox, right: PageBox) PageBox {
+    const box = left orelse return right;
+    return .{ .min_x = @min(box.min_x, right.min_x), .min_y = @min(box.min_y, right.min_y), .max_x = @max(box.max_x, right.max_x), .max_y = @max(box.max_y, right.max_y) };
+}
+
+fn pageBoxesOverlap(left: PageBox, right: PageBox) bool {
+    // Intersecting disjoint clips produces an empty (possibly inverted) box.
+    // A large text bound spanning both endpoints must not make it nonempty.
+    if (left.min_x >= left.max_x or left.min_y >= left.max_y or
+        right.min_x >= right.max_x or right.min_y >= right.max_y) return false;
+    return left.max_x > right.min_x and left.min_x < right.max_x and
+        left.max_y > right.min_y and left.min_y < right.max_y;
 }

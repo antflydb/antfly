@@ -175,6 +175,7 @@ pub const ReplayPublication = struct {
 };
 
 pub const AsyncContext = struct {
+    apply_exclusive_held: bool = false,
     replay_publication: ?ReplayPublication = null,
     alloc: Allocator,
     io: ?std.Io = null,
@@ -632,6 +633,7 @@ pub const ProfiledLock = struct {
 };
 
 pub const BatchExecutionContext = struct {
+    apply_exclusive_held: bool = false,
     alloc: Allocator,
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,
@@ -1075,6 +1077,9 @@ pub const BatchExecutionOptions = struct {
     native_topology_position: ?@import("receipt_position.zig").Native = null,
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
+    /// Outcome-receipt marker committed with the primary write. Internal
+    /// metadata: unlike `extra_store_writes`, it never forces a replay record.
+    outcome_marker_write: ?docstore_mod.KVPair = null,
     extra_store_deletes: []const []const u8 = &.{},
     merge_chunk_expected_progress: ?[32]u8 = null,
     transaction_resolution: ?TransactionResolution = null,

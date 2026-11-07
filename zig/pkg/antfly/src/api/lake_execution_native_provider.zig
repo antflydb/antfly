@@ -113,6 +113,8 @@ fn attempt(request: c.Request, callbacks: *Callbacks, io: std.Io, cause: *c.Fail
         options.provider_runtime = &runtime;
     }
     var artifact_reads = @import("lake_index_artifact_recovery.zig").Reads.init(store.artifactStore());
+    artifact_reads.enableWriteCache(a, 8 * 1024 * 1024);
+    defer artifact_reads.close();
     var handle = artifact_reads.store();
     const physical_started = probeNow();
     defer probeStage("physical_ns", physical_started);

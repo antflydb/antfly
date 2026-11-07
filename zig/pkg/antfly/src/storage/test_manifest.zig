@@ -238,6 +238,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_enrichment_document_checkpoints;
     _ = @import("antfly_local_sources").storage_db_enrichment_vector_label_cache;
     _ = @import("antfly_local_sources").storage_db_enrichment_document_extraction;
+    _ = @import("antfly_local_sources").storage_db_enrichment_document_extraction_completion;
     _ = @import("antfly_local_sources").storage_db_enrichment_document_unit_fingerprint;
     _ = @import("antfly_local_sources").storage_db_enrichment_embedder;
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_runtime;
@@ -400,6 +401,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_lite_mod;
     _ = @import("antfly_local_sources").storage_lite_native;
     _ = @import("antfly_local_sources").storage_lite_path_lock_wait;
+    _ = @import("antfly_local_sources").storage_lite_writer_queue;
     _ = @import("antfly_local_sources").storage_lite_paths;
     _ = @import("antfly_local_sources").storage_lite_read_workspace;
     _ = @import("antfly_local_sources").storage_lite_reader_epochs;

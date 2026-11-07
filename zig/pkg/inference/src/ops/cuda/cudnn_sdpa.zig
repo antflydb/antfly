@@ -129,18 +129,19 @@ pub const Key = struct {
     padding_mask: bool = false,
     ocr_vision: bool = false,
     florence_vision: bool = false,
+    whisper_encoder: bool = false,
     dtype: enum { bf16, f16 } = .bf16,
 
     fn eql(a: Key, b: Key) bool {
         return a.batch == b.batch and a.q_heads == b.q_heads and a.kv_heads == b.kv_heads and
-            a.sequence == b.sequence and a.dim == b.dim and a.florence_vision == b.florence_vision and a.dtype == b.dtype and a.ocr_vision == b.ocr_vision and a.local_window_radius == b.local_window_radius and a.padding_mask == b.padding_mask and
+            a.sequence == b.sequence and a.dim == b.dim and a.florence_vision == b.florence_vision and a.whisper_encoder == b.whisper_encoder and a.dtype == b.dtype and a.ocr_vision == b.ocr_vision and a.local_window_radius == b.local_window_radius and a.padding_mask == b.padding_mask and
             @as(u32, @bitCast(a.scale)) == @as(u32, @bitCast(b.scale));
     }
 };
 
 fn keyFingerprint(key: Key) usize {
     var value: usize = key.batch;
-    inline for (.{ key.q_heads, key.kv_heads, key.sequence, key.dim, key.local_window_radius, @as(usize, @intFromBool(key.florence_vision)), @as(usize, @backingInt(key.dtype)), @as(usize, @intFromBool(key.ocr_vision)), @as(usize, @intFromBool(key.padding_mask)), @as(usize, @intCast(@as(u32, @bitCast(key.scale)))) }) |part|
+    inline for (.{ key.q_heads, key.kv_heads, key.sequence, key.dim, key.local_window_radius, @as(usize, @intFromBool(key.florence_vision)), @as(usize, @intFromBool(key.whisper_encoder)), @as(usize, @backingInt(key.dtype)), @as(usize, @intFromBool(key.ocr_vision)), @as(usize, @intFromBool(key.padding_mask)), @as(usize, @intCast(@as(u32, @bitCast(key.scale)))) }) |part|
         value = (value ^ part) *% 0x9e3779b1;
     return value;
 }
@@ -447,6 +448,11 @@ pub const Module = struct {
 
 fn eligible(key: Key, version: usize) bool {
     if (key.batch == 0 or key.sequence == 0 or !std.math.isFinite(key.scale)) return false;
+    if (key.whisper_encoder) {
+        return key.dtype == .f16 and !key.florence_vision and !key.ocr_vision and !key.padding_mask and
+            key.local_window_radius == 0 and key.batch <= 8 and key.sequence <= 1500 and key.dim == 64 and
+            key.q_heads == key.kv_heads and (key.q_heads == 6 or key.q_heads == 8 or key.q_heads == 12 or key.q_heads == 16 or key.q_heads == 20) and key.scale == 0.125;
+    }
     if (key.florence_vision) {
         if (key.dtype != .f16 or key.ocr_vision or key.padding_mask or key.local_window_radius != 0 or key.q_heads != key.kv_heads) return false;
         const encoder = key.batch <= 64 and (key.q_heads == 8 or key.q_heads == 12 or key.q_heads == 16) and key.dim == 64 and key.sequence <= 1024;
@@ -607,4 +613,15 @@ test "LightOnOCR3 CUDA Florence F16 plans isolate dtype windows and encoder mask
     key.padding_mask = false;
     key.local_window_radius = 512;
     try std.testing.expect(!eligible(key, 92000));
+}
+
+test "Whisper cuDNN encoder isolates FP16 plans from vision and rejects unsupported geometry" {
+    var key = Key{ .batch = 1, .q_heads = 12, .kv_heads = 12, .sequence = 1500, .dim = 64, .scale = 0.125, .dtype = .f16, .whisper_encoder = true };
+    try std.testing.expect(eligible(key, 91500));
+    var other = key;
+    other.whisper_encoder = false;
+    try std.testing.expect(!Key.eql(key, other));
+    try std.testing.expect(!eligible(other, 91500));
+    key.sequence = 1501;
+    try std.testing.expect(!eligible(key, 91500));
 }

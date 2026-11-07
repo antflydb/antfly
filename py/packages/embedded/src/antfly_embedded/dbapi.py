@@ -47,6 +47,7 @@ class Warning(Exception):
 class Error(Exception):
     sqlstate: str | None = None
     transaction_id: str | None = None
+    outcome_receipt: str | None = None
 
 
 class InterfaceError(Error):
@@ -95,9 +96,12 @@ def _mapped(exc: Exception) -> Error:
         result = cls(str(exc))
         result.sqlstate = exc.sqlstate
         result.transaction_id = exc.transaction_id
+        result.outcome_receipt = exc.outcome_receipt
         return result
     if isinstance(exc, errors.AntflyError):
-        return OperationalError(str(exc))
+        result = OperationalError(str(exc))
+        result.outcome_receipt = getattr(exc, "outcome_receipt", None)
+        return result
     return InterfaceError(str(exc))
 
 

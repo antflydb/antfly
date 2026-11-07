@@ -859,7 +859,7 @@ pub const Inspector = struct {
         };
         switch (source) {
             .none => {},
-            .text => {},
+            .text => |text| if (@import("../../chunking/chunk.zig").isRemoteModelLocator(text)) try self.locator(text, doc, field),
             .source => |reference| try self.locator(reference.uri, doc, field),
             .media => try self.report.add(self.options, .embedded, "inline", doc, field, 0),
         }

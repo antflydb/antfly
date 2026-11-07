@@ -1453,6 +1453,14 @@ pub const AntflyApiHandler = struct {
         include_contextual: bool,
         include_probes: bool,
     ) !void {
+        // Metadata omits data-node contextual routes, but owns privacy control
+        // admission and checkpoint staging for every API issuer.
+        if (comptime @hasDecl(@TypeOf(root_server.*), "routeWithBodyLimit")) {
+            try root_server.routeWithBodyLimit(.PUT, routes.privacy_control_pattern, @import("antfly_public_limits").max_request_body_bytes, httpx.Handler.bind(self, internalPrivacyMutation));
+        } else try root_server.put(routes.privacy_control_pattern, httpx.Handler.bind(self, internalPrivacyMutation));
+        if (comptime @hasDecl(@TypeOf(root_server.*), "postWithBodyLimit")) {
+            try root_server.postWithBodyLimit(routes.privacy_scan_control_pattern, @import("antfly_public_limits").max_request_body_bytes, httpx.Handler.bind(self, internalPrivacyMutation));
+        } else try root_server.post(routes.privacy_scan_control_pattern, httpx.Handler.bind(self, internalPrivacyMutation));
         try root_server.get("/ai/v1/models", httpx.Handler.bind(self, gatewayModels));
         try root_server.postResponseStreaming("/ai/v1/chat/completions", httpx.Handler.bind(self, gatewayChat));
         try root_server.postResponseStreaming("/ai/v1/embeddings", httpx.Handler.bind(self, gatewayEmbeddings));
@@ -1472,7 +1480,6 @@ pub const AntflyApiHandler = struct {
         try root_server.postResponseStreaming("/ai/v1/read", httpx.Handler.bind(self, gatewayRead));
         try root_server.postResponseStreaming("/ai/v1/extract", httpx.Handler.bind(self, gatewayExtract));
         try root_server.postResponseStreaming("/ai/v1/rewrite", httpx.Handler.bind(self, gatewayRewrite));
-        try root_server.postResponseStreaming("/ai/v1/transcribe", httpx.Handler.bind(self, gatewayTranscribe));
         try root_server.postResponseStreaming("/ai/v1/synthesize", httpx.Handler.bind(self, gatewaySynthesize));
         try root_server.postResponseStreaming("/ai/v1/rerank", httpx.Handler.bind(self, gatewayRerank));
         try root_server.postResponseStreaming("/ai/v1/chunk", httpx.Handler.bind(self, gatewayChunk));
@@ -1598,8 +1605,16 @@ pub const AntflyApiHandler = struct {
         const table_prefix = group_prefix ++ "/tables/:table_name";
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
         try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
+        try self.registerInternalSqlRoutes(server);
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.post(group_prefix ++ routes.group_db_index_activation_suffix, httpx.Handler.bind(self, internalGroupIndexActivation));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ "/document-read", @import("antfly_public_limits").max_document_read_body_bytes, httpx.Handler.bind(self, internalDocumentRead));
+        } else {
+            // Linked-kernel registration applies the same route budget when
+            // materializing its recorded route manifest.
+            try server.post(table_prefix ++ "/document-read", httpx.Handler.bind(self, internalDocumentRead));
+        }
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_suffix, httpx.Handler.bind(self, internalDocumentArtifactManifests));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ ":artifact_name", httpx.Handler.bind(self, internalDocumentArtifactManifest));
@@ -2252,16 +2267,28 @@ pub const AntflyApiHandler = struct {
     }
 
     fn requestCancellation(ctx: *const httpx.Context) http_common.RequestCancellation {
-        return .{
-            .borrowed = ctx.cancellation,
-            .borrowed_context = if (ctx.cancellation_probe != null) ctx else null,
-            .borrowed_is_cancelled = if (ctx.cancellation_probe != null) struct {
-                fn call(raw: *const anyopaque) bool {
-                    const context: *const httpx.Context = @ptrCast(@alignCast(raw));
-                    return context.isCancellationRequested();
-                }
-            }.call else null,
+        const Control = struct {
+            fn probe(raw: *const anyopaque) bool {
+                check(raw) catch return true;
+                return false;
+            }
+            fn check(raw: *const anyopaque) !void {
+                const context: *const httpx.Context = @ptrCast(@alignCast(raw));
+                if (context.isCancellationRequested()) return error.Canceled;
+                // Keep the ingress clock: simulated executors and native
+                // owners need not share an absolute monotonic epoch.
+                const control: operation_contract.RequestContext = .{
+                    .deadline_ns = context.application_deadline_ns,
+                    .deadline_io = if (context.application_deadline_io) |io| @import("antfly_runtime_abi").io_abi.Borrow.init(&io) else null,
+                };
+                try control.ensureActive();
+            }
         };
+        return http_common.RequestCancellation.fromToken(.{
+            .ptr = ctx,
+            .is_cancelled_fn = Control.probe,
+            .check_fn = Control.check,
+        });
     }
 
     fn tableMutationContext(ctx: *httpx.Context, identity: *const ?AuthenticatedIdentity) operation_contract.RequestContext {
@@ -2961,6 +2988,39 @@ pub const AntflyApiHandler = struct {
         return ctx.json(.{ .shards = shards });
     }
 
+    fn privacyFenceAck(ctx: *httpx.Context, expected: ?[64]u8) !void {
+        if (expected) |version| if (!std.mem.allEqual(u8, &version, 0)) {
+            try ctx.setHeader("X-Antfly-Privacy-Fence", &version);
+        };
+    }
+
+    fn internalDocumentRead(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing document read body");
+        var input = std.json.parseFromSlice(@import("http_routes.zig").DocumentReadRequest, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid document read body");
+        defer input.deinit();
+        const key = input.value.decodeKey(ctx.allocator) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return textResponse(ctx, 400, "invalid document read key");
+        };
+        defer ctx.allocator.free(key);
+        if (input.value.query.len > @import("antfly_public_limits").max_request_body_bytes) return textResponse(ctx, 400, "document read exceeds byte limit");
+        switch (input.value.operation) {
+            .lookup => return self.internalGroupLookupKey(ctx, params.group_id, params.table_name, key, input.value.query),
+            .manifest => {
+                var result = self.internalGroupOperations().documentArtifactManifest(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, key, input.value.artifact_name) catch |err| return internalGroupErrorResponse(ctx, err);
+                defer result.deinit(ctx.allocator);
+                return ctx.json(result);
+            },
+            .manifests => {
+                var result = self.internalGroupOperations().documentArtifactManifests(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, key) catch |err| return internalGroupErrorResponse(ctx, err);
+                defer result.deinit(ctx.allocator);
+                return ctx.json(result);
+            },
+        }
+    }
+
     fn internalGroupLookup(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
@@ -2968,12 +3028,13 @@ pub const AntflyApiHandler = struct {
         const key = (try decodePathParamOrBadRequest(ctx, encoded_key)) orelse
             return textResponse(ctx, 400, "invalid path parameter");
         defer ctx.allocator.free(key);
-        var lookup_options = http_route_helpers.parseInternalLookupOptions(
-            ctx.allocator,
-            ctx.request.uri.query orelse "",
-        ) catch return textResponse(ctx, 400, "invalid lookup options");
+        return self.internalGroupLookupKey(ctx, params.group_id, params.table_name, key, ctx.request.uri.query orelse "");
+    }
+
+    fn internalGroupLookupKey(self: *AntflyApiHandler, ctx: *httpx.Context, group_id: u64, table_name: []const u8, key: []const u8, query: []const u8) !httpx.Response {
+        var lookup_options = http_route_helpers.parseInternalLookupOptions(ctx.allocator, query) catch return textResponse(ctx, 400, "invalid lookup options");
         defer lookup_options.deinit(ctx.allocator);
-        if (std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
+        if (lookup_options.opts.privacy_original or std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
             std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}"))
         {
             // A legacy unauthenticated internal peer must never gain the
@@ -2986,20 +3047,21 @@ pub const AntflyApiHandler = struct {
         }
         const control_lookup = lookup_options.opts.group_source_query_json.len != 0 or lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_index_status_json.len != 0 or lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0;
         const logical_key = if (control_lookup and std.mem.eql(u8, key, "\x00relational_control")) "" else key;
-        const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch
+        const consistency = http_server_mod.parseLookupReadConsistency(query) catch
             return textResponse(ctx, 400, "invalid read consistency");
         var result = self.internalGroupOperations().lookup(
             ctx.allocator,
             operationContext(ctx, null),
             .{
-                .group_id = params.group_id,
-                .table_name = params.table_name,
+                .group_id = group_id,
+                .table_name = table_name,
                 .key = logical_key,
                 .options = lookup_options.opts,
                 .consistency = consistency,
             },
         ) catch |err| return internalLookupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
+        try privacyFenceAck(ctx, lookup_options.opts.privacy_policy_version);
         var version_buf: [20]u8 = undefined;
         const version = try std.fmt.bufPrint(&version_buf, "{d}", .{result.version});
         try ctx.setHeader("X-Antfly-Version", version);
@@ -3008,6 +3070,72 @@ pub const AntflyApiHandler = struct {
             try ctx.setHeader("X-Antfly-Primary-Digest", &hex);
         }
         return ownedJsonResponse(ctx, 200, &result.json, ctx.allocator);
+    }
+
+    /// SQL control and execution use the same route set in production and
+    /// focused transport conformance checks, without linking every public API.
+    fn registerInternalSqlRoutes(self: *AntflyApiHandler, server: anytype) !void {
+        const sql_transport = @import("../serverless/sql/transport.zig");
+        try server.post(sql_transport.task_path, httpx.Handler.bind(self, internalSqlTask));
+        try server.post(sql_transport.submit_path, httpx.Handler.bind(self, internalSqlSubmit));
+        try server.post(sql_transport.turn_path, httpx.Handler.bind(self, internalSqlTurn));
+        try server.post(sql_transport.result_path, httpx.Handler.bind(self, internalSqlResult));
+        try server.post(sql_transport.cancel_path, httpx.Handler.bind(self, internalSqlCancel));
+    }
+    fn internalSqlAuthority(self: *AntflyApiHandler, ctx: *httpx.Context) !void {
+        // New task RPCs never accept the rolling-upgrade unsigned escape hatch.
+        const token = ctx.header(internal_service_auth.header_name) orelse return error.SqlExecutionUnauthorized;
+        var identity = self.api_server.authenticateInternalServiceRequest(token) catch return error.SqlExecutionUnauthorized;
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return error.SqlExecutionUnauthorized;
+    }
+    fn internalSqlService(self: *AntflyApiHandler, ctx: *httpx.Context, tenant: @import("../serverless/sql/plan.zig").Digest) !@import("../serverless/sql/runtime.zig").Service {
+        try self.internalSqlAuthority(ctx);
+        const factory = self.api_server.cfg.distributed_sql orelse return error.SqlWorkerUnavailable;
+        const request = try operationContext(ctx, null).platformDeadline();
+        return factory.open(factory.ptr, ctx.allocator, tenant, .{ .deadline_ns = request.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(request.cancellation.ptr, request.cancellation.is_cancelled_fn) });
+    }
+    fn internalSqlError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return textResponse(ctx, @import("../serverless/sql/transport.zig").errorStatus(err), @errorName(err));
+    }
+    fn internalSqlTask(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing SQL task ticket");
+        if (body.len > 1024) return textResponse(ctx, 413, "SQL task ticket too large");
+        var input = std.json.parseFromSlice(@import("../serverless/sql/plan.zig").Ticket, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid SQL task ticket");
+        defer input.deinit();
+        const service = self.internalSqlService(ctx, input.value.tenant) catch |err| return internalSqlError(ctx, err);
+        var admission = self.api_server.acquireSqlExecution(false) catch return textResponse(ctx, 429, "query capacity exhausted");
+        defer admission.release();
+        service.execute(input.value) catch |err| {
+            if (@import("../serverless/sql/runtime.zig").retiredTaskDelivery(err)) return textResponse(ctx, 204, "");
+            return internalSqlError(ctx, err);
+        };
+        return ctx.json(.{ .accepted = true });
+    }
+    fn internalSqlControl(self: *AntflyApiHandler, ctx: *httpx.Context, path: []const u8) !httpx.Response {
+        try self.internalSqlAuthority(ctx);
+        const factory = self.api_server.cfg.distributed_sql orelse return error.SqlWorkerUnavailable;
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing SQL control request");
+        const request = try operationContext(ctx, null).platformDeadline();
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        var response = try @import("../serverless/sql/transport.zig").control(factory, ctx.allocator, arena.allocator(), path, body, .{ .deadline_ns = request.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(request.cancellation.ptr, request.cancellation.is_cancelled_fn) });
+        defer response.deinit(ctx.allocator);
+        var output = try ctx.allocator.dupe(u8, response.body);
+        errdefer ctx.allocator.free(output);
+        return ownedJsonResponse(ctx, response.status, &output, ctx.allocator);
+    }
+    fn internalSqlSubmit(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSqlControl(ctx, @import("../serverless/sql/transport.zig").submit_path) catch |err| internalSqlError(ctx, err);
+    }
+    fn internalSqlTurn(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSqlControl(ctx, @import("../serverless/sql/transport.zig").turn_path) catch |err| internalSqlError(ctx, err);
+    }
+    fn internalSqlResult(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSqlControl(ctx, @import("../serverless/sql/transport.zig").result_path) catch |err| internalSqlError(ctx, err);
+    }
+    fn internalSqlCancel(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSqlControl(ctx, @import("../serverless/sql/transport.zig").cancel_path) catch |err| internalSqlError(ctx, err);
     }
 
     fn internalJoinJobState(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3210,6 +3338,7 @@ pub const AntflyApiHandler = struct {
 
     fn internalArtifactWriteErrorResponse(ctx: *httpx.Context, err: internal_group_operations.Error, invalid_message: []const u8) !httpx.Response {
         return switch (err) {
+            error.ArtifactPublicationPending => textResponse(ctx, 503, "artifact publication pending"),
             error.InvalidArgument => textResponse(ctx, 400, invalid_message),
             error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
             error.Unsupported => textResponse(ctx, 405, "method not allowed"),
@@ -3641,6 +3770,7 @@ pub const AntflyApiHandler = struct {
         else
             internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
+        try privacyFenceAck(ctx, query_request.req.privacy_policy_version);
         return internalQueryResponse(ctx, &result);
     }
 
@@ -3690,6 +3820,7 @@ pub const AntflyApiHandler = struct {
         else
             internalGroupErrorResponse(ctx, err);
         defer summary.deinit(ctx.allocator);
+        try privacyFenceAck(ctx, query_request.req.privacy_policy_version);
         return ctx.json(summary);
     }
 
@@ -3760,6 +3891,7 @@ pub const AntflyApiHandler = struct {
         }, @errorName(err));
         defer ctx.allocator.free(encoded);
         try ctx.setHeader("content-type", if (std.mem.startsWith(u8, encoded, @import("retained_read_page.zig").compact_magic)) @import("retained_read_page.zig").compact_media_type else if (std.mem.startsWith(u8, encoded, @import("retained_read_page.zig").magic)) @import("retained_read_page.zig").media_type else "application/json");
+        try privacyFenceAck(ctx, parsed.value.privacy_policy_version);
         return ctx.response.body(try ctx.allocator.dupe(u8, encoded)).build();
     }
 
@@ -3772,13 +3904,22 @@ pub const AntflyApiHandler = struct {
             else => err,
         };
         defer input.deinit(ctx.allocator);
-        const request = operationContext(ctx, null);
+        if (input.opts.privacy_original or input.opts.privacy_status) {
+            const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+            var identity = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+            defer identity.deinit(self.api_server.alloc);
+            if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        }
+        // Native ScanOptions use platform monotonic time. HTTP request
+        // deadlines can use a different .awake epoch on Darwin.
+        const request = try operationContext(ctx, null).platformDeadline();
         input.opts.execution_deadline_ns = request.deadline_ns;
         if (request.cancellation.ptr != null and request.cancellation.is_cancelled_fn != null)
             input.opts.cancellation = request.cancellation;
         const HttpScanSink = struct {
             ctx: *httpx.Context,
             writer: ?httpx.Context.StreamWriter = null,
+            privacy_version: ?[64]u8 = null,
 
             fn sink(state: *@This()) table_reads.ScanStreamSink {
                 return .{ .context = state, .start_fn = start, .write_fn = write };
@@ -3786,8 +3927,10 @@ pub const AntflyApiHandler = struct {
 
             fn start(raw: ?*anyopaque) !void {
                 const state: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
-                if (state.writer == null)
+                if (state.writer == null) {
+                    try privacyFenceAck(state.ctx, state.privacy_version);
                     state.writer = try state.ctx.streamResponseWithContentType(200, "application/x-ndjson");
+                }
             }
 
             fn write(raw: ?*anyopaque, bytes: []const u8) !void {
@@ -3796,7 +3939,7 @@ pub const AntflyApiHandler = struct {
                 try state.writer.?.write(bytes);
             }
         };
-        var stream = HttpScanSink{ .ctx = ctx };
+        var stream = HttpScanSink{ .ctx = ctx, .privacy_version = input.opts.privacy_policy_version };
         const found = self.internalGroupOperations().scanStream(
             ctx.allocator,
             request,
@@ -3907,6 +4050,7 @@ pub const AntflyApiHandler = struct {
         var result = self.internalGroupOperations().textStats(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, body) catch |err|
             return if (err == error.InvalidArgument) textResponse(ctx, 400, "invalid text stats request") else internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
+        try privacyFenceAck(ctx, try @import("http_client.zig").privacyVersionFromBody(ctx.allocator, body));
         return jsonResponse(ctx, 200, result.json);
     }
 
@@ -4552,9 +4696,6 @@ pub const AntflyApiHandler = struct {
     fn gatewayRead(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequest(ctx, .read);
     }
-    fn gatewayTranscribe(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
-        return self.gatewayRequest(ctx, .transcribe);
-    }
     fn gatewaySynthesize(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequest(ctx, .synthesize);
     }
@@ -4603,6 +4744,7 @@ pub const AntflyApiHandler = struct {
         const response = blk: {
             inference_gateway.prepare(self.api_server, ctx) catch |err| break :blk @as(anyerror!httpx.Response, err);
             var sources: GatewaySources = .{ .server = self.api_server, .ctx = ctx, .identity = identity };
+            defer sources.release();
             break :blk inference_gateway.batchWithSources(self.api_server, ctx, sources.port());
         };
         return response catch |err| gatewayFailure(ctx, err);
@@ -4612,8 +4754,35 @@ pub const AntflyApiHandler = struct {
         server: *ApiHttpServer,
         ctx: *httpx.Context,
         identity: ?AuthenticatedIdentity,
+        fetch_memory: inference_gateway.source_media.FetchScope = .{},
+        fn release(self: *@This()) void {
+            self.fetch_memory.deinit();
+        }
+        fn reset(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.release();
+        }
         fn port(self: *@This()) inference_gateway.source_media.Port {
-            return .{ .ptr = self, .lookup = lookup, .lookup_many = lookupMany };
+            return .{ .ptr = self, .lookup = lookup, .lookup_many = lookupMany, .fetch = fetch, .reset = reset };
+        }
+        fn fetch(raw: *anyopaque, a: std.mem.Allocator, resource: inference_gateway.source_media.Resource) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const now = @import("antfly_platform").time.monotonicNs();
+            const deadline = self.ctx.application_deadline_ns orelse (now + 120 * std.time.ns_per_s);
+            if (deadline <= now) return error.Timeout;
+            const cancelled = struct {
+                fn call(ptr: *const anyopaque) bool {
+                    const context: *const httpx.Context = @ptrCast(@alignCast(ptr));
+                    return context.isCancellationRequested();
+                }
+            }.call;
+            // Large bodies live for the request, outside the bounded parsing arena.
+            _ = a;
+            const media_allocator = self.fetch_memory.allocator(self.ctx.allocator);
+            return inference_gateway.source_media.fetchResource(media_allocator, self.server.inferenceIo(), self.server.cfg.remote_content, resource, .{ .ptr = self.ctx, .is_cancelled_fn = cancelled }, (deadline - now) / std.time.ns_per_ms) catch |err| {
+                if (err == error.OutOfMemory and self.fetch_memory.budget.isLocallyExhausted()) return error.InferenceCapacityUnavailable;
+                return err;
+            };
         }
         fn at(value: std.json.Value, path: []const u8) ?std.json.Value {
             var current = value;
@@ -4991,6 +5160,7 @@ pub const AntflyApiHandler = struct {
         const response = blk: {
             inference_gateway.prepare(self.api_server, ctx) catch |err| break :blk @as(anyerror!httpx.Response, err);
             var sources: GatewaySources = .{ .server = self.api_server, .ctx = ctx, .identity = identity };
+            defer sources.release();
             break :blk if (task) |selected| inference_gateway.executeOperationWithSources(self.api_server, ctx, selected, operation, sources.port()) else if (inference_gateway.isPredictorDiscoveryPath(ctx.request.uri.path)) inference_gateway.predictors(self.api_server, ctx) else inference_gateway.models(self.api_server, ctx);
         };
         return response catch |err| gatewayFailure(ctx, err);
@@ -5016,8 +5186,9 @@ pub const AntflyApiHandler = struct {
             error.DocumentStorageNotConfigured, error.NotLeader => 503,
             error.TooManyActiveJobs => 429,
             error.InlineCredentialNotAllowed => 400,
+            error.InvalidTranscriptionLanguage => 400,
             error.Canceled, error.Cancelled => return error.Canceled,
-            error.ProviderTokenBudgetExceeded, error.UnsupportedMediaTokenBudget, error.UnsupportedBedrockContentPart, error.UnsupportedBedrockGenerationOptions, error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidInferenceMedia, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature => 400,
+            error.ProviderTokenBudgetExceeded, error.UnsupportedMediaTokenBudget, error.UnsupportedBedrockContentPart, error.UnsupportedBedrockGenerationOptions, error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidInferenceMedia, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature, error.UnsupportedAudioReadCapability => 400,
             else => 502,
         };
         _ = ctx.status(status);
@@ -8305,6 +8476,10 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid create table request");
         };
+        @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(ctx.allocator, body_data) catch |err| {
+            if (err == error.PrivacyManagedGraph) return jsonErrorResponse(ctx, 400, "privacy policies and managed producers must be configured through the table Privacy API");
+            return err;
+        };
         // Reject oversized requests before JSON allocation, credential
         // sealing, or remote embedding-model probes. Forwarding has a larger
         // envelope allowance, but the user definition itself is capped here.
@@ -8364,10 +8539,9 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text(public_table_http.inference_endpoint_access_denied_message);
             },
-            error.EmbeddingProbeUnavailable => {
-                _ = ctx.status(503);
-                try ctx.setHeader("Retry-After", "1");
-                return ctx.text("table index validation probe unavailable");
+            error.ResourceLimitExceeded, error.MemoryBudgetExceeded, error.EmbeddingProbeUnavailable => {
+                var failure = try public_table_http.embeddingValidationFailureResponse(alloc, err);
+                return respondOwnedApiResponse(ctx, &failure);
             },
             else => return err,
         };
@@ -8394,10 +8568,9 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text(public_table_http.inference_endpoint_access_denied_message);
             },
-            error.EmbeddingProbeUnavailable => {
-                _ = ctx.status(503);
-                try ctx.setHeader("Retry-After", "1");
-                return ctx.text("table index validation probe unavailable");
+            error.ResourceLimitExceeded, error.MemoryBudgetExceeded, error.EmbeddingProbeUnavailable => {
+                var failure = try public_table_http.embeddingValidationFailureResponse(alloc, err);
+                return respondOwnedApiResponse(ctx, &failure);
             },
             error.InvalidCreateTableRequest, error.ChatGPTInteractiveOnly => {
                 _ = ctx.status(400);
@@ -9777,6 +9950,15 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    fn privacyArtifactInspectionAllowed(self: *AntflyApiHandler, ctx: *httpx.Context, table: []const u8, identity: ?AuthenticatedIdentity) !bool {
+        const principal = identity orelse return true;
+        if (http_server_mod.permissionsAllow(principal.permissions, .table, table, .admin)) return true;
+        const reads = self.api_server.table_reads orelse return true;
+        if (reads.vtable.privacy_policy_version == null) return true;
+        const version = try reads.privacyPolicyVersion(ctx.allocator, table, operationContext(ctx, identity).deadline_ns);
+        return std.mem.allEqual(u8, &version, 0);
+    }
+
     pub fn getDocumentArtifactManifest(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: metadata_server_openapi.server.GetDocumentArtifactManifestParams) !httpx.Response {
         _ = params;
         var authenticated_identity: ?AuthenticatedIdentity = null;
@@ -9785,10 +9967,14 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer alloc.free(decoded_table_name);
+        if (!try self.privacyArtifactInspectionAllowed(ctx, decoded_table_name, authenticated_identity)) return textResponse(ctx, 403, "Privacy artifact inspection requires table administration permission");
         const decoded_key = (try decodePathParamOrBadRequest(ctx, key)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_key);
         const decoded_artifact_name = (try decodePathParamOrBadRequest(ctx, artifact_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_artifact_name);
+        if (@import("antfly_local_sources").privacy_document.isManagedArtifactName(decoded_artifact_name)) {
+            if (authenticated_identity) |identity| if (!http_server_mod.permissionsAllow(identity.permissions, .table, decoded_table_name, .admin)) return textResponse(ctx, 403, "privacy administration permission required");
+        }
         const opts = self.api_server.documentArtifactManifestOptionsForRequest(decoded_table_name, ctx.request.uri.query orelse "", authenticated_identity) catch |err| switch (err) {
             error.InvalidDetail => {
                 _ = ctx.status(400);
@@ -9815,6 +10001,7 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer alloc.free(decoded_table_name);
+        if (!try self.privacyArtifactInspectionAllowed(ctx, decoded_table_name, authenticated_identity)) return textResponse(ctx, 403, "Privacy artifact inspection requires table administration permission");
         const decoded_key = (try decodePathParamOrBadRequest(ctx, key)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_key);
         const opts = self.api_server.documentArtifactManifestOptionsForRequest(decoded_table_name, ctx.request.uri.query orelse "", authenticated_identity) catch |err| switch (err) {
@@ -10076,6 +10263,18 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponse(ctx, &resp);
     }
 
+    fn privacyCatalogMutationBlocked(self: *AntflyApiHandler, ctx: *httpx.Context, table: []const u8, name: []const u8) !?httpx.Response {
+        if (std.mem.startsWith(u8, name, "_privacy_")) return try jsonErrorResponse(ctx, 409, "privacy-managed artifacts must be changed through the table Privacy API");
+        const record = (try self.api_server.loadOwnedTableRecord(ctx.allocator, table)) orelse return null;
+        defer @import("../metadata/table_manager.zig").freeTable(ctx.allocator, record);
+        var root = try std.json.parseFromSlice(std.json.Value, ctx.allocator, record.indexes_json, .{});
+        defer root.deinit();
+        var resource = (try @import("antfly_local_sources").privacy_catalog.current(ctx.allocator, root.value)) orelse return null;
+        defer resource.deinit();
+        if (resource.value.policy.mode != .monitor) return try jsonErrorResponse(ctx, 409, "change the table Privacy policy before modifying its protected index or artifact graph");
+        return null;
+    }
+
     pub fn createIndex(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -10084,6 +10283,7 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
+        if (try self.privacyCatalogMutationBlocked(ctx, decoded_table_name, decoded_index_name)) |response| return response;
         if (@import("relational_witness_ddl.zig").reserved(decoded_index_name)) return witnessDDLError(ctx, error.ReservedForeignKeySupportIndex);
         const body_data = (try ctx.body()) orelse "";
         const destinations_allowed = graphResolverDestinationsAllowed(
@@ -10110,6 +10310,7 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
+        if (try self.privacyCatalogMutationBlocked(ctx, decoded_table_name, decoded_index_name)) |response| return response;
         if (@import("relational_witness_ddl.zig").reserved(decoded_index_name)) return witnessDDLError(ctx, error.ReservedForeignKeySupportIndex);
         var resp = try public_table_http.handleTableDeleteIndex(ctx.allocator, decoded_table_name, decoded_index_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
@@ -10439,6 +10640,119 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponse(ctx, &resp);
     }
 
+    fn internalPrivacyMutation(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        if (try self.internalServiceAuthRejection(ctx)) |response| return response;
+        if (!self.api_server.cfg.privacy_scan_coordinator) return textResponse(ctx, 503, "privacy metadata owner required");
+        const encoded = ctx.param("table_name") orelse return textResponse(ctx, 400, "invalid table");
+        const table = (try decodePathParamOrBadRequest(ctx, encoded)) orelse return ctx.response.build();
+        defer ctx.allocator.free(table);
+        var result = try @import("privacy.zig").handle(self.api_server, ctx.allocator, table, if (ctx.request.method == .PUT) .put else .start_scan, .{
+            .body = (try ctx.body()) orelse "",
+            .if_match = ctx.header("if-match"),
+        }, operationContext(ctx, null));
+        defer if (result.etag) |etag| ctx.allocator.free(etag);
+        if (result.etag) |etag| try ctx.setHeader("ETag", etag);
+        return respondOwnedApiResponse(ctx, &result.response);
+    }
+
+    fn privacyRequest(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, action: @import("privacy.zig").Action, scan_id: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const table = (try self.resolvePublicTableName(ctx, table_name, &identity)) orelse return ctx.response.build();
+        defer ctx.allocator.free(table);
+        // Preview, findings and producer settings are a separate capability
+        // from ordinary sanitized table reads.
+        if (identity) |authenticated| if (!http_server_mod.permissionsAllow(authenticated.permissions, .table, table, .admin)) {
+            _ = ctx.status(403);
+            return ctx.json(.{ .code = "privacy_admin_required", .message = "Table administration permission is required for privacy inspection and configuration." });
+        };
+        const scan = (try decodePathParamOrBadRequest(ctx, scan_id)) orelse return ctx.response.build();
+        defer ctx.allocator.free(scan);
+        const limit = if (ctx.query("limit")) |raw| std.fmt.parseInt(u32, raw, 10) catch {
+            _ = ctx.status(400);
+            return ctx.json(.{ .code = "invalid_privacy_limit", .message = "limit must be an integer" });
+        } else 100;
+        var result = try @import("privacy.zig").handle(self.api_server, ctx.allocator, table, action, .{
+            .body = (try ctx.body()) orelse "",
+            .if_match = ctx.header("if-match"),
+            .scan_id = scan,
+            .cursor = try ctx.queryDecoded("cursor"),
+            .document = try ctx.queryDecoded("document"),
+            .field = try ctx.queryDecoded("field"),
+            .category = try ctx.queryDecoded("category"),
+            .policy_version = try ctx.queryDecoded("policy_version"),
+            .limit = limit,
+        }, operationContext(ctx, identity));
+        defer if (result.etag) |etag| ctx.allocator.free(etag);
+        if (result.etag) |etag| try ctx.setHeader("ETag", etag);
+        return respondOwnedApiResponse(ctx, &result.response);
+    }
+
+    pub fn getNamespaceTablePrivacy(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.privacyRequest(ctx, table_name, .get, "");
+    }
+
+    pub fn putNamespaceTablePrivacy(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.privacyRequest(ctx, table_name, .put, "");
+    }
+
+    pub fn previewNamespaceTablePrivacy(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.privacyRequest(ctx, table_name, .preview, "");
+    }
+
+    pub fn startNamespaceTablePrivacyScan(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.privacyRequest(ctx, table_name, .start_scan, "");
+    }
+
+    pub fn getNamespaceTablePrivacyScan(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, scan_id: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.privacyRequest(ctx, table_name, .get_scan, scan_id);
+    }
+
+    pub fn listNamespaceTablePrivacyFindings(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, _: anytype) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.privacyRequest(ctx, table_name, .findings, "");
+    }
+
+    pub fn queryNamespaceTablePrivacyFindings(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.privacyRequest(ctx, table_name, .findings, "");
+    }
+
+    pub fn getTablePrivacy(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.privacyRequest(ctx, table_name, .get, "");
+    }
+    pub fn putTablePrivacy(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.privacyRequest(ctx, table_name, .put, "");
+    }
+    pub fn previewTablePrivacy(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.privacyRequest(ctx, table_name, .preview, "");
+    }
+    pub fn startTablePrivacyScan(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.privacyRequest(ctx, table_name, .start_scan, "");
+    }
+    pub fn getTablePrivacyScan(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, scan_id: []const u8) !httpx.Response {
+        return self.privacyRequest(ctx, table_name, .get_scan, scan_id);
+    }
+    pub fn listTablePrivacyFindings(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, _: anytype) !httpx.Response {
+        return self.privacyRequest(ctx, table_name, .findings, "");
+    }
+    pub fn queryTablePrivacyFindings(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.privacyRequest(ctx, table_name, .findings, "");
+    }
+
     pub fn putArtifactEnrichment(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -10448,6 +10762,7 @@ pub const AntflyApiHandler = struct {
         defer alloc.free(decoded_table_name);
         const decoded_artifact_name = (try decodePathParamOrBadRequest(ctx, artifact_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_artifact_name);
+        if (try self.privacyCatalogMutationBlocked(ctx, decoded_table_name, decoded_artifact_name)) |response| return response;
         const body_data = (try ctx.body()) orelse "";
         var resp = try public_table_http.handlePutArtifactEnrichment(alloc, decoded_table_name, decoded_artifact_name, body_data, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
@@ -10462,6 +10777,7 @@ pub const AntflyApiHandler = struct {
         defer alloc.free(decoded_table_name);
         const decoded_artifact_name = (try decodePathParamOrBadRequest(ctx, artifact_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_artifact_name);
+        if (try self.privacyCatalogMutationBlocked(ctx, decoded_table_name, decoded_artifact_name)) |response| return response;
         var resp = try public_table_http.handleDeleteArtifactEnrichment(alloc, decoded_table_name, decoded_artifact_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
@@ -11123,6 +11439,7 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         }
 
         pub fn put(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
+            if (@import("http_routes.zig").privacyMutationBodyLimit(prefix ++ path)) |limit| return self.inner.routeWithBodyLimit(.PUT, prefix ++ path, limit, handler_fn);
             try self.inner.put(prefix ++ path, handler_fn);
         }
 
@@ -19345,6 +19662,75 @@ test "httpx inference gateway authorization covers inventory execution and sessi
     try std.testing.expectEqual(@as(usize, 1), target.calls);
 }
 
+test "httpx inference gateway large source batch items bypass metadata limits and release between items" {
+    const Media = struct {
+        scope: inference_gateway.source_media.FetchScope = .{},
+        resets: usize = 0,
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: inference_gateway.source_media.Reference) ![]const u8 {
+            return error.UnexpectedLookup;
+        }
+        fn fetch(raw: *anyopaque, _: std.mem.Allocator, resource: inference_gateway.source_media.Resource) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = try self.scope.allocator(std.testing.allocator).alloc(u8, @intCast(resource.length));
+            @memset(bytes, 42);
+            return bytes;
+        }
+        fn reset(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.scope.deinit();
+            self.resets += 1;
+        }
+    };
+    const Target = struct {
+        calls: usize = 0,
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            check(context) catch |err| return inference_connection_abi.statusFromError(err);
+            return .ok;
+        }
+        fn check(context: *const inference_connection_abi.InvokeContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            const a = context.allocator.asStd();
+            var envelope = try httpx.attachment_envelope.parseAlloc(a, context.body.slice(), .{});
+            defer envelope.deinit();
+            try std.testing.expectEqual(@as(usize, 1), envelope.attachments.len);
+            const bytes = envelope.attachments[0].data;
+            try std.testing.expectEqual(@as(usize, 65 * 1024 * 1024), bytes.len);
+            try std.testing.expectEqual(@as(u8, 42), bytes[0]);
+            try std.testing.expectEqual(@as(u8, 42), bytes[bytes.len - 1]);
+            self.calls += 1;
+            const response = try a.dupe(u8,
+                \\{"id":"test","object":"chat.completion","created":1,"model":"backend","usage":null,"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}
+            );
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = response.ptr, .len = response.len } };
+        }
+    };
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer config.deinit();
+    var source = AuthStatusSource{};
+    var target: Target = .{};
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    defer server.deinit();
+    var media: Media = .{};
+    defer media.scope.deinit();
+    const body =
+        \\{"requests":[{"custom_id":"a","body":{"model":"local/backend","messages":[{"role":"user","content":[{"type":"source","source":{"type":"source","uri":"https://sources.example/clip","mime_type":"video/mp4","version":"\"v\"","length":68157440}}]}]}},{"custom_id":"b","body":{"model":"local/backend","messages":[{"role":"user","content":[{"type":"source","source":{"type":"source","uri":"https://sources.example/clip","mime_type":"video/mp4","version":"\"v\"","length":68157440}}]}]}}]}
+    ;
+    var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/generate/batch");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try inference_gateway.batchWithSources(&server, &ctx, .{ .ptr = &media, .lookup = Media.lookup, .fetch = Media.fetch, .reset = Media.reset });
+    defer response.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("summary").?.object.get("succeeded").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), target.calls);
+    try std.testing.expectEqual(@as(usize, 2), media.resets);
+    try std.testing.expect(!media.scope.initialized);
+}
+
 test "httpx inference gateway batches buffer in-process targets without a socket" {
     const Target = struct {
         calls: usize = 0,
@@ -20227,6 +20613,7 @@ test "httpx inference gateway preserves framed media through raw and named nativ
         operation: []const u8 = "",
         calls: usize = 0,
         chunk: bool = false,
+        expected_model: []const u8 = "backend",
         fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
             check(context) catch |err| return inference_connection_abi.statusFromError(err);
             return .ok;
@@ -20245,13 +20632,13 @@ test "httpx inference gateway preserves framed media through raw and named nativ
             const parsed = try std.json.parseFromSlice(std.json.Value, a, envelope.metadata, .{});
             defer parsed.deinit();
             const model = if (self.chunk) parsed.value.object.get("config").?.object.get("model").? else parsed.value.object.get("model").?;
-            try std.testing.expectEqualStrings(if (self.chunk) "fixed" else "backend", model.string);
+            try std.testing.expectEqualStrings(if (self.chunk) "fixed" else self.expected_model, model.string);
             context.out_response.* = .{ .status = 200, .body = .{ .ptr = (try a.dupe(u8, "{}")).ptr, .len = 2 } };
         }
     };
     const a = std.testing.allocator;
     var config = try common_config.Config.parseFromSlice(a,
-        \\{"public_inference":{"enabled":true},"inference_capabilities":{"generators/native":{"images":"supported"}},"chunkers":{"paragraphs":{"provider":"antfly","model":"fixed"}},"extractors":{"entities":{"connection":"local-inference","model":"backend"}},"generators":{"native":{"provider":"antfly","model":"backend"}}}
+        \\{"public_inference":{"enabled":true},"inference_capabilities":{"generators/native":{"images":"supported","audio":"supported"}},"transcribers":{"speech":{"provider":"openai","model":"whisper-1"}},"chunkers":{"paragraphs":{"provider":"antfly","model":"fixed"}},"extractors":{"entities":{"connection":"local-inference","model":"backend"}},"generators":{"native":{"provider":"antfly","model":"backend"}}}
     );
     defer config.deinit();
     var state: State = .{};
@@ -20259,14 +20646,18 @@ test "httpx inference gateway preserves framed media through raw and named nativ
     var server = ApiHttpServer.init(a, .{ .node_config = &config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &state, .invoke = State.invoke } }, source.iface(), null, null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
-    const Case = struct { path: []const u8, operation: []const u8, body: []const u8 };
+    const Case = struct { path: []const u8, operation: []const u8, body: []const u8, model: []const u8 = "backend" };
     for ([_]Case{
+        .{ .path = "read", .operation = "read", .model = "transcribers/speech", .body = "{\"model\":\"transcribers/speech\",\"audio\":\"attachment:0\",\"retain_artifact\":true}" },
         .{ .path = "read", .operation = "read", .body = "{\"model\":\"local/backend\",\"images\":[{\"url\":\"attachment:0\"}]}" },
-        .{ .path = "transcribe", .operation = "transcribe", .body = "{\"model\":\"local/backend\",\"audio\":\"attachment:0\"}" },
+        .{ .path = "read", .operation = "read", .body = "{\"model\":\"generators/native\",\"images\":[{\"url\":\"attachment:0\"}]}" },
+        .{ .path = "read", .operation = "read", .body = "{\"model\":\"generators/native\",\"audio\":\"attachment:0\"}" },
+        .{ .path = "read", .operation = "read", .body = "{\"model\":\"local/backend\",\"audio\":\"attachment:0\",\"audio_options\":{\"timestamps\":true}}" },
         .{ .path = "extract", .operation = "extract", .body = "{\"model\":\"extractors/entities\",\"input\":[{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}]}" },
         .{ .path = "chunk", .operation = "chunk", .body = "{\"model\":\"chunkers/paragraphs\",\"input\":{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}}" },
         .{ .path = "generate", .operation = "generate", .body = "{\"model\":\"generators/native\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}]}]}" },
     }) |case| {
+        state.expected_model = case.model;
         state.operation = case.operation;
         state.chunk = std.mem.eql(u8, case.path, "chunk");
         const url = try std.fmt.allocPrint(a, "http://localhost/ai/v1/{s}", .{case.path});
@@ -20911,7 +21302,7 @@ test "httpx inference gateway request errors remain client errors without reclas
         .{ Task.embed, "/ai/v1/embeddings", "{\"model\":\"x\",\"model\":\"y\"}" },
         .{ Task.embed, "/ai/v1/embeddings", "{\"model\":\"embedders/dense\",\"input\":[{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"!\"}]}" },
         .{ Task.synthesize, "/ai/v1/synthesize", "{\"model\":\"synthesizers/voice\",\"text\":\"hello\",\"format\":\"invalid\"}" },
-        .{ Task.transcribe, "/ai/v1/transcribe", "{\"model\":\"transcribers/speech\",\"audio\":\"AAAA\",\"diarization\":true}" },
+        .{ Task.read, "/ai/v1/read", "{\"model\":\"transcribers/speech\",\"audio\":\"AAAA\",\"audio_options\":{\"diarization\":true}}" },
     };
     inline for (cases) |case| {
         var request = try httpx.Request.init(a, .POST, "http://localhost" ++ case[1]);
@@ -21028,6 +21419,108 @@ test "public execution deadlines use the ingress clock and preserve earlier boun
     try request.setHeader(limits.timeout_header, "0");
     try AntflyApiHandler.establishPublicExecutionDeadline(&ctx);
     try std.testing.expect(ctx.application_deadline_invalid);
+}
+
+test "public execution query cancellation preserves ingress deadline and clock" {
+    var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer sim.deinit();
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "http://node/db/v1/tables/docs/query");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, sim.io(), &request);
+    defer ctx.deinit();
+    ctx.application_deadline_io = sim.io();
+    ctx.application_deadline_ns = 250 * std.time.ns_per_ms;
+    var cancellation = AntflyApiHandler.requestCancellation(&ctx);
+    // The ingress executor has a different epoch from native monotonic time.
+    try cancellation.token().check();
+    try std.testing.expect(!cancellation.isCancelled());
+    ctx.application_deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, cancellation.token().check());
+    try std.testing.expect(cancellation.isCancelled());
+    ctx.application_deadline_ns = null;
+    var listener = std.atomic.Value(bool).init(false);
+    ctx.cancellation = &listener;
+    cancellation = AntflyApiHandler.requestCancellation(&ctx);
+    try cancellation.token().check();
+    listener.store(true, .release);
+    try std.testing.expectError(error.Canceled, cancellation.token().check());
+}
+
+test "public execution query routes distinguish ingress expiry from client cancellation" {
+    const a = std.testing.allocator;
+    const Source = struct {
+        fn catalog(_: *anyopaque, _: std.mem.Allocator, context: operation_contract.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            try context.ensureActive();
+            return error.TestUnexpectedResult;
+        }
+    };
+    var unused: u8 = 0;
+    var server = ApiHttpServer.init(a, .{}, .{ .ptr = &unused, .vtable = &.{ .status = undefined, .system_catalog = Source.catalog } }, null, null);
+    defer server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &server };
+    const Route = enum { table, global, ndjson, composed };
+    for ([_]Route{ .table, .global, .ndjson, .composed }) |route| {
+        for ([_]bool{ false, true }) |disconnected| {
+            var request = try httpx.Request.init(a, .POST, if (route == .global or route == .composed) "http://node/db/v1/query" else "http://node/db/v1/tables/docs/query");
+            defer request.deinit();
+            request.body = switch (route) {
+                .global => "{\"table\":\"docs\"}",
+                .composed => "{\"source\":{\"union\":[{\"table\":\"docs\"},{\"table\":\"docs\"}]},\"source_ranking\":\"rrf\"}",
+                else => "{}",
+            };
+            if (route == .ndjson) try request.setHeader("content-type", "application/x-ndjson");
+            var ctx = httpx.Context.init(a, std.testing.io, &request);
+            defer ctx.deinit();
+            var listener = std.atomic.Value(bool).init(disconnected);
+            ctx.cancellation = &listener;
+            // No socket has disconnected in the expiry case. Only the
+            // ingress budget ends, before native catalog admission begins.
+            if (!disconnected) ctx.application_deadline_ns = 0;
+            var response = if (route == .global or route == .composed) try handler.globalQuery(&ctx) else try handler.queryTable(&ctx, "docs");
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, if (disconnected) 499 else 504), response.status.code);
+            if (!disconnected) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqualStrings("query_timeout", parsed.value.object.get("code").?.string);
+                try std.testing.expect(parsed.value.object.get("retryable").?.bool);
+            }
+        }
+    }
+}
+
+test "public execution request cancellation retains foreign checkpoints without probing them" {
+    const abi = @import("antfly_runtime_abi");
+    const Foreign = struct {
+        fn dispatch(_: *const abi.native_abi.CallContract, _: *const anyopaque, _: *const anyopaque, _: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+            return abi.error_abi.statusFromError(error.DeadlineExceeded);
+        }
+        fn forbidden(_: *const anyopaque) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn probe(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    var state: u8 = 0;
+    var cancellation = http_common.RequestCancellation.fromToken(.{
+        .ptr = &state,
+        .is_cancelled_fn = Foreign.probe,
+        .check_fn = Foreign.forbidden,
+        .check_dispatch = Foreign.dispatch,
+    });
+    try std.testing.expect(!cancellation.isCancelled());
+    try std.testing.expectError(error.DeadlineExceeded, cancellation.token().check());
+    const operation: operation_contract.RequestContext = .{ .cancellation = cancellation.token() };
+    // A transport probe must not execute the fallible foreign checkpoint.
+    try std.testing.expect(!operation.isCancellationRequested());
+    const guard: @import("../serverless/api/http_types.zig").RequestGuard = .{ .context = operation };
+    try std.testing.expect(!guard.token().isCancelled());
+    try std.testing.expectError(error.DeadlineExceeded, guard.token().check());
+    try std.testing.expectError(error.DeadlineExceeded, operation.ensureActive());
+    cancellation.cancel();
+    try std.testing.expect(cancellation.isCancelled());
+    try std.testing.expectError(error.Canceled, cancellation.token().check());
 }
 
 test "public execution SQL budgets can only tighten engine limits" {
@@ -21316,6 +21809,52 @@ test "httpx inference gateway document jobs persist before dispatch and publish 
     var submitted_json = try std.json.parseFromSlice(std.json.Value, a, submitted.body.?, .{});
     defer submitted_json.deinit();
     try store.cancel(work, submitted_json.value.object.get("id").?.string, "anonymous");
+
+    // Job submission shares synchronous read planning, including namespaces
+    // that collide, hosted leaves, caller overrides and recognition defaults.
+    try config.readers.registerConfig("same", .{ .provider = .antfly, .model = "ocr-backend" });
+    try config.transcribers.registerConfig("same", .{ .provider = .antfly, .model = "whisper-backend", .language_code = "fr", .timestamps = true });
+    try config.registry.registerGeneratorConfig("same", .{ .provider = .antfly, .model = "gemma-backend", .url = "" });
+    try config.transcribers.registerConfig("hosted", .{ .provider = .openai, .model = "whisper-1", .language_code = "fr", .timestamps = true, .max_total_tokens = 100 });
+    const Case = struct { selector: []const u8, backend: []const u8, connection: []const u8, language: bool = false };
+    for ([_]Case{
+        .{ .selector = "readers/same", .backend = "ocr-backend", .connection = "readers/same" },
+        .{ .selector = "transcribers/same", .backend = "whisper-backend", .connection = "transcribers/same", .language = true },
+        .{ .selector = "generators/same", .backend = "gemma-backend", .connection = "generators/same" },
+        .{ .selector = "transcribers/hosted", .backend = "transcribers/hosted", .connection = common_config.local_inference_connection_id, .language = true },
+    }, 0..) |case, index| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/read/jobs");
+        defer request.deinit();
+        const body = try std.json.Stringify.valueAlloc(a, .{ .request = .{
+            .model = case.selector,
+            .audio = "AAAA",
+            .audio_options = .{ .timestamps = false, .diarization = false },
+        } }, .{});
+        defer a.free(body);
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.documentReadCreate(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 202), response.status.code);
+        const status = try std.json.parseFromSliceLeaky(std.json.Value, work, response.body.?, .{});
+        const job_id = status.object.get("id").?.string;
+        const queued = try store.load(work, job_id, "anonymous");
+        try std.testing.expectEqualStrings(case.connection, queued.connection);
+        const saved = try store.read(work, queued.inputs[0], 1024 * 1024);
+        const effective = try std.json.parseFromSliceLeaky(std.json.Value, work, saved, .{});
+        try std.testing.expectEqualStrings(case.backend, effective.object.get("model").?.string);
+        const options = effective.object.get("audio_options").?.object;
+        try std.testing.expect(!options.get("timestamps").?.bool);
+        try std.testing.expect(!options.get("diarization").?.bool);
+        if (case.language) try std.testing.expectEqualStrings("fr", options.get("language").?.string);
+        try server.scheduleDocumentsOnce();
+        const expected = index + 2;
+        const deadline = research_jobs.nowMillis() + 5000;
+        while (target.calls.load(.acquire) < expected and research_jobs.nowMillis() < deadline) try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+        try std.testing.expectEqual(expected, target.calls.load(.acquire));
+        try std.testing.expectEqual(.succeeded, (try store.load(work, job_id, "anonymous")).state);
+    }
 }
 
 test "httpx inference gateway typed consumers retain errors and legacy original array positions" {
@@ -21733,4 +22272,112 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     const completion = try AntflyApiHandler.requestCompletion(&ctx);
     try std.testing.expect(!completion.unknown and completion.outcomes.items.len == 1);
     try std.testing.expect(!try @import("sql_completion.zig").settled(&api, a, .{ .outcomes = completion.outcomes.items }, .{}));
+}
+
+test "distributed SQL API worker RPC requires signed service authority even during legacy migration" {
+    const a = std.testing.allocator;
+    const secret = "0123456789abcdef0123456789abcdef";
+    var api = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "sql-workers", .internal_service_accept_legacy_unauthenticated = true }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer api.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api };
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "sql-workers" }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    const ticket = try std.json.Stringify.valueAlloc(a, @import("../serverless/sql/plan.zig").Ticket{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 }, .stage = 0, .task = 0 }, .{});
+    defer a.free(ticket);
+    for ([_]?[]const u8{ null, "invalid", token }, 0..) |credential, index| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/sql/tasks/execute");
+        defer request.deinit();
+        request.body = ticket;
+        if (credential) |value| try request.headers.set(internal_service_auth.header_name, value);
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.internalSqlTask(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, if (index == 2) 503 else 403), response.status.code);
+    }
+}
+
+test "distributed SQL API control routes authenticate cancellation and share terminal status semantics" {
+    const a = std.testing.allocator;
+    const transport = @import("../serverless/sql/transport.zig");
+    const runtime = @import("../serverless/sql/runtime.zig");
+    const state = @import("../serverless/sql/state.zig");
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    const now: u64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+    const query: state.Query = .{ .id = @splat('b'), .expires_ms = now + 60000 };
+    const tenant: state.Digest = @splat('a');
+    const store: state.Store = .{ .client = memory.client(), .bucket = "queries", .prefix = "sql", .now_ms = now, .tenant = tenant };
+    const key = try store.key(a, query, null, 0);
+    defer a.free(key);
+    try store.create(a, key, query.id, query.expires_ms);
+    const Fixture = struct {
+        store: state.Store,
+        fn open(raw: *anyopaque, alloc: std.mem.Allocator, scope: state.Digest, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context) !runtime.Service {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .a = alloc, .state_store = self.store, .exchange_store = undefined, .tenant = scope, .role = .query_only, .owner = "test", .context = context, .source = undefined, .retention = undefined };
+        }
+        fn dispatch(_: *anyopaque, _: []const @import("../serverless/sql/plan.zig").Ticket, _: @import("antfly_local_sources").serverless_query_lake_read_context.Context) !void {}
+    };
+    var fixture: Fixture = .{ .store = store };
+    const secret = "0123456789abcdef0123456789abcdef";
+    var api = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "sql-workers", .internal_service_accept_legacy_unauthenticated = true, .distributed_sql = .{ .ptr = &fixture, .open = Fixture.open, .dispatcher = .{ .ptr = &fixture, .dispatch = Fixture.dispatch } } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer api.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api };
+    var server = httpx.Server.init(a, std.testing.io);
+    defer server.deinit();
+    try handler.registerInternalSqlRoutes(&server);
+    var params: [16]httpx.RouteParam = undefined;
+    for ([_][]const u8{ transport.submit_path, transport.turn_path, transport.result_path, transport.cancel_path, transport.task_path }) |path| try std.testing.expect(server.router.find(.POST, path, &params) != null);
+    const route = server.router.find(.POST, transport.cancel_path, &params).?;
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "sql-workers" }, @intCast(now / 1000));
+    defer a.free(token);
+    const body = try std.json.Stringify.valueAlloc(a, transport.QueryRequest{ .tenant = tenant, .query = query }, .{});
+    defer a.free(body);
+    for ([_]?[]const u8{ null, "invalid", token }, 0..) |credential, index| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/sql/queries/cancel");
+        defer request.deinit();
+        request.body = body;
+        if (credential) |value| try request.headers.set(internal_service_auth.header_name, value);
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try route.handler.invoke(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, if (index == 2) 200 else 403), response.status.code);
+        var record = (try store.load(a, key)).?;
+        defer record.deinit(a);
+        try std.testing.expectEqual(index == 2, record.value.cancel_requested);
+    }
+    // Structurally decodable but invalid scalar IR must fail before retention.
+    const plan = @import("../serverless/sql/plan.zig");
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('a'), .snapshot = "1", .wal_cut = 0, .cut = "cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 1, .estimated_rows = 1, .splits = 1 };
+    const malformed: plan.Plan = .{ .tenant = tenant, .expires_ms = now + 60000, .left = input, .right = input, .join = .{ .left_keys = &.{0}, .right_keys = &.{0}, .condition = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .call = .{ .function = .is_missing, .args = &.{} } } }}, .root = 0, .output = .{ .kind = .boolean } } }, .strategy = .broadcast, .partitions = 1, .limits = .{} };
+    const malformed_body = try malformed.encode(a);
+    defer a.free(malformed_body);
+    const before_invalid = memory.operationCount();
+    for ([_][]const u8{ malformed_body, "{", "{}" }) |invalid| {
+        var invalid_request = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/sql/queries/submit");
+        defer invalid_request.deinit();
+        invalid_request.body = invalid;
+        try invalid_request.headers.set(internal_service_auth.header_name, token);
+        var invalid_context = httpx.Context.init(a, std.testing.io, &invalid_request);
+        defer invalid_context.deinit();
+        var invalid_response = try server.router.find(.POST, transport.submit_path, &params).?.handler.invoke(&invalid_context);
+        defer invalid_response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), invalid_response.status.code);
+    }
+    try std.testing.expectEqual(before_invalid, memory.operationCount());
+    // The API must return authoritative failure to gateway routing rather than
+    // quarantine a healthy worker as though it had returned a provider error.
+    const claim = (try store.claim(a, key, "test", 60000)).?;
+    try store.terminate(a, key, claim, .failed, "TaskFailed");
+    var request = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/sql/queries/result");
+    defer request.deinit();
+    request.body = body;
+    try request.headers.set(internal_service_auth.header_name, token);
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try server.router.find(.POST, transport.result_path, &params).?.handler.invoke(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 409), response.status.code);
 }

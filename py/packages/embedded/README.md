@@ -105,8 +105,8 @@ Each call takes the request JSON and returns the response JSON of the
 matching `/ai/v1` route of the Antfly inference HTTP API: `embed()`,
 `rerank()`, `chunk()`, `generate()`, `generate_batch()` (up to 128
 non-streaming requests per call; per-item failures are reported in the
-response, not raised), `rewrite()`, `decide()`, `extract()`, `read()` (OCR),
-`transcribe()`, and `list_models()`. Requests accept the same `dict` / `str`
+response, not raised), `rewrite()`, `decide()`, `extract()`, `read()` (documents, images, audio),
+and `list_models()`. Requests accept the same `dict` / `str`
 / `bytes` JSON forms as `Database` methods, and responses honor the same
 `raw=True` convention. `generate()` and `generate_batch()` requests always
 return complete responses; `"stream": true` raises `InvalidArgumentError`
@@ -295,7 +295,7 @@ inventory; retry until it is `true` or your own deadline expires.
   select the destination kind).
 - **Embedded inference (no database)**: `Inference.open()`, `embed()`,
   `rerank()`, `chunk()`, `generate()`, `generate_stream()`,
-  `generate_batch()`, `rewrite()`, `decide()`, `extract()`, `read()`, `transcribe()`,
+  `generate_batch()`, `rewrite()`, `decide()`, `extract()`, `read()` (documents, images, audio),
   `list_models()`, `pull()` (with a `PullProgress` dataclass for progress
   callbacks; both `pull()` and `generate_stream()` accept a callback that
   can cancel the call by returning `False`). See "Embedded inference (no
@@ -310,6 +310,16 @@ inventory; retry until it is `true` or your own deadline expires.
   `OutcomeUnknownError`, `UnsupportedError`, `StalledError`,
   `CancelledError`, `InternalError`. Unrecognized codes raise `AntflyError`
   directly.
+- **Outcome receipts**: when `batch()`, `batch_json()`, or an autocommit
+  `sql()` write fails with ANTFLY_OUTCOME_UNKNOWN, the `OutcomeUnknownError`
+  (or `SQLStateError`, and the DB-API error mapped from either) carries
+  `.outcome_receipt` (`None` when the call issued none). Resolve it on any
+  handle for the same database with `db.outcome_receipt_status(receipt)`,
+  which returns `OutcomeReceiptStatus.APPLIED` or `.NOT_APPLIED`, or raises
+  `StalledError` while the uncertain commit is not reconciled yet (Lite:
+  retry; directory database: close the issuing handle and reopen first).
+  Call `db.forget_outcome_receipt(receipt)` once resolved; afterwards it can
+  no longer be resolved.
 
 `create()` provisions the default `full_text_index_v0` full-text index,
 matching the server's table-create behavior, so `add_index()` is only

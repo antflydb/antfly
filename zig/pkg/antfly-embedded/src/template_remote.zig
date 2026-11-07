@@ -67,6 +67,7 @@ const RenderContext = struct {
     cancellation: ?scraping.CancellationToken = null,
     remote_bytes_remaining: u64,
     max_media_parts: ?usize = null,
+    retry_hint: ?RetryHintObserver = null,
     emitted_media_parts: usize = 0,
     fatal_error: ?FatalRenderError = null,
 
@@ -124,6 +125,7 @@ fn pdfBytesForHelper(arena: Allocator, render_ctx: *RenderContext, bytes: []cons
         },
     };
 }
+pub const RetryHintObserver = @import("template_inspection.zig").RetryHintObserver;
 
 pub const RenderConfig = struct {
     /// Optional explicit backend override (including source-only test backends).
@@ -139,6 +141,7 @@ pub const RenderConfig = struct {
     /// transport it invokes.
     cancellation: ?scraping.CancellationToken = null,
     max_media_parts: ?usize = null,
+    retry_hint: ?RetryHintObserver = null,
 };
 
 pub const default_remote_fetch_max_download_size_bytes: u64 = 100 * 1024 * 1024;
@@ -237,6 +240,7 @@ pub fn renderJsonToTextWithConfig(
         .cancellation = config.cancellation,
         .remote_bytes_remaining = try remoteByteBudget(config.remote_content),
         .max_media_parts = config.max_media_parts,
+        .retry_hint = config.retry_hint,
     };
     try ensureRenderActive(&render_ctx);
 
@@ -568,6 +572,11 @@ fn credentialName(ctx: hbs.HelperContext) !?[]const u8 {
 }
 
 fn formatRemoteFetchErrorDirective(alloc: Allocator, err: anyerror) ![]const u8 {
+    // Preserve the transport's retry disposition when Handlebars requires an
+    // error directive. Report transient transport failures explicitly as
+    // unavailable while preserving the original cause in the directive.
+    if (httpx.isRetryableTransportError(err))
+        return template_mod.formatErrorDirective(alloc, 503, @errorName(err));
     return switch (err) {
         error.StreamTooLong => try template_mod.formatErrorDirective(alloc, 413, @errorName(err)),
         error.InvalidGcsUrl => try template_mod.formatErrorDirective(alloc, 400, @errorName(err)),
@@ -648,6 +657,12 @@ fn chargeDownloadOutcome(
         return error.StreamTooLong;
     }
     render_ctx.remote_bytes_remaining -= downloaded_bytes;
+    if (outcome == .http_error) {
+        const failure = outcome.http_error;
+        if (failure.status == 408 or failure.status == 425 or failure.status == 429 or (failure.status >= 500 and failure.status <= 599)) {
+            if (render_ctx.retry_hint) |observer| if (failure.retry_after_ms) |milliseconds| observer.note(milliseconds);
+        }
+    }
 }
 
 fn remoteFetchDownloadContext(
@@ -817,6 +832,7 @@ pub fn downloadRemoteContentOutcomeAllocWithRenderConfig(
         .cancellation = config.cancellation,
         .remote_bytes_remaining = try remoteByteBudget(config.remote_content),
         .max_media_parts = config.max_media_parts,
+        .retry_hint = config.retry_hint,
     };
     try ensureRenderActive(&render_ctx);
     return try downloadRemoteContentOutcomeAlloc(&render_ctx, url, credential_name);
@@ -1572,19 +1588,30 @@ test "explicit credential and invalid credential inputs render permanent 403 fai
 }
 
 test "HTTP error bodies consume the aggregate render byte budget" {
+    const Hint = struct {
+        value: u64 = 0,
+        fn note(ptr: *anyopaque, _: u64, milliseconds: u64, _: ?[32]u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.value = @max(self.value, milliseconds);
+        }
+    };
+    var hint = Hint{};
     var render_ctx = RenderContext{
         .alloc = std.testing.allocator,
         .pdf_backend = pdf_mod.Backend.system(),
         .remote_bytes_remaining = 4,
+        .retry_hint = .{ .ptr = &hint, .note_fn = Hint.note },
     };
     const error_outcome = scraping.DownloadOutcome{ .http_error = .{
         .status = 500,
         .message = "remote fetch failed",
         .downloaded_bytes = 2,
+        .retry_after_ms = 1250,
     } };
     try chargeDownloadOutcome(&render_ctx, error_outcome, 4);
     try chargeDownloadOutcome(&render_ctx, error_outcome, 2);
     try std.testing.expectEqual(@as(u64, 0), render_ctx.remote_bytes_remaining);
+    try std.testing.expectEqual(@as(u64, 1250), hint.value);
 
     render_ctx.remote_bytes_remaining = 4;
     const oversized_error = scraping.DownloadOutcome{ .http_error = .{
@@ -2406,4 +2433,19 @@ const compiled_pdf_tests = if (@hasDecl(@import("build_options"), "shared_pdf_te
 
 test {
     _ = compiled_pdf_tests;
+}
+
+test "remote fetch transport failures retain retryability through template directives" {
+    const a = std.testing.allocator;
+    for ([_]anyerror{ error.UnexpectedEof, error.ConnectionResetByPeer, error.ConnectionClosed, error.NameServerFailure }) |failure| {
+        const directive = try formatRemoteFetchErrorDirective(a, failure);
+        defer a.free(directive);
+        try std.testing.expect(std.mem.indexOf(u8, directive, @errorName(failure)) != null);
+        try std.testing.expectError(error.TransientPromptFailure, validateRenderedTemplate(a, directive));
+    }
+    for ([_]anyerror{ error.PathNotAllowed, error.HttpCredentialNotFoundOrOutOfScope, error.InvalidGcsUrl, error.StreamTooLong }) |failure| {
+        const directive = try formatRemoteFetchErrorDirective(a, failure);
+        defer a.free(directive);
+        try std.testing.expectError(error.PermanentPromptFailure, validateRenderedTemplate(a, directive));
+    }
 }

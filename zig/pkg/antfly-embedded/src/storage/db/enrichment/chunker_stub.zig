@@ -28,6 +28,16 @@ pub fn chunkText(
     chunk_size: u32,
     chunk_overlap: u32,
 ) ![]Chunk {
+    return chunkTextMinimumContent(alloc, text, chunk_size, chunk_overlap, 0);
+}
+
+fn chunkTextMinimumContent(
+    alloc: Allocator,
+    text: []const u8,
+    chunk_size: u32,
+    chunk_overlap: u32,
+    min_chars: u32,
+) ![]Chunk {
     if (chunk_size == 0) return &.{};
     if (chunk_overlap >= chunk_size) return error.InvalidChunkOverlap;
 
@@ -51,16 +61,18 @@ pub fn chunkText(
         const backward_end = utf8_text.snapToBoundary(source_text, raw_end, .backward);
         const end = if (backward_end > start) backward_end else utf8_text.snapToBoundary(source_text, raw_end, .forward);
         if (end <= start) break;
-        // Reserve the destination before allocating its owned payload. A
-        // failed list growth must not strand the text outside cleanup's slice.
-        try chunks.ensureUnusedCapacity(alloc, 1);
-        chunks.appendAssumeCapacity(.{
-            .chunk_id = chunk_id,
-            .text = try alloc.dupe(u8, source_text[start..end]),
-            .start_offset = mapOffset(&sanitized, start, .start),
-            .end_offset = mapOffset(&sanitized, end, .end),
-        });
-        chunk_id += 1;
+        if (@import("inference_chunker").types.hasMinimumTextContent(source_text[start..end], min_chars)) {
+            // Reserve the destination before allocating its owned payload. A
+            // failed list growth must not strand the text outside cleanup's slice.
+            try chunks.ensureUnusedCapacity(alloc, 1);
+            chunks.appendAssumeCapacity(.{
+                .chunk_id = chunk_id,
+                .text = try alloc.dupe(u8, source_text[start..end]),
+                .start_offset = mapOffset(&sanitized, start, .start),
+                .end_offset = mapOffset(&sanitized, end, .end),
+            });
+            chunk_id += 1;
+        }
         if (end == source_text.len) break;
         const previous_start = start;
         const raw_next = previous_start + step;
@@ -89,18 +101,20 @@ pub fn chunkTextWithConfigJson(
     const source_text = sanitized.text;
 
     const chunks = try switch (cfg.provider) {
-        .mock => chunkText(
+        .mock => chunkTextMinimumContent(
             alloc,
             source_text,
             cfg.defaultedTargetTokens(),
             cfg.defaultedOverlapTokens(),
+            cfg.text.min_chars,
         ),
         .antfly => if (cfg.model.len == 0)
-            chunkText(
+            chunkTextMinimumContent(
                 alloc,
                 source_text,
                 cfg.defaultedTargetTokens(),
                 cfg.defaultedOverlapTokens(),
+                cfg.text.min_chars,
             )
         else
             error.UnsupportedPlatform,

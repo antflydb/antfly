@@ -87,7 +87,7 @@ fn scopeDomain(table: u64, identity: [32]u8) [32]u8 {
     return result;
 }
 fn cutDigest(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay) ![32]u8 {
-    const bytes = try std.json.Stringify.valueAlloc(a, .{ .table = table.table_id, .generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .publication = publication.generation, .source = publication.signature.source, .format = "partitioned-recent-vectors-v3", .key_identity = overlay.pending.key_identity, .cut = overlay.contentIdentity() }, .{});
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ .table = table.table_id, .generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .publication = publication.generation, .source = publication.signature.source, .format = "partitioned-recent-vectors-v3", .cut = overlay.contentIdentity() }, .{});
     defer a.free(bytes);
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(bytes, &digest, .{});
@@ -110,7 +110,7 @@ pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publicati
     // completed composition proves coverage of the actual table cut.
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
-    const aggregate_key = @import("lake_wal_image.zig").digest(.{ .format = "recent-vector-composed-status-v1", .store = store.identity, .cut = try cutDigest(scratch.allocator(), table, publication, overlay), .lsn = overlay.pending.lsn });
+    const aggregate_key = @import("lake_wal_image.zig").digest(.{ .format = "recent-vector-composed-status-v1", .store = store.cache_identity, .cut = try cutDigest(scratch.allocator(), table, publication, overlay), .lsn = overlay.pending.lsn });
     if (memo) |cache| if (try cache.get(scratch.allocator(), aggregate_key, cut_expires_ms)) |_| return prepared;
     const observed = try publishStatus(a, table, publication, overlay, store, context, .ready, cut_expires_ms, aggregate);
     if (observed) if (memo) |cache| cache.put(aggregate_key, .{ .declarations = &.{} }, aggregate.until_ms);
@@ -137,7 +137,7 @@ fn preparePartitions(a: A, table: local.common_topology_records.TableRecord, pub
         var end = start + 1;
         while (end < parts.len and parts[end].prefix >> 8 == prefix) : (end += 1) {}
         var hash = std.crypto.hash.Blake3.init(.{});
-        var subset: overlay_api.Overlay = .{ .pending = .{ .key_identity = overlay.pending.key_identity, .lsn = 0, .key_fields = overlay.pending.key_fields }, .rows = overlay.rows.subset(prefix), .key_filter = "" };
+        var subset: overlay_api.Overlay = .{ .pending = .{ .lsn = 0, .key_fields = overlay.pending.key_fields }, .rows = overlay.rows.subset(prefix), .key_filter = "" };
         for (parts[start..end]) |part| {
             var number: [2]u8 = undefined;
             std.mem.writeInt(u16, &number, part.prefix, .big);
@@ -160,7 +160,7 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
     const scratch = arena.allocator();
     const cut = try cutDigest(scratch, table, publication, overlay);
     var cache_hash = std.crypto.hash.Blake3.init(.{});
-    cache_hash.update(&store.identity);
+    cache_hash.update(&store.cache_identity);
     cache_hash.update(&cut);
     var cache_key: [32]u8 = undefined;
     cache_hash.final(&cache_key);
@@ -535,16 +535,8 @@ pub fn collect(store: *Store, table: u64, context: Context) !void {
     try @import("lake_expiring_objects.zig").collect(std.heap.smp_allocator, store, table, "recent-search", context);
     try @import("lake_expiring_objects.zig").collect(std.heap.smp_allocator, store, table, "row-enrichment", context);
     var artifacts = store.artifactStore();
-    const Visitor = struct {
-        store: *stores.ArtifactStore,
-        fn visit(raw: *anyopaque, _: stores.UploadScope, id: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.store.delete(id);
-        }
-    };
-    var visitor: Visitor = .{ .store = &artifacts };
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
-    try artifacts.visitScopedUploads(scopeDomain(table, store.identity), .{ .ptr = &visitor, .visit = Visitor.visit, .fencing_cutoff = now -| 30_000, .max_entries = 128 }, cancellation(context));
+    try @import("lake_cleanup_budget.zig").collectExpiredScopes(&artifacts, scopeDomain(table, store.identity), now -| 30_000, @import("lake_cleanup_budget.zig").contextToken(&context));
 }
 
 test "external lake bounded WAL interrupted enrichment claims release conditionally without replacing a newer worker" {

@@ -1688,6 +1688,26 @@ pub const ComputeBackend = struct {
     /// `forwardWithControl` entry point.
     execution_control: ?InferenceExecutionControl = null,
     embedding_stage: ?*const EmbeddingStageControl = null,
+    /// Cooperative GPU handles bind their request budget only while owning
+    /// the model step mutex. The shared compute never retains an idle peer's
+    /// pointer, and retiring one handle cannot unbind another active peer.
+    execution_budget: ?*runtime.tier.memory.RunBudget = null,
+    execution_budget_bind: ?*const fn (*anyopaque, ?*runtime.tier.memory.RunBudget) void = null,
+    /// Only an execution scope transitions a shared backend under its mutex.
+    execution_owner: u64 = 0,
+    execution_batch_rows: ?*const fn (*anyopaque, usize) void = null,
+    execution_batch_drain: ?*const fn (*anyopaque) anyerror!void = null,
+    execution_enter: ?*const fn (*anyopaque, u64) anyerror!void = null,
+    execution_cleanup: ?*const fn (*anyopaque, u64) void = null,
+    execution_release: ?*const fn (*anyopaque, u64) void = null,
+
+    pub fn bindExecutionBudget(self: *const ComputeBackend) void {
+        if (self.execution_budget_bind) |bind| bind(self.ptr, self.execution_budget);
+    }
+
+    pub fn clearExecutionBudget(self: *const ComputeBackend) void {
+        if (self.execution_budget_bind) |bind| bind(self.ptr, null);
+    }
 
     pub fn checkExecutionControl(self: *const ComputeBackend) !void {
         if (self.execution_control) |control| try control.check();
@@ -2232,6 +2252,7 @@ pub const ComputeBackend = struct {
         packedQkvRope: ?*const fn (ctx: *anyopaque, input: CT, positions: CT, hidden: usize, head_dim: usize, theta: f32) anyerror!?SplitLastDim3Result = null,
         ensureDeviceResident: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?CT = null,
         conv1dIm2col: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, in_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize, time_major: bool) anyerror!?CT = null,
+        whisperPrepareCrossKv: ?*const fn (ctx: *anyopaque, k: CT, v: CT) anyerror!?LinearNoBiasPairResult = null,
         whisperLogitsStatsEncode: ?*const fn (ctx: *anyopaque, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) anyerror!bool = null,
         whisperLogitsStatsRead: ?*const fn (ctx: *anyopaque, slot: usize, out: *WhisperLogitsStatsRaw) bool = null,
         whisperGrammarWrite: ?*const fn (ctx: *anyopaque, state: *const WhisperGrammarState) bool = null,
@@ -4248,6 +4269,13 @@ pub const ComputeBackend = struct {
 
     pub fn packedQkvRope(self: *const ComputeBackend, input: CT, positions: CT, hidden: usize, head_dim: usize, theta: f32) !?SplitLastDim3Result {
         if (self.vtable.packedQkvRope) |f| return f(self.ptr, input, positions, hidden, head_dim, theta);
+        return null;
+    }
+
+    /// Return new immutable, backend-preferred cross-attention caches.
+    /// Inputs remain owned by the caller; null retains their current format.
+    pub fn whisperPrepareCrossKv(self: *const ComputeBackend, k: CT, v: CT) !?LinearNoBiasPairResult {
+        if (self.vtable.whisperPrepareCrossKv) |f| return f(self.ptr, k, v);
         return null;
     }
 

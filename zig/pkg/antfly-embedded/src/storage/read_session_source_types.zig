@@ -49,3 +49,5 @@ pub const document_projection = @import("document_projection.zig");
 pub const value_ranges = @import("value_ranges.zig");
 
 pub const snapshot_admission = @import("db/snapshot_admission.zig");
+
+pub const privacy_read = @import("db/privacy_read.zig");

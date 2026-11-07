@@ -684,6 +684,13 @@ Antfly Lite should match the familiar embedded database model:
 - Serialized threading within a process: one handle may be shared by any
   number of threads, with reads running in parallel and alongside writes. See
   `CAPI.md` "Thread Safety" for the per-call access classes.
+- Background full-text replay holds the writer lease only briefly. One journal
+  record can carry about a thousand changed documents; bounded replay applies
+  it in subchunks (`ANTFLY_LITE_FULL_TEXT_REPLAY_SUBCHUNK_ITEMS`, default 128)
+  and, once a turn exceeds its quantum (`ANTFLY_LITE_FULL_TEXT_REPLAY_QUANTUM_MS`,
+  default 100), publishes the applied prefix, records a durable resume point
+  `(sequence, offset)` and continues the record on the next turn. The record's
+  sequence is marked applied only when all of its items are.
 
 The CLI should expose this plainly:
 
@@ -1244,11 +1251,37 @@ warm updates hash changed chunks and bounded trie paths, and a cold ledger load
 constructs the cache once. Sealing adds no catalog allocation or durability barrier.
 Pending-retirement maps periodically rehash after removals during retirement
 service and journal replay, amortized over prior removals.
-Contended path leases join a cancelable kernel lock wait using a bounded,
-owner-scoped executor. Missing read-only sidecars and executor exhaustion retain
-short randomized retries, capped at four milliseconds. The configured busy
-timeout bounds contention waiting; an expired deadline still permits an immediate
-uncontended acquisition after a successful detached proof.
+Writers take the path lease in first-come-first-served order across processes.
+A kernel `flock` queue has no ordering, so a writer that releases and retries at
+once tends to win again and can starve the others. A `<sidecar>.q/` directory
+holds a CLH-style queue: each waiter holds an exclusive `flock` on its own
+`t-<ticket>` file and blocks only on the ticket directly ahead of it, so each
+release wakes one process. When `<sidecar>.q` would exceed the 255-byte name
+limit, the directory is named from a prefix of the sidecar name plus a hash.
+A crashed waiter or holder drops its ticket lock and
+the next ticket proceeds. Abandoned tickets (busy timeout expired) are skipped.
+The ticket counter carries a check value, so a torn write is detected and the
+counter rebuilt from the ticket files rather than read as a smaller number.
+Each grant deletes finished tickets below it, including those left by a holder
+that crashed mid-cleanup, so the directory holds only recent tickets.
+When nothing is queued, a writer takes the sidecar without a ticket. The sidecar
+`flock` remains the safety authority. Code or binaries that bypass the queue can
+delay a queued writer but cannot break exclusion. Background maintenance waits in
+the same queue, and nonblocking internal attempts refuse while anyone is queued.
+Read-only connections keep using shared sidecar locks and are not queued.
+
+The configured busy timeout is a total admission-waiting budget for one exported
+call. Re-entries after inference (resolve-query, memory) get only what remains,
+and waiting for another thread's allocator proof counts against the same budget.
+Active work is excluded: SQL preparation, the call's own proof walk, and work
+between suspension and resumption. An expired deadline still permits an
+immediate uncontended acquisition after a successful detached proof. See
+`CAPI.md` for the lease timing counters.
+
+When a call finishes while another thread of the same process is queued for the
+path gate, the lease passes to that thread without being released. A chain of
+such handoffs ends after 50 ms, or after 20 ms once a writer in another process
+has queued. The gate closes a kept lease as soon as nobody is waiting for it.
 
 A persistent `.aflite-maintenance-<path-hash>.lock` sidecar coordinates background
 turns across processes. Unverified index-runtime opens and detached proof admission

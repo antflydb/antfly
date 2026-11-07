@@ -34,7 +34,16 @@ type S3Config struct {
 	ExcludePatterns []string `json:"exclude_patterns,omitempty"`
 	MaxObjects      int      `json:"max_objects,omitempty"`
 }
-type S3Connector struct{ Client *minio.Client }
+type S3Connector struct {
+	Client    *minio.Client
+	transport interface{ CloseIdleConnections() }
+}
+
+func (c *S3Connector) CloseIdleConnections() {
+	if c.transport != nil {
+		c.transport.CloseIdleConnections()
+	}
+}
 
 func (c *S3Connector) Validate(_ context.Context, r Request) error {
 	cfg, err := decodeSourceConfig[S3Config](r.Config)
@@ -95,7 +104,7 @@ func (c *S3Connector) Enumerate(ctx context.Context, r Request) (Inventory, erro
 			return fmt.Errorf("invalid S3 revision or size")
 		}
 		uri := canonicalS3URI(cfg.Bucket, info.Key)
-		out.Objects = append(out.Objects, Item{ID: "s3://" + strings.Trim(r.SourceNamespace, "/") + "/" + cfg.Bucket + "/" + info.Key, Path: info.Key, Filename: filepath.Base(info.Key), Revision: rev, URL: uri, Size: info.Size, SourceKind: ProviderS3, ReadMode: sourceReadBytes, ObjectIndex: len(out.Objects) + 1, Metadata: map[string]any{"source_namespace": r.SourceNamespace, "bucket": cfg.Bucket, "key": info.Key, "etag": rev, "size": info.Size, "version_id": info.VersionID}})
+		out.Objects = append(out.Objects, Item{ID: "s3://" + strings.Trim(r.SourceNamespace, "/") + "/" + cfg.Bucket + "/" + info.Key, Path: info.Key, Filename: filepath.Base(info.Key), Revision: rev, URL: uri, Size: info.Size, SourceKind: ProviderS3, ReadMode: sourceReadBytes, ObjectIndex: len(out.Objects) + 1, Metadata: map[string]any{"source_namespace": r.SourceNamespace, "bucket": cfg.Bucket, "key": info.Key, "etag": rev, "size": info.Size, "version_id": info.VersionID, "mime_type": info.ContentType}})
 		return nil
 	}
 	if cfg.Key != "" {
@@ -235,7 +244,7 @@ func validateS3Response(o Item, info minio.ObjectInfo) error {
 	// the replacement happens to have the same ETag and size. The literal S3
 	// version ID "null" is retained and sent explicitly like any other ID.
 	if info.VersionID != version {
-		return fmt.Errorf("S3 version changed: expected %q, got %q; enumerate a fresh snapshot", version, info.VersionID)
+		return &RevisionChangedError{Expected: version, Actual: info.VersionID}
 	}
 	if strings.Trim(info.ETag, `"`) != o.Revision || info.Size != o.Size {
 		return &RevisionChangedError{Expected: o.Revision, Actual: strings.Trim(info.ETag, `"`)}
