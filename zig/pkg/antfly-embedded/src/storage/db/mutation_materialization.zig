@@ -4114,11 +4114,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         batch.deleted_keys,
                     );
                     defer freeOwnedKeySlice(ctx.alloc, replay_delete_keys);
-                    try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, replay_delete_keys, batch_options);
                     // As in dense replay, caller-owned vectors change only through
                     // explicit artifact mutations, never an unrelated source edit.
                     const external = ctx.index_manager.sparseIndexUsesExternalCoverage(index_ref.name);
-                    if (!external) try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
+                    // These two key sets used to cost one native commit each
+                    // (both delete-only, nothing observable happens between
+                    // them but the `external` read above): combined into one
+                    // deleteSparseBatchByNameWithOptions call.
+                    if (!external and batch.overwritten_doc_keys.len > 0) {
+                        const combined_delete_keys = try ctx.alloc.alloc([]const u8, replay_delete_keys.len + batch.overwritten_doc_keys.len);
+                        defer ctx.alloc.free(combined_delete_keys);
+                        for (replay_delete_keys, 0..) |key, i| combined_delete_keys[i] = key;
+                        for (batch.overwritten_doc_keys, 0..) |key, i| combined_delete_keys[replay_delete_keys.len + i] = key;
+                        try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, combined_delete_keys, batch_options);
+                    } else {
+                        try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, replay_delete_keys, batch_options);
+                    }
                     if (!ctx.projection_only) {
                         try deleteDerivedCoverageForDocKeysWithPlan(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, if (external) replay_delete_keys else batch.deleted_keys, coverage_plan);
                         if (ctx.index_manager.sparseIndexUsesManagedDirectField(index_ref.name)) {

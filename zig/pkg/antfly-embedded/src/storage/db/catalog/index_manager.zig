@@ -33121,45 +33121,42 @@ pub const IndexManager = struct {
             if (profile_enabled) profile.artifact_decode_ns = platform_time.monotonicNs() - decode_start_ns;
             if (unreadable_artifact_keys.items.len > 0) return error.ArtifactRepairRequired;
 
-            if (delete_keys.items.len > 0) {
-                const delete_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-                try entry.index.batchWithOptions(&.{}, delete_keys.items, .{
-                    .defer_term_range_updates = true,
-                    .backend_batch_options = batch_options,
-                });
-                if (profile_enabled) profile.delete_batch_ns = platform_time.monotonicNs() - delete_start_ns;
-            }
-            if (sparse_writes.items.len > 0) {
+            // Delete-before-insert for the same logical write (every entry
+            // appended to sparse_writes above also appended its own key to
+            // delete_keys) used to cost two separate native commits here --
+            // SparseIndex.batchWithOptions already accepts deletes and
+            // writes together in one transaction, so there is nothing
+            // sequencing-sensitive about combining them: both arms still
+            // process deletes before inserts internally.
+            if (delete_keys.items.len > 0 or sparse_writes.items.len > 0) {
                 const sparse_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-                try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
-                try entry.index.batchWithOptions(sparse_writes.items, &.{}, .{
+                if (sparse_writes.items.len > 0) try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
+                try entry.index.batchWithOptions(sparse_writes.items, delete_keys.items, .{
                     .defer_term_range_updates = true,
                     .backend_batch_options = batch_options,
                     .prefer_bulk_build = batch_options.mode == .bulk_ingest,
                     .assume_new_doc_ids = batch_options.mode == .bulk_ingest,
                 });
-                if (profile_enabled) profile.sparse_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
+                if (profile_enabled) {
+                    profile.delete_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
+                    profile.sparse_batch_ns = profile.delete_batch_ns;
+                }
             }
         }
 
-        if (pending_artifact_loads.items.len == 0 and delete_keys.items.len > 0) {
-            const delete_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-            try entry.index.batchWithOptions(&.{}, delete_keys.items, .{
-                .defer_term_range_updates = true,
-                .backend_batch_options = batch_options,
-            });
-            if (profile_enabled) profile.delete_batch_ns = platform_time.monotonicNs() - delete_start_ns;
-        }
-        if (pending_artifact_loads.items.len == 0 and sparse_writes.items.len > 0) {
+        if (pending_artifact_loads.items.len == 0 and (delete_keys.items.len > 0 or sparse_writes.items.len > 0)) {
             const sparse_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-            try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
-            try entry.index.batchWithOptions(sparse_writes.items, &.{}, .{
+            if (sparse_writes.items.len > 0) try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
+            try entry.index.batchWithOptions(sparse_writes.items, delete_keys.items, .{
                 .defer_term_range_updates = true,
                 .backend_batch_options = batch_options,
                 .prefer_bulk_build = batch_options.mode == .bulk_ingest,
                 .assume_new_doc_ids = batch_options.mode == .bulk_ingest,
             });
-            if (profile_enabled) profile.sparse_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
+            if (profile_enabled) {
+                profile.delete_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
+                profile.sparse_batch_ns = profile.delete_batch_ns;
+            }
         }
         if (profile_enabled and (pending_artifact_loads.items.len > 0 or sparse_writes.items.len > 0 or delete_keys.items.len > 0)) {
             std.log.info(
