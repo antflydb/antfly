@@ -2428,7 +2428,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
             }
             const group_control_without_replay = opts.group_source_command != null and !group_staged.hasReplay() and changed_graph_artifact_keys.items.len == 0;
-            const elide_semantic_noop_replay = group_control_without_replay or (opts.resolver_review_command == null and group_plan == null and use_thin_replay_fast_path and
+            const default_elide_semantic_noop_replay = group_control_without_replay or (opts.resolver_review_command == null and group_plan == null and use_thin_replay_fast_path and
                 opts.extra_store_writes.len == 0 and
                 opts.transaction_resolution == null and
                 opts.replication_applied_lsn_marker == null and
@@ -2439,7 +2439,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     changed_graph_artifact_keys.items,
                     derived_changed_flags,
                 ));
-            const sequence = if (elide_semantic_noop_replay)
+            const elide_semantic_noop_replay = opts.publication_cohort == null and default_elide_semantic_noop_replay;
+            var cohort_sequences: [@import("publication_cohort.zig").maximum_requests]u64 = undefined;
+            const sequence = if (opts.publication_cohort) |cohort| blk: {
+                if (cohort.requests.len == 0 or cohort.requests.len > cohort_sequences.len) return error.InvalidBatchRequest;
+                for (cohort_sequences[0..cohort.requests.len]) |*logical| logical.* = S.ownerField(self, "core").*.reserveDerivedAppendSequence();
+                break :blk cohort_sequences[cohort.requests.len - 1];
+            } else if (elide_semantic_noop_replay)
                 S.ownerField(self, "core").*.nextDerivedSequence()
             else
                 S.ownerField(self, "core").*.reserveDerivedAppendSequence();
@@ -2671,8 +2677,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             const append_derived_replay = !opts.suppress_derived_replay_append and
                 !elide_semantic_noop_replay;
+            var cohort_journal: ?@import("publication_cohort.zig").Journal = if (opts.publication_cohort) |cohort|
+                try cohort.prepareJournal(S.ownerField(self, "alloc").*, replay_payload, cohort_sequences[0..cohort.requests.len])
+            else
+                null;
+            defer if (cohort_journal) |*prepared| prepared.deinit();
             if (append_derived_replay) {
-                try appendArtifactSourceRevisionWritesFromReplay(
+                if (cohort_journal) |prepared| {
+                    for (prepared.records) |record| try appendArtifactSourceRevisionWritesFromReplay(
+                        S.ownerField(self, "alloc").*,
+                        record.payload,
+                        record.sequence,
+                        &write_buffers.store_writes,
+                        &write_buffers.owned_store_keys,
+                        &write_buffers.owned_store_values,
+                    );
+                } else try appendArtifactSourceRevisionWritesFromReplay(
                     S.ownerField(self, "alloc").*,
                     replay_payload,
                     sequence,
@@ -2981,6 +3001,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_writes);
             if (opts.outcome_marker_write) |marker| try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, marker);
+            try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.cohort_outcome_marker_writes);
             if (req.merge_page) |page| if (page.integrity.len != 0) {
                 // Private page shape, exact generation/ownership and replay cursor
                 // have been checked under this same apply fence. The physical
@@ -3052,7 +3073,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
             };
             const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (append_derived_replay)
-                .{
+                if (cohort_journal) |prepared| prepared.append() else .{
                     .sequence = sequence,
                     .payload = replay_payload,
                 }
@@ -3064,7 +3085,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // returned before the primary mutation and replay intent commit.
             const backlog_admission_start_ns = monotonicTimeNs();
             var backlog_admission = if (append_derived_replay)
-                try S.ownerField(self, "executor").*.admitBacklogBytes(@intCast(replay_payload.len))
+                try S.ownerField(self, "executor").*.admitBacklogBytes(@intCast(if (cohort_journal) |prepared| prepared.bytes else replay_payload.len))
             else
                 derived_executor_mod.BacklogAdmission{};
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_admission_ns, backlog_admission_start_ns);

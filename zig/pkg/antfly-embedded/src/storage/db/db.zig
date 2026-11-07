@@ -7631,6 +7631,47 @@ pub const DB = struct {
         };
     }
 
+    /// One owned, disjoint logical cohort and one prepared index replacement.
+    /// The queue retains every origin and publishes its outcome on that
+    /// origin's thread. In particular, it must resolve all calls sharing a
+    /// writer against that writer's final marker in this atomic publication.
+    pub fn batchTrackedWithPreparedCohort(self: *DB, cohort: *const @import("publication_cohort.zig").Group, primary_committed: *bool, markers: []const apply_receipts.OutcomeMarker, prepared: ?*@import("prepared_document_batch.zig").Plan) anyerror!void {
+        primary_committed.* = false;
+        if (markers.len != 0 and markers.len != cohort.requests.len) return error.InvalidBatchRequest;
+        if (self.local_execution.replication_write_gate != null or self.local_execution.replication_async_batch_mirror != null or self.local_execution.replication_async_effect_mirror != null or self.local_execution.replication_async_metadata_mirror != null) return error.UnsupportedPublicationCohort;
+        var view = self.core.acquireSchemaView();
+        defer if (view) |*schema| schema.release();
+        if (view) |schema| if (schema.storageMode() != .document) return error.UnsupportedPublicationCohort;
+        const capacity = @import("publication_cohort.zig").maximum_requests;
+        var keys: [capacity][apply_receipts.outcome_marker_key_len]u8 = undefined;
+        var values: [capacity][apply_receipts.outcome_marker_value_len]u8 = undefined;
+        var writes: [capacity]docstore_mod.KVPair = undefined;
+        var count: usize = 0;
+        for (markers, 0..) |marker, ordinal| {
+            var newer = false;
+            for (markers[ordinal + 1 ..]) |later| if (std.mem.eql(u8, &marker.writer, &later.writer)) {
+                if (later.sequence <= marker.sequence) return error.InvalidBatchRequest;
+                newer = true;
+            };
+            if (newer) continue;
+            writes[count] = apply_receipts.outcomeMarkerWrite(marker, &keys[count], &values[count]);
+            count += 1;
+        }
+        var progress: backend_types.CommitProgress = .{};
+        const previous = backend_types.commit_progress;
+        backend_types.commit_progress = &progress;
+        defer backend_types.commit_progress = previous;
+        self.batchInternal(cohort.request, null, .{
+            .primary_committed = primary_committed,
+            .prepared_documents = prepared,
+            .publication_cohort = cohort,
+            .cohort_outcome_marker_writes = writes[0..count],
+        }) catch |err| {
+            if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) return error.OutcomeUnknown;
+            return err;
+        };
+    }
+
     fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker_write: ?docstore_mod.KVPair, prepared: ?*@import("prepared_document_batch.zig").Plan) anyerror!void {
         const opts: BatchExecutionOptions = .{ .primary_committed = primary_committed, .outcome_marker_write = marker_write, .prepared_documents = prepared };
         if (benchMetricsEnabled()) {
@@ -150363,4 +150404,93 @@ test "privacy protected hit hydration bounds row scratch and retains only select
         }
         std.debug.print("\nPrivacy projected hydration rows={d} peak_bytes={d}\n", .{ count, budget.peak_live_bytes });
     }
+}
+
+test "db native publication cohort preserves logical journals receipts and one durability boundary" {
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    const cohort_mod = @import("publication_cohort.zig");
+    const Prepared = @import("prepared_document_batch.zig").Plan;
+    var directory = try TestDirectory.init("native-logical-publication-cohort");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/cohort.aflite", .{directory.path()});
+    defer a.free(path);
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    var backend = try lite.Handle.createWithOptions(a, path, .{ .exclusive = true, .externally_locked = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    var options: OpenOptions = .{ .backend_runtime = host.ptr(), .executor = .{ .backend = .manual }, .start_index_workers = false, .start_optional_runtimes = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .text_merge = .{ .enabled = false } };
+    try backend.configureDbOpenOptions(&options);
+    var database = try DB.open(a, path, options);
+    defer database.close();
+    try database.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    var cohort = try cohort_mod.Group.init(a, &.{
+        .{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"cohort alpha\"}" }} },
+        .{ .writes = &.{.{ .key = "b", .value = "{\"body\":\"cohort beta\"}" }} },
+        .{ .writes = &.{.{ .key = "日本語", .value = "{\"body\":\"cohort gamma\"}" }} },
+    });
+    defer cohort.deinit();
+    var plan = (try Prepared.capture(a, &database)).?;
+    defer plan.deinit();
+    try plan.prepare(cohort.request);
+    try plan.stageIndependentForegroundText();
+    try plan.stageForegroundText(&database);
+    for (plan.text.items) |item| try std.testing.expect(item.publication != null);
+    const file = &backend.native_docstore.?.file;
+    const before = file.activeCheckpoint().commit_sequence;
+    const syncs = file.test_durability_syncs.load(.monotonic);
+    const previous_source = database.core.store.lastReplaySequence(0);
+    const first_writer: [apply_receipts.outcome_writer_len]u8 = @splat(1);
+    const second_writer: [apply_receipts.outcome_writer_len]u8 = @splat(2);
+    var committed = false;
+    try database.batchTrackedWithPreparedCohort(&cohort, &committed, &.{
+        .{ .writer = first_writer, .sequence = 1 },
+        .{ .writer = first_writer, .sequence = 2 },
+        .{ .writer = second_writer, .sequence = 1 },
+    }, &plan);
+    try std.testing.expect(committed);
+    try std.testing.expectEqual(before + 1, file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(u64, 1), file.test_durability_syncs.load(.monotonic) - syncs);
+    try std.testing.expectEqual(@as(?u64, 2), try database.readOutcomeMarker(first_writer));
+    try std.testing.expectEqual(@as(?u64, 1), try database.readOutcomeMarker(second_writer));
+    const records = try database.core.store.iterateReplayFrom(a, previous_source + 1);
+    defer {
+        for (records) |*record| record.deinit(a);
+        a.free(records);
+    }
+    try std.testing.expectEqual(@as(usize, 3), records.len);
+    for (records, [_][]const u8{ "a", "b", "日本語" }, 0..) |record, key, ordinal| {
+        var decoded = try change_journal_mod.decodeRecord(a, record.payload);
+        defer decoded.deinit();
+        try std.testing.expectEqual(record.sequence, decoded.record.sequence);
+        try std.testing.expectEqual(@as(usize, 1), decoded.record.changed_doc_keys.len);
+        try std.testing.expectEqualStrings(key, decoded.record.changed_doc_keys[0]);
+        if (ordinal != 0) try std.testing.expect(record.sequence > records[ordinal - 1].sequence);
+        const value = (try database.get(a, key)).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings(cohort.requests[ordinal].writes[0].value, value);
+    }
+    {
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        const progress = (try apply_state.loadProjectionMetadataTxn(&read, "text")) orelse return error.TestMissingCohortProgress;
+        try std.testing.expectEqual(records[2].sequence, progress.applied_sequence);
+    }
+    var matches = try database.search(a, .{ .index_name = "text", .query = .{ .match = .{ .field = "body", .text = "cohort" } }, .limit = 10 });
+    defer matches.deinit();
+    try std.testing.expectEqual(@as(usize, 3), matches.hits.len);
+    var refused = try cohort_mod.Group.init(a, &.{
+        .{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"must never publish\"}" }}, .predicates = &.{.{ .key = "a", .expected_version = 0 }} },
+        .{ .writes = &.{.{ .key = "unapplied", .value = "{}" }} },
+    });
+    defer refused.deinit();
+    const before_refusal = file.activeCheckpoint().commit_sequence;
+    committed = true;
+    try std.testing.expectError(error.VersionConflict, database.batchTrackedWithPreparedCohort(&refused, &committed, &.{}, null));
+    try std.testing.expect(!committed);
+    try std.testing.expectEqual(before_refusal, file.activeCheckpoint().commit_sequence);
+    try std.testing.expect((try database.get(a, "unapplied")) == null);
+    try std.testing.expect((try file.check()).valid);
 }
