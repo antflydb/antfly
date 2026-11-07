@@ -42,10 +42,10 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Specifica
     if (parsed.value.decider.decision_method == .cascade) {
         // Hosted generated stages must accept the frozen questions too.
         const arena = parsed.arena.allocator();
-        const definition = try d.cascade_contract.compile(arena, parsed.value.decider.cascade.?);
-        try d.cascade_contract.validateBands(&definition, parsed.value.questions);
+        const definition = &(try dependencies.getCascade("materialized")).definition;
+        try d.cascade_contract.validateBands(definition, parsed.value.questions);
         for (definition.stages) |stage| {
-            const stage_config = try d.DeciderConfig.parseStage(arena, stage.decider);
+            const stage_config = try dependencies.getDeciderConfig(try providers.Registry.cascadeStageName(arena, "materialized", stage.name));
             const generator = stage_config.generator orelse continue;
             if (generator.provider == .antfly) continue;
             const c = @import("antfly_structured");
@@ -75,6 +75,10 @@ pub fn provenance(a: std.mem.Allocator, spec: Specification, source_fingerprint:
     return provenanceWithRevision(a, spec, source_fingerprint, null);
 }
 pub fn provenanceWithRevision(a: std.mem.Allocator, spec: Specification, source_fingerprint: ?[]const u8, revision: ?d.Json) !d.Json {
+    return provenanceWithDefinition(a, spec, source_fingerprint, revision, null);
+}
+
+pub fn provenanceWithDefinition(a: std.mem.Allocator, spec: Specification, source_fingerprint: ?[]const u8, revision: ?d.Json, compiled: ?*const d.cascade_contract.Definition) !d.Json {
     var generator = spec.decider.generator;
     if (generator) |*config| config.api_key = null;
     const bytes = try std.json.Stringify.valueAlloc(a, .{ .model_revision = revision, .generator = generator, .instructions = spec.decider.instructions, .output = spec.decider.output, .probabilities = spec.decider.probabilities, .batch = spec.decider.batch, .version = spec.version, .provider = spec.decider.provider, .decision_method = spec.decider.decision_method, .model = spec.decider.modelName(), .model_identity = spec.decider.model_identity, .embedding_options = spec.decider.embedding_options, .url = spec.decider.baseUrl(), .questions = spec.questions }, .{});
@@ -97,11 +101,11 @@ pub fn provenanceWithRevision(a: std.mem.Allocator, spec: Specification, source_
         digest.final(&hash);
     } else if (spec.decider.decision_method == .cascade) {
         // Stages, bands and budgets are behavior; credentials are not.
-        const definition = try d.cascade_contract.compile(a, spec.decider.cascade orelse return error.InvalidDeciderConfig);
+        const sha256 = if (compiled) |definition| definition.sha256 else (try d.cascade_contract.compile(a, spec.decider.cascade orelse return error.InvalidDeciderConfig)).sha256;
         var digest = std.crypto.hash.sha2.Sha256.init(.{});
         digest.update(bytes);
         digest.update("antfly-decider-cascade-v1");
-        digest.update(&definition.sha256);
+        digest.update(&sha256);
         digest.final(&hash);
     } else std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
     var value = d.jsonObject();

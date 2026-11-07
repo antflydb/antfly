@@ -329,8 +329,14 @@ requires the trace to list configured stages in order, ending on that stage.
 A response without the trace is invalid. The receipt keeps the normalized
 response, including the trace, under `response`; the `Evidence` layout is
 unchanged. Generated stages get the resolver's per-call batch bounds, and the
-receipt hash mixes in a combined revision of every generated stage.
-Verdict-only stages admit only 0/1 thresholds. Catalogs with a cascade policy
+receipt hash mixes in revisions reported by generated stages that actually
+answered. Reuse discovers only those dependencies; unreachable stages do not
+become availability dependencies. If an executed dependency cannot be verified,
+the previous committed verdict is preserved and the refresh fails. Explicit
+`keep_previous` outcomes remain replay-stable until inputs, policy, or a
+reported dependency changes.
+Probability thresholds apply to the probabilistic stages; a terminal
+verdict-only stage must provide a categorical 0/1 distribution. Catalogs with a cascade policy
 require reader epoch 30.
 
 **Description inputs.** Extraction mentions may supply `description` and a numeric

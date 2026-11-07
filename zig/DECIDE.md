@@ -64,13 +64,17 @@ The shared decision runtime (`pkg/antfly-embedded/src/functions/runtime.zig`)
 is the only executor, so the gateway's `deciders/<name>`, SQL `ai_*`
 functions, decision enrichments and resolver adjudication share it. The
 registry stores each stage as an ordinary decider under `<cascade>#<stage>`, so
-quotas, generator resolution and normalization are unchanged. Stage entries
+quotas, generator resolution and normalization are unchanged. Definitions and
+static capabilities compile once into registry-owned plans. Native model
+discovery runs only when the stage is reached, under the cascade deadline and
+failure policy. Stage entries
 are hidden from gateway resolution and the catalog, and configured names
 cannot contain `#`. `evaluateCore` dispatches cascades before admission;
 inputs sharing a cascade, routing scope and questions escalate together, and
 each stage re-enters `evaluateCore` as an ordinary batch.
 
-Cascade capabilities are the intersection of the stages'. Questions are
+Cascade admission intersects the stages' configured static contracts; actual
+native model capabilities are checked when a stage is reached. Questions are
 limited to choice and predicate. Normalization validates each answer by its
 own decision method, because typed and generated stages can answer in one
 batch. Escalation reads successful answers only; whole-stage and per-input

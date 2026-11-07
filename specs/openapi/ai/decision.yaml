@@ -456,6 +456,9 @@ components:
       - input_tokens
       - output_tokens
       properties:
+        estimated:
+          type: boolean
+          description: True for estimated usage, including apportioned shared generated-batch costs and embedding-based estimates. Generated cascades divide shared totals evenly, assigning integer remainders in input order; their request aggregate remains measured.
         input_tokens:
           type: integer
           minimum: 0

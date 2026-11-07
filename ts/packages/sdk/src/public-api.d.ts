@@ -18439,7 +18439,7 @@ export interface components {
         };
         /** @description Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges. */
         GraphResolverAdjudicationConfig: {
-            /** @description Frozen typed, generated or cascade decider configuration. Generated verdict-only thresholds must be zero or one, including for any verdict-only cascade stage. A cascade answer is validated against the stage that produced it, and the receipt keeps the response's stage trace. */
+            /** @description Frozen typed, generated or cascade decider configuration. Standalone generated verdict-only thresholds must be zero or one. Mixed cascades apply shared thresholds to probabilistic stages and require categorical zero-or-one terminal verdicts. A cascade answer is validated against the stage that produced it, and the receipt keeps the response's stage trace. */
             decider: components["schemas"]["DeciderConfig"];
             /** @description Bounded interpolation of m.text, m.surface_form, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions. */
             template: string;
@@ -30794,6 +30794,8 @@ export interface components {
         };
         InferenceDecideAnswer: components["schemas"]["GeneratedChoiceAnswer"] | components["schemas"]["GeneratedMultiChoiceAnswer"] | components["schemas"]["GeneratedPredicateAnswer"] | components["schemas"]["GeneratedScoreAnswer"] | components["schemas"]["TrainedChoiceAnswer"] | components["schemas"]["TrainedScoreAnswer"] | components["schemas"]["TrainedPredicateAnswer"] | components["schemas"]["EmbeddingChoiceAnswer"] | components["schemas"]["EmbeddingMultiChoiceAnswer"];
         DecisionUsage: {
+            /** @description True for estimated usage, including apportioned shared generated-batch costs and embedding-based estimates. Generated cascades divide shared totals evenly, assigning integer remainders in input order; their request aggregate remains measured. */
+            estimated?: boolean;
             /** @description Encoded tokens including repeated input text for split model tasks. */
             input_tokens: number;
             /** @description Zero for classifiers, which generate no tokens. */

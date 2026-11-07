@@ -967,10 +967,10 @@ pub const Runtime = struct {
                         var stage_remote = true;
                         if (stage_cfg.decision_method == .generated) {
                             try self.routeGeneratorConfig(scratch, &stage_cfg.generator.?);
-                            var engine = self.constrainedRuntime();
-                            const caps = try engine.capabilities(scratch, &stage_cfg.generator.?);
-                            _ = try caps.select(stage_cfg.output, stage_cfg.probabilities);
-                            stage_remote = stage_cfg.generator.?.provider != .antfly or stage_cfg.generator.?.url.len > 0;
+                            // Ownership follows the route, not a model lookup.
+                            // Discovery here would bypass cascade deadlines and
+                            // make an unused optional stage a hard dependency.
+                            stage_remote = stage_cfg.generator.?.provider != .antfly or stage_cfg.generator.?.url.len > 0 or !self.linkedGeneratorAvailable();
                         } else if (stage_cfg.provider == .antfly and stage_cfg.url.len == 0 and self.antfly_provider != null) {
                             stage_remote = self.antfly_provider.?.decide_json == null;
                         }
@@ -1992,7 +1992,8 @@ pub const Runtime = struct {
         for (items, results.values, results.failures, requests) |*item, value, failure, request| {
             var response = value;
             if (response) |*answer| {
-                var info = try materialization.provenanceWithRevision(a, parsed.value, request.source_fingerprint, answer.object.get("model_revision"));
+                const definition = if (parsed.value.decider.decision_method == .cascade) &(try registry.getCascade("materialized")).definition else null;
+                var info = try materialization.provenanceWithDefinition(a, parsed.value, request.source_fingerprint, answer.object.get("model_revision"), definition);
                 try d.put(a, &info, "model", answer.object.get("model").?);
                 try d.put(a, answer, "provenance", info);
             }
@@ -2027,7 +2028,8 @@ pub const Runtime = struct {
         defer execution.deinit();
         const results = try execution.provider().evaluateBatch(arena.allocator(), &.{.{ .decider = "materialized", .questions = parsed.value.questions, .input = .{ .text = request.source_text } }});
         var response = results[0];
-        var info = try materialization.provenance(arena.allocator(), parsed.value, request.source_fingerprint);
+        const definition = if (parsed.value.decider.decision_method == .cascade) &(try registry.getCascade("materialized")).definition else null;
+        var info = try materialization.provenanceWithDefinition(arena.allocator(), parsed.value, request.source_fingerprint, response.object.get("model_revision"), definition);
         try d.put(arena.allocator(), &info, "model", response.object.get("model").?);
         try d.put(arena.allocator(), &response, "provenance", info);
         return std.json.Stringify.valueAlloc(alloc, response, .{});
@@ -8894,9 +8896,15 @@ test "decision functions cascade enrichments advertise batching and share genera
     const Fake = struct {
         fast_calls: std.atomic.Value(usize) = .init(0),
         strong_calls: usize = 0,
+        discoveries: usize = 0,
+        confident: bool = false,
+        fail_discovery: bool = false,
         fn decide(ptr: *anyopaque, alloc: Allocator, _: []const u8, _: ?RequestContext) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.fast_calls.fetchAdd(1, .monotonic);
+            if (self.confident) return alloc.dupe(u8,
+                \\{"model":"fast","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"same","probabilities":[{"value":"same","probability":0.99},{"value":"different","probability":0.01}]}],"usage":{"input_tokens":2,"output_tokens":0}}
+            );
             return alloc.dupe(u8,
                 \\{"model":"fast","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"same","probabilities":[{"value":"same","probability":0.6},{"value":"different","probability":0.4}]}],"usage":{"input_tokens":2,"output_tokens":0}}
             );
@@ -8912,7 +8920,10 @@ test "decision functions cascade enrichments advertise batching and share genera
                 \\{"choices":[{"message":{"content":"{\"items\":[{\"item\":0,\"value\":{\"same\":\"same\"}},{\"item\":1,\"value\":{\"same\":\"different\"}}]}"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
             );
         }
-        fn capabilities(_: *anyopaque, _: Allocator, _: []const u8, _: inference_work.Task) !inference_work.InferenceCapabilities {
+        fn capabilities(ptr: *anyopaque, _: Allocator, _: []const u8, _: inference_work.Task) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.discoveries += 1;
+            if (self.fail_discovery) return error.CapabilityDiscoveryUnavailable;
             return .{ .model_revision = @splat(1), .task = .generate, .input_modalities = .{ .text = true }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true };
         }
     };
@@ -8945,7 +8956,21 @@ test "decision functions cascade enrichments advertise batching and share genera
         try std.testing.expectEqualStrings("strong", trace.get("answered_by").?.string);
         try std.testing.expectEqual(@as(usize, 2), trace.get("stages").?.array.items.len);
         try std.testing.expect(trace.get("stages").?.array.items[1].object.contains("model_revision"));
+        const usage = trace.get("stages").?.array.items[1].object.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, 5), usage.get("input_tokens").?.integer);
+        try std.testing.expect(usage.get("estimated").?.bool);
+        try std.testing.expect(response.object.get("usage").?.object.get("estimated").?.bool);
     }
+    try std.testing.expectEqual(@as(usize, 1), fake.discoveries);
+    fake.confident = true;
+    fake.fail_discovery = true;
+    var fast_only = try producer.produceBatchReported(a, &requests);
+    defer fast_only.deinit(a);
+    for (fast_only.items) |item| try std.testing.expect(item.result == .value);
+    const single = try producer.produce(a, requests[0]);
+    defer a.free(single);
+    try std.testing.expectEqual(@as(usize, 1), fake.discoveries);
+    try std.testing.expectEqual(@as(usize, 1), fake.strong_calls);
     // An available local callback must not change the ownership of hosted stages.
     const hosted =
         \\{"version":"v1","decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"a","decider":{"provider":"jev"}},{"name":"b","decider":{"provider":"jev"},"when":{"probability_between":[0.3,0.9]}}]}},"questions":[{"name":"same","type":"predicate","instructions":"Same?"}]}

@@ -92,8 +92,9 @@ pub const Config = struct {
             pos = end + 2;
         }
     }
-    /// Every stage can be the answering stage, so each must be able to satisfy
-    /// the acceptance policy. Verdict-only stages admit only 0/1 thresholds.
+    /// Every stage can be the answering stage. Shared probability thresholds
+    /// remain meaningful for the probabilistic stages; a verdict-only stage's
+    /// distribution is separately required to be categorical by classify.
     fn validateCascade(self: Config) !void {
         const body = self.decider.object.get("cascade") orelse return error.InvalidAdjudicationConfig;
         if (body != .object) return error.InvalidAdjudicationConfig;
@@ -103,11 +104,6 @@ pub const Config = struct {
             if (stage != .object) return error.InvalidAdjudicationConfig;
             const decider = stage.object.get("decider") orelse return error.InvalidAdjudicationConfig;
             if (decider != .object) return error.InvalidAdjudicationConfig;
-            const policy = decider.object.get("probabilities") orelse continue;
-            if (policy == .string and std.mem.eql(u8, policy.string, "verdict_only")) {
-                if (self.accept.min_probability != 0 and self.accept.min_probability != 1) return error.InvalidAdjudicationConfig;
-                if (self.reject) |reject| if (reject.min_probability != 0 and reject.min_probability != 1) return error.InvalidAdjudicationConfig;
-            }
         }
     }
     fn validateAcceptance(self: Config, acceptance: Acceptance) !void {
@@ -142,6 +138,72 @@ pub const Config = struct {
         const method = self.decider.object.get("decision_method") orelse return &.{};
         if (method != .string or !std.mem.eql(u8, method.string, "cascade")) return &.{};
         return self.decider.object.get("cascade").?.object.get("stages").?.array.items;
+    }
+
+    pub const RevisionProbe = struct {
+        resolved: bool = false,
+        revision: ?[32]u8 = null,
+        failure: ?anyerror = null,
+    };
+    pub const RevisionCache = [@import("antfly_decisions").cascade.max_stages]RevisionProbe;
+
+    /// Receipt dependencies are the generated stages that actually answered,
+    /// not unreachable stages. With an executor, refresh those dependencies
+    /// for reuse; without one, hash the revisions recorded by execution.
+    pub fn cascadeRevision(self: Config, a: std.mem.Allocator, response: std.json.Value, executor: ?Executor, cache: *RevisionCache) !?[32]u8 {
+        const stages = self.cascadeStages();
+        if (stages.len == 0 or response != .object) return error.InvalidAdjudicationOutput;
+        const trace = response.object.get("cascade") orelse return error.InvalidAdjudicationOutput;
+        if (trace != .object) return error.InvalidAdjudicationOutput;
+        const executed = trace.object.get("stages") orelse return error.InvalidAdjudicationOutput;
+        if (executed != .array or executed.array.items.len > stages.len or stages.len > cache.len) return error.InvalidAdjudicationOutput;
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        var pinned = false;
+        for (executed.array.items, 0..) |entry, i| {
+            if (entry != .object) return error.InvalidAdjudicationOutput;
+            const name = entry.object.get("name") orelse return error.InvalidAdjudicationOutput;
+            const configured_name = stages[i].object.get("name").?.string;
+            if (name != .string or !std.mem.eql(u8, name.string, configured_name)) return error.InvalidAdjudicationOutput;
+            if (!entry.object.contains("answers")) continue;
+            const decider = stages[i].object.get("decider").?;
+            const method = decider.object.get("decision_method") orelse continue;
+            if (method != .string or !std.mem.eql(u8, method.string, "generated")) continue;
+            const revision: ?[32]u8 = if (executor) |current| blk: {
+                const resolve = current.model_revision orelse break :blk null;
+                const probe = &cache[i];
+                if (!probe.resolved) {
+                    var timeout = @min(self.timeout_ms, self.budget_ms);
+                    const body = self.decider.object.get("cascade").?;
+                    if (body.object.get("budget")) |budget| if (budget == .object) if (budget.object.get("deadline_ms")) |deadline| {
+                        if (deadline != .integer or deadline.integer <= 0) return error.InvalidAdjudicationConfig;
+                        timeout = @intCast(@min(timeout, deadline.integer));
+                    };
+                    probe.revision = resolve(current.ptr, a, try self.stageProducerSpecification(a, stages[i]), timeout) catch |err| {
+                        probe.resolved = true;
+                        probe.failure = err;
+                        return err;
+                    };
+                    probe.resolved = true;
+                }
+                if (probe.failure) |err| return err;
+                break :blk probe.revision;
+            } else blk: {
+                const raw = entry.object.get("model_revision") orelse break :blk null;
+                if (raw != .string or raw.string.len != 64) return error.InvalidAdjudicationOutput;
+                var digest: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&digest, raw.string) catch return error.InvalidAdjudicationOutput;
+                break :blk digest;
+            };
+            if (revision) |digest| {
+                hasher.update(configured_name);
+                hasher.update(&digest);
+                pinned = true;
+            }
+        }
+        if (!pinned) return null;
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        return digest;
     }
     /// Credentials and routing leases do not change the question's meaning.
     /// Clone only the decider JSON; all other policy fields remain immutable.

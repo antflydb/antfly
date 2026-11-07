@@ -11120,10 +11120,40 @@ pub const DecisionTableSource = struct {
 };
 
 pub const DecisionUsage = struct {
+    /// True for estimated usage, including apportioned shared generated-batch costs and embedding-based estimates. Generated cascades divide shared totals evenly, assigning integer remainders in input order; their request aggregate remains measured.
+    estimated: ?bool = null,
     /// Encoded tokens including repeated input text for split model tasks.
     input_tokens: i64,
     /// Zero for classifiers, which generate no tokens.
     output_tokens: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "estimated", "estimated", true },
+        .{ "input_tokens", "input_tokens", false },
+        .{ "output_tokens", "output_tokens", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.estimated) |value| {
+            try jw.objectField("estimated");
+            try jw.write(value);
+        }
+        try jw.objectField("input_tokens");
+        try jw.write(self.input_tokens);
+        try jw.objectField("output_tokens");
+        try jw.write(self.output_tokens);
+        try jw.endObject();
+    }
 };
 
 /// Dense vector index algorithm (dense only). "hbc" (default) keeps quantized codes plus full-precision rerank data. "leann" keeps only a pruned proximity graph and compact RaBitQ codes and recomputes exact distances for a few candidates per query, re-embedding them (see leann.vector_storage) or reading their stored embedding, trading query-time work for index size. LEANN indexes do not yet support shard splits or native index backups.
@@ -25576,7 +25606,7 @@ pub const GraphResolverAdjudicationAcceptance = struct {
 
 /// Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges.
 pub const GraphResolverAdjudicationConfig = struct {
-    /// Frozen typed, generated or cascade decider configuration. Generated verdict-only thresholds must be zero or one, including for any verdict-only cascade stage. A cascade answer is validated against the stage that produced it, and the receipt keeps the response's stage trace.
+    /// Frozen typed, generated or cascade decider configuration. Standalone generated verdict-only thresholds must be zero or one. Mixed cascades apply shared thresholds to probabilistic stages and require categorical zero-or-one terminal verdicts. A cascade answer is validated against the stage that produced it, and the receipt keeps the response's stage trace.
     decider: DeciderConfig,
     /// Bounded interpolation of m.text, m.surface_form, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions.
     template: []const u8,

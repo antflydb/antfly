@@ -426,6 +426,9 @@ fn jsonEqual(lhs: V, rhs: V) bool {
 pub const StageResult = struct {
     values: []const ?V,
     failures: []const ?anyerror,
+    /// Per-input accounting supplied by the host when provider usage belongs
+    /// to a shared batch. Estimates must be explicitly labelled as such.
+    item_usage: ?[]const V = null,
 };
 
 pub const Runner = struct {
@@ -446,6 +449,7 @@ const Row = struct {
     failure: ?anyerror = null,
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
+    estimated_usage: bool = false,
     stages: std.array_list.Managed(V),
 };
 
@@ -514,14 +518,20 @@ pub fn execute(a: A, definition: *const Definition, name: []const u8, item_count
             break;
         };
         if (result.values.len != active.items.len or result.failures.len != active.items.len) return error.InvalidDecisionOutput;
+        if (result.item_usage) |usage| if (usage.len != active.items.len) return error.InvalidDecisionOutput;
         var still: std.array_list.Managed(usize) = .init(a);
-        for (active.items, result.values, result.failures) |index, value, failure| {
+        for (active.items, result.values, result.failures, 0..) |index, value, failure, position| {
             const row = &rows[index];
+            if (value) |response| if (response != .object) return error.InvalidDecisionOutput;
+            const usage: ?V = if (result.item_usage) |items| items[position] else if (value) |response| response.object.get("usage") else null;
+            row.input_tokens +|= usageField(usage, "input_tokens");
+            row.output_tokens +|= usageField(usage, "output_tokens");
+            if (usage) |u| if (u == .object) if (u.object.get("estimated")) |estimated| {
+                if (estimated != .bool) return error.InvalidDecisionOutput;
+                row.estimated_usage = row.estimated_usage or estimated.bool;
+            };
             if (value) |response| {
                 if (response != .object or response.object.get("answers") == null) return error.InvalidDecisionOutput;
-                const usage = response.object.get("usage");
-                row.input_tokens +|= usageField(usage, "input_tokens");
-                row.output_tokens +|= usageField(usage, "output_tokens");
                 try row.stages.append(try trace(a, stage, response, usage, null));
                 row.response = response;
                 row.failure = null;
@@ -530,7 +540,7 @@ pub fn execute(a: A, definition: *const Definition, name: []const u8, item_count
             }
             const err = failure orelse error.InvalidDecisionOutput;
             if (isFatal(err)) return err;
-            try row.stages.append(try trace(a, stage, null, null, err));
+            try row.stages.append(try trace(a, stage, null, usage, err));
             // keep_previous retains the previous answer; the item stops here.
             if (stage_index > 0 and stage.on_failure == .keep_previous) continue;
             row.response = null;
@@ -562,12 +572,9 @@ fn trace(a: A, stage: Stage, response: ?V, usage: ?V, err: ?anyerror) !V {
         if (value.object.get("model")) |model| try put(a, &entry, "model", model);
         if (value.object.get("model_revision")) |revision| try put(a, &entry, "model_revision", revision);
         try put(a, &entry, "answers", value.object.get("answers").?);
-        var u = std.json.ObjectMap{};
-        try put(a, &u, "input_tokens", .{ .integer = @intCast(usageField(usage, "input_tokens")) });
-        try put(a, &u, "output_tokens", .{ .integer = @intCast(usageField(usage, "output_tokens")) });
-        try put(a, &entry, "usage", .{ .object = u });
         if (value.object.get("provenance")) |provenance| try put(a, &entry, "provenance", provenance);
     }
+    if (usage) |reported| try put(a, &entry, "usage", reported);
     if (err) |e| try put(a, &entry, "error", .{ .string = @errorName(e) });
     return .{ .object = entry };
 }
@@ -580,8 +587,9 @@ fn assemble(a: A, definition: *const Definition, name: []const u8, row: *Row, fi
         try put(a, &root, key, value);
     }
     var usage = std.json.ObjectMap{};
-    try put(a, &usage, "input_tokens", .{ .integer = @intCast(row.input_tokens) });
-    try put(a, &usage, "output_tokens", .{ .integer = @intCast(row.output_tokens) });
+    try put(a, &usage, "input_tokens", .{ .integer = std.math.cast(i64, row.input_tokens) orelse return error.InvalidDecisionOutput });
+    try put(a, &usage, "output_tokens", .{ .integer = std.math.cast(i64, row.output_tokens) orelse return error.InvalidDecisionOutput });
+    if (row.estimated_usage) try put(a, &usage, "estimated", .{ .bool = true });
     try put(a, &root, "usage", .{ .object = usage });
     var cascade = std.json.ObjectMap{};
     try put(a, &cascade, "decider", .{ .string = name });
@@ -848,6 +856,37 @@ test "decision cascade binds question and choice selectors before inference" {
         \\{"same":{"type":"noul"}}
     , .{});
     try validateBands(&definition, predicate);
+}
+
+test "decision cascade apportioned usage includes failed attempts in keep_previous receipts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const definition = try compileJson(a,
+        \\{"stages":[{"name":"fast","decider":{"model":"fast"}},{"name":"strong","decider":{"decision_method":"generated","generator":{"model":"strong"}},"when":{"probability_between":[0.3,0.9]},"on_failure":"keep_previous"}]}
+    );
+    const Metered = struct {
+        fn run(ptr: *anyopaque, alloc: A, i: usize, stage: Stage, indices: []const usize) !StageResult {
+            var result = try Fake.run(ptr, alloc, i, stage, indices);
+            if (i == 1) result.item_usage = (try std.json.parseFromSliceLeaky(V, alloc,
+                \\[{"input_tokens":5,"output_tokens":3,"estimated":true},{"input_tokens":5,"output_tokens":2,"estimated":true}]
+            , .{})).array.items;
+            return result;
+        }
+    };
+    var fake = Fake{ .fast = &.{ 0.5, 0.5 }, .strong_item_failure = 1 };
+    const outcome = try execute(a, &definition, "c", 2, .{ .ptr = &fake, .run = Metered.run });
+    for (outcome.values, 0..) |value, i| {
+        const response = value.?;
+        const usage = response.object.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, 15), usage.get("input_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, if (i == 0) 5 else 4), usage.get("output_tokens").?.integer);
+        try std.testing.expect(usage.get("estimated").?.bool);
+        _ = try validateTrace(&definition, response);
+    }
+    const failed = outcome.values[1].?.object.get("cascade").?.object.get("stages").?.array.items[1].object;
+    try std.testing.expect(failed.contains("error"));
+    try std.testing.expectEqual(@as(i64, 5), failed.get("usage").?.object.get("input_tokens").?.integer);
 }
 
 test "decision cascade receipts retain every revision and reject contradictory traces" {

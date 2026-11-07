@@ -2167,23 +2167,9 @@ pub const ResolutionStage = struct {
         const model_revision: ?[32]u8 = if (self.adjudicate) |config| blk: {
             const stages = config.cascadeStages();
             if (stages.len > 0) {
-                // A cascade's receipt depends on every generated stage's revision.
-                const executor = self.adjudicator orelse break :blk null;
-                const resolve = executor.model_revision orelse break :blk null;
-                var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-                var pinned = false;
-                for (stages) |stage| {
-                    const method = stage.object.get("decider").?.object.get("decision_method") orelse continue;
-                    if (method != .string or !std.mem.eql(u8, method.string, "generated")) continue;
-                    const revision = try resolve(executor.ptr, arena, try config.stageProducerSpecification(arena, stage), @min(config.timeout_ms, config.budget_ms)) orelse continue;
-                    hasher.update(stage.object.get("name").?.string);
-                    hasher.update(&revision);
-                    pinned = true;
-                }
-                if (!pinned) break :blk null;
-                var combined: [32]u8 = undefined;
-                hasher.final(&combined);
-                break :blk combined;
+                // Discover only dependencies of a receipt considered for
+                // reuse. Cold execution must not contact unreachable stages.
+                break :blk null;
             }
             const method = config.decider.object.get("decision_method") orelse break :blk null;
             if (method != .string or !std.mem.eql(u8, method.string, "generated")) break :blk null;
@@ -2199,6 +2185,7 @@ pub const ResolutionStage = struct {
             owner.deinit();
         };
         const reused = try arena.alloc(?ResolvedEntity, parsed.entities.len);
+        var cascade_revisions: adjudication.Config.RevisionCache = @splat(.{});
         for (parsed.entities, 0..) |entity, i| {
             reused[i] = null;
             if (alias_mask[i] or (if (self.overrides) |overrides| overrides.overrideFor(entity.local_id) != null else false)) continue;
@@ -2207,7 +2194,29 @@ pub const ResolutionStage = struct {
                 for (prior_resolution.entities) |prior_entity| {
                     if (!std.mem.eql(u8, prior_entity.local_id, entity.local_id)) continue;
                     if (prior_entity.adjudication) |evidence| {
-                        if (evidence.version == 1 and std.mem.eql(u8, evidence.execution_hash, receipt_hash)) reused[i] = prior_entity;
+                        var expected = receipt_hash;
+                        if (self.adjudicate.?.cascadeStages().len > 0) {
+                            const response = evidence.response orelse continue;
+                            const recorded = self.adjudicate.?.cascadeRevision(arena, response, null, &cascade_revisions) catch continue;
+                            const recorded_hash = if (recorded) |digest| try fingerprintHex(arena, .{ base_receipt_hash, digest }) else base_receipt_hash;
+                            // Changed inputs/policy do not need to discover an
+                            // obsolete receipt's model dependencies.
+                            if (!std.mem.eql(u8, evidence.execution_hash, recorded_hash)) continue;
+                            // Receipts with no model revision dependency can
+                            // still replay offline, like ordinary typed ones.
+                            if (self.adjudicator == null) {
+                                if (recorded != null) continue;
+                                if (evidence.version == 1 and std.mem.eql(u8, evidence.execution_hash, base_receipt_hash)) reused[i] = prior_entity;
+                                continue;
+                            }
+                            const executor = self.adjudicator.?;
+                            // If an executed dependency cannot be verified,
+                            // leave the committed verdict intact. A transient
+                            // metadata outage must not silently replace it.
+                            const revision = try self.adjudicate.?.cascadeRevision(arena, response, executor, &cascade_revisions);
+                            expected = if (revision) |digest| try fingerprintHex(arena, .{ base_receipt_hash, digest }) else base_receipt_hash;
+                        }
+                        if (evidence.version == 1 and std.mem.eql(u8, evidence.execution_hash, expected)) reused[i] = prior_entity;
                     }
                 }
             }
@@ -2579,6 +2588,13 @@ pub const ResolutionStage = struct {
                     continue;
                 };
                 evidence.response = response;
+                if (config.cascadeStages().len > 0) {
+                    var unused: adjudication.Config.RevisionCache = @splat(.{});
+                    if (try config.cascadeRevision(a, response, null, &unused)) |revision| {
+                        evidence.execution_hash = try fingerprintHex(a, .{ execution_hash, revision });
+                        evidence.specification_hash = try fingerprintHex(a, .{ try config.semantic(a), revision });
+                    }
+                }
             }
         }
         for (prepared.items) |item| {
@@ -4208,9 +4224,36 @@ test "REVIEW adjudication cascade receipts verify the answering stage and its tr
     const specification = try parse(scratch, try config.value.producerSpecification(scratch));
     const strong = specification.object.get("decider").?.object.get("cascade").?.object.get("stages").?.array.items[1].object.get("decider").?;
     try testing.expectEqual(@as(i64, 8), strong.object.get("batch").?.object.get("max_items_per_call").?.integer);
-    // Verdict-only stages admit only 0/1 thresholds.
+    // Mixed cascades retain calibrated thresholds for probabilistic stages;
+    // the terminal verdict stage still must supply a categorical distribution.
     const verdict = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_config, "\"generator\":{\"provider\":\"antfly\",\"model\":\"strong\"}", "\"generator\":{\"provider\":\"antfly\",\"model\":\"strong\"},\"probabilities\":\"verdict_only\"");
-    try testing.expectError(error.InvalidAdjudicationConfig, adjudication.Config.parse(a, verdict));
+    const verdict_config = try adjudication.Config.parse(a, verdict);
+    defer verdict_config.deinit();
+    var verdict_response = try parse(scratch, try adjudicationCascadeResponse(scratch, verdict_config.value));
+    const verdict_answer = verdict_response.object.get("answers").?.array.items[0];
+    var categorical = verdict_answer;
+    try categorical.object.put(scratch, "probability_source", .{ .string = "verdict" });
+    const distribution = categorical.object.get("probabilities").?.array.items;
+    try distribution[0].object.put(scratch, "probability", .{ .integer = 1 });
+    try distribution[1].object.put(scratch, "probability", .{ .integer = 0 });
+    // The trace and final answer share this question in the test constructor.
+    verdict_response.object.getPtr("cascade").?.object.getPtr("stages").?.array.items[1].object.getPtr("answers").?.array.items[0] = .{ .object = categorical.object };
+    verdict_response.object.getPtr("answers").?.array.items[0] = .{ .object = categorical.object };
+    try testing.expectEqual(adjudication.Status.accepted, try adjudication.classify(scratch, verdict_config.value, verdict_response));
+    try distribution[0].object.put(scratch, "probability", .{ .float = 0.8 });
+    try distribution[1].object.put(scratch, "probability", .{ .float = 0.2 });
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, verdict_config.value, verdict_response));
+    const fast_trace = verdict_response.object.getPtr("cascade").?;
+    var fast_entry = fast_trace.object.getPtr("stages").?.array.items[0];
+    try fast_entry.object.put(scratch, "escalated", .{ .bool = false });
+    const fast_distribution = fast_entry.object.get("answers").?.array.items[0].object.get("probabilities").?.array.items;
+    try fast_distribution[0].object.put(scratch, "probability", .{ .float = 0.97 });
+    try fast_distribution[1].object.put(scratch, "probability", .{ .float = 0.03 });
+    fast_trace.object.getPtr("stages").?.array.shrinkRetainingCapacity(1);
+    try fast_trace.object.put(scratch, "answered_by", .{ .string = "fast" });
+    try verdict_response.object.put(scratch, "model", fast_entry.object.get("model").?);
+    try verdict_response.object.put(scratch, "answers", fast_entry.object.get("answers").?);
+    try testing.expectEqual(adjudication.Status.accepted, try adjudication.classify(scratch, verdict_config.value, verdict_response));
 }
 
 test "REVIEW adjudication cascade persists the stage trace in the receipt" {
@@ -4240,4 +4283,91 @@ test "REVIEW adjudication cascade persists the stage trace in the receipt" {
     const trace = evidence.response.?.object.get("cascade").?.object;
     try testing.expectEqualStrings("strong", trace.get("answered_by").?.string);
     try testing.expectEqual(@as(usize, 2), trace.get("stages").?.array.items.len);
+}
+
+test "REVIEW adjudication cascade receipts discover only executed dependencies and preserve committed verdicts" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    const config = try adjudication.Config.parse(a, adjudication_cascade_config);
+    defer config.deinit();
+    const Fixture = struct {
+        base: AdjudicationFixture = .{},
+        revision: [32]u8 = @splat(0xaa),
+        probes: usize = 0,
+        fail: bool = false,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: adjudication.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return AdjudicationFixture.execute(&self.base, alloc, request);
+        }
+        fn modelRevision(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u32) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.probes += 1;
+            if (self.fail) return error.CapabilityDiscoveryUnavailable;
+            return self.revision;
+        }
+    };
+    var fixture = Fixture{};
+    var response = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try adjudicationCascadeResponse(scratch, config.value), .{});
+    try response.object.put(scratch, "model_revision", .{ .string = try scratch.dupe(u8, &std.fmt.bytesToHex(fixture.revision, .lower)) });
+    try response.object.getPtr("cascade").?.object.getPtr("stages").?.array.items[1].object.put(scratch, "model_revision", response.object.get("model_revision").?);
+    fixture.base.response = try std.json.Stringify.valueAlloc(scratch, response, .{});
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+    var stage = ResolutionStage{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = .{ .ptr = &fixture, .execute = Fixture.execute, .model_revision = Fixture.modelRevision }, .work_retention = .none };
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    try testing.expectEqual(@as(usize, 1), fixture.base.calls);
+    try testing.expectEqual(@as(usize, 0), fixture.probes);
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    try testing.expectEqual(@as(usize, 1), fixture.base.calls);
+    try testing.expectEqual(@as(usize, 1), fixture.probes);
+    fixture.fail = true;
+    try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+    try testing.expectEqual(@as(usize, 1), fixture.base.calls);
+
+    // A confident fast answer has no generated revision dependency at all.
+    var fast = response.object.getPtr("cascade").?.object.getPtr("stages").?.array.items[0];
+    try fast.object.put(scratch, "escalated", .{ .bool = false });
+    const distribution = fast.object.get("answers").?.array.items[0].object.get("probabilities").?.array.items;
+    try distribution[0].object.put(scratch, "probability", .{ .float = 0.97 });
+    try distribution[1].object.put(scratch, "probability", .{ .float = 0.03 });
+    try response.object.put(scratch, "answers", fast.object.get("answers").?);
+    try response.object.put(scratch, "model", fast.object.get("model").?);
+    _ = response.object.swapRemove("model_revision");
+    try response.object.getPtr("cascade").?.object.put(scratch, "answered_by", .{ .string = "fast" });
+    response.object.getPtr("cascade").?.object.getPtr("stages").?.array.shrinkRetainingCapacity(1);
+    fixture.base.response = try std.json.Stringify.valueAlloc(scratch, response, .{});
+    const probes_before = fixture.probes;
+    stage.config_generation += 1;
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    const calls_after = fixture.base.calls;
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    try testing.expectEqual(calls_after, fixture.base.calls);
+    try testing.expectEqual(probes_before, fixture.probes);
+    stage.adjudicator = null;
+    try testing.expectEqual(RunResult.unchanged, try stage.run(a, map.store(), null, "source", "resolution"));
+    const fallback_config = try adjudication.Config.parse(a, try std.mem.replaceOwned(u8, scratch, adjudication_cascade_config, "\"when\":", "\"on_failure\":\"keep_previous\",\"when\":"));
+    defer fallback_config.deinit();
+    var fallback = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try adjudicationCascadeResponse(scratch, fallback_config.value), .{});
+    const trace = fallback.object.getPtr("cascade").?;
+    const first = trace.object.getPtr("stages").?.array.items[0];
+    try fallback.object.put(scratch, "model", first.object.get("model").?);
+    try fallback.object.put(scratch, "answers", first.object.get("answers").?);
+    try trace.object.put(scratch, "answered_by", .{ .string = "fast" });
+    trace.object.getPtr("stages").?.array.items[1] = try std.json.parseFromSliceLeaky(std.json.Value, scratch,
+        \\{"name":"strong","decision_method":"generated","error":"CapabilityDiscoveryUnavailable","escalated":false}
+    , .{});
+    fixture.base.response = try std.json.Stringify.valueAlloc(scratch, fallback, .{});
+    stage.adjudicate = fallback_config.value;
+    stage.adjudicator = .{ .ptr = &fixture, .execute = Fixture.execute, .model_revision = Fixture.modelRevision };
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    const fallback_calls = fixture.base.calls;
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    try testing.expectEqual(fallback_calls, fixture.base.calls);
 }

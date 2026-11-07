@@ -219,6 +219,7 @@ deciders:
         - name: strong
           decider:
             decision_method: generated
+            probabilities: verdict_only
             generator: {provider: anthropic, model: your-strong-model}
           when:
             question: same
@@ -236,7 +237,9 @@ resolver `adjudicate` policy or decision enrichment.
   those inputs share one call. `question` limits the band to one question, and
   `choice` measures that value's probability instead of the selected value's.
 - The final answer is the last answering stage's. Usage is summed over the
-  stages that ran for the input.
+  stages that ran for the input. Shared generated-batch usage is apportioned
+  evenly across the batch inputs, with integer remainders assigned in input
+  order, and marked `usage.estimated: true`. Request totals remain measured.
 - Only choice and predicate questions are accepted, because bands read
   probabilities. Embedding-similarity deciders and nested cascades cannot be
   stages, and a band cannot follow a `verdict_only` generated stage.
@@ -250,7 +253,8 @@ resolver `adjudicate` policy or decision enrichment.
   limits across batches in the same statement. Set row, token and batch limits
   on the stage deciders. The cascade admits images and message evidence only
   when every stage does. Question and choice selectors are validated against
-  the request before any stage runs.
+  the request before any stage runs. Native model discovery runs only when a
+  stage is reached, under its deadline and failure policy.
 
 Responses carry a `cascade` trace per input (top-level for single input, on each
 batch row otherwise):
@@ -263,6 +267,11 @@ batch row otherwise):
 ```
 
 `definition_sha256` identifies the cascade definition without credentials.
+Anthropic stages require `probabilities: verdict_only`, since they do not
+provide token logprobs. Such stages can appear only last. Resolver probability
+thresholds still apply to the probabilistic stages; a terminal verdict-only
+stage must choose categorically, and its reported 0/1 distribution is not a
+calibrated confidence estimate.
 Stage traces include `model_revision` when the provider reports an immutable
 revision. Resolver adjudication verifies the definition, escalation decisions,
 stage order, and agreement between the trace and the final answer.

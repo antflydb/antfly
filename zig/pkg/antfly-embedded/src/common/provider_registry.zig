@@ -83,6 +83,7 @@ pub const Registry = struct {
     reranker_configs: std.StringArrayHashMapUnmanaged(reranking.Config) = .{},
     default_reranker: ?[]const u8 = null,
     decider_configs: std.StringArrayHashMapUnmanaged(decisions.DeciderConfig) = .{},
+    compiled_cascades: std.StringArrayHashMapUnmanaged(CompiledCascade) = .{},
     default_decider: ?[]const u8 = null,
     embedder_configs: std.StringArrayHashMapUnmanaged(embeddings.Config) = .{},
     default_embedder: ?[]const u8 = null,
@@ -92,6 +93,12 @@ pub const Registry = struct {
     rewriter_configs: std.StringArrayHashMapUnmanaged(RuntimeBinding) = .{},
     predictor_configs: std.StringArrayHashMapUnmanaged(RuntimeBinding) = .{},
     inference_capabilities: std.StringArrayHashMapUnmanaged(capabilities.Capabilities) = .{},
+
+    pub const CompiledCascade = struct {
+        arena: std.heap.ArenaAllocator,
+        definition: decisions.cascade_contract.Definition,
+        capabilities: decisions.Capabilities,
+    };
 
     pub fn init(alloc: Allocator) Registry {
         return .{ .allocator = alloc };
@@ -134,6 +141,8 @@ pub const Registry = struct {
         }
         self.chunker_configs.deinit(self.allocator);
 
+        for (self.compiled_cascades.values()) |*cascade| cascade.arena.deinit();
+        self.compiled_cascades.deinit(self.allocator);
         var decider_it = self.decider_configs.iterator();
         while (decider_it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -243,26 +252,33 @@ pub const Registry = struct {
         return self.decider_configs.get(stripNamespace(resolved, "deciders/")) orelse error.UnknownDecider;
     }
 
+    /// Compiled definitions borrow the registry's owned config and live for
+    /// exactly as long as that config. Namespaced references share one plan.
+    pub fn getCascade(self: *const Registry, name: []const u8) !*const CompiledCascade {
+        return self.compiled_cascades.getPtr(stripNamespace(name, "deciders/")) orelse error.InvalidDeciderConfig;
+    }
+
     /// The shared decision contract intersects adapter support with any
     /// explicit backend declaration. HTTP, SQL and expressions all use this.
     pub fn getDeciderCapabilities(self: *const Registry, name: []const u8) !decisions.Capabilities {
         const cfg = try self.getDeciderConfig(name);
-        var caps = cfg.resolvedCapabilities();
         if (cfg.decision_method == .cascade) {
+            const compiled = try self.getCascade(name);
+            var caps = compiled.capabilities;
             // Media must be admitted by every stage, each under its own bounds.
             var buffer: [512]u8 = undefined;
-            var fixed = std.heap.FixedBufferAllocator.init(&buffer);
-            var arena = std.heap.ArenaAllocator.init(self.allocator);
-            defer arena.deinit();
-            const definition = try decisions.cascade_contract.compile(arena.allocator(), cfg.cascade.?);
-            for (definition.stages) |stage| {
-                fixed.reset();
-                const stage_caps = try self.getDeciderCapabilities(try cascadeStageName(fixed.allocator(), name, stage.name));
+            var storage = std.heap.BufferFirstAllocator.init(&buffer, std.heap.smp_allocator);
+            const a = storage.allocator();
+            for (compiled.definition.stages) |stage| {
+                const stage_name = try cascadeStageName(a, name, stage.name);
+                defer a.free(stage_name);
+                const stage_caps = try self.getDeciderCapabilities(stage_name);
                 caps.images = caps.images and stage_caps.images;
                 caps.messages = caps.messages and stage_caps.messages;
             }
             return caps;
         }
+        var caps = cfg.resolvedCapabilities();
         caps.images = caps.images and cfg.max_image_input_tokens != null;
         if (!caps.images or self.inference_capabilities.count() == 0) return caps;
         var buffer: [1024]u8 = undefined;
@@ -278,6 +294,8 @@ pub const Registry = struct {
         try cfg.validate();
         if (name.len == 0 or std.mem.indexOfScalar(u8, name, decisions.cascade_stage_separator) != null) return error.InvalidDeciderConfig;
         if (self.decider_configs.contains(name)) return error.DuplicateDeciderName;
+        const previous_default = self.default_decider;
+        errdefer self.default_decider = previous_default;
         const before = self.decider_configs.count();
         errdefer while (self.decider_configs.count() > before) {
             const last = self.decider_configs.count() - 1;
@@ -301,6 +319,23 @@ pub const Registry = struct {
             }
         }
         try self.putDeciderConfig(name, cfg, true);
+        if (cfg.decision_method == .cascade) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            errdefer arena.deinit();
+            const parent = self.decider_configs.getEntry(name).?;
+            const definition = try decisions.cascade_contract.compile(arena.allocator(), parent.value_ptr.cascade.?);
+            var caps = decisions.Capabilities{ .cascade = true, .max_levels = 0, .images = true, .messages = true };
+            for (definition.stages) |stage| {
+                const stage_cfg = try self.getDeciderConfig(try cascadeStageName(arena.allocator(), name, stage.name));
+                const stage_caps = stage_cfg.resolvedCapabilities();
+                caps.max_questions = @min(caps.max_questions, stage_caps.max_questions);
+                caps.max_choices = @min(caps.max_choices, stage_caps.max_choices);
+                caps.max_input_bytes = @min(caps.max_input_bytes, stage_caps.max_input_bytes);
+                caps.images = caps.images and stage_caps.images;
+                caps.messages = caps.messages and stage_caps.messages;
+            }
+            try self.compiled_cascades.put(self.allocator, parent.key_ptr.*, .{ .arena = arena, .definition = definition, .capabilities = caps });
+        }
     }
 
     /// Registry key for one cascade stage. Owned by `a`.
@@ -600,10 +635,13 @@ test "decision provider cascade registration rolls back every allocation failure
             defer registry.deinit();
             registry.registerDeciderConfig("c", cfg) catch |err| {
                 try std.testing.expectEqual(@as(usize, 0), registry.decider_configs.count());
+                try std.testing.expectEqual(@as(usize, 0), registry.compiled_cascades.count());
                 try std.testing.expect(registry.default_decider == null);
                 return err;
             };
             try std.testing.expectEqual(@as(usize, 3), registry.decider_configs.count());
+            try std.testing.expectEqual(@as(usize, 1), registry.compiled_cascades.count());
+            try std.testing.expect(try registry.getCascade("c") == try registry.getCascade("deciders/c"));
             try std.testing.expectError(error.DuplicateDeciderName, registry.registerDeciderConfig("c", cfg));
             try std.testing.expectEqual(@as(usize, 3), registry.decider_configs.count());
         }
