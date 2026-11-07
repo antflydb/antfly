@@ -247,6 +247,7 @@ const BoundModelSource = struct {
     kind: ModelSource.Kind,
     logical_path: []const u8,
     external_base_dir: ?[]u8 = null,
+    external_reader: ?onnx_graph.tensor.ExternalDataReader = null,
     owned_manifest: ?manifest_mod.ModelManifest = null,
     borrowed_manifest: ?*const manifest_mod.ModelManifest = null,
     direct_onnx_manifest: ?manifest_mod.ModelManifest = null,
@@ -261,7 +262,7 @@ const BoundModelSource = struct {
 
     fn init(proof: *ComponentConstruction, requested: []const u8, kind: ModelSource.Kind, manifest: ?*const manifest_mod.ModelManifest, external_base: ?[]const u8) !BoundModelSource {
         const artifacts = proof.artifacts();
-        var result = BoundModelSource{ .allocator = artifacts.allocator, .path = try artifacts.constructionPath(requested), .kind = kind, .logical_path = if (kind == .onnx and manifest != null) manifest.?.onnx_logical_path orelse manifest.?.onnx_path orelse requested else requested, .borrowed_manifest = manifest };
+        var result = BoundModelSource{ .allocator = artifacts.allocator, .path = try artifacts.constructionPath(requested), .kind = kind, .external_reader = artifacts.onnxReader(), .logical_path = if (kind == .onnx and manifest != null) manifest.?.onnx_logical_path orelse manifest.?.onnx_path orelse requested else requested, .borrowed_manifest = manifest };
         errdefer result.deinit();
         if (kind == .onnx) {
             if (manifest) |selected| {
@@ -307,7 +308,7 @@ const BoundModelSource = struct {
         return result;
     }
     fn view(self: *const BoundModelSource) ModelSource {
-        return .{ .path = self.path, .kind = self.kind, .logical_path = self.logical_path, .external_base_dir = self.external_base_dir, .manifest = if (self.direct_onnx_manifest) |*graph| graph else if (self.directory_manifest) |*directory| &directory.manifest else self.borrowed_manifest orelse if (self.owned_manifest) |*manifest| manifest else null };
+        return .{ .path = self.path, .kind = self.kind, .logical_path = self.logical_path, .external_base_dir = self.external_base_dir, .external_reader = self.external_reader, .manifest = if (self.direct_onnx_manifest) |*graph| graph else if (self.directory_manifest) |*directory| &directory.manifest else self.borrowed_manifest orelse if (self.owned_manifest) |*manifest| manifest else null };
     }
     /// Resolve the backend's actual source once and reuse it for proof,
     /// preflight, admission, and construction, including subsequent retries.
@@ -336,7 +337,7 @@ const BoundModelSource = struct {
                     self.onnx_binding = .{ .path = path, .external_base_dir = base, .manifest = graph_manifest };
                 }
                 const graph = &self.onnx_binding.?;
-                return .{ .path = graph.path, .kind = .onnx, .manifest = &graph.manifest, .logical_path = man.onnx_logical_path orelse selected, .external_base_dir = graph.external_base_dir };
+                return .{ .path = graph.path, .kind = .onnx, .manifest = &graph.manifest, .logical_path = man.onnx_logical_path orelse selected, .external_base_dir = graph.external_base_dir, .external_reader = self.external_reader };
             }
             if (backend == .wasm) return null;
             return self.view();
@@ -11566,10 +11567,11 @@ const ComponentArtifactEstimate = union(enum) {
 
     fn init(allocator: std.mem.Allocator, source: ModelSource) !ComponentArtifactEstimate {
         if (source.kind == .onnx) {
-            var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithBase(
+            var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithReader(
                 allocator,
                 source.path,
                 source.external_base_dir,
+                source.external_reader,
             );
             defer artifacts.deinit();
             return .{ .onnx = artifacts.encoded_bytes };
@@ -12264,7 +12266,7 @@ fn loadSessionForPreferredBackendsWithArtifacts(
         if (managed_admission) {
             const admission_result = if (source.kind == .onnx) graph_plan: {
                 if (onnx_admission_bytes == null) {
-                    var artifacts = backends.imported_onnx_session.inspectArtifactSetWithBase(manager.allocator, source.path, source.external_base_dir) catch |err| {
+                    var artifacts = backends.imported_onnx_session.inspectArtifactSetWithReader(manager.allocator, source.path, source.external_base_dir, source.external_reader) catch |err| {
                         rememberPreferredLoadError(&first_err, err);
                         continue;
                     };
@@ -20023,4 +20025,109 @@ test "model selection cold primary retains its root proof through final adoption
         try std.testing.expectEqual(probe.switch_at.?, probe.checks);
         try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
     }
+}
+
+test "model selection retained ONNX handles defeat external leaf and parent ABA switches" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for (0..3) |shape_case| for ([_]bool{ false, true }) |parent_switch| {
+        const dims: []const i64 = if (shape_case == 0) &.{4} else if (shape_case == 1) &.{ 4, 8 } else &.{32};
+        const count: usize = if (shape_case == 0) 4 else 32;
+        var values: [32]f32 = undefined;
+        var other: [32]f32 = undefined;
+        for (&values, &other, 0..) |*value, *replacement, i| {
+            value.* = @floatFromInt(i + 1);
+            replacement.* = value.* * 10;
+        }
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var builder = ml.graph.Builder.init(&graph);
+        const input = try builder.parameter("input", ml.graph.Shape.init(.f32, dims));
+        const weight = try builder.parameter("weight", ml.graph.Shape.init(.f32, dims));
+        try graph.markOutput(try builder.add(input, weight));
+        var exported = try onnx_graph.exportGraphWithExternalData(a, &graph, .{ .parameter_initializers = &.{.{ .name = "weight", .shape = ml.graph.Shape.init(.f32, dims), .data = .{ .raw_bytes = std.mem.sliceAsBytes(values[0..count]) } }} }, "weights.data");
+        defer exported.deinit(a);
+        var replacement_graph = ml.graph.Graph.init(a);
+        defer replacement_graph.deinit();
+        var replacement_builder = ml.graph.Builder.init(&replacement_graph);
+        const replacement_input = try replacement_builder.parameter("input", ml.graph.Shape.init(.f32, dims));
+        try replacement_graph.markOutput(try replacement_builder.add(replacement_input, replacement_input));
+        const replacement_bytes = try onnx_graph.exportGraph(a, &replacement_graph, .{});
+        defer a.free(replacement_bytes);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "files");
+        try tmp.dir.createDirPath(io, "foreign");
+        try tmp.dir.writeFile(io, .{ .sub_path = "files/graph.onnx", .data = exported.model_bytes });
+        try tmp.dir.writeFile(io, .{ .sub_path = "foreign/graph.onnx", .data = replacement_bytes });
+        try tmp.dir.writeFile(io, .{ .sub_path = "files/first.data", .data = exported.external_data.?.bytes });
+        try tmp.dir.writeFile(io, .{ .sub_path = "foreign/first.data", .data = std.mem.sliceAsBytes(other[0..count]) });
+        try tmp.dir.symLink(io, "files/graph.onnx", "model.onnx", .{});
+        try tmp.dir.symLink(io, "files/first.data", "weights.data", .{});
+        try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.onnx", "weights.data" });
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        const path = try std.fs.path.join(a, &.{ root, "model.onnx" });
+        defer a.free(path);
+        const Probe = struct {
+            dir: std.Io.Dir,
+            parent: bool,
+            authenticated: bool = false,
+            checks: usize = 0,
+            var current: *@This() = undefined;
+            var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+            fn open(raw: ?*anyopaque, dir: std.Io.Dir, name: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+                if (std.mem.endsWith(u8, name, "/files/first.data")) current.authenticated = true;
+                return original(raw, dir, name, options);
+            }
+            fn check(raw: ?*anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                if (!self.authenticated) return;
+                self.checks += 1;
+                if (self.checks != 1 and self.checks != 3) return;
+                if (self.parent) {
+                    if (self.checks == 1) {
+                        try self.dir.rename("files", self.dir, "saved", std.testing.io);
+                        try self.dir.symLink(std.testing.io, "foreign", "files", .{ .is_directory = true });
+                    } else {
+                        try self.dir.deleteFile(std.testing.io, "files");
+                        try self.dir.rename("saved", self.dir, "files", std.testing.io);
+                    }
+                } else {
+                    try self.dir.deleteFile(std.testing.io, "weights.data");
+                    try self.dir.symLink(std.testing.io, if (self.checks == 1) "foreign/first.data" else "files/first.data", "weights.data", .{});
+                }
+            }
+        };
+        var probe = Probe{ .dir = tmp.dir, .parent = parent_switch };
+        var table = io.vtable.*;
+        Probe.current = &probe;
+        Probe.original = table.dirOpenFile;
+        table.dirOpenFile = Probe.open;
+        const counted = std.Io{ .userdata = io.userdata, .vtable = &table };
+        var sm = backends.SessionManager.initWithIo(a, counted);
+        sm.preferred_backends = &.{.native};
+        sm.native_call_policy = .in_process;
+        var manager = ModelManager.init(a, sm);
+        defer manager.deinit();
+        manager.admission_enabled = true;
+        const selected = ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+        {
+            var loaded = try manager.loadManagedSessionWithAdmission(path, &.{.native}, null, .{ .io = counted, .ptr = &probe, .check_fn = Probe.check }, selected, null);
+            defer loaded.deinit();
+            try std.testing.expectEqual(@as(usize, 3), probe.checks);
+            // Construction's publication fence and all retained descriptors are
+            // gone here. Execution owns decoded tensors, not borrowed readers.
+            const zeros: [32]f32 = @splat(0);
+            var tensor = try backends.Tensor.initFloat32(a, "input", dims, zeros[0..count]);
+            defer tensor.deinit();
+            const outputs = try loaded.session.run(&.{tensor}, a);
+            defer {
+                for (outputs) |*output| output.deinit();
+                a.free(outputs);
+            }
+            try std.testing.expectEqualSlices(f32, values[0..count], outputs[0].asFloat32());
+        }
+        try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+    };
 }

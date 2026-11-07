@@ -25,6 +25,34 @@ pub const TensorProto = proto.TensorProto;
 
 pub const DataType = proto.DataType;
 
+/// Borrowed acquisition capability. Returned handles stay owned by the
+/// provider, and every read uses positional IO on those same opened files.
+pub const ExternalDataReader = struct {
+    context: *anyopaque,
+    open_fn: *const fn (*anyopaque, []const u8) anyerror!OpenedFile,
+    pub const OpenedFile = struct { file: std.Io.File, io: std.Io, size: u64 };
+
+    pub fn open(self: ExternalDataReader, path: []const u8) !OpenedFile {
+        return self.open_fn(self.context, path);
+    }
+    pub fn size(self: ExternalDataReader, path: []const u8) !u64 {
+        return (try self.open(path)).size;
+    }
+    pub fn read(self: ExternalDataReader, allocator: std.mem.Allocator, path: []const u8, offset: i64, length: i64, max_bytes: usize) ![]u8 {
+        if (offset < 0) return error.InvalidExternalOffset;
+        const opened = try self.open(path);
+        const off: u64 = @intCast(offset);
+        if (off > opened.size) return error.ExternalRegionOutOfBounds;
+        const len: u64 = if (length < 0) opened.size - off else @intCast(length);
+        if (len > opened.size - off) return error.ExternalRegionOutOfBounds;
+        if (len > max_bytes) return error.FileTooLarge;
+        const bytes = try allocator.alloc(u8, @intCast(len));
+        errdefer allocator.free(bytes);
+        if (try opened.file.readPositionalAll(opened.io, bytes, off) != bytes.len) return error.ExternalRegionShortRead;
+        return bytes;
+    }
+};
+
 /// Count total elements from dims.
 pub fn numElements(dims: []const i64) usize {
     if (dims.len == 0) return 1; // scalar
@@ -54,6 +82,10 @@ pub fn extractFloat32WithExternal(
     tensor: *const TensorProto,
     base_dir: ?[]const u8,
 ) ![]f32 {
+    return extractFloat32WithReader(allocator, tensor, base_dir, null);
+}
+
+pub fn extractFloat32WithReader(allocator: std.mem.Allocator, tensor: *const TensorProto, base_dir: ?[]const u8, reader: ?ExternalDataReader) ![]f32 {
     if (!tensor.isExternal()) return extractFloat32Inner(allocator, tensor);
 
     const bd = base_dir orelse return error.ExternalData;
@@ -68,7 +100,7 @@ pub fn extractFloat32WithExternal(
     const full_path = try std.fs.path.join(allocator, &.{ bd, info.location });
     defer allocator.free(full_path);
 
-    const raw = try readExternalRegion(allocator, full_path, info.offset, info.length);
+    const raw = try readExternalRegionWithReader(allocator, full_path, info.offset, info.length, reader);
     defer allocator.free(raw);
 
     const count = numElements(tensor.dims);
@@ -83,6 +115,10 @@ pub fn extractNativeBytesWithExternal(
     tensor: *const TensorProto,
     base_dir: ?[]const u8,
 ) ![]u8 {
+    return extractNativeBytesWithReader(allocator, tensor, base_dir, null);
+}
+
+pub fn extractNativeBytesWithReader(allocator: std.mem.Allocator, tensor: *const TensorProto, base_dir: ?[]const u8, reader: ?ExternalDataReader) ![]u8 {
     const element_size = try nativeByteSize(tensor.data_type);
     const count = numElements(tensor.dims);
     const byte_count = try std.math.mul(usize, count, element_size);
@@ -97,7 +133,7 @@ pub fn extractNativeBytesWithExternal(
         const full_path = try std.fs.path.join(allocator, &.{ bd, info.location });
         defer allocator.free(full_path);
 
-        const raw = try readExternalRegion(allocator, full_path, info.offset, info.length);
+        const raw = try readExternalRegionWithReader(allocator, full_path, info.offset, info.length, reader);
         errdefer allocator.free(raw);
         if (raw.len < byte_count) return error.InsufficientData;
         if (raw.len == byte_count) return raw;
@@ -156,6 +192,11 @@ fn extractFloat32Inner(allocator: std.mem.Allocator, tensor: *const TensorProto)
     const result = try allocator.alloc(f32, count);
     @memset(result, 0);
     return result;
+}
+
+fn readExternalRegionWithReader(allocator: std.mem.Allocator, path: []const u8, offset: i64, length: i64, reader: ?ExternalDataReader) ![]u8 {
+    if (reader) |source| return source.read(allocator, path, offset, length, std.math.maxInt(usize));
+    return readExternalRegion(allocator, path, offset, length);
 }
 
 /// Read a byte region from an external file. `length == -1` means "to end of file".
@@ -366,4 +407,38 @@ fn nativeByteSize(dtype: DataType) !usize {
         .int8, .uint8, .bool_ => 1,
         else => error.UnsupportedDType,
     };
+}
+
+test "retained ONNX reader preserves float and native integer data without pathname IO" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const values = [_]f32{ 1, 2 };
+    const integer: i64 = std.math.maxInt(i64);
+    const bytes = std.mem.asBytes(&values) ++ std.mem.asBytes(&integer);
+    try tmp.dir.writeFile(io, .{ .sub_path = "captured", .data = bytes });
+    const file = try tmp.dir.openFile(io, "captured", .{});
+    defer file.close(io);
+    const Context = struct {
+        file: std.Io.File,
+        fn open(raw: *anyopaque, _: []const u8) !ExternalDataReader.OpenedFile {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .file = self.file, .io = std.testing.io, .size = 16 };
+        }
+    };
+    var context = Context{ .file = file };
+    const reader = ExternalDataReader{ .context = &context, .open_fn = Context.open };
+    var dims = [_]i64{2};
+    var fields = [_]proto.ExternalDataEntry{ .{ .key = "location", .value = "not-on-disk" }, .{ .key = "offset", .value = "0" }, .{ .key = "length", .value = "8" } };
+    var tensor = TensorProto{ .data_type = .float32, .dims = &dims, .data_location = .external, .external_data = &fields };
+    const floats = try extractFloat32WithReader(a, &tensor, "/not-a-real-model", reader);
+    defer a.free(floats);
+    try std.testing.expectEqualSlices(f32, &values, floats);
+    tensor.data_type = .int64;
+    dims[0] = 1;
+    fields[1].value = "8";
+    const native = try extractNativeBytesWithReader(a, &tensor, "/not-a-real-model", reader);
+    defer a.free(native);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&integer), native);
 }

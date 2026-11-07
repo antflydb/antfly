@@ -113,24 +113,32 @@ pub const ArtifactStamp = struct {
 };
 
 pub fn verifyValidatedArtifactSha256AndStamp(io: std.Io, artifact: *const ValidatedArtifact, expected_hex: []const u8) !ArtifactStamp {
+    // Keep malformed-contract errors independent of filesystem availability.
     if (expected_hex.len != 64) return error.ChecksumMismatch;
     var expected: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&expected, expected_hex) catch return error.ChecksumMismatch;
-
     var file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
     defer file.close(io);
+    return verifyOpenedArtifactSha256AndStamp(io, file, artifact, expected_hex);
+}
+
+/// Hash the same retained file construction will read, without seeking or
+/// reopening its pathname. Positional reads permit shared tensor regions.
+pub fn verifyOpenedArtifactSha256AndStamp(io: std.Io, file: std.Io.File, artifact: *const ValidatedArtifact, expected_hex: []const u8) !ArtifactStamp {
+    if (expected_hex.len != 64) return error.ChecksumMismatch;
+    var expected: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&expected, expected_hex) catch return error.ChecksumMismatch;
     const stat = try file.stat(io);
     if (stat.kind != .file or stat.size != artifact.size) return error.InvalidManagedDownload;
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var buf: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
     while (true) {
-        const n = file.readStreaming(io, &.{buf[0..]}) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            else => return err,
-        };
+        const n = try file.readPositionalAll(io, &buf, offset);
         if (n == 0) break;
         hasher.update(buf[0..n]);
+        offset += n;
     }
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;

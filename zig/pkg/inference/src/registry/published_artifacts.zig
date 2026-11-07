@@ -83,6 +83,19 @@ pub const VerificationCache = struct {
         self.remember(a, key, verified) catch {}; // Cache pressure cannot deny a valid construction.
         return verified;
     }
+    fn verifyOpened(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, publication: [32]u8, artifact: *const managed.ValidatedArtifact, file: std.Io.File, initial: managed.ArtifactStamp) !managed.ArtifactStamp {
+        const key = keyFor(publication, artifact);
+        if (self.hit(key, initial)) return initial;
+        const builder = &self.builders[key[0] % self.builders.len];
+        try builder.lock(io);
+        defer builder.unlock(io);
+        const stamp = managed.ArtifactStamp.fromStat(try file.stat(io));
+        if (stamp.kind != .file or stamp.size != artifact.size) return error.InvalidManagedDownload;
+        if (self.hit(key, stamp)) return stamp;
+        const verified = try managed.verifyOpenedArtifactSha256AndStamp(io, file, artifact, artifact.sha256.?);
+        self.remember(a, key, verified) catch {};
+        return verified;
+    }
     pub fn deinit(self: *VerificationCache, a: std.mem.Allocator) void {
         self.entries.deinit(self.owner_allocator orelse a);
     }
@@ -108,6 +121,9 @@ pub const PublishedArtifacts = struct {
     publication: ?[32]u8,
     verified_stamps: []?managed.ArtifactStamp = &.{},
     canonical_index: std.StringHashMapUnmanaged(usize) = .empty,
+    opened_files: std.AutoHashMapUnmanaged(usize, OpenedArtifact) = .empty,
+    const OpenedArtifact = struct { file: std.Io.File, stamp: managed.ArtifactStamp };
+    const ExternalDataReader = @import("onnx_graph").tensor.ExternalDataReader;
 
     pub fn init(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: ?Expected) !PublishedArtifacts {
         const direct = managed.isDirectModelPath(root);
@@ -154,6 +170,9 @@ pub const PublishedArtifacts = struct {
         return .{ .allocator = a, .io = io, .root = root, .requested_root = requested_root, .storage_root = storage_root, .physical_root = physical_root, .physical_root_inode = root_stat.inode, .physical_direct = physical_direct, .direct_path = direct_path, .direct_index = direct_index, .receipt = receipt, .publication = publication, .canonical_index = index, .verified_stamps = verified };
     }
     pub fn deinit(self: *PublishedArtifacts) void {
+        var opened = self.opened_files.valueIterator();
+        while (opened.next()) |value| value.file.close(self.io);
+        self.opened_files.deinit(self.allocator);
         self.allocator.free(self.requested_root);
         self.allocator.free(self.storage_root);
         self.allocator.free(self.physical_root);
@@ -337,10 +356,44 @@ pub const PublishedArtifacts = struct {
     }
     pub fn verifyOnnxWithBase(self: *PublishedArtifacts, path: []const u8, external_base_dir: ?[]const u8) !void {
         if (self.receipt == null) return;
-        try self.verifyPath(path);
-        var graph = try @import("../backends/imported_onnx_session.zig").inspectArtifactSetWithBase(self.allocator, path, external_base_dir);
+        // Inspection opens and authenticates each dependency through the same
+        // retained handles the importer will consume. A pathname is never a
+        // substitute for proof of the opened bytes.
+        var graph = try @import("../backends/imported_onnx_session.zig").inspectArtifactSetWithReader(self.allocator, path, external_base_dir, self.onnxReader());
         defer graph.deinit();
-        for (graph.external_paths) |external| try self.verifyPath(external);
+    }
+
+    /// Borrow only through synchronous construction. No reader or file handle
+    /// escapes into a resident session; decoded weights and shape templates do.
+    pub fn onnxReader(self: *PublishedArtifacts) ?ExternalDataReader {
+        if (self.receipt == null) return null;
+        return .{ .context = self, .open_fn = openOnnxArtifact };
+    }
+
+    fn openOnnxArtifact(raw: *anyopaque, path: []const u8) !ExternalDataReader.OpenedFile {
+        const self: *PublishedArtifacts = @ptrCast(@alignCast(raw));
+        const member = &self.receipt.?.artifacts[try self.indexForPath(path)];
+        const index = self.canonical_index.get(member.canonical_path).?;
+        if (self.opened_files.get(index)) |opened| return .{ .file = opened.file, .io = self.io, .size = opened.stamp.size };
+        try self.opened_files.ensureUnusedCapacity(self.allocator, 1);
+        const artifact = &self.receipt.?.artifacts[index];
+        const file = try std.Io.Dir.cwd().openFile(self.io, artifact.canonical_path, .{});
+        errdefer file.close(self.io);
+        const stamp = managed.ArtifactStamp.fromStat(try file.stat(self.io));
+        if (stamp.kind != .file or stamp.size != artifact.size) return error.InvalidManagedDownload;
+        const verified = if (self.verified_stamps[index]) |prior|
+            if (std.meta.eql(prior, stamp)) stamp else try self.verifyOpened(artifact, file, stamp)
+        else
+            try self.verifyOpened(artifact, file, stamp);
+        self.verified_stamps[index] = verified;
+        self.opened_files.putAssumeCapacity(index, .{ .file = file, .stamp = verified });
+        return .{ .file = file, .io = self.io, .size = verified.size };
+    }
+
+    fn verifyOpened(self: *PublishedArtifacts, artifact: *const managed.ValidatedArtifact, file: std.Io.File, stamp: managed.ArtifactStamp) !managed.ArtifactStamp {
+        const digest = artifact.sha256 orelse return stamp;
+        if (self.verification_cache) |cache| return cache.verifyOpened(self.allocator, self.io, self.publication.?, artifact, file, stamp);
+        return managed.verifyOpenedArtifactSha256AndStamp(self.io, file, artifact, digest);
     }
     /// Rebase metadata into the captured namespace without opening optional
     /// artifacts or granting execution permission. A backend must still call
@@ -407,6 +460,11 @@ pub const PublishedArtifacts = struct {
         }
         if (self.direct_path) |path| try self.verifyBinding(path, self.physical_direct.?);
         if (!std.meta.eql(self.publication, try managed.publicationGeneration(self.allocator, self.io, self.root))) return error.ModelArtifactsChanging;
+        var opened = self.opened_files.valueIterator();
+        while (opened.next()) |value| {
+            const stamp = managed.ArtifactStamp.fromStat(try value.file.stat(self.io));
+            if (!std.meta.eql(stamp, value.stamp)) return error.ModelArtifactsChanging;
+        }
         // Native directory importers also discover members by relative names.
         // Keep every alias of a verified member bound to its captured target.
         if (self.receipt) |receipt| for (receipt.artifacts) |artifact| {
@@ -1154,4 +1212,48 @@ test "model selection direct ONNX receipt authority rejects unlisted and escapin
     defer artifacts.deinit();
     try std.testing.expect(artifacts.publication != null);
     try artifacts.verify();
+}
+
+fn retainedOnnxAllocationScenario(a: std.mem.Allocator, root: []const u8, path: []const u8, alias: []const u8) !void {
+    var artifacts = try PublishedArtifacts.init(a, std.testing.io, root, null);
+    defer artifacts.deinit();
+    const reader = artifacts.onnxReader().?;
+    const first = try reader.read(a, path, 0, -1, 1024);
+    defer a.free(first);
+    const second = try reader.read(a, alias, 1, 3, 1024);
+    defer a.free(second);
+    try std.testing.expectEqualStrings("weights", first);
+    try std.testing.expectEqualStrings("eig", second);
+    try std.testing.expectEqual(@as(usize, 1), artifacts.opened_files.count());
+    try artifacts.verify();
+}
+
+test "model selection retained ONNX aliases share one handle and unwind every allocation failure" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = "weights" });
+    try tmp.dir.symLink(io, "model.onnx", "alias.onnx", .{});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("weights", &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const json = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .artifacts = .{ .{ .path = "model.onnx", .size = 7, .sha256 = hex }, .{ .path = "alias.onnx", .size = 7, .sha256 = hex } } }, .{});
+    defer a.free(json);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data = json });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "model.onnx" });
+    defer a.free(path);
+    const alias = try std.fs.path.join(a, &.{ root, "alias.onnx" });
+    defer a.free(alias);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, retainedOnnxAllocationScenario, .{ root, path, alias });
+    var artifacts = try PublishedArtifacts.init(a, io, root, null);
+    defer artifacts.deinit();
+    const reader = artifacts.onnxReader().?;
+    _ = try reader.open(path);
+    try std.testing.expectError(error.ExternalRegionOutOfBounds, reader.read(a, path, 8, 1, 100));
+    try std.testing.expectError(error.FileTooLarge, reader.read(a, path, 0, -1, 3));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = "changed" });
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
 }
