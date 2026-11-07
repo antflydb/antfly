@@ -560,3 +560,63 @@ query after restart and five warm queries, including sampled server RSS and CPU.
 These use the fixture's small corpus, retain durable/OS caches, and must run
 without competing compilers. They supplement correctness checks; they do not
 qualify full-archive performance or a regional managed deployment.
+
+### Candidate qualification, November 7 UTC
+
+The native ARM64 ReleaseSafe candidate at `dd2d98ce38` (documentation head
+`a1ee317fa6`) built successfully. Its binary SHA-256 is
+`03f068d1935b2f0ac040740af56f5685f4b302e578bc708d5c1cd664cf22c424`.
+Twenty fresh focused regressions passed with zero failures/leaks and direct exit
+0. All four HTTP cases passed: explicit/inferred text-index selection, each with
+local and real GCS artifacts. Every case measured **two preparations for seven
+fresh leaf calls**, and **two for three calls** on the resumed pending-WAL page.
+Both retained cuts returned their exact distinct IDs after writes and restart;
+GCS cases verified both publication generation maps and nonempty retained WAL
+change parts. The budget-exhaustion regression retained no readers or charge.
+
+The HTTP corpus has 100 historical rows and 31 initial current rows. GCS holds
+native artifacts and the WAL; Parquet and the managed Iceberg warehouse remain
+local. Measurements below use five warm requests after one restart query,
+retaining durable/OS caches. GCS requests have a 1.2-second inter-request delay,
+excluded from latency. RSS is the sampled server maximum during those requests.
+
+| Artifacts | Text index | Restart query | Warm median | Sampled peak RSS |
+| --- | --- | ---: | ---: | ---: |
+| Local | Explicit | 28.23 ms | 15.26 ms | 127.75 MiB |
+| Local | Inferred | 31.84 ms | 13.82 ms | 129.16 MiB |
+| GCS | Explicit | 2,086.51 ms | 1,157.51 ms | 184.95 MiB |
+| GCS | Inferred | 2,001.11 ms | 1,157.24 ms | 185.80 MiB |
+
+A separate local matrix passed both stored-source and Parquet-hydration cells
+with 10,000 unique real HN comments across two Snappy Parquet files (4,935,176
+bytes). Inputs came from bounded `tabledata.list` reads of
+`bigquery-public-data.hacker_news.full`, normalized with the example's serving
+row conversion. No BigQuery query/export jobs were created. These unordered
+pages are not a random sample: story/title/score diversity and external comment
+ancestors are unqualified. The files were written by PyArrow, not BigQuery.
+Input SHA-256 values are
+`b34eb0bc2acd66944170158ef9a5492f0781060ee00070692c8850835ce35b3f`
+and `e34f09a1dd84b0e21ab4f0ab7c2f346ed4654da11a9a416003a423ea2ab5e39b`.
+
+| Local archive mode | Cold search | Warm median | Warm maximum | Restart | Child peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Stored source | 25.16 ms | 8.75 ms | 14.52 ms | 19.85 ms | 302.31 MiB |
+| Parquet hydration | 27.46 ms | 5.19 ms | 8.65 ms | 20.79 ms | 221.03 MiB |
+
+This matrix uses a 4 GiB process budget, five warm samples, navigation warming
+disabled and the serving cache cleared after publication. OS caches are not
+flushed, and setup includes SQL count. Child RSS is the maximum over the entire
+run, including publication and restarts, rather than query-only memory. Both
+cells verified highlights, metadata filters against residual execution, exact
+filters and score/pagination stability after restart. With 128 native current
+rows, union warm medians were 48.58/48.56 ms and saved-overlay medians were
+54.06/53.54 ms for stored-source/hydration respectively. These current rows use
+native storage, unlike the managed Iceberg HTTP regression above.
+
+All measurements are from a shared developer host, with no competing builds
+from this task during timings. Other host activity, small sample counts and
+different fixture/build settings prevent a causal comparison with earlier
+rc.10 measurements or a full-archive claim. The roughly 1.16-second GCS warm
+result still includes remote admission and continuation work; the proposed
+authoritative owner cuts, precomputed cursor references and broader warming
+remain planned work, not measured improvements in this candidate.
