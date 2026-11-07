@@ -1178,6 +1178,16 @@ pub fn decoderForwardIncrementalBatchStepFinalHiddenTensor(
     token_ids: []const i64,
     cache: *DecoderIncrementalCache,
 ) !CT {
+    return decoderForwardIncrementalBatchStepWithWeights(control_cb, allocator, config, token_ids, cache, null);
+}
+fn decoderForwardIncrementalBatchStepWithWeights(
+    control_cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    token_ids: []const i64,
+    cache: *DecoderIncrementalCache,
+    held: ?*const PreparedSingleToken.Weights,
+) !CT {
     try control_cb.checkExecutionControl();
     const layer_cb = layerComputeBackend(control_cb);
     const cb = &layer_cb;
@@ -1195,7 +1205,7 @@ pub fn decoderForwardIncrementalBatchStepFinalHiddenTensor(
 
     var frame_active = try beginFlorenceMetalFrame(cb, .decode);
     errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
-    var hidden = try applyDecoderEmbeddingsAtAssigned(cb, allocator, config, token_ids, batch, 1, old_len, assigned);
+    var hidden = try applyDecoderEmbeddingsAtAssigned(cb, allocator, config, token_ids, batch, 1, old_len, assigned, held);
     var hidden_live = true;
     errdefer if (hidden_live) stepRelease(cb, assigned, hidden);
 
@@ -1214,13 +1224,20 @@ pub fn decoderForwardIncrementalBatchStepFinalHiddenTensor(
             layer,
             cache,
             &buf,
+            if (held) |weights| &weights.layers[layer] else null,
         );
         stepRelease(cb, assigned, hidden);
         hidden = new_hidden;
     }
     cache.self.len = new_len;
 
-    if (try tryOptionalWeight(cb, "language_model.model.decoder.layer_norm.weight")) |ln_w| {
+    if (held) |weights| {
+        if (weights.final_norm) |norm| {
+            const normed = try stepNorm(cb, assigned, hidden, norm.w, norm.b, config.d_model);
+            stepRelease(cb, assigned, hidden);
+            hidden = normed;
+        }
+    } else if (try tryOptionalWeight(cb, "language_model.model.decoder.layer_norm.weight")) |ln_w| {
         const ln_b = (try tryOptionalWeight(cb, "language_model.model.decoder.layer_norm.bias")) orelse return error.MissingWeight;
         const normed = try stepNorm(cb, assigned, hidden, ln_w, ln_b, config.d_model);
         stepRelease(cb, assigned, hidden);
@@ -3084,7 +3101,7 @@ fn applyDecoderEmbeddingsAt(
     seq_len: usize,
     position_start: usize,
 ) !CT {
-    return applyDecoderEmbeddingsAtAssigned(cb, allocator, config, input_ids, batch, seq_len, position_start, null);
+    return applyDecoderEmbeddingsAtAssigned(cb, allocator, config, input_ids, batch, seq_len, position_start, null, null);
 }
 
 fn applyDecoderEmbeddingsAtAssigned(
@@ -3096,10 +3113,11 @@ fn applyDecoderEmbeddingsAtAssigned(
     seq_len: usize,
     position_start: usize,
     assigned: ?*@import("../execution/dense_decoder_schedule.zig").Schedule,
+    held: ?*const PreparedSingleToken.Weights,
 ) !CT {
     const d_model: usize = config.d_model;
     const total = batch * seq_len;
-    const embed_w = try promptEmbedWeight(cb);
+    const embed_w = if (held) |weights| weights.embed else try promptEmbedWeight(cb);
     var hidden = try stepEmbedding(cb, assigned, embed_w, input_ids, total, d_model);
     // Position metadata can fail independently of backend tensor allocation.
     // Keep the current residual owned until final normalization succeeds.
@@ -3113,14 +3131,14 @@ fn applyDecoderEmbeddingsAtAssigned(
         for (0..seq_len) |s| pos_ids[b * seq_len + s] = @intCast(position_start + s + bart_position_offset);
     }
 
-    const pos_emb = try stepEmbedding(cb, assigned, try decoderPosWeight(cb), pos_ids, total, d_model);
+    const pos_emb = try stepEmbedding(cb, assigned, if (held) |weights| weights.positions else try decoderPosWeight(cb), pos_ids, total, d_model);
     defer stepRelease(cb, assigned, pos_emb);
     const with_pos = try stepAdd(cb, assigned, hidden, pos_emb);
     stepRelease(cb, assigned, hidden);
     hidden = with_pos;
 
-    const ln_w = try decoderLayerNormEmbeddingWeight(cb);
-    const ln_b = try decoderLayerNormEmbeddingBias(cb);
+    const ln_w = if (held) |weights| weights.embed_norm.w else try decoderLayerNormEmbeddingWeight(cb);
+    const ln_b = if (held) |weights| weights.embed_norm.b else try decoderLayerNormEmbeddingBias(cb);
     const normed = try stepNorm(cb, assigned, hidden, ln_w, ln_b, d_model);
     stepRelease(cb, assigned, hidden);
     return normed;
@@ -3415,6 +3433,24 @@ fn decoderBlockWithOptionalCrossCache(
     return result;
 }
 
+/// The real prepared request holds/stamps these CTs before numerical entry.
+/// This lexical adapter borrows them only through the original compound layer;
+/// ordinary callers retain all historical lookup/alias/error/cache behavior.
+fn decoderStepLinearWeights(cb: *const ComputeBackend, layer: usize, comptime role: []const u8, buf: *[256]u8, held: ?*const PreparedSingleToken.Layer, comptime field: []const u8) !LinearWeights {
+    if (held) |weights| {
+        const pair = @field(weights, field);
+        return .{ .weight = pair.w, .bias = pair.b };
+    }
+    return decoderLinearWeights(cb, layer, role, buf);
+}
+fn decoderStepNormWeights(cb: *const ComputeBackend, layer: usize, comptime role: []const u8, buf: *[256]u8, held: ?*const PreparedSingleToken.Layer, comptime field: []const u8) !PreparedSingleToken.Pair {
+    if (held) |weights| return @field(weights, field);
+    // Same ordered old lookups; the original caller's error is preserved.
+    const w = try decoderLayerWeight(cb, layer, role ++ ".weight", buf);
+    const b = try decoderLayerWeight(cb, layer, role ++ ".bias", buf);
+    return .{ .w = w, .b = b };
+}
+
 fn decoderBlockIncrementalCached(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -3427,6 +3463,7 @@ fn decoderBlockIncrementalCached(
     layer: usize,
     cache: *DecoderIncrementalCache,
     buf: *[256]u8,
+    held: ?*const PreparedSingleToken.Layer,
 ) !CT {
     const expected_mask_len = std.math.mul(usize, batch, new_len) catch return error.InvalidInputShape;
     if (new_len != old_len + 1 or self_mask.len != expected_mask_len) return error.InvalidInputShape;
@@ -3438,9 +3475,9 @@ fn decoderBlockIncrementalCached(
     const ffn_dim = config.decoder_ffn_dim;
     var profile_stage_start = if (florenceDecoderStageFrameProfilingEnabled(cb)) nowNs() else 0;
 
-    const q_self_weights = try decoderLinearWeights(cb, layer, "self_attn.q_proj", buf);
-    const k_self_weights = try decoderLinearWeights(cb, layer, "self_attn.k_proj", buf);
-    const v_self_weights = try decoderLinearWeights(cb, layer, "self_attn.v_proj", buf);
+    const q_self_weights = try decoderStepLinearWeights(cb, layer, "self_attn.q_proj", buf, held, "q");
+    const k_self_weights = try decoderStepLinearWeights(cb, layer, "self_attn.k_proj", buf, held, "k");
+    const v_self_weights = try decoderStepLinearWeights(cb, layer, "self_attn.v_proj", buf, held, "v");
     const qkv_self = try stepTriple(cb, assigned, hidden, q_self_weights, k_self_weights, v_self_weights, batch, d_model);
     defer stepRelease(cb, assigned, qkv_self.first);
 
@@ -3456,7 +3493,7 @@ fn decoderBlockIncrementalCached(
     const self_attn = try stepPrefix(cb, assigned, qkv_self.first, cached_k_ref.tensor, cached_v_ref.tensor, self_mask, batch, new_len, num_heads, head_dim);
     defer stepRelease(cb, assigned, self_attn);
     const self_proj = block: {
-        const weights = try decoderLinearWeights(cb, layer, "self_attn.out_proj", buf);
+        const weights = try decoderStepLinearWeights(cb, layer, "self_attn.out_proj", buf, held, "o");
         break :block try stepLinear(cb, assigned, self_attn, weights.weight, weights.bias, batch, d_model, d_model);
     };
     defer stepRelease(cb, assigned, self_proj);
@@ -3464,8 +3501,9 @@ fn decoderBlockIncrementalCached(
     var self_res_live = true;
     errdefer if (self_res_live) stepRelease(cb, assigned, self_res);
 
-    const ln0_w = try decoderLayerWeight(cb, layer, "self_attn_layer_norm.weight", buf);
-    const ln0_b = try decoderLayerWeight(cb, layer, "self_attn_layer_norm.bias", buf);
+    const ln0 = try decoderStepNormWeights(cb, layer, "self_attn_layer_norm", buf, held, "self_norm");
+    const ln0_w = ln0.w;
+    const ln0_b = ln0.b;
     const self_normed = try stepNorm(cb, assigned, self_res, ln0_w, ln0_b, d_model);
     var self_normed_live = true;
     errdefer if (self_normed_live) stepRelease(cb, assigned, self_normed);
@@ -3474,7 +3512,7 @@ fn decoderBlockIncrementalCached(
     profile_stage_start = try profileFlorenceDecoderStageFrameBoundary(cb, "decoder_self", layer, profile_stage_start);
 
     const q_cross = block: {
-        const weights = try decoderLinearWeights(cb, layer, "encoder_attn.q_proj", buf);
+        const weights = try decoderStepLinearWeights(cb, layer, "encoder_attn.q_proj", buf, held, "cross_q");
         break :block try stepLinear(cb, assigned, self_normed, weights.weight, weights.bias, batch, d_model, d_model);
     };
     defer stepRelease(cb, assigned, q_cross);
@@ -3482,7 +3520,7 @@ fn decoderBlockIncrementalCached(
     const cross_attn = try stepPrefix(cb, assigned, q_cross, cross.keys[layer], cross.values[layer], cache.encoder_mask, batch, cache.enc_seq, num_heads, head_dim);
     defer stepRelease(cb, assigned, cross_attn);
     const cross_proj = block: {
-        const weights = try decoderLinearWeights(cb, layer, "encoder_attn.out_proj", buf);
+        const weights = try decoderStepLinearWeights(cb, layer, "encoder_attn.out_proj", buf, held, "cross_o");
         break :block try stepLinear(cb, assigned, cross_attn, weights.weight, weights.bias, batch, d_model, d_model);
     };
     defer stepRelease(cb, assigned, cross_proj);
@@ -3492,8 +3530,9 @@ fn decoderBlockIncrementalCached(
     stepRelease(cb, assigned, self_normed);
     self_normed_live = false;
 
-    const ln1_w = try decoderLayerWeight(cb, layer, "encoder_attn_layer_norm.weight", buf);
-    const ln1_b = try decoderLayerWeight(cb, layer, "encoder_attn_layer_norm.bias", buf);
+    const ln1 = try decoderStepNormWeights(cb, layer, "encoder_attn_layer_norm", buf, held, "cross_norm");
+    const ln1_w = ln1.w;
+    const ln1_b = ln1.b;
     const cross_normed = try stepNorm(cb, assigned, cross_res, ln1_w, ln1_b, d_model);
     var cross_normed_live = true;
     errdefer if (cross_normed_live) stepRelease(cb, assigned, cross_normed);
@@ -3501,10 +3540,10 @@ fn decoderBlockIncrementalCached(
     cross_res_live = false;
     profile_stage_start = try profileFlorenceDecoderStageFrameBoundary(cb, "decoder_cross", layer, profile_stage_start);
 
-    const fc1_weights = try decoderLinearWeights(cb, layer, "fc1", buf);
+    const fc1_weights = try decoderStepLinearWeights(cb, layer, "fc1", buf, held, "fc1");
     if (comptime build_options.enable_cuda) {
         if (cb.kind() == .cuda and platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_BART_FFN")) {
-            const second = try decoderLinearWeights(cb, layer, "fc2", buf);
+            const second = try decoderStepLinearWeights(cb, layer, "fc2", buf, held, "fc2");
             const nw = try decoderLayerWeight(cb, layer, "final_layer_norm.weight", buf);
             const nb = try decoderLayerWeight(cb, layer, "final_layer_norm.bias", buf);
             if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceBartFfn(cb, cross_normed, .{ fc1_weights.weight, fc1_weights.bias, second.weight, second.bias, nw, nb }, batch, d_model, ffn_dim)) |fused| {
@@ -3521,7 +3560,7 @@ fn decoderBlockIncrementalCached(
     const activated = if (assigned) |schedule| try schedule.execute(&.{fc1}, null) else try florenceExactGelu(cb, fc1);
     defer stepRelease(cb, assigned, activated);
 
-    const fc2_weights = try decoderLinearWeights(cb, layer, "fc2", buf);
+    const fc2_weights = try decoderStepLinearWeights(cb, layer, "fc2", buf, held, "fc2");
     const ffn_res = if (assigned) |schedule| prepared: {
         const second = try schedule.execute(&.{ activated, fc2_weights.weight, fc2_weights.bias }, null);
         break :prepared try schedule.execute(&.{ cross_normed, second }, null);
@@ -3537,8 +3576,9 @@ fn decoderBlockIncrementalCached(
     stepRelease(cb, assigned, cross_normed);
     cross_normed_live = false;
 
-    const ln2_w = try decoderLayerWeight(cb, layer, "final_layer_norm.weight", buf);
-    const ln2_b = try decoderLayerWeight(cb, layer, "final_layer_norm.bias", buf);
+    const ln2 = try decoderStepNormWeights(cb, layer, "final_layer_norm", buf, held, "final_norm");
+    const ln2_w = ln2.w;
+    const ln2_b = ln2.b;
     const result = try stepNorm(cb, assigned, ffn_res, ln2_w, ln2_b, d_model);
     stepRelease(cb, assigned, ffn_res);
     ffn_res_live = false;
@@ -4707,6 +4747,7 @@ pub const PreparedSingleToken = struct {
     }
     fn validateCache(self: *const @This()) !void {
         const cache = self.cache orelse return error.UnpreparedDenseSchedule;
+        if (cache.assigned != self.schedule or self.weights.layers.len != self.roots.len) return error.PreparedFlorenceSourceChanged;
         if (cache.batch != 1 or cache.cross_active != null or !cache.self.preallocated or cache.self.capacity != self.capacity or cache.enc_seq != self.encoder_rows or cache.self_mask.len != self.capacity or cache.encoder_mask.len != self.encoder_rows or cache.self.keys.len != self.roots.len or cache.self.values.len != self.roots.len or cache.cross.keys.len != self.roots.len or cache.cross.values.len != self.roots.len) return error.PreparedFlorenceSourceChanged;
         for (self.roots, 0..) |root, index| if (cache.self.keys[index] != root.self_k or cache.self.values[index] != root.self_v or cache.cross.keys[index] != root.cross_k or cache.cross.values[index] != root.cross_v) return error.PreparedFlorenceSourceChanged;
     }
@@ -4752,7 +4793,7 @@ pub const PreparedSingleToken = struct {
         errdefer self.poisoned = true;
         try self.bindInputs(null, .{}, false);
         self.schedule.?.cursor = 0;
-        const result = try decoderForwardIncrementalStepFinalHiddenTensor(&receiving, self.allocator, self.config, token, cache);
+        const result = try decoderForwardIncrementalBatchStepWithWeights(&receiving, self.allocator, self.config, &.{token}, cache, &self.weights);
         if (self.schedule.?.cursor != self.schedule.?.steps.len) return error.DenseScheduleOrderChanged;
         self.completed_steps += 1;
         return result;
@@ -4765,3 +4806,23 @@ pub const PreparedSingleToken = struct {
         self.allocator.destroy(self);
     }
 };
+
+test "Florence private held tuple supplies exact original roles without a repeated provider lookup" {
+    var layer: PreparedSingleToken.Layer = undefined;
+    inline for (@typeInfo(PreparedSingleToken.Layer).@"struct".field_names, 0..) |field, i| {
+        @field(layer, field) = .{ .w = @ptrFromInt(0x1000 + i * 32), .b = @ptrFromInt(0x1010 + i * 32) };
+    }
+    // These are only metadata identities: invoking Native getWeight would
+    // touch invalid ctx16. No numerical/ownership credit is inferred here.
+    const cb = ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &@import("../ops/native_compute.zig").vtable_impl };
+    var buf: [256]u8 = undefined;
+    inline for (.{ .{ "self_attn.q_proj", "q" }, .{ "self_attn.k_proj", "k" }, .{ "self_attn.v_proj", "v" }, .{ "self_attn.out_proj", "o" }, .{ "encoder_attn.q_proj", "cross_q" }, .{ "encoder_attn.k_proj", "cross_k" }, .{ "encoder_attn.v_proj", "cross_v" }, .{ "encoder_attn.out_proj", "cross_o" }, .{ "fc1", "fc1" }, .{ "fc2", "fc2" } }) |entry| {
+        const pair = try decoderStepLinearWeights(&cb, 0, entry[0], &buf, &layer, entry[1]);
+        try std.testing.expectEqual(@field(layer, entry[1]).w, pair.weight);
+        try std.testing.expectEqual(@field(layer, entry[1]).b, pair.bias);
+    }
+    inline for (.{ .{ "self_attn_layer_norm", "self_norm" }, .{ "encoder_attn_layer_norm", "cross_norm" }, .{ "final_layer_norm", "final_norm" } }) |entry| {
+        const pair = try decoderStepNormWeights(&cb, 0, entry[0], &buf, &layer, entry[1]);
+        try std.testing.expectEqual(@field(layer, entry[1]), pair);
+    }
+}

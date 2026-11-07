@@ -1610,18 +1610,23 @@ fn stepEmbedding(cb: *const ComputeBackend, profile: *StepProfile, weight: CT, i
     }
     return cb.embeddingLookup(weight, ids, rows, width);
 }
+// An identical CT names the same retained header and therefore the same
+// actual plane. Query it once; distinct view headers still need both reports.
+// Keep the backing, offset and live extent checks on both paths.
+fn validatePrefixRows(cb: *const ComputeBackend, actual: CT, whole: CT, bytes: usize) !void {
+    const mod = @import("../execution/dense_decoder_schedule.zig");
+    const observed = try mod.residentPlane(cb, actual);
+    const full = if (actual == whole) observed else try mod.residentPlane(cb, whole);
+    if (observed.backing == null or !std.meta.eql(observed.backing, full.backing) or observed.byte_offset != full.byte_offset or observed.readable_bytes < bytes) return error.PreparedDensePrefixBindingChanged;
+}
+
 fn stepPrefix(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, mask: []const i64, live: usize, heads: usize, dim: usize) !CT {
     if (profile.assigned) |schedule| {
         if (schedule.descriptors[schedule.steps[schedule.cursor]].?.operation == .dense_attention_rows) return stepCrossRows(cb, profile, q, k, v, mask, 1, live, heads, dim);
-        const mod = @import("../execution/dense_decoder_schedule.zig");
         const node = schedule.graph.node(schedule.steps[schedule.cursor]);
         const whole_k = schedule.values[node.inputs[1]] orelse return error.MissingValue;
         const whole_v = schedule.values[node.inputs[2]] orelse return error.MissingValue;
-        for ([_]CT{ k, v }, [_]CT{ whole_k, whole_v }) |actual, whole| {
-            const observed = try mod.residentPlane(cb, actual);
-            const full = try mod.residentPlane(cb, whole);
-            if (observed.backing == null or !std.meta.eql(observed.backing, full.backing) or observed.byte_offset != full.byte_offset or observed.readable_bytes < live * heads * dim * 4) return error.PreparedDensePrefixBindingChanged;
-        }
+        for ([_]CT{ k, v }, [_]CT{ whole_k, whole_v }) |actual, whole| try validatePrefixRows(cb, actual, whole, live * heads * dim * 4);
         const attention = ops.AttentionContext{ .total_sequence_len = live, .query_sequence_len = 1, .kv_sequence_len = live, .dense_attention_prefix = .{ .live_key_rows = live, .mask = mask } };
         return schedule.execute(&.{ q, whole_k, whole_v }, &attention);
     }
@@ -2142,4 +2147,30 @@ test "CUDA optional convolution preflight preserves direct default and composes 
         try std.testing.expectEqual(expected, direct_values[(batch * 2 + channel) * 2 + time]);
     };
     try std.testing.expect(compute.decoder_runtime_linear_slots.count() > slots);
+}
+
+test "Whisper prepared prefix validates identical retained headers and distinct Native views" {
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    const whole = try cb.fromFloat32Shape(&values, &.{ 4, 4 });
+    defer cb.free(whole);
+    try validatePrefixRows(&cb, whole, whole, values.len * @sizeOf(f32));
+    try std.testing.expectError(error.PreparedDensePrefixBindingChanged, validatePrefixRows(&cb, whole, whole, (values.len + 1) * @sizeOf(f32)));
+    const prefix = try cb.sliceRows2D(a, whole, 0, 2, 4);
+    defer cb.free(prefix);
+    try std.testing.expect(prefix != whole);
+    try validatePrefixRows(&cb, prefix, whole, 8 * @sizeOf(f32));
+    try std.testing.expectError(error.PreparedDensePrefixBindingChanged, validatePrefixRows(&cb, prefix, whole, 12 * @sizeOf(f32)));
+    const shifted = try cb.sliceRows2D(a, whole, 1, 2, 4);
+    defer cb.free(shifted);
+    try std.testing.expectError(error.PreparedDensePrefixBindingChanged, validatePrefixRows(&cb, shifted, whole, 8 * @sizeOf(f32)));
+    const other = try cb.fromFloat32Shape(&values, &.{ 4, 4 });
+    defer cb.free(other);
+    try std.testing.expectError(error.PreparedDensePrefixBindingChanged, validatePrefixRows(&cb, other, whole, 8 * @sizeOf(f32)));
 }

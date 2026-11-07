@@ -17,6 +17,7 @@ const Direct = struct {
     descriptor: ops.kernel_descriptor.Descriptor,
     slot: route.OutputSlot,
     support: Support,
+    immutable_resources: bool,
     workspace: ops.kernel_descriptor.WorkspaceRequirement,
     auxiliaries: ops.kernel_descriptor.AuxiliaryRequirements,
 
@@ -24,6 +25,10 @@ const Direct = struct {
         const self: *Direct = @ptrCast(@alignCast(raw));
         if (!self.support(self.backend.ptr, &self.descriptor) or request.output.epoch != self.slot.epoch or request.output.node != self.slot.node or request.output.allocation != self.slot.allocation or !shapeEqual(request.output.logical, self.descriptor.output_shape) or request.inputs.len != self.descriptor.input_count) return false;
         for (request.inputs, 0..) |input, index| if (!bindingDense(self.backend, input, self.descriptor.input_shapes[index])) return false;
+        // Canonical prepareImmutable callers attest descriptor-only resource
+        // recipes. Keep support policy, current slots and every input checked
+        // above while reusing the cold workspace and auxiliary requirements.
+        if (self.immutable_resources) return true;
         const functions = self.backend.vtable.kernels orelse return false;
         const workspace = if (functions.assignedKernelWorkspace) |query| query(self.backend.ptr, &self.descriptor) catch return false else ops.kernel_descriptor.WorkspaceRequirement{};
         if (!std.meta.eql(workspace, self.workspace)) return false;
@@ -101,8 +106,8 @@ pub fn prepare(backend: ops.ComputeBackend, request: route.Prepare, support: Sup
     return prepareImpl(backend, request, support, false);
 }
 
-/// Only canonical backends with descriptor-only legality/resource callbacks
-/// call this. Model Tensor operands retain per-invocation validation even here.
+/// Only canonical backends with descriptor-only resource callbacks call this.
+/// Current support policy and model Tensor operands still require validation.
 /// Runtime input equivalence remains mandatory for either validation scope.
 pub fn prepareImmutable(backend: ops.ComputeBackend, request: route.Prepare, support: Support) !?route.Owned {
     return prepareImpl(backend, request, support, true);
@@ -125,7 +130,7 @@ fn prepareImpl(backend: ops.ComputeBackend, request: route.Prepare, support: Sup
         if (index >= request.inputs_witnessed.len or !request.inputs_witnessed[index] or input == .tensor) stable = false;
     }
     const owner = try request.allocator.create(Direct);
-    owner.* = .{ .allocator = request.allocator, .backend = backend.withoutSynchronousBorrows(), .descriptor = request.descriptor.*, .slot = request.output, .support = support, .workspace = workspace, .auxiliaries = auxiliaries };
+    owner.* = .{ .allocator = request.allocator, .backend = backend.withoutSynchronousBorrows(), .descriptor = request.descriptor.*, .slot = request.output, .support = support, .immutable_resources = immutable_program, .workspace = workspace, .auxiliaries = auxiliaries };
     return .{ .validation_scope = if (stable) .prepared_program else .invocation, .context = owner, .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .key = @intCast(request.output.node), .requirements = .{ .primary_alignment = request.descriptor.alignment, .primary_bytes = primary_bytes, .profile = @intCast(@backingInt(std.meta.activeTag(request.descriptor.operation))), .workspace = workspace, .auxiliaries = auxiliaries, .capture = if (functions.physicalReplayKernelSupported) |query| (if (query(backend.ptr, request.descriptor)) .supported else .unsupported) else .unsupported }, .vtable = &Direct.vtable };
 }
 
@@ -143,10 +148,12 @@ test "direct program validation stays dynamic by default and for model tensor op
     const backend = compute.computeBackend();
     const Probe = struct {
         var allowed: bool = true;
+        var fixed_queries: usize = 0;
         fn dynamic(_: *anyopaque, _: *const ops.kernel_descriptor.Descriptor) bool {
             return allowed;
         }
         fn fixed(_: *anyopaque, _: *const ops.kernel_descriptor.Descriptor) bool {
+            fixed_queries += 1;
             return true;
         }
     };
@@ -166,6 +173,12 @@ test "direct program validation stays dynamic by default and for model tensor op
     var fixed_route = (try prepareImmutable(backend, request, Probe.fixed)) orelse return error.MissingPreparedKernelRoute;
     defer fixed_route.deinit();
     try std.testing.expectEqual(route.ValidationScope.prepared_program, fixed_route.validation_scope);
+    const cold_queries = Probe.fixed_queries;
+    try fixed_route.validate(.{ .inputs = &facts, .output = slot });
+    try std.testing.expectEqual(cold_queries + 1, Probe.fixed_queries);
+    var foreign_slot = slot;
+    foreign_slot.epoch += 1;
+    try std.testing.expectError(error.PreparedKernelBindingChanged, fixed_route.validate(.{ .inputs = &facts, .output = foreign_slot }));
     var unwitnessed_request = request;
     unwitnessed_request.inputs_witnessed = @splat(false);
     var unwitnessed = (try prepareImmutable(backend, unwitnessed_request, Probe.fixed)) orelse return error.MissingPreparedKernelRoute;
@@ -179,6 +192,11 @@ test "direct program validation stays dynamic by default and for model tensor op
     var retained = (try prepareImmutable(backend, model_request, Probe.fixed)) orelse return error.MissingPreparedKernelRoute;
     defer retained.deinit();
     try std.testing.expectEqual(route.ValidationScope.invocation, retained.validation_scope);
+    try retained.validate(.{ .inputs = &model, .output = slot });
+    const wrong_input = try backend.fromFloat32Shape(&.{ 1, 2 }, &.{2});
+    defer backend.free(wrong_input);
+    const wrong_model = [_]route.Binding{.{ .tensor = .{ .value = wrong_input, .implementation = implementation } }};
+    try std.testing.expectError(error.PreparedKernelBindingChanged, retained.validate(.{ .inputs = &wrong_model, .output = slot }));
 }
 
 test "Native exact dense facts reject unaligned or oversized source F32 planes before route selection" {

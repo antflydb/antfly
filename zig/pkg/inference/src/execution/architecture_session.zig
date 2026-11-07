@@ -19876,6 +19876,13 @@ fn nativeFlorenceScheduleCase(a: std.mem.Allocator) !void {
     expected_cache.self_mask[0] = 0;
     cold.program.?.cache.?.self_mask[0] = 0;
     try cold.program.?.beginExecution(current);
+    const owned_schedule = cold.program.?.cache.?.assigned;
+    const before_wrong_schedule = cold.program.?.schedule.?.frame.?.stats.dispatches;
+    cold.program.?.cache.?.assigned = null;
+    const wrong_schedule = cold.program.?.stepBorrowed(0);
+    cold.program.?.cache.?.assigned = owned_schedule;
+    try std.testing.expectError(error.PreparedFlorenceSourceChanged, wrong_schedule);
+    try std.testing.expectEqual(before_wrong_schedule, cold.program.?.schedule.?.frame.?.stats.dispatches);
     const original_root = cold.program.?.cache.?.self.keys[0];
     cold.program.?.cache.?.self.keys[0] = cold.program.?.cache.?.self.keys[1];
     const rejection = cold.program.?.stepBorrowed(0);
