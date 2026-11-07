@@ -1937,6 +1937,25 @@ pub const Store = struct {
         self.stopRideAlongFlush();
         if (self.artifact_registry) |registry| registry.detach();
         self.stopMaintenance();
+        // `forceDrainDurable` above only forces a durable `applyMutationGroup`
+        // for a group still sitting in the queue; it is a no-op when nothing
+        // is queued (`commit_head == null`). That leaves exactly the case a
+        // ride-along write already applied *non-durably* (`durable_header !=
+        // null`) with nothing new landing behind it to ride a sync -- still
+        // only in `self.file`'s in-memory header, not on disk, with no
+        // foreground group ever going to form and carry it durable (this
+        // handle is closing). `submitMutationWithDurability`'s doc comment
+        // names close() as one of the barriers ride-along work becomes
+        // durable at (design doc §3.2a); see the regression test below
+        // (`commitRideAlong` then immediate `close()`, nothing queued).
+        // Placed after `stopRideAlongFlush`/`stopMaintenance` above, not
+        // before: with every background committer on this file now
+        // stopped, nothing can land another non-durable commit behind this
+        // sync and leave `durable_header` set again with nothing left to
+        // clear it.
+        if (!self.read_only) self.syncIndexContents() catch |err| {
+            std.log.warn("lite close: final durability sync failed, closing anyway: {s}", .{@errorName(err)});
+        };
         if (self.workspace_reclaimer) |identity| self.resource_manager.?.unregisterReclaimer(identity);
         std.debug.assert(self.retired_generations == null);
         if (self.read_generation) |generation| std.debug.assert(generation.references == 0);
@@ -7666,6 +7685,44 @@ test "lite closing a store with only ride-along work (no foreground write) does 
     const value = try reopened.file.getDocumentAlloc(alloc, "ride-only");
     defer if (value) |bytes| alloc.free(bytes);
     try std.testing.expectEqualStrings("rode along", value orelse return error.TestExpectedEqual);
+}
+
+test "lite close() makes a synchronously-applied non-durable commit durable with nothing queued behind it" {
+    // Distinct from the "only ride-along work" test above: that one leaves
+    // the write sitting in the group-commit *queue* (`stageRideAlong`'s
+    // ticket), which `forceDrainDurable` is built to drain. `commitRideAlong`
+    // instead returns only once `applyMutationGroup` has already applied the
+    // write non-durably (`durable_header` set) with no further sync -- by
+    // the time it returns, there is nothing left queued at all.
+    // `forceDrainDurable`'s "no group queued" branch is then a no-op, so
+    // close() needs its own final sync of whatever `self.file` already
+    // holds non-durably, not just a drain of anything still pending.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "close-synchronous-ride-along.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{});
+    var store_open = true;
+    defer if (store_open) store.close();
+
+    const Context = struct {
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            try file.putDocument("sync-ride-only", "landed non-durably");
+        }
+    };
+    var ctx: u8 = 0;
+    try store.commitRideAlong(&ctx, Context.apply);
+    try std.testing.expect(store.file.durable_header != null);
+
+    store.close();
+    store_open = false;
+
+    var reopened = try Store.open(alloc, path, true);
+    defer reopened.close();
+    const value = try reopened.file.getDocumentAlloc(alloc, "sync-ride-only");
+    defer if (value) |bytes| alloc.free(bytes);
+    try std.testing.expectEqualStrings("landed non-durably", value orelse return error.TestExpectedEqual);
 }
 
 test "lite ride-along idle-flush timer alone makes N ride-alongs durable with exactly 1 sync" {
