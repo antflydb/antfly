@@ -102805,6 +102805,25 @@ fn runTransientLeannStubCase(alloc: Allocator, storage: []const u8, chunked: boo
             if (monotonicTimeNs() >= deadline) break;
             try db.runUntilIdle();
         }
+        if (stubs < 256) {
+            var full: usize = 0;
+            var text_flagged: usize = 0;
+            for (key_slices) |key| for (0..@as(usize, if (chunked) 8 else 1)) |chunk_id| {
+                const artifact_key = if (chunked) blk: {
+                    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, key, "leann_idx_chunks", @intCast(chunk_id));
+                    defer alloc.free(chunk_key);
+                    break :blk try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "leann_idx");
+                } else try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, key, "leann_idx");
+                defer alloc.free(artifact_key);
+                const raw = db.core.store.get(alloc, artifact_key) catch continue;
+                defer alloc.free(raw);
+                full += 1;
+                if ((try enrichment_artifact_codec.decodeHeader(raw)).flags.text_input) text_flagged += 1;
+            };
+            std.debug.print("leann stub case storage={s} chunked={} workers={} stubs={d} artifacts={d} text_input={d} graph={} live={d} pending={}\n", .{
+                storage, chunked, workers, stubs, full, text_flagged, entry.index.leann.?.index != null, entry.index.leann.?.liveCount(), db.core.index_manager.localLeannElisionPending(),
+            });
+        }
         try std.testing.expect(entry.index.leann.?.index != null);
         try std.testing.expect(stubs >= 256);
         try std.testing.expect(!db.core.index_manager.localLeannElisionPending());
