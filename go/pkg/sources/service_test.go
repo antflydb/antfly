@@ -134,11 +134,16 @@ func TestServiceMediaRangesRevocationAndReconciliation(t *testing.T) {
 // TestServiceSourceIdentityNamespaceLifecycle exercises Part 2's PUT contract
 // end to end: a source predating identity.namespace (serviceFixture's
 // source, exactly like a real pre-upgrade deployment) still re-keys on a
-// connection/config change and the response says so; setting a namespace is
-// itself a one-time rekey; once set it is immutable, and no later PUT --
-// including one that changes connection -- ever re-keys again; a PUT that
-// omits identity entirely never clears an existing namespace; and a brand
-// new source gets a namespace at creation, so creating one never re-keys.
+// connection/config change with no namespace involved, and the response says
+// so; setting an ARBITRARY namespace (one that does not reproduce this
+// source's current keys -- verified for real against the connector, not
+// assumed from "namespace was empty") is a rekey; once set it is immutable,
+// and no later PUT -- including one that changes connection -- ever re-keys
+// again; a PUT that omits identity entirely never clears an existing
+// namespace; and a brand new source gets a namespace at creation, so
+// creating one never re-keys. See TestServiceAdoptingExactLegacyPrefixNeverRekeys
+// for the corrected, opposite case: adopting the EXACT prefix that
+// reproduces current keys never re-keys, even with a connection change.
 func TestServiceSourceIdentityNamespaceLifecycle(t *testing.T) {
 	s, _, _ := serviceFixture(t)
 	source := s.profile.Sources[0]
@@ -163,8 +168,9 @@ func TestServiceSourceIdentityNamespaceLifecycle(t *testing.T) {
 	require.Equal(t, true, response["rekeys"])
 	require.Empty(t, s.profile.Sources[0].Identity.Namespace, "a connection change alone does not assign a namespace")
 
-	// Setting a namespace for the first time is itself a one-time rekey, even
-	// with no connection/config change alongside it.
+	// Setting an arbitrary namespace -- one that does not reproduce this
+	// source's current keys -- is a rekey, confirmed against the fixture
+	// connector's own item rather than assumed.
 	source = s.profile.Sources[0]
 	source.Identity.Namespace = "adopted-namespace"
 	w = serviceCall(s, "PUT", "/v1/sources/"+source.ID, source)
@@ -205,6 +211,41 @@ func TestServiceSourceIdentityNamespaceLifecycle(t *testing.T) {
 			require.Equal(t, newID, candidate.Identity.Namespace)
 		}
 	}
+}
+
+// TestServiceAdoptingExactLegacyPrefixNeverRekeys is the corrected
+// counterpart to TestServiceSourceIdentityNamespaceLifecycle's "arbitrary
+// namespace re-keys" case: adopting the EXACT namespace that reproduces a
+// source's current keys (LegacyNamespace, derived here from the fixture
+// connector's single canned item) must report rekeys: false, even when a
+// connection change rides along in the same PUT -- exactly what
+// migrate-local's own repoint does.
+func TestServiceAdoptingExactLegacyPrefixNeverRekeys(t *testing.T) {
+	s, _, _ := serviceFixture(t)
+	source := s.profile.Sources[0]
+	require.Empty(t, source.Identity.Namespace)
+
+	// The fixture connector's one canned item is
+	// "s3://job/<testSourceID>/docs/manual.txt" with no explicit
+	// RelativeKey, so its native-ID fallback relative key is
+	// "docs/manual.txt" and its legacy namespace is "s3://job/<testSourceID>".
+	legacyNamespace := "s3://job/" + testSourceID
+
+	require.Equal(t, 200, serviceCall(s, "PUT", "/v1/connections/adopted-prefix", Connection{Provider: ProviderS3}).Code)
+	source.Connection = "adopted-prefix"
+	source.Identity.Namespace = legacyNamespace
+	w := serviceCall(s, "PUT", "/v1/sources/"+source.ID, source)
+	require.Equal(t, 200, w.Code)
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Equal(t, false, response["rekeys"], "adopting the exact legacy prefix must not re-key, even alongside a connection change")
+	require.Equal(t, legacyNamespace, s.profile.Sources[0].Identity.Namespace)
+
+	// A later PUT trying to change it away is still rejected (immutability
+	// is unaffected by how the namespace was first set).
+	source = s.profile.Sources[0]
+	source.Identity.Namespace = "something-else"
+	require.Equal(t, 409, serviceCall(s, "PUT", "/v1/sources/"+source.ID, source).Code)
 }
 
 func TestServiceRuntimeConnectionSourceLifecycle(t *testing.T) {

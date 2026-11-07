@@ -37,13 +37,16 @@ import (
 //
 // Identity (IdentityKey: see sync.go) depends only on identity.namespace and
 // each row's relative key, never on connection or provider, so a provider
-// change by itself never has to re-key anything once a namespace is set.
-// migrate-local assigns one (defaulting to the source's own ID) the first
-// time it repoints a source that does not have one yet; --to-prefix mirrors
-// the local store's own "objects/sha256/<digest>[.ext]" layout, so each
-// object's relative key is the same before and after the copy. Together
-// these mean: a source already carrying a namespace is never rekeyed by
-// this tool, and one that is not pays exactly one rekey, here, to get one.
+// change by itself never has to re-key anything once a namespace reproduces
+// a row's current key. A source that already has a namespace keeps it
+// untouched. One that does not yet have one adopts exactly the namespace
+// that reproduces its current keys under its still-current connection and
+// config (LegacyNamespace, derived before the connection change below takes
+// effect); --to-prefix mirrors the local store's own
+// "objects/sha256/<digest>[.ext]" layout, so each object's relative key is
+// the same before and after the copy. Together these mean an ordinary first
+// migration never re-keys anything, even though it is also the first time
+// the source gets a namespace.
 //
 // Row identity is not the whole story, though: whether derived data (OCR,
 // chunks, embeddings) also survives depends on the destination table's own
@@ -59,9 +62,16 @@ func (r MigrateLocalResult) IdentityNotice() string {
 		return ""
 	}
 	if r.Rekeyed {
-		return "this source had no identity.namespace yet (or had one but changed connection/config before having one), so this run assigned it a namespace; every migrated row got a new ID this one time. From here on, as long as a future provider change keeps the same relative key -- as this tool's own copy does, since --to-prefix mirrors the local store's own object layout -- rows will update in place instead."
+		// Should not happen for an ordinary first migration: migrate-local
+		// always tries to adopt the exact namespace that reproduces this
+		// source's current keys. A true Rekeyed report here means the
+		// server's own verification (service.go) could not confirm that the
+		// adopted namespace matches this source's existing rows -- for
+		// example because they disagreed on a legacy prefix, or because the
+		// server could not enumerate the existing connection to check.
+		return "this repoint re-keyed every row: the server could not confirm that the namespace this source adopted reproduces its existing keys, so it was treated as a re-key. This should not happen for an ordinary first migration from a source with consistent existing keys; if it keeps happening, something about this source's current rows does not match what migrate-local derived from its connection and config."
 	}
-	return "rows were updated in place with the same IDs (this source already had an identity.namespace). Whether derived data -- OCR, chunks, embeddings -- also survived depends on the destination table's document_extraction config declaring checksum_algorithm for this source's rows; migrate-local cannot see that table-side config and cannot confirm it either way. Without it, Antfly still recomputes derived data for a row whose location metadata (URI, etag) changed, even though its ID did not."
+	return "rows were updated in place with the same IDs. Whether derived data -- OCR, chunks, embeddings -- also survived depends on the destination table's document_extraction config declaring checksum_algorithm for this source's rows; migrate-local cannot see that table-side config and cannot confirm it either way. Without it, Antfly still recomputes derived data for a row whose location metadata (URI, etag) changed, even though its ID did not."
 }
 
 // MigrateLocalOptions configures a one-shot move of one local-provider
@@ -253,12 +263,17 @@ func migrateLocalRun(ctx context.Context, opts MigrateLocalOptions, result Migra
 		// Row identity (IdentityKey) depends only on namespace and each
 		// row's relative key, never on connection or provider. A source that
 		// has never had a namespace is still on the legacy, location-based
-		// formula (RecordKey), which the provider change below would
-		// otherwise re-key regardless of anything this tool does. Assigning
-		// one now -- the same default service.go gives a brand new source --
-		// pays that cost exactly once, here, so every later provider change
-		// (including a future migrate-local run) is free.
-		updated.Identity.Namespace = source.ID
+		// formula (RecordKey). Adopting the exact namespace that reproduces
+		// its CURRENT keys (LegacyNamespace, derived from the local store
+		// under its still-current connection/config, before the provider
+		// change above takes effect) keeps every existing row's key, so this
+		// repoint does not re-key anything even though it is also the first
+		// time this source gets a namespace.
+		namespace, err := migrateLegacyNamespace(ctx, local, request, source.ID)
+		if err != nil {
+			return result, fmt.Errorf("determine existing row identity before repointing: %w", err)
+		}
+		updated.Identity.Namespace = namespace
 	}
 	job, rekeys, err := repointer.repoint(ctx, source.ID, updated)
 	if err != nil {
@@ -269,6 +284,25 @@ func migrateLocalRun(ctx context.Context, opts MigrateLocalOptions, result Migra
 	result.RunID = job.ID
 	result.Rekeyed = rekeys
 	return result, nil
+}
+
+// migrateLegacyNamespace enumerates the local store once more (cheap: a
+// directory listing, not a copy, independent of MigrateLocalCopy's own
+// enumeration) to derive the namespace that reproduces this source's
+// current row keys (LegacyNamespace), so adopting it alongside this
+// repoint's connection/config change does not also re-key every row. An
+// empty store (nothing published under this connection/config yet) has
+// nothing to preserve, so it falls back to the source's own ID, the same
+// default a brand new source gets at creation.
+func migrateLegacyNamespace(ctx context.Context, local *LocalConnector, request Request, sourceID string) (string, error) {
+	inventory, err := local.Enumerate(ctx, request)
+	if err != nil {
+		return "", fmt.Errorf("enumerate local store: %w", err)
+	}
+	if len(inventory.Objects) == 0 {
+		return sourceID, nil
+	}
+	return LegacyNamespace(sourceID, inventory.Objects)
 }
 
 // resolveMigrationSource finds the source and its two connections in

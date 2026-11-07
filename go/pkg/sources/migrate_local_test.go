@@ -596,15 +596,16 @@ func TestMigrateLocalRepointsCatalogAndServesMediaFromBucket(t *testing.T) {
 	require.Equal(t, "hello world", w.body.String())
 }
 
-// TestMigrateLocalAdoptsNamespaceAndRekeysExactlyOnce exercises Part 2's
-// actual promise through the real Runner/Publisher pipeline: a source
-// synced before identity.namespace existed (this fixture's, exactly like a
-// real pre-upgrade deployment) is still on the legacy, location-based key
-// formula, so migrate-local's provider change rekeys it -- but only this
-// once, since migrate-local assigns it a namespace as part of the same PUT.
-// The old row is replaced (not left behind as a duplicate), and the PUT
-// response and IdentityNotice both say a rekey happened.
-func TestMigrateLocalAdoptsNamespaceAndRekeysExactlyOnce(t *testing.T) {
+// TestMigrateLocalWithNoNamespaceKeepsRowIdentity exercises the corrected
+// promise through the real Runner/Publisher pipeline: a source synced
+// before identity.namespace existed (this fixture's, exactly like a real
+// pre-upgrade deployment) is still on the legacy, location-based key
+// formula, but migrate-local's own provider change does NOT re-key it --
+// it adopts exactly the namespace that reproduces this source's current
+// keys (LegacyNamespace), so the row's key is identical before and after,
+// even though this is also the first time the source gets a namespace. The
+// PUT response and IdentityNotice both confirm no re-key happened.
+func TestMigrateLocalWithNoNamespaceKeepsRowIdentity(t *testing.T) {
 	opts, _, stateDir, _, _, backend := migrateServiceFixture(t)
 
 	// Establish a baseline row while still on the local connection, exactly
@@ -626,14 +627,43 @@ func TestMigrateLocalAdoptsNamespaceAndRekeysExactlyOnce(t *testing.T) {
 	result, err := MigrateLocal(t.Context(), opts)
 	require.NoError(t, err, "result: %+v", result)
 	require.True(t, result.CatalogRepointed)
-	require.True(t, result.Rekeyed, "this source had no identity.namespace yet")
-	require.Contains(t, result.IdentityNotice(), "assigned")
+	require.False(t, result.Rekeyed, "adopting the exact legacy prefix must not re-key anything")
+	notice := result.IdentityNotice()
+	require.Contains(t, notice, "updated in place with the same IDs")
+	require.Contains(t, notice, "checksum_algorithm", "the notice must say what migrate-local cannot confirm about the destination table")
+	require.NotContains(t, notice, "re-keyed")
 
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
-	require.Len(t, backend.records, 1, "the provider change must update the row, not add a second one")
+	require.Len(t, backend.records, 1, "the provider change must update the row in place, not add a second one")
 	_, oldKeyStillThere := backend.records[oldKey]
-	require.False(t, oldKeyStillThere, "adopting a namespace for the first time is the one unavoidable rekey; the legacy key must be gone")
+	require.True(t, oldKeyStillThere, "the row's key must be unchanged by this provider change")
+}
+
+// TestMigrateLocalIdentityNoticeStatesTheChecksumAlgorithmRequirement pins
+// the notice text itself: row identity surviving a provider change (the
+// ordinary, non-Rekeyed case) is never the whole story, since migrate-local
+// has no visibility into whether the destination table's document_extraction
+// config declares checksum_algorithm -- without it, Antfly still recomputes
+// derived data for a row whose location changed, even though migrate-local
+// kept its ID. The notice must say so plainly, every time, rather than
+// imply "rows kept their IDs" means "nothing will be recomputed."
+func TestMigrateLocalIdentityNoticeStatesTheChecksumAlgorithmRequirement(t *testing.T) {
+	keptIdentity := MigrateLocalResult{CatalogRepointed: true, Rekeyed: false}
+	notice := keptIdentity.IdentityNotice()
+	require.Contains(t, notice, "updated in place with the same IDs")
+	require.Contains(t, notice, "checksum_algorithm")
+	require.Contains(t, notice, "cannot see that table-side config")
+	require.Contains(t, notice, "still recomputes derived data")
+
+	rekeyed := MigrateLocalResult{CatalogRepointed: true, Rekeyed: true}
+	require.Contains(t, rekeyed.IdentityNotice(), "re-keyed")
+
+	dryRun := MigrateLocalResult{DryRun: true, CatalogRepointed: false}
+	require.Empty(t, dryRun.IdentityNotice())
+
+	notRepointed := MigrateLocalResult{CatalogRepointed: false}
+	require.Empty(t, notRepointed.IdentityNotice())
 }
 
 func newLoopbackMediaRequest(t *testing.T, u *url.URL, etag string) *http.Request {

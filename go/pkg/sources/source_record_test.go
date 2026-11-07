@@ -121,6 +121,56 @@ func TestIdentityKeyCurrentPrefixInvariant(t *testing.T) {
 	}
 }
 
+// TestLegacyNamespaceReproducesExistingKeys is the end-to-end proof that
+// LegacyNamespace's whole point works: for every item of a source,
+// IdentityKey(sourceID, LegacyNamespace(items), relativeKey, item.ID) must
+// equal RecordKey(sourceID, item.ID) -- the legacy key that item already
+// has -- for both a connector that reports an explicit RelativeKey (S3-like)
+// and one that falls back to its native ID (Drive/GitHub-like).
+func TestLegacyNamespaceReproducesExistingKeys(t *testing.T) {
+	pathLike := []Item{
+		{ID: "s3://job/" + testSourceID + "/bucket/docs/a.txt", RelativeKey: "docs/a.txt"},
+		{ID: "s3://job/" + testSourceID + "/bucket/docs/b.txt", RelativeKey: "docs/b.txt"},
+	}
+	nativeIDFallback := []Item{
+		{ID: "drive://job/" + testSourceID + "/file-id-one"},
+		{ID: "drive://job/" + testSourceID + "/file-id-two"},
+	}
+	for _, items := range [][]Item{pathLike, nativeIDFallback} {
+		namespace, err := LegacyNamespace(testSourceID, items)
+		require.NoError(t, err)
+		for _, item := range items {
+			legacy, err := RecordKey(testSourceID, item.ID)
+			require.NoError(t, err)
+			adopted, err := IdentityKey(testSourceID, namespace, relativeKeyFor(testSourceID, item), item.ID)
+			require.NoError(t, err)
+			require.Equal(t, legacy, adopted, item.ID)
+		}
+	}
+}
+
+func TestLegacyNamespaceRejectsDisagreementAndEmptyInput(t *testing.T) {
+	_, err := LegacyNamespace(testSourceID, nil)
+	require.Error(t, err)
+
+	// Two items whose provider IDs genuinely disagree on their namespace
+	// prefix (different buckets) must error rather than silently adopt one
+	// and re-key the other.
+	disagreeing := []Item{
+		{ID: "s3://job/" + testSourceID + "/bucket-one/docs/a.txt", RelativeKey: "docs/a.txt"},
+		{ID: "s3://job/" + testSourceID + "/bucket-two/docs/b.txt", RelativeKey: "docs/b.txt"},
+	}
+	_, err = LegacyNamespace(testSourceID, disagreeing)
+	require.Error(t, err)
+
+	// An item whose ID does not actually end with its relative key is a
+	// malformed input, not a namespace disagreement, but must also error
+	// rather than derive a garbage prefix.
+	malformed := []Item{{ID: "s3://job/" + testSourceID + "/bucket/docs/a.txt", RelativeKey: "not-a-suffix"}}
+	_, err = LegacyNamespace(testSourceID, malformed)
+	require.Error(t, err)
+}
+
 func TestSourceRowRecomputesIdentityUnderTheOwningNamespace(t *testing.T) {
 	item := Item{ID: "s3://job/" + testSourceID + "/bucket/docs/file.txt", RelativeKey: "docs/file.txt", Path: "docs/file.txt", URL: "s3://bucket/docs/file.txt", Revision: "v1", SourceKind: ProviderS3}
 	doc, err := Normalize(testSourceID, item, []byte("text"), Permissions{Readers: []string{"user:self"}}, time.Now())

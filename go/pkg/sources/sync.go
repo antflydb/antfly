@@ -62,11 +62,13 @@ func RecordKey(sourceID, providerID string) (string, error) {
 // providerID byte for byte when concatenated back with relativeKey, by
 // construction; it does not by itself reproduce RecordKey's legacy digest,
 // because the two formulas hash different strings (the full providerID vs.
-// namespace+"/"+relativeKey). Adopting a namespace on a populated source is
-// therefore always exactly one re-key, acknowledged by the API as rekeys:
-// true; only sources that never had rows under the legacy formula (new
-// sources, given a namespace at creation before any row exists) avoid it
-// entirely.
+// namespace+"/"+relativeKey) -- UNLESS the adopted namespace is exactly that
+// prefix, in which case namespace+"/"+relativeKey IS providerID again, byte
+// for byte, and the two formulas hash the identical string and so produce
+// the identical key. See LegacyNamespace, which derives that exact prefix.
+// A namespace adopted as anything else re-keys every row exactly once;
+// only a brand new source (given an opaque namespace at creation before
+// any row exists) never has rows to re-key in the first place.
 func IdentityKey(sourceID, namespace, relativeKey, providerID string) (string, error) {
 	if namespace == "" {
 		return RecordKey(sourceID, providerID)
@@ -76,6 +78,48 @@ func IdentityKey(sourceID, namespace, relativeKey, providerID string) (string, e
 	}
 	digest := sha256.Sum256([]byte(namespace + "/" + relativeKey))
 	return RecordPrefix(sourceID) + hex.EncodeToString(digest[:]), nil
+}
+
+// LegacyNamespace derives the one namespace that reproduces sourceID's
+// current (pre-identity.namespace) row keys for every given item:
+// strings.TrimSuffix(item.ID, "/"+relativeKey), where relativeKey is
+// relativeKeyFor(sourceID, item). That value is determined entirely by the
+// connection and config that produced these items (the provider scheme, the
+// "job/<sourceID>" acquisition namespace, and any bucket/prefix), never by
+// an individual item, so it must be identical across every item given here;
+// a general, connector-independent way to find it, since it only has to
+// read what each connector already put in item.ID and item.RelativeKey, not
+// re-derive either from scratch.
+//
+// Adopting this exact namespace makes IdentityKey(sourceID, namespace,
+// relativeKey, _) equal RecordKey(sourceID, providerID) for every one of
+// these items (see IdentityKey), so a source that sets it keeps every
+// existing row's key, even if its connection or config changes in the same
+// request. Items that disagree on this prefix return an error rather than
+// silently picking one, since adopting the wrong one re-keys every row that
+// disagreed with it, and no items given at all is also an error -- the
+// caller decides what an empty inventory means for its own purpose (for
+// example, nothing to re-key at all).
+func LegacyNamespace(sourceID string, items []Item) (string, error) {
+	if len(items) == 0 {
+		return "", fmt.Errorf("no items to derive a legacy namespace from")
+	}
+	namespace := ""
+	for i, item := range items {
+		relativeKey := relativeKeyFor(sourceID, item)
+		suffix := "/" + relativeKey
+		if relativeKey == "" || !strings.HasSuffix(item.ID, suffix) {
+			return "", fmt.Errorf("item %q does not end with its relative key %q; cannot derive a legacy namespace", item.ID, relativeKey)
+		}
+		candidate := strings.TrimSuffix(item.ID, suffix)
+		switch {
+		case i == 0:
+			namespace = candidate
+		case candidate != namespace:
+			return "", fmt.Errorf("items disagree on their legacy namespace prefix (%q vs %q); refusing to adopt either", namespace, candidate)
+		}
+	}
+	return namespace, nil
 }
 func RecordPrefix(sourceID string) string { return "source://job/" + sourceID + "/records/" }
 func recordRange(sourceID string) KeyRange {
