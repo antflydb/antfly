@@ -88,14 +88,18 @@ const internal_service_verification_secret_key = "antfly.internal_service.verifi
 const internal_service_issuer_key = "antfly.internal_service.issuer";
 const internal_service_rollout_mode_key = "antfly.internal_service.rollout_mode";
 
-fn isExpectedControlRoundError(err: anyerror) bool {
+pub fn isExpectedControlRoundError(err: anyerror) bool {
     // Control-round reconciliation is idempotent and is re-driven from the
     // authoritative store on the next tick. A post-admission authority loss
     // is deliberately *not* a generally retryable client mutation, but it is
     // a safe control-loop deferral: the admitted command may already have
     // committed and the next round will observe or supersede it.
+    // A decoder floor may advance after off-lock readiness capture. The
+    // append guard correctly rejects that old proof; the next control round
+    // must reacquire it without terminating the metadata process.
     return antfly.metadata.authority.isRetryableError(err) or
-        err == error.MetadataMutationOutcomeUnknown;
+        err == error.MetadataMutationOutcomeUnknown or
+        err == error.TableTopologyProtocolUpgradeRequired;
 }
 
 const metadata_raft_max_snapshot_transfer_bytes: usize = 1 << 30;
@@ -1247,6 +1251,8 @@ pub fn runFromIterator(
         if (secret_store_initialized) &secret_store else null,
     );
     defer if (trusted_principal_issuer) |value| alloc.free(value);
+    var sql_preparation_authority = try antfly.common.sql_preparation_authority_config.loadRuntime(alloc, setup_io.io(), if (secret_store_initialized) &secret_store else null, false);
+    defer if (sql_preparation_authority) |*authority| authority.deinit(alloc);
 
     const local_node_id = cli.local_node_id orelse 1;
     const metadata_group_id = group_ids.main_metadata_group_id;
@@ -1286,6 +1292,8 @@ pub fn runFromIterator(
         .api_server_cfg = .{
             .auth_enabled = effective_auth_enabled,
             .experimental = cli.experimental,
+            .sql_preparation_secret = if (sql_preparation_authority) |authority| authority.secret else null,
+            .sql_preparation_issuer = if (sql_preparation_authority) |authority| authority.issuer else null,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
             .setting_authority_secret = setting_authority_secret,
@@ -1406,7 +1414,12 @@ pub fn runFromIterator(
             std.log.warn("metadata runRound slow elapsed_ms={d}", .{@divTrunc(run_round_elapsed_ns, std.time.ns_per_ms)});
         }
         const cdc_round_start_ns = platform_time.monotonicNs();
-        server.runCdcRound() catch |err| return supervisor.fail("metadata", "cdc-round", err);
+        server.runCdcRound() catch |err| {
+            // Backfill also acquires the decoder-fenced reconcile lease.
+            // Its next round reobserves the durable state after a deferral.
+            if (!isExpectedControlRoundError(err))
+                return supervisor.fail("metadata", "cdc-round", err);
+        };
         const cdc_round_elapsed_ns = platform_time.monotonicNs() -| cdc_round_start_ns;
         if (cdc_round_elapsed_ns > std.time.ns_per_s) {
             std.log.warn("metadata runCdcRound slow elapsed_ms={d}", .{@divTrunc(cdc_round_elapsed_ns, std.time.ns_per_ms)});
@@ -2367,6 +2380,7 @@ test "metadata runtime retries authority loss from control rounds" {
         error.MetadataSnapshotHeadMismatch,
         error.ReconcileLeaseNotHeld,
         error.MetadataMutationOutcomeUnknown,
+        error.TableTopologyProtocolUpgradeRequired,
     };
     for (expected_errors) |err| {
         try std.testing.expect(isExpectedControlRoundError(err));
@@ -2376,6 +2390,8 @@ test "metadata runtime retries authority loss from control rounds" {
     try std.testing.expect(!antfly.metadata.authority.isRetryableError(
         error.MetadataMutationOutcomeUnknown,
     ));
+    try std.testing.expect(!antfly.metadata.authority.isRetryableError(error.TableTopologyProtocolUpgradeRequired));
+    try std.testing.expect(!antfly.metadata.authority.isMutationNotAdmittedError(error.TableTopologyProtocolUpgradeRequired));
     try std.testing.expect(!isExpectedControlRoundError(error.OutOfMemory));
     try std.testing.expect(!isExpectedControlRoundError(error.Corrupted));
 }

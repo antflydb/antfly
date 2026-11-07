@@ -89,6 +89,10 @@ pub const CatalogSource = struct {
     }
 
     pub const VTable = struct {
+        /// Caller-owned bounded allocation region; the vote must be read before
+        /// storage owner fences are acquired. No routing-cache fallback exists.
+        graph_preparation_read: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../system_catalog/graph_preparation.zig").Source, deadline_ns: ?u64) anyerror!@import("../system_catalog/graph_preparation.zig").Prepared = null,
+        sql_relation_boot: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) anyerror!@import("../metadata/sql_relation_boots.zig").Observation = null,
         restore_scope_for_group: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64) anyerror!?[32]u8 = null,
         restore_plan_for_group: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64) anyerror!?[16]u8 = null,
         /// Snapshot slices and all transitively referenced bytes must remain
@@ -139,6 +143,56 @@ pub const CatalogSource = struct {
             contract: metadata_api.CatalogGroupRetirementContract,
         ) anyerror!metadata_api.CatalogGroupRetirementValidation = null,
     };
+
+    /// Only lifetime operations pay for this compact linearizable boot read.
+    pub fn sqlRelationBoot(self: CatalogSource, alloc: std.mem.Allocator, node: u64, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+        return self.sqlRelationBinding(alloc, .{ .node = node }, deadline_ns);
+    }
+
+    /// The caller owns all returned Snapshot bytes through its allocation
+    /// region. A missing older receiver cannot certify graph-intent votes.
+    pub fn graphPreparationRead(self: CatalogSource, alloc: std.mem.Allocator, request: @import("../system_catalog/graph_preparation.zig").Source, deadline_ns: ?u64) !@import("../system_catalog/graph_preparation.zig").Prepared {
+        try request.validate();
+        const observe = self.vtable.graph_preparation_read orelse return error.TableTopologyProtocolUpgradeRequired;
+        try self.budget(deadline_ns).checkpoint();
+        const result = try observe(self.ptr, alloc, request, deadline_ns);
+        if (result.snapshot.metadata_group_id == 0 or result.snapshot.graph_intent_protocol < metadata_table_manager.graph_transaction_protocol_version) return error.TableTopologyProtocolUpgradeRequired;
+        try request.requireSnapshot(alloc, result.snapshot);
+        return result;
+    }
+
+    pub fn sqlRelationBinding(self: CatalogSource, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+        const observe = self.vtable.sql_relation_boot orelse return error.SqlRelationOwnerChanged;
+        try self.budget(deadline_ns).checkpoint();
+        return observe(self.ptr, alloc, query, deadline_ns);
+    }
+
+    /// Capture the initialized physical image before native participation.
+    /// Revalidation may refresh metadata cuts, never replace an already pinned
+    /// image with a successor under the same logical lock resource.
+    pub fn pinNativeParticipant(self: CatalogSource, alloc: std.mem.Allocator, fence: *metadata_api.CatalogRouteFence, deadline_ns: ?u64) !void {
+        if (fence.route.execution != .native_local) {
+            if (fence.native_participant != null) return error.SqlRelationOwnerChanged;
+            return;
+        }
+        try fence.validate();
+        const descriptor = fence.route.execution.native_local;
+        const observed = try self.sqlRelationBinding(alloc, .{ .node = descriptor.owner_node_id, .binding_table = fence.table_id }, deadline_ns);
+        const boot = try observed.requireReady();
+        const proof = observed.initialized orelse return error.SqlRelationRecoveryIncomplete;
+        try proof.verify();
+        const incarnation = fence.metadata_incarnation orelse return error.SqlRelationOwnerChanged;
+        const ns = fence.route.identity_namespace;
+        if (boot.identity.node_id != descriptor.owner_node_id or boot.identity.store_id != descriptor.owner_store_id or
+            !std.meta.eql(boot.identity, proof.identity) or proof.boot_generation != boot.generation or proof.reporter_incarnation != boot.reporter_incarnation or
+            !std.mem.eql(u8, &boot.instance, &proof.binding.native_instance) or
+            !proof.binding.descriptor.eql(descriptor) or proof.binding.table_id != fence.table_id or
+            proof.binding.shard_id != ns.shard_id or proof.binding.range_id != ns.range_id or
+            proof.metadata_group_id != fence.metadata_group_id or !std.mem.eql(u8, &proof.identity.metadata_incarnation, &incarnation)) return error.SqlRelationOwnerChanged;
+        const pin = try @import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin.fromBinding(proof.binding);
+        if (fence.native_participant) |previous| if (!previous.eql(pin)) return error.SqlRelationOwnerChanged;
+        fence.native_participant = pin;
+    }
 
     pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
         return try self.vtable.admin_snapshot(self.ptr);
@@ -214,6 +268,8 @@ pub const CatalogSource = struct {
         return .{
             .ptr = svc,
             .vtable = &.{
+                .sql_relation_boot = metadataServiceSqlRelationBoot,
+                .graph_preparation_read = metadataServiceGraphPreparationRead,
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
                 .catalog_identity = metadataServiceCatalogIdentity,
@@ -236,6 +292,8 @@ pub const CatalogSource = struct {
         return .{
             .ptr = svc,
             .vtable = &.{
+                .sql_relation_boot = metadataHttpServiceSqlRelationBoot,
+                .graph_preparation_read = metadataHttpServiceGraphPreparationRead,
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
                 .catalog_identity = metadataHttpServiceCatalogIdentity,
@@ -258,6 +316,8 @@ pub const CatalogSource = struct {
         return .{
             .ptr = srv,
             .vtable = &.{
+                .sql_relation_boot = metadataServerSqlRelationBoot,
+                .graph_preparation_read = metadataServerGraphPreparationRead,
                 .admin_snapshot = metadataServerAdminSnapshot,
                 .free_admin_snapshot = metadataServerFreeAdminSnapshot,
                 .catalog_identity = metadataServerCatalogIdentity,
@@ -596,7 +656,7 @@ pub const RoutingSession = struct {
             if (seen.contains(range.group_id)) continue;
             try seen.put(alloc, range.group_id, {});
             const range_id = metadata_table_manager.rangeDocIdentityRangeId(range);
-            try routes.append(alloc, .{ .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = table.table_id, .shard_id = metadata_table_manager.rangeDocIdentityShardId(range), .range_id = range_id } });
+            try routes.append(alloc, .{ .execution = RouteExecution.fromPersistence(table.sql_persistence), .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = table.table_id, .shard_id = metadata_table_manager.rangeDocIdentityShardId(range), .range_id = range_id } });
             try groups.append(alloc, range.group_id);
         }
         const owned_routes = try routes.toOwnedSlice(alloc);
@@ -609,6 +669,8 @@ pub const RoutingSession = struct {
     }
 
     const vtable: CatalogSource.VTable = .{
+        .sql_relation_boot = sqlRelationBoot,
+        .graph_preparation_read = graphPreparationRead,
         .restore_scope_for_group = restoreScopeForGroup,
         .restore_plan_for_group = restorePlanForGroup,
         .admin_snapshot = adminSnapshot,
@@ -625,6 +687,14 @@ pub const RoutingSession = struct {
         .validate_publication = validatePublication,
         .validate_table_publication = validateTablePublication,
     };
+
+    fn graphPreparationRead(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../system_catalog/graph_preparation.zig").Source, deadline_ns: ?u64) !@import("../system_catalog/graph_preparation.zig").Prepared {
+        return cast(ptr).base.graphPreparationRead(alloc, request, deadline_ns);
+    }
+
+    fn sqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+        return cast(ptr).base.sqlRelationBinding(alloc, query, deadline_ns);
+    }
 
     fn cast(ptr: *anyopaque) *RoutingSession {
         return @ptrCast(@alignCast(ptr));
@@ -703,6 +773,7 @@ pub const RoutingSession = struct {
                 .table_id = table.table_id,
                 .topology_epoch = self.topology_epochs.get(table.table_id) orelse return error.InvalidCatalogProjection,
                 .route = .{
+                    .execution = RouteExecution.fromPersistence(table.sql_persistence),
                     .group_id = range.group_id,
                     .range_id = range_id,
                     .identity_namespace = .{
@@ -1260,6 +1331,7 @@ pub fn resolveGroupForKeyFromRanges(
 pub const AuthoritativeTableRoutingSnapshot = struct {
     snapshot: OwnedRoutingSnapshot,
     table_id: u64,
+    execution: RouteExecution = .raft,
     ranges: []const *const metadata_table_manager.RangeRecord,
     topology_epoch: u64,
 
@@ -1274,6 +1346,7 @@ pub const AuthoritativeTableRoutingSnapshot = struct {
             if (!rangeContainsKey(range.*, key)) continue;
             const range_id = metadata_table_manager.rangeDocIdentityRangeId(range.*);
             return .{
+                .execution = self.execution,
                 .group_id = range.group_id,
                 .range_id = range_id,
                 .identity_namespace = .{
@@ -1304,13 +1377,15 @@ pub const AuthoritativeTableRoutingSnapshot = struct {
     /// admission at the data-Raft leader, not from making every coordinator
     /// perform a metadata quorum read.
     pub fn fenceForRoute(self: *const @This(), route: CatalogGroupRoute) metadata_api.CatalogRouteFence {
+        var captured_route = route;
+        captured_route.execution = self.execution;
         return .{
             .metadata_group_id = self.snapshot.value.metadata_group_id,
             .metadata_incarnation = self.snapshot.value.metadata_incarnation,
             .catalog_revision = self.snapshot.value.catalog_revision,
             .table_id = self.table_id,
             .topology_epoch = self.topology_epoch,
-            .route = route,
+            .route = captured_route,
         };
     }
 };
@@ -1337,6 +1412,7 @@ fn tableRoutingSnapshotFromOwned(
     return .{
         .snapshot = snapshot,
         .table_id = table.table_id,
+        .execution = RouteExecution.fromPersistence(table.sql_persistence),
         .ranges = ranges,
         .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
     };
@@ -1945,6 +2021,7 @@ pub const TableGroupDescriptorProjection = struct {
     schema_json: []u8,
     indexes_json: []u8,
     table_storage: ?@import("antfly_local_sources").common_table_storage.Settings,
+    sql_persistence: ?@import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor = null,
     initial_range: ?@import("antfly_local_sources").storage_byte_range.ByteRange = null,
     restore: ?@import("../storage/restore_identity.zig").Identity = null,
 
@@ -2039,6 +2116,7 @@ pub fn tableGroupDescriptorProjectionControlled(
                 table.schema_json,
                 table.indexes_json,
                 table.storage,
+                table.sql_persistence,
                 .{ .start = range.start_key, .end = range.end_key orelse "" },
                 restoreIdentityFromRange(range),
             );
@@ -2061,6 +2139,7 @@ pub fn tableGroupDescriptorProjectionControlled(
             transition.table_contract.schema_json,
             transition.table_contract.indexes_json,
             null,
+            null,
             null, // The replicated split bootstrap owns its initial range.
             null,
         );
@@ -2081,6 +2160,7 @@ pub fn tableGroupDescriptorProjectionControlled(
             identity.range_id,
             transition.table_contract.schema_json,
             transition.table_contract.indexes_json,
+            null,
             null,
             null, // The replicated merge bootstrap owns its initial range.
             null,
@@ -2106,6 +2186,7 @@ fn descriptorProjectionFromRoutingSnapshot(
             table.schema_json,
             table.indexes_json,
             table.storage,
+            table.sql_persistence,
             .{ .start = range.start_key, .end = range.end_key orelse "" },
             restoreIdentityFromRange(range),
         );
@@ -2121,6 +2202,7 @@ fn descriptorProjectionFromValues(
     schema_json: []const u8,
     indexes_json: []const u8,
     table_storage: ?@import("antfly_local_sources").common_table_storage.Settings,
+    sql_persistence: ?@import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor,
     initial_range: ?@import("antfly_local_sources").storage_byte_range.ByteRange,
     restore: ?@import("../storage/restore_identity.zig").Identity,
 ) !TableGroupDescriptorProjection {
@@ -2133,6 +2215,7 @@ fn descriptorProjectionFromValues(
     return .{
         .table_id = table_id,
         .table_storage = table_storage,
+        .sql_persistence = sql_persistence,
         .initial_range = owned_initial_range,
         .doc_identity_shard_id = doc_identity_shard_id,
         .doc_identity_range_id = doc_identity_range_id,
@@ -2211,6 +2294,7 @@ pub fn resolveGroupsForSpanPinnedUntil(
 
 pub const CatalogIdentityNamespace = metadata_api.CatalogIdentityNamespace;
 pub const CatalogGroupRoute = metadata_api.CatalogGroupRoute;
+const RouteExecution = @import("antfly_local_sources").metadata_catalog_route_contract.RouteExecution;
 
 /// A complete routing decision derived from one immutable catalog projection.
 /// Group selection and database identity must never be looked up separately.
@@ -2566,6 +2650,7 @@ fn routePlanFromIndexedRanges(
         if (!selected) continue;
         const range_id = metadata_table_manager.rangeDocIdentityRangeId(range.*);
         try groups.append(alloc, .{
+            .execution = RouteExecution.fromPersistence(table.sql_persistence),
             .group_id = range.group_id,
             .range_id = range_id,
             .identity_namespace = .{
@@ -2809,6 +2894,51 @@ pub fn resolveGroupsForSpanEventuallyUntil(
         .publication_not_observed => .not_found,
         .timed_out => .timed_out,
     };
+}
+
+/// Decode into the caller-owned region, not a temporary Parsed arena. Source
+/// identity and established native floor are checked even through adapters.
+pub fn readGraphPreparation(source: @import("http_server.zig").StatusSource, alloc: std.mem.Allocator, request: @import("../system_catalog/graph_preparation.zig").Source, deadline_ns: ?u64) !@import("../system_catalog/graph_preparation.zig").Prepared {
+    try request.validate();
+    const bytes = try source.systemCatalog(alloc, .{ .setting_admin = true, .deadline_ns = deadline_ns, .deadline_io = if (source.routing) |route| route.io else null }, .{ .sql_graph_preparation_read = request });
+    defer alloc.free(bytes);
+    if (bytes.len > @import("../system_catalog/trigger_snapshot.zig").max_snapshot_bytes + 512) return error.SqlProgramLimitExceeded;
+    const result = try std.json.parseFromSliceLeaky(@import("../system_catalog/graph_preparation.zig").Prepared, alloc, bytes, .{ .allocate = .alloc_always });
+    if (result.snapshot.metadata_group_id == 0 or result.snapshot.graph_intent_protocol < metadata_table_manager.graph_transaction_protocol_version) return error.TableTopologyProtocolUpgradeRequired;
+    try request.requireSnapshot(alloc, result.snapshot);
+    return result;
+}
+fn metadataServiceGraphPreparationRead(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../system_catalog/graph_preparation.zig").Source, deadline_ns: ?u64) !@import("../system_catalog/graph_preparation.zig").Prepared {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return readGraphPreparation(@import("http_server.zig").StatusSource.fromMetadataService(svc), alloc, request, deadline_ns);
+}
+fn metadataHttpServiceGraphPreparationRead(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../system_catalog/graph_preparation.zig").Source, deadline_ns: ?u64) !@import("../system_catalog/graph_preparation.zig").Prepared {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return readGraphPreparation(@import("http_server.zig").StatusSource.fromMetadataHttpService(svc), alloc, request, deadline_ns);
+}
+fn metadataServerGraphPreparationRead(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../system_catalog/graph_preparation.zig").Source, deadline_ns: ?u64) !@import("../system_catalog/graph_preparation.zig").Prepared {
+    const server: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return readGraphPreparation(@import("http_server.zig").StatusSource.fromMetadataHttpService(server.svc), alloc, request, deadline_ns);
+}
+
+fn readSqlRelationBoot(source: @import("http_server.zig").StatusSource, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+    const bytes = try source.systemCatalog(alloc, .{ .setting_admin = true, .deadline_ns = deadline_ns }, .{ .sql_relation_boot_read = query });
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, alloc, bytes, .{});
+    defer parsed.deinit();
+    return parsed.value;
+}
+fn metadataServiceSqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return readSqlRelationBoot(@import("http_server.zig").StatusSource.fromMetadataService(svc), alloc, query, deadline_ns);
+}
+fn metadataHttpServiceSqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return readSqlRelationBoot(@import("http_server.zig").StatusSource.fromMetadataHttpService(svc), alloc, query, deadline_ns);
+}
+fn metadataServerSqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return readSqlRelationBoot(@import("http_server.zig").StatusSource.fromMetadataHttpService(srv.svc), alloc, query, deadline_ns);
 }
 
 fn metadataServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -4663,4 +4793,34 @@ test "system catalog routing generation survives retirement and bounds request a
     try std.testing.expectEqual(@as(u64, 10000), result.?.table_id);
     try std.testing.expectEqual(@as(usize, 1), result.?.groups.len);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, session.routePlan(bounded.allocator(), "table-9999", .table, .{ .deadline_ns = 1 }));
+}
+
+test "catalog graph preparation vote requires native capability without an admin snapshot fallback" {
+    const graph = @import("../system_catalog/graph_preparation.zig");
+    const Fake = struct {
+        snapshots: usize = 0,
+        votes: usize = 0,
+        fn snapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.snapshots += 1;
+            return error.TestUnexpectedResult;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn vote(raw: *anyopaque, _: std.mem.Allocator, request: graph.Source, deadline_ns: ?u64) !graph.Prepared {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.votes += 1;
+            try std.testing.expectEqual(@as(u64, 7), request.table_id);
+            try std.testing.expectEqual(@as(?u64, null), deadline_ns);
+            return error.CatalogGenerationChanged;
+        }
+    };
+    var fake: Fake = .{};
+    const request: graph.Source = .{ .table_id = 7, .epoch = .{ .incarnation = @splat(1), .revision = 2 }, .schema_digest = @splat(2), .indexes = &.{.{ .name = "g", .digest = @splat(3) }} };
+    var source: CatalogSource = .{ .ptr = &fake, .vtable = &.{ .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free } };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, source.graphPreparationRead(std.testing.allocator, request, null));
+    try std.testing.expectEqual(@as(usize, 0), fake.snapshots);
+    source.vtable = &.{ .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free, .graph_preparation_read = Fake.vote };
+    try std.testing.expectError(error.CatalogGenerationChanged, source.graphPreparationRead(std.testing.allocator, request, null));
+    try std.testing.expectEqual(@as(usize, 1), fake.votes);
+    try std.testing.expectEqual(@as(usize, 0), fake.snapshots);
 }

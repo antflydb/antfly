@@ -505,6 +505,9 @@ pub const Constraint = struct {
 };
 
 pub const Table = struct {
+    pub fn effectiveLogicalRelationId(self: @This()) u64 {
+        return self.logical_relation_id orelse self.id;
+    }
     pub const ExternalIndexes = struct {
         /// Fresh query-definition metadata, allocated for this execution. A
         /// schema/prepared-plan cache must never retain a publication pointer.
@@ -528,8 +531,18 @@ pub const Table = struct {
             return parts.next() == null and std.mem.eql(u8, first, self.database) and std.mem.eql(u8, second, self.namespace) and std.mem.eql(u8, third, self.name);
         }
     };
+    /// SQL identity is independent of the opaque physical generation id.
+    logical_relation_id: ?u64 = null,
+    /// Immutable schema declaration; enables complete OLD images during writes.
+    has_triggers: bool = false,
+    /// Fresh source-cut evidence; unknown is not proof of FK absence.
+    incoming_foreign_keys: ?@import("../system_catalog/domain.zig").QualifiedIncomingForeignKeys = null,
+    has_incoming_foreign_keys: bool = false,
+    trigger_functions_active: bool = false,
     /// Read-only physical generation reached through a stable catalog view.
     materialized_view_id: ?u64 = null,
+    /// Captured catalog lifetime; never substituted from a schema cache.
+    sql_persistence: ?@import("../common/relation_persistence.zig").Descriptor = null,
     schema_json: []const u8 = "",
     id: u64,
     physical_name: []const u8,
@@ -1381,6 +1394,10 @@ pub const StatementRead = struct {
     close: *const fn (*anyopaque) void,
 };
 pub const Mutation = struct {
+    /// Statement-owned trigger stage; never encoded or trusted from ingress.
+    prepared_trigger: ?*const anyopaque = null,
+    /// BEFORE ROW returned NULL. Carries no primary write or absence claim.
+    trigger_suppressed: bool = false,
     /// Compiler-owned coercion witnesses, retained only through preparation.
     domain_admission: ?domain_rows.Admission = null,
     /// Completed preparation authority, never constructed from public JSON.
@@ -1398,7 +1415,7 @@ pub const Mutation = struct {
     unique_absence: bool = false,
     row: ?std.json.Value,
     json_null_fields: []const []const u8 = &.{},
-    /// Owned preimage retained only for DELETE RETURNING. The observed version
+    /// Owned preimage retained for row triggers and DELETE RETURNING. The observed version
     /// predicate makes it authoritative only after a successful commit.
     previous: ?*const Row = null,
 };
@@ -1446,6 +1463,23 @@ pub const PopulationPreparation = struct {
 };
 
 pub const routines = @import("routine_definition.zig");
+pub const triggers = @import("../system_catalog/triggers.zig");
+pub const trigger_manifest = @import("trigger_manifest.zig");
+pub const trigger_runtime = @import("trigger_runtime.zig");
+pub const trigger_preparation = @import("trigger_preparation.zig");
+pub const trigger_provider = @import("trigger_provider.zig");
+pub const trigger_handoff = @import("trigger_handoff.zig");
+pub const trigger_restore = @import("trigger_restore.zig");
+pub const trigger_native_admission = @import("trigger_native_admission.zig");
+pub const trigger_native_admission_tests = @import("trigger_native_admission_test.zig");
+test {
+    _ = triggers;
+    _ = trigger_manifest;
+    _ = trigger_runtime;
+    _ = trigger_preparation;
+    _ = trigger_restore;
+    _ = @import("trigger_native_admission_test.zig");
+}
 pub const builtin_casts = @import("../system_catalog/builtin_casts.zig");
 pub const casts = @import("../system_catalog/casts.zig");
 pub const callable_dependencies = @import("../system_catalog/callable_dependencies.zig");
@@ -1455,6 +1489,8 @@ pub const DefinitionCopyLimits = @import("immutable_plan.zig").Limits;
 
 pub const CreateTableDefinition = struct {
     name: ast.Name,
+    persistence: ast.RelationPopulation.Persistence = .permanent,
+    on_commit: ?ast.RelationPopulation.OnCommit = null,
     creation_sources: []const @import("../system_catalog/domain.zig").RelationMutationGuard = &.{},
     /// Copy native column annotations at the same linearization point as CREATE.
     creation_comment_sources: []const u64 = &.{},
@@ -1667,6 +1703,10 @@ pub const Backend = struct {
     pub const StatementMutations = struct {
         ptr: *anyopaque,
         bind: ?*const fn (*anyopaque, @import("describe.zig").BoundStatement) anyerror!void = null,
+        /// Live logical statement scope; never an ordinal per shard or row.
+        set_scope: ?*const fn (*anyopaque, *const usize) anyerror!void = null,
+        begin_step: ?*const fn (*anyopaque, usize, @import("describe.zig").BoundStatement, ast.Statement) anyerror!void = null,
+        end_step: ?*const fn (*anyopaque, usize, @import("describe.zig").BoundStatement, ast.Statement) anyerror!void = null,
         finish: *const fn (*anyopaque) anyerror!void,
         abort: *const fn (*anyopaque) void,
     };
@@ -1713,6 +1753,10 @@ pub const Backend = struct {
     scalar_control: ?struct { ptr: ?*anyopaque, checkpoint: *const fn (?*anyopaque) anyerror!void } = null,
     supports_search_relations: bool = false,
     supports_graph_relations: bool = false,
+    /// The DDL owner captures native placement and connection lifetime.
+    supports_native_relation_lifetimes: bool = false,
+    /// Captured connection identity for relation namespace lookup only.
+    temporary_relation_owner: ?@import("../common/relation_persistence.zig").Owner = null,
     supports_text_predicates: bool = false,
     /// Advisory expression probes with mandatory SQL residual evaluation.
     /// This is an execution optimization, never a readiness/capability proof.

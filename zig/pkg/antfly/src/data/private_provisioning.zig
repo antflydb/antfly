@@ -18,6 +18,32 @@
 const std = @import("std");
 const staging = @import("../metadata/restore_staging.zig");
 const tables = @import("../metadata/table_manager.zig");
+var private_cut_diagnostic_stages: std.atomic.Value(u8) = .init(0);
+fn diagnosticHash(value: anytype) u64 {
+    const bytes = std.json.Stringify.valueAlloc(std.heap.page_allocator, value, .{}) catch return 0;
+    defer std.heap.page_allocator.free(bytes);
+    return std.hash.Wyhash.hash(0, bytes);
+}
+fn diagnosePrivateCut(comptime kind: enum { table, range }, expected: anytype, actual: @TypeOf(expected)) void {
+    if (comptime @import("builtin").mode == .debug) {
+        const bit: u8 = if (kind == .table) 1 else 2;
+        if (private_cut_diagnostic_stages.fetchOr(bit, .monotonic) & bit != 0) return;
+        const fields = if (kind == .table)
+            .{ "sql_persistence", "sql_native_indexes_json", "sql_materialized_view_id", "schema_reader_requirements", "full_text_read_index", "storage_migration", "storage.engine", "storage.dense_embeddings", "object_storage_generation", "object_storage_identity", "table_id", "name", "description", "schema_json", "read_schema_json", "relational_retirement_json", "lake_index_catalog_json", "indexes_json", "replication_sources_json", "placement_role", "restore_backup_id", "restore_location", "desired_replica_count", "min_ranges" }
+        else
+            .{ "group_id", "range_id", "table_id", "start_key", "end_key", "doc_identity_shard_id", "doc_identity_range_id", "split_attempt_epoch", "restore_backup_id", "restore_artifact_backup_id", "restore_location", "restore_snapshot_path", "restore_connection", "restore_artifact_size_bytes", "restore_artifact_sha256", "restore_native_manifest_size_bytes", "restore_native_manifest_sha256", "completed_restore_fingerprint" };
+        inline for (fields) |field| {
+            const before = if (comptime std.mem.eql(u8, field, "storage.engine")) diagnosticHash(expected.storage.engine) else if (comptime std.mem.eql(u8, field, "storage.dense_embeddings")) diagnosticHash(expected.storage.dense_embeddings) else diagnosticHash(@field(expected, field));
+            const after = if (comptime std.mem.eql(u8, field, "storage.engine")) diagnosticHash(actual.storage.engine) else if (comptime std.mem.eql(u8, field, "storage.dense_embeddings")) diagnosticHash(actual.storage.dense_embeddings) else diagnosticHash(@field(actual, field));
+            if (before != after) {
+                std.debug.print("metadata private cut mismatch kind={s} table={d} field={s} expected_hash={x} actual_hash={x}\n", .{ @tagName(kind), expected.table_id, field, before, after });
+                return;
+            }
+        }
+        std.debug.print("metadata private cut mismatch kind={s} table={d} field=unknown\n", .{ @tagName(kind), expected.table_id });
+    }
+}
+
 pub const Owner = struct {
     plan_id: [16]u8,
     plan_digest: [32]u8,
@@ -26,6 +52,7 @@ pub const Owner = struct {
     bootstrap: @import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap,
     scope: @import("antfly_local_sources").storage_db_restore_staging_contract.Scope,
     cancel_recovery: bool = false,
+    native_reset: ?@import("../metadata/sql_relation_recovery.zig").Guard = null,
 };
 pub const InitialOwner = struct {
     descriptor: staging.ProvisioningProjection.InitialFkOwner,
@@ -151,6 +178,7 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
                     .bootstrap = bootstrap,
                     .scope = bootstrap.scope,
                     .cancel_recovery = parsed.value.state == .canceling,
+                    .native_reset = target.native_reset,
                 });
             }
         }
@@ -165,7 +193,10 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
             if (candidate.table_id == table.table_id) break candidate;
         } else null;
         if (published) |expected| {
-            if (!tables.tableDefinitionsEqual(expected, table)) return error.MetadataSnapshotHeadMismatch;
+            if (!tables.tableDefinitionsEqual(expected, table)) {
+                diagnosePrivateCut(.table, expected, table);
+                return error.MetadataSnapshotHeadMismatch;
+            }
         } else {
             for (owners.items) |owner| {
                 if (owner.table.table_id == table.table_id) break;
@@ -185,7 +216,10 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
             if (candidate.group_id == range.group_id) break candidate;
         } else null;
         if (published) |expected| {
-            if (!tables.rangeRecordsEqual(expected, range)) return error.MetadataSnapshotHeadMismatch;
+            if (!tables.rangeRecordsEqual(expected, range)) {
+                diagnosePrivateCut(.range, expected, range);
+                return error.MetadataSnapshotHeadMismatch;
+            }
         } else if (!seen_groups.contains(range.group_id)) {
             for (initial_owners) |owner| {
                 if (owner.range.group_id == range.group_id) break;

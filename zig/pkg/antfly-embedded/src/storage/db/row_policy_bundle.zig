@@ -123,8 +123,34 @@ pub const Receipt = struct {
 /// One immutable, cursor-owned evaluation state. The owner admission lease
 /// outlives it, keeping the source bundle alive while these predicate pointers
 /// are used. Row scratch is retained and reset rather than allocated per row.
+/// One genuine historical schema lease per old-image decode. The caller's
+/// pinned logical view and the AROW's physical header remain distinct.
+pub const PhysicalRow = struct {
+    retained: ?@import("schema_registry.zig").SchemaView,
+    row: @import("algebraic/relational_row_codec.zig").OrdinalRowView,
+
+    pub fn init(core: anytype, logical: @import("schema_registry.zig").SchemaView, bytes: []const u8) !PhysicalRow {
+        const codec = @import("algebraic/relational_row_codec.zig");
+        const version = try codec.rowSchemaVersion(bytes);
+        var retained: ?@import("schema_registry.zig").SchemaView = if (version == logical.version()) null else (try core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
+        errdefer if (retained) |*view| view.release();
+        const physical = retained orelse logical;
+        const row = if (core.store.valuesAreAuthenticated())
+            try codec.ordinalRowViewTrusted(bytes, physical.tableSchema().*, physical.physicalLayout())
+        else
+            try codec.ordinalRowViewSelective(bytes, physical.tableSchema().*, physical.physicalLayout());
+        return .{ .retained = retained, .row = row };
+    }
+
+    pub fn deinit(self: *PhysicalRow) void {
+        if (self.retained) |*view| view.release();
+        self.* = undefined;
+    }
+};
+
 pub const ReadEvaluation = struct {
     alloc: std.mem.Allocator,
+    identity_projection: gate.IdentityProjection,
     setting_view: setting_catalog.View,
     policy_view: policies.View,
     evaluator: policies.Evaluator,
@@ -141,7 +167,7 @@ pub const ReadEvaluation = struct {
     }
 
     pub fn permits(self: *@This(), row: @import("algebraic/relational_row_codec.zig").OrdinalRowView) !bool {
-        if (!try self.scratch.permits(row)) return false;
+        if (!try self.scratch.permitsProjected(row, &self.identity_projection)) return false;
         return if (self.conjunction) |other| other.permits(row) else true;
     }
 };
@@ -207,6 +233,16 @@ pub const Installed = struct {
     }
 
     pub fn captureEvaluation(self: *const Installed, alloc: std.mem.Allocator, schema: schema_mod.TableSchema, principal: *const role_authority.Payload, action: policies.Evaluator.Action) !*ReadEvaluation {
+        var layout = try @import("algebraic/relational_row_codec.zig").PhysicalLayout.init(alloc, schema);
+        defer layout.deinit();
+        return self.captureEvaluationUsingLayout(alloc, schema, &layout, principal, action);
+    }
+
+    pub fn captureEvaluationAtSchemaView(self: *const Installed, alloc: std.mem.Allocator, logical: @import("schema_registry.zig").SchemaView, principal: *const role_authority.Payload, action: policies.Evaluator.Action) !*ReadEvaluation {
+        return self.captureEvaluationUsingLayout(alloc, logical.tableSchema().*, logical.physicalLayout(), principal, action);
+    }
+
+    fn captureEvaluationUsingLayout(self: *const Installed, alloc: std.mem.Allocator, schema: schema_mod.TableSchema, layout: *const @import("algebraic/relational_row_codec.zig").PhysicalLayout, principal: *const role_authority.Payload, action: policies.Evaluator.Action) !*ReadEvaluation {
         if (principal.policy_principal != null and (principal.access != .read or action != .select)) return error.RowPolicyAuthenticationRequired;
         const bundle = self.parsed.value;
         if ((bundle.phase != .serving_install and bundle.phase != .active) or bundle.table_id != principal.table_id or
@@ -215,6 +251,7 @@ pub const Installed = struct {
         const result = try alloc.create(ReadEvaluation);
         errdefer alloc.destroy(result);
         result.alloc = alloc;
+        result.identity_projection = try gate.IdentityProjection.fromLayout(schema.version, schema.relational_columns.len, layout, bundle.schema_version, bundle.schema_digest);
         result.conjunction = null;
         const SettingOwner = struct {
             fn load(ptr: *anyopaque, arena: std.mem.Allocator, scope: settings.Scope) !settings.Snapshot {
@@ -257,6 +294,16 @@ pub const Installed = struct {
     }
 
     pub fn captureReadEvaluation(self: *const Installed, alloc: std.mem.Allocator, schema: schema_mod.TableSchema, principal: *const role_authority.Payload) !*ReadEvaluation {
+        var layout = try @import("algebraic/relational_row_codec.zig").PhysicalLayout.init(alloc, schema);
+        defer layout.deinit();
+        return self.captureReadEvaluationUsingLayout(alloc, schema, &layout, principal);
+    }
+
+    pub fn captureReadEvaluationAtSchemaView(self: *const Installed, alloc: std.mem.Allocator, logical: @import("schema_registry.zig").SchemaView, principal: *const role_authority.Payload) !*ReadEvaluation {
+        return self.captureReadEvaluationUsingLayout(alloc, logical.tableSchema().*, logical.physicalLayout(), principal);
+    }
+
+    fn captureReadEvaluationUsingLayout(self: *const Installed, alloc: std.mem.Allocator, schema: schema_mod.TableSchema, layout: *const @import("algebraic/relational_row_codec.zig").PhysicalLayout, principal: *const role_authority.Payload) !*ReadEvaluation {
         if (principal.access != .read) return error.RowPolicyAuthenticationRequired;
         const action: policies.Evaluator.Action = switch (principal.purpose) {
             .ordinary, .normalize_select => .select,
@@ -264,10 +311,10 @@ pub const Installed = struct {
             .delete, .delete_select => .delete,
             .normalize, .integrity, .sql_write => return error.RowPolicyAuthenticationRequired,
         };
-        const evaluation = try self.captureEvaluation(alloc, schema, principal, action);
+        const evaluation = try self.captureEvaluationUsingLayout(alloc, schema, layout, principal, action);
         errdefer evaluation.deinit();
         if (principal.purpose == .update_select or principal.purpose == .delete_select)
-            evaluation.conjunction = try self.captureEvaluation(alloc, schema, principal, .select);
+            evaluation.conjunction = try self.captureEvaluationUsingLayout(alloc, schema, layout, principal, .select);
         return evaluation;
     }
 };
@@ -498,4 +545,67 @@ test "installed row policy applies USING to old images and WITH CHECK to new ima
         defer evaluation.deinit();
         try std.testing.expectEqual(case.permitted, try evaluation.evaluator.permits(alloc, &.{}));
     }
+}
+
+test "row-policy coupled schema identity projection preserves headers and rejects warmed same-version layout aliases" {
+    const a = std.testing.allocator;
+    const codec = @import("algebraic/relational_row_codec.zig");
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "id", .path = "id", .column_type = .string },
+        .{ .name = "n", .path = "n", .column_type = .integer },
+    };
+    const physical: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var logical = physical;
+    logical.version = 2;
+    var old_layout = try codec.PhysicalLayout.init(a, physical);
+    defer old_layout.deinit();
+    var logical_layout = try codec.PhysicalLayout.init(a, logical);
+    defer logical_layout.deinit();
+    try std.testing.expectEqualSlices(u8, &old_layout.identity_layout_digest, &logical_layout.identity_layout_digest);
+    try std.testing.expect(!std.mem.eql(u8, &old_layout.schema_digest, &logical_layout.schema_digest));
+    const bundle = try std.json.Stringify.valueAlloc(a, policies.InstallSnapshot{ .table_id = 7, .schema_version = 2, .schema_digest = logical_layout.schema_digest, .policy_generation = 2, .catalog_epoch = 3, .phase = .active, .records = &.{}, .settings = &.{} }, .{});
+    defer a.free(bundle);
+    var installed = try Installed.init(a, bundle, 7, logical);
+    defer installed.deinit();
+    const principal: role_authority.Payload = .{ .principal = "alice", .roles = &.{"PUBLIC"}, .auth_revision = 1, .table_id = 7, .table = "rows", .database = "main", .policy_generation = 2, .catalog_epoch = 3, .access = .read, .expires = 100 };
+    var evaluation = try installed.captureReadEvaluation(a, logical, &principal);
+    defer evaluation.deinit();
+    const values = [_]codec.Cell{
+        .{ .ordinal = 0, .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "visible" } },
+        .{ .ordinal = 1, .path = "n", .value_type = .i64_val, .value = .{ .i64_val = 9 } },
+    };
+    const bytes = try codec.serializeOrdinal(a, 1, &columns, &values, @splat(0));
+    defer a.free(bytes);
+    const original = try a.dupe(u8, bytes);
+    defer a.free(original);
+    const row = try codec.ordinalRowViewTrusted(bytes, physical, &old_layout);
+    // Default deny still denies. The explicit identity proof authorizes only
+    // decoding/evaluation; it cannot turn an absent policy into row access.
+    try std.testing.expect(!try evaluation.permits(row));
+    try std.testing.expectError(error.RowPolicyCatalogChanged, evaluation.scratch.permits(row));
+    try std.testing.expectEqual(@as(u32, 1), try codec.rowSchemaVersion(bytes));
+    try std.testing.expectEqualSlices(u8, original, bytes);
+    inline for (.{ false, true }) |reorder| {
+        const changed = if (reorder)
+            [_]schema_mod.RelationalColumn{ columns[1], columns[0] }
+        else
+            [_]schema_mod.RelationalColumn{ .{ .name = "id", .path = "id", .column_type = .integer }, columns[1] };
+        var wrong = physical;
+        wrong.relational_columns = &changed;
+        var wrong_layout = try codec.PhysicalLayout.init(a, wrong);
+        defer wrong_layout.deinit();
+        const wrong_cells = if (reorder)
+            [_]codec.Cell{ .{ .ordinal = 0, .path = "n", .value_type = .i64_val, .value = .{ .i64_val = 9 } }, .{ .ordinal = 1, .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "visible" } } }
+        else
+            [_]codec.Cell{ .{ .ordinal = 0, .path = "id", .value_type = .i64_val, .value = .{ .i64_val = 7 } }, values[1] };
+        const bad = try codec.serializeOrdinal(a, 1, &changed, &wrong_cells, @splat(0));
+        defer a.free(bad);
+        const wrong_row = try codec.ordinalRowViewTrusted(bad, wrong, &wrong_layout);
+        try std.testing.expectError(error.RowPolicyCatalogChanged, evaluation.permits(wrong_row));
+        wrong.version = 2;
+        try std.testing.expectError(error.RowPolicyCatalogChanged, installed.captureReadEvaluation(a, wrong, &principal));
+    }
+    var future = logical;
+    future.version = 3;
+    try std.testing.expectError(error.RowPolicyCatalogChanged, installed.captureReadEvaluation(a, future, &principal));
 }

@@ -36,6 +36,27 @@ pub const Bound = struct {
     root: Step,
 };
 
+pub fn requiresCoordination(table: catalog.Table) bool {
+    return table.has_triggers or table.has_incoming_foreign_keys or (table.trigger_functions_active and table.incoming_foreign_keys == null);
+}
+
+/// Ordinary protected DML needs the same command-owned preparation, AFTER
+/// queue and atomic publication as writable WITH, including zero-row events.
+pub fn coordinateMutation(a: A, backend: catalog.Backend, statement: ast.Statement, binding: describe.BoundStatement) !describe.BoundStatement {
+    if (binding.effect_graph != null or backend.statement_ctes != null) return binding;
+    switch (statement) {
+        .insert, .update, .delete, .merge => {},
+        else => return binding,
+    }
+    const table = binding.table orelse return binding;
+    if (!requiresCoordination(table)) return binding;
+    const visibility = try a.create(scope.Scope);
+    visibility.* = .{ .definitions = &.{}, .binding_scope = backend.binding_scope };
+    const graph = try a.create(Bound);
+    graph.* = .{ .scope = visibility, .steps = &.{}, .root = .{ .statement = statement, .binding = binding, .mutation = true, .demanded = true, .ordered_effects = true } };
+    return .{ .table = null, .action = .read_write, .columns = binding.columns, .parameter_types = binding.parameter_types, .parameter_invocation = binding.parameter_invocation, .parameter_descriptors = binding.parameter_descriptors, .json_literals = .empty, .effect_graph = graph };
+}
+
 fn combine(a: A, prefix: []const ast.Cte, inner: []const ast.Cte) ![]const ast.Cte {
     if (prefix.len == 0) return inner;
     const result = try a.alloc(ast.Cte, prefix.len + inner.len);

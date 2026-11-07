@@ -926,6 +926,8 @@ fn fetchAgentUrl(arena: std.mem.Allocator, request_context: managed_embedder.Req
     };
 }
 
+var coordinated_failure_diagnostic_once: std.atomic.Value(bool) = .init(false);
+
 pub const AntflyApiHandler = struct {
     api_server: *ApiHttpServer,
     /// Separate phase admission for H2 query bodies. Slow uploads must not
@@ -2856,6 +2858,7 @@ pub const AntflyApiHandler = struct {
         const port = self.api_server.cfg.fk_generation_source orelse return textResponse(ctx, 503, "FK generation source unavailable");
         const receipt = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, operationContext(ctx, null)) catch |err| return switch (err) {
             error.GenerationAdmissionChanged, error.IntegrityTopologyChanged, error.IdentityNamespaceMismatch, error.InvalidGenerationPublication => textResponse(ctx, 409, "FK generation source plan or owner changed"),
+            error.TransactionTopologyBusy => jsonResponse(ctx, 503, publication.source_draining_error_json),
             error.Canceled, error.Cancelled => textResponse(ctx, 408, "FK generation source canceled"),
             else => textResponse(ctx, 503, "FK generation source must be retried"),
         };
@@ -2945,7 +2948,7 @@ pub const AntflyApiHandler = struct {
         if (body.len == 0 or body.len > preparation.max_request_bytes) return textResponse(ctx, 413, "schema preparation too large");
         var parsed = std.json.parseFromSlice(preparation.Request, ctx.allocator, body, .{ .ignore_unknown_fields = false }) catch |err| return switch (err) {
             error.OutOfMemory => textResponse(ctx, 503, @errorName(err)),
-            else => textResponse(ctx, 400, "invalid schema preparation"),
+            else => self.internalGroupTableRetirementPrepare(ctx, params.group_id, params.table_name, body, context),
         };
         defer parsed.deinit();
         parsed.value.validate(params.group_id) catch return textResponse(ctx, 400, "invalid schema preparation scope");
@@ -2959,6 +2962,35 @@ pub const AntflyApiHandler = struct {
         };
         errdefer ctx.allocator.free(bytes);
         try ctx.setHeader("content-type", "application/octet-stream");
+        _ = ctx.response.bodyOwned(ctx.allocator, bytes);
+        return ctx.response.build();
+    }
+
+    fn internalGroupTableRetirementPrepare(self: *AntflyApiHandler, ctx: *httpx.Context, group: u64, table: []const u8, body: []const u8, authenticated: operation_contract.RequestContext) !httpx.Response {
+        const preparation = @import("table_retirement_preparation.zig");
+        if (!authenticated.schema_validation_authority) return textResponse(ctx, 403, "internal preparation authority required");
+        if (body.len > preparation.max_request_bytes) return textResponse(ctx, 413, "retirement preparation too large");
+        var parsed = std.json.parseFromSlice(struct { retirement: preparation.Request }, ctx.allocator, body, .{ .ignore_unknown_fields = false }) catch |err| return switch (err) {
+            error.OutOfMemory => textResponse(ctx, 503, @errorName(err)),
+            else => textResponse(ctx, 400, "invalid schema preparation"),
+        };
+        defer parsed.deinit();
+        parsed.value.retirement.validate(group) catch return textResponse(ctx, 400, "invalid retirement preparation scope");
+        // This alternative is reachable only after the existing preparation
+        // route authenticated an internal service and bounded its deadline.
+        var context = authenticated;
+        context.setting_admin = true;
+        context.schema_validation_authority = true;
+        context.fk_generation_publication_authority = true;
+        const bytes = self.api_server.prepareTableRetirementOwner(ctx.allocator, group, table, parsed.value.retirement, context) catch |err| return switch (err) {
+            error.Canceled, error.Cancelled, error.DeadlineExceeded => textResponse(ctx, 408, @errorName(err)),
+            error.Forbidden => textResponse(ctx, 403, @errorName(err)),
+            error.InvalidCatalogRecord, error.InvalidTableRetirementManifest, error.InvalidScopeRetirement => textResponse(ctx, 400, @errorName(err)),
+            error.MetadataIncarnationMismatch, error.CatalogGenerationChanged, error.GenerationRetirementChanged, error.IntegrityCatalogChanged, error.IntegrityTopologyBusy, error.IdentityNamespaceMismatch, error.SqlRelationOwnerChanged => textResponse(ctx, 409, @errorName(err)),
+            else => textResponse(ctx, 503, @errorName(err)),
+        };
+        errdefer ctx.allocator.free(bytes);
+        try ctx.setHeader("content-type", "application/json");
         _ = ctx.response.bodyOwned(ctx.allocator, bytes);
         return ctx.response.build();
     }
@@ -3127,7 +3159,7 @@ pub const AntflyApiHandler = struct {
             lookup_options.opts.row_policy_principal_proof = token;
             lookup_options.opts.row_policy_database = decoded_policy_database.?;
         }
-        if (std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
+        if (lookup_options.opts.include_json_null_fields or std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
             std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}"))
         {
             // A legacy unauthenticated internal peer must never gain the
@@ -3142,9 +3174,23 @@ pub const AntflyApiHandler = struct {
         const logical_key = if (control_lookup and std.mem.eql(u8, key, "\x00relational_control")) "" else key;
         const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch
             return textResponse(ctx, 400, "invalid read consistency");
+        var request_context = operationContext(ctx, null);
+        if (lookup_options.opts.sql_lock_query_json.len != 0) try self.requireNativeNodeAuthority(ctx);
+        if (request_context.catalog_route_fence_json.len != 0) {
+            const fence = try std.json.parseFromSliceLeaky(metadata_api.CatalogRouteFence, ctx.allocator, request_context.catalog_route_fence_json, .{});
+            if (fence.route.execution == .native_local) {
+                try self.requireNativeNodeAuthority(ctx);
+                const private_lock = try @import("native_sql_lock_read.zig").isPrivateControl(ctx.allocator, logical_key, lookup_options.opts, fence);
+                if (!private_lock) {
+                    const body = if (ctx.request.method == .POST) (try ctx.body()) orelse "" else "";
+                    const owned = try self.nativeRelationOwnerFence(ctx, fence, body, .read);
+                    request_context.sql_relation_owner = owned.admission_sql_relation_owner;
+                }
+            }
+        }
         var result = self.internalGroupOperations().lookup(
             ctx.allocator,
-            operationContext(ctx, null),
+            request_context,
             .{
                 .group_id = params.group_id,
                 .table_name = params.table_name,
@@ -3160,6 +3206,21 @@ pub const AntflyApiHandler = struct {
         if (result.expected_content_digest) |digest| {
             const hex = std.fmt.bytesToHex(digest, .lower);
             try ctx.setHeader("X-Antfly-Primary-Digest", &hex);
+        }
+        if (lookup_options.opts.include_json_null_fields) {
+            const fields = try ctx.allocator.dupe([]const u8, result.json_null_fields);
+            defer ctx.allocator.free(fields);
+            std.mem.sort([]const u8, fields, {}, struct {
+                fn less(_: void, left: []const u8, right: []const u8) bool {
+                    return std.mem.order(u8, left, right) == .lt;
+                }
+            }.less);
+            try http_client.TypedLookup.requireCanonical(result.json, fields);
+            try ctx.setHeader("X-Antfly-Typed-Nulls", "1");
+            var encoded = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .json = result.json, .json_null_fields = fields }, .{});
+            errdefer ctx.allocator.free(encoded);
+            if (encoded.len > http_client.TypedLookup.max_response_bytes) return error.InvalidResponse;
+            return ownedJsonResponse(ctx, 200, &encoded, ctx.allocator);
         }
         return ownedJsonResponse(ctx, 200, &result.json, ctx.allocator);
     }
@@ -3632,8 +3693,7 @@ pub const AntflyApiHandler = struct {
     fn internalGroupBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
-        if (self.api_server.cfg.routed_raft_batch_writer != null)
-            return textResponse(ctx, 404, "legacy raft batch forwarding unsupported");
+
         const forwarding = internal_batch_forwarding.parseValues(
             ctx.header(internal_batch_forwarding.remaining_ms_header),
             ctx.header(internal_batch_forwarding.forwards_remaining_header),
@@ -3642,7 +3702,20 @@ pub const AntflyApiHandler = struct {
         if (forwarding != null)
             return textResponse(ctx, 400, "raft batch forwarding headers require routed endpoint");
         const body = (try ctx.body()) orelse "";
-        var input = batch_api.parseInternalBatchRequest(ctx.allocator, body) catch |err| return switch (err) {
+        var native_route: ?metadata_api.CatalogRouteFence = null;
+        if (ctx.header(metadata_api.catalog_route_fence_header)) |encoded| {
+            const decoded = try std.json.parseFromSliceLeaky(metadata_api.CatalogRouteFence, ctx.allocator, encoded, .{});
+            if (decoded.route.execution == .native_local) {
+                native_route = try self.nativeRelationOwnerFence(ctx, decoded, body, .write);
+                native_route.?.admission_deadline_ns = operationContext(ctx, null).deadline_ns;
+                native_route.?.admission_deadline_io = operationContext(ctx, null).deadline_io;
+                native_route.?.admission_cancellation = operationContext(ctx, null).cancellation;
+                if (decoded.route.group_id != params.group_id) return error.TopologyChanged;
+            }
+        }
+        if (native_route == null and self.api_server.cfg.routed_raft_batch_writer != null)
+            return textResponse(ctx, 404, "legacy raft batch forwarding unsupported");
+        var input = (if (native_route != null) batch_api.parseOwnerBatchRequest(ctx.allocator, body) else batch_api.parseInternalBatchRequest(ctx.allocator, body)) catch |err| return switch (err) {
             error.InvalidBatchRequest => textResponse(ctx, 400, "invalid batch request"),
             error.ValueTooLong => textResponse(ctx, 413, "value too large"),
             else => textResponse(ctx, 500, "internal server error"),
@@ -3650,13 +3723,14 @@ pub const AntflyApiHandler = struct {
         defer input.deinit(ctx.allocator);
         if (input.req.relational_topology) |command| if (command.action == .activate_parent_retirement or command.action == .acknowledge_parent_retirement)
             return textResponse(ctx, 403, "parent activation requires owner-local metadata proof");
-        const result = self.internalGroupOperations().batch(
+        const result = (if (native_route) |fence| self.internalGroupOperations().nativeAtomicBatch(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input.req, fence) else self.internalGroupOperations().batch(
             ctx.allocator,
             operationContext(ctx, null),
             params.group_id,
             params.table_name,
             input.req,
-        ) catch |err| return switch (err) {
+        )) catch |err| return switch (err) {
+            error.SqlRelationOwnerChanged, error.SqlTemporaryRelationNotOwned, error.SqlRelationRecoveryIncomplete, error.InvalidSqlRelationPersistence => return textResponse(ctx, 409, @errorName(err)),
             error.RetainedEffectsFull => retainedPressureResponse(ctx, true),
             error.InvalidArgument => textResponse(ctx, 400, "invalid batch request"),
             error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
@@ -3876,6 +3950,33 @@ pub const AntflyApiHandler = struct {
         return internalQueryResponse(ctx, &result);
     }
 
+    /// Node credentials do not delegate a SQL connection. Authenticate the
+    /// exact completed body and native generation before ordinary TEMP reads.
+    fn requireNativeNodeAuthority(self: *AntflyApiHandler, ctx: *httpx.Context) !void {
+        const node_token = ctx.header(internal_service_auth.header_name) orelse return error.Forbidden;
+        var node = try self.api_server.authenticateInternalServiceRequest(node_token);
+        defer node.deinit(self.api_server.alloc);
+        if (!node.is_internal_service) return error.Forbidden;
+    }
+
+    fn nativeRelationOwnerFence(self: *AntflyApiHandler, ctx: *httpx.Context, original: metadata_api.CatalogRouteFence, body: []const u8, purpose: @import("antfly_local_sources").common_relation_owner_authority.Purpose) !metadata_api.CatalogRouteFence {
+        var fence = original;
+        if (fence.route.execution != .native_local) return fence;
+        try self.requireNativeNodeAuthority(ctx);
+        if (fence.route.execution.native_local.kind != .temporary) return fence;
+        const authority = @import("antfly_local_sources").common_relation_owner_authority;
+        const proof = ctx.header(authority.header) orelse return error.SqlTemporaryRelationNotOwned;
+        const command_digest: ?[32]u8 = if (ctx.header(authority.command_digest_header)) |hex| digest: {
+            if (hex.len != 64) return error.Forbidden;
+            var value: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&value, hex) catch return error.Forbidden;
+            break :digest value;
+        } else null;
+        const key = try @import("sql_preparation_authority_keys.zig").configured(self.api_server.cfg);
+        fence.admission_sql_relation_owner = try authority.verify(ctx.allocator, key.secret, key.issuer, .{ .purpose = purpose, .table_id = fence.table_id, .group_id = fence.route.group_id, .descriptor_fingerprint = try fence.route.execution.native_local.fingerprint(), .body_digest = authority.bodyDigest(body), .command_fence_digest = command_digest }, fence.route.execution.native_local, @intCast(@divFloor(self.api_server.internalAuthRealtimeNs(), std.time.ns_per_s)), proof);
+        return fence;
+    }
+
     fn internalRetainedRead(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const rpc = @import("retained_read_rpc.zig");
         // Unlike legacy stateless internal reads, retained handles NEVER accept
@@ -3896,7 +3997,8 @@ pub const AntflyApiHandler = struct {
         try request.ensureActive();
         var source = self.api_server.table_reads orelse return textResponse(ctx, 503, "retained read source unavailable");
         source.bindCatalogRouteFenceJson(ctx.allocator, request.catalog_route_fence_json, params.group_id, request.deadline_ns, request.cancellation) catch return textResponse(ctx, 400, "invalid catalog route fence");
-        const route = source.route_fence orelse return textResponse(ctx, 400, "catalog route fence required");
+        const route = self.nativeRelationOwnerFence(ctx, source.route_fence orelse return textResponse(ctx, 400, "catalog route fence required"), body, .read) catch |err| return textResponse(ctx, 403, @errorName(err));
+        source.route_fence = route;
         var principal: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(identity.credential_principal, &principal, .{});
         const runtime = self.api_server.retainedReadRuntime() catch return textResponse(ctx, 503, "retained read owner unavailable");
@@ -3908,7 +4010,7 @@ pub const AntflyApiHandler = struct {
             .topology_revision = route.topology_epoch,
             .schema_version = parsed.value.schema_version,
         }, params.table_name, parsed.value, @import("retained_read_page.zig").formatForAccept(ctx.header("accept") orelse "")) catch |err| {
-            if (parsed.value.operation == .normalize)
+            if (parsed.value.operation == .normalize or parsed.value.operation == .graph_page)
                 return textResponse(ctx, rpc.normalizationFailureHttpStatus(err), @errorName(err));
             return textResponse(ctx, switch (err) {
                 error.InvalidRetainedReadLease, error.InvalidRetainedReadToken, error.InvalidRetainedReadQuery, error.InvalidRetainedReadPageLimit => 400,
@@ -4039,7 +4141,17 @@ pub const AntflyApiHandler = struct {
         try operationContext(ctx, null).ensureActive();
         const writes = self.api_server.table_writes orelse return textResponse(ctx, 404, "not found");
         const body = (try ctx.body()) orelse "";
-        const json = (writes.sqlMaintenanceGroupLocal(ctx.allocator, params.group_id, params.table_name, body) catch |err| switch (err) {
+        const routed: ?metadata_api.CatalogRouteFence = if (ctx.header(metadata_api.catalog_route_fence_header)) |encoded| admitted: {
+            var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").api_sql_maintenance_contract.Request, ctx.allocator, body, .{});
+            defer parsed.deinit();
+            try parsed.value.validate();
+            var fence = try self.nativeRelationOwnerFence(ctx, try std.json.parseFromSliceLeaky(metadata_api.CatalogRouteFence, ctx.allocator, encoded, .{}), body, if (parsed.value.operation == .statistics) .read else .write);
+            if (fence.route.group_id != params.group_id or fence.table_id != parsed.value.table_id) return error.TopologyChanged;
+            fence.admission_cancellation = operationContext(ctx, null).cancellation;
+            fence.admission_deadline_ns = operationContext(ctx, null).deadline_ns;
+            break :admitted fence;
+        } else null;
+        const json = ((if (routed) |fence| writes.sqlMaintenanceGroupLocalRouted(ctx.allocator, fence, params.group_id, params.table_name, body, operationContext(ctx, null).cancellation) else writes.sqlMaintenanceGroupLocal(ctx.allocator, params.group_id, params.table_name, body)) catch |err| switch (err) {
             error.InvalidSqlParameters, error.UnknownSqlColumn, error.DuplicateSqlColumn, error.IdempotencyConflict => return textResponse(ctx, 400, @errorName(err)),
             error.MaintenanceBusy => return textResponse(ctx, 503, @errorName(err)),
             error.UnknownGroup, error.NotFound => return textResponse(ctx, 404, "not found"),
@@ -4236,7 +4348,12 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         var input = distributed_txn.parseTxnBeginRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         defer distributed_txn.freeTxnBeginRequest(ctx.allocator, &input);
-        self.internalGroupOperations().txnBegin(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+        if (input.route_fence) |fence| if (fence.route.execution == .native_local) {
+            input.route_fence = self.nativeRelationOwnerFence(ctx, fence, body, .prepare) catch |err| return textResponse(ctx, 403, @errorName(err));
+        };
+        var native_context = operationContext(ctx, null);
+        if (input.route_fence) |fence| native_context.sql_relation_owner = fence.admission_sql_relation_owner;
+        self.internalGroupOperations().txnBegin(ctx.allocator, native_context, params.group_id, params.table_name, input) catch |err|
             return internalTxnErrorResponse(ctx, err, .begin);
         return ctx.json(struct {}{});
     }
@@ -4251,7 +4368,21 @@ pub const AntflyApiHandler = struct {
             return textResponse(ctx, 400, "invalid transaction request");
         };
         defer distributed_txn.freeTxnPrepareRequest(ctx.allocator, &input);
-        self.internalGroupOperations().txnPrepare(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err| {
+        if (input.route_fence) |fence| if (fence.route.execution == .native_local) {
+            if (input.req.asBatch(input.txn_id, input.topology_epoch).externalActivationOwner() != null) {
+                self.requireNativeNodeAuthority(ctx) catch |err| return textResponse(ctx, 403, @errorName(err));
+            } else {
+                input.route_fence = self.nativeRelationOwnerFence(ctx, fence, body, .prepare) catch |err| return textResponse(ctx, 403, @errorName(err));
+            }
+        };
+        if (input.req.trigger_receipts.len != 0) {
+            const route = input.route_fence orelse return textResponse(ctx, 403, "trigger route authority required");
+            input.route_fence = @import("sql_trigger_authority.zig").admitHttp(self.api_server, ctx.allocator, route, input.req, body, ctx.header(@import("antfly_local_sources").common_trigger_preparation_authority.header), .prepare) catch |err|
+                return textResponse(ctx, 403, @errorName(err));
+        }
+        var native_context = operationContext(ctx, null);
+        if (input.route_fence) |fence| native_context.sql_relation_owner = fence.admission_sql_relation_owner;
+        self.internalGroupOperations().txnPrepare(ctx.allocator, native_context, params.group_id, params.table_name, input) catch |err| {
             if (err == error.InvalidArgument and txn_prepare_diagnostic_gate.admit(platform_time.monotonicNs()))
                 std.log.warn("transaction prepare rejected phase=owner group_id={d} scoped={} class={s}", .{ params.group_id, input.req.restore_staging_scope != null, @errorName(err) });
             return internalTxnErrorResponse(ctx, err, .prepare);
@@ -4264,6 +4395,10 @@ pub const AntflyApiHandler = struct {
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         const input = distributed_txn.parseTxnResolveRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
+        if (input.route_fence) |fence| if (fence.route.execution == .native_local) {
+            self.requireNativeNodeAuthority(ctx) catch |err| return textResponse(ctx, 403, @errorName(err));
+            if (input.external_decision_owner == null) return textResponse(ctx, 403, "external decision authority required");
+        };
         self.internalGroupOperations().txnResolve(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalTxnErrorResponse(ctx, err, .resolve);
         return ctx.json(struct {}{});
@@ -4274,6 +4409,7 @@ pub const AntflyApiHandler = struct {
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         const input = distributed_txn.parseTxnStatusRequestWithScope(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
+        if (input.route_fence != null) self.requireNativeNodeAuthority(ctx) catch |err| return textResponse(ctx, 403, @errorName(err));
         const status = self.internalGroupOperations().txnStatusWithRequest(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalTxnErrorResponse(ctx, err, .status);
         return ctx.json(distributed_txn.TxnStatusResponse{ .status = status });
@@ -4285,6 +4421,7 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         var input = distributed_txn.parseTxnAcknowledgeRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         defer distributed_txn.freeTxnAcknowledgeRequest(ctx.allocator, &input);
+        if (input.route_fence != null) self.requireNativeNodeAuthority(ctx) catch |err| return textResponse(ctx, 403, @errorName(err));
         self.internalGroupOperations().txnAcknowledge(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalTxnErrorResponse(ctx, err, .acknowledge);
         return ctx.json(struct {}{});
@@ -4296,6 +4433,7 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         var input = distributed_txn.parseTxnAcknowledgeManyRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         defer distributed_txn.freeTxnAcknowledgeManyRequest(ctx.allocator, &input);
+        if (input.route_fence != null) self.requireNativeNodeAuthority(ctx) catch |err| return textResponse(ctx, 403, @errorName(err));
         self.internalGroupOperations().txnAcknowledgeMany(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err| {
             if (err == error.RaftBatchWriteOutcomeUnknown) {
                 try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
@@ -5405,6 +5543,21 @@ pub const AntflyApiHandler = struct {
         commit_req: *transactions_api.OwnedTransactionCommitRequest,
         response_mode: CommitResponseMode,
     ) !httpx.Response {
+        return self.executeCommitRequestInner(ctx, borrowed_identity, commit_req, response_mode) catch |failure| {
+            // Stable test diagnostic only. Never dump row bodies, grants or
+            // allocator-heavy stacks at this public failure boundary.
+            if (@import("builtin").mode == .debug and !coordinated_failure_diagnostic_once.swap(true, .monotonic)) std.log.warn("public coordinated commit escaped phase={s} class={s}", .{ @tagName(response_mode), @errorName(failure) });
+            return failure;
+        };
+    }
+
+    fn executeCommitRequestInner(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        borrowed_identity: ?AuthenticatedIdentity,
+        commit_req: *transactions_api.OwnedTransactionCommitRequest,
+        response_mode: CommitResponseMode,
+    ) !httpx.Response {
         const alloc = ctx.allocator;
         var authenticated_identity = try http_server_mod.cloneCatalogIdentity(self.api_server.alloc, borrowed_identity);
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -5455,9 +5608,14 @@ pub const AntflyApiHandler = struct {
         var prepared = self.api_server.preparePublicCommitWithIntegrity(alloc, distributed_tables, commit_request) catch |err|
             return self.transactionPreparationError(ctx, err);
         defer prepared.deinit();
+        // Integrity/trigger expansion fixes the final physical participants.
+        // Sign those exact bodies under this request's authenticated principal,
+        // as the single-table and SQL-session commit paths already do.
+        const signed = self.api_server.signCurrentRowPolicyMutationParticipants(alloc, prepared.tables, commit_request) catch |err|
+            return self.transactionPreparationError(ctx, err);
         const outcome = ((switch (response_mode) {
-            .transaction => source.commitTransactionWithCancellation(alloc, prepared.tables, commit_req.sync_level, commit_request.cancellation),
-            .multi_batch => source.commitBatchWithCancellation(alloc, prepared.tables, commit_req.sync_level, commit_request.cancellation),
+            .transaction => source.commitTransactionWithCancellation(alloc, signed, commit_req.sync_level, commit_request.cancellation),
+            .multi_batch => source.commitBatchWithCancellation(alloc, signed, commit_req.sync_level, commit_request.cancellation),
         }) catch |err| switch (err) {
             error.TransactionTooLarge => return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions"),
             error.InvalidBatchRequest,
@@ -5578,6 +5736,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(500);
                 return ctx.text("transaction outcome is unknown; do not retry this stateless request because it may already have committed; use a transaction session for retryable commits");
             },
+            error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => return self.transactionPreparationError(ctx, err),
             error.AbortDecisionNotDurable, error.TransactionBeginFailed, error.TransactionPrepareAbortedUnavailable => {
                 _ = ctx.status(503);
                 return ctx.text("transaction coordinator is temporarily unavailable");
@@ -6057,7 +6216,7 @@ pub const AntflyApiHandler = struct {
     fn transactionPreparationError(_: *AntflyApiHandler, ctx: *httpx.Context, err: anyerror) !httpx.Response {
         return switch (err) {
             error.DeadlineExceeded, error.PreDecisionDeadlineExceeded => textResponse(ctx, 504, "transaction preparation deadline exceeded before commit"),
-            error.Forbidden => textResponse(ctx, 403, "forbidden"),
+            error.Forbidden, error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => textResponse(ctx, 403, "forbidden"),
             error.TransactionTooLarge, error.SessionRecordTooLarge => textResponse(ctx, 413, "transaction exceeds preparation capacity"),
             error.ForeignKeyParentMissing,
             error.ForeignKeyReferenced,
@@ -7055,6 +7214,7 @@ pub const AntflyApiHandler = struct {
             var execution_limits = self.execution_limits;
             execution_limits.result_rows = self.limit;
             self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, execution_limits, if (resource != null) execution_backend else null) catch |err| {
+                sql_execution.diagnoseCatalogConflictTrace(err, @errorReturnTrace());
                 self.failure = err;
                 return;
             };
@@ -7194,6 +7354,7 @@ pub const AntflyApiHandler = struct {
         };
         _ = @import("sql_connections.zig").mutate(store, .{ .create = .{
             .id = connection_id,
+            .wire_epoch = try self.api_server.sql_connection_admission.executionInstance(self.api_server.embedding_provider_runtime.io),
             .principal = principal,
             .owner_node_id = owner_node_id,
             .expires_at_ms = now_ms +| @import("sql_connection_record.zig").ttl_ms,
@@ -7260,7 +7421,7 @@ pub const AntflyApiHandler = struct {
         if (enrolled != null) {
             var native: @import("sql_command_execution.zig").Native = .{ .server = self.api_server, .context = operationContext(ctx, identity) };
             const controller = try native.controller(connection_id, identity);
-            try controller.retireAndWait(self.api_server.alloc);
+            try native.awaitRetirement(self.api_server.alloc, controller);
         }
         _ = @import("sql_connections.zig").mutate(store, .{ .close = connection_id }, principal, self.api_server.localSessionNodeId(), now_ms) catch |err| {
             var buffer: [256]u8 = undefined;
@@ -23729,4 +23890,88 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     const completion = try AntflyApiHandler.requestCompletion(&ctx);
     try std.testing.expect(!completion.unknown and completion.outcomes.items.len == 1);
     try std.testing.expect(!try @import("sql_completion.zig").settled(&api, a, .{ .outcomes = completion.outcomes.items }, .{}));
+}
+
+test "SQL native graph public row policy rejection preserves forbidden without outcome claims" {
+    for ([_]anyerror{ error.RowPolicyDenied, error.RowPolicyAuthenticationRequired }) |failure| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/db/v1/batch");
+        defer request.deinit();
+        var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer context.deinit();
+        var handler: AntflyApiHandler = .{ .api_server = undefined };
+        var response = try handler.transactionPreparationError(&context, failure);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+        try std.testing.expectEqualStrings("forbidden", response.body.?);
+        try std.testing.expect(response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
+        try std.testing.expect(response.headers.get("Retry-After") == null);
+    }
+}
+
+test "httpx private schema preparation retirement alternative binds service authority scope and budget" {
+    const a = std.testing.allocator;
+    const preparation = @import("table_retirement_preparation.zig");
+    const schema_preparation = @import("schema_validation_preparation.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        fn prepare(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, request: preparation.Request, context: operation_contract.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(context.setting_admin and context.schema_validation_authority and context.fk_generation_publication_authority);
+            try context.ensureActive();
+            try std.testing.expect(context.deadline_ns != null and context.deadline_io == null);
+            try std.testing.expectEqual(@as(u64, 7), group);
+            try std.testing.expectEqual(@as(u64, 72), request.namespace.shard_id);
+            try std.testing.expectEqualStrings("docs", table);
+            self.calls += 1;
+            // Transport authorization only, no physical owner receipt claim.
+            return alloc.dupe(u8, "{}");
+        }
+        fn status(handler: *AntflyApiHandler, req: *httpx.Request, expected: u16, deadline: ?u64) !void {
+            var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, req);
+            defer ctx.deinit();
+            const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" } };
+            ctx.params = &params;
+            ctx.application_deadline_ns = deadline;
+            var response = try handler.internalGroupSchemaValidationPrepare(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(expected, response.status.code);
+        }
+    };
+    var fixture: Fixture = .{};
+    var source = AuthStatusSource{};
+    const secret = "retirement-preparation-secret-0123456789";
+    var server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "httpx-test", .internal_service_accept_legacy_unauthenticated = true, .table_retirement_preparation = .{ .ptr = &fixture, .prepare_fn = Fixture.prepare } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var req = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/groups/7/tables/docs/schema-validation-prepare");
+    defer req.deinit();
+    var value: preparation.Request = .{ .lookup = .{ .group = 2188, .table = 3, .id = @splat(1) }, .expected_revision = 1, .effects = .{ .digest = @splat(2), .root_table = 3, .survivors = 0, .counters = 0, .views = 0 }, .metadata_incarnation = "11111111111111111111111111111111".*, .table_id = 3, .owner_group_id = 7, .namespace = .{ .table_id = 3, .shard_id = 72, .range_id = 172 } };
+    const body = try std.json.Stringify.valueAlloc(a, .{ .retirement = value }, .{});
+    defer a.free(body);
+    try req.setBody(body);
+    try Fixture.status(&handler, &req, 401, null);
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "httpx-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    try req.headers.append(internal_service_auth.header_name, token);
+    try Fixture.status(&handler, &req, 400, null);
+    try req.headers.append(schema_preparation.remaining_ms_header, "1000");
+    try Fixture.status(&handler, &req, 408, 0);
+    const mixed = try std.fmt.allocPrint(a, "{s},\"before_schema\":\"{{}}\"}}", .{body[0 .. body.len - 1]});
+    defer a.free(mixed);
+    try req.setBody(mixed);
+    try Fixture.status(&handler, &req, 400, null);
+    value.owner_group_id = 72;
+    const foreign = try std.json.Stringify.valueAlloc(a, .{ .retirement = value }, .{});
+    defer a.free(foreign);
+    try req.setBody(foreign);
+    try Fixture.status(&handler, &req, 400, null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try req.setBody(body);
+    try Fixture.status(&handler, &req, 200, null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    const legacy = try std.json.Stringify.valueAlloc(a, schema_preparation.Request{ .group_id = 7, .metadata_incarnation = @splat('1'), .id = @splat(2), .provisional_plan = @splat(3), .transition_id = 4, .namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 }, .before_schema = "{}", .after_schema = "{}", .selection = .{ .not_null = &.{"n"} } }, .{});
+    defer a.free(legacy);
+    try req.setBody(legacy);
+    try Fixture.status(&handler, &req, 503, null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }

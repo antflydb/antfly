@@ -19,6 +19,10 @@
 const std = @import("std");
 
 pub const CreateTableRequest = struct {
+    /// Authenticated SQL/native lifecycle metadata. Public create transports
+    /// reject this field; metadata admission independently joins its boot and
+    /// exact store placement before publishing a native owner.
+    sql_persistence: ?@import("../common/relation_persistence.zig").Descriptor = null,
     tablespace_name: ?[]u8 = null,
     // Omission is a creation policy decision. Persisted table settings keep
     // their legacy default so opening an existing table never migrates it.

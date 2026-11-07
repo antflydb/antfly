@@ -365,6 +365,15 @@ pub const StandaloneRevisionState = struct {
     projection_revision: u64,
 };
 
+pub const TriggerPolicySchemaPreparation = struct {
+    after: metadata.TableRecord,
+    policy_pair: ?@import("antfly_local_sources").system_catalog_policies.SchemaPair = null,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        if (self.policy_pair) |pair| return writer.write(.{ .after = self.after, .policy_pair = pair });
+        try writer.write(.{ .after = self.after });
+    }
+};
+
 pub const CatalogProjectionRequest = union(enum) {
     read_store: struct { store_id: u64, reports: bool },
     read_store_group_facts: u64,
@@ -374,7 +383,7 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_checkpoint: []const u8,
     catalog_checkpoint_projection: @import("../../system_catalog/projection.zig").Export.NativeCheckpoint,
     catalog_export_standalone_portable: void,
-    sql_snapshot_cohort: []const u8,
+    sql_snapshot_cohort: @import("../../system_catalog/server_call.zig").SqlSnapshotCohortRequest,
     catalog_list_tables: system_catalog.TableList,
     catalog_meta: void,
     catalog_admission: system_catalog.Mutation,
@@ -386,6 +395,7 @@ pub const CatalogProjectionRequest = union(enum) {
     sql_column_identities: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard,
     sql_object_annotation: @import("antfly_local_sources").system_catalog_domain.ObjectAnnotationRead,
     relation_replacement_check: struct { guard: system_catalog.RelationMutationGuard, expected: metadata.TableRecord, replacement: metadata.TableRecord },
+    trigger_policy_schema: struct { before: metadata.TableRecord, after: metadata.TableRecord },
     sql_index_annotations: @import("antfly_local_sources").system_catalog_domain.object_annotations.IndexDescriptionsRead,
     sql_sequence_snapshot: @import("../../system_catalog/sequence_catalog.zig").SnapshotRequest,
     /// Trusted host selected this private projection only after checking both
@@ -453,6 +463,9 @@ pub const CatalogProjectionRequest = union(enum) {
     table_retirement_publication_projection: @import("../table_retirement_ledger.zig").Lookup,
     table_retirement_receipt: @import("../table_retirement_receipt.zig").Request,
     scope_retirement_work: u64,
+    sql_relation_boot: @import("../sql_relation_boots.zig").Query,
+    sql_relation_boot_preflight: []const u8,
+    sql_relation_lifetimes: @import("../sql_relation_lifetimes.zig").PageRequest,
     scope_retirement_manifest: @import("../scope_retirement_ledger.zig").Lookup,
     scope_retirement_preflight: []const u8,
     scope_retirement_observation: @import("../scope_retirement_wire.zig").Query,
@@ -499,6 +512,9 @@ pub const CatalogProjectionRequest = union(enum) {
     schema_validation_prepare: @import("../schema_validation_admission.zig").Request,
     schema_validation_status: @import("../schema_validation_admission.zig").StatusRequest,
     schema_validation_receipt_read: @import("../schema_validation_receipt.zig").Request,
+    sql_graph_preparation_read: @import("../../system_catalog/graph_preparation.zig").Source,
+    sql_graph_preparation_outcome: @import("../../system_catalog/graph_preparation.zig").Observation,
+    sql_trigger_snapshot: @import("../../system_catalog/trigger_snapshot.zig").Request,
 };
 
 test "system catalog creation sources have a distinct strict command version" {
@@ -516,4 +532,30 @@ test "system catalog creation sources have a distinct strict command version" {
         command.version = version;
         try command.validateCreationSources();
     }
+}
+
+test "graph preparation private projection selectors fail closed against strict older owner readers" {
+    const graph = @import("../../system_catalog/graph_preparation.zig");
+    const OlderProjectionRequest = union(enum) {
+        sql_trigger_snapshot: @import("../../system_catalog/trigger_snapshot.zig").Request,
+    };
+    const source: graph.Source = .{ .table_id = 7, .epoch = .{ .incarnation = @splat(1), .revision = 2 }, .schema_digest = @splat(2), .indexes = &.{.{ .name = "g", .digest = @splat(3) }} };
+    const mutation: graph.Mutation = .{ .source = source, .admission = .{ .nonce = @splat(4), .head = 0 } };
+    const a = std.testing.allocator;
+    for ([_]CatalogProjectionRequest{ .{ .sql_graph_preparation_read = source }, .{ .sql_graph_preparation_outcome = try graph.observation(a, mutation) } }) |request| {
+        const bytes = try std.json.Stringify.valueAlloc(a, request, .{});
+        defer a.free(bytes);
+        // This is the exact strict tagged-union parser used by the existing
+        // generic C ABI projection receiver, not permissive feature probing.
+        try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(OlderProjectionRequest, a, bytes, .{}));
+    }
+}
+
+test "row-policy coupled schema private preparation uses strict JSON control projection" {
+    const a = std.testing.allocator;
+    const Older = union(enum) { catalog_meta: void };
+    const request: CatalogProjectionRequest = .{ .trigger_policy_schema = .{ .before = .{ .table_id = 7, .name = "table:pair", .schema_json = "{}" }, .after = .{ .table_id = 7, .name = "table:pair", .schema_json = "{}" } } };
+    const bytes = try std.json.Stringify.valueAlloc(a, request, .{});
+    defer a.free(bytes);
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Older, a, bytes, .{}));
 }

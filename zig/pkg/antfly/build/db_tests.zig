@@ -38,6 +38,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "relational cumulative prepares",
         "relational preparation budget",
         "relational transform preparation releases",
+        "trigger prepared DOM owns one row authority",
+        "SQL trigger document candidates share native null provenance for OLD NEW and selected writes",
+        "SQL trigger AFTER row dispatcher admits one captured attachment for ordered FK interleaving",
+        "distributed txn trigger coordinator prepares generated FK rows once and runs empty child statements",
+        "SQL relation lifetime native participant records pin actual images across every decision mutation",
+        "SQL relation lifetime integrity preparation retains trusted lookup minter and rejects owner substitution",
+        "native local frozen cut proves actual sequence and owner without inventing raft positions",
+        "internal batch owner",
         "db transaction recovery",
     };
     const row_preparation_tests = b.addTest(.{

@@ -42,6 +42,7 @@ pub const document_envelope_reference = @embedFile("fixtures/sql_document_envelo
 pub const document_truncate_reference = @embedFile("fixtures/sql_document_truncate_reference.json");
 pub const document_identity_reference = @embedFile("fixtures/sql_document_identity_reference.json");
 pub const source_mutation_reference = @embedFile("fixtures/sql_source_mutation_reference.json");
+pub const source_mutation_domain_reference = @embedFile("fixtures/sql_source_mutation_domain_reference.json");
 pub const prepared_source_reference = @embedFile("fixtures/sql_prepared_source_reference.json");
 pub const table_comment_reference = @embedFile("fixtures/sql_table_comment_reference.json");
 pub const resource_comment_reference = @embedFile("fixtures/sql_resource_comment_reference.json");

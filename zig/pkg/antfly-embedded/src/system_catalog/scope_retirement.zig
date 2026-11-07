@@ -506,7 +506,29 @@ pub const Prepare = struct {
     creator: privileges.Principal,
     cascade: bool = false,
     force: bool = false,
+    sql_temporary_owner: ?@import("../common/relation_persistence.zig").Owner = null,
+    pub fn jsonStringify(self: Prepare, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Prepare).@"struct".field_names) |field| {
+            if (comptime std.mem.eql(u8, field, "sql_temporary_owner")) {
+                if (self.sql_temporary_owner != null) {
+                    try writer.objectField(field);
+                    try writer.write(@field(self, field));
+                }
+            } else {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
     pub fn validate(self: Prepare) !void {
+        if (self.sql_temporary_owner) |owner| {
+            try owner.validate();
+            if (self.kind != .namespace) return error.InvalidScopeRetirement;
+            var name: [72]u8 = undefined;
+            if (!std.mem.eql(u8, self.name, try owner.namespace(&name))) return error.InvalidScopeRetirement;
+        }
         try domain.validateName(self.database);
         try domain.validateResourceName(if (self.kind == .database) .database else .namespace, self.name);
         try self.creator.validate();

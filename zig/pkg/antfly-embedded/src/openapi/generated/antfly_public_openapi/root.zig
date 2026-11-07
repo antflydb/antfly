@@ -260,6 +260,7 @@ pub const ResourceType = types.ResourceType;
 pub const RestoreJob = types.RestoreJob;
 pub const RestoreJobList = types.RestoreJobList;
 pub const RestoreRequest = types.RestoreRequest;
+pub const RestoreRoutineMapping = types.RestoreRoutineMapping;
 pub const RetrievalAgentRequest = types.RetrievalAgentRequest;
 pub const RetrievalAgentResult = types.RetrievalAgentResult;
 pub const RetrievalAgentSteps = types.RetrievalAgentSteps;

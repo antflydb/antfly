@@ -71,8 +71,28 @@ pub fn ProofFor(comptime message_domain: []const u8, comptime accepted_domain: [
         identity: enrollment.Identity,
         reporter_incarnation: u64,
         authority: Authority,
+        native_pin: ?@import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin = null,
         root_generation: u64,
         signature: [64]u8,
+
+        pub fn nativeJsonSkipField(self: Proof, comptime name: []const u8) bool {
+            return std.mem.eql(u8, name, "native_pin") and self.native_pin == null;
+        }
+        pub fn jsonStringify(self: Proof, writer: anytype) !void {
+            try writer.beginObject();
+            inline for (@typeInfo(Proof).@"struct".field_names) |field| {
+                if (comptime std.mem.eql(u8, field, "native_pin")) {
+                    if (self.native_pin) |pin| {
+                        try writer.objectField(field);
+                        try writer.write(pin);
+                    }
+                } else {
+                    try writer.objectField(field);
+                    try writer.write(@field(self, field));
+                }
+            }
+            try writer.endObject();
+        }
 
         fn message(self: Proof, logical_digest: [32]u8) ![32]u8 {
             if (self.reporter_incarnation == 0 or self.root_generation == 0)
@@ -98,6 +118,13 @@ pub fn ProofFor(comptime message_domain: []const u8, comptime accepted_domain: [
                     hash.update("native");
                     hash.update(&binding_digest);
                 },
+            }
+            if (self.native_pin) |pin| {
+                if (self.authority != .native) return error.InvalidGenerationPublication;
+                const actual = try @import("sql_relation_attestation.zig").nativeAuthorityDigest(self.identity, pin);
+                if (!std.mem.eql(u8, &actual, &self.authority.native)) return error.InvalidGenerationPublication;
+                hash.update("native-physical-pin/v1\x00");
+                hash.update(&try pin.encode());
             }
             var digest: [32]u8 = undefined;
             hash.final(&digest);
@@ -137,11 +164,25 @@ pub const NativeView = struct {
     identity: enrollment.Identity,
     reporter_incarnation: u64,
     binding_digest: [32]u8,
+    native_pin: ?@import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin = null,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "native_pin") and self.native_pin == null;
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        if (self.native_pin) |pin| return writer.write(.{ .identity = self.identity, .reporter_incarnation = self.reporter_incarnation, .binding_digest = self.binding_digest, .native_pin = pin });
+        return writer.write(.{ .identity = self.identity, .reporter_incarnation = self.reporter_incarnation, .binding_digest = self.binding_digest });
+    }
 
     pub fn validate(self: @This(), metadata_incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation) !void {
         self.identity.validate() catch return error.InvalidCatalogRecord;
         if (self.reporter_incarnation == 0 or !std.mem.eql(u8, &metadata_incarnation, &self.identity.metadata_incarnation))
             return error.InvalidCatalogRecord;
+        if (self.native_pin) |pin| {
+            const actual = try @import("sql_relation_attestation.zig").nativeAuthorityDigest(self.identity, pin);
+            if (!std.mem.eql(u8, &actual, &self.binding_digest)) return error.InvalidCatalogRecord;
+            return;
+        }
         const binding: @import("standalone_native_owner.zig").Binding = .{
             .metadata_incarnation = self.identity.metadata_incarnation,
             .node_id = self.identity.node_id,

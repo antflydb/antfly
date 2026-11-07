@@ -21,6 +21,7 @@ const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_s
 pub const AddTestsOptions = struct {
     target: std.Build.ResolvedTarget,
     antfly_test_mod: *std.Build.Module,
+    metadata_storage_test_mod: *std.Build.Module,
 };
 pub const AddTestsResult = struct {
     run_lib_metadata_vopr_data_tests: *std.Build.Step.Run,
@@ -42,12 +43,49 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_metadata_test_step = b.step("antfly-metadata-test", "Run root-module metadata tests only");
     const scope_retirement_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "SQL scope retirement", "metadata module compiles", "metadata storage module compiles" },
+        .filters = &.{ "SQL scope retirement", "system catalog qualified DROP", "system catalog relation namespace transaction journal", "SQL command fence ordinary catalog DDL journals", "metadata raft apply store snapshot key registry", "relational index publication terminal ACK snapshot key registry", "SQL logical relation native reverse lookup survives cold publication", "SQL relation lifetime retired native group pointers preserve full width namespace and reject noncanonical aliases", "SQL relation lifetime retired native group pointers refuse active journals and never infer retirement from absence", "SQL relation lifetime native restore acceptance binds actual image position attempt and current initialized Boot", "SQL relation lifetime compact scope receipts retain the native decoder requirement", "SQL relation lifetime provisioning head binds native descriptor and preserves permanent legacy bytes", "SQL relation lifetime compact planning preserves native execution class and ordinary omission", "SQL relation lifetime clean adoption binds exact prior receipt and immutable image", "SQL relation lifetime native catalog publication requires data6 and persists the future-owner floor", "SQL relation lifetime native restore authority reads bind exact hidden plan and owner without Raft placement", "SQL relation lifetime lost directory retirement requires the accepting metadata proof", "SQL relation lifetime cached write validation requires current authenticated connection owner", "SQL relation lifetime TEMP source binding preserves exact registration and all Owner fields", "SQL relation lifetime TEMP source binding rejects successor replacement and cold index corruption", "SQL relation lifetime TEMP source cleanup fences only its admitted backend across reincarnation", "SQL relation lifetime abandoned TEMP discovery uses exact completed source and never fences successor", "SQL native generation retirement", "SQL native image", "SQL native empty", "SQL native unpublished", "SQL native prepared", "SQL native restore terminal", "SQL prepared native retirement", "SQL prepared transaction terminal session ACK requires canonical native handoff and retains cold replay outcomes", "SQL prepared transaction named lock participant survives bounded cold handoff and resolution without its source", "native restore capability", "trigger restore cold lease", "SQL table trigger source qualification", "SQL table trigger decoder", "SQL native population cancellation", "metadata module compiles", "metadata storage module compiles" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    @import("../../../build_support/antfly/test_support.zig").addTestCheckStep(b, scope_retirement_tests, "antfly-metadata-scope-retirement-check", "Type-check the owning metadata retirement tests without emitting their binary");
     const scope_retirement_run = addFilteredTestRunArtifact(b, scope_retirement_tests);
     scope_retirement_run.addArg("--require-no-skips");
     b.step("antfly-metadata-scope-retirement-test", "Verify exact ancestor retirement membership and native cold capture").dependOn(&scope_retirement_run.step);
+    const graph_logical_contract = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "graph preparation binds nonce", "SQL logical relation", "SQL relation OID", "SQL trigger logical identity", "SQL trigger restore takes logical identity", "SQL trigger frame uses stable logical identity", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const graph_logical_contract_run = addFilteredTestRunArtifact(b, graph_logical_contract);
+    graph_logical_contract_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-graph-logical-test", "Qualify shared graph transaction and trigger contracts").dependOn(&graph_logical_contract_run.step);
+
+    const coupled_policy_tests = b.addTest(.{
+        .root_module = options.metadata_storage_test_mod,
+        .filters = &.{"row-policy coupled schema"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    @import("../../../build_support/antfly/test_support.zig").addTestCheckStep(b, coupled_policy_tests, "antfly-metadata-coupled-policy-check", "Type-check paired schema and policy metadata tests without emitting their binary");
+    const coupled_policy_run = addFilteredTestRunArtifact(b, coupled_policy_tests);
+    coupled_policy_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-coupled-policy-test", "Verify paired schema/policy admission, exact historical completion and cold publication").dependOn(&coupled_policy_run.step);
+
+    const graph_committed_tests = b.addTest(.{
+        .root_module = options.metadata_storage_test_mod,
+        .filters = &.{"graph preparation native committed admission"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const graph_committed_run = addFilteredTestRunArtifact(b, graph_committed_tests);
+    graph_committed_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-graph-committed-test", "Verify native graph admission outcomes and reader floors across mixed stores and cold Raft replay").dependOn(&graph_committed_run.step);
+    const storage_query_binding_tests = b.addTest(.{
+        .root_module = options.metadata_storage_test_mod,
+        .filters = &.{ "SQL authorization catalog table creation captures defaults atomically and drop retires ACL references", "SQL table trigger source physical query bindings retain incomplete and corrupt coverage refusal", "SQL logical relation native reverse lookup survives cold publication and rejects missing orphan substituted indexes", "SQL table trigger source no sequence table publication persists typed and document attributes through cold snapshot", "SQL table trigger source generation handoff captures retained state without sequence ownership", "SQL relation OID", "trigger catalog stages routine edges atomically and previews without writes", "SQL relation lifetime native restore authority reads bind exact hidden plan and owner without Raft placement", "staged trigger handoff validates actual source attributes and recomputes fresh physical state" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const storage_query_binding_run = addFilteredTestRunArtifact(b, storage_query_binding_tests);
+    storage_query_binding_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-storage-query-binding-test", "Verify same-cut physical query definitions and identity-only catalog projections").dependOn(&storage_query_binding_run.step);
+
     const presentation_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "SQL COMMENT table descriptions", "SQL COMMENT column", "system catalog resource comments", "system catalog merged service ownership", "system catalog definite naming diagnostics", "system catalog USING rewrite decoder", "system catalog schema reader publication", "schema validation publication text binding", "catalog projection schema reader facts", "relational topology admission rejects lifecycle proposals before encoding on mixed metadata versions", "metadata module compiles", "metadata storage module compiles", "presentation SQL domain", "presentation control decoder", "presentation malformed restore" },
@@ -139,6 +177,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_authorization_run = addFilteredTestRunArtifact(b, sql_authorization_tests);
     sql_authorization_run.addArg("--require-no-skips");
     b.step("antfly-metadata-sql-authorization-test", "Verify atomic SQL role and privilege catalogs, exact outcomes and cold recovery").dependOn(&sql_authorization_run.step);
+    const graph_row_policy_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "row-policy ENABLE admits primary-rechecked", "row-policy graph publication requires durable", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const graph_row_policy_run = addFilteredTestRunArtifact(b, graph_row_policy_tests);
+    graph_row_policy_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-graph-row-policy-test", "Verify graph policy native owner admission, durable downgrade fencing and cold checkpoint closure").dependOn(&graph_row_policy_run.step);
     const sql_routine_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "SQL routine catalog", "metadata module compiles", "metadata storage module compiles" },
@@ -162,10 +208,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-metadata-backup-cohort-test", "Run durable backup cohort admission and recovery contracts").dependOn(&addFilteredTestRunArtifact(b, backup_cohort_tests).step);
     const restore_staging_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "relational integrity restore staging", "restore staging authority", "graph retirement digest", "metadata module compiles", "metadata storage module compiles" },
+        .filters = &.{ "relational integrity restore staging", "restore staging authority", "SQL relation OID reservation rejoins exact restore phase binding and immutable plan", "SQL relation lifetime native restore authority reads bind exact hidden plan and owner without Raft placement", "graph retirement digest", "metadata module compiles", "metadata storage module compiles" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("antfly-metadata-restore-staging-test", "Run atomic hidden restore target publication contracts").dependOn(&addFilteredTestRunArtifact(b, restore_staging_tests).step);
+    const restore_staging_run = addFilteredTestRunArtifact(b, restore_staging_tests);
+    restore_staging_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-restore-staging-test", "Run atomic hidden restore target publication contracts").dependOn(&restore_staging_run.step);
     const relational_topology_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "relational integrity metadata topology", "relational topology admission", "metadata raft apply store transition codec", "initializes one durable snapshotted cluster incarnation", "metadata incarnation rejects unsupported", "fences transition identity and active removal", "metadata reconciler publishes table contracts", "atomically fences table replacement during a range transition", "metadata.table storage extension", "standalone metadata", "metadata table topology protocol", "store-root enrollment status is an admin-bound read", "metadata lifecycle reconciles hidden generation", "metadata module compiles", "metadata storage module compiles" },

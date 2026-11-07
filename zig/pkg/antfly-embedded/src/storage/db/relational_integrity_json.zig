@@ -30,6 +30,9 @@ pub fn write(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
             if (@hasDecl(T, "nativeJsonProjection")) return write(value.nativeJsonProjection(), stream);
             try stream.beginObject();
             inline for (info.field_names) |reflected_name| {
+                if (comptime @hasDecl(T, "nativeJsonSkipFieldComptime")) {
+                    if (comptime T.nativeJsonSkipFieldComptime(reflected_name)) continue;
+                }
                 if (!@hasDecl(T, "nativeJsonSkipField") or !value.nativeJsonSkipField(reflected_name)) {
                     try stream.objectField(reflected_name);
                     try write(@field(value, reflected_name), stream);

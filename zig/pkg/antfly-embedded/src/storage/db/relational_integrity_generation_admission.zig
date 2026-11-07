@@ -429,6 +429,51 @@ pub const AppliedReceipt = struct {
     digest: integrity.Digest,
     term: u64,
     index: u64,
+    native_position: ?@import("receipt_position.zig").Native = null,
+
+    pub fn nativeJsonSkipField(self: AppliedReceipt, comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "native_position") and self.native_position == null;
+    }
+    pub fn jsonStringify(self: AppliedReceipt, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(AppliedReceipt).@"struct".field_names) |field| {
+            if (!((comptime std.mem.eql(u8, field, "native_position")) and self.native_position == null)) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+    pub fn position(self: AppliedReceipt) !@import("receipt_position.zig").Position {
+        return @import("receipt_position.zig").fromFields(self.term, self.index, self.native_position);
+    }
+    pub const Encoded = struct {
+        bytes: [101]u8,
+        len: usize,
+        pub fn slice(self: *const Encoded) []const u8 {
+            return self.bytes[0..self.len];
+        }
+    };
+    pub fn encodeDurable(self: AppliedReceipt) !Encoded {
+        if (self.native_position == null) {
+            var result: Encoded = .{ .bytes = undefined, .len = 48 };
+            @memcpy(result.bytes[0..48], &self.encode());
+            return result;
+        }
+        const stamp = try self.position();
+        var result: Encoded = .{ .bytes = undefined, .len = 101 };
+        @memcpy(result.bytes[0..4], "GNP1");
+        @memcpy(result.bytes[4..36], &self.digest);
+        @memcpy(result.bytes[36..69], &try stamp.encode());
+        std.crypto.hash.Blake3.hash(result.bytes[0..69], result.bytes[69..101], .{});
+        return result;
+    }
+    pub fn stageNative(txn: anytype, key: []const u8, stamp: @import("receipt_position.zig").Native) !void {
+        const prior = try AppliedReceipt.decode(try txn.get(key));
+        const native: AppliedReceipt = .{ .digest = prior.digest, .term = 0, .index = 0, .native_position = stamp };
+        const encoded = try native.encodeDurable();
+        try txn.put(key, encoded.slice());
+    }
 
     pub fn encode(self: AppliedReceipt) [48]u8 {
         var encoded: [48]u8 = undefined;
@@ -439,6 +484,15 @@ pub const AppliedReceipt = struct {
     }
 
     pub fn decode(bytes: []const u8) !AppliedReceipt {
+        if (bytes.len == 101) {
+            if (!std.mem.eql(u8, bytes[0..4], "GNP1")) return error.InvalidGenerationAdmission;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(bytes[0..69], &digest, .{});
+            if (!std.mem.eql(u8, &digest, bytes[69..101])) return error.InvalidGenerationAdmission;
+            const stamp = try @import("receipt_position.zig").Position.decode(bytes[36..69]);
+            if (stamp != .native) return error.InvalidGenerationAdmission;
+            return .{ .digest = bytes[4..36].*, .term = 0, .index = 0, .native_position = stamp.native };
+        }
         if (bytes.len != 48) return error.InvalidGenerationAdmission;
         return .{ .digest = bytes[0..32].*, .term = std.mem.readInt(u64, bytes[32..40], .little), .index = std.mem.readInt(u64, bytes[40..48], .little) };
     }
@@ -711,4 +765,20 @@ pub fn stageReferenceCoverageAcknowledgement(txn: anytype, fence: @import("relat
     }
     const encoded = (AppliedReceipt{ .digest = digest, .term = term, .index = index }).encode();
     try txn.put(acknowledged_receipt_key, &encoded);
+}
+
+test "SQL relation lifetime applied FK receipt distinguishes native clocks and validates physical bytes" {
+    const native: AppliedReceipt = .{ .digest = @splat(3), .term = 0, .index = 0, .native_position = .{ .namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 27 }, .sequence = 9 } };
+    const encoded = try native.encodeDurable();
+    try std.testing.expectEqualDeep(native, try AppliedReceipt.decode(encoded.slice()));
+    var corrupt = encoded;
+    corrupt.bytes[36] ^= 1;
+    try std.testing.expectError(error.InvalidGenerationAdmission, AppliedReceipt.decode(corrupt.slice()));
+    var mixed = native;
+    mixed.term = 1;
+    try std.testing.expectError(error.InvalidControlReceiptPosition, mixed.encodeDurable());
+    const raft: AppliedReceipt = .{ .digest = @splat(3), .term = 4, .index = 5 };
+    const previous = raft.encode();
+    const current = try raft.encodeDurable();
+    try std.testing.expectEqualSlices(u8, &previous, current.slice());
 }

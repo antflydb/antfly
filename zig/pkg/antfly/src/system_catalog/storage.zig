@@ -102,7 +102,7 @@ pub fn nextPolicyPublicationWork(alloc: std.mem.Allocator, txn: *docstore.DocSto
     return publication;
 }
 
-fn policyInstallSnapshotKeyAlloc(alloc: std.mem.Allocator, group_id: u64, table_id: u64, generation: u64, phase: policies.Publication.Phase) ![]u8 {
+pub fn policyInstallSnapshotKeyAlloc(alloc: std.mem.Allocator, group_id: u64, table_id: u64, generation: u64, phase: policies.Publication.Phase) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:policy-install:{d}:{d}:{s}", .{ group_id, table_id, generation, @tagName(phase) });
 }
 
@@ -165,9 +165,22 @@ pub fn loadServingPolicyInstallSnapshot(alloc: std.mem.Allocator, txn: *docstore
     try parsed.value.validateShape();
     if (parsed.value.table_id != table_id or parsed.value.policy_generation != generation or parsed.value.phase != .active or
         (publication.value.serving_catalog_epoch != null and parsed.value.catalog_epoch != publication.value.serving_catalog_epoch.?) or
-        parsed.value.schema_version != publication.value.schema_version or !std.mem.eql(u8, &parsed.value.schema_digest, &publication.value.schema_digest))
+        !servingSnapshotSchemaMatches(parsed.value, publication.value))
         return error.RowPolicyCatalogChanged;
     return parsed;
+}
+
+fn servingSnapshotSchemaMatches(snapshot: policies.InstallSnapshot, publication: policies.Publication) bool {
+    if (publication.phase == .pending_install) if (publication.schema_pair) |pair| {
+        // Desired owner descriptors bind the future schema. New readers during
+        // pending admission still bind the retained, independently hashed cut.
+        return snapshot.schema_version < std.math.maxInt(u32) and
+            snapshot.schema_version + 1 == publication.schema_version and
+            std.mem.eql(u8, &snapshot.schema_digest, &pair.before_schema_digest) and
+            std.mem.eql(u8, &publication.schema_digest, &pair.after_schema_digest);
+    };
+    return snapshot.schema_version == publication.schema_version and
+        std.mem.eql(u8, &snapshot.schema_digest, &publication.schema_digest);
 }
 
 fn policyReferenceGenerations(publication: ?policies.Publication) [2]?u64 {
@@ -348,7 +361,7 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
         },
     }
     if (command.publication) |publication| {
-        return applyPolicyPublicationCommandWithNextId(alloc, txn, group_id, .{ .expected_revision = command.expected_revision, .change = .{ .begin = publication } }, command_hash, next_id);
+        return applyPolicyPublicationCommandWithNextId(alloc, txn, group_id, .{ .expected_revision = command.expected_revision, .change = .{ .begin = publication } }, command_hash, next_id, null);
     }
     try applyDelta(alloc, txn, group_id, .{ .upserts = @constCast(&[_]domain.Resource{}), .removes = @constCast(&[_]domain.Resource{}), .next_id = next_id }, meta, command_hash);
 }
@@ -356,11 +369,75 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
 /// Replicated, deterministic publication transition. Metadata admission
 /// verifies the owner topology cut before proposing `begin` and `promote`;
 /// apply independently checks monotonic identity and exact committed ACKs.
-pub fn applyPolicyPublicationCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.PublicationCommand, command_hash: [32]u8) !void {
-    return applyPolicyPublicationCommandWithNextId(alloc, txn, group_id, command, command_hash, null);
+pub fn reboundSchemaPolicies(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, publication: policies.Publication) ![]const policies.Record {
+    const pair = publication.schema_pair orelse return error.InvalidRowPolicyPublication;
+    const schemas = try pair.materialize(a);
+    defer @import("antfly_local_sources").storage_schema.freeSchema(a, schemas.before);
+    defer @import("antfly_local_sources").storage_schema.freeSchema(a, schemas.after);
+    const records = try loadPolicies(a, txn, group);
+    var selected: std.ArrayList(policies.Record) = .empty;
+    defer selected.deinit(a);
+    for (records) |record| if (record.table_id == publication.table_id) {
+        if (selected.items.len == 1024 or record.schema_version != schemas.before.version or
+            !std.mem.eql(u8, &record.schema_digest, &pair.before_schema_digest)) return error.RowPolicyCatalogChanged;
+        var rebound = record;
+        rebound.generation = try std.math.add(u64, record.generation, 1);
+        rebound.schema_version = schemas.after.version;
+        rebound.schema_digest = pair.after_schema_digest;
+        try selected.append(a, rebound);
+    };
+    const result = try selected.toOwnedSlice(a);
+    const policy_settings = try loadSettings(a, txn, group);
+    const bundle = try std.json.Stringify.valueAlloc(a, policies.InstallSnapshot{
+        .table_id = publication.table_id,
+        .schema_version = schemas.after.version,
+        .schema_digest = pair.after_schema_digest,
+        .policy_generation = publication.generation,
+        .catalog_epoch = publication.catalog_epoch,
+        .phase = .pending_install,
+        .schema_pair = pair,
+        .records = result,
+        .settings = policy_settings,
+    }, .{});
+    defer a.free(bundle);
+    if (bundle.len > policies.max_install_snapshot_bytes) return error.CatalogCommandTooLarge;
+    // Validate every persisted typed DAG and setting against the actual
+    // successor before any metadata or policy generation can be published.
+    var installed = try @import("antfly_local_sources").storage_db_row_policy_bundle.Installed.init(a, bundle, publication.table_id, schemas.after);
+    defer installed.deinit();
+    return result;
 }
 
-fn applyPolicyPublicationCommandWithNextId(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.PublicationCommand, command_hash: [32]u8, next_id: ?u64) !void {
+pub fn beginCoupledSchemaPolicy(backing: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, publication: policies.Publication, delta: domain.Delta, command_hash: [32]u8) !void {
+    var region = std.heap.ArenaAllocator.init(backing);
+    defer region.deinit();
+    const a = region.allocator();
+    const pair = publication.schema_pair orelse return error.InvalidRowPolicyPublication;
+    const meta = try readMeta(a, txn, group);
+    var prior = (try loadPolicyPublication(a, txn, group, publication.table_id)) orelse return error.RowPolicyCatalogChanged;
+    defer prior.deinit();
+    if (prior.value.phase != .active or prior.value.generation != pair.before_policy_generation or
+        prior.value.catalog_epoch != pair.before_catalog_epoch or publication.phase != .pending_install or
+        publication.generation != try std.math.add(u64, prior.value.generation, 1) or
+        publication.catalog_epoch != try std.math.add(u64, meta.revision, 1)) return error.RowPolicyCatalogChanged;
+    const records = try reboundSchemaPolicies(a, txn, group, publication);
+    const before = try loadPolicies(a, txn, group);
+    for (records) |record| {
+        const old = for (before) |candidate| {
+            if (candidate.id == record.id) break candidate;
+        } else return error.RowPolicyCatalogChanged;
+        try @import("authorization_storage.zig").policyDependency(a, txn, group, old, false);
+        try @import("authorization_storage.zig").policyDependency(a, txn, group, record, true);
+        try txn.put(try policyKeyAlloc(a, group, record.id), try std.json.Stringify.valueAlloc(a, record, .{}));
+    }
+    try applyPolicyPublicationCommandWithNextId(a, txn, group, .{ .expected_revision = meta.revision, .change = .{ .begin = publication } }, command_hash, null, delta);
+}
+
+pub fn applyPolicyPublicationCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.PublicationCommand, command_hash: [32]u8) !void {
+    return applyPolicyPublicationCommandWithNextId(alloc, txn, group_id, command, command_hash, null, null);
+}
+
+fn applyPolicyPublicationCommandWithNextId(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.PublicationCommand, command_hash: [32]u8, next_id: ?u64, coupled_delta: ?domain.Delta) !void {
     if (command.version != 1) return error.InvalidRowPolicyPublication;
     const meta = try readMeta(alloc, txn, group_id);
     if (meta.revision != command.expected_revision) return;
@@ -402,6 +479,7 @@ fn applyPolicyPublicationCommandWithNextId(alloc: std.mem.Allocator, txn: *docst
                 .policy_generation = incoming.generation,
                 .catalog_epoch = incoming.catalog_epoch,
                 .phase = incoming.phase,
+                .schema_pair = incoming.schema_pair,
                 .records = selected.items,
                 .settings = setting_records,
             });
@@ -465,6 +543,13 @@ fn applyPolicyPublicationCommandWithNextId(alloc: std.mem.Allocator, txn: *docst
             prior.value.phase = input.phase;
             try putPolicyInstallSnapshot(a, txn, group_id, prior.value);
             next.phase = input.phase;
+            if (input.phase == .active) {
+                if (next.schema_pair) |pair| next.schema_record_digest = pair.after_record_digest;
+                // The immutable ACTIVE snapshot above retains the exact pair
+                // for operation recovery. The live head is now ordinary active
+                // state; later valid progress must use its current stamps.
+                next.schema_pair = null;
+            }
             if (input.phase == .active or input.phase == .disabled) {
                 next.serving_generation = null;
                 next.serving_catalog_epoch = null;
@@ -484,7 +569,7 @@ fn applyPolicyPublicationCommandWithNextId(alloc: std.mem.Allocator, txn: *docst
         try txn.put(work_key, &.{1})
     else
         try txn.delete(work_key);
-    try applyDelta(alloc, txn, group_id, .{ .upserts = @constCast(&[_]domain.Resource{}), .removes = @constCast(&[_]domain.Resource{}), .next_id = next_id orelse meta.next_id }, meta, command_hash);
+    try applyDelta(alloc, txn, group_id, coupled_delta orelse .{ .upserts = @constCast(&[_]domain.Resource{}), .removes = @constCast(&[_]domain.Resource{}), .next_id = next_id orelse meta.next_id }, meta, command_hash);
 }
 
 pub fn loadSettings(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) ![]const settings.Record {
@@ -691,10 +776,7 @@ pub fn functionOverloads(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, grou
 pub fn readMeta(alloc: std.mem.Allocator, txn: anytype, group_id: u64) !Meta {
     const key = try keyAlloc(alloc, group_id, "meta");
     defer alloc.free(key);
-    const bytes = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return .{},
-        else => return err,
-    };
+    const bytes = txn.get(key) catch |err| return if (err == error.NotFound) .{} else err;
     var parsed = try std.json.parseFromSlice(Meta, alloc, bytes, .{});
     defer parsed.deinit();
     if (parsed.value.version != 1 or parsed.value.next_id < 3) return error.InvalidCatalogRecord;
@@ -723,13 +805,60 @@ pub fn loadState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id
     return .{ .arena = arena, .meta = meta, .value = .{ .revision = meta.revision, .next_id = meta.next_id, .resources = resources, .settings = loaded_settings, .policies = loaded_policies, .policy_publications = loaded_publications, .privileges = loaded_privileges } };
 }
 
+/// Point lookup of the current physical table for a stable SQL relation.
+/// Only non-default bindings need an extra row. Older nil identity records
+/// continue using their existing immutable physical-ID point lookup.
+pub fn logicalRelationPrefixForGroup(buffer: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata_derived__:system_catalog_name:{d}:logical-relation:", .{group});
+}
+fn logicalRelationPrefixAlloc(a: std.mem.Allocator, group: u64) ![]u8 {
+    var buffer: [192]u8 = undefined;
+    return a.dupe(u8, try logicalRelationPrefixForGroup(&buffer, group));
+}
+
+/// Discover only the durable logical directory among legacy derived names.
+/// This lets native checkpoint verification find reverse-only orphan groups.
+pub const logical_relation_directory_groups = "\x00\x00__metadata_derived__:system_catalog_name:";
+pub fn logicalRelationGroupFromKey(key: []const u8) !?u64 {
+    if (!std.mem.startsWith(u8, key, logical_relation_directory_groups)) return null;
+    const tail = key[logical_relation_directory_groups.len..];
+    const separator = std.mem.indexOfScalar(u8, tail, ':') orelse return null;
+    if (!std.mem.startsWith(u8, tail[separator + 1 ..], "logical-relation:")) return null;
+    if (separator == 0 or tail[0] == '0') return error.InvalidCatalogRecord;
+    for (tail[0..separator]) |byte| if (byte < '0' or byte > '9') return error.InvalidCatalogRecord;
+    const group = std.fmt.parseInt(u64, tail[0..separator], 10) catch return error.InvalidCatalogRecord;
+    var buffer: [192]u8 = undefined;
+    const prefix = try logicalRelationPrefixForGroup(&buffer, group);
+    if (!std.mem.startsWith(u8, key, prefix) or key.len != prefix.len + 8) return error.InvalidCatalogRecord;
+    return group;
+}
+fn logicalRelationKeyAlloc(a: std.mem.Allocator, group: u64, id: u64) ![]u8 {
+    if (id == 0) return error.InvalidCatalogRecord;
+    const prefix = try logicalRelationPrefixAlloc(a, group);
+    defer a.free(prefix);
+    const key = try a.alloc(u8, prefix.len + 8);
+    @memcpy(key[0..prefix.len], prefix);
+    std.mem.writeInt(u64, key[prefix.len..][0..8], id, .big);
+    return key;
+}
+pub fn getTableByLogicalRelationId(a: std.mem.Allocator, txn: anytype, group: u64, id: u64) !?std.json.Parsed(domain.Resource) {
+    if (id == 0 or id > domain.max_relation_oid) return error.InvalidCatalogRecord;
+    const key = try logicalRelationKeyAlloc(a, group, id);
+    defer a.free(key);
+    const value = txn.get(key) catch |err| return if (err == error.NotFound) null else err;
+    if (value.len != 8) return error.InvalidCatalogRecord;
+    const physical = std.mem.readInt(u64, value[0..8], .little);
+    if (physical == 0) return error.InvalidCatalogRecord;
+    var resource = (try getById(a, txn, group, .table, physical)) orelse return error.InvalidCatalogRecord;
+    errdefer resource.deinit();
+    if (resource.value.sql_relation_id == null or resource.value.sql_relation_id.? != id) return error.InvalidCatalogRecord;
+    return resource;
+}
+
 pub fn getById(alloc: std.mem.Allocator, txn: anytype, group_id: u64, kind: domain.Kind, id: u64) !?std.json.Parsed(domain.Resource) {
     const key = try recordKeyAlloc(alloc, group_id, kind, id);
     defer alloc.free(key);
-    const bytes = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
+    const bytes = txn.get(key) catch |err| return if (err == error.NotFound) null else err;
     var parsed = try std.json.parseFromSlice(domain.Resource, alloc, bytes, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
     if (parsed.value.kind != kind or parsed.value.id != id) return error.InvalidCatalogRecord;
@@ -792,12 +921,28 @@ fn storageBindingValue(resource: domain.Resource, buffer: *[9]u8) []const u8 {
 
 /// All returned records borrow this view's arena. Its transaction pins one
 /// catalog revision for both planning and response projection.
+pub const TemporaryNamespaceLookup = struct {
+    alloc: std.mem.Allocator,
+    txn: *docstore.DocStore.Txn,
+    group_id: u64,
+    pub fn requireNamespace(self: @This(), expected: @import("temporary_namespace_index.zig").Reference) !void {
+        var actual = (try getById(self.alloc, self.txn, self.group_id, .namespace, expected.namespace_id)) orelse return error.InvalidSqlTemporaryNamespace;
+        defer actual.deinit();
+        const observed = (try @import("temporary_namespace_index.zig").reference(actual.value)) orelse return error.InvalidSqlTemporaryNamespace;
+        if (!std.meta.eql(observed, expected)) return error.InvalidSqlTemporaryNamespace;
+    }
+};
+
 pub const View = struct {
     alloc: std.mem.Allocator,
     txn: *docstore.DocStore.Txn,
     group_id: u64,
     meta: Meta,
 
+    pub fn tableByLogicalRelationId(self: View, id: u64) !?domain.Resource {
+        const record = (try getTableByLogicalRelationId(self.alloc, self.txn, self.group_id, id)) orelse return null;
+        return record.value;
+    }
     pub fn byId(self: View, kind: domain.Kind, id: u64) !?domain.Resource {
         if (try getById(self.alloc, self.txn, self.group_id, kind, id)) |record| return record.value;
         return (domain.State{}).byId(kind, id);
@@ -937,11 +1082,21 @@ pub fn rebuildNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, g
 }
 
 pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) !void {
+    try validateLogicalRelationIndex(alloc, txn, group_id);
+    try @import("temporary_namespace_index.zig").validate(alloc, txn, group_id, TemporaryNamespaceLookup{ .alloc = alloc, .txn = txn, .group_id = group_id });
+    try @import("temporary_source_binding.zig").validate(alloc, txn, group_id, TemporaryNamespaceLookup{ .alloc = alloc, .txn = txn, .group_id = group_id });
     var state = try loadState(alloc, txn, group_id);
     defer state.deinit();
     var index = try domain.StateIndex.init(alloc, state.value);
     defer index.deinit(alloc);
     for (state.value.resources) |resource| {
+        if (resource.sql_relation_id != null) {
+            var logical = (try getTableByLogicalRelationId(alloc, txn, group_id, resource.effectiveLogicalRelationId())) orelse return error.InvalidCatalogRecord;
+            defer logical.deinit();
+            if (logical.value.id != resource.id) return error.InvalidCatalogRecord;
+        }
+        try @import("temporary_namespace_index.zig").requireResource(alloc, txn, group_id, resource);
+        try @import("temporary_source_binding.zig").requireResource(alloc, txn, group_id, resource);
         var found = (if (resource.kind == .routine) try findFunction(alloc, txn, group_id, resource.parent_id, resource.name, resource.signature orelse return error.InvalidCatalogRecord) else try find(alloc, txn, group_id, resource.kind, resource.parent_id, resource.name)) orelse return error.InvalidCatalogRecord;
         defer found.deinit();
         if (resource.kind == .routine or resource.kind == .cast) {
@@ -985,6 +1140,20 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
     }
 }
 
+fn validateLogicalRelationIndex(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64) !void {
+    const prefix = try logicalRelationPrefixAlloc(a, group);
+    defer a.free(prefix);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var item = try cursor.seekAtOrAfter(prefix);
+    while (item) |entry| : (item = try cursor.next()) {
+        if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+        if (entry.key.len != prefix.len + 8 or entry.value.len != 8) return error.InvalidCatalogRecord;
+        const logical = std.mem.readInt(u64, entry.key[prefix.len..][0..8], .big);
+        var record = (try getTableByLogicalRelationId(a, txn, group, logical)) orelse return error.InvalidCatalogRecord;
+        defer record.deinit();
+    }
+}
 fn storageBindingKey(alloc: std.mem.Allocator, group_id: u64, name: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:storage:{s}", .{ group_id, name });
 }
@@ -1146,6 +1315,19 @@ pub fn validateFunctionUses(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, g
 }
 
 fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
+    try r.validateLogicalRelationId();
+    if (r.sql_relation_id) |logical| {
+        try domain.requireRelationOid(logical);
+        const key = try logicalRelationKeyAlloc(alloc, group_id, logical);
+        defer alloc.free(key);
+        var physical: [8]u8 = undefined;
+        std.mem.writeInt(u64, &physical, r.id, .little);
+        const prior = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+        if (prior) |value| if (!std.mem.eql(u8, value, &physical)) return error.InvalidCatalogRecord;
+        try txn.put(key, &physical);
+    }
+    try @import("temporary_source_binding.zig").requireResource(alloc, txn, group_id, r);
+    try @import("temporary_namespace_index.zig").stage(alloc, txn, group_id, r, true);
     try @import("authorization_storage.zig").resourceDependency(alloc, txn, group_id, r, true);
     const child_key = try childKey(alloc, group_id, r);
     defer alloc.free(child_key);
@@ -1219,6 +1401,14 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     }
 }
 fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
+    if (r.sql_relation_id) |logical| {
+        const key = try logicalRelationKeyAlloc(alloc, group_id, logical);
+        defer alloc.free(key);
+        const value = txn.get(key) catch return error.InvalidCatalogRecord;
+        if (value.len != 8 or std.mem.readInt(u64, value[0..8], .little) != r.id) return error.InvalidCatalogRecord;
+        try txn.delete(key);
+    }
+    try @import("temporary_namespace_index.zig").stage(alloc, txn, group_id, r, false);
     try @import("authorization_storage.zig").resourceDependency(alloc, txn, group_id, r, false);
     const child_key = try childKey(alloc, group_id, r);
     defer alloc.free(child_key);
@@ -1286,9 +1476,11 @@ fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
 }
 
 pub fn writeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, resource: domain.Resource) !void {
+    try resource.validateLogicalRelationId();
     if (try getById(alloc, txn, group_id, resource.kind, resource.id)) |old_value| {
         var old = old_value;
         defer old.deinit();
+        if (resource.kind == .table and old.value.sql_relation_id != null and old.value.sql_relation_id != resource.sql_relation_id) return error.InvalidCatalogMutation;
         if (resource.kind == .sequence and (resource.parent_id != old.value.parent_id or
             !std.mem.eql(u8, resource.name, old.value.name) or !std.mem.eql(u8, resource.source_json, old.value.source_json)))
             try @import("sequence_leases.zig").requireUnleased(txn, group_id, resource.id);
@@ -1325,6 +1517,7 @@ pub fn removeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, gro
 /// A retained durable ID keeps its ACL, policy programs, namespace defaults
 /// and sequence-use summary; actual deletion retires those dependent records.
 fn removeResourceRow(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, resource: domain.Resource, retire: bool) !void {
+    if (retire) try @import("temporary_source_binding.zig").remove(alloc, txn, group_id, resource);
     if (resource.kind == .view) try @import("view_leases.zig").requireUnleased(txn, group_id, resource.id);
     if (resource.kind == .sequence) {
         try @import("sequence_leases.zig").requireUnleased(txn, group_id, resource.id);
@@ -1389,6 +1582,23 @@ pub fn applyPresentationRecord(alloc: std.mem.Allocator, txn: anytype, group_id:
     try writeMeta(alloc, txn, group_id, previous, previous.next_id, command_hash);
 }
 
+/// Burn a target identity range in the existing catalog counter, in the same
+/// native transaction as the immutable Job. No public resource changed yet,
+/// so the source-definition revision remains pinned for that Job's population.
+pub fn reserveRelationOidRange(a: std.mem.Allocator, txn: anytype, group: u64, first: u64, after: u64) !void {
+    var meta = try readMeta(a, txn, group);
+    if (meta.next_id != first or after < first) return error.CatalogGenerationChanged;
+    if (after == first) return;
+    try domain.requireRelationOid(first);
+    try domain.requireRelationOid(after - 1);
+    meta.next_id = after;
+    const key = try keyAlloc(a, group, "meta");
+    defer a.free(key);
+    const bytes = try std.json.Stringify.valueAlloc(a, meta, .{});
+    defer a.free(bytes);
+    try txn.put(key, bytes);
+}
+
 fn writeMeta(alloc: std.mem.Allocator, txn: anytype, group_id: u64, previous: Meta, next_id: u64, command_hash: [32]u8) !void {
     const meta: Meta = .{ .revision = try std.math.add(u64, previous.revision, 1), .next_id = next_id, .last_command = command_hash, .sequence_outcome_head = previous.sequence_outcome_head };
     const key = try keyAlloc(alloc, group_id, "meta");
@@ -1400,6 +1610,35 @@ fn writeMeta(alloc: std.mem.Allocator, txn: anytype, group_id: u64, previous: Me
 
 /// Pure admission: all source/target scope leases precede the first write.
 pub fn requireScopeDeltaWritable(alloc: std.mem.Allocator, txn: anytype, group_id: u64, delta: domain.Delta) !void {
+    const meta = try readMeta(alloc, txn, group_id);
+    {
+        // View returns borrowed Resource values whose parsed backing belongs
+        // to its allocation region. Logical admission retains those values
+        // only for this call; no scratch pointer enters the supplied delta or
+        // escapes into the writer. Release the complete region on every exit.
+        var region = std.heap.ArenaAllocator.init(alloc);
+        defer region.deinit();
+        const scratch = region.allocator();
+        const LogicalReader = struct {
+            view: View,
+            cache: *@import("logical_relation_allocations.zig").Cache,
+            pub fn nextCatalogId(r: @This()) u64 {
+                return r.view.meta.next_id;
+            }
+            pub fn byId(r: @This(), kind: domain.Kind, id: u64) !?domain.Resource {
+                return r.view.byId(kind, id);
+            }
+            pub fn tableByLogicalRelationId(r: @This(), id: u64) !?domain.Resource {
+                return r.view.tableByLogicalRelationId(id);
+            }
+            pub fn reservedLogicalRelation(r: @This(), record: domain.Resource) !bool {
+                return r.cache.reserved(r.view.alloc, r.view.txn, r.view.group_id, record, r.view.meta.next_id);
+            }
+        };
+        var reservations: @import("logical_relation_allocations.zig").Cache = .{};
+        try domain.requireLogicalRelationDelta(scratch, LogicalReader{ .view = .{ .alloc = scratch, .txn = txn, .group_id = group_id, .meta = meta }, .cache = &reservations }, delta);
+    }
+    try @import("trigger_restore_leases.zig").requireUnleasedDelta(txn, group_id, delta);
     // Validate the complete footprint, including old parents of a move, before
     // any settings, ownership, topology or catalog effect can be committed.
     for (delta.removes) |resource| try requireScopeResourceWritableWithParents(alloc, txn, group_id, resource, delta.upserts);
@@ -1587,4 +1826,249 @@ pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     const bytes = try std.json.Stringify.valueAlloc(alloc, Meta{ .revision = state.revision, .next_id = state.next_id, .sequence_outcome_head = previous.sequence_outcome_head }, .{});
     defer alloc.free(bytes);
     try txn.put(key, bytes);
+}
+
+/// Streaming cold/checkpoint verifier. Point reads rejoin each authoritative
+/// forward field and each reverse row; absence/corruption is never repaired.
+pub fn verifyLogicalRelationDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, rows: anytype, cancelled: ?*const std.atomic.Value(bool)) !bool {
+    const meta = try readMeta(backing, reader, group);
+    const prefix = try logicalRelationPrefixAlloc(backing, group);
+    defer backing.free(prefix);
+    var buffer: [160]u8 = undefined;
+    const records = try tableRecordPrefixForGroup(&buffer, group);
+    var found = false;
+    try rows.reset();
+    while (try rows.next()) |row| {
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        if (std.mem.startsWith(u8, row.key, records)) {
+            var resource = try std.json.parseFromSlice(domain.Resource, backing, row.value, .{});
+            defer resource.deinit();
+            try resource.value.validateLogicalRelationId();
+            if (resource.value.sql_relation_id) |logical| {
+                if (logical == 0 or logical > domain.max_relation_oid or logical >= meta.next_id) return error.InvalidCatalogRecord;
+                found = true;
+                const physical = (try tableIdFromRecordKey(row.key, group)) orelse return error.InvalidCatalogRecord;
+                if (resource.value.kind != .table or physical != resource.value.id) return error.InvalidCatalogRecord;
+                var actual = (try getTableByLogicalRelationId(backing, reader, group, logical)) orelse return error.InvalidCatalogRecord;
+                defer actual.deinit();
+                if (actual.value.id != resource.value.id) return error.InvalidCatalogRecord;
+            }
+        } else if (std.mem.startsWith(u8, row.key, prefix)) {
+            found = true;
+            if (row.key.len != prefix.len + 8 or row.value.len != 8) return error.InvalidCatalogRecord;
+            const logical = std.mem.readInt(u64, row.key[prefix.len..][0..8], .big);
+            var actual = (try getTableByLogicalRelationId(backing, reader, group, logical)) orelse return error.InvalidCatalogRecord;
+            defer actual.deinit();
+        }
+    }
+    return found;
+}
+
+test "SQL logical relation native reverse lookup survives cold publication and rejects missing orphan substituted indexes" {
+    const a = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/logical-relation", .{directory.sub_path}, 0);
+    defer a.free(path);
+    const group: u64 = 1;
+    const original: domain.Resource = .{ .kind = .table, .id = 7, .sql_relation_id = 7, .parent_id = 2, .name = "items", .storage_name = "physical:7" };
+    var replacement = try original.withPhysicalRelationId(11);
+    replacement.storage_name = "physical:11";
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const meta = try readMeta(a, &txn, group);
+        var initial_upserts = [_]domain.Resource{original};
+        try applyDelta(a, &txn, group, .{ .upserts = &initial_upserts, .removes = &.{}, .next_id = 12 }, meta, @splat(1));
+        try txn.commit();
+        var cut = try store.beginReadTxn();
+        defer cut.abort();
+        var before = (try getTableByLogicalRelationId(a, &cut, group, 7)).?;
+        defer before.deinit();
+        try std.testing.expectEqual(@as(u64, 7), before.value.id);
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        var replacement_upserts = [_]domain.Resource{replacement};
+        var original_removes = [_]domain.Resource{original};
+        const rewrite: domain.Delta = .{ .removes = &original_removes, .upserts = &replacement_upserts, .next_id = 12 };
+        const Admission = struct {
+            fn check(backing: std.mem.Allocator, transaction: *docstore.DocStore.Txn, group_id: u64, delta: domain.Delta) !void {
+                try requireScopeDeltaWritable(backing, transaction, group_id, delta);
+            }
+        };
+        // Exercise the production-owned scratch region with an ordinary leak-
+        // checking allocator, including all failing allocation exits. Validation
+        // must leave the exact old binding and metadata untouched.
+        const unchanged_meta = try readMeta(a, &writer, group);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Admission.check, .{ &writer, group, rewrite });
+        var false_claims = [_]domain.Resource{original};
+        false_claims[0].sql_relation_id = 99;
+        try std.testing.expectError(error.CatalogGenerationChanged, requireScopeDeltaWritable(a, &writer, group, .{ .upserts = &.{}, .removes = &false_claims, .next_id = 12 }));
+        try std.testing.expectEqualDeep(unchanged_meta, try readMeta(a, &writer, group));
+        {
+            var unchanged = (try getById(a, &writer, group, .table, original.id)).?;
+            defer unchanged.deinit();
+            try std.testing.expectEqualStrings(original.storage_name, unchanged.value.storage_name);
+        }
+        try applyDelta(a, &writer, group, rewrite, unchanged_meta, @splat(2));
+        try writer.commit();
+        // The old pinned cut remains old; the new mapping is not a mutable
+        // process-global redirect and never substitutes a fresh physical cut.
+        var retained = (try getTableByLogicalRelationId(a, &cut, group, 7)).?;
+        defer retained.deinit();
+        try std.testing.expectEqual(@as(u64, 7), retained.value.id);
+    }
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var read = try store.beginReadTxn();
+        var selected = (try getTableByLogicalRelationId(a, &read, group, 7)).?;
+        try std.testing.expectEqual(@as(u64, 11), selected.value.id);
+        selected.deinit();
+        try validateNameIndex(a, &read, group);
+        read.abort();
+        const key = try logicalRelationKeyAlloc(a, group, 7);
+        defer a.free(key);
+        inline for (.{ "missing", "orphan", "substitute" }) |corruption| {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            if (comptime std.mem.eql(u8, corruption, "missing")) {
+                try txn.delete(key);
+            } else if (comptime std.mem.eql(u8, corruption, "orphan")) {
+                const orphan = try logicalRelationKeyAlloc(a, group, 99);
+                defer a.free(orphan);
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(u64, &bytes, 11, .little);
+                try txn.put(orphan, &bytes);
+            } else {
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(u64, &bytes, 99, .little);
+                try txn.put(key, &bytes);
+            }
+            try std.testing.expectError(error.InvalidCatalogRecord, validateNameIndex(a, &txn, group));
+        }
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        var unrelated = replacement;
+        unrelated.id = 13;
+        unrelated.name = "unrelated";
+        unrelated.storage_name = "physical:13";
+        var unrelated_upserts = [_]domain.Resource{unrelated};
+        try std.testing.expectError(error.InvalidCatalogMutation, applyDelta(a, &txn, group, .{ .upserts = &unrelated_upserts, .removes = &.{}, .next_id = 14 }, try readMeta(a, &txn, group), @splat(3)));
+        var actual = (try getTableByLogicalRelationId(a, &txn, group, 7)).?;
+        defer actual.deinit();
+        try std.testing.expectEqual(@as(u64, 11), actual.value.id);
+    }
+}
+
+test "SQL relation OID counter reservations burn only committed slots and reject unowned donation after cold restart" {
+    const a = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/oid-counter", .{directory.sub_path}, 0);
+    defer a.free(path);
+    const group: u64 = 1;
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var discarded = try store.beginWriteTxn();
+        try reserveRelationOidRange(a, &discarded, group, 3, 5);
+        discarded.abort();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(u64, 3), (try readMeta(a, &txn, group)).next_id);
+        try reserveRelationOidRange(a, &txn, group, 3, 5);
+        const meta = try readMeta(a, &txn, group);
+        try std.testing.expectEqual(@as(u64, 0), meta.revision);
+        try txn.commit();
+    }
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const meta = try readMeta(a, &txn, group);
+        try std.testing.expectEqual(@as(u64, 5), meta.next_id);
+        try std.testing.expectEqual(@as(u64, 0), meta.revision);
+        var records = [_]domain.Resource{.{ .kind = .table, .id = std.math.maxInt(u64), .sql_relation_id = 3, .parent_id = 2, .name = "fresh", .storage_name = "opaque:physical" }};
+        try std.testing.expectError(error.InvalidCatalogMutation, applyDelta(a, &txn, group, .{ .upserts = &records, .removes = &.{}, .next_id = 6 }, meta, @splat(1)));
+        // Same physical bytes can use only the actual next fresh slot.
+        records[0].sql_relation_id = 5;
+        try applyDelta(a, &txn, group, .{ .upserts = &records, .removes = &.{}, .next_id = 6 }, meta, @splat(1));
+        var numeric_alias = [_]domain.Resource{.{ .kind = .table, .id = 5, .sql_relation_id = 6, .parent_id = 2, .name = "second", .storage_name = "physical:5" }};
+        try applyDelta(a, &txn, group, .{ .upserts = &numeric_alias, .removes = &.{}, .next_id = 7 }, try readMeta(a, &txn, group), @splat(2));
+        try txn.commit();
+    }
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var resource = (try getTableByLogicalRelationId(a, &txn, group, 5)).?;
+        defer resource.deinit();
+        try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), resource.value.id);
+        try std.testing.expectEqual(@as(u64, 7), (try readMeta(a, &txn, group)).next_id);
+        var physical = (try getById(a, &txn, group, .table, 5)).?;
+        defer physical.deinit();
+        try std.testing.expectEqual(@as(u64, 6), physical.value.effectiveLogicalRelationId());
+        var second = (try getTableByLogicalRelationId(a, &txn, group, 6)).?;
+        defer second.deinit();
+        try std.testing.expectEqual(@as(u64, 5), second.value.id);
+        try validateNameIndex(a, &txn, group);
+    }
+}
+
+test "SQL relation OID adoption opens mainline high physical catalogs without allocating on reads" {
+    const a = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/oid-upgrade", .{directory.sub_path}, 0);
+    defer a.free(path);
+    const group: u64 = 1;
+    const physical: u64 = std.math.maxInt(u64) - 7;
+    const predecessor: domain.Resource = .{ .kind = .table, .id = physical, .parent_id = 2, .name = "existing", .storage_name = "physical:existing" };
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        // Genuine mainline representation: no SQL OID and a high opaque ID.
+        try writeResource(a, &txn, group, predecessor);
+        try txn.commit();
+    }
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var read = try store.beginReadTxn();
+        var ordinary = (try find(a, &read, group, .table, 2, "existing")).?;
+        defer ordinary.deinit();
+        try std.testing.expectEqual(physical, ordinary.value.id);
+        try std.testing.expect(ordinary.value.sql_relation_id == null);
+        var state = try loadState(a, &read, group);
+        defer state.deinit();
+        var indexed = try domain.StateIndex.init(a, state.value);
+        defer indexed.deinit(a);
+        try std.testing.expect(indexed.tableByLogicalRelationId(physical) == null);
+        try std.testing.expectEqual(@as(u64, 3), (try readMeta(a, &read, group)).next_id);
+        read.abort();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var adopted = [_]domain.Resource{predecessor};
+        adopted[0].sql_relation_id = 3;
+        try applyDelta(a, &txn, group, .{ .upserts = &adopted, .removes = &.{}, .next_id = 4 }, try readMeta(a, &txn, group), @splat(1));
+        try txn.commit();
+    }
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        var adopted = (try getTableByLogicalRelationId(a, &read, group, 3)).?;
+        defer adopted.deinit();
+        try std.testing.expectEqual(physical, adopted.value.id);
+        try std.testing.expectEqual(@as(u64, 4), (try readMeta(a, &read, group)).next_id);
+        try validateNameIndex(a, &read, group);
+    }
 }

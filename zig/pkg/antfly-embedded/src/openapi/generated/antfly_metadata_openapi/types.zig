@@ -2427,6 +2427,8 @@ pub const ClusterHealth = enum {
 
 /// Native cohort restores use the existing asynchronous restore job to provision hidden fresh generations, import rows, rebuild indexes and coordinated constraints, and publish the dependency-complete target set atomically. Document, relational, and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges). Skipping a live parent cannot substitute it for a parent generation required by a restored child. Overwrite retains the old generation until validation and cutover; cancellation after publication completes publication rather than rollback. Reserved destination authorization is immutable: changing principal requires canceling the old job and creating a new restore.
 pub const ClusterRestoreRequest = struct {
+    /// Explicit immutable routine identity handoff for trigger attachments. Cross-catalog restores require a mapping for every referenced trigger function. Destination functions must already exist and be authorized compatible zero-argument trigger functions. Routine bodies and names are never imported or rebound by this operation. Mappings are part of the durable job and its idempotency identity.
+    routine_mappings: ?[]const RestoreRoutineMapping = null,
     /// Unique identifier of the backup to restore from.
     backup_id: []const u8,
     /// Storage location where the backup is stored.
@@ -2440,6 +2442,7 @@ pub const ClusterRestoreRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "routine_mappings", "routine_mappings", true },
         .{ "backup_id", "backup_id", false },
         .{ "location", "location", false },
         .{ "connection", "connection", false },
@@ -2457,6 +2460,10 @@ pub const ClusterRestoreRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.routine_mappings) |value| {
+            try jw.objectField("routine_mappings");
+            try jw.write(value);
+        }
         try jw.objectField("backup_id");
         try jw.write(self.backup_id);
         try jw.objectField("location");
@@ -12147,12 +12154,54 @@ pub const RestoreJobList = struct {
 };
 
 pub const RestoreRequest = struct {
+    /// Explicit immutable routine identity handoff for trigger attachments. Cross-catalog restores require a mapping for every referenced trigger function. Destination functions must already exist and be authorized compatible zero-argument trigger functions. Routine bodies and names are never imported or rebound by this operation. Mappings are part of the durable job and its idempotency identity.
+    routine_mappings: ?[]const RestoreRoutineMapping = null,
     /// Identifier of the published backup to restore.
     backup_id: []const u8,
     /// Storage location containing the backup. The server detects the native or portable format from the published manifest and artifact.
     location: []const u8,
     /// ID of a configured `external_io` connection with `restore.read`. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
     connection: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "routine_mappings", "routine_mappings", true },
+        .{ "backup_id", "backup_id", false },
+        .{ "location", "location", false },
+        .{ "connection", "connection", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.routine_mappings) |value| {
+            try jw.objectField("routine_mappings");
+            try jw.write(value);
+        }
+        try jw.objectField("backup_id");
+        try jw.write(self.backup_id);
+        try jw.objectField("location");
+        try jw.write(self.location);
+        try jw.objectField("connection");
+        try jw.write(self.connection);
+        try jw.endObject();
+    }
+};
+
+pub const RestoreRoutineMapping = struct {
+    /// Metadata catalog incarnation recorded in the source attachment.
+    source_metadata_incarnation: []const u8,
+    /// Immutable source function identifier, expressed losslessly as decimal.
+    source_routine_id: []const u8,
+    /// Existing immutable destination function identifier, expressed losslessly as decimal.
+    destination_routine_id: []const u8,
 };
 
 /// Request for the retrieval agent. Queries define which tables and indexes to search, each as an ordinary QueryRequest. Optional tree or graph exploration is configured by steps.retrieval.navigation, targeting one query by index. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. A query may contain only a table scope and caller constraints: build_query delegates to the query-builder agent, then search executes its validated QueryRequest. Refinements use the same canonical full-DSL validator, not keyword substitution. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.

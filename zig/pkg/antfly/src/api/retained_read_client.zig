@@ -28,7 +28,7 @@ fn unpublishedAdmissionBusy(operation: @FieldType(rpc.Request, "operation"), sta
         .admit, .capture, .validate, .snapshot, .open => true,
         // These operations can run after query evaluation/row delivery. A
         // negative reply never authorizes replay of an advanced cursor.
-        .open_snapshot, .next, .normalize, .range_proofs, .close, .cancel, .renew_snapshot => false,
+        .open_snapshot, .next, .normalize, .range_proofs, .close, .cancel, .renew_snapshot, .graph_page => false,
     };
 }
 
@@ -45,6 +45,10 @@ pub const Client = struct {
     connection: u128,
     sequence: u64 = 0,
     poisoned: bool = false,
+    native_descriptor: ?@import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor = null,
+    owner_minter: ?@import("antfly_local_sources").common_relation_owner_authority.Minter = null,
+    table_id: u64 = 0,
+    group_id: u64 = 0,
 
     fn create(alloc: std.mem.Allocator, executor: http.RequestExecutor, base_uri: []const u8, table: []const u8, route: metadata.CatalogRouteFence, schema_version: u32, deadline_ns: ?u64) !*Client {
         // Table names are escaped at the path boundary, not interpolated raw.
@@ -62,7 +66,7 @@ pub const Client = struct {
         try receiver.io().randomSecure(&nonce);
         const connection = std.mem.readInt(u128, &nonce, .little);
         if (connection == 0) return error.ReadUnavailable;
-        self.* = .{ .alloc = alloc, .executor = executor, .uri = uri, .route = encoded_route, .schema_version = schema_version, .deadline_ns = deadline_ns orelse executor.monotonicNs() +| 30 * std.time.ns_per_s, .token = undefined, .connection = connection };
+        self.* = .{ .alloc = alloc, .executor = executor, .uri = uri, .route = encoded_route, .schema_version = schema_version, .deadline_ns = deadline_ns orelse executor.monotonicNs() +| 30 * std.time.ns_per_s, .token = undefined, .connection = connection, .native_descriptor = if (route.route.execution == .native_local) route.route.execution.native_local else null, .owner_minter = route.admission_relation_minter, .table_id = route.table_id, .group_id = route.route.group_id };
         return self;
     }
 
@@ -93,10 +97,14 @@ pub const Client = struct {
             return null;
         }
         self.token = parsed.value.token orelse return error.InvalidRetainedReadResponse;
-        return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = open, .capture_snapshot = captureSnapshot, .release = close } };
+        return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = open, .capture_snapshot = captureSnapshot, .capture_snapshot_with_graphs = captureSnapshotWithGraphs, .release = close } };
     }
 
     fn call(self: *Client, request: rpc.Request) !http.HttpResponse {
+        return self.callWithCancellation(request, null);
+    }
+    fn callWithCancellation(self: *Client, request: rpc.Request, token: ?@import("antfly_cancellation").CancellationToken) !http.HttpResponse {
+        var cancellation: ?http.RequestCancellation = if (token) |value| http.RequestCancellation.fromToken(value) else null;
         const cleanup = request.operation == .close or request.operation == .cancel;
         if (self.poisoned and !cleanup) return error.RetainedReadRestartRequired;
         const now = self.executor.monotonicNs();
@@ -106,14 +114,34 @@ pub const Client = struct {
         defer self.alloc.free(body);
         if (body.len > rpc.max_request_bytes) return error.InvalidRetainedReadQuery;
         var timeout_buffer: [16]u8 = undefined;
-        const headers = [_]http.RequestHeader{
+        var header_storage: [5]http.RequestHeader = undefined;
+        header_storage[0..3].* = .{
             .{ .name = "accept", .value = @import("retained_read_page.zig").compact_media_type },
             .{ .name = metadata.catalog_route_fence_header, .value = self.route },
             .{ .name = metadata.catalog_route_deadline_ms_header, .value = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{timeout}) },
         };
+        var header_count: usize = 3;
+        const authority = @import("antfly_local_sources").common_relation_owner_authority;
+        const owned_grant = if (self.native_descriptor) |descriptor| grant: {
+            if (descriptor.kind != .temporary) break :grant null;
+            const minter = self.owner_minter orelse return error.SqlTemporaryRelationNotOwned;
+            try descriptor.requireConnectionOwner(minter.owner);
+            break :grant try minter.mint(self.alloc, .{ .purpose = .read, .table_id = self.table_id, .group_id = self.group_id, .descriptor_fingerprint = try descriptor.fingerprint(), .body_digest = authority.bodyDigest(body) });
+        } else null;
+        defer if (owned_grant) |value| self.alloc.free(value);
+        var digest_buffer: [64]u8 = undefined;
+        if (owned_grant) |value| {
+            header_storage[header_count] = .{ .name = authority.header, .value = value };
+            header_count += 1;
+            if (self.owner_minter.?.command_fence_digest) |digest| {
+                digest_buffer = std.fmt.bytesToHex(digest, .lower);
+                header_storage[header_count] = .{ .name = authority.command_digest_header, .value = &digest_buffer };
+                header_count += 1;
+            }
+        }
         // NEVER retry: capture/open may have allocated a capability; next may
         // already have advanced. Unknown handles are bounded by owner expiry.
-        var response = self.executor.execute(self.alloc, .{ .method = .POST, .uri = self.uri, .headers = &headers, .content_type = "application/json", .body = body, .timeout_ms = timeout, .max_response_bytes = rpc.max_response_bytes }) catch |err| {
+        var response = self.executor.execute(self.alloc, .{ .method = .POST, .uri = self.uri, .headers = header_storage[0..header_count], .content_type = "application/json", .body = body, .timeout_ms = timeout, .cancellation = if (cancellation) |*value| value else null, .max_response_bytes = rpc.max_response_bytes }) catch |err| {
             self.poisoned = true;
             return err;
         };
@@ -125,12 +153,12 @@ pub const Client = struct {
             self.poisoned = true;
             return error.SqlRangeTrackingRequired;
         }
-        // Normalization is pure preparation, not a stateful page advance or
-        // commit. An authenticated, protocol-acknowledged, canonical negative
+        // Normalization and retained graph reads do not advance a row cursor
+        // or commit. An authenticated, protocol-acknowledged, canonical negative
         // result must preserve validation/cancellation/resource identity.
         // Unknown names, mismatched status, missing ACK and other operations
         // retain the fail-closed restart path; never replay this RPC.
-        if (request.operation == .normalize and response.status >= 400 and response.status < 600 and
+        if ((request.operation == .normalize or request.operation == .graph_page) and response.status >= 400 and response.status < 600 and
             std.mem.eql(u8, response.header(metadata.catalog_route_fence_ack_header) orelse "", metadata.catalog_route_fence_ack_value))
         {
             if (@import("antfly_runtime_abi").error_abi.errorFromStableName(response.body)) |err| {
@@ -166,8 +194,11 @@ pub const Client = struct {
     }
 
     fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
+        return captureSnapshotWithGraphs(ptr, alloc, &.{});
+    }
+    fn captureSnapshotWithGraphs(ptr: *anyopaque, alloc: std.mem.Allocator, indexes: []const []const u8) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        var response = try self.call(.{ .operation = .snapshot, .schema_version = self.schema_version, .token = self.token, .connection = self.connection, .lease_ms = rpc.max_lease_ms });
+        var response = try self.call(.{ .operation = .snapshot, .graph_indexes = indexes, .schema_version = self.schema_version, .token = self.token, .connection = self.connection, .lease_ms = rpc.max_lease_ms });
         defer response.deinit(self.alloc);
         var parsed = try std.json.parseFromSlice(rpc.Response, alloc, response.body, .{});
         defer parsed.deinit();
@@ -182,8 +213,8 @@ pub const Client = struct {
         errdefer alloc.free(uri);
         const route = try alloc.dupe(u8, self.route);
         errdefer alloc.free(route);
-        snapshot.* = .{ .alloc = alloc, .executor = self.executor, .uri = uri, .route = route, .schema_version = self.schema_version, .deadline_ns = self.deadline_ns, .token = token, .connection = self.connection };
-        return .{ .ptr = snapshot, .vtable = &.{ .renew = renewRetainedSnapshot, .open = openSnapshot, .release = close } };
+        snapshot.* = .{ .alloc = alloc, .executor = self.executor, .uri = uri, .route = route, .schema_version = self.schema_version, .deadline_ns = self.deadline_ns, .token = token, .connection = self.connection, .native_descriptor = self.native_descriptor, .owner_minter = self.owner_minter, .table_id = self.table_id, .group_id = self.group_id };
+        return .{ .ptr = snapshot, .vtable = &.{ .renew = renewRetainedSnapshot, .open = openSnapshot, .graph_page = graphPage, .release = close } };
     }
 
     fn open(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions) !reads.RelationalReadView {
@@ -195,6 +226,25 @@ pub const Client = struct {
         const self: *Client = @ptrCast(@alignCast(ptr));
         self.deadline_ns = deadline_ns orelse self.executor.monotonicNs() +| 5 * std.time.ns_per_s;
         try self.renewSnapshot(rpc.max_lease_ms);
+    }
+
+    fn graphPage(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("antfly_local_sources").storage_statement_read_fence.GraphRead.Request) !@import("antfly_local_sources").storage_statement_read_fence.GraphRead.Page {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        try request.check();
+        self.deadline_ns = request.execution_deadline_ns orelse self.executor.monotonicNs() +| 5 * std.time.ns_per_s;
+        var response = try self.callWithCancellation(.{ .operation = .graph_page, .schema_version = self.schema_version, .token = self.token, .graph = .{
+            .index = request.index,
+            .key = request.key,
+            .edge_types = request.edge_types,
+            .direction = request.direction,
+            .cursor = request.cursor,
+            .limits = request.limits,
+        } }, request.cancellation);
+        defer response.deinit(self.alloc);
+        var parsed = try std.json.parseFromSlice(rpc.Response, alloc, response.body, .{});
+        defer parsed.deinit();
+        try request.check();
+        return (parsed.value.graph_page orelse return error.InvalidRetainedReadResponse).clone(alloc);
     }
 
     fn openSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions) !reads.RelationalReadView {
@@ -229,7 +279,7 @@ pub const Client = struct {
             std.crypto.hash.sha2.Sha256.hash(text.query, &expected, .{});
             if (parsed.value.text_filter_digest == null or !std.mem.eql(u8, &expected, &parsed.value.text_filter_digest.?)) return error.UnsupportedSqlExecution;
         } else if (parsed.value.text_filter_digest != null) return error.InvalidRetainedReadResponse;
-        cursor.* = .{ .alloc = alloc, .executor = self.executor, .uri = uri, .route = route, .schema_version = self.schema_version, .deadline_ns = self.deadline_ns, .token = parsed.value.token orelse return error.InvalidRetainedReadResponse, .connection = self.connection };
+        cursor.* = .{ .alloc = alloc, .executor = self.executor, .uri = uri, .route = route, .schema_version = self.schema_version, .deadline_ns = self.deadline_ns, .token = parsed.value.token orelse return error.InvalidRetainedReadResponse, .connection = self.connection, .native_descriptor = self.native_descriptor, .owner_minter = self.owner_minter, .table_id = self.table_id, .group_id = self.group_id };
         return .{ .text_filter_digest = parsed.value.text_filter_digest, .ptr = cursor, .vtable = &.{ .next = next, .close = close, .normalize = normalize, .range_proofs = rangeProofs } };
     }
 
@@ -427,7 +477,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), fixture.calls);
         }
 
-        test "retained read client preserves only canonical acknowledged normalization failures without replay" {
+        test "retained graph client preserves only canonical acknowledged normalization and graph failures without replay" {
             const Fixture = struct {
                 status: u16,
                 body: []const u8,
@@ -458,6 +508,11 @@ fn consumerTests() type {
                 .{ .status = 409 },
                 .{ .body = "RelationalCheckViolation\n" },
                 .{ .body = "PrivateProviderSecret" },
+                .{ .operation = .graph_page, .status = 403, .body = "Forbidden", .expected = error.Forbidden },
+                .{ .operation = .graph_page, .status = 503, .body = "ReadUnavailable", .expected = error.ReadUnavailable },
+                .{ .operation = .graph_page, .status = 500, .body = "OutOfMemory", .expected = error.OutOfMemory },
+                .{ .operation = .graph_page, .status = 403, .body = "Forbidden", .ack = false },
+                .{ .operation = .graph_page, .status = 409, .body = "Forbidden" },
                 .{ .operation = .next },
                 .{ .operation = .open },
             }) |case| {

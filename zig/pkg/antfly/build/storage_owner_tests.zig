@@ -75,6 +75,7 @@ pub fn add(
                         b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])}),
                         "compiled structural reconciliation publishes",
                         "api.kernel_owner_source.",
+                        "SQL relation lifetime native retained status requires explicit complete role and exact bounded roster",
                         "schema apply queue",
                         "compiled schema apply control",
                         "compiled startup catch-up retains exact retries",
@@ -87,6 +88,7 @@ pub fn add(
                 .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
             });
             tests.executable.root_module.addObject(test_metadata.object);
+            if (index == 1) @import("../../../build_support/antfly/test_support.zig").addTestCheckStep(b, tests.object, "antfly-storage-owner-source-check", "Type-check the owning provisioned source tests without emitting their binary");
             runs[index] = tests.run(b);
             if (index == 2) {
                 tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);

@@ -725,7 +725,7 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        if (tables.len == 1 and tables[0].predicates.len == 0 and tables[0].relational_index_maintenance == null) {
+        if (tables.len == 1 and tables[0].predicates.len == 0 and tables[0].relational_index_maintenance == null and tables[0].trigger_receipts.len == 0 and tables[0].graph_preparation == null and tables[0].graph_writes.len == 0 and tables[0].graph_deletes.len == 0) {
             const table = tables[0];
             const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
@@ -870,6 +870,10 @@ pub const BoundTableWriteSource = struct {
             .writes = table.writes,
             .deletes = table.deletes,
             .transforms = table.transforms,
+            .graph_preparation = table.graph_preparation,
+            .graph_writes = table.graph_writes,
+            .graph_deletes = table.graph_deletes,
+            .trigger_receipts = table.trigger_receipts,
             .predicates = table.predicates,
             .integrity = table.integrity,
             .integrity_commands = table.integrity_commands,

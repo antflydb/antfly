@@ -19,7 +19,7 @@
 const std = @import("std");
 
 pub const minimum_semantic_version: u32 = 11;
-pub const current_semantic_version: u32 = 42;
+pub const current_semantic_version: u32 = 43;
 pub const current_encoding_version: u32 = 42;
 
 pub const ReaderCapabilities = struct {

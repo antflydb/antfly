@@ -53,6 +53,16 @@ pub fn authorize(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdent
     defer a.free(resource);
     if (!try http.resourcePermissionCurrentlyAllowed(identity, routes.permissionKind(target.kind), resource, .admin)) return error.Forbidden;
 }
+fn authorizeInContext(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, a: A, target: native.Target) !void {
+    if (server.cfg.auth_enabled and identity == null) return error.Forbidden;
+    if (target.kind == .namespace and context.sql_command_fence != null) if (context.sql_relation_owner) |owner| {
+        try owner.validate();
+        var buffer: [72]u8 = undefined;
+        if (std.mem.eql(u8, target.name, try owner.namespace(&buffer))) return;
+    };
+    return authorize(server, identity, a, target);
+}
+
 fn withToken(a: A, request: native.Observation, token: []const u8) !common.Receipt {
     const database = try a.dupe(u8, request.target.database);
     errdefer a.free(database);
@@ -78,7 +88,13 @@ pub fn decodeOutcome(a: A, bytes: []const u8, request: native.Observation) ?nati
     var parsed = std.json.parseFromSlice(?native.Outcome, a, bytes, .{}) catch return null;
     defer parsed.deinit();
     const outcome = parsed.value orelse return null;
-    if (outcome == .pending) return null;
+    if (outcome == .pending) {
+        const pending = outcome.pending;
+        pending.validate() catch return null;
+        if (pending.work != .policy_pair or request.target.kind != .table or request.target.action != .alter or
+            pending.work.policy_pair.table_id != request.target.table_id or pending.revision != request.expected_revision + request.revision_delta or
+            !pending.matchesIncarnation(request.admission.incarnation)) return null;
+    }
     if (outcome == .success) {
         const result = outcome.success;
         result.validate() catch return null;
@@ -92,6 +108,11 @@ pub fn decodeOutcome(a: A, bytes: []const u8, request: native.Observation) ?nati
 }
 fn complete(receipt: *common.Receipt, request: native.Observation, outcome: native.Outcome) void {
     common.complete(receipt, outcome);
+    if (outcome == .pending and outcome.pending.work == .policy_pair) {
+        // Catalog allocator identity is the logical SQL OID. Public table
+        // receipts retain the physical table identity carried by this request.
+        receipt.object_id = request.target.table_id;
+    }
     if (outcome == .success and request.target.kind == .table and request.target.action != .drop and request.target.table_id != 0) {
         receipt.object_id = request.target.table_id;
         receipt.generation = outcome.success.revision;
@@ -99,7 +120,7 @@ fn complete(receipt: *common.Receipt, request: native.Observation, outcome: nati
 }
 pub fn observe(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, a: A, request: native.Observation) ?native.Outcome {
     context.ensureActive() catch return null;
-    authorize(server, identity, a, request.target) catch return null;
+    authorizeInContext(server, identity, context, a, request.target) catch return null;
     var private = context;
     private.setting_admin = true;
     const bytes = server.source.systemCatalog(a, private, .{ .sql_catalog_outcome = request }) catch return null;
@@ -119,7 +140,7 @@ pub fn recoverIfOrdinary(server: *http.ApiHttpServer, identity: ?http.Authentica
     const token = std.json.parseFromSliceLeaky(Token, scratch, bytes, .{ .allocate = .alloc_always }) catch return error.InvalidSqlRecoveryToken;
     token.request.validate() catch return error.InvalidSqlRecoveryToken;
     if (token.kind != kind(token.request.target)) return error.InvalidSqlRecoveryToken;
-    try authorize(server, identity, scratch, token.request.target);
+    try authorizeInContext(server, identity, context, scratch, token.request.target);
     const owned = try a.dupe(u8, encoded);
     errdefer a.free(owned);
     var receipt = try withToken(a, token.request, owned);
@@ -133,6 +154,7 @@ pub const Reply = struct {
     table_id: u64 = 0,
     table_id_text: ?[]u8 = null,
     unknown: bool = false,
+    pending: bool = false,
     pub fn takeReceipt(self: *@This()) ?common.Receipt {
         const receipt = self.receipt;
         self.receipt = null;
@@ -162,13 +184,16 @@ pub fn submitRelation(server: *http.ApiHttpServer, identity: ?http.Authenticated
     return submitIntent(server, identity, context, allocators, .{ .mutation = relation.mutation(intent.guard(), intent.action()) }, null, intent);
 }
 fn submitIntent(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, allocators: local.sql_catalog.DdlAllocators, request: domain.Request, view: ?@import("../system_catalog/views.zig").Request, relation: ?@import("../system_catalog/relations.zig").Intent) !Reply {
-    if (context.sql_command_fence == null and view == null and relation == null) return .{ .legacy = try server.source.systemCatalog(allocators.result, context, .{ .mutate = request }) };
+    // Generated labels are compiler placeholders, not public constraint/index
+    // identities. The existing native preparation and atomic admission select
+    // namespace-aware names even for connectionless statements.
+    if (context.sql_command_fence == null and view == null and relation == null and request.generated_constraint_names.len == 0) return .{ .legacy = try server.source.systemCatalog(allocators.result, context, .{ .mutate = request }) };
     var region: std.heap.ArenaAllocator = .init(allocators.scratch);
     defer region.deinit();
     const scratch = region.allocator();
     var private = context;
     private.setting_admin = true;
-    try authorize(server, identity, scratch, .{ .kind = request.mutation.kind, .action = request.mutation.action, .database = request.mutation.database, .namespace = request.mutation.namespace, .name = request.mutation.name, .table_id = 0 });
+    try authorizeInContext(server, identity, context, scratch, .{ .kind = request.mutation.kind, .action = request.mutation.action, .database = request.mutation.database, .namespace = request.mutation.namespace, .name = request.mutation.name, .table_id = 0 });
     const io = server.sharedApiIo() orelse return error.UnsupportedSqlExecution;
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
@@ -185,7 +210,7 @@ fn submitIntent(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     if (!try native.matchesViewIntent(scratch, command.sql_view, if (view) |value| value.mutation else null)) return error.InvalidCatalogMutation;
     if (!try native.matchesIntent(scratch, command.mutation, request.mutation) or !std.mem.eql(u8, &observation.admission.request.nonce, &nonce) or !std.meta.eql(observation.admission.request.command_fence, command_fence)) return error.InvalidCatalogMutation;
     if (request.physical_name) |name| if (!std.mem.eql(u8, name, command.mutation.storage_name)) return error.InvalidCatalogMutation;
-    try authorize(server, identity, scratch, observation.target);
+    try authorizeInContext(server, identity, context, scratch, observation.target);
     var receipt = try newReceipt(allocators.result, scratch, observation);
     errdefer receipt.deinit(allocators.result);
     const table_id_text = if (request.mutation.kind == .table and request.mutation.action == .create) try std.fmt.allocPrint(allocators.result, "{d}", .{observation.target.table_id}) else null;
@@ -197,9 +222,13 @@ fn submitIntent(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     if (outcome) |known| {
         // A retained native refusal proves that this schema owner was never
         // changed, even though its rejection record crossed consensus.
-        if (known == .rejected and relation != null and relation.? == .schema) if (context.sql_completion_submission) |submitted| {
+        if (known == .rejected and relation != null and (relation.? == .schema or relation.? == .trigger)) if (context.sql_completion_submission) |submitted| {
             submitted.* = false;
         };
+        if (known == .pending and known.pending.work == .policy_pair) {
+            complete(&receipt, observation, known);
+            return .{ .receipt = receipt, .table_id = observation.target.table_id, .table_id_text = table_id_text, .pending = true };
+        }
         _ = try known.result();
         complete(&receipt, observation, known);
         return .{ .receipt = receipt, .table_id = observation.target.table_id, .table_id_text = table_id_text };

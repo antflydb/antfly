@@ -29,6 +29,17 @@ const Path = @import("../pgwire/search_path.zig").Path;
 const time = @import("antfly_platform").time;
 const A = std.mem.Allocator;
 
+const NativeFailureStage = enum { capture, prepare, admit, owner_status };
+var native_failure_stages: std.atomic.Value(u8) = .init(0);
+fn diagnoseNativeFailure(stage: NativeFailureStage, err: anyerror, trace: ?*std.builtin.StackTrace) void {
+    if (comptime @import("builtin").mode == .debug) {
+        const bit = @as(u8, 1) << @backingInt(stage);
+        if (native_failure_stages.fetchOr(bit, .monotonic) & bit != 0) return;
+        std.debug.print("native population admission stage={s} err={s}\n", .{ @tagName(stage), @errorName(err) });
+        if (trace) |captured| std.debug.dumpErrorReturnTrace(captured) else std.debug.dumpCurrentStackTrace(.{});
+    }
+}
+
 fn namespaceId(server: *http.ApiHttpServer, a: A, context: operation.RequestContext, target: domain.Target) !u64 {
     if (target.isDefault()) return domain.default_namespace_id;
     const bytes = try server.source.systemCatalog(a, context, .{ .read = .{ .kind = .namespace, .database = target.database, .name = target.namespace } });
@@ -74,18 +85,7 @@ fn remoteJobs(server: *http.ApiHttpServer) bool {
     return server.cfg.deployment_mode != .standalone and server.restore_job_store.replicated == null;
 }
 fn admitJob(server: *http.ApiHttpServer, a: A, context: operation.RequestContext, request: jobs.StartRequest) !job_control.Admission {
-    if (!remoteJobs(server)) {
-        const result = try server.restore_job_store.startRecoverableObserved(a, request, true, context.sql_completion_submission);
-        return job_control.bindAdmission(a, server.source, context, result);
-    }
-    const raw = try server.source.systemCatalog(a, context, .{ .query_population_job = .{ .admit = request } });
-    defer a.free(raw);
-    var parsed = std.json.parseFromSlice(job_control.Admission, a, raw, .{}) catch return error.MetadataMutationOutcomeUnknown;
-    defer parsed.deinit();
-    return .{ .result = switch (parsed.value.result) {
-        .accepted => |bytes| .{ .accepted = a.dupe(u8, bytes) catch return error.MetadataMutationOutcomeUnknown },
-        .unknown => |bytes| .{ .unknown = a.dupe(u8, bytes) catch return error.MetadataMutationOutcomeUnknown },
-    }, .plan_digest = parsed.value.plan_digest };
+    return job_control.admit(server, a, context, request);
 }
 fn observeJob(server: *http.ApiHttpServer, a: A, context: operation.RequestContext, ref: job_control.Reference) !?[]u8 {
     if (!remoteJobs(server)) return server.restore_job_store.load(a, ref.job_id);
@@ -163,7 +163,12 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
 }
 fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, request_context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, input: @FieldType(catalog.Ddl, "populate"), path: ?*const Path, refresh: ?Refresh) !catalog.DdlOutcome {
     const intent = input.intent;
-    if (intent.persistence != .permanent or (intent.operation != .create_table_as and intent.operation != .select_into and intent.operation != .create_materialized_view and !(intent.operation == .refresh_materialized_view and refresh != null))) return error.UnsupportedSqlExecution;
+    if (intent.persistence != .temporary and intent.on_commit != null) return error.InvalidSqlRelationPersistence;
+    if (intent.operation != .create_table_as and intent.operation != .select_into and intent.operation != .create_materialized_view and !(intent.operation == .refresh_materialized_view and refresh != null)) return error.UnsupportedSqlExecution;
+    if (intent.persistence != .permanent) {
+        if (intent.materialized()) return error.UnsupportedSqlExecution;
+        if (@import("../metadata/topology_protocol.zig").current_version < @import("../metadata/topology_protocol.zig").sql_relation_persistence_version) return error.SqlRelationOwnerUnavailable;
+    }
     const source = input.source orelse return error.InvalidSqlBackendResponse;
     const io = server.sharedApiIo() orelse server.restore_job_store.io orelse return error.AsyncRestoreUnavailable;
     var context = try request_context.platformDeadline();
@@ -175,7 +180,7 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     var target: domain.Target = .{ .database = intent.name.database orelse database, .namespace = intent.name.namespace orelse namespace, .table = intent.name.table };
     try target.validate();
     // Unqualified CREATE selects the first extant user namespace in search_path.
-    if (intent.name.namespace == null and intent.name.database == null) if (path) |lookup| {
+    if (intent.persistence != .temporary and intent.name.namespace == null and intent.name.database == null) if (path) |lookup| {
         var found = false;
         for (lookup.entries[0..lookup.len]) |*entry| {
             if (std.mem.eql(u8, entry.slice(), "pg_catalog")) continue;
@@ -194,6 +199,13 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     try @import("sql_catalog_auth.zig").authorizeTarget(server, identity, a, target);
     if (!try @import("sql_catalog_auth.zig").namespaceUsage(identity, a, target)) return error.Forbidden;
     if (intent.tablespace) |space| if (identity) |actor| if (!http.permissionsAllow(actor.permissions, .tablespace, space, .read)) return error.Forbidden;
+    const lifetime = @import("sql_relation_creation.zig").prepare(server, a, context, target, intent.persistence, intent.on_commit orelse .preserve_rows, intent.name.namespace != null) catch |err| {
+        if (intent.persistence != .permanent) diagnoseNativeFailure(.capture, err, @errorReturnTrace());
+        return err;
+    };
+    target = lifetime.target;
+    if (lifetime.descriptor) |descriptor| if (descriptor.owner) |connection_owner|
+        try @import("sql_temporary_namespace.zig").ensure(server, identity, context, allocators, target.database, connection_owner);
     const principal = http.storedDestinationPrincipal(identity);
     const logical_name = try target.resourceNameAlloc(a);
     try server.requireGenerationAuthority(principal, &.{logical_name}, true);
@@ -201,6 +213,15 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     trusted.setting_admin = true;
     const ns = try namespaceId(server, a, trusted, target);
     const physical = try server.catalogStorageNameAlloc(a);
+    // Use the same native/storage defaults as ordinary CREATE. Metadata owns
+    // physical identity allocation and still verifies the complete shape.
+    var candidate = @import("tables.zig").deriveTableRecord("", .{
+        .sql_persistence = lifetime.descriptor,
+        .schema_json = @constCast(source.schema_json),
+        .indexes_json = @constCast(@as([]const u8, "{}")),
+        .num_shards = if (lifetime.descriptor != null) 1 else null,
+    });
+    candidate.table_id = 0;
     var prepared: create.Prepared = undefined;
     while (true) {
         try context.ensureActive();
@@ -213,7 +234,7 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
             .logical_name = target.table,
             .physical_name = physical,
             .tablespace_name = intent.tablespace,
-            .candidate = .{ .table_id = 0, .name = "", .schema_json = source.schema_json, .indexes_json = "{}" },
+            .candidate = candidate,
         } }) catch |err| switch (err) {
             error.CatalogAlreadyExists, error.TableAlreadyExists => if (intent.if_not_exists) return .{ .population_skipped = true } else return error.CatalogAlreadyExists,
             error.CatalogOccupancyNotReady, error.CatalogPublicationProofPending, error.TableTransitionActive => {
@@ -221,7 +242,10 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
                 try io.sleep(.fromMilliseconds(10), .awake);
                 continue;
             },
-            else => return err,
+            else => {
+                if (intent.persistence != .permanent) diagnoseNativeFailure(.prepare, err, @errorReturnTrace());
+                return err;
+            },
         };
         prepared = try std.json.parseFromSliceLeaky(create.Prepared, a, bytes, .{ .allocate = .alloc_always });
         break;
@@ -259,7 +283,7 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
         .creation_guard = guard,
         .table = prepared.child,
         .ranges = prepared.child_ranges,
-        .catalog_binding = .{ .kind = if (view_definition != null or refresh != null) .view else .table, .id = prepared.child.sql_materialized_view_id orelse prepared.child.table_id, .parent_id = ns, .tablespace_id = prepared.tablespace_id, .name = target.table, .storage_name = prepared.child.name },
+        .catalog_binding = .{ .sql_relation_id = if (view_definition == null and refresh == null) prepared.catalog_id else null, .kind = if (view_definition != null or refresh != null) .view else .table, .id = prepared.child.sql_materialized_view_id orelse prepared.child.table_id, .parent_id = ns, .tablespace_id = prepared.tablespace_id, .name = target.table, .storage_name = prepared.child.name },
     };
     const plan: stages.Plan = .{ .id = id, .cohort_digest = source.definition, .targets = &.{destination} };
     try plan.validate(a);
@@ -269,6 +293,7 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     const start_request: jobs.StartRequest = .{
         .scope = .cluster,
         .source_kind = .query_population,
+        .routine_actor = if (try @import("sql_trigger_restore.zig").needsActorForPlan(a, plan)) try @import("sql_trigger_restore.zig").actorForAdmission(server, identity) else null,
         .restore_mode = if (refresh != null) "overwrite" else "fail_if_exists",
         .backup_id = try a.dupe(u8, &std.fmt.bytesToHex(source.definition, .lower)),
         .location = "metadata://query-population",
@@ -285,7 +310,10 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
             transferred = true;
             return unresolved(receipt);
         },
-        else => return err,
+        else => {
+            if (intent.persistence != .permanent) diagnoseNativeFailure(.admit, err, @errorReturnTrace());
+            return err;
+        },
     };
     const result = admission.result;
     const admission_bytes = switch (result) {
@@ -326,17 +354,29 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     errdefer requestCleanup(server, reference);
     server.schedulePendingRestoreJobs() catch {};
     const destinations = try a.alloc(delivery.Destination, destination.ranges.len);
-    for (destinations, destination.ranges) |*out, range| out.* = .{ .port = .{ .ptr = server, .execute_fn = owner }, .table = destination.table.name, .group = range.group_id, .scope = try stages.ownerScope(a, plan, admitted_digest, destination, range), .range = .{ .start = range.start_key, .end = range.end_key orelse "" } };
+    for (destinations, destination.ranges) |*out, range| out.* = .{ .port = .{ .ptr = server, .execute_fn = owner }, .table = destination.table.name, .group = range.group_id, .native_execution = destination.table.sql_persistence, .scope = try stages.ownerScope(a, plan, admitted_digest, destination, range), .range = .{ .start = range.start_key, .end = range.end_key orelse "" } };
     // Wait for all hidden owners before any evaluation or begin RPC. A routing
     // gap during preparation cannot consume half a producer admission.
     for (destinations) |out| while (true) {
         try context.ensureActive();
-        _ = owner(server, allocators.scratch, out.table, out.group, .{ .scope = out.scope, .action = .status }, context) catch |err| switch (err) {
+        _ = owner(server, allocators.scratch, out.table, out.group, .{ .scope = out.scope, .action = .status, .native_execution = out.native_execution }, context) catch |err| switch (err) {
             error.GroupLeaderUnavailable, error.RestoreValidationPending, error.StorageBusy, error.NotFound => {
                 try io.sleep(.fromMilliseconds(10), .awake);
                 continue;
             },
-            else => return err,
+            error.SqlRelationRecoveryIncomplete => {
+                // A newly admitted native image has no initialized attestation
+                // until its private provisioning round finishes. Observe the
+                // same captured owner/scope; the producer has not begun and is
+                // never reevaluated by this readiness wait.
+                if (out.native_execution == null) return err;
+                try io.sleep(.fromMilliseconds(10), .awake);
+                continue;
+            },
+            else => {
+                if (intent.persistence != .permanent) diagnoseNativeFailure(.owner_status, err, @errorReturnTrace());
+                return err;
+            },
         };
         break;
     };

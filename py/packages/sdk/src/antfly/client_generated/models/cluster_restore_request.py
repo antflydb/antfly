@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
 from ..models.cluster_restore_request_restore_mode import ClusterRestoreRequestRestoreMode
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.restore_routine_mapping import RestoreRoutineMapping
+
 
 T = TypeVar("T", bound="ClusterRestoreRequest")
 
@@ -29,6 +33,13 @@ class ClusterRestoreRequest:
             location (str): Storage location where the backup is stored.
                  Example: s3://mybucket/antfly-backups/cluster/2025-01-15.
             connection (str): Required configured `external_io` connection with the `restore.read` capability.
+            routine_mappings (list[RestoreRoutineMapping] | Unset): Explicit immutable routine identity handoff for trigger
+                attachments.
+                Cross-catalog restores require a mapping for every referenced trigger
+                function. Destination functions must already exist and be authorized
+                compatible zero-argument trigger functions. Routine bodies and names
+                are never imported or rebound by this operation. Mappings are part
+                of the durable job and its idempotency identity.
             table_names (list[str] | Unset): Optional list of tables to restore. If omitted, all tables in the backup are
                 restored,
                 up to the cluster restore limit of 4096 tables. Larger backups must be restored
@@ -44,6 +55,7 @@ class ClusterRestoreRequest:
     backup_id: str
     location: str
     connection: str
+    routine_mappings: list[RestoreRoutineMapping] | Unset = UNSET
     table_names: list[str] | Unset = UNSET
     restore_mode: ClusterRestoreRequestRestoreMode | Unset = ClusterRestoreRequestRestoreMode.FAIL_IF_EXISTS
 
@@ -53,6 +65,13 @@ class ClusterRestoreRequest:
         location = self.location
 
         connection = self.connection
+
+        routine_mappings: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.routine_mappings, Unset):
+            routine_mappings = []
+            for routine_mappings_item_data in self.routine_mappings:
+                routine_mappings_item = routine_mappings_item_data.to_dict()
+                routine_mappings.append(routine_mappings_item)
 
         table_names: list[str] | Unset = UNSET
         if not isinstance(self.table_names, Unset):
@@ -71,6 +90,8 @@ class ClusterRestoreRequest:
                 "connection": connection,
             }
         )
+        if routine_mappings is not UNSET:
+            field_dict["routine_mappings"] = routine_mappings
         if table_names is not UNSET:
             field_dict["table_names"] = table_names
         if restore_mode is not UNSET:
@@ -80,12 +101,23 @@ class ClusterRestoreRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.restore_routine_mapping import RestoreRoutineMapping
+
         d = dict(src_dict)
         backup_id = d.pop("backup_id")
 
         location = d.pop("location")
 
         connection = d.pop("connection")
+
+        _routine_mappings = d.pop("routine_mappings", UNSET)
+        routine_mappings: list[RestoreRoutineMapping] | Unset = UNSET
+        if _routine_mappings is not UNSET:
+            routine_mappings = []
+            for routine_mappings_item_data in _routine_mappings:
+                routine_mappings_item = RestoreRoutineMapping.from_dict(routine_mappings_item_data)
+
+                routine_mappings.append(routine_mappings_item)
 
         table_names = cast(list[str], d.pop("table_names", UNSET))
 
@@ -100,6 +132,7 @@ class ClusterRestoreRequest:
             backup_id=backup_id,
             location=location,
             connection=connection,
+            routine_mappings=routine_mappings,
             table_names=table_names,
             restore_mode=restore_mode,
         )

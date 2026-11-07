@@ -26,8 +26,17 @@ pub const max_bytes = 16384;
 pub const decoder_version: u16 = @import("../metadata/topology_protocol.zig").sql_native_lock_custody_version;
 pub const Ref = struct { backend: locks.Backend, command: scopes.Command };
 pub const EffectInput = struct { command: scopes.Command, effect: scopes.ledger.Effect };
+const recovery = @import("../metadata/sql_relation_recovery.zig");
+pub const NativeRetirement = struct {
+    generation: u64,
+    query: recovery.Query,
+    source_group_id: u64,
+    decision: ?scopes.DecisionRef = null,
+    handoff: bool = false,
+};
 const DataRetirement = struct { generation: u64, native: local.storage_pessimistic_lock_control.Snapshot };
 pub const Request = struct {
+    abandoned_private: ?@import("../metadata/abandoned_temporary_retirement.zig").Selection = null,
     scope_retirement: ?@import("../metadata/scope_retirement_ledger.zig").SourceControl = null,
     notification_generation: ?u64 = null,
     admission: outcomes.Admission,
@@ -51,6 +60,7 @@ pub const Request = struct {
         data_ack: struct { generation: u64, command: scopes.Command, native: local.storage_pessimistic_lock_control.Snapshot },
         data_retire: DataRetirement,
         data_handoff: DataRetirement,
+        native_retire: NativeRetirement,
         release: scopes.Transaction,
         /// Exact unadmitted purpose, retained locally before dispatch.
         /// Native journal absence/rejection, not that local claim, authorizes cleanup.
@@ -64,7 +74,8 @@ pub const Request = struct {
         try writer.beginObject();
         inline for (@typeInfo(Request).@"struct".field_names) |field| {
             const omit = (comptime std.mem.eql(u8, field, "notification_generation")) and self.notification_generation == null or
-                (comptime std.mem.eql(u8, field, "scope_retirement")) and self.scope_retirement == null;
+                (comptime std.mem.eql(u8, field, "scope_retirement")) and self.scope_retirement == null or
+                (comptime std.mem.eql(u8, field, "abandoned_private")) and self.abandoned_private == null;
             if (!omit) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
@@ -73,11 +84,18 @@ pub const Request = struct {
         try writer.endObject();
     }
     pub fn requiredDecoderVersion(self: Request) u16 {
+        if (self.abandoned_private != null) return @import("../metadata/topology_protocol.zig").sql_relation_persistence_version;
+        if (self.operation == .native_retire) return @import("../metadata/topology_protocol.zig").sql_relation_persistence_version;
         if (self.scope_retirement != null) return @import("../metadata/topology_protocol.zig").sql_scope_retirement_version;
         if (self.notification_generation != null or self.operation == .notification_gc or self.operation == .notification_bind or self.operation == .notification_offer or self.operation == .notification_ack) return @import("../metadata/topology_protocol.zig").sql_notifications_version;
         return decoder_version;
     }
     pub fn validate(self: Request) !void {
+        if (self.abandoned_private) |selection| {
+            try selection.validate();
+            if (selection.generation == null or self.operation != .data_retire or self.operation.data_retire.generation != selection.generation.? or
+                self.actor.session_user.kind != .bootstrap or self.actor.current_role != null or self.scope_retirement != null) return error.InvalidCatalogMutation;
+        }
         if (self.scope_retirement) |root| {
             try root.root.validate();
             if (root.expected_after) |backend| try backend.validate();
@@ -115,6 +133,12 @@ pub const Request = struct {
                 try value.command.validate();
             },
             .data_retire, .data_handoff => |value| if (value.generation == 0) return error.InvalidCatalogMutation,
+            .native_retire => |value| {
+                try value.query.physical_pin.validate();
+                if (value.generation == 0 or value.source_group_id == 0 or value.query.table_id != value.query.physical_pin.table_id or
+                    (value.handoff and value.decision == null) or self.actor.session_user.kind != .bootstrap or self.actor.current_role != null) return error.InvalidCatalogMutation;
+                if (value.decision) |decision| try decision.validate();
+            },
             .release_unadmitted => |original| {
                 try original.validate();
                 if (original.operation != .admit or !std.mem.eql(u8, &original.incarnation, &self.incarnation) or original.standalone != self.standalone or original.database_id != self.database) return error.InvalidCatalogMutation;
@@ -169,6 +193,10 @@ pub const Context = struct {
     /// catalog binding, schema, physical route and transition fences.
     enrollment: ?scopes.Data.Spec = null,
     data_proof: ?local.storage_pessimistic_lock_control.Snapshot = null,
+    native_retirement: ?NativeRetirement = null,
+    /// Only the accepting metadata writer may supply this proof after reading
+    /// the canonical job/checkpoint within the same transaction.
+    verified_retirement: ?recovery.RetiredGeneration = null,
     handoff: bool = false,
     fn nativeParticipant(self: Context, root: scopes.Record, part: scopes.Data.Participant) !struct { scope: scopes.Record, owner: scopes.ledger.Owner } {
         try self.requireOwner(root);
@@ -188,6 +216,10 @@ pub const Context = struct {
         if (native.scope.command != null or !std.meta.eql(native.scope.completed, @as(?scopes.Command, try part.admission.command())) or native.owner.waiting != null or native.owner.job != null) return error.LockOwnerBusy;
     }
     pub fn requireDataRetirement(self: Context, txn: anytype, ns: scopes.ledger.Namespace, root: scopes.Record, part: scopes.Data.Participant) !void {
+        if (self.native_retirement) |retirement| return self.requireNativeRetirement(txn, ns, root, part, retirement);
+        if (self.data_proof) |proof| if (proof.scope == null and proof.owner == null) {
+            return self.requireAbsentDataRetirement(txn, ns, root, part, proof);
+        };
         const native = try self.nativeParticipant(root, part);
         if (self.handoff) {
             const proof = self.data_proof.?;
@@ -213,6 +245,81 @@ pub const Context = struct {
         if (native.scope.state != .retired or native.scope.transaction != null or native.owner.state != .retired or native.owner.resources != 0 or native.owner.waiting != null or native.owner.job != null) return error.LockOwnerBusy;
         if (self.data_proof.?.frozen) |frozen| if (!frozen.retired or !std.mem.eql(u8, &frozen.ref.admission.transaction, &part.admission.transaction)) return error.LockOwnerBusy;
     }
+    fn requireAbsentDataRetirement(self: Context, txn: anytype, ns: scopes.ledger.Namespace, root: scopes.Record, part: scopes.Data.Participant, proof: local.storage_pessimistic_lock_control.Snapshot) !void {
+        try self.requireOwner(root);
+        if (self.handoff or proof.prepared_owner != null or proof.receipt != null or proof.row_result != null or proof.resource != null or proof.bound_control != null or proof.intent_owner != null) return error.LockOwnerBusy;
+        const frozen = proof.frozen orelse return error.LockOwnerBusy;
+        if (!frozen.retired or frozen.ref.admission.generation != part.admission.generation or
+            !frozen.ref.admission.binding.eql(part.admission.binding) or
+            !std.mem.eql(u8, &frozen.ref.admission.transaction, &part.admission.transaction)) return error.InvalidLockScope;
+        var selected = root;
+        if (selected.transaction == null) selected.transaction = selected.released_transaction;
+        const transaction = selected.transaction orelse return error.InvalidLockScope;
+        if (!std.meta.eql(transaction.decision, @as(?scopes.DecisionRef, frozen.ref.decision))) return error.InvalidLockScope;
+        const canonical = try self.record(txn, ns, selected, frozen.ref.decision);
+        try canonical.validate(self.a);
+        const decision = canonical.decision orelse return error.LockOwnerBusy;
+        if (decision.status != .aborted or (canonical.phase != .resolved and canonical.phase != .retired)) return error.LockOwnerBusy;
+        try frozen.ref.validate(canonical.identity.txn_id, try canonical.identity.owner(self.a));
+        if (!std.meta.eql(canonical.identity.lock_scope.?.command, frozen.ref.admission.parent_command)) return error.InvalidLockScope;
+        for (canonical.participants) |member| {
+            const expected = (try member.lockReference(canonical.identity, self.a)) orelse continue;
+            if (!std.meta.eql(expected, frozen.ref) or !std.mem.eql(u8, member.table_name, part.spec.table_name)) continue;
+            if (!std.meta.eql(member.schema_version, part.spec.schema_version)) return error.InvalidLockScope;
+            switch (member.route.route.execution) {
+                .native_local => if (member.route.native_participant == null or part.spec.route.native_participant == null) return error.InvalidLockScope,
+                // Permanent custody is certified by the existing ordered
+                // writer/read-index Ref. It must never claim a native Pin.
+                .raft => if (member.route.native_participant != null or part.spec.route.native_participant != null) return error.InvalidLockScope,
+            }
+            const captured = try std.json.Stringify.valueAlloc(self.a, member.route, .{});
+            const enrolled = try std.json.Stringify.valueAlloc(self.a, part.spec.route, .{});
+            if (!std.mem.eql(u8, captured, enrolled)) return error.InvalidLockScope;
+            return;
+        }
+        return error.InvalidLockScope;
+    }
+    fn requireNativeRetirement(self: Context, txn: anytype, ns: scopes.ledger.Namespace, root: scopes.Record, part: scopes.Data.Participant, retirement: NativeRetirement) !void {
+        try self.requireOwner(root);
+        const proof = self.verified_retirement orelse return error.Forbidden;
+        const route = part.spec.route;
+        if (route.route.execution != .native_local) return error.InvalidLockScope;
+        const captured = route.native_participant orelse return error.InvalidLockScope;
+        if (retirement.generation != part.admission.generation or retirement.query.table_id != route.table_id or !captured.eql(retirement.query.physical_pin) or retirement.source_group_id != route.route.group_id) return error.InvalidLockScope;
+        try proof.requireCaptured(ns.group, std.fmt.bytesToHex(ns.incarnation, .lower), retirement.source_group_id, captured);
+        if (!proof.beforeBinding().binding.descriptor.eql(route.route.execution.native_local)) return error.InvalidLockScope;
+        if (retirement.decision) |decision| {
+            const found = try prepared.readOperation(self.a, txn, ns.group, decision.operation) orelse return error.CatalogPublicationProofPending;
+            const owner = try found.identity.owner(self.a);
+            const source = found.identity.lock_scope orelse return error.InvalidLockScope;
+            const session = found.identity.session orelse return error.InvalidLockScope;
+            if (!std.mem.eql(u8, &owner.admission_digest, &decision.admission) or !source.backend.eql(root.registration.lease.backend) or
+                !std.mem.eql(u8, &found.identity.txn_id, &part.admission.transaction) or found.identity.database_id != root.registration.lease.database or
+                session.owner_node_id != root.registration.lease.node or session.standalone != root.registration.standalone or
+                session.connection_id == null or !std.mem.eql(u8, &session.connection_id.?, &root.registration.connection)) return error.InvalidLockScope;
+            var matched = false;
+            for (found.participants) |member| if (try member.lockReference(found.identity, self.a)) |reference| {
+                if (reference.admission.generation != part.admission.generation or !reference.admission.binding.eql(part.admission.binding)) continue;
+                if (member.route.route.execution != .native_local or member.route.native_participant == null or
+                    !member.route.native_participant.?.eql(captured) or !member.route.route.execution.native_local.eql(route.route.execution.native_local)) return error.InvalidLockScope;
+                matched = true;
+                break;
+            };
+            if (!matched) return error.InvalidLockScope;
+            if (retirement.handoff) {
+                if (!found.hasPreparedLocks() or found.phase != .locking) return error.InvalidPreparedTransactionPhase;
+            } else if (found.decision == null) return error.InvalidPreparedTransactionPhase;
+            // Physical loss extinguished this generation's grants. This only
+            // detaches its directory slot; it manufactures no native vote or
+            // prepared owner, and every healthy participant still resolves.
+            return;
+        }
+        if (retirement.handoff or (root.state == .active and !root.releasing)) return error.LockOwnerBusy;
+        for ([_]?scopes.Transaction{ root.transaction, root.released_transaction }) |entry| if (entry) |transaction| {
+            if (transaction.decision != null and std.mem.eql(u8, &transaction.id, &part.admission.transaction)) return error.LockOwnerBusy;
+        };
+    }
+
     pub fn requireDataEnrollment(self: Context, _: anytype, _: scopes.ledger.Namespace, value: scopes.Record, spec: scopes.Data.Spec) !void {
         try self.requireOwner(value);
         const checked = self.enrollment orelse return error.Forbidden;
@@ -336,6 +443,9 @@ pub fn apply(a: A, txn: anytype, group: u64, request: Request) !?outcomes.LockEf
     return applyWithEnrollment(a, txn, group, request, null);
 }
 pub fn applyWithEnrollment(a: A, txn: anytype, group: u64, request: Request, checked: ?scopes.Data.Spec) !?outcomes.LockEffect {
+    return applyWithEnrollmentAndRetirement(a, txn, group, request, checked, null);
+}
+pub fn applyWithEnrollmentAndRetirement(a: A, txn: anytype, group: u64, request: Request, checked: ?scopes.Data.Spec, verified_retirement: ?recovery.RetiredGeneration) !?outcomes.LockEffect {
     try request.validate();
     const ns: scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
     if (request.scope_retirement) |root| {
@@ -354,11 +464,13 @@ pub fn applyWithEnrollment(a: A, txn: anytype, group: u64, request: Request, che
         const current = try retirement.sourceCursor(txn, root.root);
         if (!std.meta.eql(if (current) |value| @as(?locks.Backend, value.backend) else null, root.expected_after)) return error.CatalogGenerationChanged;
     }
-    const context: Context = .{ .a = a, .actor = request.actor, .database = request.database, .standalone = request.standalone, .maintenance = request.operation == .close_step or request.operation == .release or request.operation == .release_unadmitted or request.operation == .fence or request.operation == .data_ack or request.operation == .data_retire or request.operation == .data_handoff, .unadmitted = if (request.operation == .release_unadmitted) request.operation.release_unadmitted else null, .enrollment = checked };
+    const context: Context = .{ .a = a, .actor = request.actor, .database = request.database, .standalone = request.standalone, .maintenance = request.operation == .close_step or request.operation == .release or request.operation == .release_unadmitted or request.operation == .fence or request.operation == .data_ack or request.operation == .data_retire or request.operation == .data_handoff or request.operation == .native_retire, .unadmitted = if (request.operation == .release_unadmitted) request.operation.release_unadmitted else null, .enrollment = checked };
     var command_context = context;
     command_context.starting_command = request.operation == .begin;
     var checked_context = context;
     checked_context.handoff = request.operation == .data_handoff;
+    checked_context.native_retirement = if (request.operation == .native_retire) request.operation.native_retire else null;
+    checked_context.verified_retirement = verified_retirement;
     checked_context.data_proof = switch (request.operation) {
         .data_ack => |value| value.native,
         .data_retire, .data_handoff => |value| value.native,
@@ -395,9 +507,10 @@ pub fn applyWithEnrollment(a: A, txn: anytype, group: u64, request: Request, che
             if (request.notification_generation) |generation| try @import("sql_notifications.zig").resetBinding(a, txn, group, request.backend, generation);
         },
         .bind => |value| try scopes.bindTransaction(a, txn, ns, request.backend, value.command, value.transaction, context),
-        .data_enroll => |value| _ = try scopes.Data.enroll(a, txn, ns, request.backend, value.command, value.transaction, value.spec, context),
+        .data_enroll => |value| _ = try scopes.Data.enroll(a, txn, ns, request.backend, value.command, value.transaction, checked orelse return error.Forbidden, context),
         .data_ack => |value| try scopes.Data.acknowledge(a, txn, ns, request.backend, value.generation, value.command, checked_context),
         .data_retire, .data_handoff => |value| try scopes.Data.retire(a, txn, ns, request.backend, value.generation, checked_context),
+        .native_retire => |value| try scopes.Data.retire(a, txn, ns, request.backend, value.generation, checked_context),
         .release => |value| _ = try scopes.releaseTransaction(a, txn, ns, request.backend, value, context),
         .release_unadmitted => |original| _ = try scopes.releaseTransaction(a, txn, ns, request.backend, .{ .id = original.operation.admit.identity.txn_id }, context),
         .renew => |value| try scopes.renew(a, txn, ns, request.backend, value.expected_expiry, value.expires_at_ms, context),
@@ -459,6 +572,7 @@ pub const Query = struct {
     /// Bounded ingress anchor: one database lookup, no backend/work scan.
     discovery: ?[]const u8 = null,
     notification_work: ?struct { after: ?[32]u8 = null } = null,
+    abandoned_private: ?@import("../metadata/abandoned_temporary_retirement.zig").Selection = null,
     database_work: ?struct { after: ?locks.Backend = null, wrap: bool = false } = null,
     notifications: ?struct { generation: u64, maximum: u16 = 128 } = null,
     participant: ?union(enum) {
@@ -466,12 +580,18 @@ pub const Query = struct {
         route: struct { spec: scopes.Data.Spec, transaction: [16]u8 },
     } = null,
     pub fn requiredDecoderVersion(self: Query) u16 {
+        if (self.abandoned_private != null) return @import("../metadata/topology_protocol.zig").sql_relation_persistence_version;
         return if (self.database_work != null) @import("../metadata/topology_protocol.zig").sql_scope_retirement_version else decoder_version;
     }
     pub fn validate(self: Query) !void {
         try self.actor.validate();
-        const selectors = @as(u8, @intFromBool(self.backend != null)) + @as(u8, @intFromBool(self.work != null)) + @as(u8, @intFromBool(self.discovery != null)) + @as(u8, @intFromBool(self.notification_work != null)) + @as(u8, @intFromBool(self.database_work != null));
+        const selectors = @as(u8, @intFromBool(self.backend != null)) + @as(u8, @intFromBool(self.work != null)) + @as(u8, @intFromBool(self.discovery != null)) + @as(u8, @intFromBool(self.notification_work != null)) + @as(u8, @intFromBool(self.database_work != null)) + @as(u8, @intFromBool(self.abandoned_private != null));
         if (selectors != 1 or (self.backend != null and std.mem.allEqual(u8, &self.incarnation, 0))) return error.InvalidCatalogMutation;
+        if (self.abandoned_private) |selection| {
+            try selection.validate();
+            if (self.actor.session_user.kind != .bootstrap or self.actor.current_role != null or self.database == 0 or
+                self.participant != null or self.notifications != null or self.effect != null) return error.Forbidden;
+        }
         if (self.database_work) |selection| {
             if (self.database == 0 or self.actor.session_user.kind != .bootstrap or self.actor.current_role != null) return error.Forbidden;
             if (selection.after) |backend| {
@@ -504,6 +624,7 @@ pub const Query = struct {
     }
 };
 pub const Snapshot = struct {
+    abandoned_private: ?@import("../metadata/abandoned_temporary_retirement.zig").Work = null,
     database_after: ?locks.Backend = null,
     notification_binding: ?@import("sql_notifications.zig").Binding = null,
     notification_work: ?@import("sql_notifications.zig").Work = null,
@@ -524,7 +645,7 @@ pub const Snapshot = struct {
     pub fn jsonStringify(self: Snapshot, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Snapshot).@"struct".field_names) |field| {
-            if (comptime std.mem.eql(u8, field, "database_after") or std.mem.eql(u8, field, "notifications") or std.mem.eql(u8, field, "notification_work") or std.mem.eql(u8, field, "notification_binding")) {
+            if (comptime std.mem.eql(u8, field, "abandoned_private") or std.mem.eql(u8, field, "database_after") or std.mem.eql(u8, field, "notifications") or std.mem.eql(u8, field, "notification_work") or std.mem.eql(u8, field, "notification_binding")) {
                 if (@field(self, field)) |page| {
                     try writer.objectField(field);
                     try writer.write(page);
@@ -544,3 +665,20 @@ pub const Observer = struct {
         if (!std.meta.eql(lease, self.registration.lease) or !effect.backend.eql(lease.backend)) return error.Forbidden;
     }
 };
+
+test "SQL relation lifetime lost directory retirement requires the accepting metadata proof" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+            return error.NotFound;
+        }
+    };
+    var txn: Fake = .{};
+    const incarnation: [16]u8 = @splat(1);
+    const root: scopes.Record = .{ .registration = .{ .group = 1, .lease = .{ .backend = .{ .incarnation = incarnation, .id = @splat(2), .fence = 1 }, .database = 4, .node = 5, .principal = @splat(6), .expires_at_ms = 1000 }, .connection = @splat('a'), .nonce = @splat(8), .standalone = false } };
+    const context: Context = .{ .a = a, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database = 4, .standalone = false, .maintenance = true };
+    const retirement: NativeRetirement = .{ .generation = 1, .source_group_id = 7, .query = .{ .table_id = 3, .physical_pin = .{ .physical_root_incarnation = 9, .table_id = 3, .shard_id = 7, .range_id = 8, .data_generation = 1 } } };
+    // No deserialized claim is sufficient. Denial occurs before reading the
+    // native participant or looking up any metadata decision.
+    try std.testing.expectError(error.Forbidden, context.requireNativeRetirement(&txn, .{ .home = .metadata, .group = 1, .incarnation = incarnation }, root, undefined, retirement));
+}

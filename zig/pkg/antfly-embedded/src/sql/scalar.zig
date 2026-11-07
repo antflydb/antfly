@@ -776,6 +776,7 @@ pub const Function = enum {
     @"$routine",
     soundex,
     difference,
+    @"$array_subscript",
     pub fn volatility(self: Function) Volatility {
         if (@import("advisory_effects.zig").function(@tagName(self)) != null) return .@"volatile";
         return switch (self) {
@@ -3509,6 +3510,7 @@ fn arity(function: Function, count: usize) !void {
         .@"$document_patch" => count == 2,
         .@"$array" => true,
         .@"$array_quantified" => count == 4,
+        .@"$array_subscript" => count >= 2 and count <= 7,
         .cardinality, .array_ndims, .jsonb_array_length, .initcap, .md5, .soundex => count == 1,
         .array_length, .array_lower, .array_upper => count == 2,
         .ai_decide, .ai_probability => count == 3,
@@ -4063,6 +4065,15 @@ const Binder = struct {
                         }
                     }
                     break :blk .{ .kind = .array, .nullable = false, .element_type = kind, .numeric_modifier = try self.commonModifier(call.args, depth) };
+                }
+                if (function == .@"$array_subscript") {
+                    const input = try self.infer(call.args[0], depth + 1);
+                    if (input.kind != .array or input.element_type == null) return error.SqlTypeMismatch;
+                    for (call.args[1..]) |index| {
+                        const actual = try self.infer(index, depth + 1);
+                        if (actual.kind != null and !numeric(actual.kind)) return error.SqlTypeMismatch;
+                    }
+                    break :blk .{ .kind = arrayScalarType(input.element_type.?), .element_type = input.element_type, .numeric_modifier = input.numeric_modifier, .nullable = true };
                 }
                 if (function == .@"$array_quantified" or function == .cardinality or function == .array_ndims or function == .array_length or function == .array_lower or function == .array_upper) {
                     const array_index: usize = if (function == .@"$array_quantified") 1 else 0;
@@ -4646,7 +4657,7 @@ const Binder = struct {
                     .array_to_string => if (i == 0) .array else .string,
                     .@"$array" => if (nested_constructor) .array else arrayScalarType(kind.element_type orelse return error.InvalidSqlProgram),
                     .@"$array_quantified" => if (i == 0) (if ((try self.infer(arg, depth + 1)).kind == .number) .number else arrayScalarType((try self.infer(call.args[1], depth + 1)).element_type.?)) else if (i == 1) .array else if (i == 2) .integer else .boolean,
-                    .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) .array else .integer,
+                    .@"$array_subscript", .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) .array else .integer,
                     .ai_decide, .ai_choice, .ai_score, .ai_probability => if ((try self.infer(arg, depth + 1)).kind == .json) .json else .string,
                     .@"$single" => if (i == 0) kind.kind else .integer,
                     .@"$pattern_quantified" => if (i == 0) .string else if (i == 1) .json else .boolean,
@@ -4728,7 +4739,9 @@ const Binder = struct {
                     continue;
                 }
                 if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(desired == .enumeration and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
-                const element_context: ?arrays.ElementType = if (function == .uuid_extract_version or function == .uuid_extract_timestamp)
+                const element_context: ?arrays.ElementType = if (function == .@"$array_subscript")
+                    (if (i == 0) (try self.infer(arg, depth + 1)).element_type else .int32)
+                else if (function == .uuid_extract_version or function == .uuid_extract_timestamp)
                     .uuid
                 else if (function == .@"$record_field" or function == .@"$record_validate")
                     (if (i == 0) .jsonb else if (i == 1) .text else kind.element_type)
@@ -6134,6 +6147,25 @@ const Evaluator = struct {
                             break :ordinary if (mixed_number) try mixedNumberQuantified(array.*, element, compare_op, every.bool, &work) else try array.quantified(element, compare_op, if (every.bool) .all else .any, &work);
                         };
                         break :blk if (accepted) |value| Datum.json(.{ .bool = value }) else .{};
+                    },
+                    .@"$array_subscript" => {
+                        const input = try self.runDatum(call.args[0], depth + 1);
+                        var indices: [6]i32 = undefined;
+                        var null_input = input.sql_null;
+                        // Every index expression is evaluated even for a NULL
+                        // source; PostgreSQL still raises demanded index errors.
+                        for (call.args[1..], 0..) |argument, subscript_ordinal| {
+                            const value = try self.runDatum(argument, depth + 1);
+                            if (value.sql_null) {
+                                null_input = true;
+                                continue;
+                            }
+                            if (value.value != .integer) return error.SqlTypeMismatch;
+                            indices[subscript_ordinal] = std.math.cast(i32, value.value.integer) orelse return error.SqlNumericOutOfRange;
+                        }
+                        if (null_input) break :blk .{};
+                        const array = input.array orelse return error.SqlTypeMismatch;
+                        break :blk array.at(indices[0 .. call.args.len - 1]) orelse .{};
                     },
                     .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => {
                         const input = try self.runDatum(call.args[0], depth + 1);
@@ -10625,4 +10657,50 @@ test "SQL phonetic prepared programs retain typed nullability and match PostgreS
     const generated = try program.evaluate(owned, &.{}, &.{}, .{ .execution_io = std.testing.io });
     try std.testing.expectEqual(@as(usize, 36), generated.value.string.len);
     try std.testing.expectEqual(@as(u8, '4'), generated.value.string[14]);
+}
+
+test "SQL trigger-compatible PostgreSQL array subscripts preserve bounds rank NULLs and element widths" {
+    for ([_][]const u8{
+        "('[0:1]={a,b}'::text[])[0] = 'a'",
+        "('[-2:-1]={a,b}'::text[])[-1] = 'b'",
+        "(ARRAY[[1,2],[3,4]])[2][1] = 3",
+        "(ARRAY[[1,2],[3,4]])[2] IS NULL",
+        "(ARRAY[1,2])[0] IS NULL",
+        "(ARRAY[1,NULL])[2] IS NULL",
+        "(ARRAY[1,2])[NULL] IS NULL",
+        "(NULL::int4[])[1] IS NULL",
+        "(ARRAY[1.25::numeric(4,2)])[1] = 1.25",
+    }) |sql| {
+        var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer parsed.deinit();
+        var program = try bind(std.testing.allocator, parsed.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        try std.testing.expect(!result.sql_null and result.value == .bool and result.value.bool);
+    }
+    var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, "(ARRAY[1]::int2[])[1]", .{});
+    defer parsed.deinit();
+    var program = try bind(std.testing.allocator, parsed.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(arrays.ElementType.int16, program.output_type.element_type.?);
+}
+
+test "SQL trigger-compatible array subscripts retain PostgreSQL grammar and demanded index errors" {
+    for ([_][]const u8{ "ARRAY[1,2][1]", "string_to_array('a,b',',')[1]", "CAST(ARRAY[1,2] AS int4[])[1]" }) |sql| {
+        try std.testing.expectError(error.InvalidSqlSyntax, @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{}));
+    }
+    for ([_]struct { sql: []const u8, err: anyerror }{
+        .{ .sql = "(NULL::int4[])[1/0]", .err = error.SqlDivisionByZero },
+        .{ .sql = "(ARRAY[1,2])[999999999999]", .err = error.SqlNumericOutOfRange },
+    }) |case| {
+        var parsed = try @import("compiler.zig").compileScalar(std.testing.allocator, case.sql, .{});
+        defer parsed.deinit();
+        var program = try bind(std.testing.allocator, parsed.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        try std.testing.expectError(case.err, program.evaluate(arena.allocator(), &.{}, &.{}, .{}));
+    }
 }

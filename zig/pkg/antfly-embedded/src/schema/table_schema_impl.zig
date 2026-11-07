@@ -48,6 +48,7 @@ fn indexPredicate(alloc: std.mem.Allocator, condition: relational_wire.Relationa
 }
 
 pub const TableSchema = struct {
+    sql_triggers: ?std.json.Parsed(@import("../system_catalog/triggers.zig").State) = null,
     version: u32 = 0,
     storage_mode: StorageMode = .document,
     external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
@@ -67,6 +68,7 @@ pub const TableSchema = struct {
     named_types: ?named_layouts.Registry = null,
 
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
+        if (self.sql_triggers) |*state| state.deinit();
         if (self.external_base_source) |*source| source.deinit(alloc);
         if (self.relational_indexes) |*indexes| indexes.deinit();
         if (self.checks) |*checks| checks.deinit();
@@ -925,6 +927,7 @@ fn parseSchemaRequest(alloc: std.mem.Allocator, body: []const u8, allow_inferenc
         try validateParsedRelationalSchema(schema);
         try validateRelationalExpressions(alloc, schema);
     }
+    if (schema.sql_triggers) |state| try @import("table_triggers.zig").canonicalize(parsed.arena.allocator(), &parsed.value, state.value);
     if (schema.named_types) |registry| try named_layouts.canonicalizeSchemaLeaky(parsed.arena.allocator(), &parsed.value, registry.records);
     return try stringifyJsonValue(alloc, parsed.value);
 }
@@ -1794,6 +1797,7 @@ fn validateSchemaValue(value: std.json.Value, strict_native_keywords: bool) !voi
         else => return error.InvalidSchemaUpdateRequest,
     };
 
+    if (strict_native_keywords and root.contains("sql_triggers")) return error.InvalidSchemaUpdateRequest;
     if (root.get("version")) |version| if (version != .null) try validateNonNegativeInteger(version);
     if (root.get("storage_mode")) |storage_mode| if (storage_mode != .null) switch (storage_mode) {
         .string => |text| {
@@ -3011,6 +3015,7 @@ fn parseTableSchemaValueMode(alloc: std.mem.Allocator, value: std.json.Value, un
     };
     errdefer parsed.deinit(alloc);
 
+    if (root.get("sql_triggers")) |state| parsed.sql_triggers = try @import("table_triggers.zig").parseValue(alloc, state);
     if (root.get("version")) |version| {
         if (version != .null) parsed.version = std.math.cast(u32, exactU64JsonNumber(version) orelse return error.InvalidSchemaUpdateRequest) orelse return error.InvalidSchemaUpdateRequest;
     }

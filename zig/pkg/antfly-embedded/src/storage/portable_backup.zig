@@ -2504,6 +2504,7 @@ const CohortImportCheckpoint = struct {
     row: u32 = 0,
     rows: u64 = 0,
     expected_rows: ?u64 = null,
+    repository_namespace_seen: bool = false,
     phase: enum { objects, layouts, public_layouts, done } = .objects,
     cursor: []const u8 = "",
     saw_rows: bool = false,
@@ -2531,11 +2532,37 @@ fn cohortPageKey(alloc: Allocator, page: u32) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:portable_cohort_page:{d}", .{page});
 }
 
+/// A repository snapshot is authenticated by its complete artifact digest,
+/// not by a distributed cohort seal. The logical decoder additionally checks
+/// the source's actual namespace and public schema before completing import.
+/// Callers must verify the full artifact digest before using this proof.
+pub const RepositorySnapshotProof = struct {
+    namespace: doc_identity.Namespace,
+    schema_digest: [32]u8,
+    artifact_digest: [32]u8,
+    fn matchesNamespace(self: @This(), raw: []const u8) !bool {
+        if (raw.len != 24) return error.InvalidDocIdentityNamespace;
+        return self.namespace.eql(.{ .table_id = std.mem.readInt(u64, raw[0..8], .big), .shard_id = std.mem.readInt(u64, raw[8..16], .big), .range_id = std.mem.readInt(u64, raw[16..24], .big) });
+    }
+    pub fn encode(self: @This()) ![88]u8 {
+        if (self.namespace.table_id == 0 or self.namespace.shard_id == 0 or self.namespace.range_id == 0 or std.mem.allEqual(u8, &self.schema_digest, 0) or std.mem.allEqual(u8, &self.artifact_digest, 0)) return error.BackupIntegrityFailure;
+        var bytes: [88]u8 = undefined;
+        std.mem.writeInt(u64, bytes[0..8], self.namespace.table_id, .little);
+        std.mem.writeInt(u64, bytes[8..16], self.namespace.shard_id, .little);
+        std.mem.writeInt(u64, bytes[16..24], self.namespace.range_id, .little);
+        @memcpy(bytes[24..56], &self.schema_digest);
+        @memcpy(bytes[56..88], &self.artifact_digest);
+        return bytes;
+    }
+};
+
 const StagedImportProof = union(enum) {
+    repository_snapshot: RepositorySnapshotProof,
     cohort: CohortProof,
     source_copy: SourceCopyProof,
     fn namespace(self: StagedImportProof) doc_identity.Namespace {
         return switch (self) {
+            .repository_snapshot => |proof| proof.namespace,
             .cohort => |proof| proof.namespace,
             .source_copy => |proof| proof.scope.fence.namespace,
         };
@@ -2543,6 +2570,10 @@ const StagedImportProof = union(enum) {
     fn digest(self: StagedImportProof) ![32]u8 {
         var hash = std.crypto.hash.Blake3.init(.{});
         switch (self) {
+            .repository_snapshot => |proof| {
+                hash.update("antfly:repository-snapshot:v1");
+                hash.update(&try proof.encode());
+            },
             .cohort => |proof| hash.update(&try proof.encode()),
             .source_copy => |proof| hash.update(&try proof.encode()),
         }
@@ -2588,6 +2619,11 @@ fn loadCohortArchive(alloc: Allocator, store: *DocStore, proof: StagedImportProo
 /// with its exact archive cursor. Source identities are rebuilt, not copied.
 pub fn importCohortFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: CohortProof, scope: [32]u8, max_rows: usize, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
     return importStagedFilePage(alloc, store, io, file, size, .{ .cohort = proof }, scope, max_rows, cancellation);
+}
+
+pub fn importRepositorySnapshotFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: RepositorySnapshotProof, scope: [32]u8, max_rows: usize, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
+    _ = try proof.encode();
+    return importStagedFilePage(alloc, store, io, file, size, .{ .repository_snapshot = proof }, scope, max_rows, cancellation);
 }
 
 pub fn importSourceCopyFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: SourceCopyProof, scope: [32]u8, max_rows: usize, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
@@ -2660,6 +2696,13 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
             state.cursor = "";
             if (state.phase == .done) {
                 try archive.finish(alloc);
+                if (proof == .repository_snapshot) {
+                    if (!state.repository_namespace_seen) return error.BackupIntegrityFailure;
+                    const source_schema = try store.get(owned, "\x00\x00__metadata__:schema_json");
+                    var source_digest: [32]u8 = undefined;
+                    std.crypto.hash.Blake3.hash(source_schema, &source_digest, .{});
+                    if (!std.mem.eql(u8, &source_digest, &proof.repository_snapshot.schema_digest)) return error.BackupIntegrityFailure;
+                }
                 if (state.rows != (state.expected_rows orelse return error.InvalidBackupManifest)) return error.InvalidBackupRequest;
                 _ = try doc_identity.loadOrInitNamespace(store, proof.namespace(), true);
             }
@@ -2708,7 +2751,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
         else => return err,
     };
     const cached = if (cache_bytes) |bytes| (try std.json.parseFromSlice(CohortCachedBlock, owned, bytes, .{})).value else null;
-    const import_artifacts = proof == .cohort and isCohortArtifactBlock(object.kind);
+    const import_artifacts = (proof == .cohort or proof == .repository_snapshot) and isCohortArtifactBlock(object.kind);
     const use_cache = (object.kind == .document_batch or import_artifacts) and cached != null and cached.?.ordinal == state.ordinal;
     const block: backup_codec.Block = .{ .block_type = object.kind, .payload = if (use_cache)
         try store.get(alloc, try cohortPageKey(owned, state.row / 128))
@@ -2718,7 +2761,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
     var writes: std.ArrayListUnmanaged(KVPair) = .empty;
     if (block.block_type == .document_batch) {
         if (state.expected_rows != null) return error.InvalidBackupManifest;
-        if (!archive.saw_cohort and !archive.saw_source_copy) return error.BackupIntegrityFailure;
+        if (proof != .repository_snapshot and !archive.saw_cohort and !archive.saw_source_copy) return error.BackupIntegrityFailure;
         const entries = try backup_codec.decodeDocumentBatchBorrowed(alloc, block.payload);
         defer alloc.free(entries);
         if (!use_cache) {
@@ -2767,7 +2810,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
         try cancellation.check();
         try validateAndImportDocumentEntries(alloc, store, selected, &archive, writes.items);
     } else if (import_artifacts) {
-        if (!archive.saw_cohort) return error.BackupIntegrityFailure;
+        if (proof != .repository_snapshot and !archive.saw_cohort) return error.BackupIntegrityFailure;
         if (!use_cache) {
             if (state.row != 0) return error.InvalidRestoreSourceCheckpoint;
             // Only logical, document-owned artifacts cross the restore boundary.
@@ -2812,6 +2855,13 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
         try store.putBatch(writes.items, &.{});
     } else {
         if (state.row != 0) return error.InvalidRestoreSourceCheckpoint;
+        if (proof == .repository_snapshot and block.block_type == .doc_identity_batch) {
+            const identities = try backup_codec.decodeKeyValueBatch(owned, block.payload);
+            for (identities) |entry| if (std.mem.eql(u8, entry.key, &internal_keys.identity_namespace_key)) {
+                if (state.repository_namespace_seen or !try proof.repository_snapshot.matchesNamespace(entry.value)) return error.BackupIntegrityFailure;
+                state.repository_namespace_seen = true;
+            };
+        }
         if (block.block_type == .metadata_batch) {
             if (state.saw_rows) return error.InvalidBackupManifest;
             const entries = try backup_codec.decodeKeyValueBatch(owned, block.payload);

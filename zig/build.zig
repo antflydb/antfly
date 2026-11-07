@@ -1107,6 +1107,51 @@ pub fn create(b: *std.Build) ?Artifacts {
     }) });
     b.step("antfly-pessimistic-lock-ledger-test", "Verify exact lock effects, atomic ownership and bounded receipts").dependOn(&b.addRunArtifact(pessimistic_ledger_tests).step);
 
+    const retained_graph_tests = b.addTest(.{ .filters = &.{"retained graph "}, .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/retained_graph_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    production_antfly_imports.configureStorage(b, retained_graph_tests.root_module, true);
+    production_antfly_imports.storage_boundary.configureSources(retained_graph_tests.root_module, false, false);
+    b.step("antfly-retained-graph-test", "Verify immutable graph cuts retain backing stores across index retirement").dependOn(&b.addRunArtifact(retained_graph_tests).step);
+
+    const retained_graph_db_tests = b.addTest(.{ .filters = &.{"retained graph statement cut"}, .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/retained_graph_db_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    production_antfly_imports.configureStorage(b, retained_graph_db_tests.root_module, true);
+    production_antfly_imports.storage_boundary.configureSources(retained_graph_db_tests.root_module, false, false);
+    b.step("antfly-retained-graph-db-test", "Verify primary and graph snapshots share one completed replay cut").dependOn(&b.addRunArtifact(retained_graph_db_tests).step);
+
+    const native_fk_generation_tests = b.addTest(.{
+        .filters = &.{ "SQL relation lifetime native missing BEGIN retention snapshots", "row-policy coupled schema", "storage.db snapshot mutation move releases its sole reader before capture", "db native checked atomic intent commits rows and unique effects once without participant records", "db native checked atomic providers", "db SQL relation lifetime FK receipt positions", "SQL relation lifetime applied FK receipt", "db owner reopen pins old child schema", "db native FK generation receipts survive restart", "db native lost-image target", "db native schema-only snapshot target", "db native unpublished empty image replacement", "native empty origins", "native empty attempt marker", "native lost-image", "db native never acknowledged", "db native source retirement", "SQL relation lifetime abandoned private group", "UNLOGGED schema only", "UNLOGGED portable logical manifest" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/native_fk_generation_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    production_antfly_imports.configureStorage(b, native_fk_generation_tests.root_module, true);
+    production_antfly_imports.storage_boundary.configureSources(native_fk_generation_tests.root_module, false, false);
+    @import("build_support/antfly/test_support.zig").addTestCheckStep(b, native_fk_generation_tests, "antfly-native-fk-generation-check", "Type-check the owning native generation tests without emitting their binary");
+    const native_fk_generation_run = b.addRunArtifact(native_fk_generation_tests);
+    native_fk_generation_run.addArg("--require-no-skips");
+    b.step("antfly-native-fk-generation-test", "Verify native FK control and schema receipts commit atomically and survive replay/restart").dependOn(&native_fk_generation_run.step);
+
+    const native_graph_contract = b.addTest(.{
+        .filters = &.{ "db graph transaction effects", "db graph schema NONE", "prepared graph", "graph intent reader fence", "graph preparation native absence", "graph preparation schema NONE", "shared mutation coalescing", "SQL trigger frame uses stable logical identity", "trigger absence layout accepts opaque unsigned identity" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/graph_transaction_test_root.zig"), .target = target, .optimize = optimize }),
+    });
+    production_antfly_imports.configureStorage(b, native_graph_contract.root_module, true);
+    production_antfly_imports.storage_boundary.configureSources(native_graph_contract.root_module, false, false);
+    const native_graph_contract_run = b.addRunArtifact(native_graph_contract);
+    native_graph_contract_run.addArg("--require-no-skips");
+    b.step("antfly-native-graph-transaction-test", "Qualify real graph intent vote atomic commit abort and cold replay").dependOn(&native_graph_contract_run.step);
+
     const graph_transfer_tests = b.addTest(.{ .filters = &.{ "online graph transfer", "ordered artifact inventory graph mutation", "physical artifact catalog view", "source artifact batch", "source artifact descriptors", "ordered artifact inventory source layout cache" }, .root_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/graph_transfer_test.zig"),
         .target = target,

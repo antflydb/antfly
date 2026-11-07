@@ -59,10 +59,24 @@ pub const Binding = struct {
     id: u64,
     schema_version: u32,
     revision: u64,
+    /// Binds an immutable native lifetime independently of schema-version reuse.
+    sql_persistence_fingerprint: ?[32]u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            const emit = if (comptime std.mem.eql(u8, name, "sql_persistence_fingerprint")) self.sql_persistence_fingerprint != null else true;
+            if (emit) {
+                try jw.objectField(name);
+                try jw.write(@field(self, name));
+            }
+        }
+        try jw.endObject();
+    }
 
     pub fn from(table: catalog.Table) !Binding {
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
-        return .{ .database = scope.database, .namespace = scope.namespace, .name = scope.name, .physical_name = table.physical_name, .id = table.id, .schema_version = table.schema_version, .revision = scope.revision };
+        return .{ .database = scope.database, .namespace = scope.namespace, .name = scope.name, .physical_name = table.physical_name, .id = table.id, .schema_version = table.schema_version, .revision = scope.revision, .sql_persistence_fingerprint = if (table.sql_persistence) |descriptor| try descriptor.fingerprint() else null };
     }
 
     pub fn verify(bindings: []const Binding, table: catalog.Table) !void {
@@ -70,7 +84,7 @@ pub const Binding = struct {
         for (bindings) |entry| {
             if (entry.kind != .table) continue;
             if (!std.mem.eql(u8, entry.database, current.database) or !std.mem.eql(u8, entry.namespace, current.namespace) or !std.mem.eql(u8, entry.name, current.name)) continue;
-            if (entry.id != current.id or entry.schema_version != current.schema_version or entry.revision != current.revision or !std.mem.eql(u8, entry.physical_name, current.physical_name)) return error.CatalogGenerationChanged;
+            if (entry.id != current.id or entry.schema_version != current.schema_version or entry.revision != current.revision or !std.meta.eql(entry.sql_persistence_fingerprint, current.sql_persistence_fingerprint) or !std.mem.eql(u8, entry.physical_name, current.physical_name)) return error.CatalogGenerationChanged;
             return;
         }
         return error.CatalogGenerationChanged;

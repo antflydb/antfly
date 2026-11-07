@@ -4929,11 +4929,17 @@
         "zig",
         "build",
         "antfly-api-sql-case-cohort-test",
-        "-Dtest-filter=mounted SQL document view guards",
-        "-Dtest-filter=mounted SQL original canonical MATCH",
-        "-Dtest-filter=SQL native graph",
         "-Doptimize=Debug",
-        "-j1"
+        "-j1",
+        "--summary",
+        "all",
+        "-Dtest-filter=mounted SQL original canonical MATCH",
+        "-Dtest-filter=mounted SQL document view guards",
+        "-Dtest-filter=mounted SQL graph joined hits",
+        "-Dtest-filter=SQL native graph",
+        "-Dtest-filter=retained graph",
+        "-Dtest-filter=SQL policy publication",
+        "-Dtest-filter=SQL relation lifetime"
       ],
       "cwd": "zig",
       "timeout_seconds": 1800
@@ -4950,6 +4956,119 @@
         "scripts/generate_sql_view_guard_reference.py",
         "--check",
         "zig/pkg/antfly/src/api/fixtures/sql_view_guard_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-graph-cut-capability-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-retained-graph-test",
+        "antfly-retained-graph-db-test",
+        "antfly-metadata-graph-row-policy-test",
+        "-Doptimize=Debug",
+        "-j1",
+        "--summary",
+        "all"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-schema-retirement-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "--build-file",
+        "zig/build.zig",
+        "antfly-api-sql-schema-retirement-test",
+        "-Dtest-filter=mounted SQL scope retirement capture completes original schema CASCADE",
+        "-Dtest-filter=SQL scope retirement schema",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-schema-retirement-metadata-debug": {
+      "command": [
+        "zig",
+        "build",
+        "--build-file",
+        "zig/build.zig",
+        "antfly-metadata-scope-retirement-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-source-mutation-domains-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "--build-file",
+        "zig/build.zig",
+        "antfly-api-sql-source-mutation-domain-test",
+        "-Doptimize=Debug",
+        "-Dtest-filter=mounted SQL original UUID mutation domains",
+        "-j1",
+        "--summary",
+        "all"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-source-mutation-domains-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_source_mutation_domain_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_source_mutation_domain_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-table-trigger-originals-public-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-trigger-originals-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-table-trigger-originals-metadata-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-storage-query-binding-test",
+        "antfly-metadata-graph-logical-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-table-trigger-attachments-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_trigger_attachment_reference.py",
+        "--check"
       ],
       "cwd": ".",
       "timeout_seconds": 180
@@ -6772,8 +6891,30 @@
     },
     {
       "id": "sql-0105",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original DROP SCHEMA IF EXISTS CASCADE executes through the shared durable ancestor-retirement journal for populated local typed and document owners. Mounted authenticated SQL verifies RESTRICT and reader denial, internal FK/view/sequence retirement, unrelated-row preservation, exact receipt recovery, full owner restart and immutable schema-name reuse. Scope receipts bind durable authorization labels even for denied admissions without a reserved head. External survivor rewrites and explicit-transaction catalog rollback remain guarded and are tracked as unfinished architecture, not claimed by this local-owner witness.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_database_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement capture completes original schema CASCADE across mixed owners and cold recovery",
+          "gate": "sql-qualified-schema-retirement-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_scope_retirement.zig",
+          "test": "SQL scope retirement schema receipts reject relabeled kinds names and replacement roots",
+          "gate": "sql-qualified-schema-retirement-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_scope_retirement.zig",
+          "test": "SQL scope retirement schema recovery releases owned receipt on observation failure",
+          "gate": "sql-qualified-schema-retirement-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/scope_retirement_test.zig",
+          "test": "SQL scope retirement native admission fences capability stale cuts nonce substitution and intersecting catalog writes",
+          "gate": "sql-qualified-schema-retirement-metadata-debug"
+        }
+      ]
     },
     {
       "id": "sql-0106",
@@ -12753,7 +12894,7 @@
     {
       "id": "sql-0405",
       "status": "implemented",
-      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and mutation dispatch remain separately unresolved.",
+      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and all-ingress mutation dispatch have separate qualification gates.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
@@ -12785,7 +12926,7 @@
     {
       "id": "sql-0406",
       "status": "implemented",
-      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and mutation dispatch remain separately unresolved.",
+      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and all-ingress mutation dispatch have separate qualification gates.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
@@ -12817,7 +12958,7 @@
     {
       "id": "sql-0407",
       "status": "implemented",
-      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and mutation dispatch remain separately unresolved.",
+      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and all-ingress mutation dispatch have separate qualification gates.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
@@ -12849,7 +12990,7 @@
     {
       "id": "sql-0408",
       "status": "implemented",
-      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and mutation dispatch remain separately unresolved.",
+      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and all-ingress mutation dispatch have separate qualification gates.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
@@ -12881,7 +13022,7 @@
     {
       "id": "sql-0409",
       "status": "implemented",
-      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and mutation dispatch remain separately unresolved.",
+      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and all-ingress mutation dispatch have separate qualification gates.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
@@ -12913,7 +13054,7 @@
     {
       "id": "sql-0410",
       "status": "implemented",
-      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and mutation dispatch remain separately unresolved.",
+      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and all-ingress mutation dispatch have separate qualification gates.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
@@ -18957,18 +19098,84 @@
     },
     {
       "id": "sql-0751",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged CREATE TRIGGER executes through authenticated public SQL and actual native catalog/data owners. Its omitted FOR EACH ROW retains PostgreSQL statement timing: one notice, a zero-based TG_ARGV argument and unchanged row identity. The mounted campaign checks demanded division-by-zero rollback, complete mutation postimages, durable attachment publication and full cold restart against independent PostgreSQL 18 evidence. Broader document/FK/native-population fault campaigns remain separate qualification requirements.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_trigger_integration_test.zig",
+          "test": "mounted PostgreSQL original trigger attachment replacement and retirement preserve default statement semantics across native cold restart",
+          "gate": "sql-table-trigger-originals-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/trigger_catalog.zig",
+          "test": "trigger catalog stages routine edges atomically and previews without writes",
+          "gate": "sql-table-trigger-originals-metadata-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL relation OID committed replay keeps predecessor tables readable and activates fresh identities only at actual174",
+          "gate": "sql-table-trigger-originals-metadata-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_trigger_integration_test.zig",
+          "test": "mounted PostgreSQL original trigger attachment replacement and retirement preserve default statement semantics across native cold restart",
+          "gate": "sql-table-trigger-attachments-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0752",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged CREATE OR REPLACE TRIGGER executes through authenticated public SQL, preserving the attachment ID and advancing its generation. The mounted campaign verifies PostgreSQL default statement semantics, exact arguments/notices and row postimages, demanded-error rollback and subsequent schema publication across a full native catalog/data restart. Table/routine dependencies and SQL logical identity use the actual same-cut catalog; broader ingress and restore fault campaigns remain separately qualified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_trigger_integration_test.zig",
+          "test": "mounted PostgreSQL original trigger attachment replacement and retirement preserve default statement semantics across native cold restart",
+          "gate": "sql-table-trigger-originals-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/trigger_catalog.zig",
+          "test": "trigger catalog stages routine edges atomically and previews without writes",
+          "gate": "sql-table-trigger-originals-metadata-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL relation OID committed replay keeps predecessor tables readable and activates fresh identities only at actual174",
+          "gate": "sql-table-trigger-originals-metadata-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_trigger_integration_test.zig",
+          "test": "mounted PostgreSQL original trigger attachment replacement and retirement preserve default statement semantics across native cold restart",
+          "gate": "sql-table-trigger-attachments-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0753",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged DROP TRIGGER executes through authenticated public SQL and the durable table/routine dependency transaction. Subsequent mutations no longer invoke the attachment, complete row bags match PostgreSQL, and a full native catalog/data restart preserves the retired attachment without re-firing it. The mounted campaign also verifies replacement identity and exact demanded-error rollback; this is not blanket qualification of unfinished ingress, population or distributed restore campaigns.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_trigger_integration_test.zig",
+          "test": "mounted PostgreSQL original trigger attachment replacement and retirement preserve default statement semantics across native cold restart",
+          "gate": "sql-table-trigger-originals-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/trigger_catalog.zig",
+          "test": "trigger catalog stages routine edges atomically and previews without writes",
+          "gate": "sql-table-trigger-originals-metadata-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL relation OID committed replay keeps predecessor tables readable and activates fresh identities only at actual174",
+          "gate": "sql-table-trigger-originals-metadata-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_trigger_integration_test.zig",
+          "test": "mounted PostgreSQL original trigger attachment replacement and retirement preserve default statement semantics across native cold restart",
+          "gate": "sql-table-trigger-attachments-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0754",
@@ -26946,18 +27153,62 @@
     },
     {
       "id": "sql-1207",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original graph TVF join executes through a typed hit relation and ordinary SQL join, projection, ordering and limit. Graph adjacency and primary rows share a retained owner cohort with graph source-watermark proofs. Mounted witnesses verify complete bags, deterministic tie-breaks, TEXT IDs, absent native scores as FLOAT8 SQL NULL with explicit null bitmaps, credential filters, SQL RLS on anchors/intermediates/targets, writes after policy activation, and cold restart. Native tests qualify retained lifetimes, lag refusal, pinned TTL, allocation cleanup and durable data-owner capability admission. Explicit transactions and unsupported graph shapes remain guarded.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_graph_match_integration_test.zig",
+          "test": "mounted SQL original canonical MATCH preserves binding projection depth order filters and cold graph state",
+          "gate": "sql-qualified-graph-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_graph_join_rls_integration_test.zig",
+          "test": "mounted SQL graph joined hits compose credential and SQL policies for anchors intermediates targets and cold epochs",
+          "gate": "sql-qualified-graph-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/graph_statement_snapshot_test.zig",
+          "test": "retained graph statement cut preserves primary row and graph generation across mutation and index drop",
+          "gate": "sql-qualified-graph-cut-capability-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "row-policy graph publication requires durable data-owner capability and rejects downgrade across cold restore",
+          "gate": "sql-qualified-graph-cut-capability-debug"
+        }
+      ]
     },
     {
       "id": "sql-1208",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original graph TVF join executes through a typed hit relation and ordinary SQL join, projection, ordering and limit. Graph adjacency and primary rows share a retained owner cohort with graph source-watermark proofs. Mounted witnesses verify complete bags, deterministic tie-breaks, TEXT IDs, absent native scores as FLOAT8 SQL NULL with explicit null bitmaps, credential filters, SQL RLS on anchors/intermediates/targets, writes after policy activation, and cold restart. Native tests qualify retained lifetimes, lag refusal, pinned TTL, allocation cleanup and durable data-owner capability admission. Explicit transactions and unsupported graph shapes remain guarded.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_graph_match_integration_test.zig",
+          "test": "mounted SQL original canonical MATCH preserves binding projection depth order filters and cold graph state",
+          "gate": "sql-qualified-graph-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_graph_join_rls_integration_test.zig",
+          "test": "mounted SQL graph joined hits compose credential and SQL policies for anchors intermediates targets and cold epochs",
+          "gate": "sql-qualified-graph-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/graph_statement_snapshot_test.zig",
+          "test": "retained graph statement cut preserves primary row and graph generation across mutation and index drop",
+          "gate": "sql-qualified-graph-cut-capability-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "row-policy graph publication requires durable data-owner capability and rejects downgrade across cold restore",
+          "gate": "sql-qualified-graph-cut-capability-debug"
+        }
+      ]
     },
     {
       "id": "sql-1209",
       "status": "implemented",
-      "reason": "The exact original standalone MATCH executes through the canonical native graph engine with real binding keys/depth, then ordinary SQL projection, ordering and limit. Native in-process delivery avoids graph wire serialization that discards depth. The mounted witness verifies complete binding bags, ordering/limit, credential ID filters, hidden anchors and cold graph restart; native finite Boolean ID resolution preserves authorization and allocation-failure cleanup. Shared graph/table cuts, delegated policy authority and explicit transactions remain guarded; joined originals 1207/1208 are not credited.",
+      "reason": "The exact original standalone MATCH executes through the canonical native graph engine with real binding keys/depth, then ordinary SQL projection, ordering and limit. Native in-process delivery avoids graph wire serialization that discards depth. The mounted witness verifies complete binding bags, ordering/limit, credential ID filters, hidden anchors and cold graph restart; native finite Boolean ID resolution preserves authorization and allocation-failure cleanup. Joined graph/table cuts are independently qualified by originals 1207/1208 through the graph TVF path. Standalone canonical MATCH retains explicit transaction, delegated-authority and unsupported SQL-policy guards; joined TVF policy support does not imply standalone MATCH policy support.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/sql_graph_match_integration_test.zig",
@@ -30364,8 +30615,20 @@
     },
     {
       "id": "sql-1403",
-      "status": "unresolved",
-      "reason": "The source setup declares a UUID id and NUMERIC updated_at_ns, including placeholder resolver IDs that need independent source-domain/admission adjudication. The supplemental TEXT/BIGINT temporal-domain campaign is not evidence for this original and does not close it."
+      "status": "superseded",
+      "reason": "The original UUID/NUMERIC fixture first tries to VALIDATE a standalone index as a constraint (42704); its unchanged INSERT then rejects placeholder UUID u2 with 22P02 before later conflict arithmetic. No NUMERIC+INTERVAL overload is certified. Independent PostgreSQL verifies unchanged source setup and INSERT text; the mounted public native campaign matches the exact diagnostics with UUID source types retained, verifies complete rows/OIDs/SQL NULL provenance plus unchanged primary versions/digests and schema/index identities, executes valid typed upsert neighbors, and repeats after one independent cold owner/catalog restart. This supersedes the historical successful native-equivalence contract; it is not an unsupported-shape fallback or a TEXT-schema substitution.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_source_mutation_domain_integration_test.zig",
+          "test": "mounted SQL original UUID mutation domains preserve diagnostics complete postimages and cold native state",
+          "gate": "sql-qualified-source-mutation-domains-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_source_mutation_domain_integration_test.zig",
+          "test": "mounted SQL original UUID mutation domains preserve diagnostics complete postimages and cold native state",
+          "gate": "sql-qualified-source-mutation-domains-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1404",
@@ -31675,13 +31938,37 @@
     },
     {
       "id": "sql-1468",
-      "status": "unresolved",
-      "reason": "The source setup declares UUID id and TIMESTAMPTZ updated_at_ns, with placeholder UUIDs, nanosecond proposal values and private-era index validation preconditions requiring separate source-faithful adjudication. Supplemental TEXT/BIGINT assignment witnesses deliberately earn no credit for this original."
+      "status": "superseded",
+      "reason": "The original UUID/TIMESTAMPTZ fixture first tries to VALIDATE a standalone index as a constraint (42704); its unchanged INSERT then rejects placeholder UUID u2 with 22P02. Neither the nanosecond proposal nor the invalid numeric date_bin overload is certified by that earlier rejection. Independent PostgreSQL verifies unchanged source setup and INSERT text; the mounted public native campaign matches the exact diagnostics with UUID source types retained, verifies complete rows/OIDs/SQL NULL provenance plus unchanged primary versions/digests and schema/index identities, executes valid typed upsert neighbors, and repeats after one independent cold owner/catalog restart. This supersedes the historical successful native-equivalence contract; it is not an unsupported-shape fallback or a TEXT-schema substitution.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_source_mutation_domain_integration_test.zig",
+          "test": "mounted SQL original UUID mutation domains preserve diagnostics complete postimages and cold native state",
+          "gate": "sql-qualified-source-mutation-domains-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_source_mutation_domain_integration_test.zig",
+          "test": "mounted SQL original UUID mutation domains preserve diagnostics complete postimages and cold native state",
+          "gate": "sql-qualified-source-mutation-domains-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1469",
-      "status": "unresolved",
-      "reason": "The source setup declares UUID id and TIMESTAMPTZ updated_at_ns, with placeholder UUIDs, nanosecond proposal values and private-era index validation preconditions requiring separate source-faithful adjudication. Supplemental TEXT/BIGINT assignment witnesses deliberately earn no credit for this original."
+      "status": "superseded",
+      "reason": "The original UUID/TIMESTAMPTZ fixture first tries to VALIDATE a standalone index as a constraint (42704); its unchanged INSERT then rejects placeholder UUID u2 with 22P02. The fixture's nanosecond proposal is not silently coerced into a timestamp. Independent PostgreSQL verifies unchanged source setup and INSERT text; the mounted public native campaign matches the exact diagnostics with UUID source types retained, verifies complete rows/OIDs/SQL NULL provenance plus unchanged primary versions/digests and schema/index identities, executes valid typed upsert neighbors, and repeats after one independent cold owner/catalog restart. This supersedes the historical successful native-equivalence contract; it is not an unsupported-shape fallback or a TEXT-schema substitution.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_source_mutation_domain_integration_test.zig",
+          "test": "mounted SQL original UUID mutation domains preserve diagnostics complete postimages and cold native state",
+          "gate": "sql-qualified-source-mutation-domains-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_source_mutation_domain_integration_test.zig",
+          "test": "mounted SQL original UUID mutation domains preserve diagnostics complete postimages and cold native state",
+          "gate": "sql-qualified-source-mutation-domains-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1470",
@@ -31787,8 +32074,20 @@
     },
     {
       "id": "sql-1476",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The source declares UUID id but supplies placeholder u1; unchanged original SQL receives PostgreSQL 22P02 before the later conflict expression can execute. No uuid-ossp extension/function claim is inferred from this rejection; valid UUID neighboring upserts exercise the same durable native path. Independent PostgreSQL verifies unchanged source setup and INSERT text; the mounted public native campaign matches the exact diagnostics with UUID source types retained, verifies complete rows/OIDs/SQL NULL provenance plus unchanged primary versions/digests and schema/index identities, executes valid typed upsert neighbors, and repeats after one independent cold owner/catalog restart. This supersedes the historical successful native-equivalence contract; it is not an unsupported-shape fallback or a TEXT-schema substitution.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_source_mutation_domain_integration_test.zig",
+          "test": "mounted SQL original UUID mutation domains preserve diagnostics complete postimages and cold native state",
+          "gate": "sql-qualified-source-mutation-domains-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_source_mutation_domain_integration_test.zig",
+          "test": "mounted SQL original UUID mutation domains preserve diagnostics complete postimages and cold native state",
+          "gate": "sql-qualified-source-mutation-domains-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1477",

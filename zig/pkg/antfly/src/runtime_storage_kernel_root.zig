@@ -87,6 +87,8 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerContextConfigureRemoteContentSource, "antfly_storage_context_configure_remote_content_source");
     exportInternal(&storage_kernel_exports.storageOwnerContextConfigureRemoteContentSecurity, "antfly_storage_context_configure_remote_content_security");
     exportInternal(&storage_kernel_exports.storageOwnerContextMetrics, "antfly_storage_context_metrics");
+    exportInternal(&storage_kernel_exports.storageOwnerContextRelationLifetime, "antfly_storage_context_relation_lifetime");
+    exportInternal(&storage_kernel_exports.storageOwnerCloseFallible, "antfly_storage_owner_close_fallible");
     exportInternal(&storage_kernel_exports.storageOwnerContextInvalidateCaches, "antfly_storage_context_invalidate_caches");
     exportInternal(&storage_kernel_exports.storageContextSystemStoreOpen, "antfly_storage_context_system_store_open");
     exportInternal(&storage_kernel_exports.storageSystemStoreClose, "antfly_storage_system_store_close");

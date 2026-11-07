@@ -30,6 +30,7 @@ pub const restore_parent_activation = @import("restore_parent_activation.zig");
 pub const relational_fk_generation_publication = @import("relational_fk_generation_publication.zig");
 pub const relational_index_owner_execution = @import("relational_index_owner_execution.zig");
 pub const schema_validation_preparation = @import("schema_validation_preparation.zig");
+pub const table_retirement_preparation = @import("table_retirement_preparation.zig");
 pub const row_policy_install = @import("row_policy_install.zig");
 pub const row_policy_publication_coordinator = @import("row_policy_publication_coordinator.zig");
 pub const fk_generation_publication_coordinator = @import("fk_generation_publication_coordinator.zig");

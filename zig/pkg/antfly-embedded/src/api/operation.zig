@@ -143,8 +143,16 @@ pub const RequestContext = struct {
     /// Captured by the durable SQL command owner. Catalog adapters bind this
     /// into their existing mutation identities before any forwarding.
     sql_command_fence: ?*const @import("../storage/pessimistic_lock_authority.zig").CommandFence = null,
+    /// Session identity captured from the authenticated durable connection
+    /// under its command lease. Never parsed from public request JSON or
+    /// borrowed from a cached table owner. Native host epochs are per table.
+    sql_relation_owner: ?@import("../common/relation_persistence.zig").Owner = null,
+    /// Process-local body-bound signer for native range activation. Never decoded.
+    sql_relation_owner_minter: ?@import("../common/relation_owner_authority.zig").Minter = null,
     /// Borrowed preparation broker; never serialized or invoked by Raft apply.
     column_sequences: ?@import("../system_catalog/column_sequences.zig").Provider = null,
+    /// Live trigger coordinator; never accepted from public or replicated JSON.
+    table_triggers: ?@import("../sql/trigger_provider.zig").Provider = null,
     /// Captured by the authenticated SQL transaction owner, never decoded
     /// from public request JSON. Shared by normalization and FK cascades.
     sql_transaction_micros: ?i64 = null,

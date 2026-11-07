@@ -29590,6 +29590,26 @@ components:
 
             On restore, the format is auto-detected from file magic bytes.
           example: portable
+    RestoreRoutineMapping:
+      type: object
+      additionalProperties: false
+      required:
+        - source_metadata_incarnation
+        - source_routine_id
+        - destination_routine_id
+      properties:
+        source_metadata_incarnation:
+          type: string
+          pattern: ^[0-9a-f]{32}$
+          description: Metadata catalog incarnation recorded in the source attachment.
+        source_routine_id:
+          type: string
+          pattern: ^[1-9][0-9]{0,19}$
+          description: Immutable source function identifier, expressed losslessly as decimal.
+        destination_routine_id:
+          type: string
+          pattern: ^[1-9][0-9]{0,19}$
+          description: Existing immutable destination function identifier, expressed losslessly as decimal.
     RestoreRequest:
       type: object
       additionalProperties: false
@@ -29598,6 +29618,23 @@ components:
         - location
         - connection
       properties:
+        routine_mappings:
+          type: array
+          maxItems: 256
+          items:
+            $ref: '#/components/schemas/RestoreRoutineMapping'
+          description: >
+            Explicit immutable routine identity handoff for trigger attachments.
+
+            Cross-catalog restores require a mapping for every referenced trigger
+
+            function. Destination functions must already exist and be authorized
+
+            compatible zero-argument trigger functions. Routine bodies and names
+
+            are never imported or rebound by this operation. Mappings are part
+
+            of the durable job and its idempotency identity.
         backup_id:
           type: string
           minLength: 1
@@ -29812,6 +29849,23 @@ components:
         - location
         - connection
       properties:
+        routine_mappings:
+          type: array
+          maxItems: 256
+          items:
+            $ref: '#/components/schemas/RestoreRoutineMapping'
+          description: >
+            Explicit immutable routine identity handoff for trigger attachments.
+
+            Cross-catalog restores require a mapping for every referenced trigger
+
+            function. Destination functions must already exist and be authorized
+
+            compatible zero-argument trigger functions. Routine bodies and names
+
+            are never imported or rebound by this operation. Mappings are part
+
+            of the durable job and its idempotency identity.
         backup_id:
           type: string
           minLength: 1

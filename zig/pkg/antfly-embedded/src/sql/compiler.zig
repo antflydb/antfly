@@ -51,7 +51,76 @@ pub const Error = std.mem.Allocator.Error || error{
     SqlInvalidTableDefinition,
     SqlTriggerDeclaredArguments,
     SqlTriggerSqlLanguage,
+    InvalidSqlTriggerDefinition,
 };
+
+test "compiler original table triggers preserve PostgreSQL statement level and replacement intent" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0751", "sql-0752", "sql-0753" }, 0..) |id, index| {
+        var compiled = try compile(a, (try corpus.get(id)).sql, .{});
+        defer compiled.deinit();
+        const syntax = compiled.statement.catalog_ddl.trigger.?;
+        try std.testing.expectEqualStrings("update_timestamp", syntax.name);
+        try std.testing.expectEqualStrings("usage_records", syntax.table.table);
+        if (index == 2) {
+            try std.testing.expect(syntax.operation.drop.if_exists);
+        } else {
+            const create = syntax.operation.create;
+            try std.testing.expectEqual(index == 1, create.replace);
+            try std.testing.expectEqual(.before, create.timing);
+            try std.testing.expectEqual(.statement, create.level);
+            try std.testing.expect(create.events.update);
+            try std.testing.expectEqualStrings("touch_updated_at", create.function.table);
+            try std.testing.expectEqualStrings("updated_at_ns", create.arguments[0]);
+        }
+    }
+}
+
+test "compiler row triggers retain event selection predicate and literal arguments" {
+    const a = std.testing.allocator;
+    var compiled = try compile(a, "CREATE TRIGGER touch AFTER UPDATE OF value, status OR INSERT ON public.rows FOR EACH ROW WHEN (NEW.value > 0) EXECUTE FUNCTION helpers.audit('a''b', label, -42)", .{});
+    defer compiled.deinit();
+    const create = compiled.statement.catalog_ddl.trigger.?.operation.create;
+    try std.testing.expectEqual(.row, create.level);
+    try std.testing.expect(create.events.insert and create.events.update);
+    try std.testing.expectEqualStrings("value", create.update_columns[0]);
+    try std.testing.expectEqualStrings("status", create.update_columns[1]);
+    try std.testing.expect(create.predicate != null);
+    try std.testing.expectEqualStrings("helpers", create.function.namespace.?);
+    try std.testing.expectEqualStrings("a'b", create.arguments[0]);
+    try std.testing.expectEqualStrings("label", create.arguments[1]);
+    try std.testing.expectEqualStrings("-42", create.arguments[2]);
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TRIGGER touch BEFORE UPDATE OR UPDATE ON rows EXECUTE FUNCTION f()", .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(a, "CREATE TRIGGER touch AFTER TRUNCATE ON rows FOR EACH ROW EXECUTE FUNCTION f()", .{}));
+    try std.testing.expectError(error.DuplicateSqlColumn, compile(a, "CREATE TRIGGER touch BEFORE UPDATE OF x,x ON rows EXECUTE FUNCTION f()", .{}));
+}
+
+test "compiler table lifetimes preserve explicit ON COMMIT intent for creation and population" {
+    const a = std.testing.allocator;
+    for ([_]struct { clause: []const u8, action: ast.RelationPopulation.OnCommit }{
+        .{ .clause = "PRESERVE ROWS", .action = .preserve_rows },
+        .{ .clause = "DELETE ROWS", .action = .delete_rows },
+        .{ .clause = "DROP", .action = .drop },
+    }) |case| {
+        const ordinary = try std.fmt.allocPrint(a, "CREATE TEMP TABLE rows (id bigint) ON COMMIT {s}", .{case.clause});
+        defer a.free(ordinary);
+        var compiled = try compile(a, ordinary, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(.temporary, compiled.statement.create_table.persistence);
+        try std.testing.expectEqual(case.action, compiled.statement.create_table.on_commit.?);
+        const population = try std.fmt.allocPrint(a, "CREATE TEMP TABLE rows ON COMMIT {s} AS SELECT 1 AS id", .{case.clause});
+        defer a.free(population);
+        var populated = try compile(a, population, .{});
+        defer populated.deinit();
+        const intent = populated.statement.catalog_ddl.population.?;
+        try std.testing.expectEqual(.temporary, intent.persistence);
+        try std.testing.expectEqual(case.action, intent.on_commit.?);
+    }
+    try std.testing.expectError(error.SqlInvalidTableDefinition, compile(a, "CREATE TABLE rows (id bigint) ON COMMIT DROP", .{}));
+    try std.testing.expectError(error.SqlInvalidTableDefinition, compile(a, "CREATE UNLOGGED TABLE rows ON COMMIT DELETE ROWS AS SELECT 1 AS id", .{}));
+}
 
 test "compiler sequence originals preserve typed options and never bind ownership during parsing" {
     const a = std.testing.allocator;
@@ -805,6 +874,7 @@ const Parser = struct {
     fn scalar(self: *Parser, depth: usize, minimum: u8) Error!*const ast.Scalar {
         if (depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL scalar nesting budget exceeded");
         if (self.peek(.lbracket)) return self.fail(error.InvalidSqlSyntax, "bare array brackets require ARRAY constructor context");
+        const parenthesized_base = self.peek(.lparen);
         var left: *const ast.Scalar = undefined;
         if (self.keyword(.not)) {
             left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = try self.scalar(depth + 1, 3) } });
@@ -1025,7 +1095,23 @@ const Parser = struct {
             left = try self.scalarNode(.{ .column = try self.field() });
         } else left = try self.scalarNode(.{ .literal = try self.value() });
 
+        var subscript_allowed = parenthesized_base or left.* == .column;
         while (self.pos < self.tokens.len) {
+            if (self.peek(.lbracket)) {
+                if (!subscript_allowed) return self.fail(error.InvalidSqlSyntax, "array expression subscripting requires parentheses");
+                var arguments: std.ArrayList(*const ast.Scalar) = .empty;
+                try arguments.append(self.alloc, left);
+                while (self.take(.lbracket)) {
+                    if (arguments.items.len >= 7) return self.fail(error.SqlLimitExceeded, "array subscript rank exceeds configured bound");
+                    if (self.peek(.colon)) return self.fail(error.UnsupportedSqlShape, "array slicing requires a slice execution layout");
+                    try arguments.append(self.alloc, try self.scalar(depth + 1, 0));
+                    if (self.peek(.colon)) return self.fail(error.UnsupportedSqlShape, "array slicing requires a slice execution layout");
+                    try self.expect(.rbracket);
+                }
+                left = try self.scalarNode(.{ .call = .{ .name = "$array_subscript", .args = try arguments.toOwnedSlice(self.alloc) } });
+                subscript_allowed = true;
+                continue;
+            }
             if (minimum <= 3) {
                 const negated = self.tokens[self.pos].isKeyword(.not) and self.pos + 1 < self.tokens.len and (self.tokens[self.pos + 1].isKeyword(.in) or self.tokens[self.pos + 1].isKeyword(.between) or self.tokens[self.pos + 1].isKeyword(.like) or self.tokens[self.pos + 1].isKeyword(.ilike));
                 if (negated) self.pos += 1;
@@ -1929,7 +2015,71 @@ const Parser = struct {
             search.* = .{ .request = request, .limit = limit };
             return self.relationNode(.{ .table = .{ .name = .{ .table = table_value.string }, .search = search, .alias = (try self.sourceAlias()) orelse "antfly_search" } });
         }
+        if (name_value.database == null and name_value.namespace != null and std.mem.eql(u8, name_value.namespace.?, "antfly") and std.mem.eql(u8, name_value.table, "graph_match") and self.take(.lparen)) {
+            return self.graphTableFunction();
+        }
         return self.relationNode(.{ .table = .{ .name = name_value, .alias = try self.sourceAlias() } });
+    }
+
+    // Native pattern literals are not SQL identifiers: graph edge labels and
+    // bindings retain their case, including words that SQL reserves.
+    fn nativeGraphIdentifier(self: *Parser) Error![]const u8 {
+        if (!self.peek(.identifier)) return self.fail(error.InvalidSqlSyntax, "expected native graph identifier");
+        const item = self.tokens[self.pos];
+        if (std.mem.indexOfScalar(u8, item.text, 0) != null) return self.fail(error.InvalidSqlSyntax, "graph identifiers cannot contain NUL bytes");
+        self.pos += 1;
+        return self.alloc.dupe(u8, item.text);
+    }
+
+    fn graphTableFunction(self: *Parser) Error!*const ast.Relation {
+        var arguments: [5]?ast.Value = @splat(null);
+        while (true) {
+            const slot: usize = if (self.ddlWord("table_name")) 0 else if (self.ddlWord("index")) 1 else if (self.ddlWord("start")) 2 else if (self.ddlWord("pattern")) 3 else if (self.ddlWord("return")) 4 else return self.fail(error.InvalidSqlSyntax, "unknown graph_match argument");
+            if (arguments[slot] != null) return self.fail(error.InvalidSqlSyntax, "duplicate graph_match argument");
+            try self.expect(.eq);
+            try self.expect(.gt);
+            const argument_value = try self.value();
+            if (argument_value != .string and !(slot == 2 and argument_value == .parameter)) return self.fail(error.InvalidSqlSyntax, "graph_match requires text arguments");
+            if (argument_value == .string and argument_value.string.len == 0) return self.fail(error.InvalidSqlSyntax, "graph_match arguments cannot be empty");
+            arguments[slot] = argument_value;
+            if (!self.take(.comma)) break;
+        }
+        try self.expect(.rparen);
+        for (arguments) |argument| if (argument == null) return self.fail(error.InvalidSqlSyntax, "graph_match requires table_name, index, start, pattern and return");
+        const pattern = arguments[3].?.string;
+        const tokenized = lexer.tokenizeBoundedDiagnosticAlloc(self.alloc, pattern, self.limits.max_tokens) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidSqlSyntax;
+        const pattern_tokens = switch (tokenized) {
+            .tokens => |tokens| tokens.items,
+            .diagnostic => return self.fail(error.InvalidSqlSyntax, "invalid graph_match pattern"),
+        };
+        var parser: Parser = .{ .alloc = self.alloc, .tokens = pattern_tokens, .source = pattern, .limits = self.limits, .diagnostic = self.diagnostic };
+        var aliases: std.ArrayList([]const u8) = .empty;
+        var edges: std.ArrayList([]const u8) = .empty;
+        try parser.expect(.lparen);
+        try aliases.append(self.alloc, try parser.nativeGraphIdentifier());
+        try parser.expect(.rparen);
+        while (parser.take(.minus)) {
+            try self.node();
+            if (edges.items.len >= 63) return self.fail(error.SqlLimitExceeded, "graph pattern has too many edges");
+            try parser.expect(.lbracket);
+            try parser.expect(.colon);
+            try edges.append(self.alloc, try parser.nativeGraphIdentifier());
+            try parser.expect(.rbracket);
+            try parser.expect(.arrow_json);
+            try parser.expect(.lparen);
+            const alias = try parser.nativeGraphIdentifier();
+            for (aliases.items) |prior| if (std.mem.eql(u8, prior, alias)) return self.fail(error.UnsupportedSqlShape, "linear MATCH aliases must be distinct");
+            try aliases.append(self.alloc, alias);
+            try parser.expect(.rparen);
+        }
+        if (edges.items.len == 0 or parser.pos != pattern_tokens.len) return self.fail(error.InvalidSqlSyntax, "graph_match requires a complete outgoing linear pattern");
+        const hit_alias = arguments[4].?.string;
+        _ = for (aliases.items) |alias| {
+            if (std.mem.eql(u8, alias, hit_alias)) break alias;
+        } else return self.fail(error.InvalidSqlSyntax, "graph_match return binding is absent from its pattern");
+        const graph = try self.alloc.create(ast.Graph);
+        graph.* = .{ .index = arguments[1].?.string, .start = arguments[2].?, .aliases = try aliases.toOwnedSlice(self.alloc), .edge_types = try edges.toOwnedSlice(self.alloc), .hit_alias = hit_alias };
+        return self.relationNode(.{ .table = .{ .name = .{ .table = arguments[0].?.string }, .graph = graph, .alias = (try self.sourceAlias()) orelse "graph_match" } });
     }
 
     fn relation(self: *Parser) Error!*const ast.Relation {
@@ -2682,6 +2832,7 @@ const Parser = struct {
         }
         try self.expect(.rparen);
         const document = try self.documentTableOptions(columns.items.len, constraints.items.len);
+        const on_commit = try self.onCommitClause();
         const tablespace = if (self.keyword(.tablespace)) try self.identifier() else null;
         const document_definition = try self.documentTableSchemas(document);
         var has_primary = false;
@@ -2699,7 +2850,7 @@ const Parser = struct {
         };
         try self.normalizeUniqueConstraints(&constraints);
         try self.disambiguateGeneratedConstraintLabels(constraints.items);
-        return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .constraints = try constraints.toOwnedSlice(self.alloc), .like_tables = try like_tables.toOwnedSlice(self.alloc), .if_not_exists = if_not_exists, .tablespace = tablespace, .document = document_definition };
+        return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .constraints = try constraints.toOwnedSlice(self.alloc), .like_tables = try like_tables.toOwnedSlice(self.alloc), .if_not_exists = if_not_exists, .tablespace = tablespace, .document = document_definition, .on_commit = on_commit };
     }
 
     const DocumentOptions = struct { enabled: bool = false, default_type: ?[]const u8 = null, enforce_types: bool = false };
@@ -2938,6 +3089,18 @@ const Parser = struct {
             }
             if (depth != 0) return false;
         }
+        if (position < self.tokens.len and self.tokens[position].isKeyword(.on)) {
+            position += 1;
+            if (position >= self.tokens.len or !std.ascii.eqlIgnoreCase(self.tokens[position].text, "COMMIT")) return false;
+            position += 1;
+            if (position >= self.tokens.len) return false;
+            if (std.ascii.eqlIgnoreCase(self.tokens[position].text, "DROP")) position += 1 else {
+                if (!std.ascii.eqlIgnoreCase(self.tokens[position].text, "DELETE") and !std.ascii.eqlIgnoreCase(self.tokens[position].text, "PRESERVE")) return false;
+                position += 1;
+                if (position >= self.tokens.len or !std.ascii.eqlIgnoreCase(self.tokens[position].text, "ROWS")) return false;
+                position += 1;
+            }
+        }
         if (position < self.tokens.len and !self.tokens[position].owned and
             std.ascii.eqlIgnoreCase(self.tokens[position].text, "TABLESPACE"))
         {
@@ -2960,6 +3123,8 @@ const Parser = struct {
         if (operation != .refresh_materialized_view) {
             intent.columns = if (self.peek(.lparen)) try self.ddlColumnList() else &.{};
             if (intent.columns.len > 1024) return self.fail(error.SqlLimitExceeded, "population output column limit exceeded");
+            intent.on_commit = try self.onCommitClause();
+            if (intent.on_commit != null and persistence != .temporary) return self.fail(error.SqlInvalidTableDefinition, "ON COMMIT can only be used on temporary tables");
             if (self.ddlWord("TABLESPACE")) intent.tablespace = try self.identifier();
             try self.expectKeyword(.as);
             if (self.pos >= self.tokens.len) return self.fail(error.InvalidSqlSyntax, "population requires a source query");
@@ -3288,6 +3453,10 @@ const Parser = struct {
             ddl.force = true;
             try self.expect(.rparen);
         }
+        if (action == .drop and kind == .namespace) {
+            ddl.cascade = self.keyword(.cascade);
+            if (!ddl.cascade) _ = self.keyword(.restrict);
+        }
         if (conditional and kind == .table and action == .rename and ddl.action != .alter_schema)
             return self.fail(error.UnsupportedSqlShape, "conditional catalog ALTER requires atomic missing-owner admission");
         return ddl;
@@ -3560,6 +3729,95 @@ const Parser = struct {
         if (self.pos >= self.tokens.len or self.tokens[self.pos].owned or !std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, word)) return false;
         self.pos += 1;
         return true;
+    }
+
+    fn onCommitClause(self: *Parser) Error!?ast.RelationPopulation.OnCommit {
+        if (!self.keyword(.on)) return null;
+        if (!self.ddlWord("COMMIT")) return self.fail(error.InvalidSqlSyntax, "ON requires COMMIT");
+        if (self.ddlWord("DROP")) return .drop;
+        const action: ast.RelationPopulation.OnCommit = if (self.ddlWord("DELETE")) .delete_rows else if (self.ddlWord("PRESERVE")) .preserve_rows else return self.fail(error.InvalidSqlSyntax, "ON COMMIT requires PRESERVE ROWS, DELETE ROWS or DROP");
+        if (!self.ddlWord("ROWS")) return self.fail(error.InvalidSqlSyntax, "ON COMMIT requires ROWS");
+        return action;
+    }
+
+    fn triggerDdl(self: *Parser, create: bool, replace: bool) Error!ast.CatalogDdl {
+        const trigger = @import("trigger_definition.zig");
+        const conditional = !create and self.keyword(.@"if");
+        if (conditional) try self.expectKeyword(.exists);
+        const label = try self.identifier();
+        if (!create) {
+            try self.expectKeyword(.on);
+            const table = try self.name();
+            const cascade = self.ddlWord("CASCADE");
+            if (!cascade) _ = self.ddlWord("RESTRICT");
+            return .{ .kind = .table, .action = .alter_schema, .name = table, .trigger = .{ .name = label, .table = table, .operation = .{ .drop = .{ .if_exists = conditional, .cascade = cascade } } } };
+        }
+        const timing: trigger.Timing = if (self.ddlWord("BEFORE")) .before else if (self.ddlWord("AFTER")) .after else return self.fail(error.UnsupportedSqlShape, "trigger timing requires BEFORE or AFTER");
+        var events: trigger.Events = .{};
+        var columns: std.ArrayList([]const u8) = .empty;
+        while (true) {
+            const event: trigger.Event = if (self.ddlWord("INSERT")) .insert else if (self.ddlWord("UPDATE")) .update else if (self.ddlWord("DELETE")) .delete else if (self.ddlWord("TRUNCATE")) .truncate else return self.fail(error.InvalidSqlSyntax, "expected trigger event");
+            if (events.contains(event)) return self.fail(error.InvalidSqlSyntax, "trigger event is repeated");
+            switch (event) {
+                .insert => events.insert = true,
+                .update => events.update = true,
+                .delete => events.delete = true,
+                .truncate => events.truncate = true,
+            }
+            if (event == .update and self.ddlWord("OF")) while (true) {
+                if (columns.items.len == 256) return self.fail(error.SqlLimitExceeded, "trigger column list exceeds configured bound");
+                try columns.append(self.alloc, try self.identifier());
+                if (!self.take(.comma)) break;
+            };
+            if (!self.keyword(.@"or")) break;
+        }
+        try self.expectKeyword(.on);
+        const table = try self.name();
+        var level: trigger.Level = .statement;
+        if (self.ddlWord("FOR")) {
+            _ = self.ddlWord("EACH");
+            level = if (self.ddlWord("ROW")) .row else if (self.ddlWord("STATEMENT")) .statement else return self.fail(error.InvalidSqlSyntax, "expected ROW or STATEMENT");
+        }
+        if (events.truncate and level == .row) return self.fail(error.UnsupportedSqlShape, "TRUNCATE triggers must be FOR EACH STATEMENT");
+        var when_sql: ?[]const u8 = null;
+        const when_expression = if (self.ddlWord("WHEN")) when_clause: {
+            try self.expect(.lparen);
+            const source_start = self.tokens[self.pos].source_start;
+            const expression = try self.scalar(0, 0);
+            when_sql = try self.alloc.dupe(u8, self.source[source_start..self.tokens[self.pos - 1].source_end]);
+            try self.expect(.rparen);
+            try self.checkScalarDepth(expression, 0);
+            try self.persistentExpression(expression, true);
+            break :when_clause expression;
+        } else null;
+        if (!self.ddlWord("EXECUTE") or !(self.ddlWord("FUNCTION") or self.ddlWord("PROCEDURE"))) return self.fail(error.InvalidSqlSyntax, "trigger requires EXECUTE FUNCTION");
+        const function = try self.name();
+        try self.expect(.lparen);
+        var arguments: std.ArrayList([]const u8) = .empty;
+        var argument_bytes: usize = 0;
+        if (!self.take(.rparen)) while (true) {
+            if (arguments.items.len == 32) return self.fail(error.SqlLimitExceeded, "trigger argument count exceeds configured bound");
+            const argument = if (self.peek(.string)) (try self.value()).string else if (self.peek(.identifier)) try self.identifier() else argument: {
+                const negative = self.take(.minus);
+                const positive = if (!negative) self.take(.plus) else false;
+                if (!self.peek(.number)) return self.fail(error.InvalidSqlSyntax, "trigger arguments must be strings, identifiers or numeric literals");
+                const text = self.tokens[self.pos].text;
+                self.pos += 1;
+                break :argument if (negative) try std.fmt.allocPrint(self.alloc, "-{s}", .{text}) else if (positive) try std.fmt.allocPrint(self.alloc, "+{s}", .{text}) else try self.alloc.dupe(u8, text);
+            };
+            argument_bytes = std.math.add(usize, argument_bytes, argument.len) catch return self.fail(error.SqlLimitExceeded, "trigger arguments exceed configured bound");
+            if (argument_bytes > 64 * 1024) return self.fail(error.SqlLimitExceeded, "trigger arguments exceed configured bound");
+            try arguments.append(self.alloc, argument);
+            if (self.take(.rparen)) break;
+            try self.expect(.comma);
+        };
+        const syntax: trigger.Syntax = .{ .name = label, .table = table, .operation = .{ .create = .{ .replace = replace, .timing = timing, .events = events, .level = level, .update_columns = try columns.toOwnedSlice(self.alloc), .function = function, .arguments = try arguments.toOwnedSlice(self.alloc), .predicate = when_expression, .predicate_sql = when_sql } } };
+        syntax.validate() catch |err| return self.fail(switch (err) {
+            error.SqlProgramLimitExceeded => error.SqlLimitExceeded,
+            error.DuplicateSqlColumn => error.DuplicateSqlColumn,
+            else => error.InvalidSqlTriggerDefinition,
+        }, "invalid trigger definition");
+        return .{ .kind = .table, .action = .alter_schema, .name = table, .trigger = syntax };
     }
 
     /// Definition admission is deliberately separate from routine activation.
@@ -4718,11 +4976,13 @@ const Parser = struct {
                 if (self.ddlWord("AGGREGATE")) return .{ .catalog_ddl = try self.aggregateDdl(true, true) };
                 if (self.ddlWord("FUNCTION")) return self.routineAdmission(false, true);
                 if (self.ddlWord("PROCEDURE")) return self.routineAdmission(true, true);
+                if (self.ddlWord("TRIGGER")) return .{ .catalog_ddl = try self.triggerDdl(true, true) };
                 if (!self.ddlWord("VIEW")) return self.fail(error.UnsupportedSqlShape, "this CREATE OR REPLACE object is not supported");
                 return .{ .catalog_ddl = try self.viewDdl(.create, true) };
             }
             if (self.ddlWord("FUNCTION")) return self.routineAdmission(false, false);
             if (self.ddlWord("PROCEDURE")) return self.routineAdmission(true, false);
+            if (self.ddlWord("TRIGGER")) return .{ .catalog_ddl = try self.triggerDdl(true, false) };
             if (self.ddlWord("SEQUENCE")) return .{ .catalog_ddl = try self.sequenceDdl(.create) };
             if (self.ddlWord("VIEW")) return .{ .catalog_ddl = try self.viewDdl(.create, false) };
             if (self.ddlWord("POLICY")) return .{ .policy_ddl = try self.policyDdl(.create) };
@@ -4735,6 +4995,7 @@ const Parser = struct {
                 if (self.tableAsAhead()) return .{ .catalog_ddl = (try self.populationDdl(.create_table_as, persistence)).ddl() };
                 var create = try self.createTable();
                 create.persistence = persistence;
+                if (create.on_commit != null and persistence != .temporary) return self.fail(error.SqlInvalidTableDefinition, "ON COMMIT can only be used on temporary tables");
                 return .{ .create_table = create };
             }
             if (persistence != .permanent) return self.fail(error.InvalidSqlSyntax, "table persistence requires TABLE");
@@ -4756,6 +5017,7 @@ const Parser = struct {
             return .{ .catalog_ddl = (try self.populationDdl(.refresh_materialized_view, .permanent)).ddl() };
         }
         if (self.keyword(.drop)) {
+            if (self.ddlWord("TRIGGER")) return .{ .catalog_ddl = try self.triggerDdl(false, false) };
             if (self.ddlWord("ROLE")) return .{ .catalog_ddl = try self.roleDdl(true) };
             if (self.ddlWord("TYPE")) return .{ .catalog_ddl = try self.enumDdl(.drop) };
             if (self.ddlWord("DOMAIN")) return .{ .catalog_ddl = try self.domainDdl(.drop) };
@@ -7127,8 +7389,73 @@ test "compiler original canonical MATCH retains native graph aliases before SQL 
     try std.testing.expectEqualStrings("doc", graph.aliases[0]);
     try std.testing.expectEqualStrings("target", graph.aliases[1]);
     try std.testing.expectEqualStrings("cites", graph.edge_types[0]);
+    var mixed = try compile(std.testing.allocator, "SELECT * FROM antfly.graph_match(table_name=>'t',index=>'g',start=>'r',pattern=>'(A)-[:Cites]->(B)',return=>'B')", .{});
+    defer mixed.deinit();
+    const native = mixed.statement.select.source.?.table.graph.?;
+    try std.testing.expectEqualStrings("A", native.aliases[0]);
+    try std.testing.expectEqualStrings("B", native.hit_alias.?);
+    try std.testing.expectEqualStrings("Cites", native.edge_types[0]);
     try std.testing.expectEqualStrings("source_id", select.columns[0].alias.?);
     try std.testing.expectEqualStrings("target_id", select.columns[1].alias.?);
     try std.testing.expectEqualStrings("target\x00depth", select.order_by[0].field);
     try std.testing.expectEqual(@as(i64, 5), select.limit.?.integer);
+}
+
+test "SQL native graph table function preserves typed hit relation through CTE and inline joins" {
+    const cte = "WITH gm AS (SELECT * FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b')) SELECT d.id AS doc_id, gm.score AS graph_score FROM usage_records AS d JOIN gm ON d.id = gm.id WHERE gm.graph_name = 'graph_match' ORDER BY graph_score DESC LIMIT 5";
+    var compiled = try compile(std.testing.allocator, cte, .{});
+    defer compiled.deinit();
+    const graph = compiled.statement.select.ctes[0].query.source.?.table.graph.?;
+    try std.testing.expectEqualStrings("b", graph.hit_alias.?);
+    try std.testing.expectEqualStrings("docs_edge_graph", graph.index);
+    try std.testing.expectEqualStrings("doc:root", graph.start.string);
+    try std.testing.expectEqualStrings("cites", graph.edge_types[0]);
+    var standalone = try compile(std.testing.allocator, "SELECT * FROM antfly.graph_match(return => 'b',pattern => '(a)-[:cites]->(b)',start => $1,index => 'docs_edge_graph',table_name => 'usage_records') AS gm", .{});
+    defer standalone.deinit();
+    try std.testing.expectEqual(@as(u32, 1), standalone.parameter_count);
+    try std.testing.expectEqualStrings("gm", standalone.statement.select.source.?.table.alias.?);
+    try std.testing.expect(standalone.statement.select.source.?.table.graph.?.start == .parameter);
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "SELECT * FROM antfly.graph_match(table_name=>'t',index=>'g',start=>'r',pattern=>'(a)-[:cites]->(b) trailing',return=>'b')", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "SELECT * FROM antfly.graph_match(table_name=>'t',index=>'g',start=>'r',pattern=>'(a)-[:cites]->(b)',return=>'missing')", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "SELECT * FROM antfly.graph_match(table_name=>'t',index=>'g',start=>'r',start=>'again',pattern=>'(a)-[:cites]->(b)',return=>'b')", .{}));
+}
+
+test "SQL scope retirement schema DROP preserves PostgreSQL dependency behavior" {
+    const a = std.testing.allocator;
+    for ([_]struct { sql: []const u8, cascade: bool, conditional: bool }{
+        .{ .sql = "DROP SCHEMA IF EXISTS tenant_ops CASCADE", .cascade = true, .conditional = true },
+        .{ .sql = "DROP SCHEMA tenant_ops RESTRICT", .cascade = false, .conditional = false },
+        .{ .sql = "DROP SCHEMA tenant_ops", .cascade = false, .conditional = false },
+    }) |example| {
+        var compiled = try compile(a, example.sql, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        try std.testing.expectEqual(.namespace, ddl.kind);
+        try std.testing.expectEqual(.drop, ddl.action);
+        try std.testing.expectEqual(example.cascade, ddl.cascade);
+        try std.testing.expectEqual(example.conditional, ddl.conditional);
+    }
+}
+
+test "compiler trigger WHEN text roundtrips PostgreSQL compact comparison and UPDATE OF grammar" {
+    const a = std.testing.allocator;
+    for ([_]struct { sql: []const u8, predicate: []const u8 }{
+        .{ .sql = "CREATE TRIGGER a_skip BEFORE UPDATE OF n ON children FOR EACH ROW WHEN(NEW.n<0) EXECUTE FUNCTION skip_change()", .predicate = "NEW.n<0" },
+        .{ .sql = "CREATE TRIGGER a_skip BEFORE UPDATE OF n ON children FOR EACH ROW WHEN (NEW.n < 0) EXECUTE FUNCTION skip_change()", .predicate = "NEW.n < 0" },
+        .{ .sql = "CREATE TRIGGER a_skip BEFORE UPDATE OF n ON children FOR EACH ROW WHEN(NEW.n<-1) EXECUTE FUNCTION skip_change()", .predicate = "NEW.n<-1" },
+    }) |case| {
+        var diagnostic: Diagnostic = .{};
+        var parsed = compileDiagnostic(a, case.sql, .{}, &diagnostic) catch |err| {
+            std.debug.print("trigger declaration failed {s} at {d}..{d}: {s}\n", .{ @errorName(err), diagnostic.start, diagnostic.end, diagnostic.message });
+            return err;
+        };
+        defer parsed.deinit();
+        const create = parsed.statement.catalog_ddl.trigger.?.operation.create;
+        try std.testing.expectEqualStrings("n", create.update_columns[0]);
+        try std.testing.expectEqualStrings(case.predicate, create.predicate_sql.?);
+        var predicate = try compileScalar(a, create.predicate_sql.?, .{});
+        defer predicate.deinit();
+        try std.testing.expectEqual(.lt, predicate.expression.binary.op);
+        try std.testing.expectEqualStrings("new\x00n", predicate.expression.binary.left.column);
+    }
 }

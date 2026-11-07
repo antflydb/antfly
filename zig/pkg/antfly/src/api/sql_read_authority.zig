@@ -48,6 +48,36 @@ pub fn clone(a: std.mem.Allocator, value: *const Context) !*const Context {
     return owned;
 }
 
+/// Retain the complete identity/authority used by Adapter.verify. Declaration
+/// graphs belong to the binder and are not part of a detached verification
+/// cursor; discard them explicitly rather than borrowing their arena.
+pub fn retainVerificationTable(a: std.mem.Allocator, table: catalog.Table) !catalog.Table {
+    var retained = table;
+    retained.physical_name = try a.dupe(u8, table.physical_name);
+    if (table.scope) |scope| retained.scope = try retainScope(a, scope);
+    if (table.binding_scope) |scope| retained.binding_scope = try retainScope(a, scope);
+    if (table.version_field) |field| retained.version_field = try a.dupe(u8, field);
+    if (context(table)) |authority| retained.read_authority = try clone(a, authority);
+    retained.columns = &.{};
+    retained.column_index = null;
+    retained.indexes = &.{};
+    retained.index_definitions = &.{};
+    retained.constraints = &.{};
+    retained.schema_json = "";
+    retained.incoming_foreign_keys = null;
+    retained.external_base_source = null;
+    retained.external_indexes = null;
+    retained.virtual_columns_override = null;
+    return retained;
+}
+fn retainScope(a: std.mem.Allocator, scope: catalog.Table.Scope) !catalog.Table.Scope {
+    var retained = scope;
+    retained.database = try a.dupe(u8, scope.database);
+    retained.namespace = try a.dupe(u8, scope.namespace);
+    retained.name = try a.dupe(u8, scope.name);
+    return retained;
+}
+
 fn cloneIdentity(a: std.mem.Allocator, value: http.AuthenticatedIdentity) !http.AuthenticatedIdentity {
     var result = (try http.cloneCatalogIdentity(a, value)).?;
     result.user_instance_id = value.user_instance_id;

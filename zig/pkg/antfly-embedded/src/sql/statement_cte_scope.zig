@@ -55,6 +55,9 @@ pub const PendingTuple = struct {
 pub const Execution = struct {
     ptr: *anyopaque,
     open: *const fn (*anyopaque, usize) anyerror!*@import("replay_rows.zig").Replay.Reader,
+    /// Observe sibling tuple ownership before BEFORE ROW, without reserving a
+    /// tuple that a trigger may suppress. Final claim follows row selection.
+    eligible: ?*const fn (*anyopaque, std.mem.Allocator, catalog.Table, []const catalog.Mutation, []const u8) anyerror![]const catalog.Mutation = null,
     claim: *const fn (*anyopaque, std.mem.Allocator, catalog.Table, []const catalog.Mutation, []const u8) anyerror![]const catalog.Mutation,
     checkpoint: *const fn (*anyopaque) anyerror!void,
     scan_rows: *const fn (*anyopaque, usize) anyerror!void,

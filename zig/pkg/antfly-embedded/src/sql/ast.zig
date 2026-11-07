@@ -223,6 +223,9 @@ pub const Graph = struct {
     start: Value,
     aliases: []const []const u8,
     edge_types: []const []const u8,
+    /// A table-valued graph producer returns unique native hydrated hits for
+    /// this binding. Canonical MATCH instead exposes every alias binding.
+    hit_alias: ?[]const u8 = null,
 };
 
 pub const Search = struct { request: Value, limit: ?Value = null };
@@ -413,7 +416,7 @@ pub const LikeOptions = packed struct {
 };
 pub const LikeTable = struct { source: Name, column_offset: usize, options: LikeOptions = .{} };
 
-pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, like_tables: []const LikeTable = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null, document: ?*const DocumentTable = null, persistence: RelationPopulation.Persistence = .permanent };
+pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, like_tables: []const LikeTable = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null, document: ?*const DocumentTable = null, persistence: RelationPopulation.Persistence = .permanent, on_commit: ?RelationPopulation.OnCommit = null };
 pub const DropTable = struct { table: Name, if_exists: bool = false, cascade: bool = false };
 /// Immutable SQL intent, not a catalog identity. OWNED BY names must bind to
 /// stable relation/attribute IDs in the authoritative catalog transaction.
@@ -453,7 +456,8 @@ pub const SequenceOptions = struct {
 };
 /// A source query and destination intent, never a published relation identity.
 pub const RelationPopulation = struct {
-    pub const Persistence = enum { permanent, temporary, unlogged };
+    pub const Persistence = @import("../common/relation_persistence.zig").Kind;
+    pub const OnCommit = @import("../common/relation_persistence.zig").OnCommit;
     operation: enum { create_table_as, select_into, create_materialized_view, refresh_materialized_view },
     name: Name,
     query: ?*const Select = null,
@@ -462,6 +466,7 @@ pub const RelationPopulation = struct {
     query_sql: ?[]const u8 = null,
     columns: []const []const u8 = &.{},
     persistence: Persistence = .permanent,
+    on_commit: ?OnCommit = null,
     if_not_exists: bool = false,
     with_data: bool = true,
     concurrently: bool = false,
@@ -535,6 +540,7 @@ pub const CatalogDdl = struct {
     restart_identity: bool = false,
     cascade: bool = false,
     force: bool = false,
+    trigger: ?@import("trigger_definition.zig").Syntax = null,
     /// Index names are namespace relations, not names of their owning table.
     index_table: ?Name = null,
     native_index: ?NativeIndex = null,

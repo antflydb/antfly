@@ -40,7 +40,37 @@ const Mapping = struct {
     err: anyerror,
 };
 
+test "SQL relation persistence native failures preserve every stable boundary identity" {
+    const errors = [_]anyerror{ error.InvalidSqlRelationPersistence, error.SqlRelationOwnerChanged, error.SqlTemporaryRelationNotOwned, error.InvalidSqlTemporaryNamespace, error.SqlRelationPersistenceForeignKeyMismatch, error.SqlRelationRecoveryIncomplete, error.SqlRelationOwnerUnavailable };
+    for (errors, 970..) |err, number| {
+        const status = statusFromError(err);
+        try std.testing.expectEqual(@as(u32, @intCast(number)), @backingInt(status));
+        try std.testing.expectError(err, statusToError(status));
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 17);
+        try validateFailureEnvelope(status, &failure, abi.abi_version);
+    }
+}
+
 const mappings = [_]Mapping{
+    .{ .status = .invalid_sql_relation_persistence, .err = error.InvalidSqlRelationPersistence },
+    .{ .status = .sql_relation_owner_changed, .err = error.SqlRelationOwnerChanged },
+    .{ .status = .sql_temporary_relation_not_owned, .err = error.SqlTemporaryRelationNotOwned },
+    .{ .status = .invalid_sql_temporary_namespace, .err = error.InvalidSqlTemporaryNamespace },
+    .{ .status = .sql_relation_persistence_foreign_key_mismatch, .err = error.SqlRelationPersistenceForeignKeyMismatch },
+    .{ .status = .sql_relation_recovery_incomplete, .err = error.SqlRelationRecoveryIncomplete },
+    .{ .status = .sql_relation_owner_unavailable, .err = error.SqlRelationOwnerUnavailable },
+    .{ .status = .invalid_sql_trigger_definition, .err = error.InvalidSqlTriggerDefinition },
+    .{ .status = .invalid_sql_trigger_manifest, .err = error.InvalidSqlTriggerManifest },
+    .{ .status = .sql_trigger_context_required, .err = error.SqlTriggerContextRequired },
+    .{ .status = .sql_trigger_returned_no_value, .err = error.SqlTriggerReturnedNoValue },
+    .{ .status = .sql_trigger_return_value_required, .err = error.SqlTriggerReturnValueRequired },
+    .{ .status = .sql_trigger_declared_arguments, .err = error.SqlTriggerDeclaredArguments },
+    .{ .status = .sql_trigger_sql_language, .err = error.SqlTriggerSqlLanguage },
+    .{ .status = .sql_trigger_coordination_required, .err = error.SqlTriggerCoordinationRequired },
+    .{ .status = .sql_prepared_durability_unavailable, .err = error.SqlPreparedDurabilityUnavailable },
+    .{ .status = .invalid_prepared_graph_effects, .err = error.InvalidPreparedGraphEffects },
+    .{ .status = .commit_decision_unknown, .err = error.CommitDecisionUnknown },
+    .{ .status = .invalid_participant, .err = error.InvalidParticipant },
     .{ .status = .invalid_lock_class, .err = error.InvalidLockClass },
     .{ .status = .invalid_lock_effect, .err = error.InvalidLockEffect },
     .{ .status = .invalid_lock_owner, .err = error.InvalidLockOwner },
@@ -1402,4 +1432,41 @@ test "native locking control failures preserve exact stable identities" {
         try std.testing.expect(transported != .internal);
         try std.testing.expectError(err, statusToError(transported));
     }
+}
+
+test "SQL prepared durability refusal retains its semantic runtime identity" {
+    const encoded = statusFromError(error.SqlPreparedDurabilityUnavailable);
+    try std.testing.expectEqual(abi.Status.sql_prepared_durability_unavailable, encoded);
+    try std.testing.expectError(error.SqlPreparedDurabilityUnavailable, statusToError(encoded));
+}
+
+test "graph preparation errors retain semantic wire identity across compiled receivers" {
+    const status = statusFromError(error.InvalidPreparedGraphEffects);
+    try std.testing.expectEqual(abi.Status.invalid_prepared_graph_effects, status);
+    try std.testing.expectError(error.InvalidPreparedGraphEffects, statusToError(status));
+}
+
+test "native decision uncertainty retains its exact shared runtime identity" {
+    const status = statusFromError(error.CommitDecisionUnknown);
+    try std.testing.expectEqual(abi.Status.commit_decision_unknown, status);
+    try std.testing.expectEqual(@as(u32, 983), @backingInt(status));
+    try std.testing.expectError(error.CommitDecisionUnknown, statusToError(status));
+    var failure = failureFromError(error.CommitDecisionUnknown, .storage_owner, abi.abi_version, 1);
+    try validateFailureEnvelope(status, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings("CommitDecisionUnknown", failure.errorName());
+    failure.boundary_version = 89;
+    try std.testing.expectError(error.InvalidBoundaryFailureIdentity, validateFailureEnvelope(status, &failure, abi.abi_version));
+}
+
+// Invalid membership remains a protocol refusal across the owner boundary.
+test "external terminal ACK preserves invalid participant failure identity" {
+    const value = statusFromError(error.InvalidParticipant);
+    try std.testing.expectEqual(abi.Status.invalid_participant, value);
+    try std.testing.expectEqual(@as(u32, 985), @backingInt(value));
+    try std.testing.expectError(error.InvalidParticipant, statusToError(value));
+    var failure = failureFromError(error.InvalidParticipant, .storage_owner, abi.abi_version, 1);
+    try validateFailureEnvelope(value, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings("InvalidParticipant", failure.errorName());
+    failure.boundary_version = abi.abi_version - 1;
+    try std.testing.expectError(error.InvalidBoundaryFailureIdentity, validateFailureEnvelope(value, &failure, abi.abi_version));
 }

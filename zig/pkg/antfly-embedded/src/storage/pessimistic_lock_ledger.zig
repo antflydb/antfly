@@ -343,6 +343,43 @@ pub fn accessBlocked(backing: A, txn: anytype, ns: Namespace, resource: [32]u8, 
     return earlier_blocked;
 }
 
+/// A missing owner head alone cannot certify absent custody: orphan member,
+/// transaction-member, receipt or incoming rows must also refuse adoption.
+/// One seek over the exact backend prefix proves absence without a ledger scan.
+pub const Testing = if (@import("builtin").is_test) struct {
+    pub fn memberAddress(buffer: []u8, selected: Namespace, backend: locks.Backend, id: ?[16]u8) ![]const u8 {
+        return memberKey(buffer, selected, backend, id, @splat(7));
+    }
+} else struct {};
+
+/// Retired heads/receipts remain durable, but neither member index may retain
+/// custody. Each exact prefix is checked with one bounded seek.
+pub fn requireNoMembers(txn: anytype, ns: Namespace, backend: locks.Backend) !void {
+    var buffer: [256]u8 = undefined;
+    const address = try key(&buffer, ns, .owner, backend, @splat(0), 0);
+    const prefix = address[0 .. address.len - "head".len];
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    inline for (.{ "member:", "transaction:" }) |suffix| {
+        var lane: [256]u8 = undefined;
+        const selected = try std.fmt.bufPrint(&lane, "{s}{s}", .{ prefix, suffix });
+        if (try cursor.seekAtOrAfter(selected)) |found| {
+            if (std.mem.startsWith(u8, found.key, selected)) return error.InvalidLockRecord;
+        }
+    }
+}
+
+pub fn requireAbsent(txn: anytype, ns: Namespace, backend: locks.Backend) !void {
+    var buffer: [256]u8 = undefined;
+    const address = try key(&buffer, ns, .owner, backend, @splat(0), 0);
+    const prefix = address[0 .. address.len - "head".len];
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    if (try cursor.seekAtOrAfter(prefix)) |found| {
+        if (std.mem.startsWith(u8, found.key, prefix)) return error.InvalidLockRecord;
+    }
+}
+
 pub fn readOwner(backing: A, txn: anytype, ns: Namespace, backend: locks.Backend) !?Owner {
     try ns.validate();
     try backend.validate();

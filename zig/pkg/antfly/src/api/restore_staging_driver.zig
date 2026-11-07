@@ -24,12 +24,19 @@ const group_ids = @import("antfly_local_sources").common_group_ids;
 
 pub const SourceTable = struct {
     source_table_id: u64,
+    /// Fresh destination allocation from the authenticated target catalog cut,
+    /// never copied from a portable manifest or source Resource.
+    destination_relation_oid: ?u64 = null,
     manifest: *const backup.TableBackupManifest,
+    trigger_destination_incarnation: ?[16]u8 = null,
+    trigger_routines: []const @import("antfly_local_sources").sql_catalog.trigger_restore.RoutineMove = &.{},
     catalog_binding: ?@import("antfly_local_sources").system_catalog_domain.Resource = null,
     existing_name: ?[]const u8 = null,
     destination_name: ?[]const u8 = null,
     /// Exact primary identities from the authenticated cohort, in manifest
     /// shard order. They are not inferred from potentially historical group IDs.
+    repository_schema_digest: ?[32]u8 = null,
+    native_descriptor: ?@import("antfly_local_sources").system_catalog_domain.RelationPersistence.Descriptor = null,
     namespaces: []const @import("antfly_local_sources").storage_db_doc_identity.Namespace = &.{},
     seals: []const @import("antfly_local_sources").storage_db_native_backup_seal.Handle = &.{},
 };
@@ -86,8 +93,17 @@ pub fn cohortSource(arena: std.mem.Allocator, proof: @import("antfly_local_sourc
         if (std.mem.eql(u8, table.name, manifest.table_name)) break table;
     } else return error.BackupIntegrityFailure;
     if (selected.table_id != manifest.table_id) return error.BackupIntegrityFailure;
+    if (selected.schema_only != (manifest.content_policy == .schema_only)) return error.BackupIntegrityFailure;
     const declaration = selected.manifest_definition orelse return error.BackupIntegrityFailure;
     if (!std.mem.eql(u8, &declaration, &@import("antfly_local_sources").metadata_backup_cohort.manifestDefinition(manifest.table_name, manifest.description, manifest.schema_json, manifest.read_schema_json, manifest.indexes_json, manifest.replication_sources_json))) return error.BackupIntegrityFailure;
+    if (selected.trigger_source_columns_digest) |expected| {
+        if (manifest.sql_column_identities_json.len == 0) return error.RestoreSourceProofMissing;
+        var columns = try @import("antfly_local_sources").system_catalog_column_identities.State.decode(arena, manifest.sql_column_identities_json);
+        defer columns.deinit();
+        const actual = try @import("antfly_local_sources").sql_catalog.trigger_restore.sourceColumnsDigest(arena, columns.value);
+        if (!std.mem.eql(u8, &actual, &expected)) return error.BackupIntegrityFailure;
+    } else if (manifest.sql_column_identities_json.len != 0) return error.BackupIntegrityFailure;
+    if (selected.schema_only) return .{ .source_table_id = manifest.table_id, .manifest = manifest };
     const namespaces = try arena.alloc(@import("antfly_local_sources").storage_db_doc_identity.Namespace, manifest.shards.len);
     const handles = try arena.alloc(@import("antfly_local_sources").storage_db_native_backup_seal.Handle, manifest.shards.len);
     var matched: usize = 0;
@@ -106,6 +122,24 @@ pub fn cohortSource(arena: std.mem.Allocator, proof: @import("antfly_local_sourc
         handles[index] = seals.get(shard.group_id) orelse return error.BackupIntegrityFailure;
     }
     return .{ .source_table_id = manifest.table_id, .manifest = manifest, .namespaces = namespaces, .seals = handles };
+}
+
+/// An independent repository archive has no cohort seal or distributed cut.
+/// Its source declaration is authenticated by the existing artifact checksum;
+/// the decoder additionally proves actual namespace/schema before publication.
+pub fn repositorySource(arena: std.mem.Allocator, manifest: *const backup.TableBackupManifest) !SourceTable {
+    try @import("backups.zig").validatePublishedTableManifest(arena, manifest, manifest.backup_id);
+    if (manifest.table_id == 0 or manifest.schema_json.len == 0 or manifest.shards.len == 0) return error.RestoreSourceProofMissing;
+    if (manifest.content_policy == .schema_only) return .{ .source_table_id = manifest.table_id, .manifest = manifest };
+    const namespaces = try arena.alloc(@import("antfly_local_sources").storage_db_doc_identity.Namespace, manifest.shards.len);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(manifest.schema_json, &digest, .{});
+    for (manifest.shards, namespaces) |shard, *namespace| {
+        if (shard.artifact_size_bytes == 0 or shard.artifact_sha256.len != 64) return error.RestoreSourceProofMissing;
+        namespace.* = @import("antfly_local_sources").api_local_backups.shardAdmissionNamespace(manifest.table_id, shard);
+        if (namespace.table_id == 0 or namespace.shard_id == 0 or namespace.range_id == 0) return error.RestoreSourceProofMissing;
+    }
+    return .{ .source_table_id = manifest.table_id, .manifest = manifest, .namespaces = namespaces, .repository_schema_digest = digest };
 }
 
 fn identity(id: staging.Id, source_id: u64, ordinal: u64, domain: []const u8) u64 {
@@ -157,7 +191,7 @@ pub fn buildPlan(arena: std.mem.Allocator, id: staging.Id, cohort_digest: stagin
                 var artifact_digest: [32]u8 = undefined;
                 if (shard.artifact_sha256.len != 64) return error.BackupIntegrityFailure;
                 _ = std.fmt.hexToBytes(&artifact_digest, shard.artifact_sha256) catch return error.BackupIntegrityFailure;
-                artifacts[ordinal] = .{ .target_group_id = group_id, .source_namespace = source.namespaces[ordinal], .cohort_seal = if (source.seals.len == 0) null else source.seals[ordinal], .format = switch (manifest.format) {
+                artifacts[ordinal] = .{ .target_group_id = group_id, .source_namespace = source.namespaces[ordinal], .cohort_seal = if (source.seals.len == 0) null else source.seals[ordinal], .repository_schema_digest = source.repository_schema_digest, .format = switch (manifest.format) {
                     .native => .native,
                     .portable => .portable,
                 }, .snapshot_path = shard.snapshot_path, .artifact_size_bytes = shard.artifact_size_bytes, .artifact_sha256 = artifact_digest, .native_manifest_size_bytes = shard.native_manifest_size_bytes, .native_manifest_sha256 = shard.native_manifest_sha256 };
@@ -187,15 +221,51 @@ pub fn buildPlan(arena: std.mem.Allocator, id: staging.Id, cohort_digest: stagin
         var target: staging.Target = .{
             .source_table_id = source.source_table_id,
             .source_table_name = if (admissions.len != 0) manifest.table_name else "",
-            .table = .{ .table_id = table_id, .name = source.destination_name orelse manifest.table_name, .description = manifest.description, .schema_json = manifest.schema_json, .read_schema_json = manifest.read_schema_json, .indexes_json = manifest.indexes_json, .replication_sources_json = if (manifest.replication_sources_json.len == 0) "[]" else manifest.replication_sources_json, .placement_role = if (existing) |table| table.placement_role else "data", .desired_replica_count = if (existing) |table| table.desired_replica_count else 3, .min_ranges = @intCast(ranges.len) },
+            .table = .{ .table_id = table_id, .name = source.destination_name orelse manifest.table_name, .description = manifest.description, .schema_json = manifest.schema_json, .read_schema_json = manifest.read_schema_json, .indexes_json = manifest.indexes_json, .sql_native_indexes_json = manifest.sql_native_indexes_json, .replication_sources_json = if (manifest.replication_sources_json.len == 0) "[]" else manifest.replication_sources_json, .placement_role = if (existing) |table| table.placement_role else "data", .desired_replica_count = if (existing) |table| table.desired_replica_count else 3, .min_ranges = @intCast(ranges.len) },
             .ranges = ranges,
             .source_artifacts = artifacts,
             .source_generation_admissions = admissions,
         };
         if (source.catalog_binding) |binding| {
             target.catalog_binding = binding;
+            if (source.destination_relation_oid) |oid| try @import("antfly_local_sources").system_catalog_domain.requireRelationOid(oid);
+            target.catalog_binding.?.sql_relation_id = source.destination_relation_oid;
             target.catalog_binding.?.id = table_id;
             target.catalog_binding.?.storage_name = target.table.name;
+        }
+        const trigger_root = try std.json.parseFromSliceLeaky(std.json.Value, arena, target.table.schema_json, .{});
+        if (trigger_root == .object and trigger_root.object.contains("sql_triggers")) {
+            if (manifest.sql_column_identities_json.len == 0) return error.RestoreSourceProofMissing;
+            var columns = try @import("antfly_local_sources").system_catalog_column_identities.State.decode(arena, manifest.sql_column_identities_json);
+            defer columns.deinit();
+            try staging.prepareTargetTriggersAlloc(arena, &target, .{
+                .source_schema_json = manifest.schema_json,
+                .source_columns = columns.value,
+                .destination_incarnation = source.trigger_destination_incarnation orelse return error.RestoreSourceProofMissing,
+                .routines = source.trigger_routines,
+            });
+        } else if (source.trigger_routines.len != 0) return error.InvalidRequest;
+        if (manifest.persistence_kind != null) {
+            const descriptor = source.native_descriptor orelse return error.SqlRelationOwnerUnavailable;
+            try descriptor.validate();
+            if (descriptor.kind != .unlogged or manifest.persistence_kind != .unlogged) return error.InvalidSqlRelationPersistence;
+            target.table.sql_persistence = descriptor;
+            target.table.desired_replica_count = 1;
+            target.table.min_ranges = 1;
+        } else if (source.native_descriptor != null) return error.InvalidRestoreStaging;
+        if (manifest.content_policy == .schema_only) {
+            if (manifest.format_version != 3 or manifest.persistence_kind != .unlogged or manifest.shards.len != 1 or source.namespaces.len != 0 or source.seals.len != 0 or source.repository_schema_digest != null) return error.InvalidRestoreStaging;
+            const descriptor = source.native_descriptor orelse return error.SqlRelationOwnerUnavailable;
+            try descriptor.validate();
+            if (descriptor.kind != .unlogged) return error.InvalidSqlRelationPersistence;
+            target.table.sql_persistence = descriptor;
+            target.table.desired_replica_count = 1;
+            target.table.min_ranges = 1;
+            target.empty_generation = true;
+            const canonical = try std.json.Stringify.valueAlloc(arena, manifest.*, .{});
+            var manifest_digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(canonical, &manifest_digest, .{});
+            target.schema_only_snapshot = .{ .manifest_digest = manifest_digest, .schema_digest = sourceSchemaDigest(manifest.schema_json), .source_table_id = manifest.table_id };
         }
         if (existing) |old| {
             var old_ranges = std.ArrayListUnmanaged(metadata.RangeRecord).empty;
@@ -203,6 +273,9 @@ pub fn buildPlan(arena: std.mem.Allocator, id: staging.Id, cohort_digest: stagin
             metadata.sortKeyspaceRanges(metadata.RangeRecord, old_ranges.items);
             target.replace = .{ .table = old, .ranges = old_ranges.items };
         }
+        if (target.schema_only_snapshot != null) if (target.replace) |old| {
+            target.graph_retirement_digest = try staging.graphRetirementDigest(arena, old.table.table_id, target.table.table_id, old.table.indexes_json);
+        };
         try targets.append(arena, target);
     }
     if (targets.items.len == 0) return .{ .plan = null, .skipped = skipped.items };
@@ -228,11 +301,22 @@ test "restore staging driver shares stable identities and existing destination m
         .manifest = &manifest,
         .existing_name = "copy",
         .destination_name = "copy",
-        .catalog_binding = .{ .kind = .table, .id = 0, .parent_id = 2, .name = "copy", .storage_name = "copy" },
+        .catalog_binding = .{ .kind = .table, .id = 9, .sql_relation_id = 3, .parent_id = 2, .name = "copy", .storage_name = "copy" },
     }}, &.{.{ .table_id = 9, .name = "docs", .schema_json = "{}" }}, &.{}, "fail_if_exists");
     try std.testing.expectEqualStrings("copy", copied.plan.?.targets[0].table.name);
     try std.testing.expectEqualStrings("docs", manifest.table_name);
     try std.testing.expect(copied.plan.?.targets[0].replace == null);
+    try std.testing.expect(copied.plan.?.targets[0].catalog_binding.?.sql_relation_id == null);
+    try std.testing.expectEqual(copied.plan.?.targets[0].table.table_id, copied.plan.?.targets[0].catalog_binding.?.effectiveLogicalRelationId());
+    const assigned = try buildPlan(a, id, @splat(3), &.{.{
+        .source_table_id = 9,
+        .manifest = &manifest,
+        .destination_name = "copy",
+        .destination_relation_oid = 17,
+        .catalog_binding = .{ .kind = .table, .id = 9, .sql_relation_id = 3, .parent_id = 2, .name = "copy", .storage_name = "copy" },
+    }}, &.{}, &.{}, "fail_if_exists");
+    try std.testing.expectEqual(@as(u64, 17), assigned.plan.?.targets[0].catalog_binding.?.effectiveLogicalRelationId());
+    try std.testing.expect(assigned.plan.?.targets[0].table.table_id != 9);
     const catalog = @import("antfly_local_sources").system_catalog_domain;
     const qualified = try catalog.restoreStorageNameAlloc(a, "table:" ++ z17RepeatString("a", 32), .{
         .database = z17RepeatString("d", 128),
@@ -365,4 +449,47 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+fn sourceSchemaDigest(json: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(json, &digest, .{});
+    return digest;
+}
+
+test "UNLOGGED schema only restore uses a fresh native descriptor with no artifact source and keeps actual destination overwrite separate" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const manifest: backup.TableBackupManifest = .{ .format_version = 3, .format = .native, .content_policy = .schema_only, .persistence_kind = .unlogged, .backup_id = "daily", .table_name = "scratch", .table_id = 9, .description = "", .schema_json = "{}", .read_schema_json = "", .indexes_json = "{}", .replication_sources_json = "[]", .shards = &.{.{ .group_id = 301, .start_key = "", .snapshot_path = "" }} };
+    var source = try repositorySource(a, &manifest);
+    const descriptor: @import("antfly_local_sources").system_catalog_domain.RelationPersistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 1, .owner_store_id = 2, .generation_instance = @splat(3), .data_generation = 1 };
+    source.native_descriptor = descriptor;
+    source.catalog_binding = .{ .id = 0, .kind = .table, .parent_id = 2, .name = "scratch", .storage_name = "scratch" };
+    const selected = try buildPlan(a, @splat(1), @splat(2), &.{source}, &.{}, &.{}, "fail_if_exists");
+    const target = selected.plan.?.targets[0];
+    try std.testing.expect(target.empty_generation);
+    try std.testing.expect(descriptor.eql(target.table.sql_persistence.?));
+    try std.testing.expectEqual(@as(usize, 0), target.source_artifacts.len);
+    try std.testing.expect(target.native_reset == null);
+    try std.testing.expectEqual(@as(u64, 9), target.schema_only_snapshot.?.source_table_id);
+    const scope = try staging.ownerScope(a, selected.plan.?, try selected.plan.?.digest(a), target, target.ranges[0]);
+    try std.testing.expectEqual(@as(u64, 0), scope.source_namespace.table_id);
+    try std.testing.expect(scope.native_empty_origin.? == .schema_only_snapshot);
+    const old: metadata.TableRecord = .{ .table_id = 19, .name = "scratch", .schema_json = "{}", .indexes_json = "{\"links\":{\"type\":\"graph\",\"_index_incarnation\":17,\"edge_types\":[{\"name\":\"knows\"}]}}" };
+    const old_ranges = [_]metadata.RangeRecord{.{ .table_id = 19, .group_id = 401, .range_id = 401, .start_key = "", .end_key = null }};
+    var replacement = (try buildPlan(a, @splat(1), @splat(2), &.{source}, &.{old}, &old_ranges, "overwrite")).plan.?;
+    var targets = try a.dupe(staging.Target, replacement.targets);
+    const actual_old = targets[0].replace.?;
+    const fence: @import("antfly_local_sources").storage_db_relational_integrity_topology.Fence = .{ .transition_id = std.mem.readInt(u64, (@as([16]u8, @splat(1)))[0..8], .little), .attempt = std.mem.readInt(u64, (@as([16]u8, @splat(1)))[8..16], .little), .admission_epoch = 1, .owner_group_id = 401, .peer_group_id = 401, .role = .backup_snapshot, .namespace = .{ .table_id = 19, .shard_id = 401, .range_id = 401 }, .catalog_digest = @splat(4) };
+    targets[0].replace = actual_old;
+    targets[0].replace.?.fences = &.{fence};
+    replacement.targets = targets;
+    try replacement.validate(a);
+    try std.testing.expectEqual(@as(u64, 9), targets[0].source_table_id);
+    try std.testing.expectEqual(@as(u64, 19), targets[0].replace.?.table.table_id);
+    try std.testing.expect((try staging.graphSealScopeForOldRange(a, replacement, try replacement.digest(a), targets[0], old_ranges[0])) != null);
+    const replacement_scope = try staging.ownerScope(a, replacement, try replacement.digest(a), targets[0], targets[0].ranges[0]);
+    try std.testing.expectEqual(@as(u64, 0), replacement_scope.source_namespace.table_id);
+    try std.testing.expect(replacement_scope.graph_retirement_digest == null);
 }

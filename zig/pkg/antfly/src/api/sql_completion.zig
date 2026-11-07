@@ -391,6 +391,9 @@ pub fn settled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, rece
             const record = status.value.record orelse return false;
             if (!refs.sameOwner(target, record.owner)) return false;
             if (record.complete) continue;
+            // Newer generic coverage is not the paired owner's completion
+            // witness. Its exact ACTIVE writer settles the retained reference.
+            if (record.policy_pair) return false;
             if (target.kind != .table) return false;
             // Resolve by immutable physical identity, never a reusable SQL name.
             const physical = status.value.physical_name orelse return false;

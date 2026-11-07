@@ -351,7 +351,7 @@ pub const Candidates = struct {
                 admission.* = provenance.admission();
             }
             var old_layout: ?*const catalog.Row.TypedLayout = null;
-            if (bound.returning) {
+            if (bound.returning or bound.target.has_triggers) {
                 var names: std.ArrayList([]const u8) = .empty;
                 for (bound.target.columns, bound.field_ordinals) |field, ordinal| {
                     if (ordinal != null) try names.append(alloc, field.path);
@@ -460,7 +460,8 @@ pub const Candidates = struct {
             }
             for (assignments, values) |assignment, datum| {
                 if (assignment.program == null) continue; // DEFAULT: native preparation fills the absent cell.
-                const field = assignment.column;
+                var field = assignment.column;
+                if (self.target.has_triggers) field.nullable = true;
                 if (datum.sql_null and !field.nullable) return @import("errors.zig").notNull(backend.error_context, field.name);
                 const typed = try @import("runtime.zig").encodeStorageDatumTyped(alloc, datum, field, assignment.program.?.output_type.element_type, max_bytes);
                 if (std.mem.eql(u8, field.name, "_id")) {
@@ -495,7 +496,7 @@ pub const Candidates = struct {
                 break :blk bytes;
             };
             if (!inserting and self.target.storage_mode == .document and version != 0 and digest == null) return error.InvalidSqlBackendResponse;
-            const previous = if (deleting and self.returning) previous: {
+            const previous = if (!inserting and (self.returning or self.target.has_triggers)) previous: {
                 var preimage_values: std.ArrayList(scalar.Datum) = .empty;
                 var presence: std.ArrayList(bool) = .empty;
                 for (self.target.columns, self.field_ordinals) |field, ordinal| {
@@ -1042,8 +1043,8 @@ pub fn bindCandidates(alloc: Allocator, backend: catalog.Backend, target: catalo
     var projections: ProjectionBuilder = .{ .alloc = alloc };
     try projections.qualified(alias, "_id");
     for (joined_mutation.metadata_fields) |field| try projections.qualified(alias, field);
-    var needs_complete_target = statement.returning != null and statement.returning.?.len == 0;
-    var needs_document = false;
+    var needs_complete_target = target.has_triggers or (statement.returning != null and statement.returning.?.len == 0);
+    var needs_document = target.has_triggers and target.storage_mode == .document;
     for (statement.arms) |arm| switch (arm.action) {
         .update => {
             needs_complete_target = needs_complete_target or target.storage_mode == .relational;

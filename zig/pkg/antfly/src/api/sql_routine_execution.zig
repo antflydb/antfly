@@ -73,6 +73,9 @@ pub const Owner = struct {
     declaration_cuts: std.StringHashMapUnmanaged(routines.Snapshot) = .empty,
     settings: ?local.sql_setting_catalog.View = null,
     depth: usize = 0,
+    /// Preparation-only observation of the actual pinned callable declarations.
+    /// The observer cannot resolve or execute anything at the row receiver.
+    capture_observer: ?struct { ptr: *anyopaque, observe: *const fn (*anyopaque, routines.Snapshot, routines.Snapshot.Found, ?[]const u8) anyerror!void } = null,
 
     pub fn create(root: *execution.Adapter) !*Owner {
         const control = root.server.alloc;
@@ -207,7 +210,12 @@ pub const Owner = struct {
     fn resolveDynamicReference(raw: *anyopaque, _: A, reference: routines.records.FunctionReference, arguments: []const native.bindings.Argument) anyerror!*const native.bindings.Resolved {
         return (@as(*Owner, @ptrCast(@alignCast(raw)))).lookupReference(reference, arguments, true);
     }
+    pub fn triggerEnvironment(self: *Owner) !struct { resolver: native.bindings.Resolver, settings: ?*const local.sql_setting_catalog.View } {
+        try self.captureSettings(self.arena.allocator());
+        return .{ .resolver = self.resolverFor(true), .settings = if (self.settings) |*settings| settings else null };
+    }
     fn retainManifest(self: *Owner, a: A, cut: routines.Snapshot, found: routines.Snapshot.Found, dynamic: bool, lookup_name: ?[]const u8) !void {
+        if (self.capture_observer) |observer| try observer.observe(observer.ptr, cut, found, lookup_name);
         const Binding = @import("sql_prepared.zig").Binding;
         var manifest = try Binding.fromRoutine(a, cut.scopes[found.scope].target, found.record, cut.incarnation, cut.revision);
         manifest.routine_namespace_id = cut.scopes[found.scope].namespace_id;

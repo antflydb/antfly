@@ -953,7 +953,7 @@ fn mutateOrPrepare(svc: anytype, alloc: std.mem.Allocator, context: operation.Re
         if (try fk_publication.schemaHasForeignKeys(a, table.schema_json)) return error.ForeignKeyGenerationPublicationRequired;
         const policy = admission.placement_policy;
         try policy.validate();
-        if (table.storage.engine == .local) {
+        if (table.storage.engine == .local and table.sql_persistence == null) {
             if (policy.placement_role) |role| table.placement_role = role;
             if (policy.desired_replica_count) |count| table.desired_replica_count = count;
             if (req.num_shards == null) if (policy.min_ranges) |count| {
@@ -2574,10 +2574,11 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
     const input = try unbound.requireCommandFence(context.sql_command_fence);
     return switch (input) {
         .sql_snapshot_cohort => |request| blk: {
+            if (request.owner != null and !context.setting_admin) return error.Forbidden;
             try context.ensureActive();
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-            const bytes = try store.sqlSnapshotCohort(alloc, svc.metadata_group_id, request.database);
+            const bytes = try store.sqlSnapshotCohort(alloc, svc.metadata_group_id, request);
             errdefer alloc.free(bytes);
             try context.ensureActive();
             break :blk bytes;
@@ -2615,6 +2616,21 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             break :blk if (input == .scope_retirement_work) store.scopeRetirementWorkJson(alloc, svc.metadata_group_id, input.scope_retirement_work) else store.scopeRetirementManifestJson(alloc, svc.metadata_group_id, input.scope_retirement_manifest);
         },
         .scope_retirement_submit => |request| submitScopeRetirement(svc, alloc, context, request),
+        .sql_relation_boot_read => |query| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_relation_persistence_version);
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlRelationBootJson(alloc, svc.metadata_group_id, query);
+        },
+        .sql_relation_lifetime_page => |query| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_relation_persistence_version);
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlRelationLifetimesJson(alloc, svc.metadata_group_id, query.selection, query.after, query.limit, query.include_hidden);
+        },
+        .sql_relation_boot_submit => |bytes| @import("../metadata/sql_relation_boot_service.zig").submit(svc, alloc, context, bytes),
         .scope_retirement_observation => |query| blk: {
             if (!context.setting_admin or !context.schema_validation_authority) return error.Forbidden;
             try svc.ensureLinearizableReadWithContext(context);
@@ -3022,6 +3038,31 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             break :blk store.sqlNativeIndexOutcome(alloc, svc.metadata_group_id, request);
         },
         .sql_routine_mutate => |request| mutateSqlRoutine(svc, alloc, context, request),
+        .sql_graph_preparation_read => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlGraphPreparationRead(alloc, svc.metadata_group_id, request, context);
+        },
+        .sql_graph_preparation_outcome => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate(alloc);
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlGraphPreparationOutcome(alloc, svc.metadata_group_id, request);
+        },
+        .sql_graph_preparation_admit => |request| @import("graph_preparation_service.zig").admit(svc, alloc, context, request),
+        .sql_trigger_snapshot => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlTriggerSnapshot(alloc, svc.metadata_group_id, request, context);
+        },
         .sql_routine_snapshot => |request| blk: {
             if (!context.setting_admin) return error.Forbidden;
             try context.ensureActive();

@@ -66,6 +66,7 @@ const index_manager_mod = if (control_only_storage_sources) struct {} else @impo
 const text_analysis_config = @import("antfly_local_sources").storage_db_text_analysis_config;
 const introducer_mod = @import("antfly_local_sources").introducer;
 const graph_mod = @import("antfly_local_sources").graph_graph;
+const retained_graph_read = @import("antfly_local_sources").storage_statement_read_fence.GraphRead;
 const graph_edge_type = @import("antfly_local_sources").graph_edge_type;
 const graph_edge_weight = @import("antfly_local_sources").graph_edge_weight;
 const graph_node_identity = @import("antfly_local_sources").graph_node_identity;
@@ -438,12 +439,14 @@ fn controlledLookupResponseAlloc(
     version: u64,
     opts: db_mod.types.LookupOptions,
     expected_content_digest: ?[32]u8,
+    json_null_fields: []const []const u8,
 ) !LookupResponse {
     try checkLookupOptionsActive(opts);
     const cloned = try alloc.dupe(u8, json);
     errdefer alloc.free(cloned);
     try checkLookupOptionsActive(opts);
-    return .{ .json = cloned, .version = version, .expected_content_digest = expected_content_digest };
+    const flags = if (opts.include_json_null_fields) try db_mod.types.cloneJsonNullFields(alloc, json_null_fields) else &.{};
+    return .{ .json = cloned, .version = version, .expected_content_digest = expected_content_digest, .json_null_fields = flags };
 }
 
 fn nsToUsFloat(ns: u64) f64 {
@@ -1647,6 +1650,7 @@ pub const ResidentDbSource = struct {
 /// immutable route capability captured before admission; admin snapshots are
 /// delegated unchanged and cannot re-authorize a different generation.
 const RoutePinnedCatalog = struct {
+    captured_fence: ?metadata_api.CatalogRouteFence = null,
     base: table_catalog.CatalogSource,
     table_name: []const u8,
     routes: []const table_catalog.CatalogGroupRoute,
@@ -1661,6 +1665,8 @@ const RoutePinnedCatalog = struct {
     }
 
     const vtable: table_catalog.CatalogSource.VTable = .{
+        .sql_relation_boot = sqlRelationBoot,
+        .graph_preparation_read = graphPreparationRead,
         .restore_scope_for_group = restoreScopeForGroup,
         .restore_plan_for_group = restorePlanForGroup,
         .admin_snapshot = adminSnapshot,
@@ -1668,6 +1674,8 @@ const RoutePinnedCatalog = struct {
         .routing_snapshot = routingSnapshot,
         .linearizable_routing_snapshot = linearizableRoutingSnapshot,
         .free_routing_snapshot = freeRoutingSnapshot,
+        .resolve_route = resolveRoute,
+        .validate_route = validateRoute,
         .route_identity = routeIdentity,
         .route_fence = routeFence,
         .wait_for_routing_change = waitForRoutingChange,
@@ -1676,6 +1684,14 @@ const RoutePinnedCatalog = struct {
         .validate_publication = validatePublication,
         .validate_table_publication = validateTablePublication,
     };
+
+    fn graphPreparationRead(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../system_catalog/graph_preparation.zig").Source, deadline_ns: ?u64) !@import("../system_catalog/graph_preparation.zig").Prepared {
+        return cast(ptr).base.graphPreparationRead(alloc, request, deadline_ns);
+    }
+
+    fn sqlRelationBoot(ptr: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+        return cast(ptr).base.sqlRelationBinding(alloc, query, deadline_ns);
+    }
 
     fn cast(ptr: *anyopaque) *@This() {
         return @ptrCast(@alignCast(ptr));
@@ -1715,6 +1731,25 @@ const RoutePinnedCatalog = struct {
         self.base.vtable.free_routing_snapshot(self.base.ptr, snapshot);
     }
 
+    // Retain the base catalog's compact read/validation capability. Rebuilding
+    // a bulk projection here loses sources that deliberately expose only the
+    // exact table route. Callers still compare the fresh result to their fence.
+    fn resolveRoute(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query: table_catalog.RouteQuery, deadline_ns: ?u64) !table_catalog.RouteResult {
+        const self = cast(ptr);
+        if (!std.mem.eql(u8, self.table_name, table_name)) return error.RouteIdentityNotPinned;
+        if (self.base.vtable.resolve_route) |resolve|
+            return try resolve(self.base.ptr, alloc, table_name, query, deadline_ns);
+        return try table_catalog.resolveRoute(alloc, try self.base.routingSource(), table_name, query, deadline_ns);
+    }
+
+    fn validateRoute(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query: table_catalog.RouteQuery, deadline_ns: ?u64) !table_catalog.RouteResult {
+        const self = cast(ptr);
+        if (!std.mem.eql(u8, self.table_name, table_name)) return error.RouteIdentityNotPinned;
+        if (self.base.vtable.validate_route) |validate|
+            return try validate(self.base.ptr, alloc, table_name, query, deadline_ns);
+        return try resolveRoute(ptr, alloc, table_name, query, deadline_ns);
+    }
+
     fn routeIdentity(ptr: *anyopaque, table_name: []const u8, group_id: u64) !?metadata_api.CatalogIdentityNamespace {
         const self = cast(ptr);
         if (!std.mem.eql(u8, self.table_name, table_name)) return error.RouteIdentityNotPinned;
@@ -1731,6 +1766,7 @@ const RoutePinnedCatalog = struct {
 
     fn routeFence(ptr: *anyopaque, group_id: u64) !?metadata_api.CatalogRouteFence {
         const self = cast(ptr);
+        if (self.captured_fence) |captured| if (captured.route.group_id == group_id) return captured;
         for (self.routes) |route| {
             if (route.group_id != group_id) continue;
             return .{
@@ -1789,6 +1825,7 @@ fn routePinnedCatalogForFence(
 ) RoutePinnedCatalog {
     route_storage[0] = fence.route;
     return .{
+        .captured_fence = fence,
         .base = base,
         .table_name = table_name,
         .routes = route_storage,
@@ -2594,7 +2631,7 @@ pub const BoundTableReadSource = struct {
         var result = (try self.reads.lookupWithConsistency(alloc, self.db, key, opts, consistency)) orelse return null;
         defer result.deinit(alloc);
 
-        return try controlledLookupResponseAlloc(alloc, result.json, if (integrityLookupMode(opts)) 0 else result.version orelse try self.db.getTimestamp(alloc, key), opts, result.expected_content_digest);
+        return try controlledLookupResponseAlloc(alloc, result.json, if (integrityLookupMode(opts)) 0 else result.version orelse try self.db.getTimestamp(alloc, key), opts, result.expected_content_digest, result.json_null_fields);
     }
 
     fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.RelationalReadView {
@@ -2638,14 +2675,75 @@ pub const BoundTableReadSource = struct {
         snapshots: []@import("antfly_local_sources").storage_statement_read_fence.Snapshot,
         table: []u8,
         schema_version: u32,
+        graph_indexes: []const []const u8 = &.{},
 
-        fn open(_: *anyopaque, _: std.mem.Allocator, _: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
-            return error.SqlRangeTrackingRequired;
+        fn freeGraphIndexes(self: *@This()) void {
+            for (self.graph_indexes) |name| self.alloc.free(name);
+            self.alloc.free(self.graph_indexes);
+            self.graph_indexes = &.{};
+        }
+
+        fn cloneGraphIndexes(alloc: std.mem.Allocator, names: []const []const u8) ![]const []const u8 {
+            if (names.len > 64) return error.SqlProgramLimitExceeded;
+            if (names.len == 0) return &.{};
+            const result = try alloc.alloc([]const u8, names.len);
+            var copied: usize = 0;
+            errdefer {
+                for (result[0..copied]) |name| alloc.free(name);
+                alloc.free(result);
+            }
+            for (names, result, 0..) |name, *out, index| {
+                if (name.len == 0 or name.len > 256 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidQueryRequest;
+                for (names[0..index]) |prior| if (std.mem.eql(u8, prior, name)) return error.InvalidQueryRequest;
+                out.* = try alloc.dupe(u8, name);
+                copied += 1;
+            }
+            return result;
+        }
+
+        fn graphPage(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, group_id: u64, request: retained_graph_read.Request) !retained_graph_read.Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try request.check();
+            if (!std.mem.eql(u8, table, self.table)) return error.SqlStatementSnapshotRequired;
+            const selected = for (self.graph_indexes) |name| {
+                if (std.mem.eql(u8, name, request.index)) break true;
+            } else false;
+            if (!selected) return error.SqlStatementSnapshotRequired;
+            var owner = group_id;
+            if (owner == 0) {
+                // Outgoing adjacency belongs to its source document. Reuse
+                // the captured route only after checking its current identity;
+                // topology changes require restarting the entire statement.
+                if (request.direction != .out) return error.SqlStatementSnapshotRequired;
+                var current = try self.source.prepareRoutedKeyRead(alloc, table, request.key, .{ .lookup = .{ .key = request.key, .opts = .{ .cancellation = request.cancellation, .execution_deadline_ns = request.execution_deadline_ns } } }, .stale, .general);
+                defer current.deinit();
+                current.releaseActivity();
+                if (current.table_id != self.prepared.table_id or current.topology_epoch != self.prepared.topology_epoch or current.metadata_group_id != self.prepared.metadata_group_id or !std.meta.eql(current.metadata_incarnation, self.prepared.metadata_incarnation)) return error.CatalogGenerationChanged;
+                const route = current.route orelse return error.CatalogGenerationChanged;
+                const index = std.mem.indexOfScalar(u64, self.prepared.group_ids, route.group_id) orelse return error.CatalogGenerationChanged;
+                if (!std.meta.eql(route, self.prepared.routes[index])) return error.CatalogGenerationChanged;
+                owner = route.group_id;
+            }
+            const index = std.mem.indexOfScalar(u64, self.prepared.group_ids, owner) orelse return error.CatalogGenerationChanged;
+            return self.snapshots[index].graphPage(alloc, request);
+        }
+
+        fn open(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
+            var scan_input = input;
+            scan_input.opts.include_range_proofs = false;
+            const result = try openCaptured(ptr, alloc, scan_input, false);
+            alloc.free(result.owner_proofs);
+            return result.view;
         }
 
         fn openGuarded(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot.GuardedRead {
+            if (!input.opts.include_range_proofs) return error.SqlRangeTrackingRequired;
+            return openCaptured(ptr, alloc, input, true);
+        }
+
+        fn openCaptured(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan, require_proofs: bool) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot.GuardedRead {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (!std.mem.eql(u8, input.table, self.table) or !input.opts.include_range_proofs) return error.SqlStatementSnapshotRequired;
+            if (!std.mem.eql(u8, input.table, self.table)) return error.SqlStatementSnapshotRequired;
             const row_query = input.opts.relational_query orelse return error.SqlStatementSnapshotRequired;
             if (row_query.schema_version != self.schema_version or row_query.index != null or row_query.auto_index) return error.SqlStatementSnapshotRequired;
             const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
@@ -2670,22 +2768,23 @@ pub const BoundTableReadSource = struct {
             defer alloc.free(views);
             var opened: usize = 0;
             errdefer for (views[0..opened]) |view| view.deinit();
-            const proofs = try alloc.alloc(OwnerProof, selected_count);
+            const proofs = try alloc.alloc(OwnerProof, if (require_proofs) selected_count else 0);
             errdefer alloc.free(proofs);
             var proven: usize = 0;
             errdefer for (proofs[0..proven]) |owner| alloc.free(owner.proofs);
-            for (selection[0..selected_count], views, proofs) |index, *view, *owner| {
+            for (selection[0..selected_count], views) |index, *view| {
                 const snapshot = self.snapshots[index];
                 if (input.opts.cancellation) |token| try token.check();
                 if (input.opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
                 view.* = try snapshot.open(alloc, input.from, input.to, input.opts);
                 opened += 1;
+                if (!require_proofs) continue;
                 const native_proofs = try view.rangeProofs(alloc);
                 if (native_proofs.len == 0) {
                     alloc.free(native_proofs);
                     return error.SqlRangeTrackingRequired;
                 }
-                owner.* = .{ .fence = self.prepared.fenceAt(index, null, null), .proofs = native_proofs };
+                proofs[proven] = .{ .fence = self.prepared.fenceAt(index, null, null), .proofs = native_proofs };
                 proven += 1;
             }
             const combined = try @import("../storage/relational_read_set.zig").Set.create(alloc, views, true);
@@ -2697,6 +2796,7 @@ pub const BoundTableReadSource = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             for (self.snapshots) |snapshot| snapshot.deinit();
             self.alloc.free(self.snapshots);
+            self.freeGraphIndexes();
             self.prepared.deinit();
             self.alloc.free(self.table);
             self.alloc.destroy(self);
@@ -3216,8 +3316,13 @@ pub const BoundTableReadSource = struct {
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         if (req.topology_epoch != 0) return error.TopologyChanged;
         try distributed_graph.validateGraphEdgesTensorAccessPath(alloc, req);
+        var raw_graph = try self.db.beginRawGraphReadLease();
+        defer raw_graph.release();
         const graph_entry = self.db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-        return try @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, &graph_entry.index, req, if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs());
+        var result = try @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, &graph_entry.index, req, if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs());
+        errdefer result.deinit(alloc);
+        try raw_graph.check();
+        return result;
     }
 };
 
@@ -3240,6 +3345,15 @@ fn queryRoutingDeadline(catalog: table_catalog.CatalogSource, req: db_mod.types.
 
 // A missing route is a metadata observation, not an owner absence proof.
 // Public catalog binding resolves truly unknown tables before this boundary.
+fn requireRestoreStagingFence(identity: db_mod.DocIdentityNamespace, group_id: u64, fence: ?metadata_api.CatalogRouteFence) !void {
+    if (group_id == 0 or identity.table_id == 0 or identity.shard_id == 0 or identity.range_id == 0) return error.RestoreStagingScopeChanged;
+    if (fence) |expected| {
+        try expected.validate();
+        try expected.admission_cancellation.check();
+        if (expected.table_id != identity.table_id or expected.route.group_id != group_id or expected.route.range_id != identity.range_id or expected.route.identity_namespace.table_id != identity.table_id or expected.route.identity_namespace.shard_id != identity.shard_id or expected.route.identity_namespace.range_id != identity.range_id) return error.RestoreStagingScopeChanged;
+    }
+}
+
 fn lookupWithoutRoute(consistency: raft_mod.ReadConsistency) !?LookupResponse {
     if (consistency == .read_index) return error.StorageReadTemporarilyUnavailable;
     return null;
@@ -3296,17 +3410,64 @@ fn admitRoutedStatementGroup(
     group_id: u64,
     table_name: []const u8,
 ) !void {
+    return admitRoutedStatementGroupWithRequest(alloc, catalog, barrier, fence, group_id, table_name, .{ .lookup = .{ .key = "", .opts = .{
+        .execution_deadline_ns = fence.admission_deadline_ns,
+        .execution_io = fence.admission_deadline_io,
+        .cancellation = fence.admission_cancellation,
+    } } });
+}
+
+fn admitRoutedStatementGroupWithRequest(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    barrier: raft_mod.ReadSafetyBarrier,
+    fence: metadata_api.CatalogRouteFence,
+    group_id: u64,
+    table_name: []const u8,
+    request: ProvisionedConsistencyRequest,
+) !void {
     try fence.validate();
     if (fence.route.group_id != group_id) return error.TopologyChanged;
     try fence.admission_cancellation.check();
     try table_catalog.validateCatalogRouteFenceUntil(alloc, catalog, table_name, fence, catalog.routeFenceDeadline(fence));
-    try prepareProvisionedGroupConsistency(barrier, group_id, .{ .lookup = .{ .key = "", .opts = .{
-        .execution_deadline_ns = fence.admission_deadline_ns,
-        .execution_io = fence.admission_deadline_io,
-        .cancellation = fence.admission_cancellation,
-    } } }, .read_index, false);
+    if (fence.route.execution == .native_local) {
+        // A native owner has no Raft leader/read-index. Rejoin the current
+        // metadata Boot + signed initialized image; the following native
+        // fence capture pins its actual primary/replay cut and native sequence.
+        const private_lock = if (request == .lookup) try @import("native_sql_lock_read.zig").isPrivateControl(alloc, request.lookup.key, request.lookup.opts, fence) else false;
+        if (!private_lock) {
+            const descriptor = fence.route.execution.native_local;
+            const owner = if (fence.admission_relation_minter) |minter| minter.owner else fence.admission_sql_relation_owner;
+            try descriptor.requireConnectionOwner(owner);
+            var checked = fence;
+            try catalog.pinNativeParticipant(alloc, &checked, catalog.routeFenceDeadline(fence));
+        }
+        // Private lock observations reach the canonical native lock receiver;
+        // it rejoins ready/draining Boot, immutable Pin and sealed authority.
+        // A user read can never opt into this dispatch with a bare selector.
+    } else {
+        try prepareProvisionedGroupConsistency(barrier, group_id, request, .read_index, false);
+    }
     try table_catalog.validateCatalogRouteFenceUntil(alloc, catalog, table_name, fence, catalog.routeFenceDeadline(fence));
     try fence.admission_cancellation.check();
+}
+
+/// A process-local signer may enrich only the exact captured native route.
+/// Public lookup JSON never carries this capability or an ambient Owner.
+fn bindLookupRelationOwner(fence: *metadata_api.CatalogRouteFence, opts: db_mod.types.LookupOptions) !void {
+    if (fence.route.execution != .native_local) return;
+    const descriptor = fence.route.execution.native_local;
+    if (opts.relation_owner_minter) |minter| {
+        try descriptor.requireConnectionOwner(minter.owner);
+        if (fence.admission_sql_relation_owner) |previous| if (!previous.eql(minter.owner)) return error.SqlTemporaryRelationNotOwned;
+        if (fence.admission_relation_minter) |previous| if (!previous.owner.eql(minter.owner)) return error.SqlTemporaryRelationNotOwned;
+        fence.admission_sql_relation_owner = minter.owner;
+        fence.admission_relation_minter = minter;
+    }
+    try descriptor.requireConnectionOwner(fence.admission_sql_relation_owner);
+    fence.admission_deadline_ns = opts.execution_deadline_ns;
+    fence.admission_deadline_io = opts.execution_io;
+    fence.admission_cancellation = opts.cancellation orelse .none;
 }
 
 /// A multi-owner cut is legal only because every owner primitive rejects
@@ -3360,6 +3521,7 @@ pub const ProvisionedTableReadSource = struct {
     const topology_read_attempt_limit: usize = 4;
 
     const PreparedKeyRead = struct {
+        relation_owner_minter: ?@import("antfly_local_sources").common_relation_owner_authority.Minter = null,
         route: ?table_catalog.CatalogGroupRoute,
         metadata_group_id: u64,
         metadata_incarnation: ?metadata_api.MetadataClusterIncarnation,
@@ -3384,6 +3546,8 @@ pub const ProvisionedTableReadSource = struct {
         ) ?metadata_api.CatalogRouteFence {
             const route = self.route orelse return null;
             return .{
+                .admission_relation_minter = self.relation_owner_minter,
+                .admission_sql_relation_owner = if (self.relation_owner_minter) |minter| minter.owner else null,
                 .metadata_group_id = self.metadata_group_id,
                 .metadata_incarnation = self.metadata_incarnation,
                 .catalog_revision = self.catalog_revision,
@@ -3398,6 +3562,7 @@ pub const ProvisionedTableReadSource = struct {
     };
 
     const PreparedSpanRead = struct {
+        relation_owner_minter: ?@import("antfly_local_sources").common_relation_owner_authority.Minter = null,
         alloc: std.mem.Allocator,
         routes: []table_catalog.CatalogGroupRoute,
         group_ids: []u64,
@@ -3429,6 +3594,8 @@ pub const ProvisionedTableReadSource = struct {
             cancellation: ?db_mod.types.CancellationToken,
         ) metadata_api.CatalogRouteFence {
             return .{
+                .admission_relation_minter = self.relation_owner_minter,
+                .admission_sql_relation_owner = if (self.relation_owner_minter) |minter| minter.owner else null,
                 .metadata_group_id = self.metadata_group_id,
                 .metadata_incarnation = self.metadata_incarnation,
                 .catalog_revision = self.catalog_revision,
@@ -3985,8 +4152,10 @@ pub const ProvisionedTableReadSource = struct {
                 for (jobs[0..count]) |job| if (job.failure) |err| return err;
             }
         }
-        fn open(_: *anyopaque, _: std.mem.Allocator, _: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
-            return error.SqlRangeTrackingRequired;
+        fn open(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (self.cuts) |*cut| if (std.mem.eql(u8, cut.table, input.table)) return BoundTableReadSource.CoordinatedStatementSnapshot.open(cut, alloc, input);
+            return error.SqlStatementSnapshotRequired;
         }
         fn openGuarded(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot.GuardedRead {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -3994,11 +4163,17 @@ pub const ProvisionedTableReadSource = struct {
             // An unseen relation is never recaptured into an existing cut.
             return error.SqlStatementSnapshotRequired;
         }
+        fn graphPage(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, group_id: u64, request: retained_graph_read.Request) !retained_graph_read.Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (self.cuts) |*cut| if (std.mem.eql(u8, cut.table, table)) return BoundTableReadSource.CoordinatedStatementSnapshot.graphPage(cut, alloc, table, group_id, request);
+            return error.SqlStatementSnapshotRequired;
+        }
         fn close(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             for (self.cuts) |*cut| {
                 for (cut.snapshots) |snapshot| snapshot.deinit();
                 self.alloc.free(cut.snapshots);
+                cut.freeGraphIndexes();
                 cut.prepared.deinit();
                 self.alloc.free(cut.table);
             }
@@ -4026,7 +4201,7 @@ pub const ProvisionedTableReadSource = struct {
             const group = cut.prepared.group_ids[participant.group];
             const route_fence = cut.prepared.fenceAt(participant.group, opts.execution_deadline_ns, opts.cancellation);
             const fence = (switch (participant.route) {
-                .local => self.groupLocalSourceWithFence(route_fence).tryStatementReadFenceGroupLocal(alloc, group, cut.table, opts, .stale),
+                .local => self.groupLocalSourceWithFence(route_fence).tryStatementReadFenceGroupLocal(alloc, group, cut.table, opts, if (route_fence.route.execution == .native_local) .read_index else .stale),
                 .remote => |remote| @import("retained_read_client.zig").Client.capture(alloc, self.distributedInternalExecutor(), remote.base_uri, cut.table, route_fence, cut.schema_version, opts.execution_deadline_ns),
             } catch |err| {
                 if (err == error.ReadUnavailable) return false;
@@ -4044,7 +4219,7 @@ pub const ProvisionedTableReadSource = struct {
                 alloc.free(snapshots);
             }
             for (snapshots) |*snapshot| {
-                snapshot.* = fences[fence_index].captureSnapshot(alloc) catch |err| {
+                snapshot.* = fences[fence_index].captureSnapshotWithGraphs(alloc, cut.graph_indexes) catch |err| {
                     // Returning false is success in Zig error-unwinding terms.
                     // Release the partially forked vector explicitly first.
                     if (err == error.ReadUnavailable) {
@@ -4079,6 +4254,7 @@ pub const ProvisionedTableReadSource = struct {
         errdefer alloc.free(cuts);
         var initialized: usize = 0;
         errdefer for (cuts[0..initialized]) |*cut| {
+            cut.freeGraphIndexes();
             cut.prepared.deinit();
             alloc.free(cut.table);
             for (cut.snapshots) |snapshot| snapshot.deinit();
@@ -4092,7 +4268,9 @@ pub const ProvisionedTableReadSource = struct {
         for (targets, cuts, 0..) |target, *cut, cut_index| {
             if (cancellation) |token| try token.check();
             for (targets[0..cut_index]) |prior| if (std.mem.eql(u8, prior.table, target.table)) return error.SqlStatementSnapshotRequired;
-            var prepared = try self.prepareRoutedSpanRead(alloc, target.table, "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, if (self.distributed_router != null) .stale else consistency, .general);
+            var target_opts = opts;
+            target_opts.relation_owner_minter = target.relation_owner_minter;
+            var prepared = try self.prepareRoutedSpanRead(alloc, target.table, "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = target_opts } }, .stale, .general);
             errdefer prepared.deinit();
             if (prepared.group_ids.len == 0) return error.TableNotFound;
             if (target.table_id) |expected| if (expected != prepared.table_id) return error.CatalogGenerationChanged;
@@ -4103,18 +4281,22 @@ pub const ProvisionedTableReadSource = struct {
             // Do not retain preparation activity while awaiting Raft apply.
             if (self.distributed_router != null) prepared.releaseActivity();
             const name = try alloc.dupe(u8, target.table);
-            cut.* = .{ .alloc = alloc, .source = self, .prepared = prepared, .table = name, .schema_version = target.schema_version, .snapshots = &.{} };
+            const graph_indexes = BoundTableReadSource.CoordinatedStatementSnapshot.cloneGraphIndexes(alloc, target.graph_indexes) catch |err| {
+                alloc.free(name);
+                return err;
+            };
+            cut.* = .{ .alloc = alloc, .source = self, .prepared = prepared, .table = name, .schema_version = target.schema_version, .snapshots = &.{}, .graph_indexes = graph_indexes };
             initialized += 1;
             // Ownership passed to cuts; following errors unwind it there.
             prepared = .{ .alloc = alloc, .routes = &.{}, .group_ids = &.{}, .metadata_group_id = 0, .metadata_incarnation = null, .table_id = 0, .catalog_revision = 0, .topology_epoch = 0, .activity = null };
             for (cut.prepared.group_ids, 0..) |group, group_index| {
                 var route: table_router.GroupRoute = if (self.distributed_router) |router|
-                    (try table_router.resolveGroupRoute(temp, self.catalog, router.withBudget(.fromRequest(opts)), group, .prefer_leader)) orelse return error.GroupLeaderUnavailable
+                    (try table_router.resolveCapturedGroupRoute(temp, self.catalog, router.withBudget(.fromRequest(opts)), cut.prepared.fenceAt(group_index, deadline_ns, cancellation), .prefer_leader)) orelse return error.GroupLeaderUnavailable
                 else
                     .local;
                 errdefer route.deinit(temp);
-                if (self.distributed_router != null and consistency != .stale) switch (route) {
-                    .local => try prepareProvisionedGroupConsistency(self.read_safety_barrier, group, .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, consistency, false),
+                if (consistency != .stale) switch (route) {
+                    .local => try admitRoutedStatementGroupWithRequest(alloc, self.catalog, self.read_safety_barrier, cut.prepared.fenceAt(group_index, deadline_ns, cancellation), group, target.table, .{ .scan = .{ .from_key = "", .to_key = "", .opts = target_opts } }),
                     .remote => |remote| try @import("retained_read_client.zig").Client.admit(alloc, self.distributedInternalExecutor(), remote.base_uri, target.table, cut.prepared.fenceAt(group_index, deadline_ns, cancellation), target.schema_version, deadline_ns),
                 };
                 try participants.append(temp, .{ .cut = cut_index, .group = group_index, .route = route });
@@ -4132,7 +4314,7 @@ pub const ProvisionedTableReadSource = struct {
             try wait_budget.sleepNs(std.time.ns_per_ms);
         }
         owned.* = .{ .alloc = alloc, .cuts = cuts, .io = if (self.io_impl) |io| io.io() else null };
-        return .{ .ptr = owned, .vtable = &.{ .renew = SnapshotCohort.renew, .open = SnapshotCohort.open, .open_guarded = SnapshotCohort.openGuarded, .close = SnapshotCohort.close } };
+        return .{ .ptr = owned, .vtable = &.{ .renew = SnapshotCohort.renew, .open = SnapshotCohort.open, .open_guarded = SnapshotCohort.openGuarded, .graph_page = SnapshotCohort.graphPage, .close = SnapshotCohort.close } };
     }
 
     fn finishRelationalStatement(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, scans: []const @import("antfly_local_sources").api_table_read_source.RelationalStatementScan, consistency: raft_mod.ReadConsistency, retained: *RetainedStatementRead) !@import("antfly_local_sources").api_table_read_source.RelationalStatementRead {
@@ -4152,7 +4334,7 @@ pub const ProvisionedTableReadSource = struct {
             if (input.opts.cancellation) |token| try token.check();
             const deadline = self.catalog.deadlineFrom(.{ .deadline_ns = input.opts.execution_deadline_ns });
             if (deadline) |value| wait_budget.deadline_ns = @min(wait_budget.deadline_ns.?, value);
-            retained.prepared[scan_index] = try self.prepareRoutedSpanRead(alloc, input.table, input.from, input.to, .{ .scan = .{ .from_key = input.from, .to_key = input.to, .opts = input.opts } }, if (self.distributed_router != null) .stale else consistency, .general);
+            retained.prepared[scan_index] = try self.prepareRoutedSpanRead(alloc, input.table, input.from, input.to, .{ .scan = .{ .from_key = input.from, .to_key = input.to, .opts = input.opts } }, .stale, .general);
             retained.prepared_count += 1;
             const prepared = &retained.prepared[scan_index];
             // The routed owner admission below may wait for Raft apply, which
@@ -4191,7 +4373,7 @@ pub const ProvisionedTableReadSource = struct {
             const prepared = &retained.prepared[participant.scan_index];
             const group = prepared.group_ids[participant.group_index];
             route.* = if (self.distributed_router) |router|
-                (try table_router.resolveGroupRoute(temporary, self.catalog, router.withBudget(.fromRequest(input.opts)), group, .prefer_leader)) orelse return error.GroupLeaderUnavailable
+                (try table_router.resolveCapturedGroupRoute(temporary, self.catalog, router.withBudget(.fromRequest(input.opts)), prepared.fenceAt(participant.group_index, input.opts.execution_deadline_ns, input.opts.cancellation), .prefer_leader)) orelse return error.GroupLeaderUnavailable
             else
                 .local;
             routed_count += 1;
@@ -4199,8 +4381,8 @@ pub const ProvisionedTableReadSource = struct {
                 const row_request = input.opts.relational_query orelse try std.json.parseFromSliceLeaky(db_mod.types.RelationalRowQuery, temporary, input.opts.relational_query_json, .{ .parse_numbers = false });
                 break :schema row_request.schema_version orelse return error.InvalidRetainedReadQuery;
             } else 0;
-            if (self.distributed_router != null and consistency != .stale) switch (route.*) {
-                .local => try prepareProvisionedGroupConsistency(self.read_safety_barrier, group, .{ .scan = .{ .from_key = input.from, .to_key = input.to, .opts = input.opts } }, consistency, false),
+            if (consistency != .stale) switch (route.*) {
+                .local => try admitRoutedStatementGroupWithRequest(alloc, self.catalog, self.read_safety_barrier, prepared.fenceAt(participant.group_index, input.opts.execution_deadline_ns, input.opts.cancellation), group, input.table, .{ .scan = .{ .from_key = input.from, .to_key = input.to, .opts = input.opts } }),
                 .remote => |remote| {
                     try @import("retained_read_client.zig").Client.admit(alloc, self.distributedInternalExecutor(), remote.base_uri, input.table, prepared.fenceAt(participant.group_index, input.opts.execution_deadline_ns, input.opts.cancellation), schema_version.*, input.opts.execution_deadline_ns);
                 },
@@ -4218,7 +4400,7 @@ pub const ProvisionedTableReadSource = struct {
                 const prepared = &retained.prepared[participant.scan_index];
                 const local_source = self.groupLocalSourceWithFence(prepared.fenceAt(participant.group_index, input.opts.execution_deadline_ns, input.opts.cancellation));
                 const fence = (switch (owner_route) {
-                    .local => local_source.tryStatementReadFenceGroupLocal(alloc, prepared.group_ids[participant.group_index], input.table, input.opts, .stale),
+                    .local => local_source.tryStatementReadFenceGroupLocal(alloc, prepared.group_ids[participant.group_index], input.table, input.opts, if (prepared.routes[participant.group_index].execution == .native_local) .read_index else .stale),
                     .remote => |remote| @import("retained_read_client.zig").Client.capture(alloc, self.distributedInternalExecutor(), remote.base_uri, input.table, prepared.fenceAt(participant.group_index, input.opts.execution_deadline_ns, input.opts.cancellation), schema_version, input.opts.execution_deadline_ns),
                 } catch |err| {
                     if (err != error.ReadUnavailable) return err;
@@ -4521,6 +4703,7 @@ pub const ProvisionedTableReadSource = struct {
         kind: ReadPreparation.Kind,
     ) !PreparedKeyRead {
         const deadline_ns = provisionedConsistencyDeadline(self.catalog, request);
+        const owner_minter = if (request == .lookup) request.lookup.opts.relation_owner_minter else null;
         var attempt: usize = 0;
         while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
             if (consistency == .stale) {
@@ -4536,11 +4719,18 @@ pub const ProvisionedTableReadSource = struct {
                     },
                     else => return err,
                 };
-                return .{ .route = route.route, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = if (route.route) |value| value.identity_namespace.table_id else 0, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .activity = activity };
+                return .{ .relation_owner_minter = owner_minter, .route = route.route, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = if (route.route) |value| value.identity_namespace.table_id else 0, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .activity = activity };
             }
 
             const route = try table_catalog.routedGroupSnapshotUntil(alloc, self.catalog, table_name, key, deadline_ns);
-            if (route.route) |group_route| try self.prepareGroupsForReadAdmission(alloc, &.{group_route.group_id}, request, consistency);
+            if (route.route) |group_route| {
+                if (group_route.execution == .native_local) {
+                    var captured = route.fence() orelse return error.CatalogRouteFenceRequired;
+                    if (request != .lookup) return error.InvalidArgument;
+                    try bindLookupRelationOwner(&captured, request.lookup.opts);
+                    try admitRoutedStatementGroupWithRequest(alloc, self.catalog, self.read_safety_barrier, captured, group_route.group_id, table_name, request);
+                } else try self.prepareGroupsForReadAdmission(alloc, &.{group_route.group_id}, request, consistency);
+            }
             var activity = self.beginPreparedRead(table_name, kind);
             errdefer if (activity) |*held| held.deinit();
             table_catalog.validatePinnedTopologyEpochUntil(alloc, self.catalog, table_name, route.topology_epoch, deadline_ns) catch |err| switch (err) {
@@ -4552,7 +4742,7 @@ pub const ProvisionedTableReadSource = struct {
                 },
                 else => return err,
             };
-            return .{ .route = route.route, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = if (route.route) |value| value.identity_namespace.table_id else 0, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .activity = activity };
+            return .{ .relation_owner_minter = owner_minter, .route = route.route, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = if (route.route) |value| value.identity_namespace.table_id else 0, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .activity = activity };
         }
         unreachable;
     }
@@ -4644,7 +4834,10 @@ pub const ProvisionedTableReadSource = struct {
                     else => return err,
                 };
                 route_owned = false;
-                return .{ .alloc = alloc, .routes = routes, .group_ids = group_ids, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = route.table_id, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .routing_deadline_ns = deadline_ns, .activity = activity };
+                return .{ .relation_owner_minter = switch (request) {
+                    .scan => |span_scan| span_scan.opts.relation_owner_minter,
+                    else => null,
+                }, .alloc = alloc, .routes = routes, .group_ids = group_ids, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = route.table_id, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .routing_deadline_ns = deadline_ns, .activity = activity };
             }
 
             const route = try requestRoutedSpanSnapshot(alloc, self.catalog, table_name, from_key, to_key, request, deadline_ns);
@@ -4668,7 +4861,10 @@ pub const ProvisionedTableReadSource = struct {
                 else => return err,
             };
             route_owned = false;
-            return .{ .alloc = alloc, .routes = routes, .group_ids = group_ids, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = route.table_id, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .routing_deadline_ns = deadline_ns, .activity = activity };
+            return .{ .relation_owner_minter = switch (request) {
+                .scan => |span_scan| span_scan.opts.relation_owner_minter,
+                else => null,
+            }, .alloc = alloc, .routes = routes, .group_ids = group_ids, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = route.table_id, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .routing_deadline_ns = deadline_ns, .activity = activity };
         }
         unreachable;
     }
@@ -4749,7 +4945,16 @@ pub const ProvisionedTableReadSource = struct {
             try fence.admission_cancellation.check();
             if (fence.route.group_id != group_id) return error.TopologyChanged;
             if (consistency != .stale) {
-                if (request) |gate_request| try self.prepareGroupsForReadAdmission(alloc, &.{group_id}, gate_request, consistency);
+                if (request) |gate_request| {
+                    if (fence.route.execution == .native_local) {
+                        // Native groups have no Raft read-index. Reuse the
+                        // captured route's current Boot/initialized Pin and
+                        // connection-owner admission before the physical read.
+                        // Activity, standby and post-admission catalog checks
+                        // remain the same as ordinary routed reads below.
+                        try admitRoutedStatementGroupWithRequest(alloc, self.expected_route_fence_catalog orelse self.catalog, self.read_safety_barrier, fence, group_id, table_name, gate_request);
+                    } else try self.prepareGroupsForReadAdmission(alloc, &.{group_id}, gate_request, consistency);
+                }
             }
             var activity = self.beginPreparedRead(table_name, kind);
             errdefer if (activity) |*held| held.deinit();
@@ -5504,12 +5709,9 @@ pub const ProvisionedTableReadSource = struct {
         defer lease.release(alloc);
         try lease.db.validateRestoreStagingScope(alloc, opts.restore_staging_scope orelse return error.RestoreStagingScopeChanged);
         const identity = lease.db.core.identity_namespace;
-        if (identity.shard_id != group_id) return error.RestoreStagingScopeChanged;
-        if (fence) |expected| {
-            try expected.validate();
-            try expected.admission_cancellation.check();
-            if (expected.table_id != identity.table_id or expected.route.group_id != group_id or expected.route.range_id != identity.range_id or expected.route.identity_namespace.table_id != identity.table_id or expected.route.identity_namespace.shard_id != identity.shard_id or expected.route.identity_namespace.range_id != identity.range_id) return error.RestoreStagingScopeChanged;
-        }
+        // The resident lease already selected the actual storage group.
+        // A document shard is a namespace component, not an owner group ID.
+        try requireRestoreStagingFence(identity, group_id, fence);
         // Never downgrade a hidden validation read: its result becomes a
         // durable UNIQUE/FK coverage proof consumed by atomic publication.
         const reader = raft_mod.FeatureDBReads.init(group_id, self.read_safety_barrier);
@@ -5517,7 +5719,7 @@ pub const ProvisionedTableReadSource = struct {
         defer result.deinit(alloc);
         const version = if (integrityLookupMode(opts)) 0 else result.version orelse try lease.db.getTimestamp(alloc, key);
         try checkLookupOptionsActive(opts);
-        return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest);
+        return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest, result.json_null_fields);
     }
 
     fn certifiedHandoffReceipt(opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency, strict_read_index_absence: bool) bool {
@@ -6626,7 +6828,7 @@ pub const HostedProvisionedTableReadSource = struct {
         return key.len == 0 and consistency == .read_index and
             (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
                 std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}")) and
-            !opts.include_primary_digest and !opts.relational_integrity_catalog and !opts.relational_integrity_action and
+            !opts.include_primary_digest and !opts.include_json_null_fields and !opts.relational_integrity_catalog and !opts.relational_integrity_action and
             !opts.generation_handoff_install_read_index_certified and
             opts.relational_integrity_jobs_json.len == 0 and opts.sql_lock_query_json.len == 0 and opts.group_source_query_json.len == 0 and opts.relational_index_status_json.len == 0 and
             opts.relational_activation_json.len == 0 and opts.fields.len == 0 and
@@ -6652,6 +6854,7 @@ pub const HostedProvisionedTableReadSource = struct {
             if (!isJoinJobStateRequest(request)) {
                 const resolve = self.catalog.vtable.route_fence orelse return error.CatalogRouteFenceRequired;
                 const fence = (try resolve(self.catalog.ptr, group_id)) orelse return error.CatalogRouteFenceRequired;
+                client.relation_owner_route = fence;
                 encoded_fence = try std.json.Stringify.valueAlloc(alloc, fence, .{});
                 const headers = try alloc.alloc(http_common.RequestHeader, request.headers.len + 2);
                 @memcpy(headers[0..request.headers.len], request.headers);
@@ -6739,6 +6942,7 @@ pub const HostedProvisionedTableReadSource = struct {
                     return error.CatalogRouteFenceRequired;
                 };
                 const fence = (try resolve(self.catalog.ptr, group_id)) orelse return error.CatalogRouteFenceRequired;
+                if (fence.route.execution == .native_local and fence.route.execution.native_local.kind == .temporary) client.relation_owner_route = fence;
                 encoded_fence = try std.json.Stringify.valueAlloc(alloc, fence, .{});
                 const headers = try alloc.alloc(http_common.RequestHeader, request.headers.len + 2);
                 @memcpy(headers[0..request.headers.len], request.headers);
@@ -6957,6 +7161,21 @@ pub const HostedProvisionedTableReadSource = struct {
         var pinned: RoutePinnedCatalog = undefined;
         var routed: HostedProvisionedTableReadSource = undefined;
         try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        if (fence.route.execution == .native_local) {
+            if (group_id != fence.route.group_id) return error.SqlRelationOwnerChanged;
+            var route = (try table_router.resolveCapturedGroupRoute(alloc, routed.catalog, routed.router.withBudget(.fromRequest(opts)), fence, routePolicyForConsistency(consistency))) orelse return error.StorageReadTemporarilyUnavailable;
+            defer route.deinit(alloc);
+            return switch (route) {
+                .local => lookupGroupLocal(&routed, alloc, group_id, table_name, key, opts, consistency),
+                .remote => |remote| (if (try @import("native_sql_lock_read.zig").isPrivateControl(alloc, key, opts, fence))
+                    lookupRemoteWithFence(routed.handoffReceiptExecutor(), alloc, remote.base_uri, group_id, table_name, key, opts, consistency, fence)
+                else
+                    lookupRemote(routed.internalExecutor(), alloc, remote.base_uri, group_id, table_name, key, opts, consistency)) catch |err| switch (err) {
+                    error.AuthoritativeLookupMissing => null,
+                    else => return err,
+                },
+            };
+        }
         return try lookupGroupLocal(&routed, alloc, group_id, table_name, key, opts, consistency);
     }
 
@@ -7191,13 +7410,20 @@ pub const HostedProvisionedTableReadSource = struct {
             key,
             lookupRoutingDeadline(hosted.catalog, opts),
         );
-        const fence = routed.fence() orelse return lookupWithoutRoute(consistency);
+        var fence = routed.fence() orelse return lookupWithoutRoute(consistency);
+        if (!try @import("native_sql_lock_read.zig").isPrivateControl(alloc, key, opts, fence))
+            try bindLookupRelationOwner(&fence, opts);
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned = routePinnedCatalogForFence(hosted.catalog, table_name, fence, &route_storage);
         var routed_source = hosted.*;
         routed_source.catalog = pinned.source();
         const self = &routed_source;
         const group_id = fence.route.group_id;
+        if (fence.route.execution == .native_local) {
+            var captured_source = self.source();
+            captured_source.route_fence = fence;
+            return captured_source.lookupGroupLocal(alloc, group_id, table_name, key, opts, consistency);
+        }
         try checkLookupOptionsActive(opts);
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(opts)), group_id, routePolicyForConsistency(consistency))) orelse {
             // A catalog route proves the group exists. Failure to discover a
@@ -7505,6 +7731,8 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
         if (route != .local) return try self.openRemoteRelationalRead(alloc, table, from, to, opts, consistency);
         var fence = snapshot.fenceAt(0);
+        fence.admission_relation_minter = opts.relation_owner_minter;
+        fence.admission_sql_relation_owner = if (opts.relation_owner_minter) |minter| minter.owner else null;
         fence.admission_deadline_ns = opts.execution_deadline_ns;
         fence.admission_cancellation = opts.cancellation orelse .none;
         const local_source = self.groupLocalSourceWithFence(fence);
@@ -10029,6 +10257,8 @@ fn graphHydrateOnPreparedDb(
     req: distributed_graph.GraphHydrateRequest,
     search_req: db_mod.types.SearchRequest,
 ) !distributed_graph.GraphHydrateResponse {
+    var raw_graph = try db.beginRawGraphReadLease();
+    defer raw_graph.release();
     try validateGraphHydrateIncomingIndexIdentity(req, db);
     const hits = if (req.include_hits)
         try db.graphHydrateKeysForInternalRead(alloc, search_req, req.keys)
@@ -10312,11 +10542,14 @@ fn replaceLookupResponseWithProjectedFullPayload(
     options: db_mod.types.LookupOptions,
 ) !void {
     const projected = try db_mod.document_query.lookupJson(alloc, full.json, options);
+    errdefer alloc.free(projected.json);
+    const flags = if (options.include_json_null_fields) try db_mod.types.cloneJsonNullFields(alloc, full.json_null_fields) else &.{};
     response.deinit(alloc);
     response.* = .{
         .json = projected.json,
         .version = full.version,
         .expected_content_digest = full.expected_content_digest,
+        .json_null_fields = flags,
     };
 }
 
@@ -12017,8 +12250,13 @@ fn executeProvisionedGraphGetEdgesAttempt(
     );
     defer db_owner.deinit();
     _ = try currentIdentityReadGenerationForDb(req.identity_read_generation, db_owner.db());
+    var raw_graph = try db_owner.db().beginRawGraphReadLease();
+    defer raw_graph.release();
     const graph_entry = db_owner.db().core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    return @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, &graph_entry.index, req, if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs());
+    var result = try @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, &graph_entry.index, req, if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs());
+    errdefer result.deinit(alloc);
+    try raw_graph.check();
+    return result;
 }
 
 fn executeHostedGraphGetEdges(
@@ -12063,8 +12301,13 @@ fn graphGetEdgesLocal(
     const reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
     try reads.reads.prepareLookupWithConsistency(group_id, req.key, .{}, consistency);
 
+    var raw_graph = try db.beginRawGraphReadLease();
+    defer raw_graph.release();
     const graph_entry = db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    return @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, &graph_entry.index, req, if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs());
+    var result = try @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, &graph_entry.index, req, if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs());
+    errdefer result.deinit(alloc);
+    try raw_graph.check();
+    return result;
 }
 
 fn lookupLocal(
@@ -12089,7 +12332,7 @@ fn lookupLocal(
     try checkLookupOptionsActive(opts);
     const version = if (integrityLookupMode(opts)) 0 else result.version orelse try db.getTimestamp(alloc, key);
     try checkLookupOptionsActive(opts);
-    return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest);
+    return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest, result.json_null_fields);
 }
 
 fn lookupProvisionedLocal(
@@ -12132,7 +12375,7 @@ fn lookupProvisionedLocal(
             defer result.deinit(alloc);
             const version = if (integrityLookupMode(opts)) 0 else result.version orelse try lease.db.getTimestamp(alloc, key);
             try checkLookupOptionsActive(opts);
-            return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest);
+            return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest, result.json_null_fields);
         }
     }
 
@@ -12150,7 +12393,7 @@ fn lookupProvisionedLocal(
         defer result.deinit(alloc);
         const version = if (integrityLookupMode(opts)) 0 else result.version orelse try lease.db.getTimestamp(alloc, key);
         try checkLookupOptionsActive(opts);
-        return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest);
+        return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest, result.json_null_fields);
     }
 
     var db = try openProvisionedLookupDbForTable(
@@ -12170,7 +12413,7 @@ fn lookupProvisionedLocal(
     defer result.deinit(alloc);
     const version = if (integrityLookupMode(opts)) 0 else result.version orelse try db.getTimestamp(alloc, key);
     try checkLookupOptionsActive(opts);
-    return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest);
+    return try controlledLookupResponseAlloc(alloc, result.json, version, opts, result.expected_content_digest, result.json_null_fields);
 }
 
 fn lookupHostedLocal(
@@ -16057,6 +16300,20 @@ fn lookupRemote(
     opts: db_mod.types.LookupOptions,
     consistency: raft_mod.ReadConsistency,
 ) !?LookupResponse {
+    return lookupRemoteWithFence(executor, alloc, base_uri, group_id, table_name, key, opts, consistency, null);
+}
+
+fn lookupRemoteWithFence(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    key: []const u8,
+    opts: db_mod.types.LookupOptions,
+    consistency: raft_mod.ReadConsistency,
+    captured: ?metadata_api.CatalogRouteFence,
+) !?LookupResponse {
     try checkLookupOptionsActive(opts);
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const fields = try encodeLookupFields(alloc, opts);
@@ -16079,6 +16336,7 @@ fn lookupRemote(
         timeout_ms,
         cancellation,
         .{
+            .catalog_route_fence = captured,
             .relational_integrity_catalog = opts.relational_integrity_catalog,
             .relational_integrity_action = opts.relational_integrity_action,
             .relational_integrity_jobs_json = opts.relational_integrity_jobs_json,
@@ -16090,6 +16348,7 @@ fn lookupRemote(
             .restore_staging_scope = opts.restore_staging_scope,
             .restore_staging_plan_id = opts.restore_staging_plan_id,
             .include_primary_digest = opts.include_primary_digest,
+            .include_json_null_fields = opts.include_json_null_fields,
             .row_policy_principal_proof = opts.row_policy_principal_proof,
             .row_policy_database = opts.row_policy_database,
         },
@@ -16107,6 +16366,7 @@ fn lookupRemote(
         if (result.version) |version| try std.fmt.parseUnsigned(u64, version, 10) else 0,
         opts,
         result.expected_content_digest,
+        result.json_null_fields,
     );
 }
 
@@ -17378,6 +17638,84 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(builtin.is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "retained graph readonly rows fork the captured cut without manufacturing transaction guards" {
+            const contracts = @import("antfly_local_sources").api_table_read_source;
+            const Snapshot = @import("antfly_local_sources").storage_statement_read_fence.Snapshot;
+            const Fixture = struct {
+                opens: usize = 0,
+                closes: usize = 0,
+                guarded: bool = false,
+                fn open(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, opts: db_mod.types.ScanOptions) !contracts.RelationalReadView {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expectEqual(self.guarded, opts.include_range_proofs);
+                    self.opens += 1;
+                    return .{ .ptr = self, .vtable = &.{ .next = next, .close = close } };
+                }
+                fn next(_: *anyopaque, a: std.mem.Allocator, _: u32) !contracts.RelationalReadView.Page {
+                    return .{ .arena = .init(a), .rows = &.{}, .after = null };
+                }
+                fn close(raw: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.closes += 1;
+                }
+                fn release(_: *anyopaque) void {}
+            };
+            const a = std.testing.allocator;
+            var fixture: Fixture = .{};
+            var snapshots = [_]Snapshot{.{ .ptr = &fixture, .vtable = &.{ .open = Fixture.open, .release = Fixture.release } }};
+            var groups = [_]u64{7};
+            var routes = [_]table_catalog.CatalogGroupRoute{.{ .group_id = 7, .range_id = 8, .identity_namespace = .{ .table_id = 9, .shard_id = 7, .range_id = 8 } }};
+            var name = [_]u8{ 'd', 'o', 'c', 's' };
+            var cut: BoundTableReadSource.CoordinatedStatementSnapshot = .{
+                .alloc = a,
+                // Unbounded reads must reuse the captured vector, so this
+                // fixture deliberately has no route/preparation provider.
+                .source = undefined,
+                .prepared = .{ .alloc = a, .routes = &routes, .group_ids = &groups, .metadata_group_id = 1, .metadata_incarnation = null, .table_id = 9, .catalog_revision = 2, .topology_epoch = 3, .activity = null },
+                .snapshots = &snapshots,
+                .table = &name,
+                .schema_version = 1,
+            };
+            var input: contracts.RelationalStatementScan = .{ .table = "docs", .opts = .{ .relational_query = .{ .fields = &.{}, .schema_version = 1 } } };
+            const view = try BoundTableReadSource.CoordinatedStatementSnapshot.open(&cut, a, input);
+            var page = try view.next(a, 1);
+            page.deinit();
+            view.deinit();
+            try std.testing.expectEqual(@as(usize, 1), fixture.opens);
+            try std.testing.expectEqual(@as(usize, 1), fixture.closes);
+            try std.testing.expectError(error.SqlRangeTrackingRequired, BoundTableReadSource.CoordinatedStatementSnapshot.openGuarded(&cut, a, input));
+            fixture.guarded = true;
+            input.opts.include_range_proofs = true;
+            try std.testing.expectError(error.SqlRangeTrackingRequired, BoundTableReadSource.CoordinatedStatementSnapshot.openGuarded(&cut, a, input));
+            try std.testing.expectEqual(@as(usize, 2), fixture.opens);
+            try std.testing.expectEqual(@as(usize, 2), fixture.closes);
+            input.table = "unseen";
+            try std.testing.expectError(error.SqlStatementSnapshotRequired, BoundTableReadSource.CoordinatedStatementSnapshot.open(&cut, a, input));
+            try std.testing.expectEqual(@as(usize, 2), fixture.opens);
+        }
+
+        test "retained graph cohort owns bounded index selections and unwinds every allocation failure" {
+            const Cut = BoundTableReadSource.CoordinatedStatementSnapshot;
+            const Fixture = struct {
+                fn run(a: std.mem.Allocator) !void {
+                    var first = [_]u8{ 'l', 'i', 'n', 'k', 's' };
+                    const names = try Cut.cloneGraphIndexes(a, &.{ &first, "references" });
+                    defer {
+                        for (names) |name| a.free(name);
+                        a.free(names);
+                    }
+                    first[0] = 'x';
+                    try std.testing.expectEqualStrings("links", names[0]);
+                    try std.testing.expectEqualStrings("references", names[1]);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+            try std.testing.expectError(error.InvalidQueryRequest, Cut.cloneGraphIndexes(std.testing.allocator, &.{ "links", "links" }));
+            try std.testing.expectError(error.InvalidQueryRequest, Cut.cloneGraphIndexes(std.testing.allocator, &.{ "links", "" }));
+            const excessive: [65][]const u8 = @splat("links");
+            try std.testing.expectError(error.SqlProgramLimitExceeded, Cut.cloneGraphIndexes(std.testing.allocator, &excessive));
+        }
+
         test "relational statement retries unavailable capture and releases fences before pages or deadline" {
             const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
             const Fence = @import("antfly_local_sources").api_table_read_source.StatementReadFence;
@@ -18059,11 +18397,17 @@ fn consumerTests() type {
             const Capture = struct {
                 mode: enum { good, missing, invalid } = .good,
                 expect_policy: bool = false,
+                typed_nulls: bool = false,
+                null_ack: bool = true,
+                malformed_nulls: bool = false,
+                duplicate_ack: bool = false,
                 observations: bool = false,
                 token: []const u8 = "not-a-proof",
                 fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqual(!self.observations, std.mem.indexOf(u8, req.uri, "_primary_digest=true") != null);
+                    try std.testing.expectEqual(self.typed_nulls, std.mem.indexOf(u8, req.uri, "_json_null_fields=true") != null);
+                    try std.testing.expectEqual(if (self.typed_nulls) @as(?usize, http_client.TypedLookup.max_response_bytes) else null, req.max_response_bytes);
                     if (self.observations) try std.testing.expect(std.mem.indexOf(u8, req.uri, "_relational_integrity_jobs=") != null);
                     const authority = @import("../usermgr/mod.zig").row_policy_authority;
                     var has_principal = false;
@@ -18083,13 +18427,15 @@ fn consumerTests() type {
                     try std.testing.expect(std.mem.indexOf(u8, req.uri, self.token) == null);
                     try std.testing.expect(std.mem.indexOf(u8, req.uri, "tenant-db") == null);
                     const digest = std.fmt.bytesToHex(@as([32]u8, @splat(0xab)), .lower);
-                    const headers = try allocator.alloc(http_common.Header, if (self.observations or self.mode == .missing) 1 else 2);
+                    const headers = try allocator.alloc(http_common.Header, if (self.typed_nulls and self.null_ack) (if (self.duplicate_ack) 4 else 3) else if (self.observations or self.mode == .missing) 1 else 2);
                     headers[0] = .{ .name = try allocator.dupe(u8, "X-Antfly-Version"), .value = try allocator.dupe(u8, "77") };
-                    if (headers.len == 2) headers[1] = .{
+                    if (headers.len >= 2) headers[1] = .{
                         .name = try allocator.dupe(u8, "X-Antfly-Primary-Digest"),
                         .value = try allocator.dupe(u8, if (self.mode == .invalid) "invalid" else &digest),
                     };
-                    return .{ .status = 200, .headers = headers, .body = try allocator.dupe(u8, if (self.observations) "{\"observations\":[{\"key\":\"row\",\"row\":null}],\"typed_nulls\":true}" else "{\"id\":1}") };
+                    if (headers.len >= 3) headers[2] = .{ .name = try allocator.dupe(u8, "X-Antfly-Typed-Nulls"), .value = try allocator.dupe(u8, "1") };
+                    if (headers.len == 4) headers[3] = .{ .name = try allocator.dupe(u8, "x-antfly-typed-nulls"), .value = try allocator.dupe(u8, "1") };
+                    return .{ .status = 200, .headers = headers, .body = try allocator.dupe(u8, if (self.typed_nulls) (if (self.malformed_nulls) "{}" else "{\"json\":\"{\\\"payload\\\":null}\",\"json_null_fields\":[\"payload\"]}") else if (self.observations) "{\"observations\":[{\"key\":\"row\",\"row\":null}],\"typed_nulls\":true}" else "{\"id\":1}") };
                 }
             };
             var capture: Capture = .{};
@@ -18119,6 +18465,29 @@ fn consumerTests() type {
             try std.testing.expectError(error.InvalidResponse, lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true }, .read_index));
             capture.mode = .invalid;
             try std.testing.expectError(error.InvalidResponse, lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true }, .read_index));
+            capture.mode = .good;
+            capture.typed_nulls = true;
+            var typed = (try lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true, .include_json_null_fields = true }, .read_index)).?;
+            defer typed.deinit(alloc);
+            try std.testing.expectEqualStrings("{\"payload\":null}", typed.json);
+            try std.testing.expectEqual(@as(usize, 1), typed.json_null_fields.len);
+            try std.testing.expectEqualStrings("payload", typed.json_null_fields[0]);
+            capture.duplicate_ack = true;
+            try std.testing.expectError(error.InvalidResponse, lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true, .include_json_null_fields = true }, .read_index));
+            capture.duplicate_ack = false;
+            capture.null_ack = false;
+            try std.testing.expectError(error.InvalidResponse, lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true, .include_json_null_fields = true }, .read_index));
+            capture.null_ack = true;
+            try http_client.TypedLookup.requireCanonical("{\"a\":null,\"b\":null}", &.{ "a", "b" });
+            try std.testing.expectError(error.InvalidResponse, http_client.TypedLookup.requireCanonical("{\"a\":null}", &.{ "a", "a" }));
+            try std.testing.expectError(error.InvalidResponse, http_client.TypedLookup.requireCanonical("{\"a\":null,\"b\":null}", &.{ "b", "a" }));
+            var references = try std.json.parseFromSlice(std.json.Value, alloc, "{\"a\":null,\"b\":0}", .{});
+            defer references.deinit();
+            try @import("sql_trigger_raw.zig").requireNullFieldReferences(references.value, &.{"a"});
+            try std.testing.expectError(error.InvalidResponse, @import("sql_trigger_raw.zig").requireNullFieldReferences(references.value, &.{"b"}));
+            try std.testing.expectError(error.InvalidResponse, @import("sql_trigger_raw.zig").requireNullFieldReferences(references.value, &.{"missing"}));
+            capture.malformed_nulls = true;
+            try std.testing.expectError(error.InvalidResponse, lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true, .include_json_null_fields = true }, .read_index));
         }
 
         test "relational row query internal forwarding retains exact operands and bounds" {
@@ -35773,4 +36142,366 @@ test "public graph metric borrowed wire scan producer sink preserves bytes and f
     // An already expired request fails before forwarding buffered bytes.
     capture.fail = false;
     try std.testing.expectError(error.DeadlineExceeded, writeBorrowedScanLine(entry, capture.sink(), .{ .execution_deadline_ns = 1 }));
+}
+
+test "SQL relation lifetime remote status reads sign exact captured body and reject foreign owner or generation" {
+    const a = std.testing.allocator;
+    const authority = @import("antfly_local_sources").common_relation_owner_authority;
+    const persistence = @import("antfly_local_sources").common_topology_records.RelationPersistence;
+    const Fixture = struct {
+        fence: metadata_api.CatalogRouteFence,
+        accepted: persistence.Descriptor,
+        calls: usize = 0,
+        const secret = "native-status-test-user-preparation-secret";
+        const issuer = "native-status-issuer";
+        fn sign(_: *anyopaque, allocator: std.mem.Allocator, owner: persistence.Owner, scope: authority.Scope) ![]u8 {
+            return authority.sign(allocator, secret, issuer, owner, scope, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+        }
+        fn routeFence(raw: *anyopaque, group: u64) !?metadata_api.CatalogRouteFence {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.fence.route.group_id, group);
+            return self.fence;
+        }
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminSnapshot;
+        }
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn execute(raw: *anyopaque, allocator: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            var grant: ?[]const u8 = null;
+            var carried_route: ?[]const u8 = null;
+            for (request.headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, authority.header)) grant = header.value;
+                if (std.ascii.eqlIgnoreCase(header.name, metadata_api.catalog_route_fence_header)) carried_route = header.value;
+            }
+            const encoded = carried_route orelse return error.CatalogRouteFenceRequired;
+            var captured = try std.json.parseFromSlice(metadata_api.CatalogRouteFence, allocator, encoded, .{});
+            defer captured.deinit();
+            try std.testing.expect(captured.value.admission_sql_relation_owner == null);
+            try std.testing.expect(captured.value.admission_relation_minter == null);
+            const expected: authority.Scope = .{ .purpose = .read, .table_id = self.fence.table_id, .group_id = self.fence.route.group_id, .descriptor_fingerprint = try self.accepted.fingerprint(), .body_digest = authority.bodyDigest(request.body) };
+            const owner = try authority.verify(allocator, secret, issuer, expected, self.accepted, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)), grant orelse return error.Forbidden);
+            try std.testing.expect(owner.eql(self.accepted.owner.?));
+            var changed_body = expected;
+            changed_body.body_digest = authority.bodyDigest("a different lookup body");
+            try std.testing.expectError(error.Forbidden, authority.verify(allocator, secret, issuer, changed_body, self.accepted, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)), grant.?));
+            const headers = try allocator.alloc(http_common.Header, 1);
+            errdefer allocator.free(headers);
+            headers[0] = .{ .name = try allocator.dupe(u8, metadata_api.catalog_route_fence_ack_header), .value = try allocator.dupe(u8, metadata_api.catalog_route_fence_ack_value) };
+            return .{ .status = 200, .headers = headers, .body = try allocator.dupe(u8, "{}") };
+        }
+    };
+    const owner: persistence.Owner = .{ .issuer_node_id = 1, .connection_id = @splat(1), .wire_epoch = @splat(2), .execution_instance = @splat(3), .connection_generation = 1, .principal_digest = @splat(4) };
+    const descriptor: persistence.Descriptor = .{ .kind = .temporary, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(5), .data_generation = 1, .owner = owner };
+    var fixture: Fixture = .{ .accepted = descriptor, .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('a'), .catalog_revision = 2, .table_id = 7, .topology_epoch = 3, .route = .{ .execution = .{ .native_local = descriptor }, .group_id = 11, .range_id = 11, .identity_namespace = .{ .table_id = 7, .shard_id = 11, .range_id = 11 } }, .admission_sql_relation_owner = owner } };
+    fixture.fence.admission_relation_minter = .{ .ptr = &fixture, .sign_fn = Fixture.sign, .owner = owner };
+    var hosted: HostedProvisionedTableReadSource = .{ .replica_root_dir = "", .catalog = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.freeSnapshot, .route_fence = Fixture.routeFence } }, .read_safety_barrier = undefined, .router = undefined, .executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } } };
+    const request: http_common.HttpRequest = .{ .method = .POST, .uri = "http://owner/internal/v1/groups/11/tables/rows/lookup", .body = "{\"key\":\"\",\"mode\":\"status\"}" };
+    var response = try HostedProvisionedTableReadSource.executeInternalRequest(&hosted, a, request);
+    response.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    fixture.fence.route.execution.native_local.data_generation += 1;
+    try std.testing.expectError(error.Forbidden, HostedProvisionedTableReadSource.executeInternalRequest(&hosted, a, request));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    fixture.fence.route.execution.native_local = descriptor;
+    fixture.fence.admission_relation_minter.?.owner.wire_epoch = @splat(8);
+    try std.testing.expectError(error.SqlTemporaryRelationNotOwned, HostedProvisionedTableReadSource.executeInternalRequest(&hosted, a, request));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    fixture.fence.admission_relation_minter = null;
+    try std.testing.expectError(error.SqlTemporaryRelationNotOwned, HostedProvisionedTableReadSource.executeInternalRequest(&hosted, a, request));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
+test "SQL relation lifetime snapshot cohorts retain native routes Boot authority owner grants and actual local remote primary cuts" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const persistence = local.common_topology_records.RelationPersistence;
+    const authority = local.common_relation_owner_authority;
+    const client = @import("../storage/kernel_owner_client.zig");
+    const rpc = @import("retained_read_rpc.zig");
+    const registry = @import("../storage/retained_read_registry.zig");
+    const boots = @import("../metadata/sql_relation_boots.zig");
+    const attestation = @import("../metadata/sql_relation_attestation.zig");
+    const Provider = @import("../storage/relational_read_provider.zig").Provider;
+    const Fixture = struct {
+        fence: metadata_api.CatalogRouteFence,
+        observed: boots.Observation,
+        provider: Provider,
+        native_owner: *client.Owner,
+        lookups: usize = 0,
+        validations: usize = 0,
+        registry: *registry.Registry,
+        local_node: u64 = 7,
+        captures: usize = 0,
+        admitted: usize = 0,
+        barrier_calls: usize = 0,
+        rpc_calls: usize = 0,
+        deny_capture: bool = false,
+        stale_boot: bool = false,
+        wrong_descriptor: bool = false,
+        fn admin(_: *anyopaque) anyerror!metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminRead;
+        }
+        fn freeAdmin(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn route(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) anyerror!table_catalog.RouteResult {
+            const fixture: *@This() = @ptrCast(@alignCast(raw));
+            var selected = fixture.fence.route;
+            if (fixture.wrong_descriptor) selected.execution.native_local.data_generation += 1;
+            return .{ .found = .{ .metadata_group_id = fixture.fence.metadata_group_id, .metadata_incarnation = fixture.fence.metadata_incarnation, .catalog_revision = fixture.fence.catalog_revision, .table_id = fixture.fence.table_id, .topology_epoch = fixture.fence.topology_epoch, .groups = try alloc.dupe(table_catalog.CatalogGroupRoute, &.{selected}) } };
+        }
+        fn validateRoute(raw: *anyopaque, alloc: std.mem.Allocator, table: []const u8, query: table_catalog.RouteQuery, deadline: ?u64) anyerror!table_catalog.RouteResult {
+            const fixture: *@This() = @ptrCast(@alignCast(raw));
+            fixture.validations += 1;
+            return route(raw, alloc, table, query, deadline);
+        }
+        fn epoch(raw: *anyopaque, _: []const u8) anyerror!u64 {
+            return @as(*@This(), @ptrCast(@alignCast(raw))).fence.topology_epoch;
+        }
+        fn boot(raw: *anyopaque, _: std.mem.Allocator, query: boots.Query, _: ?u64) anyerror!boots.Observation {
+            const fixture: *@This() = @ptrCast(@alignCast(raw));
+            if (query.node != 7 or query.binding_table != 7) return error.SqlRelationOwnerChanged;
+            var result = fixture.observed;
+            if (fixture.stale_boot) result.registration_current = false;
+            return result;
+        }
+        fn catalog(fixture: *@This()) table_catalog.CatalogSource {
+            // Deliberately NO route_fence/leader/bulk fallback callback. The
+            // exact typed compact cut already contains the native execution.
+            return .{ .ptr = fixture, .vtable = &.{ .admin_snapshot = admin, .free_admin_snapshot = freeAdmin, .resolve_route = route, .validate_route = validateRoute, .sql_relation_boot = boot } };
+        }
+        fn node(raw: *anyopaque) u64 {
+            return @as(*@This(), @ptrCast(@alignCast(raw))).local_node;
+        }
+        fn status(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            @panic("native cohort must never ask Raft replica status");
+        }
+        fn uri(_: *anyopaque, alloc: std.mem.Allocator, owner: u64) anyerror!?[]u8 {
+            if (owner != 7) return error.SqlRelationOwnerUnavailable;
+            return try alloc.dupe(u8, "http://native-owner");
+        }
+        fn router(fixture: *@This()) table_router.HostedGroupRouter {
+            return .{ .ptr = fixture, .vtable = &.{ .local_node_id = node, .local_status = status, .node_base_uri = uri } };
+        }
+        fn barrier(raw: *anyopaque, _: u64, _: []const u8) anyerror!void {
+            const fixture: *@This() = @ptrCast(@alignCast(raw));
+            fixture.barrier_calls += 1;
+            return error.NotLeader;
+        }
+        fn source(fixture: *@This()) TableReadSource {
+            return .{ .ptr = fixture, .strict_read_index_absence = true, .remote_statement_fences_safe = true, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .lookup_group_local_routed = lookup, .try_statement_read_fence_group_local_routed = capture, .admit_statement_read_group_local_routed = admit } };
+        }
+        fn admit(raw: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group: u64, table: []const u8) anyerror!void {
+            const fixture: *@This() = @ptrCast(@alignCast(raw));
+            fixture.admitted += 1;
+            return admitRoutedStatementGroup(alloc, fixture.catalog(), .{ .ptr = fixture, .vtable = &.{ .wait_read_safe = barrier } }, fence, group, table);
+        }
+        fn lookup(raw: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group: u64, table: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) anyerror!?LookupResponse {
+            const fixture: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(consistency == .stale or consistency == .read_index);
+            try admit(raw, alloc, fence, group, table);
+            fixture.lookups += 1;
+            const body = try encodeStorageKernelLookupRequest(alloc, key, opts);
+            defer alloc.free(body);
+            var response = try fixture.native_owner.lookupJson(table, body);
+            defer response.deinit();
+            return .{ .json = try alloc.dupe(u8, response.bytes()), .version = response.version() };
+        }
+        fn capture(raw: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group: u64, table: []const u8, opts: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?local.storage_statement_read_fence.Fence {
+            const fixture: *@This() = @ptrCast(@alignCast(raw));
+            if (fixture.deny_capture) return error.SqlStatementSnapshotRequired;
+            if (!std.meta.eql(fence.route, fixture.fence.route) or group != fixture.fence.route.group_id) return error.SqlRelationOwnerChanged;
+            const owner = if (fence.admission_relation_minter) |minter| minter.owner else fence.admission_sql_relation_owner;
+            try fixture.fence.route.execution.native_local.requireConnectionOwner(owner);
+            var verified = fence;
+            try fixture.catalog().pinNativeParticipant(alloc, &verified, null);
+            fixture.captures += 1;
+            const actual = try fixture.provider.tryFence(alloc, table, opts);
+            if (actual) |held| {
+                // Checked native provider returns the real primary sequence;
+                // no synthetic Raft term/index or stale reader is substituted.
+                _ = try held.nativeSequence();
+            }
+            return actual;
+        }
+        fn sign(_: *anyopaque, alloc: std.mem.Allocator, owner: persistence.Owner, scope: authority.Scope) anyerror![]u8 {
+            return authority.sign(alloc, "native-cohort-owner-key", "cohort", owner, scope, 100);
+        }
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const fixture: *@This() = @ptrCast(@alignCast(raw));
+            fixture.rpc_calls += 1;
+            var route_value = try std.json.parseFromSlice(metadata_api.CatalogRouteFence, alloc, request.header(metadata_api.catalog_route_fence_header) orelse return error.Forbidden, .{});
+            defer route_value.deinit();
+            var captured = route_value.value;
+            const scope: authority.Scope = .{ .purpose = .read, .table_id = 7, .group_id = 11, .descriptor_fingerprint = try fixture.fence.route.execution.native_local.fingerprint(), .body_digest = authority.bodyDigest(request.body) };
+            captured.admission_sql_relation_owner = try authority.verify(alloc, "native-cohort-owner-key", "cohort", scope, fixture.fence.route.execution.native_local, 101, request.header(authority.header) orelse return error.Forbidden);
+            var source_value = fixture.source();
+            source_value.route_fence = captured;
+            const rpc_scope: registry.Scope = .{ .principal = @splat(1), .authorization_revision = 1, .table_id = 7, .group_id = 11, .topology_revision = 3, .schema_version = 1 };
+            const body = if (std.mem.indexOf(u8, request.uri, "&_relational_integrity_catalog=true") != null) catalog: {
+                var response = (try source_value.lookupGroupLocal(alloc, 11, "rows", "", .{ .relational_integrity_catalog = true }, .read_index)) orelse return error.TestExpectedIntegrityCatalog;
+                defer response.deinit(alloc);
+                break :catalog try alloc.dupe(u8, response.json);
+            } else retained: {
+                var input = try std.json.parseFromSlice(rpc.Request, alloc, request.body, .{});
+                defer input.deinit();
+                break :retained try rpc.execute(alloc, .{ .registry = fixture.registry, .source = source_value }, rpc_scope, "rows", input.value);
+            };
+            errdefer alloc.free(body);
+            const headers = try alloc.alloc(http_common.Header, 1);
+            errdefer alloc.free(headers);
+            const name = try alloc.dupe(u8, metadata_api.catalog_route_fence_ack_header);
+            errdefer alloc.free(name);
+            headers[0] = .{ .name = name, .value = try alloc.dupe(u8, metadata_api.catalog_route_fence_ack_value) };
+            return .{ .status = 200, .body = body, .headers = headers };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(parent);
+    const path = try std.fmt.allocPrint(a, "{s}/native", .{parent});
+    defer a.free(path);
+    var context: client.Context = .{};
+    try context.ensure();
+    defer context.deinit();
+    const instance = (try context.metrics()).execution_instance;
+    const owner: persistence.Owner = .{ .issuer_node_id = 1, .connection_id = @splat(1), .wire_epoch = @splat(2), .execution_instance = @splat(3), .connection_generation = 4, .principal_digest = @splat(5) };
+    const descriptor: persistence.Descriptor = .{ .kind = .temporary, .owner_node_id = 7, .owner_store_id = 8, .generation_instance = instance, .data_generation = 1, .owner = owner };
+    const descriptor_json = try std.json.Stringify.valueAlloc(a, descriptor, .{});
+    defer a.free(descriptor_json);
+    const host_json = try std.json.Stringify.valueAlloc(a, persistence.Context{ .node_id = 7, .store_id = 8, .execution_instance = instance, .generation_instance = instance, .data_generation = 1, .connection = owner }, .{});
+    defer a.free(host_json);
+    const boot_json = try std.json.Stringify.valueAlloc(a, persistence.Boot{ .instance = instance, .unclean_restart = false }, .{});
+    defer a.free(boot_json);
+    var native = try client.Owner.open(.{ .context = context.handle, .path = .fromSlice(path), .table_name = .fromSlice("rows"), .group_id = 11, .has_identity_namespace = 1, .identity_table_id = 7, .identity_shard_id = 12, .identity_range_id = 13, .online_source_authority = 2, .sql_persistence_json = .fromSlice(descriptor_json), .sql_persistence_context_json = .fromSlice(host_json), .persistence_boot_json = .fromSlice(boot_json), .schema_json = .fromSlice("{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}"), .indexes_json = .fromSlice("{}") });
+    defer native.deinit();
+    const binding = try native.nativeRelationBinding(a, "rows");
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7));
+    const root: local.storage_db_root_signing_identity.State = .{ .root_incarnation = 1, .seed = @splat(7), .public_key = pair.public_key.toBytes() };
+    const identity: @import("../metadata/store_root_enrollment.zig").Identity = .{ .metadata_incarnation = @splat('1'), .node_id = 7, .store_id = 8, .root_incarnation = 1, .public_key = root.public_key };
+    var resources = try registry.Registry.init(a, std.testing.io, 1, 8, 8, 30 * std.time.ns_per_s);
+    defer resources.deinit();
+    var fixture: Fixture = .{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 7, .topology_epoch = 3, .route = .{ .group_id = 11, .range_id = 13, .identity_namespace = .{ .table_id = 7, .shard_id = 12, .range_id = 13 }, .execution = .{ .native_local = descriptor } } }, .provider = try @import("../storage/relational_read_provider.zig").acquire(native.handle), .native_owner = &native, .registry = &resources, .observed = .{ .registration_current = true, .record = .{ .node_id = 7, .identity = identity, .reporter_incarnation = 1, .generation = 1, .instance = instance, .claim_digest = @splat(1), .unclean_restart = false, .phase = .ready }, .initialized = try attestation.SignedBinding.sign(.{ .kind = .initialized, .metadata_group_id = 1, .boot_generation = 1, .identity = identity, .reporter_incarnation = 1, .binding = binding }, root) } };
+    const minter: authority.Minter = .{ .ptr = &fixture, .sign_fn = Fixture.sign, .owner = owner };
+    const executor: http_common.RequestExecutor = .{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } };
+    var routed = ProvisionedTableReadSource.init("unused", fixture.catalog(), .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.barrier } });
+    routed.local_read_source = fixture.source();
+    _ = routed.withDistributedRouting(fixture.router(), executor, "node-key", "node");
+    // The same real opaque owner is also reached through the provisioned
+    // point-read wrapper used by native constraint status. Its read-index
+    // admission must never ask the absent DataRaft group for a quorum.
+    var point_fence = fixture.fence;
+    point_fence.admission_relation_minter = minter;
+    var point = routed.source();
+    point.route_fence = point_fence;
+    const point_opts: db_mod.types.LookupOptions = .{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}" };
+    var actual_point = (try point.lookupGroupLocal(a, 11, "rows", "", point_opts, .read_index)) orelse return error.TestExpectedNativeBinding;
+    defer actual_point.deinit(a);
+    var actual_binding = try std.json.parseFromSlice(persistence.NativeBinding, a, actual_point.json, .{});
+    defer actual_binding.deinit();
+    try std.testing.expect((try persistence.PhysicalPin.fromBinding(binding)).eql(try persistence.PhysicalPin.fromBinding(actual_binding.value)));
+    try std.testing.expectEqual(@as(usize, 0), fixture.barrier_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.lookups);
+    point.route_fence.?.route.identity_namespace.table_id += 1;
+    try std.testing.expectError(error.InvalidCatalogRouteFence, point.lookupGroupLocal(a, 11, "rows", "", point_opts, .read_index));
+    point.route_fence = point_fence;
+    point.route_fence.?.route.execution.native_local.data_generation += 1;
+    try std.testing.expectError(error.TopologyChanged, point.lookupGroupLocal(a, 11, "rows", "", point_opts, .read_index));
+    point.route_fence = point_fence;
+    fixture.stale_boot = true;
+    try std.testing.expectError(error.SqlRelationOwnerChanged, point.lookupGroupLocal(a, 11, "rows", "", point_opts, .read_index));
+    fixture.stale_boot = false;
+    var canceled: std.atomic.Value(bool) = .init(true);
+    point.route_fence.?.admission_cancellation = .fromAtomic(&canceled);
+    try std.testing.expectError(error.Canceled, point.lookupGroupLocal(a, 11, "rows", "", point_opts, .read_index));
+    point.route_fence = point_fence;
+    try std.testing.expectEqual(@as(usize, 1), fixture.lookups);
+    try std.testing.expectEqual(@as(usize, 0), fixture.barrier_calls);
+    const target: local.api_table_read_source.RelationalSnapshotTarget = .{ .table = "rows", .table_id = 7, .schema_version = 1, .relation_owner_minter = minter };
+    for ([_]u64{ 7, 99 }) |node_id| {
+        fixture.local_node = node_id;
+        const cut = try routed.source().openRelationalSnapshotCohort(a, &.{target}, .read_index, null, null);
+        defer cut.deinit();
+        const view = try cut.open(a, .{ .table = "rows", .opts = .{ .relational_query = .{ .schema_version = 1, .fields = &.{"n"} } } });
+        defer view.deinit();
+        var page = try view.next(a, 2);
+        try std.testing.expectEqual(@as(usize, 0), page.rows.len);
+        page.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.barrier_calls);
+    try std.testing.expectEqual(@as(usize, 2), fixture.captures);
+    try std.testing.expect(fixture.rpc_calls > 0 and fixture.admitted > 0);
+    fixture.local_node = 7;
+    fixture.stale_boot = true;
+    try std.testing.expectError(error.SqlRelationOwnerChanged, routed.source().openRelationalSnapshotCohort(a, &.{target}, .read_index, null, null));
+    fixture.stale_boot = false;
+    fixture.wrong_descriptor = true;
+    try std.testing.expectError(error.SqlRelationOwnerChanged, routed.source().openRelationalSnapshotCohort(a, &.{target}, .read_index, null, null));
+    fixture.wrong_descriptor = false;
+    var other = target;
+    other.relation_owner_minter.?.owner.wire_epoch = @splat(99);
+    try std.testing.expectError(error.SqlTemporaryRelationNotOwned, routed.source().openRelationalSnapshotCohort(a, &.{other}, .read_index, null, null));
+    fixture.deny_capture = true;
+    try std.testing.expectError(error.SqlStatementSnapshotRequired, routed.source().openRelationalSnapshotCohort(a, &.{target}, .read_index, null, null));
+    try std.testing.expectEqual(@as(usize, 0), fixture.barrier_calls);
+    // Ordinary Raft admission must still honor failed read-index; native
+    // authority is not an opt-out request flag available to Raft routes.
+    fixture.fence.route.execution = .raft;
+    point.route_fence = fixture.fence;
+    try std.testing.expectError(error.NotLeader, point.lookupGroupLocal(a, 11, "rows", "", point_opts, .read_index));
+    try std.testing.expectEqual(@as(usize, 1), fixture.barrier_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.lookups);
+    try std.testing.expectError(error.NotLeader, admitRoutedStatementGroup(a, fixture.catalog(), routed.read_safety_barrier, fixture.fence, 11, "rows"));
+    try std.testing.expectEqual(@as(usize, 2), fixture.barrier_calls);
+    // Preparation's top-level point-read API must carry its trusted signer
+    // through join-view routing into the same actual compiled native owner.
+    fixture.fence.route.execution = .{ .native_local = descriptor };
+    fixture.deny_capture = false;
+    fixture.barrier_calls = 0;
+    const owned_opts: db_mod.types.LookupOptions = .{ .relational_integrity_catalog = true, .relation_owner_minter = minter };
+    const ordinary_wire = try encodeStorageKernelLookupRequest(a, "", .{ .relational_integrity_catalog = true });
+    defer a.free(ordinary_wire);
+    const owned_wire = try encodeStorageKernelLookupRequest(a, "", owned_opts);
+    defer a.free(owned_wire);
+    try std.testing.expectEqualStrings(ordinary_wire, owned_wire);
+    for ([_]u64{ 7, 99 }) |node_id| {
+        fixture.local_node = node_id;
+        const validations_before = fixture.validations;
+        var actual_catalog = (try routed.source().lookup(a, "rows", "", owned_opts, .read_index)) orelse return error.TestExpectedIntegrityCatalog;
+        try std.testing.expect(fixture.validations > validations_before);
+        defer actual_catalog.deinit(a);
+        var parsed_catalog = try std.json.parseFromSlice(std.json.Value, a, actual_catalog.json, .{});
+        defer parsed_catalog.deinit();
+        try std.testing.expect(parsed_catalog.value == .object);
+        const completed_lookups = fixture.lookups;
+        var foreign = owned_opts;
+        foreign.relation_owner_minter.?.owner.wire_epoch = @splat(99);
+        try std.testing.expectError(error.SqlTemporaryRelationNotOwned, routed.source().lookup(a, "rows", "", foreign, .read_index));
+        fixture.stale_boot = true;
+        try std.testing.expectError(error.SqlRelationOwnerChanged, routed.source().lookup(a, "rows", "", owned_opts, .read_index));
+        fixture.stale_boot = false;
+        try std.testing.expectEqual(completed_lookups, fixture.lookups);
+        try std.testing.expectError(error.SqlTemporaryRelationNotOwned, routed.source().lookup(a, "rows", "", .{ .relational_integrity_catalog = true }, .read_index));
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.barrier_calls);
+}
+
+test "SQL relation lifetime restore staging reads bind owner group independently from document shard" {
+    const namespace: db_mod.DocIdentityNamespace = .{ .table_id = 7, .shard_id = 172, .range_id = 272 };
+    var fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 72, .range_id = 272, .identity_namespace = .{ .table_id = namespace.table_id, .shard_id = namespace.shard_id, .range_id = namespace.range_id } } };
+    try requireRestoreStagingFence(namespace, 72, fence);
+    try requireRestoreStagingFence(namespace, 72, null);
+    try std.testing.expectError(error.RestoreStagingScopeChanged, requireRestoreStagingFence(namespace, 172, fence));
+    fence.table_id = 8;
+    fence.route.identity_namespace.table_id = 8;
+    try std.testing.expectError(error.RestoreStagingScopeChanged, requireRestoreStagingFence(namespace, 72, fence));
+    fence.table_id = 7;
+    fence.route.identity_namespace.table_id = 7;
+    fence.route.identity_namespace.shard_id = 173;
+    try std.testing.expectError(error.RestoreStagingScopeChanged, requireRestoreStagingFence(namespace, 72, fence));
+    fence.route.identity_namespace.shard_id = 172;
+    fence.route.range_id = 273;
+    fence.route.identity_namespace.range_id = 273;
+    try std.testing.expectError(error.RestoreStagingScopeChanged, requireRestoreStagingFence(namespace, 72, fence));
 }

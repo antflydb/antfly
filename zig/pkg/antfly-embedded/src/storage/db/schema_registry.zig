@@ -85,13 +85,17 @@ pub const Epoch = struct {
                 !(try schema_mod.matchesExcludedSourceEpoch(alloc, owned_schema, derived)))
                 return error.InvalidSchemaUpdateRequest;
         }
+        var requirements = schema_mod.readerRequirementsForSchema(owned_schema);
+        if (owned_validator) |validator| if (validator.schema.sql_triggers != null) {
+            requirements.semantic_version = @max(requirements.semantic_version, schema_api.table_trigger_semantic_version);
+        };
         var physical_layout = try row_codec.PhysicalLayout.init(alloc, owned_schema);
         errdefer physical_layout.deinit();
         const epoch = try alloc.create(Epoch);
         epoch.* = .{
             .alloc = alloc,
             .schema = owned_schema,
-            .reader_requirements = schema_mod.readerRequirementsForSchema(owned_schema),
+            .reader_requirements = requirements,
             .physical_layout = physical_layout,
             .validator = owned_validator,
         };
@@ -142,6 +146,12 @@ pub const SchemaView = struct {
 
     pub fn validator(self: SchemaView) ?schema_api.CompiledTableValidator {
         return self.epoch.validator;
+    }
+
+    /// State borrows the pinned validator epoch, never an active mutable schema.
+    pub fn triggerState(self: SchemaView) ?*const @import("../../system_catalog/triggers.zig").State {
+        if (self.epoch.validator) |*compiled| if (compiled.schema.sql_triggers) |*state| return &state.value;
+        return null;
     }
 
     pub fn hasCoordinatedConstraints(self: SchemaView) bool {

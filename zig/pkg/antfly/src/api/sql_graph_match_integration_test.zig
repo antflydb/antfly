@@ -61,12 +61,62 @@ const Campaign = struct {
             }
         }
     }
+    fn observeHits(ctx: *fixture.Context, sql: []const u8, targets: []const []const u8, ordered: bool) !void {
+        var response = try client.execute(ctx, sql, .read);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 200) std.debug.print("SQL graph join status={d} statement={s} body={s}\n", .{ response.status, sql, response.body });
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var parsed = try std.json.parseFromSlice(Wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 2), parsed.value.columns.len);
+        try std.testing.expectEqualStrings("doc_id", parsed.value.columns[0].name);
+        try std.testing.expectEqualStrings("graph_score", parsed.value.columns[1].name);
+        try std.testing.expect(@import("sql_parity_reference.zig").postgresColumnMatches(parsed.value.columns[0], 25));
+        try std.testing.expect(@import("sql_parity_reference.zig").postgresColumnMatches(parsed.value.columns[1], 701));
+        const nulls = parsed.value.sql_nulls orelse return error.MissingSqlNullBitmap;
+        try std.testing.expectEqual(parsed.value.rows.len, nulls.len);
+        for (nulls) |flags| {
+            try std.testing.expectEqual(@as(usize, 2), flags.len);
+            try std.testing.expect(!flags[0]);
+            try std.testing.expect(flags[1]);
+        }
+        try std.testing.expectEqual(targets.len, parsed.value.rows.len);
+        const seen = try ctx.alloc.alloc(bool, targets.len);
+        defer ctx.alloc.free(seen);
+        @memset(seen, false);
+        for (parsed.value.rows, 0..) |row, index| {
+            try std.testing.expectEqual(@as(usize, 2), row.len);
+            // Canonical fixed-pattern graph hydration has an absent SearchHit
+            // score. Neither hop depth nor relationship weight is a rank score.
+            try std.testing.expect(row[1] == .null);
+            if (ordered) try std.testing.expectEqualStrings(targets[index], row[0].string) else {
+                const found = for (targets, 0..) |target, position| {
+                    if (std.mem.eql(u8, target, row[0].string)) break position;
+                } else return error.UnexpectedGraphHit;
+                try std.testing.expect(!seen[found]);
+                seen[found] = true;
+            }
+        }
+    }
+    fn checkJoined(ctx: *fixture.Context, corpus: *local.sql_parity_fixtures.Corpus, targets: []const []const u8) !void {
+        // Both archived statements execute unchanged. Their score-only ordering
+        // permits ties; a second statement witnesses SQL tie-breaking and LIMIT.
+        inline for (.{ "sql-1207", "sql-1208" }) |id| {
+            const sql = (try corpus.get(id)).sql;
+            try observeHits(ctx, sql, targets, false);
+            const ordering = std.mem.indexOf(u8, sql, "ORDER BY graph_score DESC") orelse return error.MissingOriginalGraphOrdering;
+            const stable = try std.fmt.allocPrint(ctx.alloc, "{s}ORDER BY graph_score DESC,doc_id ASC LIMIT 2", .{sql[0..ordering]});
+            defer ctx.alloc.free(stable);
+            try observeHits(ctx, stable, targets[0..@min(2, targets.len)], true);
+        }
+    }
     fn check(ctx: *fixture.Context) !void {
         var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
         defer corpus.deinit();
         // The original statement executes byte-for-byte, including its
         // unprojected native depth ordering and outer SQL limit.
         try observe(ctx, (try corpus.get("sql-1209")).sql, &.{ "doc:a", "doc:b", "doc:c" }, false);
+        try checkJoined(ctx, &corpus, &.{ "doc:a", "doc:b", "doc:c" });
         try observe(ctx, "MATCH (doc)-[:cites]->(target) WITH GRAPH docs_edge_graph ON usage_records START 'doc:root' RETURN doc.key AS source_id,target.key AS target_id ORDER BY target.key DESC LIMIT 2", &.{ "doc:c", "doc:b" }, true);
         var reader = ctx.*;
         reader.headers = ctx.reader_headers;
@@ -76,10 +126,12 @@ const Campaign = struct {
         try manager.setRowFilter("pk-reader", "usage_records", visible);
         defer manager.removeRowFilter("pk-reader", "usage_records") catch {};
         try observe(&reader, (try corpus.get("sql-1209")).sql, &.{ "doc:a", "doc:b" }, false);
+        try checkJoined(&reader, &corpus, &.{ "doc:a", "doc:b" });
         const hidden_anchor = try identityFilter(ctx.alloc, &.{ "doc:a", "doc:b" });
         defer ctx.alloc.free(hidden_anchor);
         try manager.setRowFilter("pk-reader", "usage_records", hidden_anchor);
         try observe(&reader, (try corpus.get("sql-1209")).sql, &.{}, false);
+        try checkJoined(&reader, &corpus, &.{});
     }
     pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
         try self.credentials.activateWithCatalog(ctx, true);
@@ -105,6 +157,10 @@ const Campaign = struct {
         defer batch.deinit(ctx.alloc);
         if (batch.status != 201) std.debug.print("SQL graph seed status={d} body={s}\n", .{ batch.status, batch.body });
         try std.testing.expectEqual(@as(u16, 201), batch.status);
+        // The earlier serving cut preceded the graph-index publication. Pin
+        // the real published owner again before executing corpus observations.
+        _ = try fixture.waitServingSchema(ctx, "usage_records", 0);
+        try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "usage_records");
         try check(ctx);
     }
     pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
@@ -117,5 +173,7 @@ const Campaign = struct {
 };
 
 test "mounted SQL original canonical MATCH preserves binding projection depth order filters and cold graph state" {
+    // Campaign.check executes the unchanged sql-1207/sql-1208 joins and
+    // standalone sql-1209 before and after complete owner restart.
     try fixture.run(Campaign);
 }

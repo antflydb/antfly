@@ -183,6 +183,10 @@ const OpaqueApiHttpServer = struct {
         try callFallible(u64, void, self.functions.prepare_restore_leadership, self.opaque_handle, &input, null);
     }
 
+    pub fn drainSqlConnections(self: *OpaqueApiHttpServer, deadline: @import("../common/runtime_lifecycle.zig").ShutdownDeadline) !void {
+        try callFallible(@import("../common/runtime_lifecycle.zig").ShutdownDeadline, void, self.functions.drain_sql_connections, self.opaque_handle, &deadline, null);
+    }
+
     pub fn scheduleSessionMaintenance(self: *OpaqueApiHttpServer) !void {
         try callFallible(void, void, self.functions.schedule_session_maintenance, self.opaque_handle, null, null);
     }

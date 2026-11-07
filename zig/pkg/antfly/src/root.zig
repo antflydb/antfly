@@ -221,6 +221,9 @@ pub const index_manager_vopr = @import("storage/index_manager_vopr.zig");
 pub const db_split_vopr = @import("storage/db_split_vopr.zig");
 
 test {
+    // Explicit discovery for the metadata graph/logical contract gate.
+    _ = @import("system_catalog/graph_preparation.zig");
+    _ = @import("antfly_local_sources").sql_catalog.trigger_preparation;
     _ = @import("system_catalog/server_call.zig");
     _ = @import("system_catalog/operations.zig");
     _ = @import("vopr/index_maintenance.zig");

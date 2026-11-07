@@ -1026,7 +1026,39 @@ pub const Detail = enum(c_int) {
     sql_program_limit_exceeded = 901,
     snapshot_build_cancelled = 902,
     catalog_generation_exhausted = 903,
+    invalid_sql_relation_persistence = 912,
+    sql_relation_owner_changed = 913,
+    sql_temporary_relation_not_owned = 914,
+    invalid_sql_temporary_namespace = 915,
+    sql_relation_persistence_foreign_key_mismatch = 916,
+    sql_relation_recovery_incomplete = 917,
+    sql_relation_owner_unavailable = 918,
+    invalid_sql_trigger_definition = 904,
+    invalid_sql_trigger_manifest = 905,
+    sql_trigger_context_required = 906,
+    sql_trigger_returned_no_value = 907,
+    sql_trigger_return_value_required = 908,
+    sql_trigger_declared_arguments = 909,
+    sql_trigger_sql_language = 910,
+    sql_trigger_coordination_required = 911,
+    invalid_generation_transaction = 919,
+    generation_transaction_changed = 920,
+    generation_transaction_decision_required = 921,
+    invalid_prepared_graph_effects = 922,
+    sql_prepared_durability_unavailable = 923,
+    invalid_participant = 924,
 };
+
+test "SQL relation persistence callback failures preserve exact identity and behavior" {
+    const errors = [_]anyerror{ error.InvalidSqlRelationPersistence, error.SqlRelationOwnerChanged, error.SqlTemporaryRelationNotOwned, error.InvalidSqlTemporaryNamespace, error.SqlRelationPersistenceForeignKeyMismatch, error.SqlRelationRecoveryIncomplete, error.SqlRelationOwnerUnavailable };
+    const codes = [_]Code{ .invalid_argument, .conflict, .forbidden, .invalid_argument, .invalid_argument, .unavailable, .unavailable };
+    for (errors, codes, 912..) |err, code, detail| {
+        const wire = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(code), wire.code);
+        try std.testing.expectEqual(@as(c_int, @intCast(detail)), wire.detail);
+        try std.testing.expectEqual(err, errorFromStatus(wire));
+    }
+}
 
 test "partial index proof rejection preserves exact callback error identity" {
     const wire = statusFromError(error.PartialIndexPredicateNotImplied);
@@ -1656,6 +1688,13 @@ pub fn statusFromError(err: anyerror) Status {
         error.RaftBatchWriteOutcomeUnknown => status(.retryable, .raft_batch_write_outcome_unknown),
         error.RaftApplyWriterUnavailable => status(.retryable, .raft_apply_writer_unavailable),
         error.SqlDatabaseInUse => status(.conflict, .sql_database_in_use),
+        error.InvalidSqlRelationPersistence => status(.invalid_argument, .invalid_sql_relation_persistence),
+        error.SqlRelationOwnerChanged => status(.conflict, .sql_relation_owner_changed),
+        error.SqlTemporaryRelationNotOwned => status(.forbidden, .sql_temporary_relation_not_owned),
+        error.InvalidSqlTemporaryNamespace => status(.invalid_argument, .invalid_sql_temporary_namespace),
+        error.SqlRelationPersistenceForeignKeyMismatch => status(.invalid_argument, .sql_relation_persistence_foreign_key_mismatch),
+        error.SqlRelationRecoveryIncomplete => status(.unavailable, .sql_relation_recovery_incomplete),
+        error.SqlRelationOwnerUnavailable => status(.unavailable, .sql_relation_owner_unavailable),
         error.InvalidScopeRetirement => status(.invalid_argument, .invalid_scope_retirement),
         error.ScopeRetirementChanged => status(.conflict, .scope_retirement_changed),
         error.SequenceAdmissionConflict => status(.conflict, .sequence_admission_conflict),
@@ -1663,6 +1702,20 @@ pub fn statusFromError(err: anyerror) Status {
         error.SqlProgramLimitExceeded => status(.invalid_argument, .sql_program_limit_exceeded),
         error.SnapshotBuildCancelled => status(.cancelled, .snapshot_build_cancelled),
         error.CatalogGenerationExhausted => status(.invalid_argument, .catalog_generation_exhausted),
+        error.InvalidSqlTriggerDefinition => status(.invalid_argument, .invalid_sql_trigger_definition),
+        error.InvalidSqlTriggerManifest => status(.invalid_argument, .invalid_sql_trigger_manifest),
+        error.SqlTriggerContextRequired => status(.invalid_argument, .sql_trigger_context_required),
+        error.SqlTriggerReturnedNoValue => status(.invalid_argument, .sql_trigger_returned_no_value),
+        error.SqlTriggerReturnValueRequired => status(.invalid_argument, .sql_trigger_return_value_required),
+        error.SqlTriggerDeclaredArguments => status(.invalid_argument, .sql_trigger_declared_arguments),
+        error.SqlTriggerSqlLanguage => status(.invalid_argument, .sql_trigger_sql_language),
+        error.SqlTriggerCoordinationRequired => status(.invalid_argument, .sql_trigger_coordination_required),
+        error.InvalidGenerationTransaction => status(.invalid_argument, .invalid_generation_transaction),
+        error.GenerationTransactionChanged => status(.conflict, .generation_transaction_changed),
+        error.GenerationTransactionDecisionRequired => status(.conflict, .generation_transaction_decision_required),
+        error.InvalidPreparedGraphEffects => status(.invalid_argument, .invalid_prepared_graph_effects),
+        error.SqlPreparedDurabilityUnavailable => status(.invalid_argument, .sql_prepared_durability_unavailable),
+        error.InvalidParticipant => status(.invalid_argument, .invalid_participant),
 
         error.RaftBatchWriteTransportOutcomeUnknown => status(.retryable, .raft_batch_write_transport_outcome_unknown),
         error.HttpConnectionClosing => status(.unavailable, .http_connection_closing),
@@ -2761,6 +2814,13 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .raft_batch_write_outcome_unknown => "RaftBatchWriteOutcomeUnknown",
         .raft_apply_writer_unavailable => "RaftApplyWriterUnavailable",
         .sql_database_in_use => "SqlDatabaseInUse",
+        .invalid_sql_relation_persistence => "InvalidSqlRelationPersistence",
+        .sql_relation_owner_changed => "SqlRelationOwnerChanged",
+        .sql_temporary_relation_not_owned => "SqlTemporaryRelationNotOwned",
+        .invalid_sql_temporary_namespace => "InvalidSqlTemporaryNamespace",
+        .sql_relation_persistence_foreign_key_mismatch => "SqlRelationPersistenceForeignKeyMismatch",
+        .sql_relation_recovery_incomplete => "SqlRelationRecoveryIncomplete",
+        .sql_relation_owner_unavailable => "SqlRelationOwnerUnavailable",
         .invalid_scope_retirement => "InvalidScopeRetirement",
         .scope_retirement_changed => "ScopeRetirementChanged",
         .sequence_admission_conflict => "SequenceAdmissionConflict",
@@ -2768,6 +2828,20 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .sql_program_limit_exceeded => "SqlProgramLimitExceeded",
         .snapshot_build_cancelled => "SnapshotBuildCancelled",
         .catalog_generation_exhausted => "CatalogGenerationExhausted",
+        .invalid_sql_trigger_definition => "InvalidSqlTriggerDefinition",
+        .invalid_sql_trigger_manifest => "InvalidSqlTriggerManifest",
+        .sql_trigger_context_required => "SqlTriggerContextRequired",
+        .sql_trigger_returned_no_value => "SqlTriggerReturnedNoValue",
+        .sql_trigger_return_value_required => "SqlTriggerReturnValueRequired",
+        .sql_trigger_declared_arguments => "SqlTriggerDeclaredArguments",
+        .sql_trigger_sql_language => "SqlTriggerSqlLanguage",
+        .sql_trigger_coordination_required => "SqlTriggerCoordinationRequired",
+        .invalid_generation_transaction => "InvalidGenerationTransaction",
+        .generation_transaction_changed => "GenerationTransactionChanged",
+        .generation_transaction_decision_required => "GenerationTransactionDecisionRequired",
+        .invalid_prepared_graph_effects => "InvalidPreparedGraphEffects",
+        .sql_prepared_durability_unavailable => "SqlPreparedDurabilityUnavailable",
+        .invalid_participant => "InvalidParticipant",
 
         .raft_batch_write_transport_outcome_unknown => "RaftBatchWriteTransportOutcomeUnknown",
         .http_connection_closing => "HttpConnectionClosing",
@@ -3646,4 +3720,42 @@ test "scope retirement callback descriptors preserve exact lifecycle conflict an
     try std.testing.expectEqual(@as(c_int, 903), @backingInt(Detail.catalog_generation_exhausted));
     try std.testing.expect(errorFromStableName("SqlDatabaseInUse\n") == null);
     try std.testing.expect(errorFromStableName("ScopeRetirementChangedPrivate") == null);
+}
+
+test "generation graph and durability errors survive an actual C callback status boundary without retry promotion" {
+    const Callback = *const fn (*anyopaque) callconv(.c) Status;
+    const State = struct {
+        failure: anyerror,
+        fn invoke(raw: *anyopaque) callconv(.c) Status {
+            const state: *@This() = @ptrCast(@alignCast(raw));
+            return statusFromError(state.failure);
+        }
+    };
+    const callback: Callback = State.invoke;
+    const failures = [_]anyerror{ error.InvalidGenerationTransaction, error.GenerationTransactionChanged, error.GenerationTransactionDecisionRequired, error.InvalidPreparedGraphEffects, error.SqlPreparedDurabilityUnavailable };
+    const codes = [_]Code{ .invalid_argument, .conflict, .conflict, .invalid_argument, .invalid_argument };
+    for (failures, codes, 919..) |failure, code, detail| {
+        var state: State = .{ .failure = failure };
+        const transported = callback(&state);
+        try std.testing.expectEqual(@backingInt(code), transported.code);
+        try std.testing.expectEqual(@as(c_int, @intCast(detail)), transported.detail);
+        try std.testing.expectEqual(failure, errorFromStatus(transported));
+        try std.testing.expect(transported.code != @backingInt(Code.retryable));
+    }
+}
+
+test "external terminal membership failure crosses callbacks without retry promotion" {
+    const Callback = *const fn () callconv(.c) Status;
+    const Producer = struct {
+        fn call() callconv(.c) Status {
+            return statusFromError(error.InvalidParticipant);
+        }
+    };
+    const callback: Callback = Producer.call;
+    const result = callback();
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), result.code);
+    try std.testing.expectEqual(@backingInt(Detail.invalid_participant), result.detail);
+    try std.testing.expectEqual(error.InvalidParticipant, errorFromStatus(result));
+    try std.testing.expectEqual(error.InvalidParticipant, errorFromStableName("InvalidParticipant").?);
+    try std.testing.expect(errorHasStableDetail(error.InvalidParticipant));
 }

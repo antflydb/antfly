@@ -49,6 +49,10 @@ fn logUnknownTransitionFailure(group_id: u64, action: metadata_mod.TransitionAct
 }
 
 pub const Error = @import("external_transaction_errors.zig").Error || operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
+    SqlRelationOwnerChanged,
+    SqlTemporaryRelationNotOwned,
+    SqlRelationRecoveryIncomplete,
+    InvalidSqlRelationPersistence,
     RetainedEffectsFull,
     AuthoritativeLookupMissing,
     TopologyChanged,
@@ -200,7 +204,7 @@ fn validateHandoffReceiptLookup(input: LookupInput, request: operation.RequestCo
         (!hidden_scoped and (!published_routed or identity)) or
         input.key.len != 0 or input.consistency != .read_index or
         input.options.generation_handoff_install_read_index_certified or
-        input.options.include_primary_digest or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
+        input.options.include_primary_digest or input.options.include_json_null_fields or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
         input.options.relational_integrity_jobs_json.len != 0 or input.options.sql_lock_query_json.len != 0 or input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or
         input.options.relational_activation_json.len != 0 or input.options.fields.len != 0)
         return error.InvalidArgument;
@@ -291,7 +295,15 @@ pub const Operations = struct {
             error.UnsupportedCatalogRouteFence => return error.Unsupported,
             else => return error.InvalidArgument,
         };
-        if (reads.route_fence) |*fence| fence.admission_deadline_io = request.deadline_io;
+        if (reads.route_fence) |*fence| {
+            fence.admission_deadline_io = request.deadline_io;
+            // Only trusted ingress can set this field after verifying the
+            // body-bound native read grant; route JSON always omits it.
+            if (fence.route.execution == .native_local) if (request.sql_relation_owner) |owner| {
+                fence.route.execution.native_local.requireConnectionOwner(owner) catch return error.SqlTemporaryRelationNotOwned;
+                fence.admission_sql_relation_owner = owner;
+            };
+        }
         return reads;
     }
 
@@ -449,8 +461,31 @@ pub const Operations = struct {
         table_name: []const u8,
         input: db_mod.types.BatchRequest,
     ) Error!batch_api.BatchResult {
+        return self.batchWithRoute(alloc, request, group_id, table_name, input, null);
+    }
+
+    pub fn nativeAtomicBatch(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, fence: metadata_api.CatalogRouteFence) Error!batch_api.BatchResult {
+        if (fence.route.execution != .native_local or fence.route.group_id != group_id) return error.InvalidArgument;
+        if (input.activate_range_tracking) {
+            // A native marker is a strict control-only request. It consumes
+            // the same verified route/OwnerGrant and never accepts row work.
+            @import("antfly_local_sources").storage_range_protection.validateRequest(input) catch return error.InvalidArgument;
+        } else input.requireAtomicIntentShape() catch return error.InvalidArgument;
+        var checked = request;
+        // Native ingress has already verified the body-bound OwnerGrant and
+        // attached this process-local field. Validation and owner execution
+        // must use that same authenticated connection, not the empty HTTP
+        // request context. This field is never accepted from route JSON.
+        if (fence.admission_sql_relation_owner) |owner| {
+            if (request.sql_relation_owner) |captured| if (!captured.eql(owner)) return error.SqlTemporaryRelationNotOwned;
+            checked.sql_relation_owner = owner;
+        }
+        return self.batchWithRoute(alloc, checked, group_id, table_name, input, fence);
+    }
+
+    fn batchWithRoute(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, fence: ?metadata_api.CatalogRouteFence) Error!batch_api.BatchResult {
         try request.ensureActive();
-        if (self.reject_unrouted_batch) return error.Unsupported;
+        if (self.reject_unrouted_batch and fence == null) return error.Unsupported;
         var admitted = input;
         if (input.sql_lock) |command| {
             @import("antfly_local_sources").storage_pessimistic_lock_control.validateBatch(input) catch return error.InvalidArgument;
@@ -477,7 +512,11 @@ pub const Operations = struct {
                 return error.Internal;
             },
         };
-        _ = (writes.batchGroupLocal(alloc, group_id, table_name, admitted) catch |err| switch (err) {
+        _ = ((if (fence) |captured| writes.batchGroupLocalRouted(alloc, group_id, table_name, admitted, captured) else writes.batchGroupLocal(alloc, group_id, table_name, admitted)) catch |err| switch (err) {
+            error.SqlRelationOwnerChanged => return error.SqlRelationOwnerChanged,
+            error.SqlTemporaryRelationNotOwned => return error.SqlTemporaryRelationNotOwned,
+            error.SqlRelationRecoveryIncomplete => return error.SqlRelationRecoveryIncomplete,
+            error.InvalidSqlRelationPersistence => return error.InvalidSqlRelationPersistence,
             error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
             error.RetainedEffectsFull => return retainedBatchPressure(input),
@@ -767,7 +806,11 @@ pub const Operations = struct {
         // Hidden restore owners are absent from public schema metadata. The
         // writer validates the exact durable owner capability before admission;
         // native prepare still validates every command against its own catalog.
-        if (input.req.restore_staging_scope == null) {
+        // Phase-two activation cannot acquire new effects or user authority.
+        // The native transaction manager validates its already stored owner;
+        // a new schema/user-vote projection would incorrectly require a live
+        // TEMP connection after an immutable decision has been admitted.
+        if (input.req.restore_staging_scope == null and input.req.asBatch(input.txn_id, input.topology_epoch).externalActivationOwner() == null) {
             const validator = self.txn_validator orelse return error.Unavailable;
             validator.validate(request, table_name, input.req.writes) catch |err| switch (err) {
                 error.InvalidBatchRequest => return error.InvalidArgument,
@@ -853,7 +896,7 @@ pub const Operations = struct {
     pub fn txnStatusWithRequest(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnStatusRequest) Error!db_mod.types.TxnStatus {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        const status = if (input.restore_staging_scope != null or input.restore_staging_plan_id != null)
+        const status = if (input.restore_staging_scope != null or input.restore_staging_plan_id != null or input.route_fence != null)
             writes.txnStatusGroupLocalWithRequest(alloc, group_id, table_name, input, request)
         else if (request.deadline_ns) |deadline_ns|
             writes.txnStatusGroupAuthoritativeLocalUntil(alloc, group_id, table_name, input.txn_id, deadline_ns)
@@ -1116,7 +1159,7 @@ pub const Operations = struct {
             };
             if (probe.value.transition_id != null) {
                 if (input.key.len != 0 or input.consistency != .read_index or input.options.restore_staging_scope != null or
-                    input.options.include_primary_digest or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
+                    input.options.include_primary_digest or input.options.include_json_null_fields or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
                     input.options.relational_integrity_jobs_json.len != 0 or input.options.sql_lock_query_json.len != 0 or input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or input.options.relational_activation_json.len != 0 or input.options.fields.len != 0) return error.InvalidArgument;
                 var scoped = std.json.parseFromSlice(@import("../raft/shard_ops.zig").TopologyReadRequest, alloc, input.options.relational_topology_json, .{}) catch return error.InvalidArgument;
                 defer scoped.deinit();

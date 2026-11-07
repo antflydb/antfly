@@ -26,6 +26,8 @@ pub const storage_backend_erased = @import("antfly_local_sources").storage_backe
 pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 
 test {
+    _ = @import("api/sql_data_locks.zig");
+    _ = @import("system_catalog/temporary_source_binding.zig");
     _ = @import("pgwire/notification_test.zig");
     _ = @import("api/sql_notification_integration_test.zig");
     _ = @import("api/sql_join_read_integration_test.zig");
@@ -41,6 +43,7 @@ test {
     _ = @import("storage/metadata_raft_apply_client.zig").consumer_tests;
     _ = @import("antfly_local_sources").api_relational_integrity_commit;
     _ = @import("api/table_reads.zig").consumer_tests;
+    _ = @import("api/table_writes.zig").consumer_tests;
     _ = @import("metadata/column_sequence_handoff.zig");
     _ = @import("api/transactions.zig");
     _ = @import("api/sql_connections.zig");
@@ -61,13 +64,31 @@ test {
     _ = @import("api/sql_document_alias_integration_test.zig");
     _ = @import("api/sql_document_generated_integration_test.zig");
     _ = @import("api/sql_temporal_bin_integration_test.zig");
+    _ = @import("api/sql_source_mutation_domain_integration_test.zig");
     _ = @import("api/sql_cursor_lifecycle_integration_test.zig");
     _ = @import("api/sql_copy_input_integration_test.zig");
     _ = @import("api/sql_copy_server_integration_test.zig");
     _ = @import("api/sql_scope_retirement_integration_test.zig");
+    _ = @import("api/sql_trigger_native_contract_test.zig");
     _ = @import("api/sql_database_retirement_integration_test.zig");
     _ = @import("api/sql_view_guard_integration_test.zig");
     _ = @import("api/sql_graph_match_integration_test.zig");
+    _ = @import("api/sql_graph_join_rls_integration_test.zig");
+    _ = @import("api/sql_relation_binding_test.zig");
+    _ = @import("api/sql_relation_lifetime_integration_test.zig");
+    _ = @import("api/sql_ordinary_catalog_test.zig");
+    _ = @import("api/sql_preparation_authority_test.zig");
+    _ = @import("api/sql_trigger_integration_test.zig");
+    _ = @import("api/sql_trigger_restore_integration_test.zig");
+    _ = @import("api/sql_graph_vote.zig");
+    _ = @import("api/sql_graph_execution.zig");
+    _ = @import("api/sql_graph_join_execution.zig");
+    _ = @import("system_catalog/graph_preparation_service.zig");
+    _ = @import("api/sql_graph_schemaless_integration_test.zig");
+    _ = @import("api/sql_trigger_raw_integration_test.zig");
+    _ = @import("api/restore_routine_mapping.zig");
+    _ = @import("api/native_artifact_restore_admission.zig");
+    _ = @import("metadata/trigger_restore_claims.zig");
     _ = @import("api/sql_view_domain_integration_test.zig");
     _ = @import("api/sql_routine_lifecycle_integration_test.zig");
     _ = @import("api/sql_procedure_lifecycle_integration_test.zig");
@@ -89,6 +110,18 @@ test {
     _ = @import("metadata/relation_publication_fence.zig");
     _ = @import("metadata/relation_reconciliation_worker.zig");
     _ = @import("metadata/http_client.zig");
+    _ = @import("metadata/runtime.zig");
+    _ = @import("api/kernel_abi.zig");
+    _ = @import("api/kernel_exports.zig");
+    _ = @import("api/table_retirement_coordinator.zig");
+    _ = @import("api/scope_retirement_coordinator.zig");
+    _ = @import("api/http_client.zig");
+    _ = @import("api/httpx_handler.zig");
+    _ = @import("api/fk_generation_plan_builder.zig");
+    _ = @import("api/table_retirement_preparation.zig");
+    _ = @import("api/sql_command_producer_test.zig");
+    _ = @import("api/native_sql_lock_read.zig");
+    _ = @import("system_catalog/server_call.zig");
     _ = @import("metadata/storage/raft_apply_store.zig");
     _ = @import("data/raft_batch.zig").consumer_tests;
 }

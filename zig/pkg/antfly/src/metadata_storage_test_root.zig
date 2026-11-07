@@ -18,6 +18,9 @@ const storage = @import("metadata/storage/mod.zig");
 test {
     _ = storage.raft_apply_store;
     _ = @import("system_catalog/foreign_key_dependencies.zig");
+    _ = @import("system_catalog/logical_relation_allocations.zig");
+    _ = @import("metadata/trigger_catalog.zig");
+    _ = @import("metadata/restore_staging.zig");
     _ = @import("antfly_local_sources").metadata_lake_index_catalog;
 }
 

@@ -78,6 +78,42 @@ pub const CoreOpenOptions = db_config.CoreOpenOptions;
 /// exclusive apply fence. The commit path only validates the pinned generation,
 /// fills catalog metadata, performs the durable transaction, and transfers the
 /// already-owned runtime objects into publication.
+/// The policy installer alone composes a future trigger schema with its
+/// preparing generation. Ordinary schema commits never carry this amendment.
+pub const PolicyCatalogAmendment = struct {
+    table_id: u64,
+    before_schema_version: u32,
+    before_schema_digest: [32]u8,
+    after_schema_digest: [32]u8,
+    before_policy_generation: u64,
+    before_catalog_epoch: u64,
+    policy_generation: u64,
+    catalog_epoch: u64,
+
+    fn apply(self: @This(), core: *DBCore, prepared: *const PreparedSchemaMetadata, next: *table_catalog_mod.Catalog) !void {
+        const before = core.schema orelse return error.RowPolicyCatalogChanged;
+        const after = prepared.schema().*;
+        if (core.identity_namespace.table_id != self.table_id or before.version != self.before_schema_version or
+            after.version != try std.math.add(u32, before.version, 1) or
+            core.table_catalog.row_policy_phase != .active or
+            core.table_catalog.row_policy_generation != self.before_policy_generation or
+            core.table_catalog.row_policy_catalog_epoch != self.before_catalog_epoch or
+            self.policy_generation <= self.before_policy_generation or self.catalog_epoch <= self.before_catalog_epoch)
+            return error.RowPolicyCatalogChanged;
+        const encoded = try schema_mod.serializeSchema(core.alloc, before);
+        defer core.alloc.free(encoded);
+        var before_digest: [32]u8 = undefined;
+        var after_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(encoded, &before_digest, .{});
+        std.crypto.hash.Blake3.hash(prepared.encoded, &after_digest, .{});
+        if (!std.mem.eql(u8, &before_digest, &self.before_schema_digest) or
+            !std.mem.eql(u8, &after_digest, &self.after_schema_digest)) return error.RowPolicyCatalogChanged;
+        next.row_policy_generation = self.policy_generation;
+        next.row_policy_catalog_epoch = self.catalog_epoch;
+        next.row_policy_phase = .active;
+    }
+};
+
 pub const PreparedSchemaMetadata = struct {
     alloc: Allocator,
     encoded: []u8,
@@ -98,6 +134,8 @@ pub const PreparedSchemaMetadata = struct {
         binding: @import("relational_nullability_job.zig").Binding,
         ready_digest: [32]u8,
     } = null,
+    native_child_control: ?@import("relational_integrity_topology_contract.zig").Command = null,
+    native_child_digest: ?[32]u8 = null,
     combined_writes: []docstore_mod.KVPair,
 
     fn init(
@@ -1342,6 +1380,19 @@ pub const DBCore = struct {
         );
     }
 
+    /// Caller holds apply ownership and has drained the actual row-policy
+    /// gate and durable schema leases. All schema/policy bytes join the same
+    /// ordinary metadata transaction; the catalog is composed exactly once.
+    pub fn commitPreparedSchemaMetadataPolicy(
+        self: *DBCore,
+        prepared: *PreparedSchemaMetadata,
+        metadata_writes: []const docstore_mod.KVPair,
+        metadata_deletes: []const []const u8,
+        amendment: PolicyCatalogAmendment,
+    ) !bool {
+        return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, null, false, null, null, amendment);
+    }
+
     pub fn prepareSchemaMetadata(
         self: *DBCore,
         table_schema: schema_mod.TableSchema,
@@ -1667,7 +1718,7 @@ pub const DBCore = struct {
         metadata_deletes: []const []const u8,
         reconciled_row_count: ?u64,
     ) !bool {
-        return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false, null, null);
+        return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false, null, null, null);
     }
 
     /// Atomic local installation for an independently authorized validation
@@ -1733,7 +1784,7 @@ pub const DBCore = struct {
             }
         };
         var installation: InstallState = .{ .alloc = self.alloc, .binding = binding, .ready_digest = ready_digest, .decision = decision, .physical_catalog = physical_catalog, .entry = entry, .participant = participant };
-        _ = try self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, &.{}, null, false, null, &installation);
+        _ = try self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, &.{}, null, false, null, &installation, null);
         return installation.record orelse unreachable;
     }
 
@@ -1806,7 +1857,7 @@ pub const DBCore = struct {
         if (!std.mem.eql(u8, &schema_digest, &command.schema_digest) or
             !std.mem.eql(u8, &activation_digest, &command.activation_digest)) return error.InvalidPrivateIndexNativeReceipt;
         var installation: IndexInstallState = .{ .alloc = self.alloc, .command = command, .replay = replay, .participant = if (comptime @TypeOf(participant) == @TypeOf(null)) {} else participant };
-        _ = try self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, &.{}, null, false, null, &installation);
+        _ = try self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, &.{}, null, false, null, &installation, null);
         return installation.record orelse unreachable;
     }
 
@@ -1823,7 +1874,7 @@ pub const DBCore = struct {
         source_fence: @import("relational_integrity_topology_contract.zig").Fence,
     ) !bool {
         if (source_fence.role != .child_generation_source and source_fence.role != .child_generation_dual) return error.InvalidIntegrityTopologyFence;
-        return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false, source_fence, null);
+        return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false, source_fence, null, null);
     }
 
     /// Rehydrate an exact durable schema without inventing a mutation (or an HA
@@ -1833,7 +1884,7 @@ pub const DBCore = struct {
         prepared: *PreparedSchemaMetadata,
         metadata_writes: []const docstore_mod.KVPair,
     ) !bool {
-        _ = self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, &.{}, null, true, null, null) catch |err| switch (err) {
+        _ = self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, &.{}, null, true, null, null, null) catch |err| switch (err) {
             error.SchemaMetadataChanged => return false,
             else => return err,
         };
@@ -1849,6 +1900,7 @@ pub const DBCore = struct {
         rehydrate_only: bool,
         child_fence: ?@import("relational_integrity_topology_contract.zig").Fence,
         installation: anytype,
+        policy_amendment: ?PolicyCatalogAmendment,
     ) !bool {
         // A reserved candidate is not ordinary DDL authority, even if its
         // fence disappears between preparation and commit.
@@ -1888,7 +1940,9 @@ pub const DBCore = struct {
         if (!prepared.generated_semantics_match and
             (self.table_catalog.row_count != 0 or (reconciled_row_count orelse 0) != 0))
             return error.GeneratedColumnRewriteRequired;
-        if (self.schema == null and table_schema.storage_mode == .relational) {
+        // An explicit schema-NONE lease pins absence for document tables too.
+        // A first schema cannot replace that captured cut before resolution.
+        if (self.schema == null) {
             var manager = try self.initTxnManager();
             defer manager.deinit();
             if (try manager.hasSchemaLeases()) return error.SchemaInUse;
@@ -1914,6 +1968,11 @@ pub const DBCore = struct {
         next_catalog.mode_initialized = true;
         next_catalog.storage_mode = table_schema.storage_mode;
         next_catalog.active_schema_version = table_schema.version;
+        if (policy_amendment) |amendment| {
+            if (comptime @TypeOf(installation) != @TypeOf(null)) return error.InvalidSchemaUpdateRequest;
+            if (rehydrate_only or child_fence != null) return error.InvalidSchemaUpdateRequest;
+            try amendment.apply(self, prepared, &next_catalog);
+        }
         // This transaction publishes the current runtime schema encoding and
         // its capability requirement together, including same-epoch retries.
         next_catalog.schema_format_version = schema_mod.storage_format_version;
@@ -1925,13 +1984,13 @@ pub const DBCore = struct {
             true;
         if (!validation_installation and (!same_active_epoch or !same_index_catalog))
             next_catalog.index_state = if (self.indexCount() == 0) .none else .pending;
-        const previous_catalog_data = self.table_catalog.encode();
-        const candidate_catalog_data = next_catalog.encode();
-        if (!std.mem.eql(u8, &previous_catalog_data, &candidate_catalog_data))
+        const previous_catalog_data = try self.table_catalog.encodeDurable();
+        const candidate_catalog_data = try next_catalog.encodeDurable();
+        if (!std.mem.eql(u8, previous_catalog_data.slice(), candidate_catalog_data.slice()))
             next_catalog.generation +|= 1;
-        const catalog_data = next_catalog.encode();
+        const catalog_data = try next_catalog.encodeDurable();
         @memcpy(prepared.combined_writes[0..metadata_writes.len], metadata_writes);
-        prepared.combined_writes[metadata_writes.len] = .{ .key = table_catalog_mod.key, .value = &catalog_data };
+        prepared.combined_writes[metadata_writes.len] = .{ .key = table_catalog_mod.key, .value = catalog_data.slice() };
         const Participants = struct {
             core: *DBCore,
             prepared: *PreparedSchemaMetadata,
@@ -1988,6 +2047,13 @@ pub const DBCore = struct {
                 // validateBefore was also called before *any* schema writes.
                 try participants.validateGuards(txn);
                 try participants.stageChanges(txn);
+                if (participants.prepared.native_child_control) |command| {
+                    const fence = participants.child_fence orelse return error.InvalidControlReceiptPosition;
+                    if (!command.fence.eql(fence) or command.action != .install_child_schema) return error.InvalidControlReceiptPosition;
+                    const digest = participants.prepared.native_child_digest orelse return error.InvalidControlReceiptPosition;
+                    const stamp = try @import("native_topology_receipt.zig").stageWithDigest(txn, command, digest, null);
+                    try @import("relational_integrity_generation_admission.zig").AppliedReceipt.stageNative(txn, @import("relational_integrity_generation_admission.zig").source_install_receipt_key, stamp.receipt);
+                }
                 if (comptime @TypeOf(installation) != @TypeOf(null))
                     try participants.installation.stage(txn, participants.prepared.integrity_catalog.?.catalog);
                 if (participants.child_fence) |expected| {
@@ -2213,8 +2279,8 @@ pub const DBCore = struct {
         var next = self.table_catalog;
         next.index_state = state;
         next.generation +|= 1;
-        const encoded = next.encode();
-        try self.store.putBatch(&.{.{ .key = table_catalog_mod.key, .value = &encoded }}, &.{});
+        const encoded = try next.encodeDurable();
+        try self.store.putBatch(&.{.{ .key = table_catalog_mod.key, .value = encoded.slice() }}, &.{});
         self.table_catalog = next;
     }
 
@@ -2675,6 +2741,12 @@ pub const DBCore = struct {
         if (bound.schema_binding == null)
             bound.schema_binding = .{ .version = if (self.schema) |schema| schema.version else null };
         try manager.writeIntentsExtraBatch(txn_id, intents, predicates, bound);
+        // The durable marker was in that same vote batch. Keep the held core's
+        // cached catalog sticky so later schema/index writes cannot downgrade it.
+        for (intents) |intent| if (intent.prepared_graph_effects != null) {
+            self.table_catalog.transaction_effect_format = @max(self.table_catalog.transaction_effect_format, 1);
+            break;
+        };
     }
 
     pub fn checkVersionPredicates(
@@ -3099,6 +3171,9 @@ fn buildRecoveryIntentBatch(
 ) !transactions_mod.ResolutionExtraBatch {
     const alloc = owner.allocator();
     owner.snapshot = try manager.collectIntentBatch(alloc, txn_id);
+    // This identity-only fallback cannot materialize graph effects. The full
+    // native DB resolution path owns the shared primary+graph batch instead.
+    if (owner.snapshot.prepared_graph_effects.len != 0) return error.PreparedIntentRequiresMaterialization;
     const binding = owner.snapshot.schema_binding;
     const context_snapshot = blk: {
         identity_ctx.mutex.lockUncancelable(identity_ctx.io);
@@ -3286,6 +3361,7 @@ fn buildRecoveryIntentBatch(
         .writes = owned_writes,
         .deletes = owned_deletes,
         .skip_all_intent_application = skip_all_intent_application,
+        .prepared_graph_effects_checked = true,
         .skip_intent_keys = owned_skip_intent_keys,
     };
 }
@@ -3400,6 +3476,7 @@ pub fn openCoreResourcesFromPrimaryStore(
     index_repair_checkpoint_storage: ?lsm_backend_mod.Storage,
     root_generation: u64,
     read_only: bool,
+    row_wal_enabled: bool,
 ) !OpenedCoreResources {
     var owned_path: ?[]u8 = null;
     var owned_applied_sequence_checkpoint_path: ?[]u8 = null;
@@ -3492,18 +3569,17 @@ pub fn openCoreResourcesFromPrimaryStore(
     defer alloc.free(change_journal_path);
     const change_journal_path_z = try alloc.dupeSentinel(u8, change_journal_path, 0);
     defer alloc.free(change_journal_path_z);
-    change_journal.* = try change_journal_mod.Journal.open(
-        change_journal_path_z,
-        changeJournalOpenOptionsForPrimaryKind(
-            map_size,
-            no_sync,
-            primary_backend_kind,
-            primary_lsm_storage,
-            change_journal_backend,
-            change_journal_storage,
-            read_only,
-        ),
+    var journal_options = changeJournalOpenOptionsForPrimaryKind(
+        map_size,
+        no_sync,
+        primary_backend_kind,
+        primary_lsm_storage,
+        change_journal_backend,
+        change_journal_storage,
+        read_only,
     );
+    journal_options.lsm_options.wal_enabled = row_wal_enabled;
+    change_journal.* = try change_journal_mod.Journal.open(change_journal_path_z, journal_options);
     errdefer {
         change_journal.close();
     }

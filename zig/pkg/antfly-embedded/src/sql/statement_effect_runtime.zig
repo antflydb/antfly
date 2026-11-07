@@ -78,6 +78,8 @@ const Slot = struct {
     owner: *State,
     index: usize,
     status: enum { fresh, running, complete, failed } = .fresh,
+    statement_begun: bool = false,
+    statement_ended: bool = false,
     failure: ?anyerror = null,
     replay: ?*Replay = null,
     output: ?runtime.Output = null,
@@ -162,6 +164,9 @@ const State = struct {
     graph: *const plan.Bound,
     slots: []Slot,
     current: usize,
+    command: ?catalog.Backend.StatementMutations = null,
+    root_statement_begun: bool = false,
+    root_statement_ended: bool = false,
     tuples: Directory = .empty,
     pending: Pending = .empty,
     mutations: usize = 0,
@@ -171,6 +176,13 @@ const State = struct {
     work: usize = 0,
     prior_scalar_control: @FieldType(catalog.Backend, "scalar_control") = null,
 
+    fn beginStatement(self: *State, index: usize) !void {
+        const begun = if (index == self.slots.len) &self.root_statement_begun else &self.slots[index].statement_begun;
+        if (begun.*) return;
+        const step = if (index == self.slots.len) self.graph.root else self.graph.steps[index];
+        if (step.mutation) if (self.command) |command| if (command.begin_step) |begin| try begin(command.ptr, index, step.binding, step.statement);
+        begun.* = true;
+    }
     fn child(self: *State, step: plan.Step, ordinal: usize) runtime.Context {
         var context = self.context;
         context.binding = step.binding;
@@ -184,6 +196,13 @@ const State = struct {
         context.typed_output = true;
         return context;
     }
+    fn endStatement(self: *State, index: usize) !void {
+        const ended = if (index == self.slots.len) &self.root_statement_ended else &self.slots[index].statement_ended;
+        if (ended.*) return;
+        const step = if (index == self.slots.len) self.graph.root else self.graph.steps[index];
+        if (step.mutation) if (self.command) |command| if (command.end_step) |end| try end(command.ptr, index, step.binding, step.statement);
+        ended.* = true;
+    }
     fn nextJoined(self: *State, index: usize) anyerror!?[]const Datum {
         const slot = &self.slots[index];
         switch (slot.status) {
@@ -196,11 +215,13 @@ const State = struct {
         const saved = self.current;
         self.current = index;
         defer self.current = saved;
+        try self.beginStatement(index);
         const row = self.advanceJoined(index) catch |err| {
             slot.status = .failed;
             slot.failure = err;
             return err;
         };
+        if (row == null) try self.endStatement(index);
         slot.status = if (row == null) .complete else .fresh;
         return row;
     }
@@ -231,12 +252,14 @@ const State = struct {
         const saved = self.current;
         self.current = index;
         defer self.current = saved;
+        try self.beginStatement(index);
         const context = self.child(self.graph.steps[index], index);
         slot.output = context.run(self.graph.steps[index].statement) catch |err| {
             slot.status = .failed;
             slot.failure = err;
             return err;
         };
+        try self.endStatement(index);
         slot.status = .complete;
     }
     fn open(raw: *anyopaque, index: usize) anyerror!*Replay.Reader {
@@ -250,6 +273,31 @@ const State = struct {
             slot.replay = replay;
         }
         return slot.replay.?.openReader();
+    }
+    fn eligible(raw: *anyopaque, a: A, table: catalog.Table, input: []const catalog.Mutation, tag: []const u8) anyerror![]const catalog.Mutation {
+        const self: *State = @ptrCast(@alignCast(raw));
+        var selected: ?std.ArrayList(catalog.Mutation) = null;
+        defer if (selected) |*values| values.deinit(a);
+        for (input, 0..) |candidate, index| {
+            if (!candidate.predicate_only) {
+                if (candidate.unique_absence and std.mem.eql(u8, tag, "INSERT")) if (self.pending.get(.{ .table = table.id, .physical = table.physical_name, .row = candidate.key, .version = 0 })) |previous| {
+                    if (!previous.retired) return error.DuplicateSqlRow;
+                };
+                if (self.tuples.get(.{ .table = table.id, .physical = table.physical_name, .row = candidate.key, .version = candidate.expected_version })) |owner| {
+                    if (owner != self.current) {
+                        if (std.mem.eql(u8, tag, "MERGE")) return error.SqlMutationCardinalityViolation;
+                        if (candidate.unique_absence) return error.UniqueConstraintViolation;
+                        if (selected == null) {
+                            selected = .empty;
+                            try selected.?.appendSlice(a, input[0..index]);
+                        }
+                        continue;
+                    }
+                }
+            }
+            if (selected) |*values| try values.append(a, candidate);
+        }
+        return if (selected) |*values| try values.toOwnedSlice(a) else input;
     }
     fn claim(raw: *anyopaque, a: A, table: catalog.Table, input: []const catalog.Mutation, tag: []const u8) anyerror![]const catalog.Mutation {
         const self: *State = @ptrCast(@alignCast(raw));
@@ -349,13 +397,15 @@ pub fn execute(input: runtime.Context, graph: *const plan.Bound) anyerror!runtim
     try @import("decision_eval.zig").validateStatement(input.arena, input.backend.decision_provider, input.binding, input.parameters);
     var capture = try @import("mutation_capture.zig").open(input.alloc, input.backend, input.binding, input.parameters);
     defer capture.deinit();
-    var state: State = .{ .context = input, .graph = graph, .slots = try input.alloc.alloc(Slot, graph.steps.len), .current = graph.steps.len };
+    var state: State = .{ .context = input, .graph = graph, .slots = try input.alloc.alloc(Slot, graph.steps.len), .current = graph.steps.len, .command = command };
     for (state.slots, 0..) |*slot, index| slot.* = .{ .owner = &state, .index = index };
     defer state.deinit();
     state.context.statement_capture = &capture;
     state.prior_scalar_control = input.backend.scalar_control;
     state.context.backend.scalar_control = .{ .ptr = &state, .checkpoint = State.scalarCheckpoint };
-    state.context.backend.statement_effect_execution = .{ .ptr = &state, .open = State.open, .claim = State.claim, .checkpoint = State.checkpoint, .scan_rows = State.scan, .scan_page = State.scanPage, .pending_owner = State.pendingOwner };
+    state.context.backend.statement_effect_execution = .{ .ptr = &state, .open = State.open, .eligible = State.eligible, .claim = State.claim, .checkpoint = State.checkpoint, .scan_rows = State.scan, .scan_page = State.scanPage, .pending_owner = State.pendingOwner };
+    if (command.set_scope) |set| try set(command.ptr, &state.current);
+    try state.beginStatement(graph.steps.len);
     var root = state.child(graph.root, graph.steps.len);
     root.limits = input.limits;
     root.typed_output = input.typed_output;
@@ -363,6 +413,7 @@ pub fn execute(input: runtime.Context, graph: *const plan.Bound) anyerror!runtim
         try collectMutation(root, graph.root)
     else
         try root.run(graph.root.statement);
+    try state.endStatement(graph.steps.len);
     // Auxiliary mutations finish even when unused or hidden by LIMIT 0. Their
     // outputs remain private; the root alone determines the command result.
     for (graph.steps, 0..) |step, index| if (step.mutation) try state.mutation(index);

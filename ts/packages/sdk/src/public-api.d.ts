@@ -11349,7 +11349,24 @@ export interface components {
              */
             format?: "native" | "portable";
         };
+        RestoreRoutineMapping: {
+            /** @description Metadata catalog incarnation recorded in the source attachment. */
+            source_metadata_incarnation: string;
+            /** @description Immutable source function identifier, expressed losslessly as decimal. */
+            source_routine_id: string;
+            /** @description Existing immutable destination function identifier, expressed losslessly as decimal. */
+            destination_routine_id: string;
+        };
         RestoreRequest: {
+            /**
+             * @description Explicit immutable routine identity handoff for trigger attachments.
+             *     Cross-catalog restores require a mapping for every referenced trigger
+             *     function. Destination functions must already exist and be authorized
+             *     compatible zero-argument trigger functions. Routine bodies and names
+             *     are never imported or rebound by this operation. Mappings are part
+             *     of the durable job and its idempotency identity.
+             */
+            routine_mappings?: components["schemas"]["RestoreRoutineMapping"][];
             /**
              * @description Identifier of the published backup to restore.
              * @example backup-2025-01-15-v2
@@ -11478,6 +11495,15 @@ export interface components {
          *     canceling the old job and creating a new restore.
          */
         ClusterRestoreRequest: {
+            /**
+             * @description Explicit immutable routine identity handoff for trigger attachments.
+             *     Cross-catalog restores require a mapping for every referenced trigger
+             *     function. Destination functions must already exist and be authorized
+             *     compatible zero-argument trigger functions. Routine bodies and names
+             *     are never imported or rebound by this operation. Mappings are part
+             *     of the durable job and its idempotency identity.
+             */
+            routine_mappings?: components["schemas"]["RestoreRoutineMapping"][];
             /**
              * @description Unique identifier of the backup to restore from.
              * @example cluster-backup-2025-01-15

@@ -15,12 +15,22 @@
 
 const std = @import("std");
 const schema_mod = @import("../schema.zig");
+const persistence = @import("../../common/relation_persistence.zig");
+const persistence_codec = @import("../../common/relation_persistence_codec.zig");
 const row_codec = @import("algebraic/relational_row_codec.zig");
 
 pub const key = "\x00\x00__metadata__:table_catalog";
 pub const encoded_len: usize = 72;
+pub const Encoded = struct {
+    bytes: [encoded_len + 1 + persistence_codec.descriptor_bytes + persistence_codec.owner_bytes]u8 = @splat(0),
+    len: usize = encoded_len,
+    pub fn slice(self: *const Encoded) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
 const magic = "ATBL";
 const format_version: u32 = 3;
+pub const maximum_transaction_effect_format: u8 = 1;
 pub const default_transaction_admission_bytes: u64 = 128 * 1024 * 1024;
 
 pub const IndexState = enum(u8) {
@@ -63,7 +73,15 @@ pub const Catalog = struct {
     row_policy_generation: u64 = 0,
     row_policy_catalog_epoch: u64 = 0,
 
+    sql_persistence: ?persistence.Descriptor = null,
+    /// Sticky graph-intent decoder fence. First admission updates this catalog
+    /// in the same primary-store batch as the prepare vote and row intents.
+    transaction_effect_format: u8 = 0,
+
+    /// The legacy image remains byte-identical for permanent tables. Callers
+    /// persisting a potentially process-owned table must use encodeDurable.
     pub fn encode(self: Catalog) [encoded_len]u8 {
+        std.debug.assert(self.sql_persistence == null and self.transaction_effect_format == 0);
         var out: [encoded_len]u8 = @splat(0);
         @memcpy(out[0..4], magic);
         std.mem.writeInt(u32, out[4..8], format_version, .little);
@@ -83,16 +101,37 @@ pub const Catalog = struct {
         return out;
     }
 
+    pub fn encodeDurable(self: Catalog) !Encoded {
+        var base = self;
+        base.sql_persistence = null;
+        base.transaction_effect_format = 0;
+        var out: Encoded = .{};
+        @memcpy(out.bytes[0..encoded_len], &base.encode());
+        if (self.transaction_effect_format > maximum_transaction_effect_format) return error.UnsupportedTableCatalogVersion;
+        if (self.transaction_effect_format != 0) {
+            std.mem.writeInt(u32, out.bytes[4..8], 5, .little);
+            out.bytes[encoded_len] = self.transaction_effect_format;
+            out.len += 1;
+        }
+        if (self.sql_persistence) |descriptor| {
+            const encoded = try persistence_codec.encodeFixed(descriptor);
+            if (self.transaction_effect_format == 0) std.mem.writeInt(u32, out.bytes[4..8], 4, .little);
+            @memcpy(out.bytes[out.len..][0..encoded.len], encoded.slice());
+            out.len += encoded.len;
+        }
+        return out;
+    }
+
     pub fn decode(data: []const u8) !Catalog {
-        if ((data.len != encoded_len and data.len != 48) or !std.mem.eql(u8, data[0..4], magic)) return error.InvalidTableCatalog;
+        if (data.len < 48 or !std.mem.eql(u8, data[0..4], magic)) return error.InvalidTableCatalog;
         const version = std.mem.readInt(u32, data[4..8], .little);
-        if (version != format_version and version != 2) return error.UnsupportedTableCatalogVersion;
-        if ((version == 2 and data.len != 48) or (version == format_version and data.len != encoded_len)) return error.InvalidTableCatalog;
+        if (version != format_version and version != 2 and version != 4 and version != 5) return error.UnsupportedTableCatalogVersion;
+        if ((version == 2 and data.len != 48) or (version == format_version and data.len != encoded_len) or (version == 4 and data.len <= encoded_len) or (version == 5 and data.len < encoded_len + 1)) return error.InvalidTableCatalog;
         const row_count = std.mem.readInt(u64, data[24..32], .little);
         if (data[8] > 1 or data[9] > @backingInt(schema_mod.StorageMode.relational) or
             data[10] > @backingInt(IndexState.failed) or data[11] > 1 or row_count > 1)
             return error.InvalidTableCatalog;
-        const catalog: Catalog = .{
+        var catalog: Catalog = .{
             .mode_initialized = data[8] == 1,
             .storage_mode = @fromBackingInt(data[9]),
             .index_state = @fromBackingInt(data[10]),
@@ -107,6 +146,15 @@ pub const Catalog = struct {
             .row_policy_generation = if (version == 2) 0 else std.mem.readInt(u64, data[56..64], .little),
             .row_policy_catalog_epoch = if (version == 2) 0 else std.mem.readInt(u64, data[64..72], .little),
         };
+        if (version == 5) {
+            catalog.transaction_effect_format = data[encoded_len];
+            if (catalog.transaction_effect_format == 0 or catalog.transaction_effect_format > maximum_transaction_effect_format) return error.UnsupportedTableCatalogVersion;
+        }
+        if (version == 4 or (version == 5 and data.len > encoded_len + 1)) {
+            var pos: usize = encoded_len + @as(usize, @intFromBool(version == 5));
+            catalog.sql_persistence = persistence_codec.read(data, &pos) catch return error.InvalidTableCatalog;
+            if (pos != data.len) return error.InvalidTableCatalog;
+        }
         // A disabled catalog retains the last generation as a revocation
         // high-water mark. Resetting it would allow an old signed view to be
         // replayed after a later re-enable at the same generation.
@@ -115,7 +163,7 @@ pub const Catalog = struct {
         // Zero is the initial, durable relational schema epoch, not absence.
         // Generation/catalog epoch above still fence installed policy state.
         if (catalog.row_policy_phase != .disabled and catalog.storage_mode != .relational) return error.InvalidTableCatalog;
-        if (version == format_version) for (data[49..56]) |reserved| {
+        if (version >= format_version) for (data[49..56]) |reserved| {
             if (reserved != 0) return error.InvalidTableCatalog;
         };
         if (catalog.transaction_admission_bytes == 0) return error.InvalidTableCatalog;
@@ -143,6 +191,18 @@ pub const Catalog = struct {
             return error.TableCatalogSchemaMismatch;
     }
 };
+
+/// Raise an existing image's decoder requirement in the caller's atomic
+/// transaction. This does not attest fleet readiness or grant any row effect.
+pub fn stageReaderFormat(txn: anytype, required: u8) !Catalog {
+    if (required == 0 or required > maximum_transaction_effect_format) return error.UnsupportedTransactionEffectFormat;
+    var current = try Catalog.decode(try txn.get(key));
+    if (current.transaction_effect_format >= required) return current;
+    current.transaction_effect_format = required;
+    const encoded = try current.encodeDurable();
+    try txn.put(key, encoded.slice());
+    return current;
+}
 
 pub fn load(alloc: std.mem.Allocator, store: anytype) !?Catalog {
     const raw = store.get(alloc, key) catch |err| switch (err) {
@@ -405,4 +465,44 @@ test "table catalog is bound to its active runtime schema" {
     try (Catalog{}).validateForSchema(null);
     mismatched = .{ .mode_initialized = true, .storage_mode = .relational };
     try std.testing.expectError(error.TableCatalogSchemaMismatch, mismatched.validateForSchema(null));
+}
+
+test "SQL relation persistence physical catalog keeps permanent bytes and fences exact native epochs" {
+    const permanent: Catalog = .{};
+    const original = permanent.encode();
+    const durable = try permanent.encodeDurable();
+    try std.testing.expectEqualSlices(u8, &original, durable.slice());
+    const descriptor: persistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = std.math.maxInt(u64), .owner_store_id = 17, .generation_instance = @splat(7), .data_generation = 3 };
+    const owned: Catalog = .{ .sql_persistence = descriptor };
+    const encoded = try owned.encodeDurable();
+    const restored = try Catalog.decode(encoded.slice());
+    try std.testing.expectEqualDeep(owned, restored);
+    for (encoded_len..encoded.len) |length| try std.testing.expectError(error.InvalidTableCatalog, Catalog.decode(encoded.bytes[0..length]));
+    var extra = encoded;
+    extra.len += 1;
+    try std.testing.expectError(error.InvalidTableCatalog, Catalog.decode(extra.slice()));
+    var changed = restored;
+    changed.sql_persistence.?.generation_instance[0] ^= 1;
+    try std.testing.expect(!std.meta.eql(restored.sql_persistence, changed.sql_persistence));
+}
+
+test "graph intent reader fence is sticky and ordinary physical catalog bytes remain unchanged" {
+    const ordinary: Catalog = .{};
+    const before = try ordinary.encodeDurable();
+    try std.testing.expectEqualSlices(u8, &ordinary.encode(), before.slice());
+    var graph = ordinary;
+    graph.transaction_effect_format = 1;
+    const encoded = try graph.encodeDurable();
+    try std.testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, encoded.bytes[4..8], .little));
+    var restored = try Catalog.decode(encoded.slice());
+    try std.testing.expectEqual(@as(u8, 1), restored.transaction_effect_format);
+    restored.generation += 1;
+    const next = try restored.encodeDurable();
+    try std.testing.expectEqual(@as(u8, 1), (try Catalog.decode(next.slice())).transaction_effect_format);
+    var future = next;
+    future.bytes[encoded_len] = 2;
+    try std.testing.expectError(error.UnsupportedTableCatalogVersion, Catalog.decode(future.slice()));
+    var truncated = encoded;
+    truncated.len = encoded_len;
+    try std.testing.expectError(error.InvalidTableCatalog, Catalog.decode(truncated.slice()));
 }

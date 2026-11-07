@@ -809,7 +809,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response", "httpx SQL original nullability relaxation" } });
     const sql_command_producer_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = &.{ "SQL command producer native", "SQL execution lease borrowing", "HTTP connection", "HTTP sequence sessions", "SQL connection admission", "durable SQL session rejects duplicate savepoint ids", "durable SQL connection execution projection", "distributed txn session preserves numeric tokens" },
+        .filters = &.{ "SQL command producer native", "SQL relation lifetime source outbox owns TEMP through discard generation failure and retired cleanup", "SQL execution lease borrowing", "HTTP connection", "HTTP sequence sessions", "SQL connection admission", "durable SQL session rejects duplicate savepoint ids", "durable SQL connection execution projection", "distributed txn session preserves numeric tokens" },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 28 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -820,6 +820,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_command_producer_audit = b.addSystemCommand(&.{"python3"});
     sql_command_producer_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
     for ([_][]const u8{
+        "SQL relation lifetime source outbox owns TEMP through discard generation failure and retired cleanup",
+        "SQL command producer native begin observation cannot erase TEMP namespace cleanup ownership",
         "SQL command producer native cold recovery never replays SQL and retires bound scopes incrementally",
         "SQL command producer native shared facades preserve execution ownership lease renewal and admission recovery",
         "SQL command producer native connection GC retains uncertain owners and native fences prevent identity resurrection",
@@ -1121,7 +1123,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, restore_owner_test_mod, true, true);
     const restore_owner_tests = b.addTest(.{
         .root_module = restore_owner_test_mod,
-        .filters = &.{ "restore owner SQL population", "restore owner verified decoder", "restore decoder", "relational integrity portable decoder resumes bounded row pages across LSM reopen", "mapped restore admission" },
+        .filters = &.{ "restore owner SQL population", "restore owner verified decoder", "restore owner independent repository snapshot", "restore decoder", "relational integrity portable decoder resumes bounded row pages across LSM reopen", "mapped restore admission" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-restore-owner-test", "Run authenticated source cache and replicated owner control integration").dependOn(&addFilteredTestRunArtifact(b, restore_owner_tests).step);
@@ -3883,6 +3885,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const metadata_tests_addTests_result = metadata_tests.addTests(b, .{
         .target = target,
         .antfly_test_mod = antfly_test_mod,
+        .metadata_storage_test_mod = metadata_unit_baseline_mods[metadata_unit_baseline_mods.len - 1],
     });
     const run_lib_metadata_vopr_data_tests = metadata_tests_addTests_result.run_lib_metadata_vopr_data_tests;
     const lib_metadata_runtime_filters = metadata_tests_addTests_result.lib_metadata_runtime_filters;
@@ -6087,6 +6090,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "offline migration rejects authoritative metadata",
             "standalone catalog remote apply outage preserves committed creation and retry authority",
             "standalone metadata replay refreshes colliding revisions and only publishes complete effects",
+            "standalone native SQL connection enrolls the real durable producer before lending temporary ownership",
             "standalone metadata advertises a linearizable owned snapshot",
             "standalone catalog journal preserves imported policy publication as fail closed",
             "standalone schema mutation supports atomic merge patch and version CAS",

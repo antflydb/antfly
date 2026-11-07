@@ -288,6 +288,13 @@ pub fn queryPopulationJob(context: *const CallContext) callconv(.c) abi.Status {
     return .ok;
 }
 
+pub fn drainSqlConnections(context: *const CallContext) callconv(.c) abi.Status {
+    const Deadline = @import("../common/runtime_lifecycle.zig").ShutdownDeadline;
+    if (validateCall(Deadline, void, context)) |failure| return failure;
+    serverState(context).server.drainSqlConnections(input(Deadline, context).*) catch |err| return fail(err);
+    return .ok;
+}
+
 pub fn resumeRestoreJobs(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(void, void, context)) |failure| return failure;
     serverState(context).server.resumeRestoreJobsOnce() catch |err| return fail(err);
@@ -571,6 +578,7 @@ const function_table: abi.FunctionTable = .{
     .attach_replicated_restore_store = &attachReplicatedRestoreStore,
     .query_population_job = &queryPopulationJob,
     .authorize_sql_lock = &authorizeSqlLock,
+    .drain_sql_connections = &drainSqlConnections,
     .resume_restore_jobs = &resumeRestoreJobs,
     .poll_restore_jobs = &pollRestoreJobs,
     .prepare_restore_leadership = &prepareRestoreLeadership,
@@ -1220,4 +1228,50 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
         handle = null;
         try Probe.run(std.testing.io);
     }
+}
+
+test "API kernel SQL shutdown validates deadline authority before handle access and forwards the exact lifecycle" {
+    const old: CreateContext = .{
+        .abi_version = 33,
+        .owner_alloc = @ptrFromInt(0x1000),
+        .cfg = @ptrFromInt(0x1000),
+        .cfg_contract = .of(void),
+        .source = @ptrFromInt(0x1000),
+        .source_contract = .of(void),
+        .table_reads = @ptrFromInt(0x1000),
+        .table_reads_contract = .of(void),
+        .table_writes = @ptrFromInt(0x1000),
+        .table_writes_contract = .of(void),
+        .out_handle = @ptrFromInt(0x1000),
+        .out_request_alloc = @ptrFromInt(0x1000),
+    };
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(create(&old)));
+
+    const Deadline = @import("../common/runtime_lifecycle.zig").ShutdownDeadline;
+    var deadline = Deadline.afterMilliseconds(1000);
+    var invalid: CallContext = .{ .abi_version = abi.abi_version - 1, .handle = @ptrFromInt(1), .input = &deadline, .input_contract = .of(Deadline) };
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(function_table.drain_sql_connections(&invalid)));
+    invalid.abi_version = abi.abi_version;
+    invalid.input_contract = .of(u64);
+    try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(function_table.drain_sql_connections(&invalid)));
+    invalid.input_contract = .of(Deadline);
+    invalid.input = null;
+    try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(function_table.drain_sql_connections(&invalid)));
+    const Stub = struct {
+        fn status(_: *anyopaque) anyerror!metadata_api.MetadataStatus {
+            return error.TestUnexpectedStatusRead;
+        }
+    };
+    var token: u8 = 0;
+    var state: ServerState = .{
+        .owner_alloc = std.testing.allocator,
+        .server = server_mod.ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &token, .vtable = &.{ .status = Stub.status } }, null, null),
+        .request_alloc_abi = undefined,
+    };
+    defer state.server.deinit();
+    try std.testing.expect(!state.server.sql_command_upkeep_closing.load(.acquire));
+    const valid: CallContext = .{ .abi_version = abi.abi_version, .handle = &state, .input = &deadline, .input_contract = .of(Deadline) };
+    try std.testing.expect(function_table.drain_sql_connections(&valid).isOk());
+    try std.testing.expect(state.server.sql_command_upkeep_closing.load(.acquire));
+    try std.testing.expect(function_table.drain_sql_connections(&valid).isOk());
 }

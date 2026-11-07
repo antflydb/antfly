@@ -1151,6 +1151,7 @@ pub const GraphIndex = struct {
     /// Topology task views borrow stores and live ownership from this owner.
     /// Never copy a live GraphIndex: its mutexes and caches have identity.
     borrowed_owner: ?*GraphIndex = null,
+    retained_stores: ?*RetainedStores = null,
     /// Explicit small-page injection for recovery fixtures; production uses
     /// byte/work-bounded checkpoints with 4096-unit scheduling ranges.
     test_partition_target_units: ?usize = null,
@@ -1328,6 +1329,235 @@ pub const GraphIndex = struct {
         defer self.ownership_mutex.unlock();
         if (self.ownership_handoff) |handoff| return handoff.reverse.forkRead();
         return self.beginOwnershipRead(true);
+    }
+
+    // Backend lifetime is independent of a movable IndexManager entry. Logical
+    // drop releases its owner reference; immutable graph cuts release theirs
+    // only after aborting their paired transactions. No live GraphIndex moves
+    // into this capsule and no delayed callback dereferences the catalog entry.
+    const RetainedStores = struct {
+        alloc: Allocator,
+        references: std.atomic.Value(usize) = .init(1),
+        retired: ?struct {
+            outgoing: backend_erased.Store,
+            outgoing_owner: ReverseStoreOwner,
+            reverse: backend_erased.Store,
+            reverse_owner: ReverseStoreOwner,
+            crash: bool,
+        } = null,
+
+        fn release(self: *@This()) void {
+            if (self.references.fetchSub(1, .acq_rel) != 1) return;
+            if (self.retired) |*stores| {
+                stores.outgoing.deinit();
+                stores.reverse.deinit();
+                if (stores.crash) {
+                    stores.outgoing_owner.abandonAfterCrash(self.alloc);
+                    stores.reverse_owner.abandonAfterCrash(self.alloc);
+                } else {
+                    stores.outgoing_owner.close(self.alloc);
+                    stores.reverse_owner.close(self.alloc);
+                }
+            }
+            const alloc = self.alloc;
+            alloc.destroy(self);
+        }
+    };
+
+    const ReadDefinition = struct {
+        index_name: []const u8,
+        ttl_duration_ns: u64,
+        contributor_ordering_enabled: std.atomic.Value(bool),
+    };
+
+    /// Owned adjacency definition, paired immutable transactions, and backing
+    /// store lifetime. Capturing requires the caller's publication/apply fence;
+    /// paging requires neither the live index nor its catalog entry.
+    pub const RetainedEdgeRead = struct {
+        alloc: Allocator,
+        definition: ReadDefinition,
+        stores: *RetainedStores,
+        context: EdgeReadContext,
+
+        pub fn deinit(self: *@This()) void {
+            self.context.deinit();
+            self.alloc.free(self.definition.index_name);
+            self.stores.release();
+            self.* = undefined;
+        }
+        pub fn indexName(self: *const @This()) []const u8 {
+            return self.definition.index_name;
+        }
+        pub const PolicyOwners = struct {
+            documents: [][][]u8,
+            owned_bytes: usize,
+            scanned_rows: usize,
+        };
+        /// Read actual producer membership from this retained reverse cut.
+        /// Relationship identity and its user-visible edge are not rewritten.
+        pub fn policyOwners(self: *@This(), alloc: Allocator, edges: []const Edge, max_bytes: usize, max_rows: usize) !PolicyOwners {
+            const outer_bytes = std.math.mul(usize, edges.len, @sizeOf([][]u8)) catch return error.GraphExploredEdgeBytesBudgetExceeded;
+            if (outer_bytes > max_bytes) return error.GraphExploredEdgeBytesBudgetExceeded;
+            const groups = try alloc.alloc([][]u8, edges.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (groups[0..initialized]) |owners| {
+                    for (owners) |owner| alloc.free(owner);
+                    alloc.free(owners);
+                }
+                alloc.free(groups);
+            }
+            var bytes = outer_bytes;
+            var scanned: usize = 0;
+            for (edges, groups) |edge, *group| {
+                var owners: std.ArrayList([]u8) = .empty;
+                errdefer {
+                    for (owners.items) |owner| alloc.free(owner);
+                    owners.deinit(alloc);
+                }
+                if (edge.owner_document.len != 0) {
+                    const needed = edge.owner_document.len + @sizeOf([]u8);
+                    if (needed > max_bytes - bytes) return error.GraphExploredEdgeBytesBudgetExceeded;
+                    const owned = try alloc.dupe(u8, edge.owner_document);
+                    errdefer alloc.free(owned);
+                    try owners.append(alloc, owned);
+                    bytes += needed;
+                } else {
+                    const read = if (self.context.reads.incoming) |*incoming| incoming else return error.SqlStatementSnapshotRequired;
+                    const prefix = try ownerMemberEdgePrefixAlloc(alloc, edge.source, edge.edge_type, edge.target);
+                    defer alloc.free(prefix);
+                    const upper = try graphIndexEdgeUpperAlloc(alloc, prefix);
+                    defer alloc.free(upper);
+                    var cursor = try read.openCursor();
+                    defer cursor.close();
+                    cursor.setUpperBound(upper);
+                    var entry = try cursor.seekAtOrAfter(prefix);
+                    while (entry) |row| : (entry = try cursor.next()) {
+                        if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                        if (scanned == max_rows) return error.GraphExploredEdgesBudgetExceeded;
+                        scanned += 1;
+                        if (!std.mem.eql(u8, row.value, "1")) return error.InvalidGraphSegment;
+                        const suffix = row.key[prefix.len..];
+                        const end = internal_keys.findComponentTerminator(suffix, 0) orelse return error.InvalidGraphSegment;
+                        if (end + 2 != suffix.len or end == 0) return error.InvalidGraphSegment;
+                        const needed = BorrowedEdgeKey.decodedLen(suffix[0..end]) + @sizeOf([]u8);
+                        if (needed > max_bytes - bytes) return error.GraphExploredEdgeBytesBudgetExceeded;
+                        const owned = try BorrowedEdgeKey.decode(alloc, suffix[0..end]);
+                        errdefer alloc.free(owned);
+                        try owners.append(alloc, owned);
+                        bytes += needed;
+                    }
+                    // Before explicit producer membership existed, tuple
+                    // edges were source-owned. A non-source producer always
+                    // creates a member row in the same reverse transaction.
+                    if (owners.items.len == 0) {
+                        const needed = edge.source.len + @sizeOf([]u8);
+                        if (needed > max_bytes - bytes) return error.GraphExploredEdgeBytesBudgetExceeded;
+                        const owned = try alloc.dupe(u8, edge.source);
+                        errdefer alloc.free(owned);
+                        try owners.append(alloc, owned);
+                        bytes += needed;
+                    }
+                }
+                group.* = try owners.toOwnedSlice(alloc);
+                initialized += 1;
+            }
+            return .{ .documents = groups, .owned_bytes = bytes, .scanned_rows = scanned };
+        }
+
+        pub fn getPage(self: *@This(), alloc: Allocator, key: []const u8, edge_types: []const []const u8, cursor: ?EdgeScanCursor, limits: EdgePageLimits, now_ns: u64) !EdgePage {
+            return self.getPageDirected(alloc, key, edge_types, self.context.direction, cursor, limits, now_ns);
+        }
+        pub fn getPageDirected(self: *@This(), alloc: Allocator, key: []const u8, edge_types: []const []const u8, direction: EdgeDirection, cursor: ?EdgeScanCursor, limits: EdgePageLimits, now_ns: u64) !EdgePage {
+            if (cursor) |continuation| try self.context.validateContinuation(continuation);
+            var page = try getEdgesByTypesPageInRead(&self.definition, alloc, key, edge_types, direction, cursor, limits, now_ns, null, &self.context.reads);
+            if (page.next_cursor) |*continuation| self.context.bindContinuation(continuation);
+            return page;
+        }
+    };
+
+    pub fn retainEdgeReadWithProof(self: *GraphIndex, direction: EdgeDirection) !RetainedEdgeRead {
+        if (self.borrowed_owner != null) return error.SqlStatementSnapshotRequired;
+        var context = try self.beginEdgeReadContextWithProof(direction);
+        errdefer context.deinit();
+        if (context.read_generation == null) return error.SqlStatementReadUnavailable;
+        const name = try self.alloc.dupe(u8, self.index_name);
+        errdefer self.alloc.free(name);
+        const stores = self.retained_stores orelse blk: {
+            const owned = try self.alloc.create(RetainedStores);
+            owned.* = .{ .alloc = self.alloc };
+            self.retained_stores = owned;
+            break :blk owned;
+        };
+        _ = stores.references.fetchAdd(1, .monotonic);
+        // Retained readers never use the raw pointer. Make accidental use
+        // detectable in Debug even if the logical entry still happens to live.
+        context.index = undefined;
+        return .{ .alloc = self.alloc, .definition = .{
+            .index_name = name,
+            .ttl_duration_ns = self.ttl_duration_ns,
+            .contributor_ordering_enabled = .init(self.contributor_ordering_enabled.load(.acquire)),
+        }, .stores = stores, .context = context };
+    }
+
+    /// Empty physical stores need an epoch just as nonempty mutation batches
+    /// do. Certify during writable owner publication/recovery, never during a
+    /// read. Both private stores are streamed with bounded memory; a single
+    /// relationship (including an owner record) refuses empty certification.
+    /// This also repairs an interrupted empty initialization, but cannot bless
+    /// the two-store gap of a real mutation because its forward fact exists.
+    fn certifyEmptyReadGeneration(self: *GraphIndex) !void {
+        @import("antfly_platform").sync.lockYielding(&self.ownership_write_mutex);
+        defer self.ownership_write_mutex.unlock();
+        const key = try outgoingReadGenerationKeyAlloc(self.alloc, self.index_name);
+        defer self.alloc.free(key);
+        var reads = try self.beginReadEdgeTxns(.both);
+        defer reads.deinit();
+        const outgoing = try readU64OrZero(&reads.outgoing.?, key);
+        const incoming = try readU64OrZero(&reads.incoming.?, graph_read_generation_key);
+        if (outgoing != 0 and outgoing == incoming) return;
+        if (self.edge_count != 0) return;
+        for ([_]*backend_erased.ReadTxn{ &reads.outgoing.?, &reads.incoming.? }, [_]EdgeDirection{ .out, .in }) |txn, direction| {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.first();
+            while (row) |entry| : (row = try cursor.next()) {
+                if (BorrowedEdgeKey.parse(entry.key, direction) != null) return;
+            }
+        }
+        const generation = std.math.add(u64, @max(outgoing, incoming), 1) catch return error.InvalidGraphMetricBuildManifest;
+        var forward = try self.beginWriteOutgoingBatch();
+        var forward_active = true;
+        errdefer if (forward_active) forward.abort();
+        var reverse = try self.beginWriteReverseBatch();
+        var reverse_active = true;
+        errdefer if (reverse_active) reverse.abort();
+        try putU64(&forward, key, generation);
+        try putU64(&reverse, graph_read_generation_key, generation);
+        try bumpReverseReadGeneration(&reverse);
+        try forward.commit();
+        forward_active = false;
+        try reverse.commit();
+        reverse_active = false;
+        try self.outgoing_owner.sync(true);
+        try self.reverse_owner.sync(true);
+    }
+
+    fn retireBackingStores(self: *GraphIndex, crash: bool) void {
+        if (self.retained_stores) |stores| {
+            stores.retired = .{ .outgoing = self.outgoing_store, .outgoing_owner = self.outgoing_owner, .reverse = self.reverse_store, .reverse_owner = self.reverse_owner, .crash = crash };
+            stores.release();
+        } else {
+            self.outgoing_store.deinit();
+            self.reverse_store.deinit();
+            if (crash) {
+                self.outgoing_owner.abandonAfterCrash(self.alloc);
+                self.reverse_owner.abandonAfterCrash(self.alloc);
+            } else {
+                self.outgoing_owner.close(self.alloc);
+                self.reverse_owner.close(self.alloc);
+            }
+        }
     }
 
     const OwnershipHandoff = struct {
@@ -6869,7 +7099,10 @@ pub const GraphIndex = struct {
         if (counters_pending) try result.rebuildCounterMetadata();
         // Upgrade before publishing a writable owner. Ordinary document
         // mutations must never discover a whole historical graph migration.
-        if (!opts.reverse_lsm_options.backend.read_only) try result.ensureLegacyOwnerDirectory();
+        if (!opts.reverse_lsm_options.backend.read_only) {
+            try result.ensureLegacyOwnerDirectory();
+            try result.certifyEmptyReadGeneration();
+        }
         return result;
     }
 
@@ -6948,10 +7181,7 @@ pub const GraphIndex = struct {
         std.debug.assert(self.borrowed_owner == null);
         if (self.ownership_fence) |scope| self.alloc.free(scope);
         self.sealed_vectors.deinit(self.alloc);
-        self.outgoing_store.deinit();
-        self.outgoing_owner.close(self.alloc);
-        self.reverse_store.deinit();
-        self.reverse_owner.close(self.alloc);
+        self.retireBackingStores(false);
         if (self.rebuild_root_path) |path| self.alloc.free(path);
         self.* = undefined;
     }
@@ -6960,10 +7190,7 @@ pub const GraphIndex = struct {
         std.debug.assert(self.borrowed_owner == null);
         if (self.ownership_fence) |scope| self.alloc.free(scope);
         self.sealed_vectors.deinit(self.alloc);
-        self.outgoing_store.deinit();
-        self.outgoing_owner.abandonAfterCrash(self.alloc);
-        self.reverse_store.deinit();
-        self.reverse_owner.abandonAfterCrash(self.alloc);
+        self.retireBackingStores(true);
         if (self.rebuild_root_path) |path| self.alloc.free(path);
         self.* = undefined;
     }
@@ -7390,7 +7617,7 @@ pub const GraphIndex = struct {
         self.contributor_ordering_enabled.store(true, .release);
     }
 
-    fn needsContributorSelection(self: *const GraphIndex) bool {
+    fn needsContributorSelection(self: anytype) bool {
         return self.ttl_duration_ns != 0 or self.contributor_ordering_enabled.load(.acquire);
     }
 
@@ -8270,7 +8497,7 @@ pub const GraphIndex = struct {
         return self.edgeExpiredAt(edge, self.clock.nowRealtimeNs());
     }
 
-    fn edgeExpiredAt(self: *const GraphIndex, edge: DecodedEdgeValue, now_ns: u64) bool {
+    fn edgeExpiredAt(self: anytype, edge: DecodedEdgeValue, now_ns: u64) bool {
         if (self.ttl_duration_ns == 0) return false;
         // A TTL-enabled incarnation cannot make an un-stamped legacy value
         // visible indefinitely. The index rebuild must supply a timestamp.
@@ -8346,7 +8573,7 @@ pub const GraphIndex = struct {
 
     const SelectionMode = enum { value, edge, borrowed_edge, presence };
 
-    fn liveEdgeSelectionInTxnAlloc(self: *GraphIndex, alloc: Allocator, txn: *backend_erased.ReadTxn, now_ns: u64, source: []const u8, edge_type: []const u8, target: []const u8, projected: []const u8, edge_id: []const u8, owner_document: []const u8, mode: SelectionMode, supplied_budget: ?*SelectionBudget) !?LiveEdgeSelection {
+    fn liveEdgeSelectionInTxnAlloc(self: anytype, alloc: Allocator, txn: *backend_erased.ReadTxn, now_ns: u64, source: []const u8, edge_type: []const u8, target: []const u8, projected: []const u8, edge_id: []const u8, owner_document: []const u8, mode: SelectionMode, supplied_budget: ?*SelectionBudget) !?LiveEdgeSelection {
         const include_order = mode == .edge or mode == .borrowed_edge;
         var local_rows: usize = 0;
         var local_budget = SelectionBudget{ .rows = &local_rows, .limit = @import("work_budget.zig").default_max_explored_edges };
@@ -8360,7 +8587,7 @@ pub const GraphIndex = struct {
             else => return err,
         };
         if (projected_only) {
-            if (self.edgeExpiredAt(try decodeEdgeValue(projected), now_ns)) return null;
+            if (edgeExpiredAt(self, try decodeEdgeValue(projected), now_ns)) return null;
             if (mode == .presence) return .{ .value = &.{} };
             if (try selectionOwnedBytes(source, edge_type, target, projected, 0, include_order) > budget.max_selection_bytes) return error.GraphExploredEdgeBytesBudgetExceeded;
             return .{ .value = if (mode == .borrowed_edge) @constCast(projected) else try alloc.dupe(u8, projected), .value_owned = mode != .borrowed_edge };
@@ -8382,7 +8609,7 @@ pub const GraphIndex = struct {
             const priority_rank = sourcePriorityRank(priority);
             if (found and priority_rank >= best_priority_rank) continue;
             const edge_value = entry.value[8..];
-            if (self.edgeExpiredAt(try decodeEdgeValue(edge_value), now_ns)) continue;
+            if (edgeExpiredAt(self, try decodeEdgeValue(edge_value), now_ns)) continue;
             // Existence needs any live contributor, with no payload copy.
             if (mode == .presence) return .{ .value = &.{} };
             const key = try alloc.dupe(u8, entry.key);
@@ -8515,7 +8742,7 @@ pub const GraphIndex = struct {
     }
 
     fn getEdgesByTypesPageInRead(
-        self: *GraphIndex,
+        self: anytype,
         alloc: Allocator,
         key: []const u8,
         edge_types: []const []const u8,
@@ -8595,7 +8822,8 @@ pub const GraphIndex = struct {
                     cursor.type_index == type_index and cursor.direction == phase
                 else
                     false;
-                const capped = try self.scanEdgePagePhase(
+                const capped = try scanEdgePagePhase(
+                    self,
                     alloc,
                     if (phase == .out) &reads.outgoing.? else &reads.incoming.?,
                     if (reads.incoming) |*reverse| reverse else null,
@@ -8926,7 +9154,7 @@ pub const GraphIndex = struct {
     }
 
     fn scanEdgePagePhase(
-        self: *GraphIndex,
+        self: anytype,
         alloc: Allocator,
         txn: *backend_erased.ReadTxn,
         selection_txn: ?*backend_erased.ReadTxn,
@@ -8982,7 +9210,7 @@ pub const GraphIndex = struct {
 
             scanned_rows.* += 1;
             var selection_budget = SelectionBudget{ .rows = scanned_rows, .limit = limits.max_scanned_rows };
-            switch (try self.appendAdmittedEdge(alloc, selection_txn, results, owned_bytes, entry, phase, skip_mirrored_self_loops, limits.max_owned_bytes, now_ns, &selection_budget)) {
+            switch (try appendAdmittedEdge(self, alloc, selection_txn, results, owned_bytes, entry, phase, skip_mirrored_self_loops, limits.max_owned_bytes, now_ns, &selection_budget)) {
                 .full => {
                     // The next page will fetch this row again. Both backend
                     // visits count against the physical scan budget.
@@ -9009,12 +9237,12 @@ pub const GraphIndex = struct {
 
     /// Shared by RPC pages and retained native scans. No owned edge allocation
     /// takes place until the complete decoded edge fits the remaining budget.
-    fn appendAdmittedEdge(self: *GraphIndex, alloc: Allocator, selection_txn: ?*backend_erased.ReadTxn, results: *std.ArrayListUnmanaged(Edge), owned_bytes: *usize, entry: backend_erased.Entry, phase: EdgeDirection, skip_self_loops: bool, max_bytes: usize, now_ns: u64, budget: *SelectionBudget) !EdgeAdmission {
+    fn appendAdmittedEdge(self: anytype, alloc: Allocator, selection_txn: ?*backend_erased.ReadTxn, results: *std.ArrayListUnmanaged(Edge), owned_bytes: *usize, entry: backend_erased.Entry, phase: EdgeDirection, skip_self_loops: bool, max_bytes: usize, now_ns: u64, budget: *SelectionBudget) !EdgeAdmission {
         const key = BorrowedEdgeKey.parse(entry.key, phase) orelse return .skipped;
         if (skip_self_loops and std.mem.eql(u8, key.source, key.target)) return .skipped;
         var selection: ?LiveEdgeSelection = null;
         defer if (selection) |owned| owned.deinit(alloc);
-        const selected = if (selection_txn != null and self.needsContributorSelection()) blk: {
+        const selected = if (selection_txn != null and needsContributorSelection(self)) blk: {
             const source_key = try BorrowedEdgeKey.decode(alloc, key.source);
             defer alloc.free(source_key);
             const target_key = try BorrowedEdgeKey.decode(alloc, key.target);
@@ -9026,7 +9254,7 @@ pub const GraphIndex = struct {
             const relationship_owner = try BorrowedEdgeKey.decode(alloc, key.owner_document);
             defer alloc.free(relationship_owner);
             budget.max_selection_bytes = max_bytes - owned_bytes.*;
-            selection = self.liveEdgeSelectionInTxnAlloc(alloc, selection_txn.?, now_ns, source_key, kind, target_key, entry.value, relationship_id, relationship_owner, .borrowed_edge, budget) catch |err| {
+            selection = liveEdgeSelectionInTxnAlloc(self, alloc, selection_txn.?, now_ns, source_key, kind, target_key, entry.value, relationship_id, relationship_owner, .borrowed_edge, budget) catch |err| {
                 if (err == error.GraphExploredEdgeBytesBudgetExceeded and results.items.len != 0) return .full;
                 return err;
             };
@@ -39813,4 +40041,81 @@ test "graph committed intents survive canceled durability fences" {
     test_intent_sync_hook = null;
     try g.batchApply(&.{}, &.{.{ .source = "source", .target = "target", .edge_type = "link", .clear_all_private_state = true }});
     try std.testing.expectEqual(@as(usize, 0), (try g.getEdges(a, "source", "link", .out)).len);
+}
+
+test "retained graph adjacency owns immutable stores across index close and mutation" {
+    const a = std.testing.allocator;
+    var index = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "retained", .{ .reverse_backend = .mem });
+    var active = true;
+    defer if (active) index.close();
+    try index.addEdge("root", "old", "cites", 2.5, 0, 0, "{}");
+    var pinned = try index.retainEdgeReadWithProof(.out);
+    defer pinned.deinit();
+    try index.addEdge("root", "new", "cites", 9, 0, 0, "{}");
+    var newer = try index.retainEdgeReadWithProof(.out);
+    defer newer.deinit();
+    index.close();
+    active = false;
+    var page = try pinned.getPage(a, "root", &.{"cites"}, null, .{ .max_edges = 8, .max_owned_bytes = 4096 }, 0);
+    defer page.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), page.edges.len);
+    try std.testing.expectEqualStrings("old", page.edges[0].target);
+    try std.testing.expectEqual(@as(f64, 2.5), page.edges[0].weight);
+    var current = try newer.getPage(a, "root", &.{"cites"}, null, .{ .max_edges = 8, .max_owned_bytes = 4096 }, 0);
+    defer current.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), current.edges.len);
+    var first = try pinned.getPage(a, "root", &.{"cites"}, null, .{ .max_edges = 1, .max_owned_bytes = 4096 }, 0);
+    defer first.deinit(a);
+    try std.testing.expect(first.next_cursor != null);
+    try std.testing.expectError(error.TopologyChanged, newer.getPage(a, "root", &.{"cites"}, first.next_cursor, .{ .max_edges = 8, .max_owned_bytes = 4096 }, 0));
+}
+
+test "retained graph policy producers use actual paired member rows across mutation index close and allocation failure" {
+    const a = std.testing.allocator;
+    var index = try GraphIndex.openWithPrivateStores(a, "unused-policy-out", "unused-policy-in", "g", .{ .reverse_backend = .mem });
+    var active = true;
+    defer if (active) index.close();
+    try index.batchApply(&.{
+        .{ .source = "root", .target = "tuple", .edge_type = "R", .owner = "fact:a" },
+        .{ .source = "root", .target = "tuple", .edge_type = "R", .owner = "fact:b" },
+        .{ .source = "root", .target = "explicit", .edge_type = "R", .edge_id = "relation", .owner_document = "fact:c" },
+        .{ .source = "root", .target = "implicit", .edge_type = "R" },
+    }, &.{});
+    var pinned = try index.retainEdgeReadWithProof(.both);
+    defer pinned.deinit();
+    var page = try pinned.getPageDirected(a, "root", &.{"R"}, .out, null, .{ .max_edges = 8, .max_owned_bytes = 16384 }, 0);
+    defer page.deinit(a);
+    try index.batchApply(&.{.{ .source = "root", .target = "tuple", .edge_type = "R", .owner = "fact:d" }}, &.{});
+    index.close();
+    active = false;
+    const Harness = struct {
+        fn run(alloc: Allocator, retained: *GraphIndex.RetainedEdgeRead, edges: []const Edge) !void {
+            const owners = try retained.policyOwners(alloc, edges, 16384, 128);
+            defer {
+                for (owners.documents) |group| {
+                    for (group) |owner| alloc.free(owner);
+                    alloc.free(group);
+                }
+                alloc.free(owners.documents);
+            }
+            try std.testing.expectEqual(edges.len, owners.documents.len);
+            for (edges, owners.documents) |edge, group| {
+                if (std.mem.eql(u8, edge.target, "tuple")) {
+                    try std.testing.expectEqual(@as(usize, 2), group.len);
+                    try std.testing.expectEqualStrings("fact:a", group[0]);
+                    try std.testing.expectEqualStrings("fact:b", group[1]);
+                } else if (std.mem.eql(u8, edge.target, "explicit")) {
+                    try std.testing.expectEqual(@as(usize, 1), group.len);
+                    try std.testing.expectEqualStrings("fact:c", group[0]);
+                } else {
+                    try std.testing.expectEqualStrings("implicit", edge.target);
+                    try std.testing.expectEqual(@as(usize, 1), group.len);
+                    try std.testing.expectEqualStrings("root", group[0]);
+                }
+            }
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{ &pinned, page.edges });
+    try std.testing.expectError(error.GraphExploredEdgeBytesBudgetExceeded, pinned.policyOwners(a, page.edges, 0, 128));
+    try std.testing.expectError(error.GraphExploredEdgesBudgetExceeded, pinned.policyOwners(a, page.edges, 16384, 0));
 }

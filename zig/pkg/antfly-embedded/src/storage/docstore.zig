@@ -452,6 +452,9 @@ fn updateGraphEndpointCleanupAdmission(txn: anytype, alloc: Allocator, key: []co
 }
 
 pub const DocStore = struct {
+    /// Actual native primary identity, installed by its DB owner. Transaction
+    /// adapters inherit this authority; request JSON never supplies it.
+    native_relation_pin: ?@import("../common/relation_persistence.zig").PhysicalPin = null,
     payload_store: ?artifact_payload.Store = null,
     payload_capture_inline: bool = false,
     payload_migration_allowance: ?u64 = null,

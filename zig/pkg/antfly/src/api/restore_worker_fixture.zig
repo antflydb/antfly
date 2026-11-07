@@ -374,7 +374,7 @@ const Fixture = struct {
                 self.materialization_max_ns = @max(self.materialization_max_ns, elapsed_ns);
             }
         }
-        if (request.action == .validate or request.action == .install_generation_admissions) {
+        if (request.action == .validate or request.action == .install_generation_admissions or request.action == .install_native_empty) {
             self.validation_owner_calls += 1;
             const elapsed_ns = @import("antfly_platform").time.monotonicNs() - owner_started_ns;
             self.validation_owner_elapsed_ns +|= elapsed_ns;
@@ -394,7 +394,7 @@ const Fixture = struct {
             .begin => 0,
             .import_page => if (result.rows != 0 or result.phase == .imported) 2 else 0,
             .validate => if (result.phase == .validated) 4 else 0,
-            .install_generation_admissions => 0,
+            .install_generation_admissions, .install_native_empty => 0,
             .publish => 8,
             .cancel => 16,
             .status => 0,

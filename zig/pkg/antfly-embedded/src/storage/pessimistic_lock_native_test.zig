@@ -1568,6 +1568,7 @@ test "pessimistic locks native LSM compare and lock preserves false outcomes cur
 }
 
 test "pessimistic locks native LSM abort before BEGIN retires lock custody through bounded cold quanta and aborts every partial adoption" {
+    try qualifyAbsentAbortCustody();
     const native_control = @import("pessimistic_lock_control.zig");
     const frozen = @import("pessimistic_lock_transaction.zig");
     const path = try pathFor("abort-before-begin");
@@ -1633,6 +1634,19 @@ test "pessimistic locks native LSM abort before BEGIN retires lock custody throu
         if (done) break;
     }
     try std.testing.expect(done);
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.delete(&frozen.key(admission.transaction));
+        const backend = try scopes.preparedBackend(admission.binding.namespace, decision);
+        var lease = (try admission.registration()).lease;
+        lease.backend = backend;
+        try ledger.register(a, &txn, admission.binding.namespace, lease, Context{ .lease = lease });
+        // A zero-resource ACTIVE destination still owns custody. The absent-Ref
+        // path must preserve complete()'s retired-destination requirement.
+        try std.testing.expectError(error.InvalidLockRecord, frozen.adoptAborted(a, &txn, admission.binding.identity, ref));
+        try std.testing.expect((try frozen.read(a, &txn, admission.transaction)) == null);
+    }
     var read = try store.beginReadTxn();
     defer read.abort();
     try std.testing.expect(!try ledger.accessBlocked(a, &read, admission.binding.namespace, try admission.binding.row("r"), .{ .row = .update }, null));
@@ -1754,4 +1768,180 @@ test "pessimistic locks native LSM terminal external participants leave range ac
     _ = try manager.resolveIntentsWithExtraBatch(legacy, .committed, 400, .{});
     try std.testing.expect(try manager.hasRangeActivationTransactions());
     try std.testing.expect(try manager.hasTopologySensitiveTransactions());
+}
+
+test "SQL relation lifetime abandoned private group drains actual old lock custody without fencing successor or touching rows" {
+    const control = @import("pessimistic_lock_control.zig");
+    const topology = @import("db/relational_integrity_topology.zig");
+    const p = @import("../common/relation_persistence.zig");
+    const path = try pathFor("abandoned-private-group");
+    defer a.free(path);
+    defer cleanup(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    const admission = dataFixture();
+    const authorized: DataAuthority = .{ .approved = admission };
+    const owner: p.Owner = .{ .issuer_node_id = admission.source.lease.node, .connection_id = admission.source.connection, .wire_epoch = @splat(11), .execution_instance = admission.parent_command.executor, .connection_generation = 1, .principal_digest = @splat(12) };
+    const route: @import("../metadata/catalog_route_contract.zig").CatalogRouteFence = .{ .metadata_group_id = admission.source.group, .metadata_incarnation = std.fmt.bytesToHex(admission.binding.namespace.incarnation, .lower), .catalog_revision = 2, .table_id = admission.binding.identity.table_id, .topology_epoch = 1, .route = .{ .group_id = admission.binding.namespace.group, .range_id = admission.binding.identity.range_id, .identity_namespace = .{ .table_id = admission.binding.identity.table_id, .shard_id = admission.binding.identity.shard_id, .range_id = admission.binding.identity.range_id }, .execution = .{ .native_local = .{ .kind = .temporary, .owner_node_id = 10, .owner_store_id = 11, .generation_instance = @splat(13), .data_generation = 1, .owner = owner } } }, .native_participant = .{ .physical_root_incarnation = 14, .table_id = admission.binding.identity.table_id, .shard_id = admission.binding.identity.shard_id, .range_id = admission.binding.identity.range_id, .data_generation = 1 } };
+    var empty_catalog_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash("", &empty_catalog_digest, .{});
+    const fence: topology.Fence = .{ .transition_id = 20, .attempt = 1, .peer_group_id = admission.binding.namespace.group, .owner_group_id = admission.binding.namespace.group, .role = .document_retirement_source, .namespace = admission.binding.identity, .catalog_digest = empty_catalog_digest };
+    const retirement: control.RetirementControl = .{ .route = route, .scope_id = @splat(22), .scope_revision = 1, .abandonment_digest = @splat(23), .physical_fence = fence, .participant = .{ .spec = .{ .table_name = "private_table", .route = route }, .admission = admission } };
+    var command: control.Command = .{ .admission = admission, .retirement_control = retirement, .operation = .close };
+    try command.validate();
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put("surviving_row", "unchanged");
+        const catalog = @import("db/table_catalog.zig");
+        const facts = (catalog.Catalog{ .mode_initialized = true }).encode();
+        try txn.put(catalog.key, &facts);
+        _ = try data_participant.admit(a, &txn, admission.binding.identity, admission, authorized);
+        _ = try data_participant.acquire(a, &txn, admission.binding.identity, try dataGrant(admission, 1, "r", .update, 0), authorized);
+        try txn.commit();
+    }
+    // Neither a retirement-shaped body without an actual local fence nor a
+    // different admitted fence grants authority over the old native DataScope.
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.IntegrityTopologyFenceMissing, control.apply(a, &txn, admission.binding.identity, admission.binding.namespace.group, .document, command));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try topology.stageBegin(&txn, fence);
+        try txn.commit();
+    }
+    var invalid = command;
+    invalid.operation = .begin;
+    try std.testing.expectError(error.InvalidLockScope, invalid.validate());
+    invalid = command;
+    invalid.retirement_control.?.route.route.execution.native_local.owner.?.execution_instance[0] ^= 1;
+    try std.testing.expectError(error.LockOwnerChanged, invalid.validate());
+    invalid = command;
+    invalid.retirement_control.?.physical_fence.role = .backup_snapshot;
+    try std.testing.expectError(error.LockOwnerChanged, invalid.validate());
+    invalid = command;
+    invalid.retirement_control.?.physical_fence.admission_epoch += 1;
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.IntegrityTopologyChanged, control.apply(a, &txn, admission.binding.identity, admission.binding.namespace.group, .document, invalid));
+    }
+    // A durable close quantum may be replayed after a lost reply and a cold
+    // open; the metadata backend itself is never read, mutated or fenced here.
+    for (0..16) |_| {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try control.apply(a, &txn, admission.binding.identity, admission.binding.namespace.group, .document, command);
+        try txn.commit();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const current = (try scopes.read(a, &read, admission.binding.namespace, (try admission.registration()).lease.backend)).?;
+        if (current.state == .retired) break;
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualStrings("unchanged", try read.get("surviving_row"));
+        const observed = try control.snapshot(a, &read, admission.binding.identity, .{ .admission = admission, .retirement_control = retirement });
+        try std.testing.expect(observed.scope.?.state == .retired);
+        var invalid_query: control.Query = .{ .admission = admission, .retirement_control = retirement, .intent_key = "surviving_row" };
+        try std.testing.expectError(error.InvalidLockScope, invalid_query.validate());
+        invalid_query.intent_key = null;
+        invalid_query.retirement_control.?.physical_fence.admission_epoch += 1;
+        try std.testing.expectError(error.IntegrityTopologyChanged, control.snapshot(a, &read, admission.binding.identity, invalid_query));
+        try std.testing.expect((try scopes.read(a, &read, admission.binding.namespace, (try admission.registration()).lease.backend)).?.state == .retired);
+        try std.testing.expectEqual(@as(u32, 0), try scopes.activeCount(&read, admission.binding.namespace));
+    }
+    // A real native external owner is never converted into an unprepared
+    // close permit, even when the old DataScope has already drained.
+    {
+        var manager = try native_transactions.TxnManager.init(a, &store);
+        defer manager.deinit();
+        const decision_owner: native_transactions.ExternalDecisionOwner = .{ .metadata_incarnation = route.metadata_incarnation.?, .operation_id = @splat(31), .admission_digest = @splat(32), .expires_at_unix_ns = 10000 };
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(admission.transaction, 100, 1, &.{"data:901"}, false, true, .{ .external_decision_owner = decision_owner });
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.LockOwnerBusy, control.apply(a, &txn, admission.binding.identity, admission.binding.namespace.group, .document, command));
+    }
+    command.retirement_control = null;
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.Forbidden, control.apply(a, &txn, admission.binding.identity, admission.binding.namespace.group, .document, command));
+    }
+}
+
+fn qualifyAbsentAbortCustody() !void {
+    const frozen = @import("pessimistic_lock_transaction.zig");
+    const control = @import("pessimistic_lock_control.zig");
+    const path = try pathFor("absent-abort-custody");
+    defer a.free(path);
+    defer cleanup(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    const execution = dataFixture();
+    var resolving = execution;
+    resolving.purpose = .resolution;
+    resolving.serial += 1;
+    const decision: scopes.DecisionRef = .{ .operation = @splat(51), .admission = @splat(52) };
+    const owner: native_transactions.ExternalDecisionOwner = .{ .metadata_incarnation = std.fmt.bytesToHex(execution.binding.namespace.incarnation, .lower), .operation_id = decision.operation, .admission_digest = decision.admission, .expires_at_unix_ns = 10000 };
+    const ref: frozen.Ref = .{ .admission = resolving, .decision = decision };
+    {
+        var manager = try native_transactions.TxnManager.init(a, &store);
+        defer manager.deinit();
+        try std.testing.expectError(error.TxnNotFound, manager.resolveIntentsWithExtraBatch(execution.transaction, .committed, 200, .{ .external_decision_owner = owner }));
+        _ = try manager.resolveIntentsWithExtraBatch(execution.transaction, .aborted, 200, .{ .external_decision_owner = owner });
+    }
+    const registration = try resolving.registration();
+    for (0..5) |scenario| {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        if (scenario == 0) {
+            var fault: FaultTxn = .{ .txn = &txn, .remaining = 0 };
+            try std.testing.expectError(error.InjectedLockWriteFailure, frozen.adoptAborted(a, &fault, execution.binding.identity, ref));
+        } else {
+            var buffer: [256]u8 = undefined;
+            if (scenario == 1) {
+                try txn.put(try data_participant.Testing.originAddress(&buffer, resolving), "orphan");
+            } else if (scenario == 2) {
+                try ledger.register(a, &txn, resolving.binding.namespace, registration.lease, Context{ .lease = registration.lease });
+            } else {
+                const backend = if (scenario == 3) registration.lease.backend else try scopes.preparedBackend(resolving.binding.namespace, decision);
+                const address = try ledger.Testing.memberAddress(&buffer, resolving.binding.namespace, backend, if (scenario == 3) null else resolving.transaction);
+                try txn.put(address, &.{@backingInt(locks.Class.row)});
+            }
+            // Owner-head absence must not bless orphan origins or either
+            // source/prepared backend's global/transaction member indexes.
+            try std.testing.expectError(error.InvalidLockRecord, frozen.adoptAborted(a, &txn, execution.binding.identity, ref));
+        }
+        try std.testing.expect((try frozen.read(a, &txn, execution.transaction)) == null);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var wrong = ref;
+        wrong.decision.admission[0] ^= 1;
+        try std.testing.expectError(error.ExternalTransactionDecisionChanged, frozen.adoptAborted(a, &txn, execution.binding.identity, wrong));
+        try control.apply(a, &txn, execution.binding.identity, execution.binding.namespace.group, .document, .{ .admission = resolving, .operation = .{ .resolve = decision } });
+        try txn.commit();
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const before = (try frozen.read(a, &txn, execution.transaction)).?;
+        try std.testing.expect(before.retired);
+        try std.testing.expect((try scopes.read(a, &txn, resolving.binding.namespace, registration.lease.backend)) == null);
+        try ledger.requireAbsent(&txn, resolving.binding.namespace, registration.lease.backend);
+        try ledger.requireAbsent(&txn, resolving.binding.namespace, try scopes.preparedBackend(resolving.binding.namespace, decision));
+        try control.apply(a, &txn, execution.binding.identity, execution.binding.namespace.group, .document, .{ .admission = resolving, .operation = .{ .resolve = decision } });
+        try std.testing.expectEqualDeep(before, (try frozen.read(a, &txn, execution.transaction)).?);
+        try txn.commit();
+    }
 }

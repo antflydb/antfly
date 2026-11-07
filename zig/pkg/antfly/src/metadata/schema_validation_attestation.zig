@@ -71,7 +71,10 @@ pub const SignedPreparation = struct {
         return hashValue("antfly/schema-validation-prepared-physical-cut/v2", .{ .preparation = intent, .completed = self.completed });
     }
     pub fn sign(value: job.Preparation, identity: @import("store_root_enrollment.zig").Identity, reporter: u64, authority: roots.Authority, generation: u64, completed: ?local.storage_read_consistency.ReadSafetyBarrier.FrozenProof, root: local.storage_db_root_signing_identity.State) !@This() {
-        var result: @This() = .{ .value = value, .completed = completed, .proof = .{ .identity = identity, .reporter_incarnation = reporter, .authority = authority, .root_generation = generation, .signature = undefined } };
+        return signPinned(value, identity, reporter, authority, generation, completed, null, root);
+    }
+    pub fn signPinned(value: job.Preparation, identity: @import("store_root_enrollment.zig").Identity, reporter: u64, authority: roots.Authority, generation: u64, completed: ?local.storage_read_consistency.ReadSafetyBarrier.FrozenProof, native_pin: ?local.common_topology_records.RelationPersistence.PhysicalPin, root: local.storage_db_root_signing_identity.State) !@This() {
+        var result: @This() = .{ .value = value, .completed = completed, .proof = .{ .identity = identity, .reporter_incarnation = reporter, .authority = authority, .native_pin = native_pin, .root_generation = generation, .signature = undefined } };
         if ((value.binding.authority == .native) != (authority == .native)) return error.SchemaValidationJobChanged;
         result.proof = try result.proof.sign(root, try result.evidenceDigest());
         return result;
@@ -150,6 +153,7 @@ pub const SignedNativeObservation = struct {
                 .identity = expected.signing.identity,
                 .reporter_incarnation = expected.signing.reporter_incarnation,
                 .authority = .{ .native = expected.signing.binding_digest },
+                .native_pin = expected.signing.native_pin,
                 .root_generation = observed.root_generation,
                 .signature = undefined,
             },
@@ -161,7 +165,7 @@ pub const SignedNativeObservation = struct {
         try expected.require(self.rooted);
         try requireSignable(self.rooted);
         if (!std.meta.eql(self.proof.identity, expected.signing.identity) or
-            self.proof.reporter_incarnation != expected.signing.reporter_incarnation or
+            self.proof.reporter_incarnation != expected.signing.reporter_incarnation or !std.meta.eql(self.proof.native_pin, expected.signing.native_pin) or
             self.proof.root_generation != self.rooted.root_generation or self.proof.authority != .native or
             !std.mem.eql(u8, &self.proof.authority.native, &expected.signing.binding_digest))
             return error.SchemaValidationJobChanged;

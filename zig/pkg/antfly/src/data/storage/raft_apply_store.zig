@@ -2481,6 +2481,12 @@ pub const RaftApplyStore = struct {
             try operations.append(alloc, .{ .set_raft_batch_protocol = version });
             return;
         }
+        if (@import("../../api/internal_batch_forwarding.zig").graphTransactionProtocol(decoded.batch.req)) |required| {
+            // Replay must verify the durable barrier, even if a producer
+            // bypassed live preflight or the log is restored without it.
+            if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
+            try operations.append(alloc, .{ .require_raft_batch_protocol = .{ .version = required } });
+        }
         if (decoded.batch.req.relational_index_owner_control) |command| {
             if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
             try operations.append(alloc, .{ .require_raft_batch_protocol = .{

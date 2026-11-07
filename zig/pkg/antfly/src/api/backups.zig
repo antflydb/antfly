@@ -50,6 +50,7 @@ pub const ClusterBackupRequest = struct {
     single_table_manifest_id: ?[]const u8 = null,
 };
 pub const ClusterRestoreRequest = struct {
+    routine_mappings: ?[]const metadata_openapi.RestoreRoutineMapping = null,
     backup_id: []const u8,
     location: []const u8,
     connection: ?[]const u8 = null,
@@ -1998,7 +1999,10 @@ pub fn parseBackupRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.
 }
 
 pub fn parseRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(RestoreRequest) {
-    return std.json.parseFromSlice(RestoreRequest, alloc, body, .{});
+    var parsed = try std.json.parseFromSlice(RestoreRequest, alloc, body, .{});
+    errdefer parsed.deinit();
+    try @import("restore_routine_mapping.zig").validate(parsed.value.routine_mappings orelse &.{});
+    return parsed;
 }
 
 test "backup API requests reject unknown operational fields" {
@@ -2096,12 +2100,15 @@ pub fn parseClusterRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !C
     errdefer if (table_names) |values| freeStringSlice(alloc, values);
     const restore_mode = if (parsed.value.restore_mode) |value| try alloc.dupe(u8, value) else null;
     errdefer if (restore_mode) |value| alloc.free(value);
+    const routine_mappings = try @import("restore_routine_mapping.zig").cloneOptional(alloc, parsed.value.routine_mappings);
+    errdefer @import("restore_routine_mapping.zig").freeOptional(alloc, routine_mappings);
     return .{
         .backup_id = backup_id,
         .location = location,
         .connection = connection,
         .table_names = table_names,
         .restore_mode = restore_mode,
+        .routine_mappings = routine_mappings,
     };
 }
 
@@ -2234,7 +2241,7 @@ const parseTableBackupManifestWithArtifactBackupId = @import("antfly_local_sourc
 
 pub const validateTableManifest = @import("antfly_local_sources").api_local_backups.validateTableManifest;
 
-const validatePublishedTableManifest = @import("antfly_local_sources").api_local_backups.validatePublishedTableManifest;
+pub const validatePublishedTableManifest = @import("antfly_local_sources").api_local_backups.validatePublishedTableManifest;
 
 const validateManifestShards = @import("antfly_local_sources").api_local_backups.validateManifestShards;
 
@@ -10353,6 +10360,8 @@ pub fn verifyTableBackupArtifactsIntegrityAtLocationWithCache(
     table_manifest: *const TableBackupManifest,
     cache: ?*ArtifactVerificationCache,
 ) !void {
+    try validatePublishedTableManifest(alloc, table_manifest, table_manifest.backup_id);
+    if (table_manifest.content_policy == .schema_only) return;
     if (table_manifest.artifact_integrity_mode != .declared)
         return error.BackupIntegrityMissing;
     for (table_manifest.shards) |*shard| {
@@ -12021,6 +12030,7 @@ pub fn freeClusterBackupRequest(alloc: std.mem.Allocator, req: *ClusterBackupReq
 }
 
 pub fn freeClusterRestoreRequest(alloc: std.mem.Allocator, req: *ClusterRestoreRequest) void {
+    @import("restore_routine_mapping.zig").freeOptional(alloc, req.routine_mappings);
     alloc.free(req.backup_id);
     alloc.free(req.location);
     if (req.connection) |value| alloc.free(value);
@@ -18805,4 +18815,16 @@ test "restore manifest preserves trusted coverage incarnation metadata for SQL n
         }
     };
     try std.testing.checkAllAllocationFailures(a, Probe.run, .{&manifest});
+}
+
+test "public table and cluster restore own explicit routine identity mappings" {
+    const a = std.testing.allocator;
+    const body = "{\"backup_id\":\"daily\",\"location\":\"file:///archive\",\"connection\":\"reader\",\"routine_mappings\":[{\"source_metadata_incarnation\":\"11111111111111111111111111111111\",\"source_routine_id\":\"18446744073709551615\",\"destination_routine_id\":\"9007199254740993\"}]}";
+    var table = try parseRestoreRequest(a, body);
+    defer table.deinit();
+    var cluster = try parseClusterRestoreRequest(a, body);
+    defer freeClusterRestoreRequest(a, &cluster);
+    try std.testing.expectEqualStrings("18446744073709551615", table.value.routine_mappings.?[0].source_routine_id);
+    try std.testing.expectEqualStrings("9007199254740993", cluster.routine_mappings.?[0].destination_routine_id);
+    try std.testing.expectError(error.InvalidRequest, parseRestoreRequest(a, "{\"backup_id\":\"daily\",\"location\":\"file:///archive\",\"connection\":\"reader\",\"routine_mappings\":[{\"source_metadata_incarnation\":\"11111111111111111111111111111111\",\"source_routine_id\":\"01\",\"destination_routine_id\":\"9\"}]}"));
 }

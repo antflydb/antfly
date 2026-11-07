@@ -110,6 +110,10 @@ pub const Cell = struct {
 pub const PhysicalLayout = struct {
     alloc: Allocator,
     schema_version: u32,
+    /// Immutable semantic layout identity, independent only of schema version.
+    /// Computed during epoch construction; row evaluation never serializes it.
+    identity_layout_digest: [32]u8,
+    schema_digest: [32]u8,
     column_count: u32,
     bitmap_len: u32,
     fixed_len: u32,
@@ -126,6 +130,27 @@ pub const PhysicalLayout = struct {
     enum_column_type_ids: []u64,
 
     const not_applicable = std.math.maxInt(u32);
+
+    pub fn schemaDigest(alloc: Allocator, table_schema: runtime_schema.TableSchema) ![32]u8 {
+        const encoded = try runtime_schema.serializeSchema(alloc, table_schema);
+        defer alloc.free(encoded);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(encoded, &digest, .{});
+        return digest;
+    }
+
+    pub fn identityLayoutDigest(alloc: Allocator, table_schema: runtime_schema.TableSchema) ![32]u8 {
+        var normalized = table_schema;
+        normalized.version = 0;
+        const encoded = try runtime_schema.serializeSchema(alloc, normalized);
+        defer alloc.free(encoded);
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly:row-policy-identity-layout:v1\x00");
+        hash.update(encoded);
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return digest;
+    }
 
     pub fn init(alloc: Allocator, table_schema: runtime_schema.TableSchema) !PhysicalLayout {
         const columns = table_schema.relational_columns;
@@ -207,6 +232,8 @@ pub const PhysicalLayout = struct {
         return .{
             .alloc = alloc,
             .schema_version = table_schema.version,
+            .identity_layout_digest = try identityLayoutDigest(alloc, table_schema),
+            .schema_digest = try schemaDigest(alloc, table_schema),
             .column_count = column_count,
             .bitmap_len = std.math.cast(u32, (columns.len + 7) / 8) orelse return error.InvalidSchema,
             .fixed_len = std.math.cast(u32, fixed_pos) orelse return error.InvalidSchema,

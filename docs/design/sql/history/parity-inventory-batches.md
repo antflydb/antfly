@@ -2188,3 +2188,118 @@ uncredited. Public SQL-only grants/delegated graph policies, shared graph/row cu
 transactional schema retirement with rewritten survivors and archival-proof GC
 remain separate obligations. See the ledger for reproducible native Debug and
 PostgreSQL evidence gates; this checkpoint grants no blanket feature waiver.
+
+## 2026-11-05: retained graph joins and policy composition
+
+Originals 1207 and 1208 now execute unchanged through the mounted SQL endpoint,
+reducing unresolved cases from 59 to 57 (937 implemented). The CTE and inline
+TVFs share retained graph/primary cuts with ordinary aliases. Native source
+watermarks, pinned TTL clocks and retained backing stores prevent mixed reads
+across writes, replay lag, index retirement and cold reopen.
+
+Public witnesses check complete bags, deterministic ordering/limit variants,
+TEXT IDs and FLOAT8 SQL NULL scores with explicit null provenance. Actual SQL
+RLS intersects mandatory credential filters at anchors, intermediate nodes and
+targets. An authorized write after policy activation updates traversal results
+and survives complete metadata/data restart. Raw graph transports stay guarded.
+Protected graph policy publication requires durable native data-owner capability
+5, including cold restore and downgrade checks; unrelated metadata capabilities
+are not raised. Ordinary metadata-incarnation bootstrap keeps requirement zero.
+
+Debug verification: the public cohort passes all 20 tests without skips or leaks
+(83 successful steps); retained graph and metadata capability gates pass
+(65 successful steps); the focused SQL gate passes 20 local plus four server
+tests; the bootstrap capability regression passes in the metadata gate
+(77 successful steps). Reproducible commands are recorded in the ledger.
+
+Explicit graph transactions and unsupported patterns remain guarded. Standalone
+MATCH does not inherit the joined TVF's SQL-policy support. TEMP/UNLOGGED and
+trigger foundations earn no case credit until their remaining native admission,
+coordinator, recovery and public campaigns qualify. The pinned original corpus
+and its source hashes are unchanged.
+
+## 2026-11-05: shared schema retirement and exact receipt authority
+
+Original 0105 now executes unchanged through authenticated public SQL, reducing
+unresolved originals from 57 to 56 (938 implemented). DROP SCHEMA consumes
+PostgreSQL CASCADE/RESTRICT clauses and uses the existing durable ancestor
+retirement coordinator for local document and typed owners. The mounted Debug
+campaign retires populated tables, an internal FK, a view and a sequence;
+RESTRICT and reader credentials are denied, unrelated rows survive, and a
+pending DROP finishes after complete metadata/data restart. Reusing the schema
+name cannot redirect an old receipt to the replacement incarnation.
+
+Denied admissions now persist their authorization-label digest even before a
+retirement Head exists. Recovery verifies those durable labels and rejects
+relabeled or unprovable outcomes. The recovery receipt transfers ownership once,
+including observation-error paths. All three public/receipt checks pass without
+skips or leaks; the compiler dependency-clause regression and all 29 native
+metadata retirement checks also pass in Debug.
+
+This witness covers the local-owner contract, not blanket DDL completion.
+External surviving FK/default/type/view rewrites and transactional catalog
+rollback remain guarded and unfinished. TEMP/UNLOGGED and statement-trigger
+foundations retain zero additional original-case credit until their public
+activation and recovery obligations qualify. Native lifecycle and trigger
+capabilities remain disabled; the ledger retains the other 56 unresolved cases.
+
+## Original UUID mutation-domain adjudication (2026-11-06)
+
+Originals `sql-1403`, `sql-1468`, `sql-1469`, and `sql-1476` are qualified
+supersessions, reducing unresolved originals from 56 to 52. The historical
+fixtures declare UUID primary keys but propose `u1`/`u2`; PostgreSQL rejects the
+unchanged INSERT statements with `22P02` before their later conflict expressions
+execute. Three fixtures also try to validate a standalone UNIQUE index as a
+constraint, which PostgreSQL rejects with `42704`. These diagnostics do not
+certify NUMERIC/INTERVAL arithmetic, numeric timestamp/date_bin overloads, or
+uuid-ossp installation and invocation.
+
+The oracle verifies the original source commit, complete source hash, per-entry
+identity, unchanged schemas/setup and SQL. The public native campaign uses four
+isolated namespaces in one cluster, valid UUID predecessor rows, exact error
+codes, complete RETURNING/postimage bags with OIDs and SQL NULL flags, and
+unchanged physical primary versions/digests, schema/read-layout/index identities.
+Valid typed neighboring upserts execute before and after one independent native
+owner/catalog restart. No TEXT/BIGINT schema substitution or generic unsupported
+rejection qualifies the originals. PostgreSQL reference verification and the
+83-step Debug native campaign pass without skips or leaks.
+
+The campaign also exposed a real UNIQUE-publication overlap: HTTP admission
+is not index completion. It now observes the existing exact index-publication
+receipt. A topology-busy participant prepare is retryable only after the
+coordinator proves a durable abort; an uncertain abort remains unknown. The
+existing actual coordinator fault regression covers both outcomes and passes
+its 27-step Debug gate. No unknown mutation was replayed.
+
+The native lifetime/trigger foundations still earn no additional original-case
+credit: their full recovery/activation work remains in progress. The independent
+native lifetime/trigger/schema API gate passes 95/95 steps; the metadata scope
+gate passes 58/58 after its TEMP fixtures enroll real backend/command authority.
+
+## 2026-11-06: complete original table-trigger lifecycle
+
+Originals `sql-0751`, `sql-0752` and `sql-0753` now execute unchanged through
+authenticated mounted SQL and actual native catalog/data owners. Counts move
+from 938 implemented / 138 rejected / 458 superseded / 52 unresolved to
+941 implemented / 138 rejected / 458 superseded / 49 unresolved. The pinned
+1,586-statement source and inventory hashes are unchanged.
+
+The campaign preserves PostgreSQL default statement timing, zero-based TG_ARGV,
+notices, replacement identity and complete row postimages. Demanded division by
+zero returns 22012 after proven rollback, subsequent schema publication succeeds,
+and a full metadata/data restart preserves the final retired attachment without
+re-firing it. Independent PostgreSQL 18 evidence is rechecked. The Debug mounted
+original and metadata qualification passes 103/103 steps without skips or leaks.
+
+The fixes preserve explicit SQL OIDs across same-cut relation projections, keep
+native persistence descriptors through normalized staging and savepoint aliases,
+and retire a terminal transaction's physical read cut while retaining sealed
+plans and acknowledgement debt. Metadata recovery also verifies hidden OID
+reservations, strict trigger/sequence handoff composition and exact native hidden
+restore read authority. Their component witnesses do not grant original-case
+credit for unfinished native population or distributed ingress fault campaigns.
+
+Reproduce with `zig build antfly-api-sql-trigger-originals-test
+antfly-metadata-storage-query-binding-test antfly-metadata-graph-logical-test
+-Doptimize=Debug -j1` from `zig/`, and the registered PostgreSQL attachment gate.
+The ledger retains the other 49 unresolved cases.

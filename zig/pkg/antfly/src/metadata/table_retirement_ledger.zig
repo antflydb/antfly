@@ -25,6 +25,9 @@ const lifecycle = @import("table_lifecycle_lock.zig");
 const counters = @import("../system_catalog/sequence_leases.zig");
 const views = @import("../system_catalog/view_leases.zig");
 const A = std.mem.Allocator;
+comptime {
+    if (@import("builtin").is_test) _ = @import("native_group_retirement.zig");
+}
 pub const Id = [16]u8;
 pub const max_tables = 1 + manifests.max_survivors + manifests.max_parents + manifests.max_views;
 pub const Phase = enum { reserved, canceled, retiring, physical_ready, validating_survivors, published };
@@ -73,6 +76,8 @@ pub const Head = struct {
     revision: u64 = 1,
     phase: Phase = .reserved,
     physical: ?physical.State = null,
+    /// Exact irreversible scope checkpoint, never a native source receipt.
+    native_loss: ?[32]u8 = null,
     survivor: ?@import("table_retirement_authority.zig").Cohort = null,
     schema_attempts: u32 = 0,
     /// Logical catalog cut for publication with no surviving schemas.
@@ -83,7 +88,8 @@ pub const Head = struct {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            const skip = (comptime std.mem.eql(u8, field, "physical")) and self.physical == null or
+            const skip = (comptime std.mem.eql(u8, field, "native_loss")) and self.native_loss == null or
+                (comptime std.mem.eql(u8, field, "physical")) and self.physical == null or
                 (comptime std.mem.eql(u8, field, "survivor")) and self.survivor == null or
                 (comptime std.mem.eql(u8, field, "schema_attempts")) and self.schema_attempts == 0 or
                 (comptime std.mem.eql(u8, field, "direct_catalog_revision")) and self.direct_catalog_revision == 0;
@@ -104,10 +110,15 @@ pub const Head = struct {
         if (!local.metadata_incarnation.isValid(self.incarnation) or self.effects.root_table != self.lookup.table or
             self.range_count > manifests.max_ranges or self.participant_count == 0 or self.participant_count > max_tables or std.mem.allEqual(u8, &self.participants_digest, 0) or
             (self.phase == .reserved and self.revision != 1) or (self.phase == .canceled and self.revision != 2) or
-            ((self.phase != .reserved and self.phase != .canceled) != (self.physical != null))) return error.InvalidCatalogRecord;
+            ((self.phase != .reserved and self.phase != .canceled) != (self.physical != null or self.native_loss != null))) return error.InvalidCatalogRecord;
+        if (self.native_loss) |loss| {
+            if (self.scope.parent == null or std.mem.allEqual(u8, &loss, 0) or self.effects.survivors != 0 or self.schema_attempts != 0 or self.survivor != null or
+                (self.phase != .physical_ready and self.phase != .published)) return error.InvalidCatalogRecord;
+            if (self.physical == null and self.revision != 2 + @as(u64, @intFromBool(self.direct_catalog_revision != 0))) return error.InvalidCatalogRecord;
+        }
         if (self.physical) |state| {
             try state.validate();
-            var expected_revision: u64 = 2;
+            var expected_revision: u64 = 2 + @as(u64, @intFromBool(self.native_loss != null));
             for (state.counts) |count| expected_revision += count;
             expected_revision += @as(u64, self.schema_attempts) * 2;
             if (self.direct_catalog_revision != 0) expected_revision += 1;
@@ -115,7 +126,7 @@ pub const Head = struct {
                 if (self.schema_attempts == 0) return error.InvalidCatalogRecord;
                 expected_revision -= 1;
             }
-            if (self.revision != expected_revision or (self.phase != .retiring) != (state.phase == .ready)) return error.InvalidCatalogRecord;
+            if (self.revision != expected_revision or (self.native_loss == null and (self.phase != .retiring) != (state.phase == .ready))) return error.InvalidCatalogRecord;
         }
         if (self.survivor) |candidate| {
             try candidate.validate();
@@ -172,6 +183,7 @@ pub fn address(group: u64, bytes: []const u8) !?Address {
     var buffer: [128]u8 = undefined;
     const start = try prefix(&buffer, group);
     if (!std.mem.startsWith(u8, bytes, start)) return null;
+    if (std.mem.startsWith(u8, bytes[start.len..], "native-group:")) return null;
     var parts = std.mem.splitScalar(u8, bytes[start.len..], ':');
     const table = parts.next() orelse return error.InvalidCatalogRecord;
     const job = parts.next() orelse return error.InvalidCatalogRecord;
@@ -531,6 +543,7 @@ pub fn cancel(a: A, txn: anytype, lookup: Lookup, expected_revision: u64) !void 
 }
 
 pub fn authority(value: Head) !@import("table_retirement_authority.zig").Authority {
+    if (value.native_loss != null) return error.GenerationPublicationChanged;
     const state = value.physical orelse return error.GenerationPublicationChanged;
     if (state.phase != .ready) return error.GenerationPublicationChanged;
     const result: @import("table_retirement_authority.zig").Authority = .{ .root = value.lookup, .effects = value.effects, .physical_plan = state.summary.plan_digest };
@@ -628,6 +641,7 @@ pub fn transferReservations(txn: anytype, value: Head, manifest: manifests.Manif
     const direct = value.phase == .physical_ready and value.effects.survivors == 0 and value.survivor == null;
     if (!direct and (value.phase != .validating_survivors or value.survivor == null)) return error.GenerationPublicationChanged;
     if (direct and manifest.survivors.len != 0) return error.GenerationPublicationChanged;
+    try @import("native_group_retirement.zig").stage(txn, value, manifest);
     var buffer: [256]u8 = undefined;
     var survivor: usize = 0;
     for (tables) |table| {
@@ -677,6 +691,27 @@ pub fn readPhysicalOwner(reader: anytype, value: Head, ordinal: u16) !physical.O
     if (owner.ordinal != ordinal) return error.InvalidCatalogRecord;
     return owner;
 }
+pub fn stageNativeLoss(txn: anytype, before: Head, checkpoint: @import("temporary_relation_retirement.zig").Checkpoint, manifest: manifests.Manifest) !Head {
+    try before.validate();
+    if (!std.meta.eql((try head(txn, before.lookup)) orelse return error.GenerationPublicationChanged, before) or
+        !std.meta.eql(before.scope.parent, @as(?@import("scope_retirement_ledger.zig").Child, checkpoint.child))) return error.GenerationPublicationChanged;
+    try @import("temporary_relation_retirement.zig").requireManifest(txn, checkpoint, manifest);
+    const digest = try checkpoint.digest();
+    if (before.native_loss) |previous| {
+        if (!std.mem.eql(u8, &previous, &digest)) return error.InvalidScopeRetirement;
+        return before;
+    }
+    if (before.phase != .reserved and before.phase != .retiring and before.phase != .physical_ready) return error.GenerationPublicationChanged;
+    var after = before;
+    after.native_loss = digest;
+    after.phase = .physical_ready;
+    after.revision = std.math.add(u64, before.revision, 1) catch return error.CatalogRevisionExhausted;
+    const encoded = try HeadRecord.init(after);
+    var buffer: [256]u8 = undefined;
+    try txn.put(try key(&buffer, before.lookup, .head), encoded.slice());
+    return after;
+}
+
 pub const PhysicalAck = struct { after: Head, receipt: physical.ReceiptRecord };
 
 /// Read-only rejection is separated from staging so a storage failure can
@@ -723,6 +758,7 @@ pub fn recordPhysical(txn: anytype, before: Head, ordinal: u16, step: physical.S
 /// One prefix seek selects pending work for the current barrier. Completed
 /// work is deleted with its receipt; restart does not rescan all old owners.
 pub fn nextPhysical(reader: anytype, value: Head) !?physical.Owner {
+    if (value.native_loss != null) return null;
     const state = value.physical orelse return null;
     if (state.phase == .ready) return null;
     const step: physical.Step = @fromBackingInt(@backingInt(state.phase));
@@ -740,6 +776,12 @@ pub fn nextPhysical(reader: anytype, value: Head) !?physical.Owner {
 }
 
 pub fn verifyPhysical(backing: A, reader: anytype, value: Head, manifest: manifests.Manifest) !u64 {
+    if (value.native_loss) |digest| {
+        const child = value.scope.parent orelse return error.InvalidScopeRetirement;
+        const loss = (try @import("temporary_relation_retirement.zig").read(reader, child)) orelse return error.InvalidScopeRetirement;
+        if (!std.mem.eql(u8, &digest, &try loss.digest())) return error.InvalidScopeRetirement;
+        try @import("temporary_relation_retirement.zig").requireManifest(reader, loss, manifest);
+    }
     const state = value.physical orelse return 0;
     var region = std.heap.ArenaAllocator.init(backing);
     defer region.deinit();
@@ -758,6 +800,14 @@ pub fn verifyPhysical(backing: A, reader: anytype, value: Head, manifest: manife
             if (try optional(reader, try physical.key(&buffer, value.lookup, .receipt, owner.ordinal, step))) |bytes| {
                 const receipt = try physical.ReceiptRecord.decode(bytes);
                 if (!std.meta.eql(receipt.root, value.lookup) or receipt.ordinal != owner.ordinal or receipt.step != step) return error.InvalidCatalogRecord;
+                switch (receipt.evidence) {
+                    .source => |evidence| if (evidence.native_proof) |proof| {
+                        if (!std.mem.eql(u8, &proof.identity.metadata_incarnation, &manifest.metadata_incarnation)) return error.InvalidCatalogRecord;
+                    },
+                    .parent => |evidence| if (evidence.native_proof) |proof| {
+                        if (!std.mem.eql(u8, &proof.identity.metadata_incarnation, &manifest.metadata_incarnation)) return error.InvalidCatalogRecord;
+                    },
+                }
                 const digest = try physical.verifyEvidence(value.lookup, state, owner, step, receipt.evidence);
                 counts[@backingInt(step)] += 1;
                 for (&digests[@backingInt(step)], digest) |*byte, input| byte.* ^= input;
@@ -790,6 +840,12 @@ pub fn verifyDirectory(backing: A, reader: anytype, group: u64, rows: anytype, c
     while (try rows.next()) |row| {
         if (canceled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
         if (!std.mem.startsWith(u8, row.key, starts)) continue;
+        if (try @import("native_group_retirement.zig").address(group, row.key)) |source_group| {
+            var region = std.heap.ArenaAllocator.init(backing);
+            defer region.deinit();
+            _ = (try @import("native_group_retirement.zig").readPublished(region.allocator(), reader, group, source_group)) orelse return error.InvalidCatalogRecord;
+            continue;
+        }
         const selected = (try address(group, row.key)) orelse return error.InvalidCatalogRecord;
         if (selected.kind != .head) {
             const lookup = if (selected.kind == .active) try ActiveRecord.decode(row.value) else selected.lookup;
@@ -814,7 +870,10 @@ pub fn verifyDirectory(backing: A, reader: anytype, group: u64, rows: anytype, c
         if (value.participant_count != tables.len or value.range_count != rangeCount(owned.value) or !std.mem.eql(u8, &value.participants_digest, &tableDigest(tables))) return error.InvalidCatalogRecord;
         expected_physical += try verifyPhysical(backing, reader, value, owned.value);
         if (value.survivor != null) try context.verifySurvivorPlan(reader, value, owned.value);
-        if (value.phase == .published) continue;
+        if (value.phase == .published) {
+            try @import("native_group_retirement.zig").requirePublished(reader, value, owned.value);
+            continue;
+        }
         try context.verify(reader, value, owned.value);
         try requireReservations(reader, value, owned.value, tables);
         expected_active += 1;
@@ -842,6 +901,7 @@ pub fn verifyDirectory(backing: A, reader: anytype, group: u64, rows: anytype, c
     while (try rows.next()) |row| {
         if (canceled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
         if (std.mem.startsWith(u8, row.key, starts)) {
+            if (try @import("native_group_retirement.zig").address(group, row.key) != null) continue;
             if ((try address(group, row.key)).?.kind == .active) active_count += 1;
         } else if (std.mem.startsWith(u8, row.key, members_prefix)) {
             const selected = try MemberRecord.decode(row.value);

@@ -84,6 +84,7 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     const restore_location = try alloc.dupe(u8, record.restore_location);
     errdefer alloc.free(restore_location);
     return .{
+        .sql_persistence = record.sql_persistence,
         .sql_materialized_view_id = record.sql_materialized_view_id,
         .sql_native_indexes_json = sql_native_indexes_json,
         .schema_reader_requirements = record.schema_reader_requirements,

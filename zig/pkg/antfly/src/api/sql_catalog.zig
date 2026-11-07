@@ -285,14 +285,26 @@ pub fn captureTableAdmission(server: *server_mod.ApiHttpServer, identity: ?serve
 /// Name-only DDL does not need to decode every candidate table schema. The
 /// bounded path is resolved in one catalog transaction, authorization names the
 /// first visible owner, and metadata admits the same exact owner before preparing topology.
-fn captureTableNameMutation(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, a: std.mem.Allocator, requested: domain.Target, path: ?*const SearchPath) !?struct { target: domain.Target, guard: domain.RelationMutationGuard } {
+fn captureTableNameMutation(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, a: std.mem.Allocator, requested: domain.Target, path: ?*const SearchPath, implicit_temporary: bool) !?struct { target: domain.Target, guard: domain.RelationMutationGuard } {
     const namespaces = if (path) |value| value.len else 1;
-    if (namespaces == 0) return null;
     if (namespaces > SearchPath.max_namespaces) return error.InvalidParameter;
-    var candidates: [SearchPath.max_namespaces]domain.RelationTarget = undefined;
+    var temporary_buffer: [72]u8 = undefined;
+    const temporary: ?[]const u8 = if (@import("../metadata/topology_protocol.zig").current_version >= @import("../metadata/topology_protocol.zig").sql_relation_persistence_version and context.sql_relation_owner != null)
+        try context.sql_relation_owner.?.namespace(&temporary_buffer)
+    else
+        null;
+    const placed = if (path) |value| for (value.entries[0..value.len]) |*entry| {
+        if (std.mem.eql(u8, entry.slice(), "pg_temp") or (temporary != null and std.mem.eql(u8, entry.slice(), temporary.?))) break true;
+    } else false else false;
+    var candidates: [SearchPath.max_namespaces + 1]domain.RelationTarget = undefined;
     var count: usize = 0;
+    if (temporary != null and implicit_temporary and !placed) {
+        candidates[count] = .{ .database = requested.database, .namespace = temporary.?, .name = requested.table };
+        count += 1;
+    }
     for (0..namespaces) |i| {
-        const target: domain.Target = .{ .database = requested.database, .namespace = if (path) |value| value.entries[i].slice() else requested.namespace, .table = requested.table };
+        const candidate_namespace = if (path) |value| value.entries[i].slice() else requested.namespace;
+        const target: domain.Target = .{ .database = requested.database, .namespace = if (temporary != null and std.mem.eql(u8, candidate_namespace, "pg_temp")) temporary.? else candidate_namespace, .table = requested.table };
         if (path != null and !try @import("sql_catalog_auth.zig").namespaceUsage(identity, a, target)) continue;
         candidates[count] = .{ .database = target.database, .namespace = target.namespace, .name = target.table };
         count += 1;
@@ -1104,9 +1116,67 @@ fn createConflict(server: *server_mod.ApiHttpServer, context: operation.RequestC
     return err;
 }
 
+/// Publish private schema execution metadata on the captured relation's ordinary
+/// durable catalog lane. This helper is shared by attachment DDL, not public
+/// schema JSON: native preparation validates exact private routine references.
+pub fn publishCapturedSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, allocators: catalog.DdlAllocators, initial: RelationAdmission, trigger_operation: @FieldType(@import("../system_catalog/server_call.zig").RelationTriggerMutation, "operation")) !catalog.DdlOutcome {
+    var region: std.heap.ArenaAllocator = .init(allocators.scratch);
+    defer region.deinit();
+    const a = region.allocator();
+    const captured = try waitPriorSchemaFinalization(server, context, a, allocators.scratch, initial);
+    const definition = captured.table.query_definition orelse return error.InvalidSqlBackendResponse;
+    const version = std.math.add(u32, try tables.schemaVersion(definition.schema_json), 1) catch return error.SqlLimitExceeded;
+    const owner: operation.SQLCompletionOwner = .{ .id = captured.table.table_id, .schema_version = version };
+    // Allocate response custody before admission. A canceled/failed activation
+    // observation must retain the already-committed catalog recovery token.
+    var receipt = try newReceipt(allocators.result, .{ .database = captured.guard.target.database, .namespace = captured.guard.target.namespace, .table = captured.guard.target.name }, captured.table.table_id, version);
+    var receipt_transferred = false;
+    defer if (!receipt_transferred) {
+        allocators.result.free(receipt.database);
+        allocators.result.free(receipt.namespace);
+        allocators.result.free(receipt.table);
+        allocators.result.free(receipt.table_id);
+    };
+    try @import("sql_completion.zig").prepareMetadataWithContext(context, owner);
+    var submitted = false;
+    var private = context;
+    private.setting_admin = true;
+    private.sql_completion_submission = &submitted;
+    var reply = @import("sql_ordinary_catalog.zig").submitRelation(server, identity, private, allocators, .{ .trigger = .{ .guard = captured.guard, .operation = trigger_operation } }) catch |err| {
+        if (!submitted) try @import("sql_completion.zig").rejectMetadataBeforeSubmission(context, owner);
+        try @import("sql_completion.zig").rejectMetadataWithContext(context, owner, err);
+        if (err == error.MetadataMutationOutcomeUnknown or (err == error.OutOfMemory and submitted)) return error.SqlMutationOutcomeUnknown;
+        return err;
+    };
+    defer reply.deinit(allocators.result);
+    if (reply.unknown) {
+        receipt.state = .admission_unknown;
+        receipt.diagnostic = "Schema declaration admission is unresolved. Observe the catalog receipt; do not replay the DDL.";
+        receipt_transferred = true;
+        return .{ .mutation_outcome = null, .catalog_receipt = reply.takeReceipt(), .receipt = receipt };
+    }
+    awaitActivation(server, context, allocators.scratch, captured.table.name, &receipt, allocators.completion) catch {
+        receipt.state = .pending;
+        receipt.diagnostic = "Schema declaration committed; the exact schema and policy pair is still activating. Observe this table ID and schema version; do not replay the DDL.";
+    };
+    receipt_transferred = true;
+    return .{ .mutation_outcome = if (receipt.state == .ready) .committed else if (receipt.state == .invalid) .committed_repair_required else .committed_pending, .catalog_receipt = reply.takeReceipt(), .receipt = receipt };
+}
+
 pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, input: catalog.Ddl, path: ?*const SearchPath) !catalog.DdlOutcome {
+    // Trigger attachment has its own immutable catalog payload. It cannot be
+    // interpreted as a column/schema change while its native activation
+    // authority is unavailable.
+    if (input == .catalog_ddl and input.catalog_ddl.trigger != null) {
+        var actor = identity;
+        var adapter: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = &actor, .context = context, .database = database, .namespace = namespace, .ddl_search_path = path };
+        defer adapter.releaseExecutionOwners();
+        return @import("sql_trigger_ddl.zig").execute(&adapter, allocators, input.catalog_ddl);
+    }
     if (input == .catalog_ddl and input.catalog_ddl.kind == .database and input.catalog_ddl.action == .drop)
         return @import("sql_scope_retirement.zig").executeDatabase(server, identity, context, database, allocators, input.catalog_ddl);
+    if (input == .catalog_ddl and input.catalog_ddl.kind == .namespace and input.catalog_ddl.action == .drop and input.catalog_ddl.cascade)
+        return @import("sql_scope_retirement.zig").executeNamespace(server, identity, context, database, allocators, input.catalog_ddl);
     if (input == .populate) return @import("sql_population.zig").execute(server, identity, context, database, namespace, allocators, input.populate, path);
     const alloc = allocators.result;
     try context.ensureActive();
@@ -1138,6 +1208,14 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         return executeIndex(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
     if (input == .catalog_ddl and input.catalog_ddl.kind == .view)
         return @import("sql_view_ddl.zig").execute(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
+    if (input == .create_table and input.create_table.persistence != .temporary and input.create_table.on_commit != null)
+        return error.InvalidSqlRelationPersistence;
+    if (input == .create_table and input.create_table.persistence != .permanent and
+        @import("../metadata/topology_protocol.zig").current_version < @import("../metadata/topology_protocol.zig").sql_relation_persistence_version)
+        return error.SqlRelationOwnerUnavailable;
+    var arena = std.heap.ArenaAllocator.init(allocators.scratch);
+    defer arena.deinit();
+    const a = arena.allocator();
     const name = switch (input) {
         .create_table => |v| v.name,
         .drop_table => |v| v.table,
@@ -1164,6 +1242,18 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     const alter_path_lookup = input == .catalog_ddl and input.catalog_ddl.action == .alter_schema and
         path != null and name.namespace == null and name.database == null;
     if (!alter_path_lookup and !table_path_mutation) if (identity) |authenticated| if (!server_mod.permissionsAllow(authenticated.permissions, permission_kind, resource, .admin)) return error.Forbidden;
+    // Capture the native host only after authorizing the requested logical
+    // scope. Metadata independently rejoins this boot during publication.
+    const lifetime = if (input == .create_table)
+        try @import("sql_relation_creation.zig").prepare(server, a, context, target, input.create_table.persistence, input.create_table.on_commit orelse .preserve_rows, name.namespace != null)
+    else
+        null;
+    if (lifetime) |captured| {
+        target = captured.target;
+        route.namespace = target.namespace;
+        if (captured.descriptor) |descriptor| if (descriptor.owner) |owner|
+            try @import("sql_temporary_namespace.zig").ensure(server, identity, context, allocators, target.database, owner);
+    }
     if (input == .catalog_ddl and input.catalog_ddl.action == .alter_schema)
         return alterSchema(server, identity, context, allocators, target, input.catalog_ddl, null, path);
     if (input == .catalog_ddl and input.catalog_ddl.action == .truncate)
@@ -1178,11 +1268,8 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         },
         .policy_ddl, .populate => unreachable,
     }, .kind = kind, .database = target.database, .namespace = target.namespace, .name = target.table } };
-    var arena = std.heap.ArenaAllocator.init(allocators.scratch);
-    defer arena.deinit();
-    const a = arena.allocator();
     if (table_path_mutation or input == .drop_table) {
-        const captured = (try captureTableNameMutation(server, identity, context, a, target, if (table_path_mutation) path else null)) orelse {
+        const captured = (try captureTableNameMutation(server, identity, context, a, target, if (table_path_mutation) path else null, name.namespace == null and name.database == null)) orelse {
             const conditional = switch (input) {
                 .drop_table => |drop| drop.if_exists,
                 .catalog_ddl => |ddl| ddl.conditional,
@@ -1231,6 +1318,8 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             const body = try std.json.Stringify.valueAlloc(a, .{ .schema = schema_value, .indexes = std.json.Value{ .object = .empty } }, .{});
             var parsed = try tables.parseStoredCreateTableRequest(allocators.scratch, body);
             parsed.storage = .{};
+            parsed.sql_persistence = lifetime.?.descriptor;
+            if (parsed.sql_persistence != null) parsed.num_shards = 1;
             defer parsed.deinit(allocators.scratch);
             if (create.tablespace) |tablespace| parsed.tablespace_name = try allocators.scratch.dupe(u8, tablespace);
             if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(a, bound_schema)) {
@@ -1265,9 +1354,13 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
                     "Initial FK table publication was admitted. Poll for the table; do not replay CREATE.";
                 return .{ .mutation_outcome = if (accepted.state == .admission_unknown) null else .committed_pending, .receipt = receipt };
             }
+            // A native declaration is not ready until its real primary image
+            // has durably published initialized authority. Even a table with
+            // no constraint workers needs this ordinary DDL completion receipt.
+            if (parsed.sql_persistence != null) creation_receipt = try newReceipt(alloc, target, 0, 0);
             for ([_][]const u8{ "unique_constraints", "checks" }) |key| {
                 if (schema_value.object.get(key)) |constraints| if (constraints == .array and constraints.array.items.len != 0) {
-                    creation_receipt = try newReceipt(alloc, target, 0, 0);
+                    if (creation_receipt == null) creation_receipt = try newReceipt(alloc, target, 0, 0);
                     break;
                 };
             }
@@ -1298,8 +1391,17 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         if (!server_mod.permissionsAllow(authenticated.permissions, .tablespace, tablespace, .read)) return error.Forbidden;
     };
     var mutation_context = context;
-    if (request.mutation.sql_owner != null) mutation_context.setting_admin = true;
+    if (request.mutation.sql_owner != null or (lifetime != null and lifetime.?.descriptor != null)) mutation_context.setting_admin = true;
+    if (lifetime) |captured| {
+        if (captured.descriptor != null) mutation_context.sql_relation_owner_minter = try @import("sql_relation_lifetimes.zig").ownerMinterForRelation(server, context, captured.descriptor);
+    }
     var reply = @import("sql_ordinary_catalog.zig").submit(server, identity, mutation_context, allocators, request) catch |err| {
+        if (@import("builtin").mode == .debug and input == .drop_table) {
+            const Trace = struct {
+                var seen: std.atomic.Value(bool) = .init(false);
+            };
+            if (!Trace.seen.swap(true, .monotonic)) std.debug.print("native SQL DROP admission err={s} table={} captured_owner={}\n", .{ @errorName(err), if (request.binding_guard) |guard| guard.owner.table_id else 0, context.sql_relation_owner != null });
+        }
         // Conditional DDL observes the authority's atomic outcome. Owner binding
         // never permits retrying an ambiguous durable submission.
         switch (input) {
@@ -1353,7 +1455,11 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         const table_id = reply.takeTableId() orelse (std.fmt.allocPrint(alloc, "{d}", .{committed_id}) catch return error.SqlMutationOutcomeUnknown);
         alloc.free(receipt.table_id);
         receipt.table_id = table_id;
-        awaitActivation(server, context, alloc, request.physical_name.?, receipt, allocators.completion) catch |err| {
+        // Native first publication must complete under this command's real
+        // owner grant. A later HTTP status request cannot impersonate the TEMP
+        // connection to finish initialization, so retain its admitted deadline.
+        const completion: catalog.DdlAllocators.Completion = if (lifetime != null and lifetime.?.descriptor != null) .until_deadline else allocators.completion;
+        awaitActivation(server, mutation_context, alloc, request.physical_name.?, receipt, completion) catch |err| {
             std.log.warn("SQL table creation committed but activation observation failed table_id={s} err={s}", .{ receipt.table_id, @errorName(err) });
             receipt.state = .pending;
             receipt.diagnostic = "Table creation committed; constraint activation is not yet confirmed. Inspect table constraint status; do not replay the DDL.";

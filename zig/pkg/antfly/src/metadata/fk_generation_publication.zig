@@ -644,15 +644,16 @@ pub const Plan = struct {
     }
 
     pub fn verifySourceReceipt(self: Plan, identity: ChildIdentity, plan_digest: Digest, receipt: @import("../api/relational_fk_generation_publication.zig").SourceReceipt) !void {
+        _ = try receipt.position();
         if (receipt.document_source != self.isDocumentSource() or (self.isDocumentSource() and receipt.action != .fence)) return error.InvalidGenerationPublication;
         if (self.historical_reference_coverage and receipt.action == .install and !receipt.reference_coverage_ready) return error.InvalidGenerationPublication;
         if (!std.mem.eql(u8, &receipt.plan_id, &self.id) or
             !std.mem.eql(u8, &receipt.plan_digest, &plan_digest) or
-            receipt.child_table_id != self.child_before.table_id or
-            receipt.applied_term == 0 or receipt.applied_index == 0) return error.InvalidGenerationPublication;
+            receipt.child_table_id != self.child_before.table_id) return error.InvalidGenerationPublication;
         const index = for (self.child_ranges, 0..) |range, i| {
             if (range.group_id == receipt.child_group_id) break i;
         } else return error.InvalidGenerationPublication;
+        try @import("../api/relational_fk_generation_publication.zig").requireCapturedPosition(receipt, self.child_before.sql_persistence, self.child_fences[index].namespace);
         const fence_bytes = try self.child_fences[index].encode();
         var fence_digest: Digest = undefined;
         std.crypto.hash.Blake3.hash(&fence_bytes, &fence_digest, .{});
@@ -666,13 +667,17 @@ pub const Plan = struct {
     }
 
     pub fn verifyParentReceipt(self: Plan, alloc: std.mem.Allocator, plan_digest: Digest, receipt: @import("../api/relational_fk_generation_publication.zig").Receipt) !void {
+        _ = try receipt.position();
         if (!std.mem.eql(u8, &receipt.plan_id, &self.id) or
-            receipt.child_table_id != self.child_before.table_id or
-            receipt.applied_term == 0 or receipt.applied_index == 0) return error.InvalidGenerationPublication;
+            receipt.child_table_id != self.child_before.table_id) return error.InvalidGenerationPublication;
         if (!std.mem.eql(u8, &receipt.decision_digest, &plan_digest)) return error.InvalidGenerationPublication;
         const parent = for (self.parents) |candidate| {
             if (candidate.table.table_id == receipt.parent_table_id) break candidate;
         } else return error.InvalidGenerationPublication;
+        const range = for (parent.ranges) |candidate| {
+            if (candidate.group_id == receipt.parent_group_id) break candidate;
+        } else return error.InvalidGenerationPublication;
+        try @import("../api/relational_fk_generation_publication.zig").requireCapturedPosition(receipt, parent.table.sql_persistence, .{ .table_id = parent.table.table_id, .shard_id = table_manager.rangeDocIdentityShardId(range), .range_id = table_manager.rangeDocIdentityRangeId(range) });
         try requireReceiptRange(parent.ranges, receipt.parent_group_id);
         const admission = @import("antfly_local_sources").storage_db_relational_integrity_generation_admission;
         const transitions = try alloc.alloc(admission.Transition, parent.transitions.len);
@@ -982,15 +987,18 @@ pub const InitialCreatePlan = struct {
     }
 
     pub fn verifyParentReceipt(self: InitialCreatePlan, alloc: std.mem.Allocator, plan_digest: Digest, receipt: @import("../api/relational_fk_generation_publication.zig").Receipt) !void {
+        _ = try receipt.position();
         if (!std.mem.eql(u8, &receipt.plan_id, &self.id) or
             receipt.child_table_id != self.child.table_id or
-            receipt.applied_term == 0 or receipt.applied_index == 0 or
             !std.mem.eql(u8, &receipt.decision_digest, &plan_digest))
             return error.InvalidGenerationPublication;
         const parent = for (self.parents) |candidate| {
             if (candidate.table.table_id == receipt.parent_table_id) break candidate;
         } else return error.InvalidGenerationPublication;
-        try requireReceiptRange(parent.ranges, receipt.parent_group_id);
+        const range = for (parent.ranges) |candidate| {
+            if (candidate.group_id == receipt.parent_group_id) break candidate;
+        } else return error.InvalidGenerationPublication;
+        try @import("../api/relational_fk_generation_publication.zig").requireCapturedPosition(receipt, parent.table.sql_persistence, .{ .table_id = parent.table.table_id, .shard_id = table_manager.rangeDocIdentityShardId(range), .range_id = table_manager.rangeDocIdentityRangeId(range) });
         const admission = @import("antfly_local_sources").storage_db_relational_integrity_generation_admission;
         const transitions = try alloc.alloc(admission.Transition, parent.transitions.len);
         defer alloc.free(transitions);

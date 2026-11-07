@@ -42,52 +42,10 @@ fn generatedConstraintNamesAlloc(a: std.mem.Allocator, create: ast.CreateTable) 
     return result;
 }
 
-pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, input: ast.Statement) !Output {
-    const alloc = allocators.scratch;
-    var type_region = std.heap.ArenaAllocator.init(alloc);
-    defer type_region.deinit();
-    var statement = input;
-    if (input == .create_table) {
-        const needed = for (input.create_table.columns) |column| {
-            if (column.named_type != null) break true;
-        } else false;
-        if (needed and input.create_table.like_tables.len == 0) {
-            const resolver = backend.resolve_declared_types orelse return error.UnsupportedSqlExecution;
-            statement.create_table = try resolver.resolve(resolver.ptr, type_region.allocator(), input.create_table);
-        }
-    }
-    if (statement == .catalog_ddl and (statement.catalog_ddl.action == .populate or (statement.catalog_ddl.materialized and statement.catalog_ddl.action != .drop))) return error.UnsupportedSqlExecution;
-    const dispatch = backend.vtable.ddl orelse return error.UnsupportedSqlExecution;
-    try backend.vtable.checkpoint(backend.ptr);
-    const copies_definition = statement == .create_table and statement.create_table.like_tables.len != 0;
-    if (!copies_definition) if (backend.validate_persisted_expressions) |validate| try validate.validate(validate.ptr, alloc, statement);
-    const preparation: @import("immutable_plan.zig").Limits = if (backend.scalar_control) |control| .{ .checkpoint = control.checkpoint, .checkpoint_context = control.ptr } else .{};
-    const generated_names = if (statement == .create_table) try generatedConstraintNamesAlloc(alloc, statement.create_table) else &.{};
-    defer alloc.free(generated_names);
-    var column_sequences: std.ArrayList(@import("../system_catalog/column_sequences.zig").Creation) = .empty;
-    defer column_sequences.deinit(alloc);
-    if (statement == .create_table) for (statement.create_table.columns) |column| {
-        if (column.sequence) |intent| try column_sequences.append(alloc, intent);
-    };
-    const request: catalog.Ddl = switch (statement) {
-        .create_table => |create| .{ .create_table = if (copies_definition) copied: {
-            const provider = backend.prepare_definition_copy orelse return error.UnsupportedSqlExecution;
-            break :copied try provider.prepare(provider.ptr, type_region.allocator(), create, preparation);
-        } else .{ .name = create.table, .schema_json = try createSchemaAllocWithLimits(alloc, create, preparation), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace, .generated_constraint_names = generated_names, .column_sequences = column_sequences.items } },
-        .drop_table => |drop| .{ .drop_table = drop },
-        .catalog_ddl => |ddl| .{ .catalog_ddl = ddl },
-        .policy_ddl => |ddl| .{ .policy_ddl = ddl },
-        else => return error.UnsupportedSqlExecution,
-    };
-
-    if (request == .create_table and request.create_table.existing) return .{ .command_tag = "CREATE TABLE", .mutation_outcome = null };
-    defer if (request == .create_table and !copies_definition) {
-        alloc.free(request.create_table.schema_json);
-    };
-    try backend.vtable.checkpoint(backend.ptr);
-    const outcome = try dispatch(backend.ptr, allocators, request);
-    return .{ .command_tag = if (outcome.mutation_outcome == .committed_pending or (outcome.receipt != null and outcome.receipt.?.state != .ready) or (outcome.catalog_receipt != null and (outcome.catalog_receipt.?.state == .unknown or outcome.catalog_receipt.?.state == .pending))) "DDL PENDING" else switch (request) {
-        .populate => unreachable,
+/// Classify the response before consulting any backend or effectful provider.
+/// Trigger attachments intentionally have no column schema_change.
+fn commandTag(statement: ast.Statement) ![]const u8 {
+    return switch (statement) {
         .create_table => "CREATE TABLE",
         .drop_table => "DROP TABLE",
         .policy_ddl => |ddl| switch (ddl.action) {
@@ -97,7 +55,13 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, inpu
             .enable => "ALTER TABLE ENABLE ROW LEVEL SECURITY",
             .disable => "ALTER TABLE DISABLE ROW LEVEL SECURITY",
         },
-        .catalog_ddl => |ddl| if (ddl.authorization) |intent| switch (intent.operation) {
+        .catalog_ddl => |ddl| if (ddl.trigger) |trigger| tag: {
+            if (ddl.kind != .table or ddl.action != .alter_schema or ddl.schema_change != null) return error.InvalidSqlSyntax;
+            break :tag switch (trigger.operation) {
+                .create => "CREATE TRIGGER",
+                .drop => "DROP TRIGGER",
+            };
+        } else if (ddl.authorization) |intent| switch (intent.operation) {
             .grant => switch (intent.scope) {
                 .defaults => "ALTER DEFAULT PRIVILEGES",
                 .roles => "GRANT ROLE",
@@ -140,7 +104,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, inpu
                 .aggregate => "CREATE AGGREGATE",
                 .cast => "CREATE CAST",
                 .named_type => if (ddl.named_type_kind == .domain) "CREATE DOMAIN" else "CREATE TYPE",
-                .table => unreachable,
+                .table => return error.InvalidSqlSyntax,
             },
             .drop => switch (ddl.kind) {
                 .database => "DROP DATABASE",
@@ -156,7 +120,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, inpu
                 .aggregate => "DROP AGGREGATE",
                 .cast => "DROP CAST",
                 .named_type => if (ddl.named_type_kind == .domain) "DROP DOMAIN" else "DROP TYPE",
-                .table => unreachable,
+                .table => return error.InvalidSqlSyntax,
             },
             .rename, .set_tablespace => switch (ddl.kind) {
                 .database => "ALTER DATABASE",
@@ -175,7 +139,58 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, inpu
                 .named_type => if (ddl.named_type_kind == .domain) "ALTER DOMAIN" else "ALTER TYPE",
             },
         },
-    }, .mutation_outcome = outcome.mutation_outcome, .receipt = outcome.receipt, .catalog_receipt = outcome.catalog_receipt };
+        else => return error.UnsupportedSqlExecution,
+    };
+}
+
+pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, input: ast.Statement) !Output {
+    const command_tag = try commandTag(input);
+    const alloc = allocators.scratch;
+    var type_region = std.heap.ArenaAllocator.init(alloc);
+    defer type_region.deinit();
+    var statement = input;
+    if (input == .create_table) {
+        const needed = for (input.create_table.columns) |column| {
+            if (column.named_type != null) break true;
+        } else false;
+        if (needed and input.create_table.like_tables.len == 0) {
+            const resolver = backend.resolve_declared_types orelse return error.UnsupportedSqlExecution;
+            statement.create_table = try resolver.resolve(resolver.ptr, type_region.allocator(), input.create_table);
+        }
+    }
+    if (statement == .create_table and statement.create_table.persistence != .permanent and !backend.supports_native_relation_lifetimes)
+        return error.UnsupportedSqlExecution;
+    if (statement == .catalog_ddl and (statement.catalog_ddl.action == .populate or (statement.catalog_ddl.materialized and statement.catalog_ddl.action != .drop))) return error.UnsupportedSqlExecution;
+    const dispatch = backend.vtable.ddl orelse return error.UnsupportedSqlExecution;
+    try backend.vtable.checkpoint(backend.ptr);
+    const copies_definition = statement == .create_table and statement.create_table.like_tables.len != 0;
+    if (!copies_definition) if (backend.validate_persisted_expressions) |validate| try validate.validate(validate.ptr, alloc, statement);
+    const preparation: @import("immutable_plan.zig").Limits = if (backend.scalar_control) |control| .{ .checkpoint = control.checkpoint, .checkpoint_context = control.ptr } else .{};
+    const generated_names = if (statement == .create_table) try generatedConstraintNamesAlloc(alloc, statement.create_table) else &.{};
+    defer alloc.free(generated_names);
+    var column_sequences: std.ArrayList(@import("../system_catalog/column_sequences.zig").Creation) = .empty;
+    defer column_sequences.deinit(alloc);
+    if (statement == .create_table) for (statement.create_table.columns) |column| {
+        if (column.sequence) |intent| try column_sequences.append(alloc, intent);
+    };
+    const request: catalog.Ddl = switch (statement) {
+        .create_table => |create| .{ .create_table = if (copies_definition) copied: {
+            const provider = backend.prepare_definition_copy orelse return error.UnsupportedSqlExecution;
+            break :copied try provider.prepare(provider.ptr, type_region.allocator(), create, preparation);
+        } else .{ .name = create.table, .persistence = create.persistence, .on_commit = create.on_commit, .schema_json = try createSchemaAllocWithLimits(alloc, create, preparation), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace, .generated_constraint_names = generated_names, .column_sequences = column_sequences.items } },
+        .drop_table => |drop| .{ .drop_table = drop },
+        .catalog_ddl => |ddl| .{ .catalog_ddl = ddl },
+        .policy_ddl => |ddl| .{ .policy_ddl = ddl },
+        else => return error.UnsupportedSqlExecution,
+    };
+
+    if (request == .create_table and request.create_table.existing) return .{ .command_tag = "CREATE TABLE", .mutation_outcome = null };
+    defer if (request == .create_table and !copies_definition) {
+        alloc.free(request.create_table.schema_json);
+    };
+    try backend.vtable.checkpoint(backend.ptr);
+    const outcome = try dispatch(backend.ptr, allocators, request);
+    return .{ .command_tag = if (outcome.mutation_outcome == .committed_pending or (outcome.receipt != null and outcome.receipt.?.state != .ready) or (outcome.catalog_receipt != null and (outcome.catalog_receipt.?.state == .unknown or outcome.catalog_receipt.?.state == .pending))) "DDL PENDING" else command_tag, .mutation_outcome = outcome.mutation_outcome, .receipt = outcome.receipt, .catalog_receipt = outcome.catalog_receipt };
 }
 
 /// Result belongs to the caller; temporary objects are bounded by the caller's
@@ -404,7 +419,9 @@ pub fn createSchemaFromDefinitionsAlloc(alloc: std.mem.Allocator, create: ast.Cr
 }
 
 pub fn createSchemaFromDefinitionsAndSequencesAlloc(alloc: std.mem.Allocator, create: ast.CreateTable, definitions: []const std.json.Value, sequences: []const @import("../system_catalog/column_sequences.zig").Creation, limits: @import("immutable_plan.zig").Limits) anyerror![]u8 {
-    if (create.persistence != .permanent) return error.UnsupportedSqlExecution;
+    // Physical row layout is independent of relation lifetime. The DDL
+    // backend, rather than this schema encoder, owns lifetime admission.
+    if (create.persistence != .temporary and create.on_commit != null) return error.InvalidSqlRelationPersistence;
     if (definitions.len != create.like_tables.len or definitions.len > 16) return error.InvalidSqlBackendResponse;
     if (limits.checkpoint) |check| try check(limits.checkpoint_context);
     if (create.document) |document| return documentSchemaAlloc(alloc, create, document.*, limits);
@@ -1816,4 +1833,74 @@ fn qualifiedForeignKeyCandidates(a: std.mem.Allocator) !void {
 test "SQL qualified foreign key candidates retain components and quoted identity through allocation faults" {
     try qualifiedForeignKeyCandidates(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, qualifiedForeignKeyCandidates, .{});
+}
+
+test "SQL trigger DDL classifies original accepted publications before dispatch and preserves exactly one effect" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        checkpoints: usize = 0,
+        pending: bool,
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkpoints += 1;
+        }
+        fn ddl(raw: *anyopaque, _: catalog.DdlAllocators, request: catalog.Ddl) !catalog.DdlOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(request == .catalog_ddl);
+            try std.testing.expect(request.catalog_ddl.trigger != null);
+            try std.testing.expect(request.catalog_ddl.schema_change == null);
+            self.calls += 1; // The accepted publication may not be replayed.
+            return .{ .mutation_outcome = if (self.pending) .committed_pending else .committed };
+        }
+    };
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    const ids = [_][]const u8{ "sql-0751", "sql-0752", "sql-0753" };
+    for (ids, 0..) |id, ordinal| {
+        for ([_]bool{ false, true }) |pending| {
+            var compiled = try @import("compiler.zig").compile(a, (try corpus.get(id)).sql, .{});
+            defer compiled.deinit();
+            var probe: Probe = .{ .pending = pending };
+            const backend: catalog.Backend = .{ .ptr = &probe, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = Probe.checkpoint, .ddl = Probe.ddl } };
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const bound = try @import("describe.zig").bind(scratch, backend, &compiled, &.{});
+            try std.testing.expect(bound.table == null);
+            try std.testing.expectEqual(@as(usize, 0), probe.calls);
+            const checkpoints_before = probe.checkpoints;
+            const output = try execute(.{ .result = scratch, .scratch = scratch }, backend, compiled.statement);
+            try std.testing.expectEqualStrings(if (pending) "DDL PENDING" else if (ordinal == 2) "DROP TRIGGER" else "CREATE TRIGGER", output.command_tag);
+            try std.testing.expectEqual(if (pending) catalog.MutationOutcome.committed_pending else catalog.MutationOutcome.committed, output.mutation_outcome.?);
+            try std.testing.expectEqual(@as(usize, 1), probe.calls);
+            try std.testing.expectEqual(checkpoints_before + 2, probe.checkpoints);
+        }
+    }
+}
+
+test "SQL trigger DDL malformed response shape rejects before checkpoint or backend mutation" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.TestUnexpectedEffect;
+        }
+        fn ddl(raw: *anyopaque, _: catalog.DdlAllocators, _: catalog.Ddl) !catalog.DdlOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.TestUnexpectedEffect;
+        }
+    };
+    var probe: Probe = .{};
+    const backend: catalog.Backend = .{ .ptr = &probe, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = Probe.checkpoint, .ddl = Probe.ddl } };
+    var compiled = try @import("compiler.zig").compile(a, "CREATE TRIGGER a_skip BEFORE UPDATE OF n ON children FOR EACH ROW WHEN(NEW.n<0) EXECUTE FUNCTION skip_change()", .{});
+    defer compiled.deinit();
+    // A stale/private producer cannot leave a naked alter_schema shape and
+    // discover its missing command classification after a native commit.
+    compiled.statement.catalog_ddl.trigger = null;
+    try std.testing.expectError(error.InvalidSqlSyntax, execute(.{ .result = a, .scratch = a }, backend, compiled.statement));
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
 }

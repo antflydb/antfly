@@ -128,7 +128,7 @@ pub fn requireReady(backing: std.mem.Allocator, reader: anytype, child: scopes.C
     _ = try requireParent(reader, child);
     const value = (try tables.head(reader, .{ .group = child.lookup.group, .table = child.table, .id = child.id })) orelse return error.ScopeRetirementChanged;
     if (!std.meta.eql(value.scope.parent, @as(?scopes.Child, child)) or value.phase != .physical_ready or
-        value.physical == null or value.physical.?.phase != .ready) return error.ScopeRetirementChanged;
+        (value.native_loss == null and (value.physical == null or value.physical.?.phase != .ready))) return error.ScopeRetirementChanged;
     var buffer: [256]u8 = undefined;
     var body = try manifests.Owned.parse(backing, try reader.get(try tables.key(&buffer, value.lookup, .effects)));
     defer body.deinit();

@@ -21,6 +21,7 @@ const internal_batch_forwarding = @import("../api/internal_batch_forwarding.zig"
 
 pub const acknowledge_many_protocol_version = @import("../common/data_raft_protocol.zig").batch_acknowledge_many_protocol_version;
 pub const protocol_version = internal_batch_forwarding.raft_batch_protocol_version;
+pub const maximum_decodable_protocol_version = @import("../common/data_raft_protocol.zig").maximum_decodable_batch_protocol_version;
 pub const index_owner_control_protocol_version = internal_batch_forwarding.raft_batch_index_owner_control_protocol_version;
 pub const artifact_catalog_protocol_version = internal_batch_forwarding.raft_batch_artifact_catalog_protocol_version;
 pub const timestamp_protocol_version = internal_batch_forwarding.raft_batch_timestamp_protocol_version;
@@ -111,6 +112,9 @@ fn encodeWithStorageOwnerDescriptorOwned(
     req: db_mod.types.BatchRequest,
     descriptor: ?descriptor_contract.Descriptor,
 ) ![]u8 {
+    if (internal_batch_forwarding.graphTransactionProtocol(req)) |required| {
+        if (protocol_version < required) return error.UnsupportedRaftBatchProtocolVersion;
+    }
     const batch_json = try batch_api.encodeBatchRequest(alloc, req);
     defer alloc.free(batch_json);
 
@@ -179,7 +183,7 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
         if (barrier_value != .number_string) return error.InvalidReplicatedBatch;
         const version = std.fmt.parseUnsigned(u16, barrier_value.number_string, 10) catch return error.InvalidReplicatedBatch;
         if (version == 0) return error.InvalidReplicatedBatch;
-        if (version > protocol_version) return error.UnsupportedRaftBatchProtocolVersion;
+        if (version > maximum_decodable_protocol_version) return error.UnsupportedRaftBatchProtocolVersion;
         if (batch_value != .null) return error.InvalidReplicatedBatch;
         return .{
             .table_name = table_name,
@@ -189,6 +193,9 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
     }
     var batch = try batch_api.parseInternalBatchValue(alloc, batch_value);
     errdefer batch.deinit(alloc);
+    if (internal_batch_forwarding.graphTransactionProtocol(batch.req)) |required| {
+        if (protocol_version < required) return error.UnsupportedRaftBatchProtocolVersion;
+    }
 
     var storage_owner_descriptor: ?OwnedStorageOwnerDescriptor = null;
     errdefer if (storage_owner_descriptor) |*descriptor| descriptor.deinit(alloc);
@@ -216,6 +223,61 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "graph batch34 internal producer transport preserves tuple and explicit ownership" {
+            const a = std.testing.allocator;
+            const request: db_mod.types.BatchRequest = .{ .graph_writes = &.{
+                .{ .index_name = "g", .source = "root", .target = "tuple", .edge_type = "R", .owner = "fact:tuple" },
+                .{ .index_name = "g", .source = "root", .target = "explicit", .edge_type = "R", .edge_id = "relationship", .owner_document = "fact:explicit" },
+            } };
+            const encoded = try encode(a, "docs", request);
+            var encoded_live = true;
+            defer if (encoded_live) a.free(encoded);
+            var decoded = try decode(a, encoded);
+            defer decoded.deinit(a);
+            a.free(encoded);
+            encoded_live = false;
+            try std.testing.expectEqualStrings("docs", decoded.table_name);
+            try std.testing.expectEqualDeep(request.graph_writes, decoded.batch.req.graph_writes);
+            // Decoded fields remain valid after the first transport is gone.
+            const replay = try encode(a, decoded.table_name, decoded.batch.req);
+            defer a.free(replay);
+            var replayed = try decode(a, replay);
+            defer replayed.deinit(a);
+            try std.testing.expectEqualDeep(request.graph_writes, replayed.batch.req.graph_writes);
+        }
+
+        test "graph batch34 rejects unsupported active writers and decoders while preserving ordinary wire bytes" {
+            const alloc = std.testing.allocator;
+            const types = db_mod.types;
+            var req: types.BatchRequest = .{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} };
+            const ordinary = try encode(alloc, "docs", req);
+            defer alloc.free(ordinary);
+            var legacy = try decode(alloc, ordinary);
+            defer legacy.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), legacy.batch.req.graph_writes.len);
+            req.transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 1 } };
+            if (protocol_version < 34) {
+                try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, encode(alloc, "docs", req));
+                const raw = try batch_api.encodeBatchRequest(alloc, req);
+                defer alloc.free(raw);
+                const forged = try std.fmt.allocPrint(alloc, "{{\"table\":\"docs\",\"batch\":{s}}}", .{raw});
+                defer alloc.free(forged);
+                try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, decode(alloc, forged));
+            } else {
+                const encoded = try encode(alloc, "docs", req);
+                defer alloc.free(encoded);
+                var decoded = try decode(alloc, encoded);
+                defer decoded.deinit(alloc);
+                try std.testing.expectEqual(@as(?u16, 34), internal_batch_forwarding.graphTransactionProtocol(decoded.batch.req));
+            }
+            var barrier = try decode(alloc, "{\"table\":\"docs\",\"protocol_barrier\":34,\"batch\":null}");
+            defer barrier.deinit(alloc);
+            try std.testing.expectEqual(@as(?u16, 34), barrier.protocol_barrier_version);
+            const future = try std.fmt.allocPrint(alloc, "{{\"table\":\"docs\",\"protocol_barrier\":{d},\"batch\":null}}", .{maximum_decodable_protocol_version + 1});
+            defer alloc.free(future);
+            try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, decode(alloc, future));
+        }
+
         test "raft batch round trips table batch payload exact numbers without envelope reparse" {
             const Check = struct {
                 fn run(alloc: std.mem.Allocator) !void {
@@ -315,7 +377,7 @@ fn consumerTests() type {
             const encoded = try std.fmt.allocPrint(
                 std.testing.allocator,
                 "{{\"table\":\"docs\",\"protocol_barrier\":{d},\"batch\":null}}",
-                .{protocol_version + 1},
+                .{maximum_decodable_protocol_version + 1},
             );
             defer std.testing.allocator.free(encoded);
             try std.testing.expectError(

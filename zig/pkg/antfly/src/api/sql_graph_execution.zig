@@ -18,6 +18,10 @@ pub fn open(adapter: *Adapter, a: A, requests: []const catalog.StatementScan) !?
         if (scan.request.graph != null) break true;
     } else false;
     if (!has_graph) return null;
+    const hits = for (requests) |scan| {
+        if (scan.request.graph) |graph| if (graph.hit_alias != null) break true;
+    } else false;
+    if (hits) return @import("sql_graph_join_execution.zig").open(adapter, a, requests) catch |err| return failure(adapter.context, err);
     // Native graph execution has its own retained identity/index cut. A future
     // combined provider must explicitly attest the same cut for row scans.
     try requireStandalone(requests, adapter.active_transaction != null or adapter.dynamic_snapshot != null or adapter.pending_transaction_cut != null or adapter.range_reads != null or adapter.staged != null);
@@ -26,6 +30,8 @@ pub fn open(adapter: *Adapter, a: A, requests: []const catalog.StatementScan) !?
     const graph = scan.request.graph.?;
     if (graph.start != .string or graph.start.string.len == 0 or graph.aliases.len < 2 or graph.aliases.len != graph.edge_types.len + 1) return error.InvalidSqlParameters;
     try adapter.verify(a, scan.table);
+    if (try adapter.graphRequiresPrimaryAuthorization(a, scan.table))
+        return @import("sql_graph_join_execution.zig").open(adapter, a, requests) catch |err| return failure(adapter.context, err);
     const scope = scan.table.scope orelse return error.InvalidSqlBackendResponse;
     const logical = try (local.system_catalog_domain.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(a);
     defer a.free(logical);
@@ -39,19 +45,7 @@ pub fn open(adapter: *Adapter, a: A, requests: []const catalog.StatementScan) !?
     for (owner.aliases) |*alias| alias.* = try retained.dupe(u8, alias.*);
     // Deep-own only the cursor metadata; immutable compiled descriptors expire
     // after execution setup and may not be retained by detached SQL cursors.
-    owner.table = .{
-        .id = scan.table.id,
-        .schema_version = scan.table.schema_version,
-        .physical_name = try retained.dupe(u8, scan.table.physical_name),
-        .columns = &.{},
-        .storage_mode = scan.table.storage_mode,
-        .scope = .{ .database = try retained.dupe(u8, scope.database), .namespace = try retained.dupe(u8, scope.namespace), .name = try retained.dupe(u8, scope.name), .revision = scope.revision },
-        .sql_access = scan.table.sql_access,
-        .sql_native_rights = scan.table.sql_native_rights,
-        .sql_required_privileges = scan.table.sql_required_privileges,
-        .row_policy_purpose = scan.table.row_policy_purpose,
-        .read_authority = if (@import("sql_read_authority.zig").context(scan.table)) |authority| try @import("sql_read_authority.zig").clone(retained, authority) else null,
-    };
+    owner.table = try @import("sql_read_authority.zig").retainVerificationTable(retained, scan.table);
     const body = try requestJson(a, graph);
     defer a.free(body);
     const authority = @import("sql_read_authority.zig").context(scan.table);
@@ -429,4 +423,40 @@ test "SQL native graph primary identity Boolean resolution releases every failed
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL native graph retained cursor keeps logical identity persistence and owned verification scope" {
+    var source: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer source.deinit();
+    var retained: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer retained.deinit();
+    const a = source.allocator();
+    const original: catalog.Table = .{
+        .id = std.math.maxInt(u64) - 1,
+        .logical_relation_id = 7,
+        .sql_persistence = .{ .kind = .unlogged, .owner_node_id = 1, .owner_store_id = 2, .generation_instance = @splat(3), .data_generation = 4 },
+        .physical_name = try a.dupe(u8, "table:physical"),
+        .schema_version = 3,
+        .columns = &.{},
+        .scope = .{ .database = try a.dupe(u8, "default"), .namespace = try a.dupe(u8, "public"), .name = try a.dupe(u8, "graph_items"), .revision = 9 },
+        .binding_scope = .{ .database = try a.dupe(u8, "bound"), .namespace = try a.dupe(u8, "public"), .name = try a.dupe(u8, "graph_items"), .revision = 8 },
+        .version_field = try a.dupe(u8, "stamp"),
+        .sql_native_rights = 7,
+        .sql_required_privileges = 1,
+    };
+    const owned = try @import("sql_read_authority.zig").retainVerificationTable(retained.allocator(), original);
+    _ = source.reset(.free_all);
+    try std.testing.expectEqual(original.id, owned.id);
+    try std.testing.expectEqual(@as(u64, 7), owned.effectiveLogicalRelationId());
+    try std.testing.expectEqualDeep(original.sql_persistence, owned.sql_persistence);
+    try std.testing.expectEqualStrings("table:physical", owned.physical_name);
+    try std.testing.expectEqualStrings("graph_items", owned.scope.?.name);
+    try std.testing.expectEqual(@as(u64, 9), owned.scope.?.revision);
+    try std.testing.expectEqualStrings("bound", owned.binding_scope.?.database);
+    try std.testing.expectEqualStrings("stamp", owned.version_field.?);
+    try std.testing.expectEqual(@as(u16, 7), owned.sql_native_rights);
+    try std.testing.expectEqual(@as(u16, 1), owned.sql_required_privileges);
+    const unassigned = try @import("sql_read_authority.zig").retainVerificationTable(retained.allocator(), .{ .id = 42, .physical_name = "legacy", .schema_version = 0, .columns = &.{} });
+    try std.testing.expectEqual(@as(u64, 42), unassigned.effectiveLogicalRelationId());
+    try std.testing.expect(unassigned.sql_persistence == null);
 }

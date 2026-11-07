@@ -66,7 +66,10 @@ pub fn proofLess(a: Proof, b: Proof) bool {
 }
 
 pub fn validateRequest(req: anytype) !void {
-    if (req.range_guards.len != 0 and (req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
+    if (req.range_guards.len != 0 and (req.transaction == null or req.transaction.? != .prepare)) {
+        if (req.transaction != null) return error.InvalidBatchRequest;
+        try req.requireAtomicIntentShape();
+    }
     if (!req.activate_range_tracking) return;
     const defaults: @TypeOf(req) = .{};
     inline for (@typeInfo(@TypeOf(req)).@"struct".field_names, @typeInfo(@TypeOf(req)).@"struct".field_types) |reflected_name, field_type| {

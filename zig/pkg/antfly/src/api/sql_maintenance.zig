@@ -26,6 +26,30 @@ const domain = local.system_catalog_domain;
 const wire = @import("antfly_indexes_openapi").types;
 const A = std.mem.Allocator;
 
+/// The fence is derived from the very snapshot used to select this owner.
+/// TEMP admission is a process-local capability locally, and a body-bound
+/// signed grant when the existing hosted client forwards to a remote owner.
+fn maintenanceGroup(root: *execution.Adapter, a: A, table: catalog.Table, cut: metadata.AdminSnapshot, group: u64, body: []const u8, cancellation: local.storage_db_types.CancellationToken, context: local.api_operation.RequestContext) !?[]u8 {
+    const writer = root.server.table_writes orelse return error.UnsupportedSqlExecution;
+    if (table.sql_persistence == null) return writer.sqlMaintenanceGroup(a, group, table.physical_name, body, cancellation);
+    const normalized = try context.platformDeadline();
+    const routing: metadata.CatalogRoutingSnapshot = .{ .metadata_group_id = cut.status.metadata_group_id, .metadata_incarnation = cut.status.metadata_incarnation, .tables = cut.tables, .ranges = cut.ranges };
+    var fence = try nativeMaintenanceFence(a, routing, table.id, table.physical_name, table.sql_persistence.?, group, normalized.deadline_ns);
+    fence.admission_relation_minter = try @import("sql_relation_lifetimes.zig").ownerMinterForRelation(root.server, root.context, table.sql_persistence);
+    fence.admission_sql_relation_owner = if (fence.admission_relation_minter) |minter| minter.owner else null;
+    fence.admission_deadline_ns = normalized.deadline_ns;
+    fence.admission_deadline_io = normalized.deadline_io;
+    fence.admission_cancellation = cancellation;
+    return writer.sqlMaintenanceGroupRouted(a, fence, group, table.physical_name, body, cancellation);
+}
+
+fn nativeMaintenanceFence(a: A, routing: metadata.CatalogRoutingSnapshot, table_id: u64, table_name: []const u8, descriptor: local.common_topology_records.RelationPersistence.Descriptor, group: u64, deadline: ?u64) !metadata.CatalogRouteFence {
+    var plan = (try @import("table_catalog.zig").routePlanFromSnapshotUntil(a, routing, table_name, .{ .group = group }, deadline)) orelse return error.TableNotFound;
+    defer plan.deinit(a);
+    if (plan.table_id != table_id or plan.groups.len != 1 or plan.groups[0].execution != .native_local or !plan.groups[0].execution.native_local.eql(descriptor)) return error.SqlRelationOwnerChanged;
+    return .{ .metadata_group_id = plan.metadata_group_id, .metadata_incarnation = plan.metadata_incarnation, .catalog_revision = plan.catalog_revision, .table_id = plan.table_id, .topology_epoch = plan.topology_epoch, .route = plan.groups[0] };
+}
+
 fn wait(root: *execution.Adapter) !void {
     try root.context.ensureActive();
     const io = root.server.sharedApiIo() orelse return error.UnsupportedSqlExecution;
@@ -84,7 +108,7 @@ pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl:
     for (intent.columns) |name| _ = try table.column(name);
     const verbose_message = if (intent.verbose) try std.fmt.allocPrint(a, "{s} completed for table \"{s}\"", .{ if (intent.operation == .vacuum) @as([]const u8, "VACUUM") else "ANALYZE", ddl.name.table }) else null;
     if (verbose_message) |message| if (root.notice_sink) |sink| if (sink.reserve) |reserve| try reserve(sink.ptr, 1, message.len);
-    const writer = root.server.table_writes orelse return error.UnsupportedSqlExecution;
+    _ = root.server.table_writes orelse return error.UnsupportedSqlExecution;
     var initial = (try root.server.source.adminSnapshot()) orelse return error.Unavailable;
     defer root.server.source.freeAdminSnapshot(&initial);
     try validateCut(table, initial);
@@ -106,7 +130,7 @@ pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl:
                 var quantum = std.heap.ArenaAllocator.init(allocators.scratch);
                 defer quantum.deinit();
                 const qa = quantum.allocator();
-                const reply = writer.sqlMaintenanceGroup(qa, range.group_id, table.physical_name, body, control.cancellation()) catch |err| switch (err) {
+                const reply = maintenanceGroup(root, qa, table, initial, range.group_id, body, control.cancellation(), root.context) catch |err| switch (err) {
                     error.MaintenanceBusy, error.LeaderUnavailable, error.Unavailable => {
                         pending = true;
                         continue;
@@ -147,7 +171,7 @@ pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl:
 /// empty. No primary rows are read by this path.
 fn statistics(root: *execution.Adapter, a: A, table: catalog.Table) !?contract.Aggregate {
     const writer = root.server.table_writes orelse return null;
-    if (writer.vtable.sql_maintenance_group == null) return null;
+    if (table.sql_persistence == null and writer.vtable.sql_maintenance_group == null) return null;
     var cut = (try root.server.source.adminSnapshot()) orelse return null;
     defer root.server.source.freeAdminSnapshot(&cut);
     try validateCut(table, cut);
@@ -166,7 +190,7 @@ fn statistics(root: *execution.Adapter, a: A, table: catalog.Table) !?contract.A
         try request.ensureActive();
         _ = scratch.reset(.free_all);
         const qa = scratch.allocator();
-        const raw = (try writer.sqlMaintenanceGroup(qa, range.group_id, table.physical_name, body, control.cancellation())) orelse return null;
+        const raw = (try maintenanceGroup(root, qa, table, cut, range.group_id, body, control.cancellation(), request)) orelse return null;
         if (raw.len > contract.max_bytes) return error.InvalidSqlBackendResponse;
         const response = try std.json.parseFromSliceLeaky(contract.Response, qa, raw, .{ .allocate = .alloc_always });
         if (!response.done or !response.available) return null;
@@ -344,4 +368,22 @@ fn reindex(root: *execution.Adapter, a: A, scratch_backing: A, table: catalog.Ta
 test "SQL statistics cache cannot start owner work after native read admission" {
     var root: execution.Adapter = .{ .server = undefined, .identity = undefined, .context = .{}, .statistics_reads_started = true };
     try prepareStatistics(&root, .{ .id = 1, .physical_name = "retained", .schema_version = 1, .columns = &.{} });
+}
+
+test "SQL relation lifetime maintenance captures exact native image route and refuses descriptor substitution" {
+    const p: local.common_topology_records.RelationPersistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 7, .owner_store_id = 9, .generation_instance = @splat(3), .data_generation = 4 };
+    var records = [_]@import("../metadata/table_manager.zig").TableRecord{.{ .table_id = 11, .name = "maintenance_owner", .sql_persistence = p }};
+    var ranges = [_]@import("../metadata/table_manager.zig").RangeRecord{.{ .table_id = 11, .group_id = 13, .range_id = 17, .start_key = "", .end_key = null }};
+    const cut: metadata.CatalogRoutingSnapshot = .{ .metadata_group_id = 19, .catalog_revision = 23, .tables = &records, .ranges = &ranges };
+    const fence = try nativeMaintenanceFence(std.testing.allocator, cut, 11, "maintenance_owner", p, 13, null);
+    try std.testing.expectEqual(@as(u64, 19), fence.metadata_group_id);
+    try std.testing.expectEqual(@as(u64, 23), fence.catalog_revision);
+    try std.testing.expect(fence.route.execution == .native_local);
+    try std.testing.expect(fence.route.execution.native_local.eql(p));
+    try std.testing.expectEqual(@as(u64, 13), fence.route.group_id);
+    try std.testing.expect(fence.admission_sql_relation_owner == null);
+    var changed = p;
+    changed.data_generation += 1;
+    try std.testing.expectError(error.SqlRelationOwnerChanged, nativeMaintenanceFence(std.testing.allocator, cut, 11, "maintenance_owner", changed, 13, null));
+    try std.testing.expectError(error.TableNotFound, nativeMaintenanceFence(std.testing.allocator, cut, 11, "maintenance_owner", p, 29, null));
 }

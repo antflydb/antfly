@@ -1887,8 +1887,13 @@ pub fn createManifest(
 
     const owned_sql_names = try alloc.dupe(u8, table.sql_native_indexes_json);
     errdefer alloc.free(owned_sql_names);
+    const unlogged = if (table.sql_persistence) |native| native.kind == .unlogged else false;
+    const schema_only = unlogged and format == .native;
     const manifest: TableBackupManifest = .{
         .sql_native_indexes_json = owned_sql_names,
+        .format_version = if (unlogged) 3 else format_version,
+        .content_policy = if (schema_only) .schema_only else .complete,
+        .persistence_kind = if (unlogged) .unlogged else null,
         .format = format,
         .backup_id = owned_backup_id,
         .table_name = owned_table_name,
@@ -2091,10 +2096,19 @@ pub fn validateTableManifest(
     manifest: *const TableBackupManifest,
     requested_backup_id: []const u8,
 ) !void {
-    if (manifest.format_version != format_version) return error.UnsupportedBackupFormat;
+    try validateTableContentPolicy(manifest);
     var sql_indexes = @import("../system_catalog/native_indexes.zig").read(alloc, manifest.sql_native_indexes_json, manifest.indexes_json) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBackupRequest;
     defer sql_indexes.deinit();
     if (!std.mem.eql(u8, manifest.backup_id, requested_backup_id)) return error.InvalidBackupRequest;
+    if (manifest.sql_column_identities_json.len != 0) {
+        var identities = try @import("../system_catalog/column_identities.zig").State.decode(alloc, manifest.sql_column_identities_json);
+        defer identities.deinit();
+        const header = try std.json.parseFromSlice(struct { version: u32 = 0 }, alloc, manifest.schema_json, .{ .ignore_unknown_fields = true });
+        defer header.deinit();
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(manifest.schema_json, &digest, .{});
+        if (identities.value.table_id != manifest.table_id or identities.value.epoch.version != header.value.version or !std.mem.eql(u8, &identities.value.epoch.digest, &digest)) return error.BackupIntegrityFailure;
+    }
     var proof_count: usize = 0;
     for (manifest.shards) |shard| {
         if (shard.accepted_generation_summary_digest) |digest| {
@@ -2122,6 +2136,17 @@ pub fn validatePublishedTableManifest(
         return error.BackupIntegrityMissing;
 }
 
+pub fn validateTableContentPolicy(manifest: *const TableBackupManifest) !void {
+    if (manifest.persistence_kind == null) {
+        if (manifest.format_version != format_version or manifest.content_policy != .complete) return error.UnsupportedBackupFormat;
+        return;
+    }
+    if (manifest.format_version != 3 or manifest.persistence_kind != .unlogged or manifest.table_id == 0 or manifest.artifact_integrity_mode != .declared) return error.UnsupportedBackupFormat;
+    // PostgreSQL physical/base snapshots omit UNLOGGED data, while logical
+    // dumps preserve it. Keep the public native/portable distinction exact.
+    if ((manifest.format == .native) != (manifest.content_policy == .schema_only)) return error.UnsupportedBackupFormat;
+}
+
 pub fn validateManifestShards(
     alloc: std.mem.Allocator,
     manifest: *const TableBackupManifest,
@@ -2132,8 +2157,12 @@ pub fn validateManifestShards(
     var paths_seen = std.StringHashMapUnmanaged(void).empty;
     defer paths_seen.deinit(alloc);
 
+    try validateTableContentPolicy(manifest);
     for (manifest.shards) |shard| {
-        try validateArtifactRelativePath(shard.snapshot_path);
+        if (manifest.content_policy == .complete) try validateArtifactRelativePath(shard.snapshot_path) else {
+            if (manifest.shards.len != 1 or shard.group_id == 0 or shard.start_key.len != 0 or shard.end_key != null or shard.snapshot_path.len != 0 or shard.artifact_size_bytes != 0 or shard.artifact_sha256.len != 0 or shard.native_manifest_size_bytes != 0 or shard.native_manifest_sha256.len != 0 or shard.accepted_generation_summary.len != 0 or shard.accepted_generation_summary_digest != null) return error.InvalidBackupRequest;
+            continue;
+        }
         if (shard.end_key) |end_key| {
             if (end_key.len == 0 or std.mem.order(u8, shard.start_key, end_key) != .lt)
                 return error.InvalidBackupRequest;
@@ -3234,6 +3263,8 @@ pub fn writeFileToLocation(
 pub fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupManifest) !TableBackupManifest {
     const owned_sql_names = try alloc.dupe(u8, manifest.sql_native_indexes_json);
     errdefer alloc.free(owned_sql_names);
+    const owned_columns = try alloc.dupe(u8, manifest.sql_column_identities_json);
+    errdefer alloc.free(owned_columns);
     const shards = try alloc.alloc(ShardSnapshot, manifest.shards.len);
     var initialized_shards: usize = 0;
     errdefer {
@@ -3268,9 +3299,12 @@ pub fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupM
 
     return .{
         .sql_native_indexes_json = owned_sql_names,
+        .sql_column_identities_json = owned_columns,
         .format_version = manifest.format_version,
         .format = manifest.format,
         .artifact_integrity_mode = manifest.artifact_integrity_mode,
+        .content_policy = manifest.content_policy,
+        .persistence_kind = manifest.persistence_kind,
         .backup_id = try alloc.dupe(u8, manifest.backup_id),
         .table_name = try alloc.dupe(u8, manifest.table_name),
         .table_id = manifest.table_id,
@@ -4036,4 +4070,44 @@ test "external lake restore retains index rebuild obligations without retired pu
     try std.testing.expectEqualStrings(schema, restored.schema_json);
     try std.testing.expectEqual(@as(usize, 0), restored.lake_index_catalog_json.len);
     try std.testing.expectEqual(@as(usize, 0), restored.read_schema_json.len);
+}
+
+test "UNLOGGED schema only snapshot manifest explicitly omits volatile data and rejects invented artifact authority" {
+    const a = std.testing.allocator;
+    var manifest: TableBackupManifest = .{ .format_version = 3, .content_policy = .schema_only, .persistence_kind = .unlogged, .format = .native, .backup_id = "daily", .table_name = "scratch", .table_id = 9, .description = "", .schema_json = "{}", .read_schema_json = "", .indexes_json = "{}", .replication_sources_json = "[]", .shards = &.{.{ .group_id = 301, .start_key = "", .snapshot_path = "" }} };
+    try validatePublishedTableManifest(a, &manifest, "daily");
+    const encoded = try std.json.Stringify.valueAlloc(a, manifest, .{});
+    defer a.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"content_policy\":\"schema_only\"") != null);
+    var parsed = try std.json.parseFromSlice(TableBackupManifest, a, encoded, .{});
+    defer parsed.deinit();
+    try validatePublishedTableManifest(a, &parsed.value, "daily");
+    manifest.format_version = 2;
+    try std.testing.expectError(error.UnsupportedBackupFormat, validatePublishedTableManifest(a, &manifest, "daily"));
+    manifest.format_version = 3;
+    manifest.persistence_kind = null;
+    try std.testing.expectError(error.UnsupportedBackupFormat, validatePublishedTableManifest(a, &manifest, "daily"));
+    manifest.persistence_kind = .unlogged;
+    manifest.shards = &.{.{ .group_id = 301, .start_key = "", .snapshot_path = "invented/snapshot", .artifact_sha256 = "0123456789012345678901234567890123456789012345678901234567890123" }};
+    try std.testing.expectError(error.InvalidBackupRequest, validatePublishedTableManifest(a, &manifest, "daily"));
+    var ordinary = manifest;
+    ordinary.format_version = 2;
+    ordinary.content_policy = .complete;
+    ordinary.persistence_kind = null;
+    const legacy = try std.json.Stringify.valueAlloc(a, ordinary, .{});
+    defer a.free(legacy);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "content_policy") == null);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "persistence_kind") == null);
+}
+
+test "UNLOGGED portable logical manifest preserves artifact content and explicitly retains persistence" {
+    const a = std.testing.allocator;
+    var logical: TableBackupManifest = .{ .format_version = 3, .format = .portable, .content_policy = .complete, .persistence_kind = .unlogged, .backup_id = "daily", .table_name = "scratch", .table_id = 9, .description = "", .schema_json = "{}", .read_schema_json = "", .indexes_json = "{}", .replication_sources_json = "[]", .shards = &.{.{ .group_id = 301, .start_key = "", .snapshot_path = "daily/301.afb", .artifact_size_bytes = 17, .artifact_sha256 = "0123456789012345678901234567890123456789012345678901234567890123" }} };
+    try validatePublishedTableManifest(a, &logical, "daily");
+    const encoded = try std.json.Stringify.valueAlloc(a, logical, .{});
+    defer a.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"content_policy\":\"complete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"persistence_kind\":\"unlogged\"") != null);
+    logical.content_policy = .schema_only;
+    try std.testing.expectError(error.UnsupportedBackupFormat, validatePublishedTableManifest(a, &logical, "daily"));
 }

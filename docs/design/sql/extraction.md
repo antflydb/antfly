@@ -27,7 +27,10 @@ Page arenas are released between reads. Output and mutation admission limits are
 independent from SQL LIMIT; exceeding a result cap must fail, not silently
 truncate a query. Mutations prepare the entire bounded write set before making
 one native atomic commit, with observed row versions and the bound schema epoch.
-SQL cannot retry an ambiguous mutation automatically.
+SQL cannot retry an ambiguous mutation automatically. A topology-busy prepare
+can report retryable unavailability only after the coordinator proves a durable
+abort; an uncertain abort remains an unknown outcome. Index-creation admission
+also remains distinct from completion of its publication receipt.
 
 Allocation admission applies before allocation to both result arena capacity
 and temporary page storage. Page-count limits also bound scans that return no

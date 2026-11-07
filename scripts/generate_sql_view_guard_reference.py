@@ -7,6 +7,7 @@ Keep the original SELECTs and declared document domains. Public SQL views use
 explicit path extraction/casts; storage-index lifecycle is not a view dependency.
 This witness does not by itself qualify stale native source publication guards.
 """
+
 import argparse
 import json
 import subprocess
@@ -30,7 +31,8 @@ def reference():
     corpus = json.loads(
         subprocess.check_output(
             [
-                "git", "show",
+                "git",
+                "show",
                 f"{SOURCE}:zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
             ],
             cwd=ROOT,
@@ -57,7 +59,9 @@ def reference():
             try:
                 with db.transaction(), db.cursor() as cursor:
                     entry["result"] = cursor_result(
-                        cursor, {"id": case_id, "sql": original["sql"], "params": []}, True
+                        cursor,
+                        {"id": case_id, "sql": original["sql"], "params": []},
+                        True,
                     )
             except psycopg.Error as error:
                 entry["sqlstate"] = error.sqlstate
@@ -91,7 +95,9 @@ def main():
     if args.check:
         if json.loads(args.check.read_text()) != result:
             raise SystemExit("document view guard PostgreSQL drift")
-        print("verified five original SELECTs, source contracts, casts and projection guards")
+        print(
+            "verified five original SELECTs, source contracts, casts and projection guards"
+        )
     else:
         print(json.dumps(result, indent=2))
 

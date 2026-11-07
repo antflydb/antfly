@@ -3558,6 +3558,7 @@ pub const StorageKernelLookupWireRequest = struct {
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     include_primary_digest: bool = false,
+    include_json_null_fields: bool = false,
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,
     relational_integrity_catalog: bool = false,
@@ -3577,6 +3578,7 @@ pub const StorageKernelLookupWireRequest = struct {
             .fields = self.fields,
             .include_all_fields = self.include_all_fields,
             .include_primary_digest = self.include_primary_digest,
+            .include_json_null_fields = self.include_json_null_fields,
             .restore_staging_scope = self.restore_staging_scope,
             .restore_staging_plan_id = self.restore_staging_plan_id,
             .relational_integrity_catalog = self.relational_integrity_catalog,
@@ -3593,10 +3595,15 @@ pub const StorageKernelLookupWireRequest = struct {
     pub fn jsonStringify(self: StorageKernelLookupWireRequest, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
         inline for (comptime std.meta.fieldNames(StorageKernelLookupWireRequest)) |reflected_name| {
+            if (comptime std.mem.eql(u8, reflected_name, "include_json_null_fields")) continue;
             try stream.objectField(reflected_name);
             if (comptime std.mem.eql(u8, reflected_name, "key") or std.mem.eql(u8, reflected_name, "restore_staging_scope") or std.mem.eql(u8, reflected_name, "restore_staging_plan_id")) {
                 try @import("../storage/db/relational_integrity_json.zig").write(@field(self, reflected_name), stream);
             } else try stream.write(@field(self, reflected_name));
+        }
+        if (self.include_json_null_fields) {
+            try stream.objectField("include_json_null_fields");
+            try stream.write(true);
         }
         try stream.endObject();
     }
@@ -3613,6 +3620,7 @@ test "compiled lookup wire preserves binary scope and every integrity control" {
         .fields = &.{"id"},
         .include_all_fields = false,
         .include_primary_digest = true,
+        .include_json_null_fields = true,
         .restore_staging_scope = scope,
         .restore_staging_plan_id = @splat(0xfe),
         .relational_integrity_catalog = true,
@@ -3638,7 +3646,7 @@ test "compiled lookup wire preserves binary scope and every integrity control" {
     const actual = decoded.value.options();
     try std.testing.expectEqualSlices(u8, &scope, &actual.restore_staging_scope.?);
     try std.testing.expectEqual(options.restore_staging_plan_id, actual.restore_staging_plan_id);
-    try std.testing.expect(actual.include_primary_digest and !actual.include_all_fields);
+    try std.testing.expect(actual.include_primary_digest and actual.include_json_null_fields and !actual.include_all_fields);
     try std.testing.expect(actual.relational_integrity_catalog and actual.relational_integrity_action);
     try std.testing.expectEqualStrings(options.relational_integrity_jobs_json, actual.relational_integrity_jobs_json);
     try std.testing.expectEqualStrings(options.relational_activation_json, actual.relational_activation_json);
@@ -3663,6 +3671,7 @@ pub fn encodeStorageKernelLookupRequest(
         .fields = opts.fields,
         .include_all_fields = opts.include_all_fields,
         .include_primary_digest = opts.include_primary_digest,
+        .include_json_null_fields = opts.include_json_null_fields,
         .restore_staging_scope = opts.restore_staging_scope,
         .restore_staging_plan_id = opts.restore_staging_plan_id,
         .relational_integrity_catalog = opts.relational_integrity_catalog,
@@ -3675,6 +3684,54 @@ pub fn encodeStorageKernelLookupRequest(
         .relational_topology_json = opts.relational_topology_json,
     }, .{});
 }
+
+/// Private opt-in result inside the existing opaque owner bytes. The strict
+/// request decoder rejects this selector on older providers; ordinary result
+/// bytes and the fixed VersionedOwnedBytes ABI remain unchanged.
+pub const StorageKernelTypedLookup = struct {
+    const Wire = struct { kind: enum { typed_primary_lookup_v1 }, json: []const u8, json_null_fields: []const []const u8 };
+    pub const max_document_bytes = 16 * 1024 * 1024;
+    pub const max_bytes = 8 * max_document_bytes + 4096;
+
+    fn requireMetadata(json: []const u8, fields: []const []const u8) !void {
+        if (json.len > max_document_bytes or fields.len > json.len) return error.InvalidResponse;
+        var total: usize = 0;
+        for (fields, 0..) |field, i| {
+            if (field.len == 0 or field.len > json.len -| total or !std.unicode.utf8ValidateSlice(field)) return error.InvalidResponse;
+            total += field.len;
+            if (i != 0 and std.mem.order(u8, fields[i - 1], field) != .lt) return error.InvalidResponse;
+        }
+    }
+
+    pub fn encode(a: std.mem.Allocator, result: db_mod.types.LookupResult) ![]u8 {
+        if (result.json.len > max_document_bytes) return error.InvalidResponse;
+        const fields = try a.dupe([]const u8, result.json_null_fields);
+        defer a.free(fields);
+        std.mem.sort([]const u8, fields, {}, struct {
+            fn less(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.less);
+        try requireMetadata(result.json, fields);
+        const encoded = try std.json.Stringify.valueAlloc(a, Wire{ .kind = .typed_primary_lookup_v1, .json = result.json, .json_null_fields = fields }, .{});
+        errdefer a.free(encoded);
+        if (encoded.len > max_bytes) return error.InvalidResponse;
+        return encoded;
+    }
+
+    pub fn decode(a: std.mem.Allocator, bytes: []const u8) !db_mod.types.LookupResult {
+        if (bytes.len > max_bytes) return error.InvalidResponse;
+        var parsed = std.json.parseFromSlice(Wire, a, bytes, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidResponse;
+        defer parsed.deinit();
+        try requireMetadata(parsed.value.json, parsed.value.json_null_fields);
+        const flags = try db_mod.types.cloneJsonNullFields(a, parsed.value.json_null_fields);
+        errdefer {
+            for (flags) |field| a.free(field);
+            if (flags.len != 0) a.free(flags);
+        }
+        return .{ .json = try a.dupe(u8, parsed.value.json), .json_null_fields = flags };
+    }
+};
 
 pub const StorageKernelDocumentArtifactManifestWireRequest = struct {
     doc_key: []const u8,

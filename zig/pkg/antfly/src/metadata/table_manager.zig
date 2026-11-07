@@ -24,7 +24,40 @@ pub const dense_native_storage_protocol_version: u16 = 1;
 pub const coordinated_integrity_protocol_version: u16 = 2;
 pub const query_population_protocol_version: u16 = 3;
 pub const materialized_view_protocol_version: u16 = 4;
-pub const relational_topology_protocol_version: u16 = materialized_view_protocol_version;
+/// Raw graph reads fail closed under RLS; retained SQL graph cuts reauthorize
+/// each traversed node. Publication requires every data owner to attest this.
+pub const graph_row_policy_protocol_version: u16 = 5;
+/// Native-local TEMP/UNLOGGED owners and authenticated boot recovery.
+/// Artifact-backed restoration has an independent, stricter admission floor.
+pub const native_relation_protocol_version: u16 = 6;
+/// Atomic graph attachments in prepared primary-row intents.
+pub const graph_transaction_protocol_version: u16 = 7;
+comptime {
+    // Store registration and status producers publish this exact constant.
+    // A build cannot advertise semantic7 with the historical batch33 decoder.
+    const batch = @import("../common/data_raft_protocol.zig");
+    if (!batch.graphCapabilityCoupled(relational_topology_protocol_version, batch.batch_protocol_version))
+        @compileError("semantic data7 requires serving Raft batch34");
+}
+/// Artifact-backed native restoration requires independently qualified image
+/// repair and replay after owner loss. A decoder ceiling is not readiness.
+pub const native_nonempty_restore_protocol_version: u16 = 9;
+/// Paired schema/policy install requires the batch35 decoder at every owner.
+pub const coupled_schema_policy_protocol_version: u16 = 8;
+
+/// Query populations and proven empty images need only the native owner lane.
+/// Artifact-backed images (including rewrites) additionally need durable repair.
+pub fn nativeRestoreRequiredProtocolVersion(target: anytype) u16 {
+    if (target.table.sql_persistence == null) return 0;
+    if (!target.empty_generation and (target.rewrite != null or target.source_artifacts.len != 0))
+        return native_nonempty_restore_protocol_version;
+    return native_relation_protocol_version;
+}
+/// Stored requirements can be decoded before a serving binary advertises a
+/// new capability. This ceiling grants neither placement nor native opens.
+pub const maximum_decodable_relational_topology_floor_version: u16 = native_nonempty_restore_protocol_version;
+
+pub const relational_topology_protocol_version: u16 = coupled_schema_policy_protocol_version;
 pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("antfly_local_sources").common_group_ids;
 const topology_records = @import("antfly_local_sources").common_topology_records;
@@ -74,7 +107,7 @@ pub const TableRecord = @import("antfly_local_sources").metadata_local_catalog.T
 pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return std.mem.eql(u8, lhs.sql_native_indexes_json, rhs.sql_native_indexes_json) and lhs.sql_materialized_view_id == rhs.sql_materialized_view_id and std.meta.eql(lhs.schema_reader_requirements, rhs.schema_reader_requirements) and
+    return std.meta.eql(lhs.sql_persistence, rhs.sql_persistence) and std.mem.eql(u8, lhs.sql_native_indexes_json, rhs.sql_native_indexes_json) and lhs.sql_materialized_view_id == rhs.sql_materialized_view_id and std.meta.eql(lhs.schema_reader_requirements, rhs.schema_reader_requirements) and
         (if (lhs.full_text_read_index) |name| if (rhs.full_text_read_index) |other| std.mem.eql(u8, name, other) else false else rhs.full_text_read_index == null) and
         @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
         lhs.storage.engine == rhs.storage.engine and
@@ -135,6 +168,10 @@ fn hashTableDefinitionPart(hasher: *std.crypto.hash.sha2.Sha256, value: []const 
 pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerprint {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-table-definition-v1");
+    if (table.sql_persistence) |descriptor| {
+        hashTableDefinitionPart(&hasher, "sql-relation-persistence-v1");
+        hasher.update(&descriptor.fingerprintUnchecked());
+    }
     if (table.schema_reader_requirements) |requirements| {
         hashTableDefinitionPart(&hasher, "schema-reader-requirements-v1");
         var versions: [8]u8 = undefined;
@@ -2308,6 +2345,7 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
     const restore_location = try alloc.dupe(u8, "");
     errdefer alloc.free(restore_location);
     return .{
+        .sql_persistence = record.sql_persistence,
         .table_id = record.table_id,
         .name = name,
         .description = description,
@@ -3632,4 +3670,26 @@ test "source vector migration catalog fences configurations topology and stale p
     complete.storage_migration = null;
     try manager.publishVectorMigrationTable(published, complete);
     try std.testing.expectError(error.UnsupportedVectorMigrationDirection, manager.publishVectorMigrationTable(complete, before));
+}
+
+test "native restore capability distinguishes artifact replay from populations and empty images" {
+    const Target = struct {
+        table: struct { sql_persistence: ?u8 = null } = .{},
+        empty_generation: bool = false,
+        rewrite: ?u8 = null,
+        source_artifacts: []const u8 = &.{},
+    };
+    var target: Target = .{};
+    try std.testing.expectEqual(@as(u16, 0), nativeRestoreRequiredProtocolVersion(target));
+    target.table.sql_persistence = 1;
+    try std.testing.expectEqual(native_relation_protocol_version, nativeRestoreRequiredProtocolVersion(target));
+    target.source_artifacts = &.{1};
+    try std.testing.expectEqual(native_nonempty_restore_protocol_version, nativeRestoreRequiredProtocolVersion(target));
+    target.empty_generation = true;
+    try std.testing.expectEqual(native_relation_protocol_version, nativeRestoreRequiredProtocolVersion(target));
+    target.empty_generation = false;
+    target.source_artifacts = &.{};
+    target.rewrite = 1;
+    try std.testing.expectEqual(native_nonempty_restore_protocol_version, nativeRestoreRequiredProtocolVersion(target));
+    try std.testing.expect(relational_topology_protocol_version < native_nonempty_restore_protocol_version);
 }

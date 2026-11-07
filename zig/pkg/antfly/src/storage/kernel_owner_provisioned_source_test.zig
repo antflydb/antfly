@@ -1046,6 +1046,21 @@ test "native index owner adapter inspects cold native ownership and rejects fore
     }
 }
 
+fn applyCommittedSnapshotFixtureEntry(owner: *@import("kernel_owner_client.zig").Owner, table: []const u8, body: []const u8, term: u64, index: u64) !@import("kernel_owner_client.zig").Response {
+    const clock = @import("antfly_platform").time;
+    const deadline = clock.monotonicNs() +| 2 * std.time.ns_per_s;
+    while (true) {
+        return owner.replicatedBatchAtRaftEntryJson(table, body, term, index) catch |err| switch (err) {
+            error.RaftApplyWriterUnavailable => {
+                if (clock.monotonicNs() >= deadline) return err;
+                try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
 /// Actual native snapshot materialization/installation followed by retained
 /// control replay. Committed entries are fixture inputs, not quorum evidence;
 /// no metadata root adoption or source grant is inferred from applying them.
@@ -1098,7 +1113,7 @@ fn qualifySchemaSnapshotReplay(
     const binding = prepared_binding: {
         var seed = try client.Owner.open(.{ .path = .fromSlice(source_path), .table_name = .fromSlice("items"), .group_id = group, .lsm_root_generation = source_generation.value, .has_identity_namespace = 1, .identity_table_id = namespace.table_id, .identity_shard_id = namespace.shard_id, .identity_range_id = namespace.range_id, .online_source_authority = 1, .schema_json = .fromSlice(before), .indexes_json = .fromSlice("{}") });
         defer seed.deinit();
-        var written = try seed.replicatedBatchAtRaftEntryJson("items", row_json, 1, 2);
+        var written = try applyCommittedSnapshotFixtureEntry(&seed, "items", row_json, 1, 2);
         written.deinit();
         var found = try seed.lookupJson("items", lookup);
         defer found.deinit();

@@ -37,9 +37,13 @@ pub const Source = struct {
     peer_descriptor: ?@import("antfly_local_sources").storage_db_source_artifact_transfer.Descriptor = null,
 };
 pub const Request = struct {
+    /// Routing hint captured from the admitted immutable target. The receiver
+    /// rejoins the actual job descriptor before choosing an execution lane.
+    native_execution: ?@import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor = null,
     scope: staging.Scope,
-    action: enum { begin, import_page, status, validate, install_generation_admissions, publish, cancel },
+    action: enum { begin, import_page, status, validate, install_generation_admissions, publish, cancel, install_native_empty },
     generation_admissions: ?staging.InstallGenerationAdmissions = null,
+    native_empty_install: ?@import("antfly_local_sources").storage_db_native_empty_generation.Install = null,
     source: ?Source = null,
     source_chunk: ?@import("antfly_local_sources").storage_db_source_artifact_transfer.ReadResponse = null,
     rewrite: ?@import("antfly_local_sources").storage_db_relational_rewrite_contract.Intent = null,
@@ -48,16 +52,21 @@ pub const Request = struct {
     population_page: ?@import("antfly_local_sources").storage_db_relational_population_contract.Page = null,
     population_complete: ?@import("antfly_local_sources").storage_db_relational_population_contract.Completion = null,
     max_rows: u16 = 128,
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return ((comptime std.mem.eql(u8, field, "native_execution")) and self.native_execution == null) or
+            ((comptime std.mem.eql(u8, field, "native_empty_install")) and self.native_empty_install == null);
+    }
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, jw);
     }
     /// A post-proposal receipt read must not replay import-only data or final
     /// cut commands. Its exact scope is all the authority a status read needs.
     pub fn statusRead(self: Request) Request {
-        return .{ .scope = self.scope, .action = .status, .max_rows = self.max_rows };
+        return .{ .scope = self.scope, .action = .status, .max_rows = self.max_rows, .native_execution = self.native_execution };
     }
     pub fn validate(self: Request, group_id: u64) !void {
         try self.scope.validate();
+        if (self.native_execution) |native| try native.validate();
         if (self.scope.population) |binding| {
             const fields = @as(u8, @intFromBool(self.population_page != null)) + @intFromBool(self.population_complete != null);
             if ((self.action == .import_page and fields != 1) or (self.action != .import_page and fields != 0) or
@@ -70,6 +79,15 @@ pub const Request = struct {
             if (self.population_complete) |receipt| if (!std.mem.eql(u8, &receipt.binding, &try binding.digest())) return error.RestoreStagingScopeChanged;
         } else if (self.population_page != null or self.population_complete != null) return error.InvalidRestoreStagingCommand;
         if ((self.action == .install_generation_admissions) != (self.generation_admissions != null)) return error.InvalidRestoreStagingCommand;
+        if ((self.action == .install_native_empty) != (self.native_empty_install != null)) return error.InvalidRestoreStagingCommand;
+        if (self.native_empty_install) |command| {
+            try command.validate();
+            const origin = self.scope.native_empty_origin orelse return error.InvalidRestoreStagingCommand;
+            if (!std.meta.eql(origin, command.origin)) return error.RestoreStagingScopeChanged;
+            if (self.native_execution == null or self.native_execution.?.kind != .unlogged or !self.scope.empty_generation or
+                !std.mem.eql(u8, &command.scope, &self.scope.digest()) or self.source != null or self.source_chunk != null or
+                self.rewrite != null or self.rewrite_tail != null or self.rewrite_finish != null) return error.InvalidRestoreStagingCommand;
+        }
         if (self.generation_admissions) |command| {
             try command.validate();
             if (!std.mem.eql(u8, &command.scope, &self.scope.digest()) or self.source != null or self.source_chunk != null or
@@ -111,10 +129,21 @@ pub const Response = struct {
     rows: u64,
     receipt: staging.Digest,
     generation_admission_receipt: ?staging.Digest = null,
+    native_empty_receipt: ?staging.Digest = null,
+    native_empty_commit: ?@import("antfly_local_sources").storage_db_native_empty_generation.Receipt = null,
+    native_empty_acceptance: ?@import("../metadata/native_restore_acceptance.zig").Acceptance = null,
     population: ?@import("antfly_local_sources").storage_db_relational_population_contract.Cursor = null,
     rewrite: ?@import("antfly_local_sources").storage_db_relational_rewrite_contract.Progress = null,
     tail_next: u32 = 0,
     source_next_offset: u64 = 0,
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return ((comptime std.mem.eql(u8, field, "native_empty_receipt")) and self.native_empty_receipt == null) or
+            ((comptime std.mem.eql(u8, field, "native_empty_commit")) and self.native_empty_commit == null) or
+            ((comptime std.mem.eql(u8, field, "native_empty_acceptance")) and self.native_empty_acceptance == null);
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, writer);
+    }
 };
 
 pub fn validatePeerSource(source: Source, scope: staging.Scope, descriptor: @import("antfly_local_sources").storage_db_source_artifact_transfer.Descriptor) !void {
@@ -125,7 +154,7 @@ pub fn validatePeerSource(source: Source, scope: staging.Scope, descriptor: @imp
     if (!std.meta.eql(binding, artifact_binding)) return error.RestoreStagingScopeChanged;
     try descriptor.scope.validate();
     const certificate_digest = try descriptor.certificate.digest();
-    if (source.location.len != 0 or source.connection.len != 0 or source.artifact.format != .portable or source.artifact.cohort_seal != null or
+    if (source.location.len != 0 or source.connection.len != 0 or source.artifact.format != .portable or source.artifact.cohort_seal != null or source.artifact.repository_schema_digest != null or
         descriptor.total_bytes == 0 or descriptor.total_bytes > std.math.maxInt(i64) or descriptor.total_bytes != source.artifact.artifact_size_bytes or
         !std.meta.eql(descriptor.scope, source_scope) or !source_scope.receiver_namespace.eql(scope.target_namespace) or !descriptor.certificate.cut.namespace.eql(scope.source_namespace) or
         descriptor.certificate.cut.applied_index != binding.source_applied_index or descriptor.certificate.cut.retained_start != binding.retained_start or

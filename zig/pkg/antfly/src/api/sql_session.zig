@@ -61,41 +61,67 @@ pub const Coordinator = struct {
 
     /// Publish SQL metadata and native control intent together. Recovery only
     /// drains native control; it never evaluates this SQL operation again.
+    const SavepointPhase = enum { admission, session, source, executing, load, renewal, plan, publication, drain };
+
     pub fn savepoint(ptr: *anyopaque, scope: sql.Scope, id: sql.Id, name: []const u8, action: transactions.SessionRegistry.SqlSavepointAction) !void {
+        var phase: SavepointPhase = .admission;
+        return savepointChecked(ptr, scope, id, name, action, &phase) catch |err| {
+            if (comptime @import("builtin").mode == .debug) {
+                const Once = struct {
+                    var reported: std.atomic.Value(bool) = .init(false);
+                };
+                if (!Once.reported.swap(true, .monotonic)) {
+                    const coordinator: *Coordinator = @ptrCast(@alignCast(ptr));
+                    std.debug.print("native SQL savepoint phase={s} owner={} err={s}\n", .{ @tagName(phase), coordinator.context.sql_relation_owner != null, @errorName(err) });
+                }
+            }
+            return err;
+        };
+    }
+
+    fn savepointChecked(ptr: *anyopaque, scope: sql.Scope, id: sql.Id, name: []const u8, action: transactions.SessionRegistry.SqlSavepointAction, phase: *SavepointPhase) !void {
         const self: *Coordinator = @ptrCast(@alignCast(ptr));
         try self.context.ensureActive();
         const fence = self.context.sql_command_fence orelse return error.SqlConnectionBusy;
         const store = self.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+        phase.* = .session;
         var state = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
         defer state.deinit(self.server.alloc);
         const connection = state.connection_id orelse return error.SqlConnectionNotFound;
         const producer = @import("sql_command_producer.zig");
         const io = self.server.embedding_provider_runtime.io;
+        phase.* = .source;
         const instance = try self.server.sql_connection_admission.executionInstance(io);
         const frame: @import("sql_advisory_execution.zig").Frame = .{ .source = store, .connection = connection, .principal = scope.principal, .instance = instance, .fence = fence.*, .actor = try @import("sql_authorization_recovery.zig").actor(self.server, self.identity.*) };
         var native: producer.NativePort = .{ .server = self.server, .context = self.context };
         for (0..8) |_| {
+            phase.* = .executing;
             try frame.requireExecuting(self.server.alloc, platform_time.realtimeNs() / std.time.ns_per_ms);
+            phase.* = .load;
             var owned = (try producer.load(store, self.server.alloc, connection)) orelse return error.SqlConnectionNotFound;
             defer owned.deinit();
             var nonce: [16]u8 = undefined;
             try io.randomSecure(&nonce);
             if (owned.value.pending != null and owned.value.pending.?.operation == .renew) {
+                phase.* = .renewal;
                 producer.advance(store, self.server.alloc, scope.principal, owned.value, instance, platform_time.realtimeNs() / std.time.ns_per_ms, nonce, native.port()) catch |err| switch (err) {
                     error.MetadataMutationOutcomeUnknown, error.SqlConnectionChanged => {},
                     else => return err,
                 };
                 continue;
             }
+            phase.* = .plan;
             var plan = try producer.observeControlPlan(self.server.alloc, owned.value, instance, id, platform_time.realtimeNs() / std.time.ns_per_ms, nonce, native.port());
             try self.context.ensureActive();
             plan.now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+            phase.* = .publication;
             _ = (self.server.txn_sessions.changeSqlSavepoint(self.server.alloc, id, name, action, plan) catch |err| switch (err) {
                 // A failed source CAS aborts the whole SQL publication. Only
                 // that proven pre-publication failure permits replanning.
                 error.SqlConnectionChanged => continue,
                 else => return err,
             }) orelse return error.SqlSavepointNotFound;
+            phase.* = .drain;
             try self.drainControl(scope.principal, connection, instance, owned.value.ticket.?);
             return;
         }
@@ -295,7 +321,12 @@ pub const Coordinator = struct {
         defer plan.deinit();
         // Once the durable plan is sealed, no error is safe to turn into a
         // replay invitation. Maintenance owns completion under this same id.
-        const outcome = (source.commitTransactionWithIdAndCancellation(alloc, id, info.begin_timestamp, plan.value, frozen.sync_level, self.context.cancellation) catch |err| {
+        // Serialization deliberately removes process-local capabilities. Only
+        // this authenticated immediate execution may reconstruct user authority;
+        // recovery uses the existing external decision owner instead.
+        const owner_tables = try @import("sql_relation_lifetimes.zig").attachOwnerMinters(server, proof_arena.allocator(), commit_context, plan.value);
+        const execution_tables = try @import("sql_trigger_authority.zig").attachMinters(server, proof_arena.allocator(), commit_context, owner_tables);
+        const outcome = (source.commitTransactionWithIdAndCancellation(alloc, id, info.begin_timestamp, execution_tables, frozen.sync_level, self.context.cancellation) catch |err| {
             if (transactions.classifyCommitRejection(info, err) == .fresh) {
                 _ = (server.txn_sessions.recordTerminalAbort(alloc, id) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
                 return .{ .outcome = .aborted, .reconciliation_id = id };
@@ -473,7 +504,10 @@ pub const Adapter = struct {
                     self.connectionMutation(scope, .{ .uncertain = .{ .id = connection, .txn_id = id } }) catch {};
                 return err;
             };
-            if (self.connection_id) |connection| self.connectionMutation(scope, .{ .terminal = .{ .id = connection, .txn_id = id } }) catch {};
+            // A known ABORT is not complete at this SQL boundary until
+            // its exact connection attachment is durably detached. A lost
+            // detach reply retains same-ID reconciliation ownership.
+            if (self.connection_id) |connection| try self.connectionMutation(scope, .{ .terminal = .{ .id = connection, .txn_id = id } });
             return;
         }
         if (self.connection_id) |connection|

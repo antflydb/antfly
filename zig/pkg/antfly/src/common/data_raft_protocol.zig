@@ -40,7 +40,29 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 33;
+pub const batch_protocol_version: u16 = batch_coupled_schema_policy_protocol_version;
+pub const batch_coupled_schema_policy_protocol_version: u16 = 35;
+/// Prepared graph attachments change both the root batch and intent payload.
+/// Serving remains independent: parsing a reserved barrier never admits it.
+pub const batch_graph_transaction_protocol_version: u16 = 34;
+pub const maximum_decodable_batch_protocol_version: u16 = batch_coupled_schema_policy_protocol_version;
+
+/// Semantic data7 includes the graph batch34 decoder. Every production store
+/// report uses the compiled semantic version; overrides cannot split this pair.
+pub fn graphCapabilityCoupled(data_version: u16, batch_version: u16) bool {
+    return (data_version < 7 or batch_version >= batch_graph_transaction_protocol_version) and
+        (data_version < 8 or batch_version >= batch_coupled_schema_policy_protocol_version);
+}
+
+test "graph capability requires batch34 and never treats the decoder ceiling as serving support" {
+    const testing = @import("std").testing;
+    try testing.expect(graphCapabilityCoupled(6, 33));
+    try testing.expect(!graphCapabilityCoupled(7, 33));
+    try testing.expect(graphCapabilityCoupled(7, 34));
+    try testing.expect(!graphCapabilityCoupled(8, 34));
+    try testing.expect(graphCapabilityCoupled(8, 35));
+    try testing.expect(maximum_decodable_batch_protocol_version >= batch_protocol_version);
+}
 /// Document retirement binds the exact source definition under the apply
 /// writer and persists a source-only proof without a relational catalog.
 pub const batch_document_retirement_protocol_version: u16 = 33;

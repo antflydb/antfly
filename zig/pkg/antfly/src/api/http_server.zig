@@ -24,6 +24,22 @@ const TestDirectory = @import("antfly_local_sources").common_test_directory.Test
 const ant_json = @import("antfly-json");
 const kernel_abi = @import("kernel_abi.zig");
 const builtin = @import("builtin");
+var constraint_activation_trace_seen: std.atomic.Value(bool) = .init(false);
+var prepared_recovery_restore_bound_trace_seen: std.atomic.Value(bool) = .init(false);
+fn diagnosePreparedRecoveryRestoreBound(err: anyerror) void {
+    if (comptime builtin.mode == .debug) {
+        if (err != error.RestoreJobRecordTooLarge or prepared_recovery_restore_bound_trace_seen.swap(true, .monotonic)) return;
+        std.debug.print("prepared recovery catch site=advance_work err={s}\n", .{@errorName(err)});
+    }
+}
+
+fn diagnoseConstraintActivation(err: anyerror, _: ?*std.builtin.StackTrace) void {
+    if (comptime builtin.mode == .debug) {
+        if (err != error.MetadataSnapshotHeadMismatch or constraint_activation_trace_seen.swap(true, .monotonic)) return;
+        std.debug.print("metadata cut catch stage=constraint_activation err={s}\n", .{@errorName(err)});
+    }
+}
+
 const test_runtime_support = if (builtin.is_test) @import("http_test_runtime.zig") else struct {};
 const platform = @import("antfly_platform");
 const build_options = @import("build_options");
@@ -1666,6 +1682,9 @@ pub const ApiHttpServerConfig = struct {
     ard_publisher_domain: []const u8 = "antfly.local",
     ard_display_name: []const u8 = "Antfly",
     ard_public_catalog_enabled: bool = false,
+    /// Private grant authority; never enables public principal authentication.
+    sql_preparation_secret: ?[]const u8 = null,
+    sql_preparation_issuer: ?[]const u8 = null,
     trusted_principal_secret: ?[]const u8 = null,
     trusted_principal_issuer: ?[]const u8 = null,
     setting_authority_secret: ?[]const u8 = null,
@@ -1714,6 +1733,7 @@ pub const ApiHttpServerConfig = struct {
     relational_index_claims: ?@import("relational_index_owner_execution.zig").ClaimPort = null,
     relational_index_control: ?@import("relational_index_owner_execution.zig").ControlPort = null,
     schema_validation_preparation: ?@import("schema_validation_preparation.zig").Port = null,
+    table_retirement_preparation: ?@import("table_retirement_preparation.zig").Port = null,
     row_policy_install: ?@import("row_policy_install.zig").Port = null,
     online_merge_io: ?@import("online_merge_io.zig").Port = null,
     secret_store: ?*common_secrets.FileStore = null,
@@ -2054,6 +2074,8 @@ pub const StatusSource = struct {
 
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
+        /// Exact native control destination, owned by caller; never a row or Raft route capability.
+        native_owner_data_uri: ?*const fn (*anyopaque, std.mem.Allocator, u64, u64, api_operation.RequestContext) anyerror!?[]u8 = null,
         /// Complete catalog and store capabilities without detailed inventories.
         control_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         cached_admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!?metadata_api.AdminSnapshot = null,
@@ -2165,21 +2187,27 @@ pub const StatusSource = struct {
         };
         errdefer alloc.free(bytes);
         switch (input) {
+            .write_validation => {
+                var parsed = try std.json.parseFromSlice(@import("../system_catalog/projection.zig").WriteValidation, alloc, bytes, .{});
+                defer parsed.deinit();
+                try parsed.value.requireOwner(context.sql_relation_owner);
+            },
             .query_definition => {
                 var parsed = try std.json.parseFromSlice(?system_catalog.QueryDefinition, alloc, bytes, .{ .ignore_unknown_fields = true });
                 defer parsed.deinit();
-                if (parsed.value) |definition| try @import("antfly_local_sources").api_operation.requireNativeServiceAccess(definition.native_service, context.native_service);
+                if (parsed.value) |definition| try definition.requireRequestAccess(context.native_service, context.sql_relation_owner);
             },
             .resolve => {
                 var parsed = try std.json.parseFromSlice(?system_catalog.ResolvedTable, alloc, bytes, .{ .ignore_unknown_fields = true });
                 defer parsed.deinit();
-                if (parsed.value) |table| try table.requireAccess(context.native_service);
+                if (parsed.value) |table| try table.requireRequestAccess(context.native_service, context.sql_relation_owner);
             },
             .resolve_many => {
                 var parsed = try std.json.parseFromSlice(system_catalog.ResolvedMany, alloc, bytes, .{ .ignore_unknown_fields = true });
                 defer parsed.deinit();
-                for (parsed.value.tables) |table| if (table) |value| try value.requireAccess(context.native_service);
-                for (parsed.value.relations) |relation| if (relation) |value| try value.table.requireAccess(context.native_service);
+                for (parsed.value.tables) |table| if (table) |value| try value.requireRequestAccess(context.native_service, context.sql_relation_owner);
+                for (parsed.value.storage_tables) |table| if (table) |value| try value.requireRequestAccess(context.native_service, context.sql_relation_owner);
+                for (parsed.value.relations) |relation| if (relation) |value| try value.table.requireRequestAccess(context.native_service, context.sql_relation_owner);
             },
             else => {},
         }
@@ -2196,6 +2224,18 @@ pub const StatusSource = struct {
 
     pub fn status(self: StatusSource) !metadata_api.MetadataStatus {
         return try BoundaryAbi.call("status", self.boundary_dispatch, self.vtable.status, .{self.ptr});
+    }
+
+    pub fn nativeOwnerDataUri(self: StatusSource, alloc: std.mem.Allocator, node_id: u64, store_id: u64, input: api_operation.RequestContext) !?[]u8 {
+        const context = try input.platformDeadline();
+        try context.ensureActive();
+        if (node_id == 0 or store_id == 0) return error.InvalidCatalogRecord;
+        const callback = self.vtable.native_owner_data_uri orelse return error.SqlRelationOwnerUnavailable;
+        const uri = try BoundaryAbi.call("native_owner_data_uri", self.boundary_dispatch, callback, .{ self.ptr, alloc, node_id, store_id, context });
+        errdefer if (uri) |value| alloc.free(value);
+        try context.ensureActive();
+        if (uri) |value| if (value.len == 0) return error.InvalidResponse;
+        return uri;
     }
 
     pub fn adminSnapshot(self: StatusSource) !?metadata_api.AdminSnapshot {
@@ -2562,6 +2602,10 @@ pub const StatusSource = struct {
                 return try cast(ptr).status();
             }
 
+            fn nativeOwnerDataUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64, store_id: u64, context: api_operation.RequestContext) anyerror!?[]u8 {
+                return cast(ptr).nativeOwnerDataUri(alloc, node_id, store_id, context);
+            }
+
             fn adminSnapshot(ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot {
                 return try cast(ptr).adminSnapshot();
             }
@@ -2859,6 +2903,7 @@ pub const StatusSource = struct {
             .supports_resolver_authority = true,
             .status = Gen.status,
             .admin_snapshot = Gen.adminSnapshot,
+            .native_owner_data_uri = if (@hasDecl(T, "nativeOwnerDataUri")) Gen.nativeOwnerDataUri else null,
             .control_snapshot = if (@hasDecl(T, "controlSnapshot")) Gen.controlSnapshot else null,
             .acquire_join_planning = Gen.acquireJoinPlanning,
             .cached_admin_snapshot = Gen.cachedAdminSnapshot,
@@ -4069,6 +4114,8 @@ pub const ApiHttpServer = struct {
     fk_generation_publication_cursor: std.atomic.Value(u64) = .init(0),
     table_retirement_cursor: std.atomic.Value(u64) = .init(0),
     scope_retirement_cursor: std.atomic.Value(u64) = .init(0),
+    temporary_cleanup_cursor: std.atomic.Value(u64) = .init(0),
+    temporary_cleanup_poll_after_ns: std.atomic.Value(u64) = .init(0),
     fk_publication_test_control: if (builtin.is_test) struct {
         paused: std.atomic.Value(bool) = .init(false),
         in_flight: std.atomic.Value(u32) = .init(0),
@@ -4956,6 +5003,19 @@ pub const ApiHttpServer = struct {
         return registry;
     }
 
+    /// Invoked after ingress and its request borrowers have joined, while the
+    /// catalog, transport, session store and native owners can still advance.
+    pub fn drainSqlConnections(self: *ApiHttpServer, deadline: @import("../common/runtime_lifecycle.zig").ShutdownDeadline) !void {
+        self.stopSqlCommandUpkeep();
+        if (self.cfg.backend_runtime) |runtime| {
+            if (self.session_maintenance_owner_id != 0) {
+                runtime.durable_jobs.closeOwner(self.session_maintenance_owner_id);
+                self.session_maintenance_owner_id = 0;
+            }
+        }
+        try @import("sql_command_producer.zig").drainCurrentProcess(self, deadline);
+    }
+
     pub fn deinit(self: *ApiHttpServer) void {
         self.stopSqlCommandUpkeep();
         self.object_tables.deinit(self.owner_alloc);
@@ -5063,6 +5123,17 @@ pub const ApiHttpServer = struct {
         switch (request) {
             .admit => |req| {
                 try self.requireGenerationAuthority(req.destination_authorization_principal, req.table_names.?, true);
+                if (req.source_kind == .empty_generation) {
+                    // TRUNCATE CASCADE also fences unchanged external parents.
+                    // Recheck their actual current ACLs at the metadata owner.
+                    var region = std.heap.ArenaAllocator.init(a);
+                    defer region.deinit();
+                    const scratch = region.allocator();
+                    const plan = try std.json.parseFromSliceLeaky(@import("../metadata/restore_staging.zig").Plan, scratch, req.generation_plan_json.?, .{});
+                    const parents = try scratch.alloc([]const u8, plan.external_fk_parents.len);
+                    for (plan.external_fk_parents, parents) |parent, *name| name.* = parent.table.name;
+                    try self.requireGenerationAuthority(req.destination_authorization_principal, parents, true);
+                }
                 const result = try self.restore_job_store.startRecoverableObserved(a, req, true, context.sql_completion_submission);
                 const bound = try @import("../metadata/query_population_job.zig").bindAdmission(a, self.source, context, result);
                 defer switch (bound.result) {
@@ -5070,6 +5141,62 @@ pub const ApiHttpServer = struct {
                 };
                 self.schedulePendingRestoreJobs() catch {};
                 return std.json.Stringify.valueAlloc(a, bound, .{});
+            },
+            .recover_native_entry => |recovery| {
+                const contract = @import("../metadata/query_population_job.zig");
+                const native = recovery.entry.descriptor;
+                const observed_bytes = try self.source.systemCatalog(a, context, .{ .sql_relation_boot_read = .{ .node = native.owner_node_id, .binding_table = recovery.entry.table_id } });
+                defer a.free(observed_bytes);
+                var observed = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, a, observed_bytes, .{});
+                defer observed.deinit();
+                if (!observed.value.registration_current or observed.value.record == null or !std.meta.eql(observed.value.record.?, recovery.boot)) return error.SqlRelationOwnerChanged;
+                if (native.kind == .unlogged) {
+                    const actual = observed.value.initialized orelse return error.SqlRelationRecoveryIncomplete;
+                    if (!std.mem.eql(u8, &try actual.digest(), &try recovery.entry.initialized.?.digest()) or !actual.binding.descriptor.eql(native)) return error.SqlRelationOwnerChanged;
+                    @import("sql_truncate.zig").recoverNativeLoss(self, a, recovery.boot, recovery.entry, context) catch |err| switch (err) {
+                        error.SqlRelationRecoveryIncomplete => return std.json.Stringify.valueAlloc(a, contract.NativeRecoveryResult{ .phase = .pending }, .{}),
+                        else => return err,
+                    };
+                    // This planner's successful path still requires a later
+                    // canonical entry/retirement proof, never admission alone.
+                    return std.json.Stringify.valueAlloc(a, contract.NativeRecoveryResult{ .phase = .pending }, .{});
+                }
+                @import("sql_temporary_lifecycle.zig").retireLostNativeEntry(self, a, recovery.boot, recovery.entry, context) catch |err| switch (err) {
+                    error.SqlRelationRecoveryIncomplete => return std.json.Stringify.valueAlloc(a, contract.NativeRecoveryResult{ .phase = .pending }, .{}),
+                    else => return err,
+                };
+                // TEMP helper returns only after the exact canonical scope
+                // checkpoint proves this entry irreversibly retired.
+                return std.json.Stringify.valueAlloc(a, contract.NativeRecoveryResult{ .phase = .retired }, .{});
+            },
+            .cancel_lost_native => |lost| {
+                const stages = @import("../metadata/restore_staging.zig");
+                const control = @import("../metadata/query_population_job.zig");
+                const job_id = std.mem.readInt(u64, lost.scope.plan_id[0..8], .little);
+                const bytes = (try self.restore_job_store.load(a, job_id)) orelse return error.RestoreStagingScopeChanged;
+                defer a.free(bytes);
+                var state = try std.json.parseFromSlice(restore_jobs.JobState, a, bytes, .{ .ignore_unknown_fields = true });
+                defer state.deinit();
+                const actual_scope = try stages.idForAttempt(job_id, state.value.staging_attempt_id);
+                if (state.value.source_kind != .query_population or !std.mem.eql(u8, &actual_scope, &lost.scope.plan_id)) return error.RestoreStagingScopeChanged;
+                const raw = (try self.source.getRestoreStaging(a, actual_scope, context)) orelse return error.RestoreStagingScopeChanged;
+                defer a.free(raw);
+                var job = try std.json.parseFromSlice(stages.Job, a, raw, .{ .allocate = .alloc_always });
+                defer job.deinit();
+                if (!std.mem.eql(u8, &job.value.plan.id, &actual_scope) or !std.mem.eql(u8, &job.value.plan_digest, &lost.scope.plan_digest) or !std.mem.eql(u8, &try job.value.plan.digest(a), &lost.scope.plan_digest) or job.value.plan.targets.len != 1) return error.RestoreStagingScopeChanged;
+                const target = job.value.plan.targets[0];
+                const native = target.table.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+                if (target.table.table_id != lost.table_id or target.ranges.len != 1 or target.native_reset != null or target.rewrite != null or target.schema_only_snapshot != null or target.source_artifacts.len != 0) return error.RestoreStagingScopeChanged;
+                const observed_bytes = try self.source.systemCatalog(a, context, .{ .sql_relation_boot_read = .{ .node = native.owner_node_id, .binding_table = lost.table_id, .creation_scope = lost.scope } });
+                defer a.free(observed_bytes);
+                var observed = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, a, observed_bytes, .{});
+                defer observed.deinit();
+                try lost.requireObserved(target, observed.value);
+                const reference: control.Reference = .{ .job_id = job_id, .namespace = state.value.idempotency_namespace, .key = state.value.idempotency_key, .fingerprint = state.value.request_fingerprint, .plan_digest = lost.scope.plan_digest };
+                // Only the actual metadata job owner touches its Store. The
+                // standard cancellation retains its immutable principal and
+                // runs the existing staged owner/cooperative cleanup lane.
+                return self.executeQueryPopulationJob(a, context, .{ .cancel = reference });
             },
             .observe, .cancel => |ref| {
                 const bytes = (try self.restore_job_store.load(a, ref.job_id)) orelse return a.dupe(u8, "null");
@@ -5686,7 +5813,10 @@ pub const ApiHttpServer = struct {
             error.Canceled,
             error.DeadlineExceeded,
             => {},
-            else => std.log.warn("relational constraint activation deferred err={s}", .{@errorName(err)}),
+            else => {
+                diagnoseConstraintActivation(err, @errorReturnTrace());
+                std.log.warn("relational constraint activation deferred err={s}", .{@errorName(err)});
+            },
         };
         self.runScopeRetirementMaintenanceOnce();
         self.advanceTableRetirementOnce() catch |err| {
@@ -5738,7 +5868,10 @@ pub const ApiHttpServer = struct {
                 self.sql_prepared_work_due_ns = now +| std.time.ns_per_s;
                 @import("sql_prepared_coordinator.zig").advanceWork(self, &self.sql_prepared_work_cursor) catch |err| switch (err) {
                     error.UnsupportedSqlExecution, error.TableTopologyProtocolUpgradeRequired, error.CatalogGenerationChanged, error.MetadataMutationOutcomeUnknown, error.CommitDecisionUnknown, error.CommitVisibilityNotSatisfied, error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress, error.CommitPropagationIncomplete, error.Timeout, error.Canceled, error.DeadlineExceeded => {},
-                    else => std.log.warn("prepared transaction participant recovery deferred err={s}", .{@errorName(err)}),
+                    else => {
+                        diagnosePreparedRecoveryRestoreBound(err);
+                        std.log.warn("prepared transaction participant recovery deferred err={s}", .{@errorName(err)});
+                    },
                 };
             }
         }
@@ -6119,41 +6252,51 @@ pub const ApiHttpServer = struct {
         if (snapshot.ranges.len == 0) return;
         const next = self.relational_activation_range_cursor.fetchAdd(1, .monotonic) % snapshot.ranges.len;
         const owner = snapshot.ranges[next];
-        // All data nodes see the full catalog. Only the current range leader
-        // should spend RPC/transaction capacity on this restartable page.
+        // All data nodes see the full catalog. Only its current scheduling
+        // owner should spend RPC/transaction capacity on this restartable page.
         // Recheck on every pass: an election transfers scheduling immediately,
         // while the existing progress CAS rejects any old in-flight attempt.
-        if (self.cfg.relational_maintenance_leadership) |leadership| {
-            if (!leadership.isLocalLeader(owner.group_id)) return;
-        }
-        for (snapshot.tables) |table| if (table.table_id == owner.table_id) {
-            if (try @import("relational_witness_ddl.zig").cleanup(self.alloc, snapshot.tables, table)) |replacement| {
-                defer metadata_table_manager.freeTable(self.alloc, replacement);
-                // An unpublished initial child is deliberately absent from
-                // this public snapshot. Its parent support indexes still
-                // belong to the durable FK reservation. A failed cleanup CAS
-                // must not return before activation advances the parent's
-                // read-schema migration (which the FK seal awaits).
-                const context: api_operation.RequestContext = .{
-                    .deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s,
-                    .setting_admin = true,
-                    .fk_generation_publication_authority = true,
-                };
-                const lock_bytes = self.source.systemCatalog(self.alloc, context, .{ .fk_generation_table_locked = table.table_id }) catch null;
-                defer if (lock_bytes) |bytes| self.alloc.free(bytes);
-                const locked = if (lock_bytes) |bytes| blk: {
-                    var parsed = std.json.parseFromSlice(bool, self.alloc, bytes, .{}) catch break :blk true;
-                    defer parsed.deinit();
-                    break :blk parsed.value;
-                } else true; // No authority means cleanup is unsafe; activation may still progress.
-                if (!locked) {
-                    try self.source.replaceTableDefinition(table, replacement);
-                    return;
-                }
+        const table = for (snapshot.tables) |candidate| {
+            if (candidate.table_id == owner.table_id) break candidate;
+        } else return;
+        // Native groups have no Raft leader. Elect against the descriptor
+        // captured with this exact range and the current registered Boot.
+        // This grants scheduling only; page/retirement effects retain their
+        // own metadata authority and native read/write receiver checks.
+        if (!try @import("group_work_ownership.zig").mayCoordinate(
+            self.cfg.relational_maintenance_leadership,
+            self.alloc,
+            table.table_id,
+            owner.group_id,
+            table.sql_persistence,
+            if (table.relational_retirement_json.len != 0) .retirement else .serving,
+            .{ .deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s },
+        )) return;
+        if (try @import("relational_witness_ddl.zig").cleanup(self.alloc, snapshot.tables, table)) |replacement| {
+            defer metadata_table_manager.freeTable(self.alloc, replacement);
+            // An unpublished initial child is deliberately absent from
+            // this public snapshot. Its parent support indexes still
+            // belong to the durable FK reservation. A failed cleanup CAS
+            // must not return before activation advances the parent's
+            // read-schema migration (which the FK seal awaits).
+            const context: api_operation.RequestContext = .{
+                .deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s,
+                .setting_admin = true,
+                .fk_generation_publication_authority = true,
+            };
+            const lock_bytes = self.source.systemCatalog(self.alloc, context, .{ .fk_generation_table_locked = table.table_id }) catch null;
+            defer if (lock_bytes) |bytes| self.alloc.free(bytes);
+            const locked = if (lock_bytes) |bytes| blk: {
+                var parsed = std.json.parseFromSlice(bool, self.alloc, bytes, .{}) catch break :blk true;
+                defer parsed.deinit();
+                break :blk parsed.value;
+            } else true; // No authority means cleanup is unsafe; activation may still progress.
+            if (!locked) {
+                try self.source.replaceTableDefinition(table, replacement);
+                return;
             }
-            break;
-        };
-        for (snapshot.tables) |table| if (table.table_id == owner.table_id and table.relational_retirement_json.len != 0) {
+        }
+        if (table.relational_retirement_json.len != 0) {
             var job = try @import("../metadata/relational_retirement.zig").parse(self.alloc, table.relational_retirement_json);
             defer job.deinit();
             if ((job.value.phase == .ready or (job.value.phase == .published and table.read_schema_json.len == 0)) and job.value.failure.len == 0 and !job.value.drop) {
@@ -6168,11 +6311,8 @@ pub const ApiHttpServer = struct {
                 try self.source.replaceTableDefinition(table, replacement.table);
             }
             return;
-        };
+        }
         _ = try @import("relational_activation_worker.zig").runPage(self.alloc, reader, writer, snapshot.tables, snapshot.ranges, snapshot.ranges[next]);
-        const table = for (snapshot.tables) |candidate| {
-            if (candidate.table_id == owner.table_id) break candidate;
-        } else return;
         var page_response = (reader.lookup(self.alloc, table.name, owner.start_key, .{
             .relational_topology_json = "{\"mode\":\"generation_gc\"}",
             .execution_deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s,
@@ -6213,6 +6353,24 @@ pub const ApiHttpServer = struct {
         const context: api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| 20 * std.time.ns_per_s, .setting_admin = true, .schema_validation_authority = true, .fk_generation_publication_authority = true };
         const next = try @import("scope_retirement_coordinator.zig").step(self, self.scope_retirement_cursor.load(.monotonic), context);
         self.scope_retirement_cursor.store(next, .monotonic);
+        try @import("sql_abandoned_temporary.zig").step(self, context);
+    }
+
+    /// Value-free owner capture for an existing admitted retirement. Only the
+    /// authenticated metadata control path can invoke this process-local port.
+    pub fn prepareTableRetirementOwner(self: *ApiHttpServer, a: std.mem.Allocator, group: u64, table: []const u8, request: @import("table_retirement_preparation.zig").Request, context: api_operation.RequestContext) ![]u8 {
+        const preparation = @import("table_retirement_preparation.zig");
+        if (!context.setting_admin or !context.schema_validation_authority or !context.fk_generation_publication_authority) return error.Forbidden;
+        try context.ensureActive();
+        try request.validate(group);
+        if (table.len == 0) return error.InvalidCatalogRecord;
+        const port = self.cfg.table_retirement_preparation orelse return error.GenerationAdmissionPending;
+        const bytes = try port.prepare_fn(port.ptr, a, group, table, request, context);
+        if (bytes.len == 0 or bytes.len > preparation.max_response_bytes) {
+            a.free(bytes);
+            return error.InvalidResponse;
+        }
+        return bytes;
     }
 
     pub fn advanceTableRetirementOnce(self: *ApiHttpServer) !void {
@@ -7000,6 +7158,7 @@ pub const ApiHttpServer = struct {
     };
 
     pub fn scheduleSessionMaintenance(self: *ApiHttpServer) !void {
+        if (self.sql_command_upkeep_closing.load(.acquire)) return;
         if (!self.cfg.session_maintenance_local_only) try self.scheduleLakeArtifactCollection();
         // The data runtime can complete many rounds per second. Rate-limit
         // submission before allocating work so an idle server does not churn
@@ -8656,11 +8815,21 @@ pub const ApiHttpServer = struct {
         return storage_status_buf[0..];
     }
 
+    fn apiHttpServerCatalogSqlRelationBoot(raw: *anyopaque, alloc: std.mem.Allocator, query: @import("../metadata/sql_relation_boots.zig").Query, deadline_ns: ?u64) !@import("../metadata/sql_relation_boots.zig").Observation {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(raw));
+        const bytes = try self.source.systemCatalog(alloc, .{ .setting_admin = true, .deadline_ns = deadline_ns }, .{ .sql_relation_boot_read = query });
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, alloc, bytes, .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
     pub fn catalogSource(self: *ApiHttpServer) table_catalog.CatalogSource {
         if (self.source.routingSource() == null) {
             return .{
                 .ptr = self,
                 .vtable = &.{
+                    .sql_relation_boot = apiHttpServerCatalogSqlRelationBoot,
                     .admin_snapshot = apiHttpServerCatalogAdminSnapshot,
                     .free_admin_snapshot = apiHttpServerCatalogFreeAdminSnapshot,
                     .routing_snapshot = apiHttpServerCatalogRoutingSnapshot,
@@ -8671,6 +8840,7 @@ pub const ApiHttpServer = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .sql_relation_boot = apiHttpServerCatalogSqlRelationBoot,
                 .admin_snapshot = apiHttpServerCatalogAdminSnapshot,
                 .free_admin_snapshot = apiHttpServerCatalogFreeAdminSnapshot,
                 .routing_snapshot = apiHttpServerCatalogRoutingSnapshot,
@@ -8924,7 +9094,7 @@ pub const ApiHttpServer = struct {
         return self.rowPolicyWriteProofForPurpose(alloc, context, table_id, physical_table, database, schema_version, .ordinary);
     }
 
-    fn rowPolicyWriteProofForPurpose(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, table_id: u64, physical_table: []const u8, database: []const u8, schema_version: ?u32, purpose: usermgr.row_policy_authority.Purpose) !?[]u8 {
+    pub fn rowPolicyWriteProofForPurpose(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, table_id: u64, physical_table: []const u8, database: []const u8, schema_version: ?u32, purpose: usermgr.row_policy_authority.Purpose) !?[]u8 {
         if (context.row_policy_proof_provider) |provider| switch (try provider.sign(provider.ptr, alloc, table_id, physical_table, database, schema_version, purpose)) {
             .handled => |proof| return proof,
             .unhandled => {},
@@ -9005,7 +9175,7 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn internalAuthRealtimeNs(self: *ApiHttpServer) i128 {
+    pub fn internalAuthRealtimeNs(self: *ApiHttpServer) i128 {
         if (configuredDurableIo(self.cfg)) |io|
             return @intCast(std.Io.Clock.real.now(io).nanoseconds);
         return nowNs();
@@ -12526,6 +12696,15 @@ pub const ApiHttpServer = struct {
         writer_lease: *TableBackupWriterLeaseHeartbeat,
         cleanup_safe: *bool,
     ) !void {
+        if (@import("schema_only_backup.zig").eligible(table.*, format)) {
+            var manifest = try @import("schema_only_backup.zig").capture(self.alloc, self, table.*, fence, backup_id, format, .{ .deadline_ns = operation_control.deadline_ns, .cancellation = operation_control.token() });
+            defer manifest.deinit(self.alloc);
+            try writer_lease.ensureOwned();
+            try operation_control.ensureActive();
+            cleanup_safe.* = false;
+            try backups_api.writeManifestToLocationWithIoAndCancellation(self.alloc, io, backup_location, &manifest, operation_control.token());
+            return;
+        }
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
         const staging_io = self.backupStagingIo(io);
         const remote_repository = switch (backup_location.*) {
@@ -12548,6 +12727,7 @@ pub const ApiHttpServer = struct {
             }
             var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
             defer manifest.deinit(self.alloc);
+            try @import("sql_trigger_backup.zig").decorate(self.alloc, self.source, .{ .deadline_ns = operation_control.deadline_ns, .cancellation = operation_control.token() }, table.*, &manifest);
             try operation_control.ensureActive();
             cleanup_safe.* = false;
             backups_api.writeManifestToLocationWithIoAndCancellation(
@@ -12677,6 +12857,7 @@ pub const ApiHttpServer = struct {
         try operation_control.ensureActive();
         var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
         defer manifest.deinit(self.alloc);
+        try @import("sql_trigger_backup.zig").decorate(self.alloc, self.source, .{ .deadline_ns = operation_control.deadline_ns, .cancellation = operation_control.token() }, table.*, &manifest);
         try writer_lease.ensureOwned();
         try operation_control.ensureActive();
         cleanup_safe.* = false;
@@ -14598,20 +14779,29 @@ pub const ApiHttpServer = struct {
         var start: usize = 0;
         while (start < names.items.len) {
             const chunk = names.items[start..@min(names.items.len, start + 256)];
-            const bytes = try self.source.systemCatalog(a, request, .{ .resolve_many = .{ .storage_names = chunk, .expected_revision = revision } });
+            const storage_bindings = candidate != null and @import("../metadata/topology_protocol.zig").current_version >= @import("../metadata/topology_protocol.zig").sql_relation_persistence_version;
+            const lookup: system_catalog.ResolveMany = .{ .storage_names = chunk, .expected_revision = revision, .include_storage_bindings = storage_bindings };
+            const bytes = try self.source.systemCatalog(a, request, .{ .resolve_many = lookup });
             const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
             if (resolved.logical_names.len != chunk.len) return error.UnsupportedOperation;
+            try resolved.validateAuthority(a, lookup);
             revision = resolved.revision;
-            for (chunk, resolved.logical_names, mutations.items[start..][0..chunk.len]) |physical, logical, mutates| {
+            for (chunk, resolved.logical_names, mutations.items[start..][0..chunk.len], 0..) |physical, logical, mutates, index| {
+                const binding = if (storage_bindings) resolved.storage_tables[index] else null;
+                if (binding) |value| try value.requireRequestAccess(request.native_service, request.sql_relation_owner);
                 const name = logical orelse if (std.mem.startsWith(u8, physical, "table:")) return error.TableNotFound else physical;
                 if (authorize and mutates) {
                     const authority = request.table_write_authorization orelse return error.Forbidden;
                     if (!authority.allows(authority.ptr, name)) return error.Forbidden;
                 }
                 if (candidate) |session| {
-                    for (session.catalog_bindings.items) |binding| {
-                        if (std.mem.eql(u8, binding.physical, physical)) break;
-                    } else try session.bind(alloc, name, physical);
+                    const persistence = if (binding) |value| value.sql_persistence else null;
+                    for (session.catalog_bindings.items) |previous| {
+                        if (std.mem.eql(u8, previous.physical, physical)) {
+                            if (storage_bindings and !std.meta.eql(previous.sql_persistence, persistence)) return error.CatalogGenerationChanged;
+                            break;
+                        }
+                    } else try session.bindWithPersistence(alloc, name, physical, persistence);
                 }
             }
             start += chunk.len;
@@ -14628,27 +14818,47 @@ pub const ApiHttpServer = struct {
         defer column_defaults.deinit();
         var preparation_request = column_defaults.attach(self, integrity_reads.attach(request));
         if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
-        const selected = (try self.selectIntegritySnapshot(alloc, tables, request)) orelse
-            return .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = tables };
+        const raw_api = @import("sql_trigger_raw.zig");
+        const protocol = @import("../metadata/topology_protocol.zig");
+        var raw = raw_api.Owner.create(self, alloc, preparation_request, tables, protocol.current_version >= protocol.sql_table_triggers_version) catch |err| return raw_api.captureFailure(.method_create, err);
+        defer if (raw) |owner| owner.deinit();
+        const incoming = if (raw) |owner| owner.tables else tables;
+        if (raw) |owner| preparation_request = owner.context;
+        const selected = (self.selectIntegritySnapshot(alloc, incoming, request) catch |err| return raw_api.captureFailure(.select_integrity, err)) orelse {
+            var prepared: integrity.Prepared = .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = incoming };
+            errdefer prepared.deinit();
+            raw_api.finishPreparation(&raw, &prepared) catch |err| return raw_api.captureFailure(.finish, err);
+            return prepared;
+        };
         var snapshot = selected.snapshot;
         defer self.source.freeAdminSnapshot(&snapshot);
+        for (incoming) |participant| for (snapshot.tables) |definition| {
+            if (!std.mem.eql(u8, participant.table_name, definition.name)) continue;
+            if (try @import("sql_relation_lifetimes.zig").ownerMinterForRelation(self, preparation_request, definition.sql_persistence)) |minter|
+                preparation_request.sql_relation_owner_minter = minter;
+            break;
+        };
         if (selected.coordinated) {
             try ensureTableOperationActive(request);
             const reader = self.table_reads orelse return error.IntegrityCatalogUnavailable;
-            var prepared = integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request) catch |err| blk: {
-                if (err != error.PreparedGenerationChanged) return err;
+            var prepared = integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, incoming, preparation_request) catch |err| blk: {
+                if (err != error.PreparedGenerationChanged or preparation_request.table_triggers != null) return err;
                 const authoritative = try self.authoritativeIntegritySnapshot(preparation_request);
                 self.source.freeAdminSnapshot(&snapshot);
                 snapshot = authoritative;
                 if (!try integrity.metadataRequiresCoordination(alloc, snapshot.tables, tables))
                     return .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = tables };
-                break :blk try integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request);
+                break :blk try integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, incoming, preparation_request);
             };
             errdefer prepared.deinit();
-            try self.authorizeIntegrityMutations(request, prepared.tables);
+            self.authorizeIntegrityMutations(request, prepared.tables) catch |err| return raw_api.captureFailure(.authorize_integrity, err);
+            raw_api.finishPreparation(&raw, &prepared) catch |err| return raw_api.captureFailure(.finish, err);
             return prepared;
         }
-        return .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = tables };
+        var prepared: integrity.Prepared = .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = incoming };
+        errdefer prepared.deinit();
+        raw_api.finishPreparation(&raw, &prepared) catch |err| return raw_api.captureFailure(.finish, err);
+        return prepared;
     }
 
     fn hasRowPolicyWritePrincipal(request: api_operation.RequestContext) bool {
@@ -14666,9 +14876,13 @@ pub const ApiHttpServer = struct {
         catalog_tables: []const metadata_table_manager.TableRecord,
         request: api_operation.RequestContext,
     ) ![]const distributed_txn.TableCommitRequest {
-        if (!hasRowPolicyWritePrincipal(request)) return tables;
+        const lifetimes = @import("sql_relation_lifetimes.zig");
+        const bound = try lifetimes.bindParticipants(alloc, request, catalog_tables, tables);
+        const owners = try lifetimes.attachOwnerMinters(self, alloc, request, bound);
+        const captured = try @import("sql_trigger_authority.zig").attachMinters(self, alloc, request, owners);
+        if (!hasRowPolicyWritePrincipal(request)) return captured;
         const a = alloc;
-        const signed = try a.dupe(distributed_txn.TableCommitRequest, tables);
+        const signed = try a.dupe(distributed_txn.TableCommitRequest, captured);
         var indices: std.ArrayList(usize) = .empty;
         var names: std.ArrayList([]const u8) = .empty;
         for (tables, 0..) |table, index| {
@@ -14712,7 +14926,10 @@ pub const ApiHttpServer = struct {
         tables: []const distributed_txn.TableCommitRequest,
         request: api_operation.RequestContext,
     ) ![]const distributed_txn.TableCommitRequest {
-        if (!hasRowPolicyWritePrincipal(request)) return tables;
+        if (!hasRowPolicyWritePrincipal(request)) {
+            const owners = try @import("sql_relation_lifetimes.zig").attachOwnerMinters(self, alloc, request, tables);
+            return @import("sql_trigger_authority.zig").attachMinters(self, alloc, request, owners);
+        }
         var snapshot_opt = try self.source.cachedAdminSnapshot();
         if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
         var snapshot = snapshot_opt orelse return error.RowPolicyCatalogChanged;
@@ -14776,8 +14993,8 @@ pub const ApiHttpServer = struct {
     ) !?distributed_txn.CommitOutcome {
         var arena_state = std.heap.ArenaAllocator.init(alloc);
         defer arena_state.deinit();
-        const signed = try self.signRowPolicyMutationParticipants(arena_state.allocator(), tables, catalog_tables, request);
-        return source.commitBatchWithCancellation(alloc, signed, sync_level, request.cancellation);
+        const signed = self.signRowPolicyMutationParticipants(arena_state.allocator(), tables, catalog_tables, request) catch |err| return @import("sql_trigger_raw.zig").captureFailure(.sign, err);
+        return source.commitBatchWithCancellation(alloc, signed, sync_level, request.cancellation) catch |err| return @import("sql_trigger_raw.zig").captureFailure(.commit, err);
     }
 
     /// Only use at read-only preparation boundaries, never around commit.
@@ -14796,13 +15013,50 @@ pub const ApiHttpServer = struct {
         request: api_operation.RequestContext,
         retained_preparation: *?@import("antfly_local_sources").api_relational_integrity_commit.Prepared,
     ) !?distributed_txn.CommitOutcome {
+        return self.commitPublicTableBatchWithIntegrityImpl(alloc, source, tables, sync_level, request, retained_preparation) catch |failure| {
+            return @import("sql_trigger_raw.zig").captureFailure(.integrity_preparation, failure);
+        };
+    }
+
+    fn commitPublicTableBatchWithIntegrityImpl(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        source: table_writes.TableWriteSource,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        request: api_operation.RequestContext,
+        retained_preparation: *?@import("antfly_local_sources").api_relational_integrity_commit.Prepared,
+    ) !?distributed_txn.CommitOutcome {
         std.debug.assert(retained_preparation.* == null);
         const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
-        const selected = (try self.selectIntegritySnapshot(alloc, tables, request)) orelse {
-            return source.commitBatchWithCancellation(alloc, tables, sync_level, request.cancellation);
+        var integrity_reads = @import("sql_policy_integrity_reads.zig").Cache.init(self, request);
+        defer integrity_reads.deinit();
+        var column_defaults: @import("sql_column_defaults.zig").Broker = .{};
+        defer column_defaults.deinit();
+        var preparation_request = column_defaults.attach(self, integrity_reads.attach(request));
+        if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
+        const raw_api = @import("sql_trigger_raw.zig");
+        const protocol = @import("../metadata/topology_protocol.zig");
+        var raw = raw_api.Owner.create(self, alloc, preparation_request, tables, protocol.current_version >= protocol.sql_table_triggers_version) catch |err| return raw_api.captureFailure(.method_create, err);
+        defer if (raw) |owner| owner.deinit();
+        const incoming = if (raw) |owner| owner.tables else tables;
+        if (raw) |owner| preparation_request = owner.context;
+        const selected = (self.selectIntegritySnapshot(alloc, incoming, request) catch |err| return raw_api.captureFailure(.select_integrity, err)) orelse {
+            if (raw != null) {
+                retained_preparation.* = .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = incoming };
+                raw_api.finishPreparation(&raw, &retained_preparation.*.?) catch |err| return raw_api.captureFailure(.finish, err);
+                return source.commitBatchWithCancellation(alloc, retained_preparation.*.?.tables, sync_level, request.cancellation);
+            }
+            return source.commitBatchWithCancellation(alloc, incoming, sync_level, request.cancellation);
         };
         var snapshot = selected.snapshot;
         defer self.source.freeAdminSnapshot(&snapshot);
+        for (incoming) |participant| for (snapshot.tables) |definition| {
+            if (!std.mem.eql(u8, participant.table_name, definition.name)) continue;
+            if (try @import("sql_relation_lifetimes.zig").ownerMinterForRelation(self, preparation_request, definition.sql_persistence)) |minter|
+                preparation_request.sql_relation_owner_minter = minter;
+            break;
+        };
         const coordinated = selected.coordinated;
         if (request.relational_recovery != .none) {
             if (tables.len != 1) return error.InvalidBatchRequest;
@@ -14816,7 +15070,14 @@ pub const ApiHttpServer = struct {
             else
                 table.relational_retirement_json.len != 0 or try integrity.requiresActivation(alloc, table.schema_json);
             if (!eligible) return error.InvalidBatchRequest;
-        } else if (!coordinated) return self.commitPublicBatchWithPolicy(alloc, source, tables, snapshot.tables, sync_level, request);
+        } else if (!coordinated) {
+            if (raw != null) {
+                retained_preparation.* = .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = incoming };
+                raw_api.finishPreparation(&raw, &retained_preparation.*.?) catch |err| return raw_api.captureFailure(.finish, err);
+                return self.commitPublicBatchWithPolicy(alloc, source, retained_preparation.*.?.tables, snapshot.tables, sync_level, request);
+            }
+            return self.commitPublicBatchWithPolicy(alloc, source, incoming, snapshot.tables, sync_level, request);
+        }
         ensureTableOperationActive(request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err;
         const reader = self.table_reads orelse return error.IntegrityCatalogUnavailable;
         if (request.relational_recovery == .retire) {
@@ -14866,17 +15127,11 @@ pub const ApiHttpServer = struct {
             try @import("relational_constraint_recovery.zig").retry(alloc, reader, source, snapshot.tables, snapshot.ranges, tables[0], request);
             return .{ .committed = .{ .participant_count = 0 } };
         }
-        var integrity_reads = @import("sql_policy_integrity_reads.zig").Cache.init(self, request);
-        defer integrity_reads.deinit();
-        var column_defaults: @import("sql_column_defaults.zig").Broker = .{};
-        defer column_defaults.deinit();
-        var preparation_request = column_defaults.attach(self, integrity_reads.attach(request));
-        if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
         retained_preparation.* = if (request.relational_recovery == .repair)
             integrity.prepareRepair(alloc, reader, snapshot.tables, snapshot.ranges, tables[0], preparation_request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err
         else blk: {
-            const optimistic = integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request) catch |err| {
-                if (err != error.PreparedGenerationChanged) return precommitIntegrityPreparationError(err);
+            const optimistic = integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, incoming, preparation_request) catch |err| {
+                if (err != error.PreparedGenerationChanged or preparation_request.table_triggers != null) return precommitIntegrityPreparationError(err);
                 // Preparation only reads and owns speculative commands; no
                 // transaction has begun. Rebind the entire plan once against
                 // a read-indexed catalog, under the original deadline.
@@ -14886,7 +15141,7 @@ pub const ApiHttpServer = struct {
                 if (!try integrity.metadataRequiresCoordination(alloc, snapshot.tables, tables)) {
                     return self.commitPublicBatchWithPolicy(alloc, source, tables, snapshot.tables, sync_level, request);
                 }
-                break :blk integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request) catch |read_err| return precommitIntegrityPreparationError(read_err);
+                break :blk integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, incoming, preparation_request) catch |read_err| return precommitIntegrityPreparationError(read_err);
             };
             break :blk optimistic;
         };
@@ -14895,10 +15150,11 @@ pub const ApiHttpServer = struct {
         // including diagnostics, without allocating after a durable decision.
         const prepared = &retained_preparation.*.?;
         ensureTableOperationActive(request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err;
-        try self.authorizeIntegrityMutations(request, prepared.tables);
+        self.authorizeIntegrityMutations(request, prepared.tables) catch |err| return raw_api.captureFailure(.authorize_integrity, err);
         if (request.relational_recovery == .none) {
             integrity.rejectDefiniteConflicts(alloc, reader, snapshot.tables, snapshot.ranges, prepared.tables, preparation_request) catch |err| return precommitIntegrityPreparationError(err);
         }
+        try raw_api.finishPreparation(&raw, prepared);
         return self.commitPublicBatchWithPolicy(alloc, source, prepared.tables, snapshot.tables, sync_level, request);
     }
 
@@ -17882,6 +18138,13 @@ pub const ApiHttpServer = struct {
             try self.commitPublicRelationalIndexDefinition(alloc, table_before, replacement, request);
             return response;
         }
+        // Lost native images cannot yet provide the old-source graph barrier.
+        // Refuse this declaration before any build, reservation or projection.
+        if (table_before.sql_persistence != null) {
+            var candidate = std.json.parseFromSlice(std.json.Value, alloc, index_json, .{}) catch return error.InvalidIndexRequest;
+            defer candidate.deinit();
+            if ((table_index_config.parseIndexKind(candidate.value) catch return error.InvalidIndexRequest) == .graph) return error.InvalidIndexRequest;
+        }
         if (relational.contains(alloc, table_before.schema_json, index_name) catch return error.InternalFailure) return error.Conflict;
         tables_api.validatePublicAlgebraicIndexJson(alloc, index_json) catch return error.InvalidIndexRequest;
         const expanded_index_json = tables_api.expandSchemaDerivedAlgebraicIndexAlloc(alloc, table_name, index_json, table_before.schema_json) catch |err| switch (err) {
@@ -18437,7 +18700,7 @@ pub const ApiHttpServer = struct {
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(encoded_request, &digest, .{});
         const backup_id = try alloc.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
-        var start: restore_jobs.StartRequest = .{ .scope = .cluster, .source_kind = .schema_rewrite, .backup_id = backup_id, .location = try std.fmt.allocPrint(alloc, "metadata://schema-rewrite/{s}", .{std.fmt.bytesToHex(plan_id, .lower)}), .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = namespace, .idempotency_key = key, .destination_authorization_principal = storedDestinationPrincipal(identity) };
+        var start: restore_jobs.StartRequest = .{ .scope = .cluster, .source_kind = .schema_rewrite, .routine_actor = if (try @import("sql_trigger_restore.zig").needsActorForTables(alloc, cohort)) try @import("sql_trigger_restore.zig").actorForAdmission(self, identity) else null, .backup_id = backup_id, .location = try std.fmt.allocPrint(alloc, "metadata://schema-rewrite/{s}", .{std.fmt.bytesToHex(plan_id, .lower)}), .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = namespace, .idempotency_key = key, .destination_authorization_principal = storedDestinationPrincipal(identity) };
         if (try self.restore_job_store.existingRewriteAdmission(self.alloc, start)) |existing| {
             defer self.alloc.free(existing);
             if (context.sql_completion_submission) |observed| observed.* = true;
@@ -19145,6 +19408,12 @@ pub const ApiHttpServer = struct {
             return zig017_err;
         };
         defer freeOwnedTableNames(op_alloc, table_names);
+        // Session-owned relations are never database-backup objects. Check
+        // explicit selections before creating markers, fences or artifacts.
+        @import("sql_relation_backup.zig").requireSelection(authoritative_snapshot.tables, table_names) catch |err| return trace.internal(err) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        };
         if (table_names.len > restore_jobs.max_cluster_tables_per_job or
             table_names.len > backups_api.max_cluster_backup_attempt_tables)
         {
@@ -19922,6 +20191,11 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn applyRewriteStagingCommand(self: *ApiHttpServer, job: *std.json.Parsed(@import("../metadata/restore_staging.zig").Job), command: @import("../metadata/restore_staging.zig").Command, context: api_operation.RequestContext) !void {
+        if (command.action == .begin_cutover or command.action == .begin_activation or command.action == .publish) {
+            var authorization = std.heap.ArenaAllocator.init(self.alloc);
+            defer authorization.deinit();
+            try @import("sql_trigger_restore.zig").reauthorizeJob(authorization.allocator(), self, context, job.value);
+        }
         const encoded = try std.json.Stringify.valueAlloc(self.alloc, command, .{});
         defer self.alloc.free(encoded);
         const replacement = try self.source.applyRestoreStaging(self.alloc, encoded, context);
@@ -20037,7 +20311,7 @@ pub const ApiHttpServer = struct {
         const transform_rewrite = job.value.plan.type_retirement != null or for (job.value.plan.targets) |target| {
             if (target.rewrite) |rewrite| if (rewrite.column_transforms.len != 0) break true;
         } else false;
-        if (!failed and !worker_state.value.cancel_requested and job.value.state != .published and job.value.state != .canceled) {
+        if (!failed and !worker_state.value.cancel_requested and job.value.state != .canceled and !stages.decisionCommitted(job.value)) {
             if (worker_state.value.source_kind == .query_population and self.cfg.auth_enabled) {
                 const manager = self.cfg.user_manager orelse return error.StoredDestinationAuthorizationRevoked;
                 for (job.value.plan.targets) |target| {
@@ -20053,7 +20327,10 @@ pub const ApiHttpServer = struct {
                     }
                 }
             }
-            if (worker_state.value.source_kind == .empty_generation or worker_state.value.source_kind == .query_population) {
+            if (@import("sql_relation_recovery_authority.zig").requiresNativeRecovery(job.value.plan)) {
+                var maintenance_control: StagedRestoreControl = .{ .server = self, .restore = restore };
+                try @import("sql_relation_recovery_authority.zig").requireAdmitted(self, self.alloc, job.value.plan, maintenance_control.context());
+            } else if (worker_state.value.source_kind == .empty_generation or worker_state.value.source_kind == .query_population) {
                 (self.requireEmptyGenerationAuthority(worker_state.value.destination_authorization_principal, worker_state.value.table_names orelse return zig017_failure: {
                     zig017_return_error = error.CorruptRestoreJobStore;
                     break :zig017_failure error.CorruptRestoreJobStore;
@@ -20090,6 +20367,14 @@ pub const ApiHttpServer = struct {
         };
         var control = StagedRestoreControl{ .server = self, .restore = restore };
         const context = control.context();
+        if (!failed and !worker_state.value.cancel_requested) {
+            var authorization = std.heap.ArenaAllocator.init(self.alloc);
+            defer authorization.deinit();
+            @import("sql_trigger_restore.zig").reauthorizeJob(authorization.allocator(), self, context, job.value) catch |failure| {
+                zig017_return_error = failure;
+                return failure;
+            };
+        }
         var phase = job.value.state;
         var owner_cursor: usize = if (worker_state.value.staging_owner_phase == @backingInt(phase)) worker_state.value.staging_owner_cursor else 0;
         const saved_owner_cursor = owner_cursor;
@@ -20571,6 +20856,37 @@ pub const ApiHttpServer = struct {
                             owner_cursor += 1;
                             continue;
                         }
+                        const loss_owner: ?struct { target: stages.Target, range: metadata_table_manager.RangeRecord } = loss_scan: for (job.value.plan.targets) |target| {
+                            if (try stages.nativeEmptyOriginForTarget(job.value.plan, job.value.plan_digest, target) == null) continue;
+                            for (target.ranges) |range| {
+                                if (admission_index == 0) break :loss_scan .{ .target = target, .range = range };
+                                admission_index -= 1;
+                            }
+                        } else null;
+                        if (loss_owner) |selected| {
+                            if (try self.source.getRestoreStagingReceipt(self.alloc, job.value.plan.id, phase, selected.range.group_id, context)) |receipt| {
+                                self.alloc.free(receipt);
+                                owner_cursor += 1;
+                                continue;
+                            }
+                            var region = std.heap.ArenaAllocator.init(self.alloc);
+                            defer region.deinit();
+                            const a = region.allocator();
+                            const command = try stages.nativeEmptyInstallForRangeAlloc(a, job.value.plan, job.value.plan_digest, selected.target, selected.range);
+                            const response = try self.executeRestoreOwner(self.alloc, selected.target.table.name, selected.range.group_id, .{
+                                .scope = try stages.ownerScope(a, job.value.plan, job.value.plan_digest, selected.target, selected.range),
+                                .action = .install_native_empty,
+                                .native_execution = selected.target.table.sql_persistence,
+                                .native_empty_install = command,
+                            }, context);
+                            const actual = response.native_empty_receipt orelse return error.RestoreValidationPending;
+                            if (!std.mem.eql(u8, &actual, &try command.digest())) return error.RestoreSourceProofMissing;
+                            const accepted = response.native_empty_acceptance orelse return error.RestoreValidationPending;
+                            try accepted.requireLogical(selected.range.group_id, job.value.plan_digest, (try stages.ownerScope(a, job.value.plan, job.value.plan_digest, selected.target, selected.range)).digest(), command, selected.target.table.sql_persistence orelse return error.InvalidSqlRelationPersistence, .{ .table_id = selected.target.table.table_id, .shard_id = metadata_table_manager.rangeDocIdentityShardId(selected.range), .range_id = metadata_table_manager.rangeDocIdentityRangeId(selected.range) });
+                            try self.stagingCommand(&job, .target_admissions_activated, .{ .group_id = selected.range.group_id, .range_id = if (selected.range.range_id == 0) selected.range.group_id else selected.range.range_id, .plan_digest = job.value.plan_digest, .completion_digest = try accepted.digest(), .native_empty_acceptance = accepted }, context);
+                            owner_cursor += 1;
+                            continue;
+                        }
                         const admission_owner: ?struct { target: stages.Target, range: metadata_table_manager.RangeRecord } = outer: for (job.value.plan.targets) |target| {
                             for (target.source_generation_admissions) |range_proof| {
                                 if (range_proof.entries.len == 0) continue;
@@ -20636,6 +20952,7 @@ pub const ApiHttpServer = struct {
                     var old_index = parent_index;
                     if (phase == .activating) old_index = std.math.maxInt(usize);
                     const selected: ?struct { table: metadata_table_manager.TableRecord, range: metadata_table_manager.RangeRecord, fence: @import("antfly_local_sources").storage_db_relational_integrity_topology.Fence, rewrite_source: ?@import("antfly_local_sources").storage_db_online_source_contract.Scope, graph_scope: ?@import("antfly_local_sources").storage_db_graph_retirement_seal.Scope, handoff: ?stages.GenerationHandoffRange } = for (job.value.plan.targets) |target| {
+                        if (target.native_reset != null) continue;
                         if (target.replace) |old| {
                             if (old.fences.len != old.ranges.len) return zig017_failure: {
                                 zig017_return_error = error.RestoreSourceProofMissing;
@@ -20793,10 +21110,11 @@ pub const ApiHttpServer = struct {
                         return zig017_err;
                     }),
                     .validating => {
-                        const has_old = for (job.value.plan.targets) |target| {
-                            if (target.replace != null) break true;
+                        const has_old = job.value.plan.external_fk_parents.len != 0 or for (job.value.plan.targets) |target| {
+                            if (target.replace != null and target.native_reset == null) break true;
                         } else false;
                         const has_admissions = outer: for (job.value.plan.targets) |target| {
+                            if (try stages.nativeEmptyOriginForTarget(job.value.plan, job.value.plan_digest, target) != null) break :outer true;
                             for (target.source_generation_admissions) |range_proof| if (range_proof.entries.len != 0) break :outer true;
                         } else false;
                         (self.stagingCommand(&job, if (has_old) .begin_cutover else if (has_admissions) .begin_activation else .publish, null, context) catch |zig017_err| {
@@ -20810,6 +21128,7 @@ pub const ApiHttpServer = struct {
                     },
                     .cutover => {
                         const has_admissions = outer: for (job.value.plan.targets) |target| {
+                            if (try stages.nativeEmptyOriginForTarget(job.value.plan, job.value.plan_digest, target) != null) break :outer true;
                             for (target.source_generation_admissions) |range_proof| if (range_proof.entries.len != 0) break :outer true;
                         } else false;
                         const has_handoffs = for (job.value.plan.targets) |target| {
@@ -21021,6 +21340,24 @@ pub const ApiHttpServer = struct {
             fn execute(slot: *@This(), server: *ApiHttpServer, plan: stages.Plan, digest: [32]u8, control: api_operation.RequestContext) !void {
                 const alloc = slot.arena.allocator();
                 const scope = try stages.ownerScope(alloc, plan, digest, slot.target, slot.range);
+                if (slot.target.table.sql_persistence) |descriptor| {
+                    const terminal = @import("../metadata/sql_relation_restore_terminal.zig");
+                    const query: terminal.Query = .{ .creation_scope = .{ .plan_id = plan.id, .plan_digest = digest }, .table_id = slot.target.table.table_id, .group_id = slot.range.group_id, .scope_digest = scope.digest() };
+                    var private = control;
+                    private.setting_admin = true;
+                    private.sql_command_fence = null;
+                    private.sql_completion = null;
+                    private.sql_completion_submission = null;
+                    const bytes = try server.source.systemCatalog(alloc, private, .{ .sql_relation_boot_read = .{ .restore_terminal = query } });
+                    if (bytes.len > 64 * 1024) return error.InvalidSqlBackendResponse;
+                    const observed = try std.json.parseFromSliceLeaky(@import("../metadata/sql_relation_boots.zig").Observation, alloc, bytes, .{});
+                    if (observed.restore_terminal) |proof| {
+                        try proof.require(query, descriptor);
+                        // Only the existing API delivery cursor advances. The
+                        // old physical owner's Progress remains untouched.
+                        return;
+                    }
+                }
                 const response = try server.executeRestoreOwner(alloc, slot.target.table.name, slot.range.group_id, owner_contract.Request{ .scope = scope, .action = .publish }, control);
                 if (response.phase != .published) return error.RestoreStagingScopeChanged;
             }
@@ -21113,16 +21450,51 @@ pub const ApiHttpServer = struct {
         return (try writes.resolverOperationGroupLocal(alloc, group_id, table_name, status_body)) orelse error.UnknownGroup;
     }
 
-    pub fn executeRestoreOwner(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("restore_owner.zig").Request, context: api_operation.RequestContext) !@import("restore_owner.zig").Response {
+    pub fn executeRestoreOwner(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("restore_owner.zig").Request, context: api_operation.RequestContext) anyerror!@import("restore_owner.zig").Response {
         try context.ensureActive();
         // Standalone has no replicated placement catalog. The local owner
         // receiver independently verifies the durable plan and exact scope.
         if (self.cfg.deployment_mode == .standalone) return (self.cfg.restore_owner orelse return error.RestoreValidationPending).execute(alloc, table_name, group_id, request, context);
         var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
         const router = self.cfg.session_router orelse fallback.router();
+        if (request.native_execution) |native| {
+            try native.validate();
+            // The receiving owner rejoins the immutable job and current Boot;
+            // neither this hint nor internal transport grants row authority.
+            if (native.owner_node_id == router.localNodeId())
+                return (self.cfg.restore_owner orelse return error.RestoreValidationPending).execute(alloc, table_name, group_id, request, context);
+            const uri = (try router.nodeBaseUri(alloc, native.owner_node_id)) orelse return error.GroupLeaderUnavailable;
+            defer alloc.free(uri);
+            var client = @import("http_client.zig").ApiHttpClient.init(alloc, self.cfg.session_executor orelse return error.HttpExecutorUnavailable);
+            _ = client.withInternalServiceAuth(self.cfg.internal_service_secret, self.cfg.internal_service_issuer);
+            return client.fetchRestoreOwner(uri, group_id, table_name, request, context);
+        }
         // No route means no owner request was sent. Preserve that readiness
         // classification instead of conflating it with an unknown owner write.
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse {
+            // Cold recovery may not retain the process-local routing hint.
+            // Decode the existing immutable plan once, without invoking its
+            // query producer or changing the captured target identity.
+            const encoded = (try self.source.getRestoreStaging(alloc, request.scope.plan_id, context)) orelse return error.RestoreStagingScopeChanged;
+            defer alloc.free(encoded);
+            var job = try std.json.parseFromSlice(@import("../metadata/restore_staging.zig").Job, alloc, encoded, .{});
+            defer job.deinit();
+            if (!std.mem.eql(u8, &job.value.plan.id, &request.scope.plan_id) or !std.mem.eql(u8, &job.value.plan_digest, &request.scope.plan_digest) or
+                !std.mem.eql(u8, &try job.value.plan.digest(alloc), &request.scope.plan_digest)) return error.RestoreStagingScopeChanged;
+            for (job.value.plan.targets) |target| {
+                if (target.table.table_id != request.scope.target_namespace.table_id or !std.mem.eql(u8, target.table.name, table_name)) continue;
+                const native = target.table.sql_persistence orelse return error.GroupLeaderUnavailable;
+                for (target.ranges, 0..) |range, index| {
+                    if (range.group_id != group_id) continue;
+                    const bootstrap = try @import("../metadata/restore_staging.zig").ownerBootstrapForRangeIndex(alloc, job.value.plan, job.value.plan_digest, target, index);
+                    if (!std.mem.eql(u8, &bootstrap.scope.digest(), &request.scope.digest())) return error.RestoreStagingScopeChanged;
+                    var captured = request;
+                    captured.native_execution = native;
+                    return self.executeRestoreOwner(alloc, table_name, group_id, captured, context);
+                }
+            }
+            return error.GroupLeaderUnavailable;
+        };
         defer route.deinit(alloc);
         switch (route) {
             .local => return (self.cfg.restore_owner orelse return error.RestoreValidationPending).execute(alloc, table_name, group_id, request, context),
@@ -21152,6 +21524,66 @@ pub const ApiHttpServer = struct {
                 return client.fetchRestoreParentActivation(remote.base_uri, group_id, table_name, request, context);
             },
         }
+    }
+
+    fn capturedFkNamespace(captured: @import("table_retirement_preparation.zig").Selection, table_id: u64, group_id: u64) !@import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace {
+        if (table_id == 0 or group_id == 0 or captured.table.table_id != table_id or captured.range.table_id != table_id or captured.range.group_id != group_id or captured.table.name.len == 0) return error.InvalidGenerationPublication;
+        return .{ .table_id = table_id, .shard_id = metadata_table_manager.rangeDocIdentityShardId(captured.range), .range_id = metadata_table_manager.rangeDocIdentityRangeId(captured.range) };
+    }
+
+    // Placement selects delivery only. Each receiving owner independently
+    // fetches the sealed decision before executing a physical operation.
+    fn capturedNativeFkDelivery(self: *ApiHttpServer, alloc: std.mem.Allocator, captured: @import("table_retirement_preparation.zig").Selection, has_local_port: bool, context: api_operation.RequestContext) !table_router.GroupRoute {
+        const descriptor = captured.table.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+        try descriptor.validate();
+        if (has_local_port and try @import("group_work_ownership.zig").mayCoordinate(self.cfg.relational_maintenance_leadership, alloc, captured.table.table_id, captured.range.group_id, descriptor, .retirement, context)) return .local;
+        // Native groups have no Raft placement. Select the exact data store;
+        // another store or a metadata endpoint on this node is not a fallback.
+        const uri = (try self.source.nativeOwnerDataUri(alloc, descriptor.owner_node_id, descriptor.owner_store_id, context)) orelse return error.SqlRelationOwnerUnavailable;
+        return .{ .remote = .{ .node_id = descriptor.owner_node_id, .base_uri = uri } };
+    }
+
+    pub fn executeCapturedFkGenerationParent(self: *ApiHttpServer, alloc: std.mem.Allocator, captured: @import("table_retirement_preparation.zig").Selection, request: @import("relational_fk_generation_publication.zig").Request, input: api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").Receipt {
+        if (!input.setting_admin or !input.schema_validation_authority or !input.fk_generation_publication_authority) return error.Forbidden;
+        const context = try input.platformDeadline();
+        try context.ensureActive();
+        try request.validate(captured.range.group_id);
+        const namespace = try capturedFkNamespace(captured, request.parent_table_id, request.parent_group_id);
+        const descriptor = captured.table.sql_persistence orelse return self.executeFkGenerationParent(alloc, captured.table.name, captured.range.group_id, request, context);
+        var delivery = try self.capturedNativeFkDelivery(alloc, captured, self.cfg.fk_generation_parent != null, context);
+        defer delivery.deinit(alloc);
+        const receipt = switch (delivery) {
+            .local => try (self.cfg.fk_generation_parent orelse return error.GenerationAdmissionPending).execute(alloc, captured.table.name, captured.range.group_id, request, context),
+            .remote => |remote| forward: {
+                var client = @import("http_client.zig").ApiHttpClient.init(alloc, self.cfg.session_executor orelse return error.HttpExecutorUnavailable);
+                _ = client.withInternalServiceAuth(self.cfg.internal_service_secret, self.cfg.internal_service_issuer);
+                break :forward try client.fetchFkGenerationParent(remote.base_uri, captured.range.group_id, captured.table.name, request, context);
+            },
+        };
+        try @import("relational_fk_generation_publication.zig").requireCapturedPosition(receipt, descriptor, namespace);
+        return receipt;
+    }
+
+    pub fn executeCapturedFkGenerationSource(self: *ApiHttpServer, alloc: std.mem.Allocator, captured: @import("table_retirement_preparation.zig").Selection, request: @import("relational_fk_generation_publication.zig").SourceRequest, input: api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").SourceReceipt {
+        if (!input.setting_admin or !input.schema_validation_authority or !input.fk_generation_publication_authority) return error.Forbidden;
+        const context = try input.platformDeadline();
+        try context.ensureActive();
+        try request.validate(captured.range.group_id);
+        const namespace = try capturedFkNamespace(captured, request.child_table_id, request.child_group_id);
+        if (!std.mem.eql(u8, request.child_table_name, captured.table.name)) return error.InvalidGenerationPublication;
+        const descriptor = captured.table.sql_persistence orelse return self.executeFkGenerationSource(alloc, captured.table.name, captured.range.group_id, request, context);
+        var delivery = try self.capturedNativeFkDelivery(alloc, captured, self.cfg.fk_generation_source != null, context);
+        defer delivery.deinit(alloc);
+        const receipt = switch (delivery) {
+            .local => try (self.cfg.fk_generation_source orelse return error.GenerationAdmissionPending).execute(alloc, captured.table.name, captured.range.group_id, request, context),
+            .remote => |remote| forward: {
+                var client = @import("http_client.zig").ApiHttpClient.init(alloc, self.cfg.session_executor orelse return error.HttpExecutorUnavailable);
+                _ = client.withInternalServiceAuth(self.cfg.internal_service_secret, self.cfg.internal_service_issuer);
+                break :forward try client.fetchFkGenerationSource(remote.base_uri, captured.range.group_id, captured.table.name, request, context);
+            },
+        };
+        try @import("relational_fk_generation_publication.zig").requireCapturedPosition(receipt, descriptor, namespace);
+        return receipt;
     }
 
     pub fn executeFkGenerationParent(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("relational_fk_generation_publication.zig").Request, context: api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").Receipt {
@@ -21242,13 +21674,19 @@ pub const ApiHttpServer = struct {
     }
 
     fn admitStagedClusterRestore(self: *ApiHttpServer, req: backups_api.ClusterRestoreRequest, location: *backups_api.BackupLocation, manifest: *const backups_api.ClusterBackupManifest, names: []const []const u8, restore: RestoreCancellation, principal: []const u8) ![]u8 {
+        return self.admitStagedSnapshotRestore(req, location, manifest, null, names, restore, principal);
+    }
+
+    fn admitStagedSnapshotRestore(self: *ApiHttpServer, req: backups_api.ClusterRestoreRequest, location: *backups_api.BackupLocation, aggregate: ?*const backups_api.ClusterBackupManifest, independent: ?*const backups_api.TableBackupManifest, names: []const []const u8, restore: RestoreCancellation, principal: []const u8) ![]u8 {
+        if ((aggregate == null) == (independent == null)) return error.InvalidRequest;
         const driver = @import("restore_staging_driver.zig");
         const stages = @import("../metadata/restore_staging.zig");
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const proof = try std.json.parseFromSlice(@import("antfly_local_sources").metadata_backup_cohort.Job, a, manifest.cohort_json, .{ .allocate = .alloc_always });
-        if (!std.mem.eql(u8, proof.value.backup_id, req.backup_id)) return error.BackupIntegrityFailure;
+        const proof = if (aggregate) |manifest| try std.json.parseFromSlice(@import("antfly_local_sources").metadata_backup_cohort.Job, a, manifest.cohort_json, .{ .allocate = .alloc_always }) else null;
+        if (proof) |captured| if (!std.mem.eql(u8, captured.value.backup_id, req.backup_id)) return error.BackupIntegrityFailure;
+        if (independent) |manifest| if (names.len != 1 or !std.mem.eql(u8, manifest.backup_id, req.backup_id) or !std.mem.eql(u8, manifest.table_name, names[0])) return error.BackupIntegrityFailure;
         const state_json = (try self.restore_job_store.load(self.alloc, restore.job_id)) orelse return error.RestoreJobFenced;
         defer self.alloc.free(state_json);
         const state = try std.json.parseFromSlice(restore_jobs.JobState, a, state_json, .{});
@@ -21270,18 +21708,25 @@ pub const ApiHttpServer = struct {
         defer logical_index.deinit(a);
         if (req.single_table_destination != null and names.len != 1) return error.InvalidRequest;
         for (names, sources) |name, *source| {
-            const entry = backups_api.findClusterTable(manifest, name) orelse return error.InvalidRequest;
-            try self.authorizeClusterRestoreManifestDestinations(self.alloc, location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id, principal);
+            const entry = if (aggregate) |manifest| backups_api.findClusterTable(manifest, name) orelse return error.InvalidRequest else null;
+            const manifest_id = if (entry) |declared| declared.table_backup_id else req.backup_id;
+            const artifact_id = if (entry) |declared| declared.artifact_backup_id orelse declared.table_backup_id else req.backup_id;
+            try self.authorizeClusterRestoreManifestDestinations(self.alloc, location, manifest_id, artifact_id, principal);
             const table = try a.create(backups_api.TableBackupManifest);
-            table.* = try backups_api.readManifestFromLocationWithArtifactBackupId(a, location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id);
+            table.* = if (independent) |manifest| manifest.* else try backups_api.readManifestFromLocationWithArtifactBackupId(a, location, manifest_id, artifact_id);
             if (!std.mem.eql(u8, table.table_name, name)) return error.BackupIntegrityFailure;
             // Re-read at execution: a repository mutation after the public
             // preflight cannot reserve owners for an unverified portable FK.
             if (try portableForeignKeyRestoreGuarded(a, table, self.cfg.allow_unverified_portable_fk_restore_for_tests))
                 return error.RestoreNewAdmissionGuarded;
             try self.admitArtifactSources(.{}, try indexes_api.indexesConfigUsesArtifactSources(a, table.indexes_json));
-            source.* = try driver.cohortSource(a, proof.value, table);
+            source.* = if (proof) |captured| try driver.cohortSource(a, captured.value, table) else try driver.repositorySource(a, table);
             source.destination_name = req.single_table_destination;
+
+            if (table.persistence_kind != null) {
+                const captured_native = try @import("sql_relation_creation.zig").prepare(self, a, context, try system_catalog.Target.literal(req.single_table_destination orelse name), .unlogged, .preserve_rows, true);
+                source.native_descriptor = captured_native.descriptor orelse return error.SqlRelationOwnerUnavailable;
+            }
             if (self.source.vtable.system_catalog != null) {
                 const destination = if (req.single_table_destination) |physical| destination: {
                     if (try system_catalog.restoreTarget(a, physical)) |decoded| break :destination decoded.value;
@@ -21291,7 +21736,7 @@ pub const ApiHttpServer = struct {
                         break :destination system_catalog.Target{ .database = database.name, .namespace = ns.name, .table = binding.name };
                     }
                     break :destination try system_catalog.Target.literal(physical);
-                } else entry.catalog_target orelse try system_catalog.Target.literal(name);
+                } else if (entry) |declared| declared.catalog_target orelse try system_catalog.Target.literal(name) else try system_catalog.Target.literal(name);
                 const namespace = try logical_index.namespaceFor(destination.database, destination.namespace);
                 const existing = logical_index.find(.table, namespace.id, destination.table);
                 if (req.single_table_destination) |physical| if (existing) |binding| {
@@ -21309,11 +21754,27 @@ pub const ApiHttpServer = struct {
                 source.existing_name = physical;
             }
         }
+        try @import("sql_trigger_restore.zig").prepare(a, self, context, principal, state.value.routine_actor, req.routine_mappings, &logical_index, logical_state.revision, sources);
         var snapshot = (try self.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
         defer self.source.freeAdminSnapshot(&snapshot);
-        const manifest_json = try std.json.Stringify.valueAlloc(a, manifest.*, .{});
+        const manifest_json = if (aggregate) |manifest| try std.json.Stringify.valueAlloc(a, manifest.*, .{}) else try std.json.Stringify.valueAlloc(a, independent.?.*, .{});
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(manifest_json, &digest, .{});
+        // The admitted native Job is observed before reaching this planner,
+        // so a lost reserve reply never allocates another destination identity.
+        var next_relation_oid = logical_state.next_id;
+        for (sources) |*source| {
+            if (source.catalog_binding == null) continue;
+            const exists = for (snapshot.tables) |table| {
+                if (std.mem.eql(u8, table.name, source.existing_name orelse source.manifest.table_name)) break true;
+            } else false;
+            if (exists and std.mem.eql(u8, req.restore_mode orelse "fail_if_exists", "skip_if_exists")) continue;
+            try system_catalog.requireRelationOid(next_relation_oid);
+            if (logical_index.tableByLogicalRelationId(next_relation_oid) != null) return error.InvalidCatalogRecord;
+            const selected = next_relation_oid;
+            source.destination_relation_oid = selected;
+            next_relation_oid += 1;
+        }
         const selection = try driver.buildPlan(a, id, digest, sources, snapshot.tables, snapshot.ranges, req.restore_mode orelse "fail_if_exists");
         var plan = selection.plan orelse {
             // No reservation or owner side effect exists. A skipped no-op is
@@ -21367,7 +21828,7 @@ pub const ApiHttpServer = struct {
             error.Cancelled => error.Cancelled,
             error.RestoreJobFenced, error.NotLeader => error.NotLeader,
             error.TableAlreadyExists => error.TableAlreadyExists,
-            error.RestoreDependencyMissing, error.InvalidRestoreMode, error.InvalidRestoreStaging, error.InvalidRestoreMigrationState, error.InvalidRequest, error.StoreRegistrationRequired => error.InvalidRequest,
+            error.SqlPreparationAuthorityNotConfigured, error.InvalidSqlTriggerDefinition, error.RestoreDependencyMissing, error.InvalidRestoreMode, error.InvalidRestoreStaging, error.InvalidRestoreMigrationState, error.InvalidRequest, error.StoreRegistrationRequired => error.InvalidRequest,
             error.BackupIntegrityFailure, error.BackupArtifactIntegrityMismatch, error.RestoreStagingScopeChanged, error.RestoreStagingFailed, error.SourceSnapshotIncomplete => error.BackupIntegrityFailure,
             error.RestoreDestinationReauthorizationRequired, error.StoredDestinationAuthorizationRevoked => error.RestoreDestinationReauthorizationRequired,
             error.RestoreNewAdmissionGuarded => error.PortableForeignKeyRestoreUnavailable,
@@ -21396,6 +21857,8 @@ pub const ApiHttpServer = struct {
             error.StoredDestinationAuthorizationRevoked,
             error.RestoreNewAdmissionGuarded,
             error.UnsupportedEmptyGenerationAuthority,
+            error.SqlPreparationAuthorityNotConfigured,
+            error.InvalidSqlTriggerDefinition,
             error.SourceSnapshotIncomplete,
             => true,
             else => false,
@@ -22476,7 +22939,7 @@ pub const ApiHttpServer = struct {
         const resolved = try self.resolveQueryCatalog(&resolver, context, targets.items, false);
         for (names.items, resolved.tables) |name, table| {
             const value = table orelse return error.TableNotFound;
-            try request.bind(alloc, name, value.name);
+            try request.bindWithPersistence(alloc, name, value.name, value.sql_persistence);
             if (identity.*) |*auth| try projectCatalogIdentity(self.alloc, auth, name, value.name);
         }
     }
@@ -25000,13 +25463,26 @@ pub const ApiHttpServer = struct {
             table_name,
         );
         defer self.alloc.free(idempotency_namespace);
+        @import("native_artifact_restore_admission.zig").require(self.alloc, self, .{}, &manifest) catch |failure| {
+            if (failure == error.NativeArtifactRestoreUpgradeRequired) return try contextualRetryableJsonErrorResponse(self.alloc, 503, "artifact-backed UNLOGGED restore requires upgraded metadata and all serving data stores supporting native data protocol8");
+            return failure;
+        };
         const portable_guarded = portableForeignKeyRestoreGuarded(self.alloc, &manifest, self.cfg.allow_unverified_portable_fk_restore_for_tests) catch
             return try contextualJsonErrorResponse(self.alloc, 400, "invalid relational backup declarations");
+        const trigger_authority_required = try @import("sql_trigger_restore.zig").needsActorForSchema(self.alloc, manifest.schema_json);
+        const trigger_actor = if (trigger_authority_required) try @import("sql_trigger_restore.zig").actorForAdmission(self, authenticated_identity) else null;
+        if (trigger_authority_required) {
+            @import("sql_preparation_authority_keys.zig").requireConfiguration(self.cfg) catch return try contextualJsonErrorResponse(self.alloc, 503, "restore requires SQL preparation authority: configure antfly.sql_preparation.secret and antfly.sql_preparation.issuer, or the persisted antfly.sql_preparation.authority bundle");
+            if (self.cfg.auth_enabled and trigger_actor == null) return try contextualJsonErrorResponse(self.alloc, 422, "restoring trigger attachments requires durable Basic or API-key authentication");
+        }
+
         const admission = self.restore_job_store.startRecoverableGuarded(self.alloc, .{
             .scope = .table,
             .source_kind = source_kind,
             .restore_mode = if (source_kind == .cluster_cohort) "overwrite" else "fail_if_exists",
             .table_name = table_name,
+            .routine_mappings = parsed.value.routine_mappings,
+            .routine_actor = trigger_actor,
             .backup_id = parsed.value.backup_id,
             .location = parsed.value.location,
             .connection = connection,
@@ -25123,12 +25599,14 @@ pub const ApiHttpServer = struct {
             null,
         );
         defer self.alloc.free(idempotency_namespace);
-        const start_request: restore_jobs.StartRequest = .{
+        var start_request: restore_jobs.StartRequest = .{
             .scope = .cluster,
             .backup_id = req.backup_id,
             .location = req.location,
             .connection = connection,
             .restore_mode = restore_mode,
+            .routine_mappings = req.routine_mappings,
+            .routine_actor = try @import("sql_trigger_restore.zig").actorForAdmission(self, authenticated_identity),
             .table_names = req.table_names,
             .idempotency_namespace = idempotency_namespace,
             .idempotency_key = idempotency_key,
@@ -25152,8 +25630,16 @@ pub const ApiHttpServer = struct {
             var manifest = backups_api.readClusterManifestForRestoreAdmissionWithCache(self.alloc, restore_io, &location, req.backup_id, &verification_cache) catch |err|
                 return try contextualJsonErrorResponse(self.alloc, if (err == error.BackupManifestTooLarge) 413 else 400, "invalid cluster backup manifest");
             defer manifest.deinit(self.alloc);
+            @import("native_artifact_restore_admission.zig").requireCluster(self.alloc, self, .{}, &location, &manifest, req.table_names) catch |failure| {
+                if (failure == error.NativeArtifactRestoreUpgradeRequired) return try contextualRetryableJsonErrorResponse(self.alloc, 503, "artifact-backed UNLOGGED restore requires upgraded metadata and all serving data stores supporting native data protocol8");
+                return failure;
+            };
             const guarded = clusterPortableForeignKeyRestoreGuarded(self.alloc, &location, &manifest, req.table_names, self.cfg.allow_unverified_portable_fk_restore_for_tests) catch
                 return try contextualJsonErrorResponse(self.alloc, 400, "invalid relational backup declarations");
+            if (!try @import("sql_trigger_restore.zig").needsActorForCluster(self.alloc, &location, &manifest, req.table_names)) start_request.routine_actor = null else {
+                @import("sql_preparation_authority_keys.zig").requireConfiguration(self.cfg) catch return try contextualJsonErrorResponse(self.alloc, 503, "restore requires SQL preparation authority: configure antfly.sql_preparation.secret and antfly.sql_preparation.issuer, or the persisted antfly.sql_preparation.authority bundle");
+                if (self.cfg.auth_enabled and start_request.routine_actor == null) return try contextualJsonErrorResponse(self.alloc, 422, "restoring trigger attachments requires durable Basic or API-key authentication");
+            }
             admission = self.restore_job_store.startRecoverableGuarded(self.alloc, start_request, !guarded) catch |err|
                 return try restoreJobStartErrorResponse(self.alloc, err);
         }
@@ -25498,6 +25984,7 @@ pub const ApiHttpServer = struct {
                         .connection = state.connection,
                         .single_table_destination = table_name,
                         .restore_mode = state.restore_mode,
+                        .routine_mappings = state.routine_mappings,
                     }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
                         if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                         if (restoreJobErrorIsRetryable(err)) {
@@ -25507,6 +25994,31 @@ pub const ApiHttpServer = struct {
                             return;
                         }
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
+                        self.alloc.free(failed);
+                        return;
+                    };
+                    defer self.alloc.free(response);
+                    var summary = try restore_jobs.summarizeClusterResultAlloc(self.alloc, response);
+                    defer summary.deinit(self.alloc);
+                    if (!summary.succeeded) {
+                        const failed = try self.restore_job_store.failWithResult(self.alloc, state, summary.encoded, "TableRestoreFailed");
+                        self.alloc.free(failed);
+                        return;
+                    }
+                    break :blk try backups_api.encodeRestoreTriggered(self.alloc);
+                }
+                var independent = try backups_api.readManifestFromLocationWithArtifactBackupId(self.alloc, &location, state.backup_id, state.backup_id);
+                defer independent.deinit(self.alloc);
+                if (independent.content_policy == .schema_only or try @import("../metadata/restore_staging.zig").needsTriggerHandoff(self.alloc, independent.schema_json)) {
+                    const response = self.admitStagedSnapshotRestore(.{ .backup_id = state.backup_id, .location = state.location, .connection = state.connection, .single_table_destination = table_name, .restore_mode = state.restore_mode, .routine_mappings = state.routine_mappings }, &location, null, &independent, &.{independent.table_name}, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.destination_authorization_principal) catch |failure| {
+                        if (restoreJobErrorIsFenced(failure)) return error.RestoreJobFenced;
+                        if (restoreJobErrorIsRetryable(failure)) {
+                            const encoded = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(failure), restoreRetryDelayNs(failure, state.job_id, state.attempt_id));
+                            self.alloc.free(encoded);
+                            self.wakeRequeuedRestoreJobs();
+                            return;
+                        }
+                        const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(failure));
                         self.alloc.free(failed);
                         return;
                     };
@@ -25626,6 +26138,7 @@ pub const ApiHttpServer = struct {
                 .connection = state.connection,
                 .table_names = state.table_names,
                 .restore_mode = state.restore_mode,
+                .routine_mappings = state.routine_mappings,
             }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
                 if (restoreJobErrorIsRetryable(err)) {
                     const retry_delay_ns = restoreRetryDelayNs(err, state.job_id, state.attempt_id);
@@ -28084,17 +28597,7 @@ fn tableNamesFromAdminSnapshotAlloc(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
 ) ![][]u8 {
-    const names = try alloc.alloc([]u8, snapshot.tables.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (names[0..initialized]) |name| alloc.free(name);
-        alloc.free(names);
-    }
-    for (snapshot.tables, 0..) |table, i| {
-        names[i] = try alloc.dupe(u8, table.name);
-        initialized += 1;
-    }
-    return names;
+    return @import("sql_relation_backup.zig").selectedNames(alloc, snapshot.tables);
 }
 
 fn tableNamesFromClusterManifestAlloc(
@@ -44668,12 +45171,52 @@ test "api http server reloads durable transaction sessions after restart" {
     try std.testing.expectEqualStrings("after restart", stored.value.title);
 }
 
+// These coordinator-maintenance fixtures own one immutable predecessor
+// document table. They do not claim trigger/FK activation or absence proofs.
+fn SessionMaintenanceFixtureCatalog(comptime Source: type) type {
+    return struct {
+        fn call(ptr: *anyopaque, a: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            try context.ensureActive();
+            const source: *Source = @ptrCast(@alignCast(ptr));
+            const table = source.tables[0];
+            if (input == .write_validation) {
+                if (!std.mem.eql(u8, input.write_validation, table.name)) return error.UnsupportedOperation;
+                return std.json.Stringify.valueAlloc(a, @import("../system_catalog/projection.zig").WriteValidation{ .schema_json = table.schema_json }, .{});
+            }
+            if (input != .resolve_many) return error.UnsupportedOperation;
+            const request = input.resolve_many;
+            if (request.sql_principal != null or request.sql_sources.len != 0 or request.relations.len != 0 or request.name_allocation or request.expected_relation_epoch != null)
+                return error.UnsupportedOperation;
+            if (request.expected_revision) |revision| if (revision != 1) return error.CatalogGenerationChanged;
+            // Binding the public transaction uses the forward selector;
+            // Raw.Owner preparation uses the explicit physical selector.
+            const forward = request.targets.len == 1 and request.storage_names.len == 0 and !request.include_storage_bindings;
+            const physical = request.targets.len == 0 and request.storage_names.len == 1;
+            if (!forward and !physical) return error.UnsupportedOperation;
+            if (forward) {
+                const target = request.targets[0];
+                if (!std.mem.eql(u8, target.database, system_catalog.default_database_name) or !std.mem.eql(u8, target.namespace, system_catalog.default_namespace_name) or !std.mem.eql(u8, target.table, table.name)) return error.UnsupportedOperation;
+            } else if (!std.mem.eql(u8, request.storage_names[0], table.name)) return error.UnsupportedOperation;
+            var identity = system_catalog.ResolvedTable.fromTable(table);
+            if (request.include_query_definitions) identity.query_definition = system_catalog.QueryDefinition.fromTable(table);
+            var identities = [_]?system_catalog.ResolvedTable{identity};
+            const logical = [_]?[]const u8{table.name};
+            return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{
+                .revision = 1,
+                .tables = if (forward) &identities else &.{},
+                .logical_names = if (physical) &logical else &.{},
+                .storage_tables = if (physical and request.include_storage_bindings) &identities else &.{},
+            }, .{});
+        }
+    };
+}
+
 test "api http server retries stable terminal commits without replaying writes" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
         tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 1, .name = "docs" }},
         fn iface(self: *@This()) StatusSource {
-            return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot } };
+            return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot, .system_catalog = SessionMaintenanceFixtureCatalog(@This()).call } };
         }
 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
@@ -44817,7 +45360,7 @@ test "api session maintenance recovers crash window after durable 2pc commit" {
     const FakeSource = struct {
         tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 1, .name = "docs" }},
         fn iface(self: *@This()) StatusSource {
-            return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot } };
+            return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot, .system_catalog = SessionMaintenanceFixtureCatalog(@This()).call } };
         }
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
@@ -44931,7 +45474,7 @@ test "api session maintenance skips live commit execution and acknowledgement" {
     const FakeSource = struct {
         tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 1, .name = "docs" }},
         fn iface(self: *@This()) StatusSource {
-            return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot } };
+            return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot, .system_catalog = SessionMaintenanceFixtureCatalog(@This()).call } };
         }
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
@@ -62198,6 +62741,30 @@ test "SQL pgwire native restart discards unpublished subscriptions without claim
     try std.testing.expectEqual(@as(u64, 4), try durable.registrationFloor());
 }
 
+test "SQL policy publication submission distinguishes preflight refusal from unknown durable admission" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        submitted: bool = false,
+        fn call(raw: *anyopaque, _: std.mem.Allocator, context: api_operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.submitted) {
+                context.markSQLSubmission();
+                return error.MetadataMutationOutcomeUnknown;
+            }
+            return error.RowPolicyUnsupported;
+        }
+    };
+    var fixture: Fixture = .{};
+    const source: StatusSource = .{ .ptr = &fixture, .vtable = &.{ .status = undefined, .system_catalog = Fixture.call, .tracks_sql_submission = true } };
+    const request: @import("../system_catalog/server_call.zig").Call = .{ .policy_publication_begin = .{ .table_id = 1, .enable = true, .expected_revision = 1 } };
+    var submitted = false;
+    try std.testing.expectError(error.RowPolicyUnsupported, source.systemCatalog(a, .{ .sql_completion_submission = &submitted }, request));
+    try std.testing.expect(!submitted);
+    fixture.submitted = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.systemCatalog(a, .{ .sql_completion_submission = &submitted }, request));
+    try std.testing.expect(submitted);
+}
+
 test "SQL pgwire native schema rewrite pre-submission failure retires its prepared proof" {
     const a = std.testing.allocator;
     const Store = @import("../metadata/storage/raft_apply_store.zig").RaftApplyStore;
@@ -62924,4 +63491,207 @@ test "public execution native query checkpoints preserve scoped deadline errors"
     try std.testing.expectError(error.DeadlineExceeded, ensureRequestActive(.{ .ptr = &state, .is_cancelled_fn = Check.probe, .check_fn = Check.expired }));
     var disconnected = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Cancelled, ensureRequestActive(CancellationToken.fromAtomic(&disconnected)));
+}
+
+test "SQL relation lifetime table retirement preparation requires exact private authority before owner capture" {
+    const preparation = @import("table_retirement_preparation.zig");
+    const a = std.testing.allocator;
+    const request: preparation.Request = .{ .lookup = .{ .group = 2188, .table = 3, .id = @splat(1) }, .expected_revision = 1, .effects = .{ .digest = @splat(2), .root_table = 3, .survivors = 0, .counters = 0, .views = 0 }, .metadata_incarnation = "11111111111111111111111111111111".*, .table_id = 3, .owner_group_id = 7, .namespace = .{ .table_id = 3, .shard_id = 72, .range_id = 172 } };
+    try request.validate(7);
+    const Fixture = struct {
+        calls: usize = 0,
+        empty: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedStatusRead;
+        }
+        fn prepare(raw: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, value: preparation.Request, context: api_operation.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(context.setting_admin and context.schema_validation_authority and context.fk_generation_publication_authority);
+            try context.ensureActive();
+            try std.testing.expectEqual(@as(u64, 7), group);
+            try std.testing.expectEqualStrings("items", table);
+            try std.testing.expectEqualDeep(request, value);
+            self.calls += 1;
+            return alloc.dupe(u8, if (self.empty) "" else "{}");
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(a, .{ .table_retirement_preparation = .{ .ptr = &fixture, .prepare_fn = Fixture.prepare } }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status } }, null, null);
+    defer server.deinit();
+    const trusted: api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true, .fk_generation_publication_authority = true };
+    inline for (.{ "setting_admin", "schema_validation_authority", "fk_generation_publication_authority" }) |field| {
+        var missing = trusted;
+        @field(missing, field) = false;
+        try std.testing.expectError(error.Forbidden, server.prepareTableRetirementOwner(a, 7, "items", request, missing));
+    }
+    var expired = trusted;
+    expired.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, server.prepareTableRetirementOwner(a, 7, "items", request, expired));
+    try std.testing.expectError(error.InvalidCatalogRecord, server.prepareTableRetirementOwner(a, 72, "items", request, trusted));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    const bytes = try server.prepareTableRetirementOwner(a, 7, "items", request, trusted);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("{}", bytes);
+    fixture.empty = true;
+    try std.testing.expectError(error.InvalidResponse, server.prepareTableRetirementOwner(a, 7, "items", request, trusted));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
+test "SQL relation lifetime captured retirement delivery selects exact native store without Raft rediscovery" {
+    const a = std.testing.allocator;
+    const fk = @import("relational_fk_generation_publication.zig");
+    const ownership = @import("group_work_ownership.zig");
+    const descriptor: @import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(3), .data_generation = 1 };
+    const captured: @import("table_retirement_preparation.zig").Selection = .{
+        .table = .{ .table_id = 7, .name = "rows", .sql_persistence = descriptor },
+        .range = .{ .table_id = 7, .group_id = 72, .doc_identity_shard_id = 172, .doc_identity_range_id = 272, .start_key = "" },
+    };
+    const source_request: fk.SourceRequest = .{ .plan_id = @splat(1), .child_table_id = 7, .child_table_name = "rows", .child_group_id = 72, .action = .fence };
+    const parent_request: fk.Request = .{ .plan_id = @splat(1), .parent_table_id = 7, .parent_group_id = 72, .child_table_id = 17, .child_table_name = "child", .action = .stage };
+    const Fixture = struct {
+        stores: [3]metadata_table_manager.StoreRecord = .{
+            .{ .store_id = 1, .node_id = 9, .role = "metadata", .api_url = "http://metadata" },
+            .{ .store_id = 10, .node_id = 9, .api_url = "http://wrong-store" },
+            .{ .store_id = 11, .node_id = 9, .role = "cold", .api_url = "http://native-data", .live = false, .drain_requested = true },
+        },
+        snapshots: usize = 0,
+        endpoint_reads: usize = 0,
+        releases: usize = 0,
+        raft_calls: usize = 0,
+        http_calls: usize = 0,
+        local_calls: usize = 0,
+        local_owner: bool = false,
+        ordinary_expected: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 2188, .metrics = .{} };
+        }
+        fn snapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.ordinary_expected) {
+                self.raft_calls += 1;
+                return error.TestExpectedOrdinaryRaftRouting;
+            }
+            self.snapshots += 1;
+            return error.TestUnexpectedFullCatalog;
+        }
+        fn endpoint(raw: *anyopaque, alloc: std.mem.Allocator, node: u64, store: u64, context: api_operation.RequestContext) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.ensureActive();
+            self.endpoint_reads += 1;
+            return metadata_api.nativeOwnerDataUri(alloc, &self.stores, node, store);
+        }
+        fn release(raw: *anyopaque, _: *metadata_api.AdminSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.releases += 1;
+        }
+        fn routing(raw: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.raft_calls += 1;
+            return error.TestExpectedOrdinaryRaftRouting;
+        }
+        fn freeRouting(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+        fn raft(raw: *anyopaque, _: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.raft_calls += 1;
+            return false;
+        }
+        fn native(raw: *anyopaque, _: std.mem.Allocator, selected: ownership.NativeSelection, context: api_operation.RequestContext) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 7), selected.table_id);
+            try std.testing.expectEqual(@as(u64, 72), selected.group_id);
+            try std.testing.expectEqualDeep(descriptor, selected.descriptor);
+            try std.testing.expectEqual(ownership.NativePurpose.retirement, selected.purpose);
+            try std.testing.expect(context.sql_relation_owner == null);
+            return self.local_owner;
+        }
+        fn source(raw: *anyopaque, _: std.mem.Allocator, table: []const u8, group: u64, request: fk.SourceRequest, context: api_operation.RequestContext) !fk.SourceReceipt {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.local_calls += 1;
+            try std.testing.expectEqualStrings("rows", table);
+            try std.testing.expectEqual(@as(u64, 72), group);
+            try std.testing.expectEqualDeep(source_request, request);
+            try std.testing.expect(context.sql_relation_owner == null);
+            // Selection proof only; no fabricated physical receipt.
+            return error.TestCapturedLocalDelivery;
+        }
+        fn parent(raw: *anyopaque, _: std.mem.Allocator, table: []const u8, group: u64, request: fk.Request, context: api_operation.RequestContext) !fk.Receipt {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.local_calls += 1;
+            try std.testing.expectEqualStrings("rows", table);
+            try std.testing.expectEqual(@as(u64, 72), group);
+            try std.testing.expectEqualDeep(parent_request, request);
+            try std.testing.expect(context.sql_relation_owner == null);
+            return error.TestCapturedLocalDelivery;
+        }
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.http_calls += 1;
+            try std.testing.expectEqual(http_common.Method.POST, request.method);
+            try std.testing.expect(std.mem.startsWith(u8, request.uri, "http://native-data/internal/v1/groups/72/tables/rows"));
+            try std.testing.expect(request.header(@import("internal_service_auth.zig").header_name) != null);
+            if (std.mem.endsWith(u8, request.uri, routes.Routes.fk_generation_source_suffix)) {
+                var parsed = try std.json.parseFromSlice(fk.SourceRequest, alloc, request.body, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqualDeep(source_request, parsed.value);
+            } else {
+                try std.testing.expect(std.mem.endsWith(u8, request.uri, routes.Routes.fk_generation_parent_suffix));
+                var parsed = try std.json.parseFromSlice(fk.Request, alloc, request.body, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqualDeep(parent_request, parsed.value);
+            }
+            // Real receiver validation is covered by the mounted native case.
+            return .{ .status = 503, .body = try alloc.dupe(u8, "pending") };
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(a, .{
+        .deployment_mode = .standalone,
+        .internal_service_secret = "captured-native-delivery-secret-0123456789",
+        .internal_service_issuer = "delivery-test",
+        .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } },
+        .relational_maintenance_leadership = .{ .ptr = &fixture, .vtable = &.{ .is_local_leader = Fixture.raft, .native_local = Fixture.native } },
+    }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .admin_snapshot = Fixture.snapshot, .native_owner_data_uri = Fixture.endpoint, .free_admin_snapshot = Fixture.release, .routing_snapshot = Fixture.routing, .linearizable_routing_snapshot = Fixture.routing, .free_routing_snapshot = Fixture.freeRouting } }, null, null);
+    defer server.deinit();
+    const context: api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true, .fk_generation_publication_authority = true };
+    try std.testing.expectError(error.Forbidden, server.executeCapturedFkGenerationSource(a, captured, source_request, .{}));
+    var wrong = captured;
+    wrong.range.group_id += 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, server.executeCapturedFkGenerationSource(a, wrong, source_request, context));
+    wrong = captured;
+    wrong.table.name = "another";
+    try std.testing.expectError(error.InvalidGenerationPublication, server.executeCapturedFkGenerationSource(a, wrong, source_request, context));
+    try std.testing.expectEqual(@as(usize, 0), fixture.snapshots);
+    try std.testing.expectError(error.GenerationAdmissionPending, server.executeCapturedFkGenerationSource(a, captured, source_request, context));
+    try std.testing.expectError(error.GenerationAdmissionPending, server.executeCapturedFkGenerationParent(a, captured, parent_request, context));
+    try std.testing.expectEqual(@as(usize, 2), fixture.http_calls);
+    fixture.stores[2].node_id = 10;
+    try std.testing.expectError(error.SqlRelationOwnerUnavailable, server.executeCapturedFkGenerationSource(a, captured, source_request, context));
+    fixture.stores[2].node_id = 9;
+    fixture.stores[2].role = "metadata";
+    try std.testing.expectError(error.SqlRelationOwnerUnavailable, server.executeCapturedFkGenerationSource(a, captured, source_request, context));
+    fixture.stores[2].role = "cold";
+    fixture.stores[2].store_id = 12;
+    try std.testing.expectError(error.SqlRelationOwnerUnavailable, server.executeCapturedFkGenerationSource(a, captured, source_request, context));
+    fixture.stores[2].store_id = 11;
+    try std.testing.expectEqual(@as(usize, 2), fixture.http_calls);
+    server.cfg.fk_generation_source = .{ .ptr = &fixture, .execute_fn = Fixture.source };
+    server.cfg.fk_generation_parent = .{ .ptr = &fixture, .execute_fn = Fixture.parent };
+    fixture.local_owner = true;
+    const snapshots_before_local = fixture.endpoint_reads;
+    try std.testing.expectError(error.TestCapturedLocalDelivery, server.executeCapturedFkGenerationSource(a, captured, source_request, context));
+    try std.testing.expectError(error.TestCapturedLocalDelivery, server.executeCapturedFkGenerationParent(a, captured, parent_request, context));
+    try std.testing.expectEqual(snapshots_before_local, fixture.endpoint_reads);
+    try std.testing.expectEqual(@as(usize, 2), fixture.local_calls);
+    fixture.local_owner = false;
+    try std.testing.expectError(error.GenerationAdmissionPending, server.executeCapturedFkGenerationSource(a, captured, source_request, context));
+    try std.testing.expectEqual(@as(usize, 3), fixture.http_calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.raft_calls);
+    try std.testing.expectEqual(fixture.snapshots, fixture.releases);
+    // Ordinary document/Raft delivery retains its original path.
+    wrong = captured;
+    wrong.table.sql_persistence = null;
+    server.cfg.deployment_mode = .distributed;
+    fixture.ordinary_expected = true;
+    try std.testing.expectError(error.TestExpectedOrdinaryRaftRouting, server.executeCapturedFkGenerationSource(a, wrong, source_request, context));
+    try std.testing.expect(fixture.raft_calls > 0);
 }

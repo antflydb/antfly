@@ -67,7 +67,15 @@ pub fn applyReplicatedTransactionMutationInternal(
     visibility_cancellation: db_mod.types.CancellationToken,
     raft_entry: ?db_mod.OrderedApplyReceipt,
 ) !void {
+    try @import("antfly_local_sources").sql_catalog.trigger_native_admission.requireOwnerGroup(req, group_id);
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
+    // These new private controls belong to native-local owners. Never drop
+    // a real Raft receipt by routing them through a replica-local helper.
+    if (raft_entry != null) switch (mutation) {
+        .acknowledge => |ack| if (ack.external_decision_owner != null) return error.InvalidBatchRequest,
+        .acknowledge_many => |ack| if (ack.external_decision_owner != null) return error.InvalidBatchRequest,
+        else => {},
+    };
     try @import("antfly_local_sources").storage_range_protection.validateRequest(req);
     if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
     switch (mutation) {
@@ -159,7 +167,13 @@ pub fn applyReplicatedTransactionMutationInternal(
                 );
             } else {
                 if (resolve.external_decision_owner) |owner| {
-                    try db.resolveExternalTransaction(.{ .txn_id = resolve.txn_id, .owner = owner, .status = resolve.status, .commit_version = resolve.commit_version, .sync_level = req.sync_level, .visibility_cancellation = visibility_cancellation });
+                    // Publish the native participant ACK with its decision.
+                    // An abort before BEGIN has no roster yet: the existing
+                    // abort-fence writer creates its exact local membership.
+                    const defer_coordinator_ack = resolve.status == .committed and
+                        try db.transactionRetainsCoordinatorAcknowledgement(resolve.txn_id);
+                    try db.resolveExternalTransaction(.{ .txn_id = resolve.txn_id, .owner = owner, .status = resolve.status, .commit_version = resolve.commit_version, .sync_level = req.sync_level, .visibility_cancellation = visibility_cancellation, .resolved_participant = if (defer_coordinator_ack) null else local_participant });
+                    return;
                 } else try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
                     resolve.txn_id,
                     resolve.status,
@@ -179,21 +193,25 @@ pub fn applyReplicatedTransactionMutationInternal(
                 }
             }
         },
-        .acknowledge => |ack| (if (raft_entry) |entry|
+        .acknowledge => |ack| (if (ack.external_decision_owner) |owner|
+            db.markExternalTransactionParticipantsResolved(ack.txn_id, &.{ack.participant}, owner)
+        else if (raft_entry) |entry|
             db.markReplicatedTransactionParticipantResolvedAtOrderedReceipt(ack.txn_id, ack.participant, entry)
         else
             db.markTransactionParticipantResolved(ack.txn_id, ack.participant)) catch |err| switch (err) {
             // Cleanup and acknowledgements are independently retryable Raft
             // commands. Once cleanup wins, a late acknowledgement is a safe
             // no-op and must not recreate coordinator sidecar metadata.
-            transactions_mod.TxnError.TxnNotFound => {},
+            transactions_mod.TxnError.TxnNotFound => if (ack.external_decision_owner != null) return error.CommitDecisionUnknown,
             else => return err,
         },
-        .acknowledge_many => |ack| (if (raft_entry) |entry|
+        .acknowledge_many => |ack| (if (ack.external_decision_owner) |owner|
+            db.markExternalTransactionParticipantsResolved(ack.txn_id, ack.participants, owner)
+        else if (raft_entry) |entry|
             db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(ack.txn_id, ack.participants, entry)
         else
             db.markTransactionParticipantsResolved(ack.txn_id, ack.participants)) catch |err| switch (err) {
-            transactions_mod.TxnError.TxnNotFound => {},
+            transactions_mod.TxnError.TxnNotFound => if (ack.external_decision_owner != null) return error.CommitDecisionUnknown,
             else => return err,
         },
         .cleanup => |cleanup| {

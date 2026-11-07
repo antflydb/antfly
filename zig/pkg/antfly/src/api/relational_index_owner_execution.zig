@@ -217,7 +217,7 @@ pub const Result = union(enum) {
             if (node_id != view.identity.node_id or store_id != view.identity.store_id or reporter_incarnation != view.reporter_incarnation or
                 audit.audit.root_incarnation != view.identity.root_incarnation) return error.IndexOwnerReceiptChanged;
             const digest = try audit.readyDigest();
-            const proof = try (publication.RootProof{ .identity = view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = view.binding_digest }, .root_generation = value.root_generation, .signature = undefined }).sign(root, digest);
+            const proof = try (publication.RootProof{ .identity = view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = view.binding_digest }, .native_pin = view.native_pin, .root_generation = value.root_generation, .signature = undefined }).sign(root, digest);
             const signed: publication.SignedAudit = .{ .outcome_digest = digest, .proof = proof };
             _ = try signed.verifiedDigest(audit);
             const logical: ?publication.SignedReceipt = if (value.outcome.value == .validated) receipt: {
@@ -226,7 +226,7 @@ pub const Result = union(enum) {
                 try sealed.validate();
                 if (!std.meta.eql(sealed.command, try audit.logicalCommand())) return error.InvalidPrivateIndexNativeReceipt;
                 const committed = sealed.receipt orelse return error.NativeIndexSigningUnavailable;
-                const receipt_proof = try (publication.RootProof{ .identity = view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = view.binding_digest }, .root_generation = value.root_generation, .signature = undefined }).sign(root, try committed.digest());
+                const receipt_proof = try (publication.RootProof{ .identity = view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = view.binding_digest }, .native_pin = view.native_pin, .root_generation = value.root_generation, .signature = undefined }).sign(root, try committed.digest());
                 const signed_receipt: publication.SignedReceipt = .{ .receipt = committed, .proof = receipt_proof };
                 try signed_receipt.verifySignature();
                 break :receipt signed_receipt;
@@ -249,6 +249,7 @@ pub const Result = union(enum) {
             .identity = context.view.identity,
             .reporter_incarnation = reporter_incarnation,
             .authority = .{ .native = context.view.binding_digest },
+            .native_pin = context.view.native_pin,
             .root_generation = self.rootGeneration() orelse return error.NativeIndexSigningUnavailable,
             .signature = undefined,
         }).sign(root, try receipt.digest());
@@ -362,7 +363,7 @@ const ReleaseResult = struct {
         try view.validate(self.outcome.value.intent.installed.command.validation.command.expected.metadata_incarnation);
         if (node_id != view.identity.node_id or store_id != view.identity.store_id or reporter_incarnation != view.reporter_incarnation) return error.IndexOwnerReceiptChanged;
         const receipt = self.outcome.value.receipt.?;
-        const proof = try (publication.RootProof{ .identity = view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = view.binding_digest }, .root_generation = self.root_generation, .signature = undefined }).sign(root, try receipt.digest());
+        const proof = try (publication.RootProof{ .identity = view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = view.binding_digest }, .native_pin = view.native_pin, .root_generation = self.root_generation, .signature = undefined }).sign(root, try receipt.digest());
         const signed: publication.SignedReceipt = .{ .receipt = receipt, .proof = proof };
         try signed.verifySignature();
         self.signed_receipt = signed;
@@ -432,7 +433,7 @@ const InstallationResult = struct {
         if (node_id != view.identity.node_id or store_id != view.identity.store_id or reporter_incarnation != view.reporter_incarnation or
             value.physical.audit.root_incarnation != view.identity.root_incarnation) return error.IndexOwnerReceiptChanged;
         try self.outcome.value.validateFor(.{ .intent = value.logical.command.intent(), .budget = .{} });
-        const template: publication.RootProof = .{ .identity = view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = view.binding_digest }, .root_generation = self.root_generation, .signature = undefined };
+        const template: publication.RootProof = .{ .identity = view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = view.binding_digest }, .native_pin = view.native_pin, .root_generation = self.root_generation, .signature = undefined };
         const digest = try value.physical.readyDigest();
         const signed_audit: publication.SignedAudit = .{ .outcome_digest = digest, .proof = try template.sign(root, digest) };
         const receipt = value.logical.receipt orelse return error.NativeIndexSigningUnavailable;
@@ -796,7 +797,7 @@ pub const ControlResponse = union(enum) {
                     try ack.validate();
                     const receipt = value.outcome.receipt orelse return error.InvalidPrivateIndexNativeReceipt;
                     if (!std.mem.eql(u8, &try receipt.digest(), &try ack.signed.receipt.digest())) return error.InvalidPrivateIndexNativeReceipt;
-                    try (publication.NativeSigningView{ .identity = ack.signed.proof.identity, .reporter_incarnation = ack.signed.proof.reporter_incarnation, .binding_digest = ack.signed.proof.authority.native }).validate(ack.signed.proof.identity.metadata_incarnation);
+                    try (publication.NativeSigningView{ .identity = ack.signed.proof.identity, .reporter_incarnation = ack.signed.proof.reporter_incarnation, .binding_digest = ack.signed.proof.authority.native, .native_pin = ack.signed.proof.native_pin }).validate(ack.signed.proof.identity.metadata_incarnation);
                 }
                 break :blk value.outcome;
             },
@@ -843,7 +844,7 @@ pub const SourceResponse = struct {
         if (authority == .native) try self.observation.requireIdentity(self.identity(request)) else try self.observation.requireRaftIdentity(self.identity(request));
         if (self.signed_source) |proof| {
             if (self.signing_failure != null or proof.root_generation != self.root_generation or (proof.authority == .native) != (authority == .native)) return error.InvalidPrivateIndexClaimReceipt;
-            if (authority == .native) (publication.NativeSigningView{ .identity = proof.identity, .reporter_incarnation = proof.reporter_incarnation, .binding_digest = proof.authority.native }).validate(proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
+            if (authority == .native) (publication.NativeSigningView{ .identity = proof.identity, .reporter_incarnation = proof.reporter_incarnation, .binding_digest = proof.authority.native, .native_pin = proof.native_pin }).validate(proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
             proof.verify(try self.observation.headerCommitment()) catch return error.InvalidPrivateIndexClaimReceipt;
         }
     }
@@ -900,7 +901,7 @@ pub const SourceResult = struct {
         try pinned.view.validate(pinned.view.identity.metadata_incarnation);
         if (pinned.digest == null or node_id != pinned.view.identity.node_id or store_id != pinned.view.identity.store_id or reporter_incarnation != pinned.view.reporter_incarnation or
             self.root_generation != pinned.root_generation or !std.mem.eql(u8, &digest, &pinned.digest.?) or !std.mem.eql(u8, &digest, &try self.wire.value.headerCommitment())) return error.IndexOwnerReceiptChanged;
-        self.signed_source = try (publication.RootProof{ .identity = pinned.view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = pinned.view.binding_digest }, .root_generation = self.root_generation, .signature = undefined }).sign(root, digest);
+        self.signed_source = try (publication.RootProof{ .identity = pinned.view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = pinned.view.binding_digest }, .native_pin = pinned.view.native_pin, .root_generation = self.root_generation, .signature = undefined }).sign(root, digest);
         self.signing_failure = null;
     }
 
@@ -1235,7 +1236,7 @@ pub const ClaimResult = union(enum) {
             if (value.expected_digest == null or value.root_generation != value.pinned_root_generation or
                 !std.mem.eql(u8, &actual, &value.expected_digest.?) or !std.mem.eql(u8, &outcome.accepted.metadata_incarnation, &value.view.identity.metadata_incarnation) or
                 node_id != value.view.identity.node_id or store_id != value.view.identity.store_id or reporter_incarnation != value.view.reporter_incarnation) return error.IndexOwnerReceiptChanged;
-            value.proof = try (publication.RootProof{ .identity = value.view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = value.view.binding_digest }, .root_generation = value.root_generation, .signature = undefined }).sign(root, actual);
+            value.proof = try (publication.RootProof{ .identity = value.view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = value.view.binding_digest }, .native_pin = value.view.native_pin, .root_generation = value.root_generation, .signature = undefined }).sign(root, actual);
             value.signing_failure = null;
             return;
         }
@@ -1244,7 +1245,7 @@ pub const ClaimResult = union(enum) {
             try closed.view.validate(closed.view.identity.metadata_incarnation);
             const actual = try closed.owned.data.digest();
             if (closed.root_generation != closed.pinned_root_generation or !std.mem.eql(u8, &actual, &closed.expected_digest) or node_id != closed.view.identity.node_id or store_id != closed.view.identity.store_id or reporter_incarnation != closed.view.reporter_incarnation) return error.IndexOwnerReceiptChanged;
-            closed.proof = try (publication.RootProof{ .identity = closed.view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = closed.view.binding_digest }, .root_generation = closed.root_generation, .signature = undefined }).sign(root, actual);
+            closed.proof = try (publication.RootProof{ .identity = closed.view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = closed.view.binding_digest }, .native_pin = closed.view.native_pin, .root_generation = closed.root_generation, .signature = undefined }).sign(root, actual);
             closed.signing_failure = null;
             return;
         }
@@ -1261,6 +1262,7 @@ pub const ClaimResult = union(enum) {
             .identity = context.view.identity,
             .reporter_incarnation = reporter_incarnation,
             .authority = .{ .native = context.view.binding_digest },
+            .native_pin = context.view.native_pin,
             .root_generation = value.root_generation,
             .signature = undefined,
         }).sign(root, delivery_digest);
@@ -1442,7 +1444,7 @@ fn CancellationCheckpointResult(comptime releasing: bool) type {
             if (self.root_generation == 0 or self.root_generation != self.pinned_root_generation or
                 node_id != self.signing.identity.node_id or store_id != self.signing.identity.store_id or reporter_incarnation != self.signing.reporter_incarnation) return error.IndexOwnerReceiptChanged;
             const receipt = self.outcome.value.receipt.?;
-            const proof = try (publication.RootProof{ .identity = self.signing.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = self.signing.binding_digest }, .root_generation = self.root_generation, .signature = undefined }).sign(root, try receipt.digest());
+            const proof = try (publication.RootProof{ .identity = self.signing.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = self.signing.binding_digest }, .native_pin = self.signing.native_pin, .root_generation = self.root_generation, .signature = undefined }).sign(root, try receipt.digest());
             const signed: publication.SignedReceipt = .{ .receipt = receipt, .proof = proof };
             if (releasing) try signed.verifySignature() else try (publication.CancellationWitness{ .record = self.outcome.value.record orelse return error.InvalidPrivateIndexCancellation }).verifyFor(signed);
             self.signed_receipt = signed;
@@ -2584,7 +2586,7 @@ fn testSchedulerDeliveryFault(alloc: std.mem.Allocator, permission: publication.
     for ([_]local.storage_db_relational_index_publication_progress.Action{ .fenced, .reserved }, 1..) |action, sequence| {
         const receipt: local.storage_db_relational_index_publication_progress.Receipt = .{ .owner = permission.owner.owner, .action = action, .position = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = sequence } }, .candidate_digest = permission.head.candidate_digest, .reservation_digest = permission.head.reservation_digest, .evidence_digest = @splat(9) };
         try std.testing.expectEqual(try receipt.digest(), permission.owner.receipts[@backingInt(action)]);
-        const proof = try (publication.RootProof{ .identity = view.identity, .reporter_incarnation = view.reporter_incarnation, .authority = .{ .native = view.binding_digest }, .root_generation = driver.root_generation, .signature = undefined }).sign(root, try receipt.digest());
+        const proof = try (publication.RootProof{ .identity = view.identity, .reporter_incarnation = view.reporter_incarnation, .authority = .{ .native = view.binding_digest }, .native_pin = view.native_pin, .root_generation = driver.root_generation, .signature = undefined }).sign(root, try receipt.digest());
         driver.value.owner.attestations[@backingInt(action)] = try proof.commitment(try receipt.digest());
     }
     var host: TestSchedulerHost = .{ .driver = &driver };
@@ -3424,7 +3426,7 @@ test "relational index publication installed receiver binds fresh decision and r
     const signing_view = driver.value.native_signing.?;
     for ([_]progress.Action{ .fenced, .reserved, .validated }, [_]u64{ 1, 2, 8 }) |action, sequence| {
         const receipt: progress.Receipt = if (action == .validated) try validated.logical.command.receipt(validated.logical.position) else .{ .owner = driver.value.owner.owner, .action = action, .position = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = sequence } }, .candidate_digest = prepared.head.candidate_digest, .reservation_digest = prepared.head.reservation_digest, .evidence_digest = @splat(9) };
-        const proof = try (publication.RootProof{ .identity = signing_view.identity, .reporter_incarnation = signing_view.reporter_incarnation, .authority = .{ .native = signing_view.binding_digest }, .root_generation = driver.root_generation, .signature = undefined }).sign(root, try receipt.digest());
+        const proof = try (publication.RootProof{ .identity = signing_view.identity, .reporter_incarnation = signing_view.reporter_incarnation, .authority = .{ .native = signing_view.binding_digest }, .native_pin = signing_view.native_pin, .root_generation = driver.root_generation, .signature = undefined }).sign(root, try receipt.digest());
         driver.value.owner.attestations[@backingInt(action)] = try proof.commitment(try receipt.digest());
     }
     try testSchedulerInstallationFaults(alloc, driver.value, binding, root, driver.installation_response.?);

@@ -29,15 +29,52 @@ pub const Lookup = struct {
         try self.reference.validate();
     }
 };
+pub const NativeLosses = struct { count: u16, digest: [32]u8 };
 pub const Head = struct {
     lookup: Lookup,
     metadata_incarnation: [16]u8,
     creator: local.system_catalog_privileges.Principal,
     target_digest: contract.Digest,
+    temporary_owner: ?local.common_topology_records.RelationPersistence.Owner = null,
+    /// Recovery-only reservation; old native births are already inaccessible.
+    native_loss_requested: bool = false,
+    native_losses: ?NativeLosses = null,
+    temporary_abandonment: ?[32]u8 = null,
     force: bool = false,
     sequence: u64,
     progress: contract.Progress,
+    pub fn jsonStringify(self: Head, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Head).@"struct".field_names) |field| {
+            if (comptime std.mem.eql(u8, field, "temporary_owner") or std.mem.eql(u8, field, "native_losses") or std.mem.eql(u8, field, "temporary_abandonment")) {
+                if (@field(self, field) != null) {
+                    try writer.objectField(field);
+                    try writer.write(@field(self, field));
+                }
+            } else if (comptime std.mem.eql(u8, field, "native_loss_requested")) {
+                if (self.native_loss_requested) {
+                    try writer.objectField(field);
+                    try writer.write(true);
+                }
+            } else {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
     pub fn validate(self: Head) !void {
+        if (self.temporary_owner) |owner| {
+            try owner.validate();
+            if (self.lookup.reference.kind != .namespace) return error.InvalidScopeRetirement;
+        }
+        if (self.temporary_abandonment) |digest| {
+            if (self.temporary_owner == null or self.lookup.reference.kind != .namespace or self.progress.phase == .canceled or std.mem.allEqual(u8, &digest, 0)) return error.InvalidScopeRetirement;
+        }
+        if (self.native_loss_requested and (self.temporary_owner == null or self.lookup.reference.kind != .namespace or self.progress.phase == .canceled)) return error.InvalidScopeRetirement;
+        if (self.native_losses) |losses| {
+            if (losses.count == 0 or losses.count > self.lookup.reference.tables or self.progress.phase == .canceled) return error.InvalidScopeRetirement;
+        }
         try self.lookup.validate();
         try self.creator.validate();
         try self.progress.validate();
@@ -48,7 +85,7 @@ pub const Head = struct {
         return self.progress.phase != .published and self.progress.phase != .canceled;
     }
 };
-pub const HeadRecord = records.Record(Head, "SRHD", 2048);
+pub const HeadRecord = records.Record(Head, "SRHD", 4096);
 pub const Lease = struct {
     lookup: Lookup,
     metadata_incarnation: [16]u8,
@@ -82,7 +119,7 @@ pub fn prepare(backing: A, group: u64, id: contract.Id, bytes: []const u8) !Prep
     const encoded = try std.json.Stringify.valueAlloc(a, manifest, .{});
     return .{ .arena = arena, .manifest = manifest, .lookup = lookup, .encoded = encoded };
 }
-const Kind = enum { head, manifest, terminal_outcome, drain_outcome, source_cursor };
+const Kind = enum { head, manifest, terminal_outcome, drain_outcome, source_cursor, temporary_abandonment };
 pub fn prefix(buffer: []u8, group: u64) ![]const u8 {
     if (group == 0) return error.InvalidScopeRetirement;
     return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:system_catalog:{d}:scope-retirement:", .{group});
@@ -179,10 +216,7 @@ pub fn counterKey(buffer: []u8, group: u64) ![]const u8 {
     return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:system_catalog:{d}:scope-retirement-sequence", .{group});
 }
 fn optional(reader: anytype, name: []const u8) !?[]const u8 {
-    return reader.get(name) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return reader.get(name) catch |err| return if (err == error.NotFound) null else err;
 }
 pub fn head(reader: anytype, lookup: Lookup) !?Head {
     var buffer: [256]u8 = undefined;
@@ -295,7 +329,7 @@ pub fn stageBegin(txn: anytype, prepared: *const Prepared) !Head {
     } else 0;
     const sequence = std.math.add(u64, previous, 1) catch return error.SqlProgramLimitExceeded;
     if (try optional(txn, try queueKey(&buffer, prepared.lookup.group, sequence)) != null) return error.InvalidScopeRetirement;
-    const value: Head = .{ .lookup = prepared.lookup, .metadata_incarnation = prepared.manifest.metadata_incarnation, .creator = prepared.manifest.creator, .target_digest = prepared.manifest.scope.labelsDigest(), .force = prepared.manifest.force, .sequence = sequence, .progress = .{ .reference = prepared.lookup.reference } };
+    const value: Head = .{ .lookup = prepared.lookup, .metadata_incarnation = prepared.manifest.metadata_incarnation, .creator = prepared.manifest.creator, .target_digest = prepared.manifest.scope.labelsDigest(), .temporary_owner = if (prepared.manifest.scope.namespace) |namespace| namespace.sql_temporary_owner else null, .force = prepared.manifest.force, .sequence = sequence, .progress = .{ .reference = prepared.lookup.reference } };
     try value.validate();
     for (0..prepared.lookup.reference.tables) |ordinal| {
         if (try child(txn, prepared.lookup, @intCast(ordinal)) != null) return error.InvalidScopeRetirement;
@@ -357,6 +391,7 @@ pub fn requireMembers(reader: anytype, prepared: *const Prepared, value: Head) !
 pub fn stageAdvance(txn: anytype, prepared: *const Prepared, before: Head, next: contract.Progress) !Head {
     const current = (try existing(txn, prepared)) orelse return error.CatalogGenerationChanged;
     if (!std.meta.eql(current, before) or !before.active() or !std.meta.eql(next.reference, before.lookup.reference)) return error.CatalogGenerationChanged;
+    if (next.phase == .canceled and (before.native_loss_requested or before.native_losses != null or before.temporary_abandonment != null)) return error.ScopeRetirementChanged;
     const expected = switch (next.phase) {
         .draining_connections => return error.ScopeRetirementChanged,
         .retiring_tables => if (before.progress.phase == .draining_connections) try before.progress.drained() else try before.progress.tablePublished(before.progress.completed_tables),

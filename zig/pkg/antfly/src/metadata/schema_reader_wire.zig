@@ -42,6 +42,10 @@ pub fn requiresStrongestDecoder(bytes: []const u8) bool {
     };
 }
 
+pub fn requiresCoupledSchemaPolicy(bytes: []const u8) bool {
+    return requiresMarker(bytes, "schema_pair") or requiresMarker(bytes, "policy_pair");
+}
+
 pub fn requiresSqlAuthorization(bytes: []const u8) bool {
     return requiresMarker(bytes, "sql_authorization") or requiresMarker(bytes, "sql_owner");
 }
@@ -88,6 +92,10 @@ pub fn requiresScopeRetirementAuthority(bytes: []const u8) bool {
         requiresMarker(bytes, "document_source") or requiresMarker(bytes, "document_schema_digest");
 }
 
+pub fn requiresSqlRelationPersistence(bytes: []const u8) bool {
+    return requiresMarker(bytes, "native_retired") or requiresMarker(bytes, "native_retirements") or requiresMarker(bytes, "native_participant") or requiresMarker(bytes, "schema_only") or requiresMarker(bytes, "sql_persistence") or requiresMarker(bytes, "sql_temporary_owner") or requiresMarker(bytes, "native_pin") or requiresMarker(bytes, "native_reset") or requiresMarker(bytes, "native_empty_source") or requiresMarker(bytes, "native_empty_install") or requiresMarker(bytes, "native_loss_generations") or requiresMarker(bytes, "lost_generation") or requiresMarker(bytes, "temporary_owner") or requiresMarker(bytes, "native_loss_requested") or requiresMarker(bytes, "native_losses") or requiresMarker(bytes, "native_loss") or requiresMarker(bytes, "reserve_lost_temporary") or requiresMarker(bytes, "source_lost") or requiresMarker(bytes, "temporary_abandonment") or requiresMarker(bytes, "reserve_abandoned_temporary") or requiresMarker(bytes, "native_empty_origin") or requiresMarker(bytes, "schema_only_snapshot") or requiresMarker(bytes, "native_empty_acceptance") or requiresMarker(bytes, "install_native_empty") or requiresMarker(bytes, "image_attempt") or requiresMarker(bytes, "reserve_empty") or requiresMarker(bytes, "initialized_empty") or requiresMarker(bytes, "retire_unpublished") or requiresMarker(bytes, "unpublished_retirement") or requiresMarker(bytes, "recovery_capture");
+}
+
 pub fn requiresSqlNotifications(bytes: []const u8) bool {
     return requiresMarker(bytes, "@sql-notifications");
 }
@@ -102,6 +110,14 @@ pub fn requiresSqlCommandFence(bytes: []const u8) bool {
 
 pub fn requiresSqlNativeIndex(bytes: []const u8) bool {
     return requiresMarker(bytes, "sql_native_index") or requiresMarker(bytes, "sql_native_indexes_json");
+}
+
+pub fn requiresLogicalRelations(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_relation_id") or requiresMarker(bytes, "logical_relation_id");
+}
+
+pub fn requiresSqlTableTriggers(bytes: []const u8) bool {
+    return requiresLogicalRelations(bytes) or requiresMarker(bytes, "sql_triggers") or requiresMarker(bytes, "trigger_handoff") or requiresMarker(bytes, "trigger_source_columns_digest") or requiresMarker(bytes, "routine_mappings") or requiresMarker(bytes, "routine_actor");
 }
 
 pub fn requiresSqlTriggerFunction(bytes: []const u8) bool {
@@ -561,4 +577,22 @@ test "SQL scope retirement termination decoder projection ignores payloads and r
 test "document retirement decoder projection follows source identity markers not user payloads" {
     for ([_][]const u8{ "{}", "{\"document_schema_digest\":null}", "{\"payload\":\"document_source document_schema_digest\"}" }) |bytes| try std.testing.expect(!requiresScopeRetirementAuthority(bytes));
     for ([_][]const u8{ "{\"document_source\":false}", "{\"document_source\":true}", "{\"document_sou\\u0072ce\":true}", "{\"document_schema_digest\":[1]}", "{\"summary\":{\"document_source\":true}}" }) |bytes| try std.testing.expect(requiresScopeRetirementAuthority(bytes));
+}
+
+test "SQL relation lifetime compact scope receipts retain the native decoder requirement" {
+    try std.testing.expect(requiresSqlRelationPersistence("{\"temporary_owner\":{\"connection_generation\":1}}"));
+    try std.testing.expect(!requiresSqlRelationPersistence("{\"payload\":\"temporary_owner\"}"));
+}
+
+test "SQL native prepared retirement markers demand the persistence reader without matching user strings" {
+    for ([_][]const u8{ "{\"native_retired\":[{\"member\":0}]}", "{\"native_retirements\":[{\"member\":0}]}", "{\"route\":{\"native_participant\":{\"table_id\":4}}}" }) |bytes| try std.testing.expect(requiresSqlRelationPersistence(bytes));
+    for ([_][]const u8{ "{}", "{\"native_retired\":null}", "{\"payload\":\"native_retired native_retirements native_participant\"}" }) |bytes| try std.testing.expect(!requiresSqlRelationPersistence(bytes));
+}
+
+test "SQL logical relation identity requires structural metadata174 and ignores nil or opaque text" {
+    inline for (.{ "{}", "{\"sql_relation_id\":null}", "{\"source_json\":\"sql_relation_id logical_relation_id\"}" }) |bytes| try std.testing.expect(!requiresLogicalRelations(bytes));
+    inline for (.{ "{\"sql_relation_id\":7}", "{\"logical_relation_id\":7}", "{\"sql_relat\\u0069on_id\":7}" }) |bytes| {
+        try std.testing.expect(requiresLogicalRelations(bytes));
+        try std.testing.expect(requiresSqlTableTriggers(bytes));
+    }
 }

@@ -213,6 +213,37 @@ const storageOwnerContextConfigureSecrets = server_api.storageOwnerContextConfig
 const storageOwnerContextConfigureRemoteContentSecurity = server_api.storageOwnerContextConfigureRemoteContentSecurity;
 const storageOwnerContextCacheKindStats = server_api.storageOwnerContextCacheKindStats;
 const storageOwnerContextMetrics = server_api.storageOwnerContextMetrics;
+
+test "storage owner context generates independent native relation execution epochs" {
+    var first: ?*anyopaque = null;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextCreate(&.{}, &first));
+    defer std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextDestroy(first)) catch unreachable;
+    var second: ?*anyopaque = null;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextCreate(&.{}, &second));
+    defer std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextDestroy(second)) catch unreachable;
+    var a: kernel_owner_abi.ContextMetricsResult = .{};
+    var b: kernel_owner_abi.ContextMetricsResult = .{};
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextMetrics(first, &a));
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextMetrics(second, &b));
+    try std.testing.expect(!std.mem.allEqual(u8, &a.execution_instance, 0));
+    try std.testing.expect(!std.mem.eql(u8, &a.execution_instance, &b.execution_instance));
+    const first_epoch = a.execution_instance;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextMetrics(first, &a));
+    try std.testing.expectEqualDeep(first_epoch, a.execution_instance);
+    var observed: kernel_owner_abi.RelationLifetimeContextResult = .{};
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextRelationLifetime(first, &.{ .execution_instance = first_epoch }, &observed));
+    try std.testing.expectEqual(@as(u8, 0), observed.admission_closed);
+    try std.testing.expect(std.mem.allEqual(u8, &observed.clean_digest, 0));
+    try std.testing.expect(server_api.storageOwnerContextRelationLifetime(first, &.{ .action = .begin_drain, .execution_instance = b.execution_instance }, &observed) != .ok);
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextRelationLifetime(first, &.{ .action = .begin_drain, .execution_instance = first_epoch }, &observed));
+    try std.testing.expectEqual(@as(u8, 1), observed.admission_closed);
+    try std.testing.expect(!std.mem.allEqual(u8, &observed.clean_digest, 0));
+    const clean = observed.clean_digest;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextRelationLifetime(first, &.{ .execution_instance = first_epoch }, &observed));
+    try std.testing.expectEqualDeep(clean, observed.clean_digest);
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextRelationLifetime(second, &.{ .execution_instance = b.execution_instance }, &observed));
+    try std.testing.expectEqual(@as(u8, 0), observed.admission_closed);
+}
 const storageOwnerContextInvalidateCaches = server_api.storageOwnerContextInvalidateCaches;
 const asSystemStore = server_api.asSystemStore;
 const asSystemReadTxn = server_api.asSystemReadTxn;

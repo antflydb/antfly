@@ -43,6 +43,14 @@ pub const SnapshotAdmission = struct {
             return .{ .admission = self.admission, .capture = self.capture };
         }
 
+        // Move this owned admission without retaining another shared reader.
+        pub fn take(self: *@This()) @This() {
+            std.debug.assert(self.active);
+            const owned = self.*;
+            self.active = false;
+            return owned;
+        }
+
         pub fn release(self: *@This()) void {
             if (!self.active) return;
             if (self.capture) |capture| {
@@ -304,4 +312,16 @@ test "storage.db snapshot admission nonblocking mutation yields to capture" {
     resumed.release();
     var complete = admission.tryAcquireCapture().?;
     complete.release();
+}
+
+test "storage.db snapshot mutation move releases its sole reader before capture" {
+    var admission: SnapshotAdmission = .{};
+    var outer = admission.acquireMutation();
+    var inner = outer.take();
+    try std.testing.expect(!outer.active and inner.active);
+    outer.release();
+    try std.testing.expect(admission.tryAcquireCapture() == null);
+    inner.release();
+    var capture = admission.tryAcquireCapture() orelse return error.TestUnexpectedResult;
+    capture.release();
 }

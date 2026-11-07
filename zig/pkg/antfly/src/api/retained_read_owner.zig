@@ -134,13 +134,17 @@ pub const Owner = struct {
     /// owner cut. The coordinator captures every owner while all fences are
     /// held, validates the cohort, then releases the fences before row work.
     pub fn captureSnapshot(self: Owner, scope: registry_mod.Scope, capture_token: registry_mod.Token, connection: u128, deadline_ns: u64) !registry_mod.Token {
+        return self.captureSnapshotWithGraphs(scope, capture_token, connection, deadline_ns, &.{});
+    }
+    pub fn captureSnapshotWithGraphs(self: Owner, scope: registry_mod.Scope, capture_token: registry_mod.Token, connection: u128, deadline_ns: u64, indexes: []const []const u8) !registry_mod.Token {
+        if (indexes.len > 64) return error.InvalidRetainedReadQuery;
         var borrow = try self.registry.borrow(capture_token, scope, .capture, time.monotonicNs());
         defer borrow.deinit();
         const capture_value: *Capture = @ptrCast(@alignCast(borrow.resource.ptr));
         const alloc = self.registry.alloc;
         const owned = try alloc.create(Snapshot);
         errdefer alloc.destroy(owned);
-        owned.* = .{ .alloc = alloc, .snapshot = try capture_value.fence.captureSnapshot(alloc) };
+        owned.* = .{ .alloc = alloc, .snapshot = try capture_value.fence.captureSnapshotWithGraphs(alloc, indexes) };
         errdefer owned.snapshot.deinit();
         try capture_value.fence.validate();
         try borrow.validate(time.monotonicNs());
@@ -187,6 +191,18 @@ pub const Owner = struct {
         }
         const token = try self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = owned, .kind = .cursor, .close = Cursor.close, .cancellation = &owned.cancelled });
         return .{ .token = token, .text_filter_digest = owned.view.text_filter_digest };
+    }
+
+    pub fn graphPage(self: Owner, alloc: std.mem.Allocator, scope: registry_mod.Scope, token: registry_mod.Token, request: @import("antfly_local_sources").storage_statement_read_fence.GraphRead.Request) !@import("antfly_local_sources").storage_statement_read_fence.GraphRead.Page {
+        var borrow = try self.registry.borrow(token, scope, .snapshot, time.monotonicNs());
+        defer borrow.deinit();
+        const retained: *Snapshot = @ptrCast(@alignCast(borrow.resource.ptr));
+        var input = request;
+        input.cancellation = CancellationToken.fromAtomic(&retained.cancelled);
+        var page = try retained.snapshot.graphPage(alloc, input);
+        errdefer page.deinit(alloc);
+        try borrow.validate(time.monotonicNs());
+        return page;
     }
 
     pub fn openSnapshot(self: Owner, scope: registry_mod.Scope, snapshot_token: registry_mod.Token, connection: u128, from: []const u8, to: []const u8, input: types.ScanOptions, deadline_ns: u64) !registry_mod.Token {

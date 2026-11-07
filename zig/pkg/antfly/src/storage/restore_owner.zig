@@ -104,7 +104,7 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
     options.required_capability = "restore.read";
     var optional_location = if (source.peer_descriptor == null) try backups.openBackupLocationWithOptions(alloc, source.location, options) else null;
     defer if (optional_location) |*location| location.deinit(alloc);
-    if (source.artifact.format == .portable and (source.artifact.cohort_seal != null or source.artifact.rewrite != null)) {
+    if (source.artifact.format == .portable and (source.artifact.cohort_seal != null or source.artifact.rewrite != null or source.artifact.repository_schema_digest != null)) {
         const work_path = try std.fmt.allocPrint(alloc, "{s}.materializing", .{env.cache_path});
         defer alloc.free(work_path);
         const complete = if (source.peer_descriptor != null) peer: {
@@ -118,6 +118,7 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
         var decoder = try db.DB.open(alloc, files, .{ .backend_runtime = env.runtime, .identity_namespace = input.scope.source_namespace, .prefer_existing_identity_namespace = false, .primary_backend = .{ .lsm = .{} }, .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
         {
             defer decoder.close();
+            try requireRepositorySchema(alloc, &decoder, source.artifact);
             if (program) |compiled| {
                 try decoder.requireRewriteSourceManifest(alloc, compiled, context.cancellation);
             }
@@ -147,7 +148,10 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
         defer alloc.free(files);
         if (!try materialization.hasScope(alloc, env.io, files, input.scope)) {
             var decoder = try db.DB.open(alloc, files, .{ .backend_runtime = env.runtime, .identity_namespace = input.scope.source_namespace, .prefer_existing_identity_namespace = false, .primary_backend = .{ .lsm = .{} }, .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
-            decoder.close();
+            {
+                defer decoder.close();
+                try requireRepositorySchema(alloc, &decoder, source.artifact);
+            }
             const candidate_marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{files});
             defer alloc.free(candidate_marker);
             _ = try native_backup.writeFileDurable(env.io, candidate_marker, &input.scope.digest());
@@ -260,6 +264,13 @@ fn releaseSourceAt(alloc: std.mem.Allocator, env: Environment, scope: staging.Sc
     if (try candidate.publish() != .durable) return error.RestoreSourceDurabilityUncertain;
 }
 
+fn nativeEmptyReceipt(target: *db.DB, expected: ?@import("antfly_local_sources").storage_db_native_empty_generation.Install) !?@import("antfly_local_sources").storage_db_native_empty_generation.Receipt {
+    var read = try target.core.store.beginProbeTxn();
+    defer read.abort();
+    if (expected) |command| return @import("antfly_local_sources").storage_db_native_empty_generation.requireInstalled(&read, command);
+    return @import("antfly_local_sources").storage_db_native_empty_generation.load(&read);
+}
+
 /// Caller holds an exact resident owner lease and a ReadIndex barrier. The
 /// persisted reservation has already authenticated the entire source scope.
 /// Publication also requires the metadata job's committed publication proof.
@@ -275,13 +286,14 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     // Metadata/owner receipts survive restart; physical index coverage belongs
     // to this replica. Recheck it before acknowledging recovered readiness.
     // Cancellation must remain available even when a projection is broken.
-    if ((input.action == .status or input.action == .validate or input.action == .install_generation_admissions or input.action == .publish) and
+    if ((input.action == .status or input.action == .validate or input.action == .install_generation_admissions or input.action == .install_native_empty or input.action == .publish) and
         (before.value.phase == .validated or before.value.phase == .published))
     {
         if (!try target.prepareRestoreStagingIndexesStep(alloc, input.scope.digest())) return error.RestoreValidationPending;
     }
     if (input.action == .status) {
         const admission_receipt = try target.restoreGenerationAdmissionReceipt();
+        const native_empty = try nativeEmptyReceipt(target, null);
         const admission_digest: ?staging.Digest = if (admission_receipt) |receipt|
             if (std.mem.eql(u8, &receipt.scope, &input.scope.digest())) receipt.logical_digest else null
         else
@@ -293,7 +305,16 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
             defer transition.deinit();
             break :blk try @import("antfly_local_sources").storage_rewrite_tail_spool.resumeOffset(alloc, env.io, env.cache_path, input.scope, progress.sequence);
         } else 0;
-        return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .population = before.value.population, .generation_admission_receipt = admission_digest, .rewrite = before.value.rewrite, .tail_next = resume_offset };
+        return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .population = before.value.population, .generation_admission_receipt = admission_digest, .native_empty_receipt = if (native_empty) |receipt| receipt.install_digest else null, .native_empty_commit = native_empty, .rewrite = before.value.rewrite, .tail_next = resume_offset };
+    }
+    if (input.action == .install_native_empty) {
+        if (try nativeEmptyReceipt(target, input.native_empty_install.?)) |receipt| {
+            const command = input.native_empty_install.?;
+            if (!std.mem.eql(u8, &receipt.scope, &input.scope.digest()) or receipt.origin_kind != command.origin.kind() or !std.mem.eql(u8, &receipt.origin_digest, &try command.origin.digest()) or
+                !std.mem.eql(u8, &receipt.install_digest, &try command.digest())) return error.RestoreStagingScopeChanged;
+            return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .population = before.value.population, .native_empty_receipt = receipt.install_digest, .native_empty_commit = receipt };
+        }
+        if (before.value.phase != .validated) return error.RestoreStagingInProgress;
     }
     if (input.action == .install_generation_admissions) {
         if (try target.restoreGenerationAdmissionReceipt()) |receipt| {
@@ -346,6 +367,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     switch (input.action) {
         .begin => try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .begin = input.scope } }, context),
         .install_generation_admissions => try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .install_generation_admissions = input.generation_admissions.? } }, context),
+        .install_native_empty => try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .install_native_empty = input.native_empty_install.? } }, context),
         .import_page => import: {
             if (admit_import) {
                 try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .begin = input.scope } }, context);
@@ -508,7 +530,8 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
         if (input.scope.population == null) try releaseSource(alloc, env, input.scope);
     }
     const admission_receipt = if (input.action == .install_generation_admissions) try target.restoreGenerationAdmissionReceipt() else null;
-    return .{ .phase = after.value.phase, .rows = after.value.rows, .receipt = after.value.receipt(), .population = after.value.population, .generation_admission_receipt = if (admission_receipt) |receipt| receipt.logical_digest else null, .rewrite = after.value.rewrite, .tail_next = tail_next, .source_next_offset = source_next_offset };
+    const native_empty = if (input.action == .install_native_empty) try nativeEmptyReceipt(target, input.native_empty_install.?) else null;
+    return .{ .phase = after.value.phase, .rows = after.value.rows, .receipt = after.value.receipt(), .population = after.value.population, .generation_admission_receipt = if (admission_receipt) |receipt| receipt.logical_digest else null, .native_empty_receipt = if (native_empty) |receipt| receipt.install_digest else null, .native_empty_commit = native_empty, .rewrite = after.value.rewrite, .tail_next = tail_next, .source_next_offset = source_next_offset };
 }
 
 test "restore owner verified decoder rewrite history compiles once across production tail pages" {
@@ -663,6 +686,10 @@ test "restore owner verified decoder rewrite history compiles once across produc
 
 test "restore owner verified decoder is reused across pages and terminal cleanup revokes import" {
     try testVerifiedDecoder(false);
+}
+
+test "restore owner independent repository snapshot resumes without a synthetic cohort seal and preserves source identity and schema" {
+    try testVerifiedDecoderOrigin(true, true);
 }
 
 test "restore owner verified decoder portable resumes and preserves vector projections" {
@@ -865,7 +892,20 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
     try std.testing.expectError(error.RestoreStagingScopeChanged, executeResident(alloc, &target, env, request, .{}));
 }
 
+fn requireRepositorySchema(alloc: std.mem.Allocator, decoder: *db.DB, artifact: @import("../metadata/restore_staging.zig").SourceArtifact) !void {
+    const expected = artifact.repository_schema_digest orelse return;
+    const schema = (try decoder.getSchemaJson(alloc)) orelse return error.RestoreSourceProofMissing;
+    defer alloc.free(schema);
+    var actual: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema, &actual, .{});
+    if (!std.mem.eql(u8, &actual, &expected)) return error.BackupIntegrityFailure;
+}
+
 fn testVerifiedDecoder(comptime portable: bool) !void {
+    return testVerifiedDecoderOrigin(portable, false);
+}
+
+fn testVerifiedDecoderOrigin(comptime portable: bool, comptime repository: bool) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -890,11 +930,14 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
     try source.setSchemaJson(alloc, row_schema);
     try source.addIndex(dense_index);
     try source.batch(.{ .sync_level = .full_index, .writes = &.{ .{ .key = "a", .value = "{\"v\":1,\"embedding\":[1,0]}" }, .{ .key = "b", .value = "{\"v\":2,\"embedding\":[0,1]}" }, .{ .key = "c", .value = "{\"v\":3,\"embedding\":[1,1]}" } } });
-    const source_identity = try source.relationalTopologyIdentity();
-    const source_fence: @import("antfly_local_sources").storage_db_relational_integrity_topology.Fence = .{ .role = .backup_snapshot, .transition_id = 900, .attempt = 1, .peer_group_id = 101, .owner_group_id = 101, .admission_epoch = source_identity.next_epoch, .namespace = source_identity.namespace, .catalog_digest = source_identity.catalog_digest };
-    try source.applyRelationalTopologyControl(.{ .fence = source_fence, .action = .begin }, null);
-    const seal = try source.sealBackupCohort("source-pin", source_fence, .none);
-    try source.applyRelationalTopologyControl(.{ .fence = source_fence, .action = .release }, null);
+    const seal: ?@import("antfly_local_sources").storage_db_native_backup_seal.Handle = if (repository) null else seal: {
+        const source_identity = try source.relationalTopologyIdentity();
+        const source_fence: @import("antfly_local_sources").storage_db_relational_integrity_topology.Fence = .{ .role = .backup_snapshot, .transition_id = 900, .attempt = 1, .peer_group_id = 101, .owner_group_id = 101, .admission_epoch = source_identity.next_epoch, .namespace = source_identity.namespace, .catalog_digest = source_identity.catalog_digest };
+        try source.applyRelationalTopologyControl(.{ .fence = source_fence, .action = .begin }, null);
+        const captured = try source.sealBackupCohort("source-pin", source_fence, .none);
+        try source.applyRelationalTopologyControl(.{ .fence = source_fence, .action = .release }, null);
+        break :seal captured;
+    };
     const artifact_path = if (portable) try std.fmt.allocPrint(alloc, "{s}/source.afb", .{root}) else try std.fmt.allocPrint(alloc, "{s}.snapshots/source-image", .{source_path});
     defer alloc.free(artifact_path);
     if (portable) {
@@ -902,10 +945,10 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
         defer file.close(std.testing.io);
         var buffer: [64 * 1024]u8 = undefined;
         var writer = file.writer(std.testing.io, &buffer);
-        try source.exportBackupCohortPortable(seal, &writer.interface, .{}, .none);
+        if (repository) try @import("antfly_local_sources").storage_portable_backup.exportPortableToWriter(alloc, source.core.store, &writer.interface) else try source.exportBackupCohortPortable(seal.?, &writer.interface, .{}, .none);
         try writer.interface.flush();
         try file.sync(std.testing.io);
-    } else _ = try source.exportBackupCohort(seal, "source-image", .none);
+    } else _ = try source.exportBackupCohort(seal.?, "source-image", .none);
     var integrity = try backups.artifactIntegrityAlloc(alloc, std.testing.io, if (portable) .portable else .native, artifact_path);
     defer integrity.deinit(alloc);
     var artifact_digest: [32]u8 = undefined;
@@ -947,6 +990,11 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
     var apply: Apply = .{ .target = &target };
     const env: Environment = .{ .io = std.testing.io, .runtime = &runtime, .location_options = .{ .filesystem_io = std.testing.io }, .cache_path = cache_path, .proposer = .{ .ptr = &apply, .propose = Apply.propose } };
     var artifact: metadata_staging.SourceArtifact = .{ .target_group_id = 102, .source_namespace = source_namespace, .format = if (portable) .portable else .native, .snapshot_path = if (portable) "source.afb" else "source.snapshots/source-image", .artifact_size_bytes = integrity.size_bytes, .artifact_sha256 = artifact_digest, .cohort_seal = seal };
+    if (repository) {
+        var source_schema_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(row_schema, &source_schema_digest, .{});
+        artifact.repository_schema_digest = source_schema_digest;
+    }
     if (!portable) {
         var manifest_integrity = try backups.nativeGenerationManifestIntegrityAllocWithCancellation(alloc, std.testing.io, artifact_path, .none);
         defer manifest_integrity.deinit(alloc);
@@ -954,6 +1002,28 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
         artifact.native_manifest_sha256 = try alloc.dupe(u8, manifest_integrity.sha256);
     }
     defer if (!portable) alloc.free(artifact.native_manifest_sha256);
+    if (repository) {
+        // The repository checksum is genuinely valid. Mutate only each
+        // claimed source identity and require the real archive decoder to
+        // reject it before the unpublished source can acquire a durable mark.
+        const archive = try std.Io.Dir.cwd().openFile(std.testing.io, artifact_path, .{});
+        defer archive.close(std.testing.io);
+        for ([_]enum { namespace, schema }{ .namespace, .schema }) |bad| {
+            const reject_path = try std.fmt.allocPrint(alloc, "{s}/reject-{s}", .{ root, @tagName(bad) });
+            defer alloc.free(reject_path);
+            var rejected = try db.DB.open(alloc, reject_path, .{ .backend_runtime = &runtime, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+            defer rejected.close();
+            var proof: @import("antfly_local_sources").storage_portable_backup.RepositorySnapshotProof = .{ .namespace = source_namespace, .schema_digest = artifact.repository_schema_digest.?, .artifact_digest = artifact.artifact_sha256 };
+            if (bad == .namespace) proof.namespace.range_id += 1 else proof.schema_digest[0] ^= 1;
+            for (0..500) |_| {
+                const complete = @import("antfly_local_sources").storage_portable_backup.importRepositorySnapshotFilePage(alloc, rejected.core.store, std.testing.io, archive, integrity.size_bytes, proof, @splat(9), 1, .none) catch |failure| {
+                    try std.testing.expectEqual(error.BackupIntegrityFailure, failure);
+                    break;
+                };
+                if (complete) return error.ForgedRepositorySnapshotAccepted;
+            } else return error.RepositoryProofDidNotConverge;
+        }
+    }
     scope.source_descriptor_digest = try artifact.digest(alloc);
     try target.reserveRestoreStagingScoped(alloc, scope);
     const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{root});

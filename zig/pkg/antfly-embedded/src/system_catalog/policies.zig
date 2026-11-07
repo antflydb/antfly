@@ -304,6 +304,106 @@ test "row-policy owner descriptor digest fences physical range and generation" {
     try std.testing.expect(!std.mem.eql(u8, &baseline, &changed_range_digest));
 }
 
+/// An immutable same-object trigger-only schema successor. Both native
+/// layout identities remain truthful; compatibility does not rewrite history.
+pub const SchemaPair = struct {
+    before_schema_json: []const u8,
+    after_schema_json: []const u8,
+    before_schema_digest: [32]u8,
+    after_schema_digest: [32]u8,
+    before_record_digest: [32]u8,
+    staged_record_digest: [32]u8,
+    after_record_digest: [32]u8,
+    before_policy_generation: u64,
+    before_catalog_epoch: u64,
+
+    pub const Schemas = struct { before: @import("../storage/schema.zig").TableSchema, after: @import("../storage/schema.zig").TableSchema };
+
+    pub fn materialize(self: @This(), a: std.mem.Allocator) !Schemas {
+        if (self.before_schema_json.len == 0 or self.after_schema_json.len == 0 or
+            self.before_schema_json.len > max_install_snapshot_bytes or
+            self.after_schema_json.len > max_install_snapshot_bytes - self.before_schema_json.len or
+            self.before_policy_generation == 0 or self.before_catalog_epoch == 0) return error.InvalidRowPolicyBundle;
+        inline for (.{ self.before_schema_digest, self.after_schema_digest, self.before_record_digest, self.staged_record_digest, self.after_record_digest }) |field_digest| {
+            if (std.mem.allEqual(u8, &field_digest, 0)) return error.InvalidRowPolicyBundle;
+        }
+        const parser = @import("../schema/mod.zig");
+        const native = @import("../storage/schema.zig");
+        var before_public = try parser.parseValidatedTableSchema(a, self.before_schema_json);
+        defer before_public.deinit(a);
+        var after_public = try parser.parseValidatedTableSchema(a, self.after_schema_json);
+        defer after_public.deinit(a);
+        const before = try parser.deriveRuntimeTableSchema(a, before_public);
+        errdefer native.freeSchema(a, before);
+        const after = try parser.deriveRuntimeTableSchema(a, after_public);
+        errdefer native.freeSchema(a, after);
+        if (before.storage_mode != .relational or after.storage_mode != .relational or
+            after.version != try std.math.add(u32, before.version, 1)) return error.RowPolicyCatalogChanged;
+        const before_bytes = try native.serializeSchema(a, before);
+        defer a.free(before_bytes);
+        const after_bytes = try native.serializeSchema(a, after);
+        defer a.free(after_bytes);
+        var before_digest: [32]u8 = undefined;
+        var after_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(before_bytes, &before_digest, .{});
+        std.crypto.hash.Blake3.hash(after_bytes, &after_digest, .{});
+        if (!std.mem.eql(u8, &before_digest, &self.before_schema_digest) or
+            !std.mem.eql(u8, &after_digest, &self.after_schema_digest)) return error.RowPolicyCatalogChanged;
+        var normalized = after;
+        normalized.version = before.version;
+        const normalized_bytes = try native.serializeSchema(a, normalized);
+        defer a.free(normalized_bytes);
+        if (!std.mem.eql(u8, before_bytes, normalized_bytes)) return error.RowPolicyUnsupported;
+        var before_json = try std.json.parseFromSlice(std.json.Value, a, self.before_schema_json, .{ .allocate = .alloc_always });
+        defer before_json.deinit();
+        var after_json = try std.json.parseFromSlice(std.json.Value, a, self.after_schema_json, .{ .allocate = .alloc_always });
+        defer after_json.deinit();
+        if (before_json.value != .object or after_json.value != .object) return error.InvalidRowPolicyBundle;
+        var compared = before_json.value;
+        var candidate = after_json.value;
+        _ = compared.object.swapRemove("version");
+        _ = compared.object.swapRemove("sql_triggers");
+        _ = candidate.object.swapRemove("version");
+        _ = candidate.object.swapRemove("sql_triggers");
+        if (!jsonEqual(compared, candidate)) return error.RowPolicyUnsupported;
+        return .{ .before = before, .after = after };
+    }
+
+    pub fn digest(self: @This(), a: std.mem.Allocator) ![32]u8 {
+        const bytes = try std.json.Stringify.valueAlloc(a, self, .{});
+        defer a.free(bytes);
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly:row-policy-schema-pair:v1\x00");
+        hash.update(bytes);
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+
+    fn jsonEqual(left: std.json.Value, right: std.json.Value) bool {
+        if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+        return switch (left) {
+            .null => true,
+            .bool => |value| value == right.bool,
+            .integer => |value| value == right.integer,
+            .float => |value| value == right.float,
+            .number_string => |value| std.mem.eql(u8, value, right.number_string),
+            .string => |value| std.mem.eql(u8, value, right.string),
+            .array => |value| block: {
+                if (value.items.len != right.array.items.len) break :block false;
+                for (value.items, right.array.items) |a, b| if (!jsonEqual(a, b)) break :block false;
+                break :block true;
+            },
+            .object => |value| block: {
+                if (value.count() != right.object.count()) break :block false;
+                var entries = value.iterator();
+                while (entries.next()) |entry| if (!jsonEqual(entry.value_ptr.*, right.object.get(entry.key_ptr.*) orelse break :block false)) break :block false;
+                break :block true;
+            },
+        };
+    }
+};
+
 pub const InstallSnapshot = struct {
     table_id: u64,
     schema_version: u32,
@@ -311,13 +411,30 @@ pub const InstallSnapshot = struct {
     policy_generation: u64,
     catalog_epoch: u64,
     phase: Publication.Phase,
+    schema_pair: ?SchemaPair = null,
     records: []const Record,
     settings: []const @import("settings.zig").Record,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "schema_pair")) or self.schema_pair != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 
     pub fn validateShape(self: @This()) !void {
         if (self.table_id == 0 or std.mem.allEqual(u8, &self.schema_digest, 0) or self.policy_generation == 0 or
             self.catalog_epoch == 0 or self.records.len > 1024 or self.settings.len > 1024)
             return error.InvalidRowPolicyRecord;
+        if (self.schema_pair) |pair| {
+            if ((self.phase != .pending_install and self.phase != .serving_install and self.phase != .active) or
+                self.policy_generation <= pair.before_policy_generation or self.catalog_epoch <= pair.before_catalog_epoch or
+                !std.mem.eql(u8, &self.schema_digest, &pair.after_schema_digest)) return error.InvalidRowPolicyRecord;
+        }
         // An enabled table with no policies is a valid default-deny epoch.
         for (self.records, 0..) |record, i| {
             try record.validateShape();
@@ -389,6 +506,7 @@ pub const Publication = struct {
     /// Digest of schema, migration, and index-capability bytes maintained
     /// transactionally with table upserts. Zero forces full validation.
     schema_record_digest: [32]u8 = @splat(0),
+    schema_pair: ?SchemaPair = null,
     /// A prior active generation remains the read authority while a new
     /// immutable candidate is staged, until metadata promotes it.
     serving_generation: ?u64 = null,
@@ -401,6 +519,17 @@ pub const Publication = struct {
     /// until each one has durably installed disabled and this receipt lands.
     disabled_acknowledged_owners: []const OwnerAck = &.{},
 
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "schema_pair")) or self.schema_pair != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn validateShape(self: @This()) !void {
         if (self.table_id == 0 or std.mem.allEqual(u8, &self.schema_digest, 0) or self.generation == 0 or
             self.catalog_epoch == 0 or self.required_owners.len == 0 or self.required_owners.len > 4096 or
@@ -408,6 +537,12 @@ pub const Publication = struct {
             self.serving_acknowledged_owners.len > self.required_owners.len or
             self.disabled_acknowledged_owners.len > self.required_owners.len)
             return error.InvalidRowPolicyPublication;
+        if (self.schema_pair) |pair| {
+            if ((self.phase != .pending_install and self.phase != .serving_install and self.phase != .active) or
+                self.generation <= pair.before_policy_generation or self.catalog_epoch <= pair.before_catalog_epoch or
+                !std.mem.eql(u8, &self.schema_digest, &pair.after_schema_digest)) return error.InvalidRowPolicyPublication;
+            if (self.phase != .active and (self.serving_generation != pair.before_policy_generation or self.serving_catalog_epoch != pair.before_catalog_epoch)) return error.InvalidRowPolicyPublication;
+        }
         if (self.serving_generation) |serving| {
             if (serving == 0 or serving >= self.generation or self.serving_catalog_epoch == null or self.serving_catalog_epoch.? == 0 or self.serving_catalog_epoch.? >= self.catalog_epoch or
                 (self.phase != .pending_install and self.phase != .pending_disable and
@@ -909,4 +1044,51 @@ test "owner policy evaluator combines permissive and restrictive programs with S
     var insert = try Evaluator.init(alloc, &view, &settings, .insert);
     defer insert.deinit();
     try std.testing.expect(!try insert.permits(alloc, &.{ scalar.Datum.json(.{ .string = "a" }), scalar.Datum.json(.{ .bool = true }) }));
+}
+
+/// Bounded feature projection for the opaque owner install snapshot. Malformed
+/// input conservatively requires the new decoder; semantic validation remains
+/// in the normal install path. Row strings are skipped without allocation.
+pub fn requiresSchemaPairDecoder(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    if (bytes.len > 4 * 1024 * 1024) return true;
+    var memory: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), bytes);
+    defer scanner.deinit();
+    if ((scanner.next() catch return true) != .object_begin) return true;
+    while ((scanner.peekNextTokenType() catch return true) != .object_end) {
+        const key = scanner.nextAllocMax(fixed.allocator(), .alloc_if_needed, 1024) catch return true;
+        const paired = switch (key) {
+            .string => |name| std.mem.eql(u8, name, "schema_pair"),
+            .allocated_string => |name| value: {
+                defer fixed.allocator().free(name);
+                break :value std.mem.eql(u8, name, "schema_pair");
+            },
+            else => return true,
+        };
+        if (paired and (scanner.peekNextTokenType() catch return true) != .null) return true;
+        scanner.skipValue() catch return true;
+    }
+    _ = scanner.next() catch return true;
+    return (scanner.next() catch return true) != .end_of_document;
+}
+
+test "row-policy coupled schema decoder projects captured snapshot before historical selectors" {
+    try std.testing.expect(!requiresSchemaPairDecoder("{}"));
+    try std.testing.expect(!requiresSchemaPairDecoder("{\"schema_pair\":null}"));
+    try std.testing.expect(!requiresSchemaPairDecoder("{\"name\":\"schema_pair\"}"));
+    try std.testing.expect(requiresSchemaPairDecoder("{\"schema_pair\":{}}"));
+    try std.testing.expect(requiresSchemaPairDecoder("{\"schema_p\\u0061ir\":{}}"));
+    try std.testing.expect(requiresSchemaPairDecoder("{"));
+}
+
+test "row-policy coupled schema optional snapshot field preserves historical ordinary bytes" {
+    const a = std.testing.allocator;
+    const snapshot: InstallSnapshot = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .policy_generation = 2, .catalog_epoch = 3, .phase = .pending_install, .records = &.{}, .settings = &.{} };
+    const actual = try std.json.Stringify.valueAlloc(a, snapshot, .{});
+    defer a.free(actual);
+    const old = try std.json.Stringify.valueAlloc(a, .{ .table_id = snapshot.table_id, .schema_version = snapshot.schema_version, .schema_digest = snapshot.schema_digest, .policy_generation = snapshot.policy_generation, .catalog_epoch = snapshot.catalog_epoch, .phase = snapshot.phase, .records = snapshot.records, .settings = snapshot.settings }, .{});
+    defer a.free(old);
+    try std.testing.expectEqualStrings(old, actual);
 }

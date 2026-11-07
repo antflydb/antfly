@@ -106,10 +106,39 @@ pub fn adoptAborted(a: A, txn: anytype, receiving: @import("db/doc_identity_name
     const owner = native.owner orelse return error.ExternalTransactionDecisionChanged;
     try ref.validate(id, owner);
     if (native.status != .aborted) return error.ExternalTransactionDecisionChanged;
-    const scope = try scopes.read(a, txn, ref.admission.binding.namespace, (try ref.admission.registration()).lease.backend) orelse return error.LockOwnerChanged;
-    var expected = try ref.admission.registration();
+    const registration = try ref.admission.registration();
+    const ns = ref.admission.binding.namespace;
+    const scope = try scopes.read(a, txn, ns, registration.lease.backend) orelse {
+        // Actual ABORT plus indexed absence is a terminal physical fact, not
+        // permission to manufacture a source or native execution grant.
+        if (native.prepared) return error.InvalidLockRecord;
+        try scopes.ledger.requireAbsent(txn, ns, registration.lease.backend);
+        try scopes.ledger.requireAbsent(txn, ns, try scopes.preparedBackend(ns, ref.decision));
+        try participant.requireUnadmitted(txn, ref.admission);
+        const encoded = try encode(a, .{ .ref = ref, .retired = true });
+        defer a.free(encoded);
+        try txn.put(&key(id), encoded);
+        return;
+    };
+    var expected = registration;
     expected.lease.expires_at_ms = scope.registration.lease.expires_at_ms;
-    if (!std.meta.eql(expected, scope.registration) or scope.state == .retired) return error.LockOwnerChanged;
+    if (!std.meta.eql(expected, scope.registration)) return error.LockOwnerChanged;
+    if (scope.state == .retired) {
+        const held = try scopes.ledger.readOwner(a, txn, ns, registration.lease.backend) orelse return error.InvalidLockRecord;
+        if (scope.transaction != null or held.state != .retired or held.resources != 0 or held.job != null or held.waiting != null or held.transaction != null or held.incoming != null) return error.InvalidLockRecord;
+        if (scope.released_transaction) |released| if (!std.mem.eql(u8, &released.id, &id) or
+            (released.decision != null and !std.meta.eql(released.decision.?, ref.decision))) return error.InvalidLockScope;
+        try scopes.ledger.requireNoMembers(txn, ns, registration.lease.backend);
+        const prepared_backend = try scopes.preparedBackend(ns, ref.decision);
+        if (try scopes.ledger.readOwner(a, txn, ns, prepared_backend)) |prepared| {
+            if (prepared.state != .retired or prepared.resources != 0 or prepared.job != null or prepared.waiting != null or prepared.transaction != null or prepared.incoming != null) return error.InvalidLockRecord;
+            try scopes.ledger.requireNoMembers(txn, ns, prepared_backend);
+        } else try scopes.ledger.requireAbsent(txn, ns, prepared_backend);
+        const encoded = try encode(a, .{ .ref = ref, .retired = true });
+        defer a.free(encoded);
+        try txn.put(&key(id), encoded);
+        return;
+    }
     if (scope.transaction) |value| {
         if (!std.mem.eql(u8, &value.id, &id) or (value.decision != null and !std.meta.eql(value.decision.?, ref.decision))) return error.InvalidLockScope;
     } else if (scope.released_transaction) |value| {

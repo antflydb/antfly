@@ -155,6 +155,44 @@ pub const StorageOwnerContext = struct {
     auth_casbin_store: ?antfly.storage_backend_erased.Store = null,
     mutex: std.atomic.Mutex = .unlocked,
     active_owners: usize = 0,
+    execution_instance: [16]u8 = @splat(0),
+    lifetime_owners: std.AutoHashMapUnmanaged(usize, bool) = .empty,
+    lifetime_opening: u64 = 0,
+    lifetime_failed_closes: u64 = 0,
+    lifetime_admission_closed: bool = false,
+
+    fn beginLifetimeOpen(self: *StorageOwnerContext) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.lifetime_admission_closed) return error.SqlRelationOwnerChanged;
+        self.lifetime_opening = try std.math.add(u64, self.lifetime_opening, 1);
+    }
+    fn finishLifetimeOpen(self: *StorageOwnerContext, success: bool) void {
+        self.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.lifetime_opening > 0);
+        self.lifetime_opening -= 1;
+        if (!success) self.lifetime_failed_closes +|= 1;
+    }
+    fn registerLifetimeOwner(self: *StorageOwnerContext, handle: *Handle) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        const value = try self.lifetime_owners.getOrPut(self.alloc, @intFromPtr(handle));
+        if (value.found_existing) return error.SqlRelationOwnerChanged;
+        value.value_ptr.* = false;
+    }
+    fn proveLifetimeOwnerClosed(self: *StorageOwnerContext, handle: *Handle, success: bool) void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.lifetime_owners.getPtr(@intFromPtr(handle))) |value| value.* = success;
+    }
+    fn removeLifetimeOwner(self: *StorageOwnerContext, handle: *Handle) void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.lifetime_owners.fetchRemove(@intFromPtr(handle))) |entry| {
+            if (!entry.value) self.lifetime_failed_closes +|= 1;
+        }
+    }
 
     pub fn lock(self: *StorageOwnerContext) void {
         antfly.platform_sync.lockYielding(&self.mutex);
@@ -206,6 +244,8 @@ pub const StorageOwnerContext = struct {
         // table before poisoning/freeing the object that contains the adapter.
         const bridge = self.allocator_bridge;
         const alloc = if (bridge) |*value| value.asStd() else self.alloc;
+        std.debug.assert(self.lifetime_owners.count() == 0 and self.lifetime_opening == 0);
+        self.lifetime_owners.deinit(alloc);
         self.* = undefined;
         alloc.destroy(self);
         return true;
@@ -826,6 +866,8 @@ pub fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*St
     };
     context.backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, runtime_config);
     errdefer context.backend_runtime.deinit();
+    const instance_io = context.backend_runtime.ptr().io() orelse return error.StorageIoUnavailable;
+    while (std.mem.allEqual(u8, &context.execution_instance, 0)) try instance_io.randomSecure(&context.execution_instance);
     context.resources.attachResourceManager();
     switch (request.storage_kind) {
         .directory => if (request.storage_path.len != 0) return error.InvalidArgument,
@@ -1030,6 +1072,7 @@ pub fn storageOwnerContextMetrics(
         .lsm_run_table_index = storageOwnerContextCacheKindStats(stats.run_table_index),
         .lsm_run_table_block = storageOwnerContextCacheKindStats(stats.run_table_block),
         .lsm_run_table_physical_block = storageOwnerContextCacheKindStats(stats.run_table_physical_block),
+        .execution_instance = owner_context.execution_instance,
     };
     const resources = owner_context.resources.resource_manager.snapshot();
     out_result.resource_memory = kernel_owner_abi.ContextResourceBudgetStats.fromResourceStats(resources.memory);
@@ -1050,6 +1093,34 @@ pub fn storageOwnerContextInvalidateCaches(context: ?*anyopaque) callconv(.c) ke
     // context does not disturb owners of unrelated groups.
     owner_context.resources.lsm_cache.invalidatePrefix("");
     owner_context.resources.hbc_cache.clear();
+    return .ok;
+}
+
+pub fn storageOwnerContextRelationLifetime(context: ?*anyopaque, request: *const kernel_owner_abi.RelationLifetimeContextRequest, out_result: *kernel_owner_abi.RelationLifetimeContextResult) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version or out_result.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (!std.mem.allEqual(u8, &request._reserved, 0)) return .invalid_argument;
+    const native = asStorageOwnerContext(context) orelse return .invalid_argument;
+    native.lock();
+    defer native.mutex.unlock();
+    if (!std.mem.eql(u8, &native.execution_instance, &request.execution_instance)) return storageOwnerStatusFromError(error.SqlRelationOwnerChanged);
+    switch (request.action) {
+        .observe => {},
+        .begin_drain => native.lifetime_admission_closed = true,
+        else => return .invalid_argument,
+    }
+    out_result.* = .{
+        .execution_instance = native.execution_instance,
+        .admission_closed = @intFromBool(native.lifetime_admission_closed),
+        .live_owners = native.lifetime_owners.count(),
+        .opening_owners = native.lifetime_opening,
+        .failed_closes = native.lifetime_failed_closes,
+    };
+    if (native.lifetime_admission_closed and native.lifetime_owners.count() == 0 and native.lifetime_opening == 0 and native.lifetime_failed_closes == 0) {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly/sql-relation-boot/native-clean-context/v1\x00");
+        hash.update(&native.execution_instance);
+        hash.final(&out_result.clean_digest);
+    }
     return .ok;
 }
 
@@ -1958,8 +2029,8 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.exportStandalonePortableCatalog(a) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
-                .sql_snapshot_cohort => |database| {
-                    const value = handle.store.sqlSnapshotCohort(a, group_id, database) catch |err| break :blk storageOwnerStatusFromError(err);
+                .sql_snapshot_cohort => |cohort_request| {
+                    const value = handle.store.sqlSnapshotCohort(a, group_id, cohort_request) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .catalog_list_tables => |input| {
@@ -2001,6 +2072,12 @@ pub fn metadataApplyStoreProjection(
                     const bytes = handle.store.getSqlIndexAnnotations(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, bytes);
                 },
+                .trigger_policy_schema => |input| {
+                    if (input.before.table_id != input.after.table_id or !std.mem.eql(u8, input.before.name, input.after.name)) break :blk storageOwnerStatusFromError(error.InvalidCatalogMutation);
+                    var after = input.after;
+                    const pair = handle.store.prepareTriggerPolicySchema(a, group_id, input.before, &after) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, @import("../metadata/storage/raft_apply_contract.zig").TriggerPolicySchemaPreparation{ .after = after, .policy_pair = pair });
+                },
                 .relation_replacement_check => |input| {
                     handle.store.validateRelationReplacement(group_id, input.guard, input.expected, input.replacement) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, true);
@@ -2031,7 +2108,7 @@ pub fn metadataApplyStoreProjection(
                 },
                 .sql_lock_read => |input| {
                     if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
-                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = input.database_work != null, .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = input.database_work != null or input.abandoned_private != null, .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
                     const value = handle.store.sqlLockRead(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(switch (err) {
                         error.InvalidLockRecord => error.InvalidCatalogRecord,
                         else => err,
@@ -2102,6 +2179,25 @@ pub fn metadataApplyStoreProjection(
                         error.SequenceAdmissionExpired, error.SequenceAdmissionConflict => error.MetadataMutationOutcomeUnknown,
                         else => err,
                     });
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_graph_preparation_read => |input| {
+                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .setting_admin = true, .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+                    const value = handle.store.sqlGraphPreparationRead(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_graph_preparation_outcome => |input| {
+                    const value = handle.store.sqlGraphPreparationOutcome(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(switch (err) {
+                        error.SequenceAdmissionExpired, error.SequenceAdmissionConflict => error.MetadataMutationOutcomeUnknown,
+                        else => err,
+                    });
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_trigger_snapshot => |input| {
+                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+                    const value = handle.store.sqlTriggerSnapshot(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .sql_routine_snapshot => |input| {
@@ -2424,6 +2520,18 @@ pub fn metadataApplyStoreProjection(
                 },
                 .scope_retirement_work => |input| {
                     const value = handle.store.scopeRetirementWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
+                .sql_relation_boot => |input| {
+                    const value = handle.store.sqlRelationBootJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
+                .sql_relation_boot_preflight => |input| {
+                    const value = handle.store.sqlRelationBootPreflightJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
+                .sql_relation_lifetimes => |input| {
+                    const value = handle.store.sqlRelationLifetimesJson(a, group_id, input.selection, input.after, input.limit, input.include_hidden) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionBytes(alloc, out_json, value);
                 },
                 .scope_retirement_manifest => |input| {
@@ -3764,17 +3872,25 @@ pub fn storageOwnerOpen(
 ) callconv(.c) kernel_owner_abi.Status {
     out_owner.* = null;
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const lifetime_recovery = request.catalog_mode == .lifetime_recovery;
     const durable_catalog = switch (request.catalog_mode) {
         .descriptor => false,
-        .durable_only => true,
+        .durable_only, .lifetime_recovery => true,
         _ => return .invalid_argument,
     };
     if (request._reserved0 != 0 or !std.mem.allEqual(u8, &request._reserved1, 0) or
         !std.mem.allEqual(u8, &request._restore_reserved, 0)) return .invalid_argument;
-    if (durable_catalog and (request.historical_raft_apply != 1 or request.has_identity_namespace != 1 or
+    if (durable_catalog and !lifetime_recovery and (request.historical_raft_apply != 1 or request.has_identity_namespace != 1 or
         request.online_source_authority != 1 or request.dense_embedding_storage != .persisted or request.schema_json.len != 0 or request.indexes_json.len != 0 or
         request.restore_bootstrap_json.len != 0 or request.initial_child_bootstrap_json.len != 0 or
-        request.has_initial_range != 0 or request.restore_cancel_recovery != 0 or request.restore_ha_replay != 0)) return .invalid_argument;
+        request.has_initial_range != 0 or request.restore_cancel_recovery != 0 or request.restore_ha_replay != 0 or
+        request.sql_persistence_json.len != 0 or request.sql_persistence_context_json.len != 0 or request.persistence_boot_json.len != 0)) return .invalid_argument;
+    if (lifetime_recovery and (request.historical_raft_apply != 0 or request.has_identity_namespace != 1 or
+        request.online_source_authority != 2 or request.dense_embedding_storage != .persisted or
+        request.schema_json.len != 0 or request.indexes_json.len != 0 or request.restore_bootstrap_json.len != 0 or
+        request.initial_child_bootstrap_json.len != 0 or request.has_initial_range != 0 or
+        request.restore_cancel_recovery != 0 or request.restore_ha_replay != 0 or request.sql_persistence_json.len == 0 or
+        request.sql_persistence_context_json.len == 0 or request.persistence_boot_json.len == 0)) return .invalid_argument;
     const path = request.path.slice();
     const table_name = request.table_name.slice();
     if (path.len == 0 or table_name.len == 0) return .invalid_argument;
@@ -3897,8 +4013,38 @@ pub fn storageOwnerOpen(
         const namespace = identity_namespace orelse return .invalid_argument;
         if (!namespace.eql(initial_child_bootstrap.?.value.namespace)) return storageOwnerStatusFromError(error.InvalidInitialChildPublication);
     }
+    const persistence = @import("antfly_local_sources").common_topology_records.RelationPersistence;
+    var lifetime: ?std.json.Parsed(persistence.Descriptor) = null;
+    defer if (lifetime) |*parsed| parsed.deinit();
+    var lifetime_context: ?std.json.Parsed(persistence.Context) = null;
+    defer if (lifetime_context) |*parsed| parsed.deinit();
+    var lifetime_boot: ?std.json.Parsed(persistence.Boot) = null;
+    defer if (lifetime_boot) |*parsed| parsed.deinit();
+    var lifetime_open_reserved = false;
+    defer if (lifetime_open_reserved) owner_context.?.finishLifetimeOpen(success);
+    if (request.sql_persistence_json.len != 0) {
+        if (request.sql_persistence_json.len > 2048 or request.sql_persistence_context_json.len == 0 or
+            request.sql_persistence_context_json.len > 2048 or request.persistence_boot_json.len == 0 or
+            request.persistence_boot_json.len > 4096 or request.historical_raft_apply != 0 or request.online_source_authority != 2)
+            return .invalid_argument;
+        lifetime = std.json.parseFromSlice(persistence.Descriptor, alloc, request.sql_persistence_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+        lifetime_context = std.json.parseFromSlice(persistence.Context, alloc, request.sql_persistence_context_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+        lifetime_boot = std.json.parseFromSlice(persistence.Boot, alloc, request.persistence_boot_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+        if (lifetime_recovery != (lifetime_boot.?.value.adoption != null)) return .invalid_argument;
+        const native = owner_context orelse return storageOwnerStatusFromError(error.SqlRelationOwnerChanged);
+        if (std.mem.allEqual(u8, &native.execution_instance, 0) or
+            !std.mem.eql(u8, &native.execution_instance, &lifetime_context.?.value.execution_instance) or
+            !std.mem.eql(u8, &native.execution_instance, &lifetime_boot.?.value.instance))
+            return storageOwnerStatusFromError(error.SqlRelationOwnerChanged);
+        native.beginLifetimeOpen() catch |err| return storageOwnerStatusFromError(err);
+        lifetime_open_reserved = true;
+    } else if (request.sql_persistence_context_json.len != 0 or request.persistence_boot_json.len != 0)
+        return .invalid_argument;
     var open_options = db_mod.OpenOptions{
         .require_existing_catalog = durable_catalog,
+        .sql_persistence = if (lifetime) |parsed| parsed.value else null,
+        .sql_persistence_context = if (lifetime_context) |parsed| parsed.value else null,
+        .persistence_boot = if (lifetime_boot) |parsed| parsed.value else null,
         .open_mode = if (durable_catalog) .writer_no_replay else .writer,
         .online_source_authority = std.enums.fromInt(antfly.capi_dependencies.storage_source_authority.Kind, request.online_source_authority) orelse return .invalid_argument,
         .table_storage = switch (request.dense_embedding_storage) {
@@ -3926,6 +4072,7 @@ pub fn storageOwnerOpen(
         // replay can hold its catalog fence or invoke distributed callbacks.
         .start_resolver_workers = false,
         .index_backends = .{ .dense_native_migration_policy_source = if (runtime_hooks) |value| value.nativeMigrationPolicy() else null },
+        .load_sql_preparation_from_secret_store = false,
         .secret_store = if (owner_context) |context| context.secret_store else null,
         .remote_content = if (owner_context) |context| context.remoteContent() else null,
         .start_optional_runtimes = !durable_catalog and restore_bootstrap == null and initial_child_bootstrap == null,
@@ -3969,6 +4116,17 @@ pub fn storageOwnerOpen(
     else
         null;
     defer if (!success) if (owned_policy_issuer) |issuer| alloc.free(issuer);
+    if ((request.sql_preparation_secret.len != 0 and request.sql_preparation_secret.ptr == null) or
+        (request.sql_preparation_issuer.len != 0 and request.sql_preparation_issuer.ptr == null) or
+        (request.sql_preparation_secret.len == 0) != (request.sql_preparation_issuer.len == 0) or
+        request.sql_preparation_secret.len > 4096 or request.sql_preparation_issuer.len > 256) return .invalid_argument;
+    const owned_sql_secret = if (request.sql_preparation_secret.len != 0) alloc.dupe(u8, request.sql_preparation_secret.slice()) catch return .out_of_memory else null;
+    defer if (!success) if (owned_sql_secret) |value| {
+        @memset(value, 0);
+        alloc.free(value);
+    };
+    const owned_sql_issuer = if (request.sql_preparation_issuer.len != 0) alloc.dupe(u8, request.sql_preparation_issuer.slice()) catch return .out_of_memory else null;
+    defer if (!success) if (owned_sql_issuer) |value| alloc.free(value);
     const handle = alloc.create(Handle) catch return .out_of_memory;
     defer if (!success) alloc.destroy(handle);
     handle.* = .{
@@ -3986,7 +4144,10 @@ pub fn storageOwnerOpen(
             return storageOwnerStatusFromError(err);
         },
         .storage_owner_path = owned_path,
+        .storage_owner_lifetime_recovery = lifetime_recovery or (lifetime_boot != null and lifetime_boot.?.value.initializing),
         .storage_owner_table_name = owned_table_name,
+        .sql_preparation_secret = owned_sql_secret,
+        .sql_preparation_issuer = owned_sql_issuer,
         .row_policy_authority_secret = owned_policy_secret,
         .row_policy_authority_issuer = owned_policy_issuer,
         .storage_owner_group_id = request.group_id,
@@ -3999,6 +4160,8 @@ pub fn storageOwnerOpen(
         .storage_owner_target_observer = request.target_observer,
     };
     defer if (!success) handle.db.close();
+    handle.db.local_execution.sql_preparation_secret = owned_sql_secret orelse owned_policy_secret;
+    handle.db.local_execution.sql_preparation_issuer = owned_sql_issuer orelse owned_policy_issuer;
     handle.db.local_execution.row_policy_authority_secret = owned_policy_secret;
     handle.db.local_execution.row_policy_authority_issuer = owned_policy_issuer;
     handle.db.local_execution.row_policy_table_name = owned_table_name;
@@ -4039,7 +4202,7 @@ pub fn storageOwnerOpen(
     // permanent address with configuration installed; use the same startup as
     // resident caches so relational builds, retirement and durable outboxes
     // make progress. Hidden restore owners must remain unpublished/quiescent.
-    if (!durable_catalog and restore_bootstrap == null) {
+    if (!durable_catalog and restore_bootstrap == null and !(lifetime_boot != null and lifetime_boot.?.value.initializing)) {
         handle.db.activateResolverReplayRuntimes() catch |err| {
             return storageOwnerStatusFromError(err);
         };
@@ -4049,6 +4212,8 @@ pub fn storageOwnerOpen(
     // the DB and release the borrowed context exactly once, as for every
     // earlier failure. (publishHandle's close-on-failure would release the
     // context a second time.)
+    if (lifetime_open_reserved) owner_context.?.registerLifetimeOwner(handle) catch |err| return storageOwnerStatusFromError(err);
+    defer if (!success and lifetime_open_reserved) owner_context.?.removeLifetimeOwner(handle);
     const owner_id = handleRegistry().register(handle) catch |err| return storageOwnerStatusFromError(err);
     success = true;
     out_owner.* = owner_id;
@@ -4058,6 +4223,23 @@ pub fn storageOwnerOpen(
 
 pub fn storageOwnerClose(owner: ?*anyopaque) callconv(.c) void {
     closeHandleId(owner);
+}
+
+pub fn storageOwnerCloseFallible(owner: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    const context = asStorageOwnerContext(handle.storage_owner_context);
+    const failure: ?anyerror = if (handle.db_live) blk: {
+        handle.db.closeFallible() catch |err| break :blk err;
+        break :blk null;
+    } else null;
+    if (failure) |err| {
+        if (context) |native| native.proveLifetimeOwnerClosed(handle, false);
+        return storageOwnerStatusFromError(err);
+    }
+    handle.db_live = false;
+    if (context) |native| native.proveLifetimeOwnerClosed(handle, true);
+    closeHandleId(owner);
+    return .ok;
 }
 
 pub fn storageOwnerConfigure(
@@ -4309,6 +4491,7 @@ pub fn storageOwnerOperationTableName(
     handle: *const Handle,
     request: *const kernel_owner_abi.JsonOperationRequest,
 ) ?[]const u8 {
+    if (handle.storage_owner_lifetime_recovery) return null;
     return storageOwnerTableName(handle, request.table_name);
 }
 
@@ -4466,6 +4649,14 @@ pub fn storageOwnerCallbackStatusToError(status: kernel_owner_abi.Status) !void 
 }
 
 pub fn storageOwnerTableName(handle: *const Handle, table_name: kernel_owner_abi.BorrowedBytes) ?[]const u8 {
+    // Recovery leases expose only their native durable binding observation.
+    // All ordinary data, schema, maintenance and artifact controls share this
+    // admission point, including batch requests with a distinct wire type.
+    if (handle.storage_owner_lifetime_recovery) return null;
+    return storageOwnerRawTableName(handle, table_name);
+}
+
+fn storageOwnerRawTableName(handle: *const Handle, table_name: kernel_owner_abi.BorrowedBytes) ?[]const u8 {
     const requested = table_name.slice();
     const owned = handle.storage_owner_table_name orelse return null;
     if (!std.mem.eql(u8, requested, owned)) return null;
@@ -5873,6 +6064,12 @@ pub fn storageOwnerNativeFkGenerationControlJson(
     var owned = batch_api.parseInternalBatchRequest(handle.alloc, request.request_json.slice()) catch |err|
         return storageOwnerStatusFromError(err);
     defer owned.deinit(handle.alloc);
+    const command = owned.req.relational_topology orelse return .invalid_argument;
+    if (command.fence.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.IntegrityTopologyChanged);
+    @import("antfly_local_sources").sql_catalog.trigger_native_admission.requireOwnerGroup(owned.req, handle.storage_owner_group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    if (owned.req.sql_lock) |lock_command| if (lock_command.admission.binding.namespace.group != handle.storage_owner_group_id)
+        return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
     handle.db.batchNativeFkGenerationApply(owned.req) catch |err| return storageOwnerStatusFromError(err);
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err|
         return storageOwnerStatusFromError(err);
@@ -5893,6 +6090,10 @@ pub fn storageOwnerNativeInitialChildControlJson(
     var owned = batch_api.parseInternalBatchRequest(handle.alloc, request.request_json.slice()) catch |err|
         return storageOwnerStatusFromError(err);
     defer owned.deinit(handle.alloc);
+    @import("antfly_local_sources").sql_catalog.trigger_native_admission.requireOwnerGroup(owned.req, handle.storage_owner_group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    if (owned.req.sql_lock) |lock_command| if (lock_command.admission.binding.namespace.group != handle.storage_owner_group_id)
+        return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
     handle.db.batchNativeInitialChildApply(owned.req, .{
         .term = request.operation_term,
         .index = request.operation_index,
@@ -5908,12 +6109,42 @@ pub fn storageOwnerTransactionStatus(
     request: *const kernel_owner_abi.TransactionStatusRequest,
     out_result: *kernel_owner_abi.TransactionStatusResult,
 ) callconv(.c) kernel_owner_abi.Status {
-    out_result.* = .{};
+    // The old status result is smaller. Negotiate the fixed prefix before
+    // touching any output byte owned by an older caller.
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    out_result.* = .{};
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    const status = handle.db.getTransactionStatus(request.txn_id.bytes) catch |err|
-        return storageOwnerStatusFromError(err);
+    if (request.include_retention != 0) {
+        if (request.include_retention != 1 or request.retention_group_id == 0 or request.retention_group_id != handle.storage_owner_group_id or request.external_owner.len == 0)
+            return storageOwnerStatusFromError(error.ExternalTransactionDecisionChanged);
+        const expected = @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner.decode(request.external_owner.slice()) catch |err| return storageOwnerStatusFromError(err);
+        const pin = @import("antfly_local_sources").storage_transactions.NativePhysicalPin.decode(request.retention_native_pin.slice()) catch |err| return storageOwnerStatusFromError(err);
+        var retained = handle.db.externalTransactionRetentionSnapshot(std.heap.c_allocator, request.txn_id.bytes, expected, pin) catch |err| return storageOwnerStatusFromError(err);
+        defer retained.deinit(std.heap.c_allocator);
+        const encoded = std.json.Stringify.valueAlloc(std.heap.c_allocator, retained.participants, .{}) catch |err| return storageOwnerStatusFromError(err);
+        if (encoded.len > kernel_owner_abi.max_retention_participants_bytes) {
+            std.heap.c_allocator.free(encoded);
+            return storageOwnerStatusFromError(error.InvalidTxnRecord);
+        }
+        out_result.status = switch (retained.status) {
+            .pending => .pending,
+            .committed => .committed,
+            .aborted => .aborted,
+        };
+        out_result.retention_included = 1;
+        out_result.coordinator = @intFromBool(retained.coordinator);
+        out_result.prepared = @intFromBool(retained.prepared);
+        out_result.intents_resolved = @intFromBool(retained.intents_resolved);
+        out_result.participant_count = @intCast(retained.participants.len);
+        out_result.participants_json = .{ .ptr = encoded.ptr, .len = encoded.len };
+        return .ok;
+    }
+    if (request.retention_group_id != 0 or request.retention_native_pin.len != 0) return storageOwnerStatusFromError(error.InvalidTxnRequest);
+    const status = if (request.external_owner.len != 0) external: {
+        const expected = @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner.decode(request.external_owner.slice()) catch |err| return storageOwnerStatusFromError(err);
+        break :external handle.db.externalTransactionStatus(request.txn_id.bytes, expected) catch |err| return storageOwnerStatusFromError(err);
+    } else handle.db.getTransactionStatus(request.txn_id.bytes) catch |err| return storageOwnerStatusFromError(err);
     out_result.status = switch (status) {
         .pending => .pending,
         .committed => .committed,
@@ -6596,6 +6827,7 @@ pub const NativeSnapshotCapture = struct {
 pub fn storageOwnerSnapshotCapture(owner: ?*anyopaque, group_id: u64, through_index: u64, out_capture: *?*anyopaque) callconv(.c) kernel_owner_abi.Status {
     out_capture.* = null;
     const handle = asHandle(owner) orelse return .invalid_argument;
+    if (handle.storage_owner_lifetime_recovery) return .invalid_argument;
     if (handle.storage_owner_group_id != group_id) return .invalid_argument;
     const capture = std.heap.c_allocator.create(NativeSnapshotCapture) catch return .out_of_memory;
     const pinned = @import("../storage/server_db_adapter.zig").captureSnapshot(&handle.db, group_id, through_index) catch |err| {
@@ -6759,6 +6991,13 @@ pub fn batchStorageKernelJson(
     var owned = batch_api.parseOwnerBatchRequest(handle.alloc, request_json.bytes()) catch |err|
         return storageOwnerStatusFromError(err);
     defer owned.deinit(handle.alloc);
+    @import("antfly_local_sources").sql_catalog.trigger_native_admission.requireOwnerGroup(owned.req, handle.storage_owner_group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    if (owned.req.sql_lock) |lock_command| if (lock_command.admission.binding.namespace.group != handle.storage_owner_group_id)
+        return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
+    // Transaction controls have a distinct dispatcher. DB.batch must never
+    // turn a misrouted private BEGIN/PREPARE/ACK into a successful no-op.
+    if (owned.req.transaction != null) return .invalid_argument;
     if (owned.req.row_policy_publication != null) return .invalid_argument;
     if (owned.req.relational_index_maintenance) |command| if (command.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.PreparedGenerationChanged);
 
@@ -6790,6 +7029,10 @@ pub fn replicatedBatchStorageKernelJson(
     var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err|
         return storageOwnerStatusFromError(err);
     defer owned.deinit(handle.alloc);
+    @import("antfly_local_sources").sql_catalog.trigger_native_admission.requireOwnerGroup(owned.req, handle.storage_owner_group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    if (owned.req.sql_lock) |lock_command| if (lock_command.admission.binding.namespace.group != handle.storage_owner_group_id)
+        return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
     if (owned.req.row_policy_publication != null) return .invalid_argument;
     if (owned.req.relational_index_maintenance) |command| if (command.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.PreparedGenerationChanged);
 
@@ -6818,14 +7061,19 @@ pub fn replicatedBatchStorageKernelJsonAtRaftEntry(
     var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err|
         return storageOwnerStatusFromError(err);
     defer owned.deinit(handle.alloc);
+    @import("antfly_local_sources").sql_catalog.trigger_native_admission.requireOwnerGroup(owned.req, handle.storage_owner_group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    if (owned.req.sql_lock) |lock_command| if (lock_command.admission.binding.namespace.group != handle.storage_owner_group_id)
+        return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
     if (owned.req.row_policy_publication) |publication| {
         if (publication.table_id != handle.db.core.identity_namespace.table_id or publication.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
         const bundle = owned.req.row_policy_install_bundle;
         // Bound the private ABI payload before crossing into the storage owner;
         // the owner independently checks the canonical bundle limit and shape.
         if (bundle.len == 0 or bundle.len > 4 * 1024 * 1024) return .invalid_argument;
-        const receipt = handle.db.applyReplicatedRowPolicyPublication(bundle, publication, raft_entry) catch |err|
+        const receipt = handle.db.applyReplicatedRowPolicyPublication(bundle, publication, raft_entry) catch |err| {
             return storageOwnerStatusFromError(err);
+        };
         var result = owned.result();
         result.row_policy_receipt = receipt;
         const response = batch_api.encodeBatchResponse(std.heap.c_allocator, result) catch |err|
@@ -6894,11 +7142,30 @@ pub fn storageOwnerLookupJson(
     ) catch return .invalid_argument;
     defer parsed.deinit();
     const opts = parsed.value.options();
+    if (opts.include_json_null_fields and antfly.local_query_contract.integrityLookupMode(opts)) return .invalid_argument;
+    const lock_query = opts.sql_lock_query_json;
+    if (lock_query.len != 0) {
+        const raw = lock_query;
+        if (raw.len > 32768) return storageOwnerStatusFromError(error.InvalidLockRecord);
+        const locks = @import("antfly_local_sources").storage_pessimistic_lock_control;
+        const query = std.json.parseFromSlice(locks.Query, handle.alloc, raw, .{}) catch |err| return storageOwnerStatusFromError(err);
+        defer query.deinit();
+        query.value.validate() catch |err| return storageOwnerStatusFromError(err);
+        if (query.value.admission.binding.namespace.group != handle.storage_owner_group_id)
+            return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
+    }
     handle.prepareLookupRequest(parsed.value.key, opts) catch |err| return storageOwnerStatusFromError(err);
-    var result = (handle.db.getDocument(handle.alloc, parsed.value.key, opts) catch |err| return storageOwnerStatusFromError(err)) orelse return .not_found;
+    var result = (handle.db.getDocument(handle.alloc, parsed.value.key, opts) catch |err| {
+        return storageOwnerStatusFromError(err);
+    }) orelse return .not_found;
     defer result.deinit(handle.alloc);
     const version = if (antfly.local_query_contract.integrityLookupMode(opts)) 0 else result.version orelse (handle.db.getTimestamp(handle.alloc, parsed.value.key) catch |err| return storageOwnerStatusFromError(err));
-    const response = dupBytes(result.json) catch return .out_of_memory;
+    const typed = if (opts.include_json_null_fields)
+        antfly.local_query_contract.StorageKernelTypedLookup.encode(handle.alloc, result) catch |err| return storageOwnerStatusFromError(err)
+    else
+        null;
+    defer if (typed) |bytes| handle.alloc.free(bytes);
+    const response = dupBytes(typed orelse result.json) catch return .out_of_memory;
     out_response.* = .{
         .buffer = .{
             .ptr = response.ptr,
@@ -6939,7 +7206,6 @@ pub const StorageRelationalRead = struct {
 
         pub fn open(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !View {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (!opts.include_range_proofs) return error.SqlRangeTrackingRequired;
             const query = opts.relational_query orelse return error.SqlStatementSnapshotRequired;
             if (query.index != null or query.auto_index) return error.SqlStatementSnapshotRequired;
             if (self.read.document) {
@@ -6948,6 +7214,11 @@ pub const StorageRelationalRead = struct {
             }
             const session = try self.db.openRelationalReadSessionAtSnapshot(alloc, from, to, opts, &self.read);
             return .{ .ptr = session, .vtable = &.{ .next = StorageRelationalRead.next, .close = StorageRelationalRead.close, .normalize = StorageRelationalRead.normalize, .range_proofs = StorageRelationalRead.rangeProofs } };
+        }
+
+        pub fn graphPage(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("antfly_local_sources").storage_statement_read_fence.GraphRead.Request) !@import("antfly_local_sources").storage_statement_read_fence.GraphRead.Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.db.relationalGraphSnapshotPage(&self.read, alloc, request);
         }
 
         pub fn release(ptr: *anyopaque) void {
@@ -6969,6 +7240,11 @@ pub const StorageRelationalRead = struct {
             if (self.cancellation) |token| try token.check();
             if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         }
+        pub fn nativeSequence(ptr: *anyopaque) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try validate(ptr);
+            return self.db.statementFenceSequence(&self.fence);
+        }
         pub fn release(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.fence.release();
@@ -6984,15 +7260,18 @@ pub const StorageRelationalRead = struct {
         }
 
         pub fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !Snapshot {
+            return captureSnapshotWithGraphs(ptr, alloc, &.{});
+        }
+        pub fn captureSnapshotWithGraphs(ptr: *anyopaque, alloc: std.mem.Allocator, indexes: []const []const u8) !Snapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try validate(ptr);
             const pinned = try alloc.create(Pinned);
             errdefer alloc.destroy(pinned);
-            var read = try self.db.captureRelationalStatementSnapshot();
+            var read = try self.db.captureRelationalStatementSnapshotWithGraphs(indexes);
             errdefer read.deinit();
             pinned.* = .{ .alloc = alloc, .db = self.db, .read = read };
             try validate(ptr);
-            return .{ .ptr = pinned, .vtable = &.{ .open = Pinned.open, .release = Pinned.release } };
+            return .{ .ptr = pinned, .vtable = &.{ .open = Pinned.open, .graph_page = Pinned.graphPage, .release = Pinned.release } };
         }
     };
 
@@ -7006,7 +7285,7 @@ pub const StorageRelationalRead = struct {
         errdefer alloc.destroy(capture);
         capture.* = .{ .alloc = alloc, .db = &handle.db, .fence = fence, .cancellation = opts.cancellation, .deadline_ns = opts.execution_deadline_ns };
         try Capture.validate(capture);
-        return .{ .ptr = capture, .vtable = &.{ .validate = Capture.validate, .open = Capture.open, .capture_snapshot = Capture.captureSnapshot, .release = Capture.release } };
+        return .{ .ptr = capture, .vtable = &.{ .validate = Capture.validate, .native_sequence = Capture.nativeSequence, .open = Capture.open, .capture_snapshot = Capture.captureSnapshot, .capture_snapshot_with_graphs = Capture.captureSnapshotWithGraphs, .release = Capture.release } };
     }
 
     pub fn open(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !View {
@@ -8191,15 +8470,50 @@ pub fn storageOwnerRelationalTransitionRead(owner_ptr: ?*anyopaque, request: *co
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     if (request.request_json.len > 16 * 1024 * 1024) return .invalid_argument;
     const handle = asHandle(owner_ptr) orelse return .invalid_argument;
-    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    _ = storageOwnerRawTableName(handle, request.table_name) orelse return .invalid_argument;
     var arena = std.heap.ArenaAllocator.init(handle.alloc);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const command = std.json.parseFromSlice(antfly.capi_dependencies.storage_db_relational_transition_contract.Request, alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false }) catch |err| return storageOwnerStatusFromError(err);
+    // Closed metadata requests reject mixed or missing selectors as argument
+    // failures; parser implementation names are not a storage failure identity.
+    const command = std.json.parseFromSlice(antfly.capi_dependencies.storage_db_relational_transition_contract.Request, alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false }) catch |err| return if (err == error.OutOfMemory) .out_of_memory else .invalid_argument;
+    if (handle.storage_owner_lifetime_recovery and command.value != .sql_relation_binding) return storageOwnerStatusFromError(error.SqlRelationRecoveryIncomplete);
     var output: std.Io.Writer.Allocating = .init(handle.alloc);
     defer output.deinit();
     var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
     switch (command.value) {
+        .native_retirement_status => |input| {
+            const contract = antfly.capi_dependencies.storage_db_relational_transition_contract;
+            if (request.request_json.len > contract.max_native_retirement_status_bytes) return .invalid_argument;
+            input.validate() catch |err| return storageOwnerStatusFromError(err);
+            if (input.fence.owner_group_id != handle.storage_owner_group_id or
+                input.fence.namespace.table_id != handle.db.core.identity_namespace.table_id or
+                input.fence.namespace.shard_id != handle.db.core.identity_namespace.shard_id or
+                input.fence.namespace.range_id != handle.db.core.identity_namespace.range_id) return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
+            const descriptor = handle.db.sql_persistence orelse return storageOwnerStatusFromError(error.InvalidSqlRelationPersistence);
+            const native_context = asStorageOwnerContext(handle.storage_owner_context) orelse return storageOwnerStatusFromError(error.InvalidSqlRelationPersistence);
+            const actual_pin = (handle.db.relationPhysicalPin() catch |err| return storageOwnerStatusFromError(err)) orelse return storageOwnerStatusFromError(error.InvalidSqlRelationPersistence);
+            if (!descriptor.eql(input.descriptor) or !actual_pin.eql(input.pin) or
+                !std.mem.eql(u8, &native_context.execution_instance, &input.native_instance)) return storageOwnerStatusFromError(error.SqlRelationOwnerChanged);
+            const before = handle.db.relationalTopologyStatus() catch |err| return storageOwnerStatusFromError(err);
+            if (before.fence == null or !before.fence.?.eql(input.fence)) return storageOwnerStatusFromError(error.IntegrityTopologyChanged);
+            // The closed private operation authenticates one actual native
+            // handle and its stored fence before constructing this local bit.
+            // It never passes through the public JSON lookup decoder.
+            var result = (handle.db.lookup(alloc, "", .{ .relational_topology_json = "{\"mode\":\"retirement_status\"}", .fk_generation_source_control = true }) catch |err| return storageOwnerStatusFromError(err)) orelse return storageOwnerStatusFromError(error.InvalidSqlRelationPersistence);
+            defer result.deinit(alloc);
+            var observed = std.json.parseFromSlice(db_mod.DB.RelationalTopologyStatus, alloc, result.json, .{}) catch |err| return storageOwnerStatusFromError(err);
+            defer observed.deinit();
+            const after_pin = (handle.db.relationPhysicalPin() catch |err| return storageOwnerStatusFromError(err)) orelse return storageOwnerStatusFromError(error.InvalidSqlRelationPersistence);
+            if (!after_pin.eql(input.pin) or !std.mem.eql(u8, &native_context.execution_instance, &input.native_instance)) return storageOwnerStatusFromError(error.SqlRelationOwnerChanged);
+            if (observed.value.fence == null or !observed.value.fence.?.eql(input.fence)) return storageOwnerStatusFromError(error.IntegrityTopologyChanged);
+            output.writer.writeAll(result.json) catch |err| return storageOwnerStatusFromError(err);
+        },
+        .sql_relation_binding => {
+            var result = (handle.db.lookup(alloc, "", .{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}" }) catch |err| return storageOwnerStatusFromError(err)) orelse return storageOwnerStatusFromError(error.InvalidSqlRelationPersistence);
+            defer result.deinit(alloc);
+            output.writer.writeAll(result.json) catch |err| return storageOwnerStatusFromError(err);
+        },
         .identity => antfly.capi_dependencies.storage_db_relational_integrity_json.write(handle.db.relationalTopologyIdentity() catch |err| return storageOwnerStatusFromError(err), &stream) catch |err| return storageOwnerStatusFromError(err),
         .status => antfly.capi_dependencies.storage_db_relational_integrity_json.write(handle.db.relationalTopologyStatus() catch |err| return storageOwnerStatusFromError(err), &stream) catch |err| return storageOwnerStatusFromError(err),
         .manifest => |input| antfly.capi_dependencies.storage_db_relational_integrity_json.write(handle.db.relationalHandoffManifest(alloc, input.source, input.destination, input.lower, input.upper, input.primary_sequence) catch |err| return storageOwnerStatusFromError(err), &stream) catch |err| return storageOwnerStatusFromError(err),
@@ -8254,6 +8568,7 @@ pub fn hiddenRestoreJson(alloc: std.mem.Allocator, db: *db_mod.DB, request: *con
         },
         .capture_public_snapshot => unreachable,
         .read_initial_child => unreachable,
+        .inspect_native_root, .replace_native_empty => unreachable,
         .cancel_initial_child_retirement => unreachable,
     }
 }
@@ -8278,7 +8593,64 @@ pub fn captureOwnerSeedSnapshot(alloc: std.mem.Allocator, db: *db_mod.DB, reques
 pub fn storageOwnerHiddenRestoreJson(owner_ptr: ?*anyopaque, request: *const kernel_owner_abi.HiddenRestoreRequest, out_result: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
     out_result.* = .{};
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request.operation == .replace_native_empty) {
+        if (owner_ptr != null or request.path.len == 0 or request.native_image_json.len == 0 or request.native_image_json.len > 16 * 1024 * 1024) return .invalid_argument;
+        const native = asStorageOwnerContext(request.context) orelse return .invalid_argument;
+        const p = @import("antfly_local_sources").common_topology_records.RelationPersistence;
+        const Input = struct {
+            descriptor: p.Descriptor,
+            host: p.Context,
+            boot: p.Boot,
+            bootstrap: @import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap,
+            attempt_number: u64,
+            attempt_digest: [32]u8,
+            previous_root: u128,
+        };
+        var input = std.json.parseFromSlice(Input, native.alloc, request.native_image_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+        defer input.deinit();
+        if (!std.mem.eql(u8, &native.execution_instance, &input.value.host.execution_instance) or !std.mem.eql(u8, &native.execution_instance, &input.value.boot.instance)) return storageOwnerStatusFromError(error.SqlRelationOwnerChanged);
+        input.value.descriptor.requireHost(input.value.host) catch |err| return storageOwnerStatusFromError(err);
+        native.beginLifetimeOpen() catch |err| return storageOwnerStatusFromError(err);
+        // This operation closes every ephemeral candidate before returning.
+        // A failed candidate has no row/participant ACK, is discarded, and
+        // cannot count as a clean initialized image or a retained live owner.
+        defer native.finishLifetimeOpen(false);
+        const prepared_schema = local_write.prepareOwnerSchemaBeforeIndexLoad(native.alloc, input.value.bootstrap.schema_json) catch |err| return storageOwnerStatusFromError(err);
+        defer local_write.freeOwnerSchemaBeforeIndexLoad(native.alloc, prepared_schema);
+        const binding = db_mod.DB.replaceUnpublishedNativeEmptyImage(native.alloc, request.path.slice(), .{
+            .sql_persistence = input.value.descriptor,
+            .sql_persistence_context = input.value.host,
+            .persistence_boot = input.value.boot,
+            .online_source_authority = .native,
+            .identity_namespace = input.value.bootstrap.scope.target_namespace,
+            .schema_before_index_load = prepared_schema,
+            .resource_manager = &native.resources.resource_manager,
+            .lsm_cache = &native.resources.lsm_cache,
+            .hbc_cache = &native.resources.hbc_cache,
+            .backend_runtime = native.backend_runtime.ptr(),
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .start_independent_maintenance = false,
+        }, input.value.bootstrap, input.value.attempt_number, input.value.attempt_digest, input.value.previous_root) catch |err| return storageOwnerStatusFromError(err);
+        const encoded = std.json.Stringify.valueAlloc(native.alloc, binding, .{}) catch |err| return storageOwnerStatusFromError(err);
+        out_result.* = .{ .ptr = encoded.ptr, .len = @intCast(encoded.len) };
+        return .ok;
+    }
+    if (request.operation == .inspect_native_root) {
+        // This is an authenticated server lifecycle observation, never an
+        // owner-read or a way to admit rows on an old TEMP generation.
+        if (owner_ptr != null or request.path.len == 0 or request.native_inspection_json.len == 0 or request.native_inspection_json.len > 4096) return .invalid_argument;
+        const context = asStorageOwnerContext(request.context) orelse return .invalid_argument;
+        const persistence = @import("antfly_local_sources").common_topology_records.RelationPersistence;
+        var descriptor = std.json.parseFromSlice(?persistence.Descriptor, context.alloc, request.native_inspection_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+        defer descriptor.deinit();
+        const observed = db_mod.DB.inspectUnpublishedNativeImage(context.alloc, request.path.slice(), context.backend_runtime.ptr(), descriptor.value, .{ .resource_manager = &context.resources.resource_manager, .lsm_cache = &context.resources.lsm_cache, .hbc_cache = &context.resources.hbc_cache }) catch |err| return storageOwnerStatusFromError(err);
+        const encoded = std.json.Stringify.valueAlloc(context.alloc, observed, .{}) catch |err| return storageOwnerStatusFromError(err);
+        out_result.* = .{ .ptr = encoded.ptr, .len = @intCast(encoded.len) };
+        return .ok;
+    }
     if (asHandle(owner_ptr)) |handle| {
+        if (handle.storage_owner_lifetime_recovery) return .invalid_argument;
         hiddenRestoreJson(handle.alloc, &handle.db, request, out_result) catch |err| return storageOwnerStatusFromError(err);
         return .ok;
     }
@@ -8338,6 +8710,7 @@ pub fn storageOwnerMergeCleanupKeysPage(owner_ptr: ?*anyopaque, request: *const 
 }
 
 pub fn cleanupServerHandle(handle: *Handle) void {
+    if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.removeLifetimeOwner(handle);
     if (handle.storage_owner_transaction_recovery) |context_ptr| {
         const recovery: *StorageOwnerTransactionRecovery = @ptrCast(@alignCast(context_ptr));
         recovery.deinit();

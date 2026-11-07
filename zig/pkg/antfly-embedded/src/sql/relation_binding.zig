@@ -1941,6 +1941,21 @@ const Builder = struct {
                         if (self.parameters[slot]) |kind| if (kind != .string) return error.ConflictingSqlParameterTypes;
                         self.parameters[slot] = .string;
                     }
+                    if (graph.hit_alias != null) {
+                        const names = [_][]const u8{ "id", "score", "graph_name" };
+                        const columns = try self.alloc.alloc(Column, names.len);
+                        const fields = try self.alloc.alloc([]const u8, names.len);
+                        for (names, columns, fields, 0..) |name, *column, *scan_field, position| {
+                            const kind: ast.ColumnType = if (position == 1) .number else .string;
+                            column.* = .{ .name = name, .internal = try self.internal(), .qualifier = reference.alias orelse "graph_match", .type = kind, .nullable = position == 1 };
+                            scan_field.* = name;
+                            if (self.shape_only) try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = kind, .nullable = position == 1 });
+                        }
+                        const index = self.scans.items.len;
+                        if (index >= 64) return error.SqlProgramLimitExceeded;
+                        try self.scans.append(self.alloc, .{ .table = resolved.table, .request = .{ .graph = graph, .fields = fields, .limit = 256 } });
+                        break :blk try self.node(columns, .{ .scan = .{ .index = index, .source_columns = fields } });
+                    }
                     const width = graph.aliases.len * 3;
                     const columns = try self.alloc.alloc(Column, width);
                     const fields = try self.alloc.alloc([]const u8, width);
@@ -2020,7 +2035,7 @@ const Builder = struct {
                     request.* = .{ .expression = search.* };
                     break :search_request request;
                 } else null;
-                try self.scans.append(self.alloc, .{ .table = table, .request = .{ .search = search_request, .fields = fields, .limit = 256, .include_primary_digest = reference.mutation_target, .include_document = reference.mutation_document and table.storage_mode == .document } });
+                try self.scans.append(self.alloc, .{ .table = table, .request = .{ .search = search_request, .fields = fields, .limit = 256, .include_primary_digest = reference.mutation_target, .include_document = (reference.mutation_document or (reference.mutation_target and table.has_triggers)) and table.storage_mode == .document } });
                 break :blk try self.node(columns, .{ .scan = .{ .index = index, .source_columns = source_columns } });
             },
             .derived => |query| blk: {

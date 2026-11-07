@@ -409,11 +409,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
             if (openModeRequiresReadOnlyBackends(S.ownerField(self, "open_mode").*)) return error.ReadOnly;
             if (!opts.bypass_replication_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
-            if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrier();
-            var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+            if (!opts.bypass_replication_write_gate) {
+                if (opts.checked_native_atomic) |checked| {
+                    // Real preflight completed before row-policy/preparation
+                    // admission. Recheck flags without repeating waits.
+                    if (checked.schema_namespace_generation != S.ownerField(self, "core").*.schemaNamespaceGeneration() or
+                        S.ownerField(self, "async_context").*.primary_replication_append_pending.load(.acquire) or
+                        S.ownerField(self, "local_execution").*.durable_replication_startup_barrier_pending.load(.acquire) or
+                        S.ownerField(self, "local_execution").*.row_policy_replication_outbox_pending.load(.acquire)) return error.PreparedReadSetChanged;
+                } else try self.ensureDurableReplicationStartupBarrier();
+            }
+            var replication_mutation = if (opts.checked_native_atomic) |checked| moved: {
+                const owned = checked.replication_owner.*;
+                checked.replication_owner.* = null;
+                break :moved owned;
+            } else if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
             defer if (replication_mutation) |*lease| lease.release();
             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
-            if (!opts.bypass_replication_write_gate) try self.preflightReplicationBatchSyncCommit();
+            // Checked native admission ran the real synchronous policy preflight
+            // before RLS/preparation/apply admission. Its moved shared lease
+            // pins that configuration; do not reacquire the publisher log mutex
+            // while the native planner already owns apply. Normal commit still
+            // performs the configured durable append and acknowledgement checks.
+            if (!opts.bypass_replication_write_gate and opts.checked_native_atomic == null) try self.preflightReplicationBatchSyncCommit();
             const total_start_ns = monotonicTimeNs();
             var schedule_replication_recovery_on_exit = false;
             defer {
@@ -432,7 +450,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // calls on a PreparedRow that cannot yet commit. Maintenance workers
             // remain able to drain the pressure because no DB apply lock is held.
             if (S.ownerField(self, "core").*.index_manager.resource_manager) |manager| {
-                try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
+                if (opts.checked_native_atomic != null) {
+                    // The real pressure wait ran before native apply admission.
+                    // A changed hard limit must reject here rather than park
+                    // while retaining the checked planner fence.
+                    const bytes = projectedBatchLsmAdmissionBytes(req);
+                    const decision = manager.admissionDecision(.lsm_in_memory_state, bytes);
+                    if ((decision.hard_limit_bytes != 0 and bytes > decision.hard_limit_bytes) or decision.action == .reject_work) return error.ResourceBudgetExceeded;
+                    if (decision.action == .throttle_writes and decision.pressure == .hard) return error.ResourceTemporarilyUnavailable;
+                } else try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
             }
             const preparation_timestamp_ns = if (req.timestamp_ns != 0) req.timestamp_ns else S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs();
             const preparation_alloc = prepared_row_allocator.allocator();
@@ -498,6 +524,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .row_policy_principal_proof = req.row_policy_principal_proof,
                 .row_policy_database = req.row_policy_database,
                 .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
+                .trigger_receipts = req.trigger_receipts,
+                .trigger_preparation_proof = req.trigger_preparation_proof,
+                .trigger_preparation_group_id = req.trigger_preparation_group_id,
+                .trigger_preparation_command_digest = req.trigger_preparation_command_digest,
+                .trigger_preparation_admitted_at_seconds = req.trigger_preparation_admitted_at_seconds,
                 .range_guards = req.range_guards,
                 .restore_staging_scope = req.restore_staging_scope,
                 .restore_staging_plan_id = req.restore_staging_plan_id,
@@ -566,8 +597,35 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.transaction_resolution == null and !scoped_restore_replication_apply and !live_replication_apply) {
                 for (effective_ops.writes) |write| if (isProtectedIntegrityKey(write.key) or isProtectedRangeWriteKey(write.key)) return error.InvalidIntegrityOperation;
                 for (effective_ops.deletes) |key| if (isProtectedIntegrityKey(key) or isProtectedRangeWriteKey(key)) return error.InvalidIntegrityOperation;
-                if (!req.graph_endpoint_cleanup_planned and hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
+                if (opts.checked_native_atomic == null and !req.graph_endpoint_cleanup_planned and hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
                     return error.ForeignKeyCoordinationRequired;
+            }
+            // Physical population/resolution already carries owner-authenticated
+            // row provenance and never runs triggers. Every logical mutation,
+            // including ordered replay of prepared statements, verifies the
+            // immutable trigger receipt before parsing or entering apply.
+            if (opts.checked_native_atomic == null and opts.transaction_resolution == null and opts.restore_staging == null and
+                !scoped_restore_replication_apply and !live_replication_apply and
+                req.split_replication == null and req.merge_replication == null)
+            {
+                try @import("../../sql/trigger_native_admission.zig").requireSchemaView(req, request_schema_view != null);
+                try @import("../../sql/trigger_native_admission.zig").requireOwnerTable(req, S.ownerField(self, "core").*.identity_namespace.table_id);
+                if (request_schema_view) |view| try @import("../../sql/trigger_native_admission.zig").verify(
+                    preparation_alloc,
+                    view,
+                    req,
+                    S.ownerField(self, "local_execution").*.sql_preparation_secret,
+                    S.ownerField(self, "local_execution").*.sql_preparation_issuer,
+                    @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)),
+                    opts.ordered_apply_receipt != null or opts.native_initial_child_entry != null,
+                ) else try @import("../../sql/trigger_native_admission.zig").verifyNoSchema(
+                    preparation_alloc,
+                    req,
+                    S.ownerField(self, "local_execution").*.sql_preparation_secret,
+                    S.ownerField(self, "local_execution").*.sql_preparation_issuer,
+                    @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)),
+                    opts.ordered_apply_receipt != null or opts.native_initial_child_entry != null,
+                );
             }
             if (req.relational_schema_version) |version| {
                 const view = request_schema_view orelse return error.InvalidRelationalRowsRequest;
@@ -940,7 +998,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 );
             }
 
-            var snapshot_mutation = if (opts.snapshot_mutation) |lease| lease.retain() else S.ownerField(self, "core").*.snapshot_admission.acquireMutation();
+            var snapshot_mutation = if (opts.checked_native_atomic) |checked| checked.snapshot_owner.take() else if (opts.snapshot_mutation) |lease| lease.retain() else S.ownerField(self, "core").*.snapshot_admission.acquireMutation();
             defer snapshot_mutation.release();
             std.debug.assert(snapshot_mutation.admission == S.ownerField(self, "core").*.snapshot_admission);
             if (builtin.is_test) {
@@ -958,6 +1016,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (preparation.write_plan == null and (S.ownerField(self, "core").*.index_manager.hasGroupSources() or opts.group_source_command != null) and
                 (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or opts.group_source_command != null))
                 preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+            var native_atomic_effects: execution_resources.NativeAtomicEffects = .{};
             const apply_lock_wait_start_ns = monotonicTimeNs();
             try self.lockApplyForPortableRuntime();
             if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
@@ -995,6 +1054,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Durable intents already retain a historical schema identity.
             // Ordinary requests must still prove their speculative epoch current.
             if (request_schema_binding == null) try self.validatePreparedSchemaViewLocked(request_schema_view);
+            try @import("prepared_graph_effects.zig").requireIndexes(preparation_alloc, S.ownerField(self, "core").*.index_manager, opts.prepared_graph_indexes);
+            if (req.graph_preparation) |proof| try @import("prepared_graph_effects.zig").requireDefinitions(preparation_alloc, S.ownerField(self, "core").*.index_manager, proof);
             if (prepared_document != null and S.ownerField(self, "core").*.index_manager.writePlanGeneration() != document_generated_write_plan_generation.?) return error.PreparedGenerationChanged;
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             if (live_replication_apply) {
@@ -1207,6 +1268,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             .completion_writes = completion_writes,
                             .resolved_participant = resolution.resolved_participant,
                             .expected_intent_revision = resolution.expected_intent_revision,
+                            .prepared_graph_effects_checked = resolution.prepared_graph_effects_checked,
                             .known_intent_keys = resolution.intent_keys,
                         },
                     );
@@ -1280,6 +1342,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // schemaless or unconstrained document write must not bypass a newly
             // published schema. Durable decisions retain their admitted epoch.
             if (request_schema_binding == null) try self.validatePreparedSchemaViewLocked(request_schema_view);
+            try @import("prepared_graph_effects.zig").requireIndexes(preparation_alloc, S.ownerField(self, "core").*.index_manager, opts.prepared_graph_indexes);
+            if (req.graph_preparation) |proof| try @import("prepared_graph_effects.zig").requireDefinitions(preparation_alloc, S.ownerField(self, "core").*.index_manager, proof);
             // An index-only publication need not change the schema generation.
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             if (preparation.write_plan) |pinned| if (pinned.plan().group_sources) |group_plan| {
@@ -1367,6 +1431,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // data changes. use_preprepared_document_generated already forced a
             // retry on a stale catalog; this call does the same for a stale key.
             if (use_preprepared_document_generated) try self.validateGeneratedWriteReadSnapshot(preparation.generated_snapshot);
+
+            if (opts.checked_native_atomic) |checked| {
+                if (checked.schema_namespace_generation != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+                native_atomic_effects = try checked.finalize_fn(checked.ptr);
+            }
 
             if (effective_req.predicates.len > 0) {
                 const predicates_start_ns = monotonicTimeNs();
@@ -2567,7 +2636,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 );
             };
             var next_table_catalog: ?table_catalog_mod.Catalog = null;
-            var table_catalog_value: [table_catalog_mod.encoded_len]u8 = undefined;
+            var table_catalog_value: table_catalog_mod.Encoded = undefined;
             if (pending_identity_visibility_summary != null or merge_count_prepared) {
                 var catalog = S.ownerField(self, "core").*.table_catalog;
                 const previous = catalog;
@@ -2591,7 +2660,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     catalog.reconciled != previous.reconciled)
                 {
                     catalog.generation +|= 1;
-                    table_catalog_value = catalog.encode();
+                    table_catalog_value = try catalog.encodeDurable();
                     next_table_catalog = catalog;
                 }
             } else if (S.ownerField(self, "core").*.table_catalog.row_count == 0 and (effective_req.writes.len != 0 or effective_req.deletes.len != 0)) {
@@ -2610,14 +2679,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     catalog.active_schema_version = if (S.ownerField(self, "core").*.schema) |table_schema| table_schema.version else 0;
                     catalog.row_count = 1;
                     catalog.generation +|= 1;
-                    table_catalog_value = catalog.encode();
+                    table_catalog_value = try catalog.encodeDurable();
                     next_table_catalog = catalog;
                 }
             }
             try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, write_buffers.identity_writes.items);
             if (next_table_catalog != null) try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{
                 .key = table_catalog_mod.key,
-                .value = &table_catalog_value,
+                .value = table_catalog_value.slice(),
             });
             try appendDocumentChildRangeOutboxWrites(
                 S.ownerField(self, "alloc").*,
@@ -3011,6 +3080,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &write_buffers.owned_store_values,
             );
             try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_writes);
+            try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, native_atomic_effects.writes);
             if (opts.outcome_marker_write) |marker| try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, marker);
             if (req.merge_page) |page| if (page.integrity.len != 0) {
                 // Private page shape, exact generation/ownership and replay cursor
@@ -3035,6 +3105,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key, .value = effect.value orelse return error.InvalidMergePage });
             };
             try write_buffers.delete_keys.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_deletes);
+            try write_buffers.delete_keys.appendSlice(S.ownerField(self, "alloc").*, native_atomic_effects.deletes);
             if (index_stage) |*stage| {
                 const effects = try stage.seal();
                 if (opts.transaction_resolution == null and !live_replication_apply and !scoped_restore_replication_apply) {
@@ -3135,6 +3206,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .deletes = write_buffers.delete_keys.items,
                         .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
                         .expected_intent_revision = resolution.expected_intent_revision,
+                        .prepared_graph_effects_checked = resolution.prepared_graph_effects_checked,
                         .known_intent_keys = resolution.intent_keys,
                         .skip_all_intent_application = relationalColumns(self) != null,
                         .completion_writes = if (ordered_apply_receipt_write) |write| &.{write} else &.{},
@@ -3372,6 +3444,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             while (true) {
                 self.batchInternalPrepared(req, profile, opts, &generated_memo, allocator_guard) catch |err| switch (err) {
                     error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
+                        // The native checked plan consumes owned admissions.
+                        // Rebuild outside its policy and preparation gates.
+                        if (opts.checked_native_atomic != null) return err;
                         if (retry_count >= max_prepared_generation_retries) return err;
                         retry_count += 1;
                         continue;
@@ -3449,15 +3524,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const schema = schema_view.tableSchema().*;
             var requirements = try @import("row_policy_bundle.zig").MutationRequirements.init(S.ownerField(self, "alloc").*, req.predicates, principal);
             defer requirements.deinit(S.ownerField(self, "alloc").*);
-            const select_check = if (requirements.needsSelect()) try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .select) else null;
+            const select_check = if (requirements.needsSelect()) try bundle.captureEvaluationAtSchemaView(S.ownerField(self, "alloc").*, schema_view, principal, .select) else null;
             defer if (select_check) |evaluation| evaluation.deinit();
-            var insert_check = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .insert);
+            var insert_check = try bundle.captureEvaluationAtSchemaView(S.ownerField(self, "alloc").*, schema_view, principal, .insert);
             defer insert_check.deinit();
-            var update_old = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .update_old);
+            var update_old = try bundle.captureEvaluationAtSchemaView(S.ownerField(self, "alloc").*, schema_view, principal, .update_old);
             defer update_old.deinit();
-            var update_new = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .update_new);
+            var update_new = try bundle.captureEvaluationAtSchemaView(S.ownerField(self, "alloc").*, schema_view, principal, .update_new);
             defer update_new.deinit();
-            var delete_old = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .delete);
+            var delete_old = try bundle.captureEvaluationAtSchemaView(S.ownerField(self, "alloc").*, schema_view, principal, .delete);
             defer delete_old.deinit();
             var probe = try S.ownerField(self, "core").*.store.beginProbeTxn();
             defer probe.abort();
@@ -3473,11 +3548,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
                 if (old_bytes) |bytes| {
                     if (requirement.isInsert()) return error.RowPolicyDenied;
-                    if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
-                    const old = if (S.ownerField(self, "core").*.store.valuesAreAuthenticated())
-                        try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
-                    else
-                        try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
+                    var physical = try row_policy_bundle_mod.PhysicalRow.init(S.ownerField(self, "core").*, schema_view, bytes);
+                    defer physical.deinit();
+                    const old = physical.row;
                     if (!try update_old.permits(old)) return error.RowPolicyDenied;
                     if (requirement.requiresSelect() and !try select_check.?.permits(old)) return error.RowPolicyDenied;
                 }
@@ -3498,11 +3571,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     error.NotFound => continue,
                     else => return err,
                 };
-                if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
-                const old = if (S.ownerField(self, "core").*.store.valuesAreAuthenticated())
-                    try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
-                else
-                    try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
+                var physical = try row_policy_bundle_mod.PhysicalRow.init(S.ownerField(self, "core").*, schema_view, bytes);
+                defer physical.deinit();
+                const old = physical.row;
                 if (!try delete_old.permits(old)) return error.RowPolicyDenied;
                 if (requirement.requiresSelect() and !try select_check.?.permits(old)) return error.RowPolicyDenied;
             }
@@ -3566,6 +3637,77 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         }
 
+        /// Complete only the exact Raft-authored future-schema intent. The
+        /// old durable schema/bundle remain intact until this single commit.
+        pub fn finalizePendingRowPolicySchemaPairLocked(self: anytype, expected: row_policy_bundle_mod.Receipt) !?row_policy_bundle_mod.Receipt {
+            const alloc = S.ownerField(self, "alloc").*;
+            const core = S.ownerField(self, "core").*;
+            const raw = core.store.get(alloc, row_policy_bundle_mod.candidate_key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            defer alloc.free(raw);
+            var parsed = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, raw, .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            const pair = parsed.value.schema_pair orelse return null;
+            if (expected.phase != .serving_install or parsed.value.phase != .serving_install or
+                expected.table_id != parsed.value.table_id or expected.generation != parsed.value.policy_generation or
+                expected.catalog_epoch != parsed.value.catalog_epoch) return error.RowPolicyCatalogChanged;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &expected.bundle_digest)) return error.RowPolicyCatalogChanged;
+            const native = @import("../schema.zig");
+            const schemas = try pair.materialize(alloc);
+            defer native.freeSchema(alloc, schemas.before);
+            defer native.freeSchema(alloc, schemas.after);
+            const observed_schema = core.schema orelse return error.RowPolicyCatalogChanged;
+            const observed = try native.serializeSchema(alloc, observed_schema);
+            defer alloc.free(observed);
+            std.crypto.hash.Blake3.hash(observed, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &pair.before_schema_digest)) return error.RowPolicyCatalogChanged;
+            var installed = try row_policy_bundle_mod.Installed.init(alloc, raw, core.identity_namespace.table_id, schemas.after);
+            var installed_owned = true;
+            defer if (installed_owned) installed.deinit();
+            const public_schema = @import("../../schema/mod.zig");
+            const versioned = try public_schema.versionedSchemaKeyAlloc(alloc, schemas.after.version);
+            defer alloc.free(versioned);
+            var receipt_buffer: [128]u8 = undefined;
+            const receipt_key = try expected.key(&receipt_buffer);
+            const encoded_receipt = expected.encode();
+            const writes = [_]docstore_mod.KVPair{
+                .{ .key = internal_keys.public_schema_json_key, .value = pair.after_schema_json },
+                .{ .key = versioned, .value = pair.after_schema_json },
+                .{ .key = row_policy_bundle_mod.key, .value = raw },
+                .{ .key = receipt_key, .value = &encoded_receipt },
+            };
+            var prepared = try core.prepareSchemaMetadataAtVersion(schemas.after, &writes, schemas.before.version);
+            defer prepared.deinit();
+            const core_mod = @import("core.zig");
+            var recovery = if (S.ownerField(self, "transaction_recovery_identity_context").* != null)
+                try core_mod.PreparedRecoveryRelationalState.init(S.ownerField(self, "runtime_alloc").*, schemas.after.relational_columns, schemas.after.version)
+            else
+                null;
+            defer if (recovery) |*state| state.deinit();
+            _ = try core.commitPreparedSchemaMetadataPolicy(&prepared, &writes, &.{ row_policy_bundle_mod.pending_key, row_policy_bundle_mod.candidate_key }, .{
+                .table_id = expected.table_id,
+                .before_schema_version = schemas.before.version,
+                .before_schema_digest = pair.before_schema_digest,
+                .after_schema_digest = pair.after_schema_digest,
+                .before_policy_generation = pair.before_policy_generation,
+                .before_catalog_epoch = pair.before_catalog_epoch,
+                .policy_generation = expected.generation,
+                .catalog_epoch = expected.catalog_epoch,
+            });
+            if (S.ownerField(self, "transaction_recovery_identity_context").*) |context| {
+                if (recovery) |*state| context.installPreparedRelationalState(state) else unreachable;
+            }
+            if (S.ownerField(self, "local_execution").*.row_policy_bundle) |*old| old.deinit();
+            S.ownerField(self, "local_execution").*.row_policy_bundle = installed;
+            installed_owned = false;
+            try S.ownerField(self, "local_execution").*.row_policy_gate.publishCommitted(core.table_catalog);
+            return expected;
+        }
+
         pub fn finalizePendingRowPolicyReceiptLocked(self: anytype, expected: row_policy_bundle_mod.Receipt) !row_policy_bundle_mod.Receipt {
             const pending = (try self.pendingRowPolicyReceipt()) orelse return error.NotFound;
             if (!std.meta.eql(pending, expected)) return error.RowPolicyCatalogChanged;
@@ -3573,6 +3715,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var manager = try S.ownerField(self, "core").*.initTxnManager();
             defer manager.deinit();
             if (try manager.hasSchemaLeases()) return error.RowPolicyReadersActive;
+            if (try self.finalizePendingRowPolicySchemaPairLocked(expected)) |receipt| return receipt;
             const schema = S.ownerField(self, "core").*.schema orelse return error.RowPolicyCatalogChanged;
             const bundle_bytes = try S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, row_policy_bundle_mod.key);
             defer S.ownerField(self, "alloc").*.free(bundle_bytes);
@@ -3599,14 +3742,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .disabled => .disabled,
             };
             next.generation +|= 1;
-            const catalog_bytes = next.encode();
+            const catalog_bytes = try next.encodeDurable();
             const encoded_receipt = expected.encode();
             var receipt_key_buf: [128]u8 = undefined;
             const receipt_key = try expected.key(&receipt_key_buf);
             var txn = try S.ownerField(self, "core").*.store.beginWriteTxn();
             errdefer txn.abort();
             try txn.put(receipt_key, &encoded_receipt);
-            try txn.put(table_catalog_mod.key, &catalog_bytes);
+            try txn.put(table_catalog_mod.key, catalog_bytes.slice());
             try txn.delete(row_policy_bundle_mod.pending_key);
             try txn.commit();
             S.ownerField(self, "core").*.table_catalog = next;
@@ -4064,6 +4207,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const writes = try alloc.alloc(types.BatchWrite, intents.writes.len);
                 defer alloc.free(writes);
                 for (intents.writes, 0..) |write, i| writes[i] = .{ .key = write.key, .value = write.value };
+                var graph_arena = std.heap.ArenaAllocator.init(alloc);
+                defer graph_arena.deinit();
+                const graph_alloc = graph_arena.allocator();
+                var graph_writes: std.ArrayList(types.GraphEdgeWrite) = .empty;
+                var graph_deletes: std.ArrayList(types.GraphEdgeDelete) = .empty;
+                var graph_indexes: std.StringHashMapUnmanaged(@import("prepared_graph_effects.zig").Index) = .empty;
+                for (intents.prepared_graph_effects, 0..) |maybe_effects, row_index| if (maybe_effects) |bytes| {
+                    const effects = try std.json.parseFromSliceLeaky(@import("prepared_graph_effects.zig").Effects, graph_alloc, bytes, .{ .allocate = .alloc_always });
+                    try effects.validate(intents.writes[row_index].key);
+                    try graph_writes.appendSlice(graph_alloc, effects.writes);
+                    try graph_deletes.appendSlice(graph_alloc, effects.deletes);
+                    for (effects.indexes) |index| {
+                        const slot = try graph_indexes.getOrPut(graph_alloc, index.name);
+                        if (slot.found_existing) {
+                            if (slot.value_ptr.generation != index.generation or !std.mem.eql(u8, &slot.value_ptr.definition_digest, &index.definition_digest)) return error.PreparedGenerationChanged;
+                        } else slot.value_ptr.* = index;
+                    }
+                };
+                const required_graph_indexes = try graph_alloc.alloc(@import("prepared_graph_effects.zig").Index, graph_indexes.count());
+                var index_iterator = graph_indexes.valueIterator();
+                for (required_graph_indexes) |*index| index.* = index_iterator.next().?.*;
                 var durable_rows = std.StringHashMapUnmanaged([]const u8).empty;
                 defer durable_rows.deinit(alloc);
                 for (intents.prepared_rows, 0..) |maybe_row, i| if (maybe_row) |row| {
@@ -4072,6 +4236,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 self.batchInternalWithPreparationAllocator(.{
                     .writes = writes,
                     .deletes = intents.deletes,
+                    .graph_writes = graph_writes.items,
+                    .graph_deletes = graph_deletes.items,
                     .timestamp_ns = commit_version,
                     .sync_level = commit_sync_level,
                     .restore_staging_scope = restore_scope,
@@ -4080,7 +4246,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .bypass_replication_write_gate = bypass_replication_write_gate,
                     .ordered_apply_receipt = ordered_receipt,
                     .durable_rows = &durable_rows,
+                    .prepared_graph_indexes = required_graph_indexes,
                     .transaction_resolution = .{
+                        .prepared_graph_effects_checked = true,
                         .external_decision_owner = external_decision_owner,
                         .txn_id = txn_id,
                         .status = status,

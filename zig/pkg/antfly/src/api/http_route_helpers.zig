@@ -204,6 +204,9 @@ pub fn parseInternalLookupOptions(alloc: std.mem.Allocator, query: []const u8) !
             if (seen or !std.mem.eql(u8, part, "_relational_integrity_catalog=true")) return error.InvalidQueryRequest;
             seen = true;
             result.opts.relational_integrity_catalog = true;
+        } else if (std.mem.startsWith(u8, part, "_json_null_fields=")) {
+            if (result.opts.include_json_null_fields or !std.mem.eql(u8, part, "_json_null_fields=true")) return error.InvalidQueryRequest;
+            result.opts.include_json_null_fields = true;
         } else if (std.mem.startsWith(u8, part, "_primary_digest=")) {
             if (result.opts.include_primary_digest or !std.mem.eql(u8, part, "_primary_digest=true")) return error.InvalidQueryRequest;
             result.opts.include_primary_digest = true;
@@ -277,6 +280,14 @@ test "relational row query control modes require authenticated internal parsing"
     defer public_primary.deinit(alloc);
     try std.testing.expect(!public_primary.opts.include_primary_digest);
     try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, "_primary_digest=true&_primary_digest=true"));
+    var typed = try parseInternalLookupOptions(alloc, "_json_null_fields=true");
+    defer typed.deinit(alloc);
+    try std.testing.expect(typed.opts.include_json_null_fields);
+    var public_typed = try parseLookupOptions(alloc, "_json_null_fields=true");
+    defer public_typed.deinit(alloc);
+    try std.testing.expect(!public_typed.opts.include_json_null_fields);
+    try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, "_json_null_fields=true&_json_null_fields=true"));
+    try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, "_json_null_fields=false"));
     const query = "_relational_activation=%7B%22mode%22%3A%22status%22%7D";
     var internal = try parseInternalLookupOptions(alloc, query);
     defer internal.deinit(alloc);

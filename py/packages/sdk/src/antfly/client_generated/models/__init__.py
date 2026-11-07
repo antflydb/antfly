@@ -2260,6 +2260,7 @@ from .restore_job_result_restore import RestoreJobResultRestore
 from .restore_job_result_status import RestoreJobResultStatus
 from .restore_job_scope import RestoreJobScope
 from .restore_request import RestoreRequest
+from .restore_routine_mapping import RestoreRoutineMapping
 from .result_extract_document_job_response_200 import ResultExtractDocumentJobResponse200
 from .result_read_document_job_response_200 import ResultReadDocumentJobResponse200
 from .retrieval_agent_request import RetrievalAgentRequest
@@ -4614,6 +4615,7 @@ __all__ = (
     "RestoreJobResultStatus",
     "RestoreJobScope",
     "RestoreRequest",
+    "RestoreRoutineMapping",
     "ResultExtractDocumentJobResponse200",
     "ResultReadDocumentJobResponse200",
     "RetrievalAgentRequest",

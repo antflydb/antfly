@@ -409,8 +409,8 @@ pub const RaftApplyStore = struct {
     pub fn projectHotStandbyCheckpointCatalog(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, checkpoint: @import("hot_standby/metadata_effects.zig").CheckpointArtifact) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_checkpoint_projection = checkpoint });
     }
-    pub fn sqlSnapshotCohort(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, database: []const u8) ![]u8 {
-        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_snapshot_cohort = database });
+    pub fn sqlSnapshotCohort(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/server_call.zig").SqlSnapshotCohortRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_snapshot_cohort = request });
     }
     pub fn listSystemCatalogTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.TableList) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_list_tables = request });
@@ -447,6 +447,23 @@ pub const RaftApplyStore = struct {
     pub fn getSqlObjectAnnotation(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: @import("antfly_local_sources").system_catalog_domain.ObjectAnnotationRead) ![]u8 {
         return self.catalogProjection([]u8, alloc, group, .{ .sql_object_annotation = request });
     }
+    /// The real metadata owner captures policy source, capability and layout
+    /// in one read transaction. This facade transports its owned control result;
+    /// it never prepares catalog state from a local mirror or imports storage.
+    pub fn prepareTriggerPolicySchema(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, before: metadata.TableRecord, after: *metadata.TableRecord) !?sql_policies.SchemaPair {
+        if (before.table_id != after.table_id or !std.mem.eql(u8, before.name, after.name)) return error.InvalidCatalogMutation;
+        const prepared = try self.catalogProjection(contract.TriggerPolicySchemaPreparation, alloc, group, .{ .trigger_policy_schema = .{ .before = before, .after = after.* } });
+        var expected = after.*;
+        if (prepared.policy_pair) |pair| {
+            if (!std.mem.eql(u8, pair.before_schema_json, before.schema_json) or !std.mem.eql(u8, pair.after_schema_json, after.schema_json)) return error.InvalidCatalogRecord;
+            expected.read_schema_json = before.schema_json;
+            expected.schema_reader_requirements = prepared.after.schema_reader_requirements;
+        }
+        if (!metadata.table_manager.tableDefinitionsEqual(expected, prepared.after)) return error.InvalidCatalogRecord;
+        after.* = prepared.after;
+        return prepared.policy_pair;
+    }
+
     pub fn getSqlColumnIdentities(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, guard: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard) !std.json.Parsed(@import("antfly_local_sources").system_catalog_column_identities.State) {
         const bytes = try self.catalogProjection([]u8, alloc, group, .{ .sql_column_identities = guard });
         defer alloc.free(bytes);
@@ -610,6 +627,54 @@ pub const RaftApplyStore = struct {
     }
     pub fn sqlNativeIndexOutcome(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/native_indexes.zig").OutcomeRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .sql_native_index_outcome = request });
+    }
+    pub fn sqlGraphPreparationRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/graph_preparation.zig").Source, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        try context.ensureActive();
+        try request.validate();
+        const deadline = (@import("antfly_local_sources").api_routing_budget.RoutingBudget{}).deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        const Callback = struct {
+            fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                return @intFromBool(token.isCancelled());
+            }
+        };
+        const bytes = try std.json.Stringify.valueAlloc(alloc, contract.CatalogProjectionRequest{ .sql_graph_preparation_read = request }, .{});
+        defer alloc.free(bytes);
+        const result = try self.projectionWithAllocator([]u8, alloc, .{ .kind = .system_catalog, .group_id = group_id, .key = .fromSlice(bytes), .control = .{
+            .execution_deadline_ns = deadline orelse 0,
+            .has_execution_deadline = @intFromBool(deadline != null),
+            .cancellation_ctx = @ptrCast(@constCast(&context.cancellation)),
+            .cancellation_fn = Callback.cancelled,
+        } });
+        errdefer alloc.free(result);
+        try context.ensureActive();
+        return result;
+    }
+    pub fn sqlGraphPreparationOutcome(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/graph_preparation.zig").Observation) ![]u8 {
+        try request.validate(alloc);
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_graph_preparation_outcome = request });
+    }
+    pub fn sqlTriggerSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/trigger_snapshot.zig").Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        try context.ensureActive();
+        try request.validate();
+        const deadline = (@import("antfly_local_sources").api_routing_budget.RoutingBudget{}).deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        const Callback = struct {
+            fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                return @intFromBool(token.isCancelled());
+            }
+        };
+        const bytes = try std.json.Stringify.valueAlloc(alloc, contract.CatalogProjectionRequest{ .sql_trigger_snapshot = request }, .{});
+        defer alloc.free(bytes);
+        const result = try self.projectionWithAllocator([]u8, alloc, .{ .kind = .system_catalog, .group_id = group_id, .key = .fromSlice(bytes), .control = .{
+            .execution_deadline_ns = deadline orelse 0,
+            .has_execution_deadline = @intFromBool(deadline != null),
+            .cancellation_ctx = @ptrCast(@constCast(&context.cancellation)),
+            .cancellation_fn = Callback.cancelled,
+        } });
+        errdefer alloc.free(result);
+        try context.ensureActive();
+        return result;
     }
     pub fn sqlRoutineSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/routines.zig").SnapshotRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         try context.ensureActive();
@@ -1064,6 +1129,16 @@ pub const RaftApplyStore = struct {
     }
     pub fn scopeRetirementWorkJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, after: u64) ![]u8 {
         return self.rawCatalogProjection(a, group, .{ .scope_retirement_work = after }, 8192);
+    }
+    pub fn sqlRelationBootJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, query: @import("../metadata/sql_relation_boots.zig").Query) ![]u8 {
+        return self.rawCatalogProjection(a, group, .{ .sql_relation_boot = query }, if (query.recovery_capture != null) @import("../system_catalog/trigger_snapshot.zig").max_snapshot_bytes else 64 * 1024);
+    }
+    pub fn sqlRelationBootPreflightJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, bytes: []const u8) ![]u8 {
+        return self.rawCatalogProjection(a, group, .{ .sql_relation_boot_preflight = bytes }, 64 * 1024);
+    }
+    pub fn sqlRelationLifetimesJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, selection: @import("../metadata/sql_relation_lifetimes.zig").Selection, after: ?u64, limit: u16, include_hidden: bool) ![]u8 {
+        if (limit == 0 or limit > 128) return error.InvalidSqlRelationPersistence;
+        return self.rawCatalogProjection(a, group, .{ .sql_relation_lifetimes = .{ .selection = selection, .after = after, .limit = limit, .include_hidden = include_hidden } }, if (include_hidden) @import("../metadata/sql_relation_recovery_work.zig").max_wire_bytes else 128 * @import("../metadata/sql_relation_lifetimes.zig").max_record_bytes);
     }
     pub fn scopeRetirementManifestJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, lookup: @import("../metadata/scope_retirement_ledger.zig").Lookup) ![]u8 {
         try lookup.validate();

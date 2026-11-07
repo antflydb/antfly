@@ -32,6 +32,10 @@ pub const Controller = struct {
     standalone: bool,
     port: source.Port,
     runtime: Runtime,
+    /// Borrowed only by a request-local Native port. Connection validation
+    /// publishes its authenticated capsule before assisting earlier controls,
+    /// which can precede the new SQL body's Request.attach call.
+    relation_owner_context: ?*?@import("sql_relation_lifetimes.zig").Owner = null,
 
     fn nonce(self: Controller) ![16]u8 {
         return self.runtime.nonce(self.runtime.ptr);
@@ -51,11 +55,18 @@ pub const Controller = struct {
             !std.mem.eql(u8, record.actor.credential, self.actor.credential) or !std.meta.eql(record.actor.current_role, self.actor.current_role)) return error.SqlConnectionChanged;
         return owned;
     }
-    fn validateConnection(self: Controller, a: A, database: ?[]const u8) !void {
+    fn validateConnection(self: Controller, a: A, database: ?[]const u8) !?@import("sql_relation_lifetimes.zig").Owner {
+        if (self.relation_owner_context) |slot| slot.* = null;
         var connection = try @import("sql_connections.zig").load(self.store, a, self.connection, self.principal, self.node, self.now());
         defer connection.deinit();
         if (database) |name| if (!std.mem.eql(u8, connection.value.database, name)) return error.SqlConnectionChanged;
         if (connection.value.state == .beginning or connection.value.state == .uncertain) return error.SqlConnectionBusy;
+        // Connections predating a process-bound wire identity retain their
+        // ordinary SQL behavior, but cannot lend authority for TEMP storage.
+        if (connection.value.wire_epoch == null) return null;
+        const owner = try @import("sql_relation_lifetimes.zig").ownerFromConnection(connection.value, self.instance, self.node);
+        if (self.relation_owner_context) |slot| slot.* = owner;
+        return owner;
     }
     fn advance(self: Controller, a: A, record: source.Record) !void {
         source.advance(self.store, a, self.principal, record, self.instance, self.now(), try self.nonce(), self.port) catch |err| switch (err) {
@@ -67,7 +78,7 @@ pub const Controller = struct {
     /// the database and capability anchor instead of scanning owners/jobs.
     pub fn enroll(self: Controller, a: A, database: []const u8) !void {
         try self.check();
-        try self.validateConnection(a, database);
+        _ = try self.validateConnection(a, database);
         if (!self.store.supportsSharedMutations()) return error.SqlConnectionUnavailable;
         var existing = try source.load(self.store, a, self.connection);
         defer if (existing) |*owned| owned.deinit();
@@ -108,7 +119,7 @@ pub const Controller = struct {
     /// executing command is never adopted, even for byte-identical SQL.
     pub fn take(self: Controller, a: A, body: [32]u8) !Loan {
         try self.check();
-        try self.validateConnection(a, null);
+        var relation_owner = try self.validateConnection(a, null);
         for (0..16) |_| {
             var owned = try self.load(a);
             defer owned.deinit();
@@ -117,12 +128,17 @@ pub const Controller = struct {
             if (owned.value.phase != .finishing and !(owned.value.phase == .beginning and owned.value.body_skipped) and !(owned.value.phase == .idle and owned.value.pending != null and owned.value.pending.?.operation == .renew)) return error.SqlConnectionBusy;
             try self.check();
             try self.advance(a, owned.value);
+            // Assisting an earlier DISCARD can advance the connection's
+            // generation. Its successor command must pin the successor owner.
+            relation_owner = try self.validateConnection(a, null);
         }
         var prior = try self.load(a);
         defer prior.deinit();
         // Completion remains publishable after request/task cancellation.
         const finish_nonce = try self.nonce();
-        const command: authority.scopes.Command = .{ .sequence = prior.value.next_command, .nonce = try self.nonce(), .executor = try self.nonce() };
+        // Executor identifies the API process, including TEMP ownership and
+        // native lock admission. Sequence and nonce identify each command.
+        const command: authority.scopes.Command = .{ .sequence = prior.value.next_command, .nonce = try self.nonce(), .executor = self.instance };
         const ticket = try source.beginObserved(self.store, a, self.principal, prior.value, self.instance, command, body, try self.nonce(), self.now(), self.port);
         errdefer self.abandon(a, ticket, finish_nonce) catch {};
         for (0..16) |_| {
@@ -132,7 +148,7 @@ pub const Controller = struct {
             if (owned.value.recovery or !std.meta.eql(owned.value.ticket, @as(?source.Ticket, ticket))) return error.SqlConnectionBusy;
             if (owned.value.phase == .ready) {
                 const fence = try source.take(self.store, self.principal, owned.value, self.instance, ticket, self.now());
-                return .{ .controller = self, .ticket = ticket, .fence = fence, .finish_nonce = finish_nonce };
+                return .{ .controller = self, .ticket = ticket, .fence = fence, .finish_nonce = finish_nonce, .relation_owner = relation_owner };
             }
             if (owned.value.phase != .beginning) return error.SqlConnectionBusy;
             try self.advance(a, owned.value);
@@ -153,7 +169,10 @@ pub const Controller = struct {
         }
         return error.SqlConnectionBusy;
     }
-    pub fn retireAndWait(self: Controller, a: A) !void {
+    pub const RetirementProgress = enum { complete, pending };
+    /// Pending denotes only unfinished retirement, never a connection guard
+    /// refusal or failed child control. One slice retains the bounded quantum.
+    pub fn retireSlice(self: Controller, a: A) !RetirementProgress {
         try self.check();
         var connection = try @import("sql_connections.zig").load(self.store, a, self.connection, self.principal, self.node, self.now());
         defer connection.deinit();
@@ -162,7 +181,7 @@ pub const Controller = struct {
             try self.check();
             var owned = try self.load(a);
             defer owned.deinit();
-            if (owned.value.phase == .retired) return;
+            if (owned.value.phase == .retired and owned.value.temporaryRetirementComplete()) return .complete;
             if (!owned.value.recovery) {
                 source.requestRecovery(self.store, self.principal, owned.value) catch |err| switch (err) {
                     error.SqlConnectionChanged => continue,
@@ -170,7 +189,19 @@ pub const Controller = struct {
                 };
             } else try self.advance(a, owned.value);
         }
-        return error.SqlConnectionBusy;
+        return .pending;
+    }
+    pub fn retireAndWait(self: Controller, a: A) !void {
+        if (try self.retireSlice(a) == .pending) return error.SqlConnectionBusy;
+    }
+    /// Native foreground use supplies an absolute request deadline. Yield
+    /// between slices so workers and the metadata owner can make progress.
+    pub fn awaitRetirement(self: Controller, a: A) !void {
+        while (try self.retireSlice(a) == .pending) {
+            try self.check();
+            try self.runtime.pause(self.runtime.ptr, 2);
+            try self.check();
+        }
     }
     pub fn retire(self: Controller, a: A) !void {
         var owned = try self.load(a);
@@ -183,6 +214,7 @@ pub const Loan = struct {
     ticket: source.Ticket,
     fence: authority.scopes.CommandFence,
     finish_nonce: [16]u8,
+    relation_owner: ?@import("sql_relation_lifetimes.zig").Owner = null,
     finished: std.atomic.Value(bool) = .init(false),
     /// Bind liveness after durable take and before executing any SQL. A pool
     /// entry by itself is never proof that this particular command is live.
@@ -277,20 +309,45 @@ pub const Loan = struct {
 pub const Native = struct {
     server: *@import("http_server.zig").ApiHttpServer,
     context: @import("antfly_local_sources").api_operation.RequestContext,
+    pub fn awaitRetirement(self: *Native, a: A, controller_value: Controller) !void {
+        const prior_context = self.context;
+        defer self.context = prior_context;
+        self.context = try retirementContext(prior_context);
+        try controller_value.awaitRetirement(a);
+    }
+    fn retirementContext(request: @import("antfly_local_sources").api_operation.RequestContext) !@import("antfly_local_sources").api_operation.RequestContext {
+        var context = try request.platformDeadline();
+        context.deadline_io = null;
+        // Normalize once for the whole close; individual child RPCs cannot
+        // renew this budget. Requests without a deadline get a bounded fallback.
+        context.deadline_ns = context.deadline_ns orelse
+            (@import("antfly_platform").time.monotonicNs() +|
+                @as(u64, (@import("../pgwire/protocol.zig").Limits{}).statement_timeout_ms) * std.time.ns_per_ms);
+        return context;
+    }
     pub fn controller(self: *Native, connection: [32]u8, identity: ?@import("http_server.zig").AuthenticatedIdentity) !Controller {
         const server = self.server;
         const store = server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
         var owned = try source.load(store, server.alloc, connection);
         defer if (owned) |*value| value.deinit();
-        return .{ .store = store, .connection = connection, .principal = @import("http_server.zig").transactionPrincipal(identity) orelse "", .actor = try @import("sql_authorization_recovery.zig").actor(server, identity), .instance = try server.sql_connection_admission.executionInstance(server.embedding_provider_runtime.io), .node = server.localSessionNodeId(), .standalone = if (owned) |value| value.value.registration.standalone else server.cfg.deployment_mode == .standalone, .port = .{ .ptr = self, .call = call }, .runtime = .{ .ptr = self, .now_ms = now, .nonce = nonce, .active = active, .pause = pause } };
+        return .{ .store = store, .connection = connection, .principal = @import("http_server.zig").transactionPrincipal(identity) orelse "", .actor = try @import("sql_authorization_recovery.zig").actor(server, identity), .instance = try server.sql_connection_admission.executionInstance(server.embedding_provider_runtime.io), .node = server.localSessionNodeId(), .standalone = if (owned) |value| value.value.registration.standalone else server.cfg.deployment_mode == .standalone, .port = .{ .ptr = self, .call = call, .retire_temporary = retireTemporary }, .runtime = .{ .ptr = self, .now_ms = now, .nonce = nonce, .active = active, .pause = pause }, .relation_owner_context = &self.context.sql_relation_owner };
     }
     fn call(raw: *anyopaque, a: A, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
         const self: *Native = @ptrCast(@alignCast(raw));
+        var port: source.NativePort = .{ .server = self.server, .context = try self.controlContext() };
+        return port.port().call(port.port().ptr, a, input);
+    }
+    fn controlContext(self: *Native) !@import("antfly_local_sources").api_operation.RequestContext {
         var context = try self.context.platformDeadline();
         const deadline = @import("antfly_platform").time.monotonicNs() +| std.time.ns_per_s;
         context.deadline_ns = @min(context.deadline_ns orelse deadline, deadline);
-        var port: source.NativePort = .{ .server = self.server, .context = context };
-        return port.port().call(port.port().ptr, a, input);
+        return context;
+    }
+    fn retireTemporary(raw: *anyopaque, a: A, prior: source.Record) anyerror!source.TemporaryProgress {
+        const self: *Native = @ptrCast(@alignCast(raw));
+        var port: source.NativePort = .{ .server = self.server, .context = try self.controlContext() };
+        const control = port.port();
+        return control.retire_temporary.?(control.ptr, a, prior);
     }
     fn now(_: *anyopaque) u64 {
         return @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
@@ -312,6 +369,20 @@ pub const Native = struct {
         try active(raw);
     }
 };
+
+test "SQL relation lifetime foreground close retains an absolute inherited deadline and bounds missing budgets" {
+    const time = @import("antfly_platform").time;
+    const before = time.monotonicNs();
+    const inherited = before +| std.time.ns_per_s;
+    const request = try Native.retirementContext(.{ .deadline_ns = inherited });
+    try std.testing.expectEqual(@as(?u64, inherited), request.deadline_ns);
+    const io = std.testing.io;
+    const fallback = try Native.retirementContext(.{ .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) });
+    try std.testing.expect(fallback.deadline_io == null);
+    const budget = @as(u64, (@import("../pgwire/protocol.zig").Limits{}).statement_timeout_ms) * std.time.ns_per_ms;
+    try std.testing.expect(fallback.deadline_ns.? >= before +| budget);
+    try std.testing.expect(fallback.deadline_ns.? <= time.monotonicNs() +| budget);
+}
 
 /// One request borrows the connection's durable command authority. The pool
 /// releases its signal before this stack frame or the request context expires.
@@ -356,6 +427,7 @@ pub const Request = struct {
         std.debug.assert(self.loan != null);
         var result = context;
         result.sql_command_fence = &self.loan.?.fence;
+        result.sql_relation_owner = self.loan.?.relation_owner;
         result.cancellation = .{ .ptr = self, .is_cancelled_fn = cancelled };
         return result;
     }

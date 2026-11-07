@@ -24,10 +24,41 @@ pub const CatalogIdentityNamespace = struct {
     range_id: u64,
 };
 
+/// Native-local rows retain the cluster catalog realm while their only row
+/// owner is an exact admitted process/store generation, never a Raft leader.
+pub const RouteExecution = union(enum) {
+    raft,
+    native_local: @import("../common/topology_records.zig").RelationPersistence.Descriptor,
+
+    pub fn fromPersistence(value: ?@import("../common/topology_records.zig").RelationPersistence.Descriptor) RouteExecution {
+        return if (value) |descriptor| .{ .native_local = descriptor } else .raft;
+    }
+    pub fn validate(self: RouteExecution) !void {
+        if (self == .native_local) try self.native_local.validate();
+    }
+};
+
 pub const CatalogGroupRoute = struct {
     group_id: u64,
     range_id: u64,
     identity_namespace: CatalogIdentityNamespace,
+    execution: RouteExecution = .raft,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return (comptime std.mem.eql(u8, field, "execution")) and self.execution == .raft;
+    }
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            const omit = (comptime std.mem.eql(u8, field, "execution")) and self.execution == .raft;
+            if (!omit) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const catalog_route_fence_protocol_current: u16 = 1;
@@ -54,9 +85,23 @@ pub const CatalogRouteFence = struct {
     table_id: u64,
     topology_epoch: u64,
     route: CatalogGroupRoute,
+    /// Immutable initialized image pinned before native participant admission.
+    /// It authorizes no user work and never changes with a process restart.
+    native_participant: ?@import("../common/relation_persistence.zig").PhysicalPin = null,
     /// Receiver-local admission context. These fields are intentionally
     /// excluded from the wire representation: monotonic clocks and borrowed
     /// cancellation callbacks are process-local capabilities.
+    /// Authenticated receiver-local owner, populated only after a signed
+    /// lifetime grant has been verified. Never accepted from the fence JSON.
+    admission_sql_relation_owner: ?@import("../common/relation_persistence.zig").Owner = null,
+    admission_relation_minter: ?@import("../common/relation_owner_authority.zig").Minter = null,
+    admission_relation_grant: []const u8 = "",
+    /// Distinct trigger preparation purpose; never an owner/namespace grant.
+    admission_trigger_minter: ?@import("../common/trigger_preparation_authority.zig").Minter = null,
+    admission_trigger_grant: []const u8 = "",
+
+    admission_body_digest: ?[32]u8 = null,
+    admission_command_digest: ?[32]u8 = null,
     admission_deadline_ns: ?u64 = null,
     admission_deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
     admission_cancellation: CancellationToken = .none,
@@ -69,6 +114,21 @@ pub const CatalogRouteFence = struct {
         table_id: u64,
         topology_epoch: u64,
         route: CatalogGroupRoute,
+        native_participant: ?@import("../common/relation_persistence.zig").PhysicalPin = null,
+
+        pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+            return (comptime std.mem.eql(u8, field, "native_participant")) and self.native_participant == null;
+        }
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            try writer.beginObject();
+            inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+                if (!self.nativeJsonSkipField(field)) {
+                    try writer.objectField(field);
+                    try writer.write(@field(self, field));
+                }
+            }
+            try writer.endObject();
+        }
     };
 
     fn wire(self: @This()) Wire {
@@ -80,6 +140,7 @@ pub const CatalogRouteFence = struct {
             .table_id = self.table_id,
             .topology_epoch = self.topology_epoch,
             .route = self.route,
+            .native_participant = self.native_participant,
         };
     }
 
@@ -103,6 +164,7 @@ pub const CatalogRouteFence = struct {
             .table_id = value.table_id,
             .topology_epoch = value.topology_epoch,
             .route = value.route,
+            .native_participant = value.native_participant,
         };
     }
 
@@ -110,6 +172,13 @@ pub const CatalogRouteFence = struct {
         if (self.protocol != catalog_route_fence_protocol_current) return error.UnsupportedCatalogRouteFence;
         if (self.metadata_group_id == 0 or self.table_id == 0 or self.route.group_id == 0) return error.InvalidCatalogRouteFence;
         if (self.route.identity_namespace.table_id != self.table_id) return error.InvalidCatalogRouteFence;
+        try self.route.execution.validate();
+        if (self.native_participant) |pin| {
+            try pin.validate();
+            if (self.route.execution != .native_local or pin.table_id != self.table_id or
+                pin.shard_id != self.route.identity_namespace.shard_id or pin.range_id != self.route.identity_namespace.range_id or
+                pin.data_generation != self.route.execution.native_local.data_generation) return error.InvalidCatalogRouteFence;
+        }
     }
 
     pub fn jsonParseFromValue(alloc: std.mem.Allocator, value: std.json.Value, options: std.json.ParseOptions) !@This() {
@@ -122,6 +191,42 @@ pub const CatalogRouteFence = struct {
             .table_id = parsed.table_id,
             .topology_epoch = parsed.topology_epoch,
             .route = parsed.route,
+            .native_participant = parsed.native_participant,
         };
     }
 };
+
+test "native local catalog route binds exact owner while ordinary wire and local grant stay private" {
+    const a = std.testing.allocator;
+    var fence: CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 2, .table_id = 3, .topology_epoch = 4, .route = .{ .group_id = 5, .range_id = 6, .identity_namespace = .{ .table_id = 3, .shard_id = 5, .range_id = 6 } } };
+    const ordinary = try std.json.Stringify.valueAlloc(a, fence, .{});
+    defer a.free(ordinary);
+    try std.testing.expect(std.mem.indexOf(u8, ordinary, "execution") == null);
+    const Generic = struct {
+        value: CatalogRouteFence,
+        pub fn jsonStringify(self: @This(), stream: anytype) !void {
+            return @import("../storage/db/relational_integrity_json.zig").write(self.value, stream);
+        }
+    };
+    const durable_ordinary = try std.json.Stringify.valueAlloc(a, Generic{ .value = fence }, .{});
+    defer a.free(durable_ordinary);
+    try std.testing.expectEqualStrings(ordinary, durable_ordinary);
+
+    fence.route.execution = .{ .native_local = .{ .kind = .unlogged, .owner_node_id = 7, .owner_store_id = 8, .generation_instance = @splat(9), .data_generation = 10 } };
+    fence.admission_relation_grant = "private-owner-grant";
+    fence.admission_body_digest = @splat(11);
+    fence.admission_command_digest = @splat(12);
+    const native = try std.json.Stringify.valueAlloc(a, fence, .{});
+    defer a.free(native);
+    try std.testing.expect(std.mem.indexOf(u8, native, "private-owner-grant") == null);
+    try std.testing.expect(std.mem.indexOf(u8, native, "admission_") == null);
+    var decoded = try std.json.parseFromSlice(CatalogRouteFence, a, native, .{});
+    defer decoded.deinit();
+    try decoded.value.validate();
+    try std.testing.expect(std.meta.eql(fence.route, decoded.value.route));
+    try std.testing.expect(decoded.value.admission_sql_relation_owner == null);
+    try std.testing.expect(decoded.value.admission_relation_minter == null);
+    var replaced = decoded.value.route;
+    replaced.execution.native_local.data_generation += 1;
+    try std.testing.expect(!std.meta.eql(fence.route, replaced));
+}

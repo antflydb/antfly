@@ -25,9 +25,24 @@ const Source = jobs.private_claims.SourceStream;
 const publication = @import("relational_index_publication.zig");
 const Digest = [32]u8;
 pub const max_parts = jobs.private_claims.max_claims;
-// The complete 128-destination typed statement fits even at maximum integer
-// and byte-array widths. The wire-footprint test guards this transport bound.
-pub const max_wire_bytes = 512 * 1024;
+// Preserve the full ordinary 128-destination envelope, then account for the
+// optional native pin on every target proof and the source proof. Compute its
+// exact worst-case JSON contribution from the actual pin type/serializer so
+// new generation evidence cannot exceed the receiver or journal budgets.
+const native_pin_property_bytes: usize = blk: {
+    @setEvalBranchQuota(10000);
+    const Pin = std.meta.Child(@FieldType(publication.RootProof, "native_pin"));
+    var pin: Pin = undefined;
+    for (@typeInfo(Pin).@"struct".field_names) |field| {
+        @field(pin, field) = std.math.maxInt(@FieldType(Pin, field));
+    }
+    var bytes: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&bytes);
+    std.json.Stringify.value(.{ .native_pin = pin }, .{}, &writer) catch @compileError("native pin exceeds its bounded JSON accounting buffer");
+    // Remove the two object braces and include the separating comma.
+    break :blk writer.buffered().len - 1;
+};
+pub const max_wire_bytes = 512 * 1024 + (max_parts + 1) * native_pin_property_bytes;
 
 pub const Delivered = struct { index: u16, signed: publication.SignedClaimDelivery };
 
@@ -214,7 +229,7 @@ pub const Signed = struct {
     proof: publication.RootProof,
     pub fn verify(self: Signed) !void {
         if ((self.proof.authority == .native) != (self.data.source.authority == .native)) return error.InvalidPrivateIndexClaimReceipt;
-        if (self.proof.authority == .native) (publication.NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
+        if (self.proof.authority == .native) (publication.NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native, .native_pin = self.proof.native_pin }).validate(self.proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
         self.proof.verify(try self.data.digest()) catch return error.InvalidPrivateIndexClaimReceipt;
     }
 };

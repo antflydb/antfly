@@ -603,6 +603,9 @@ pub const OpenOptions = struct {
     /// outside their capture fence. Opening retains the durable replay debt.
     defer_index_backfill_on_open: bool = false,
     table_storage: ?table_storage_mod.Settings = null,
+    sql_persistence: ?@import("../../common/relation_persistence.zig").Descriptor = null,
+    sql_persistence_context: ?@import("../../common/relation_persistence.zig").Context = null,
+    persistence_boot: ?@import("../../common/relation_persistence.zig").Boot = null,
     open_mode: OpenOptions.OpenMode = .writer,
     /// An authenticated restore decoder needs rows and schema layouts, never
     /// source projections. Do not open intentionally omitted index artifacts.
@@ -660,6 +663,9 @@ pub const OpenOptions = struct {
     /// A path-bound proof prevents a copied option set from silently skipping
     /// configuration for a different DB namespace.
     _backend_configuration_resolution: ?BackendConfigurationResolution = null,
+    /// Opaque native hosts supply a process-captured verifier directly; avoid
+    /// repeating private keystore lookups for every physical owner.
+    load_sql_preparation_from_secret_store: bool = true,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     start_index_workers: bool = true,
@@ -2200,6 +2206,21 @@ fn loadOrCreateDurableRootIdentity(
     return try root_identity.loadOrCreate(alloc, io_impl.io(), path);
 }
 
+fn loadExistingDurableRootIdentity(
+    alloc: Allocator,
+    backend_runtime: ?*background_runtime_mod.BackendRuntime,
+    path: []const u8,
+) !root_identity.State {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
+    if (backend_runtime) |runtime| {
+        const io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        return root_identity.load(alloc, io, path) catch |err| return if (err == error.FileNotFound) error.SqlRelationOwnerChanged else err;
+    }
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    return root_identity.load(alloc, io_impl.io(), path) catch |err| return if (err == error.FileNotFound) error.SqlRelationOwnerChanged else err;
+}
+
 const monotonicTimeNs = execution_resources.monotonicTimeNs;
 
 const elapsedSince = execution_resources.elapsedSince;
@@ -3143,6 +3164,7 @@ pub const DB = struct {
     /// Shared local mutation state outlives foreground and recovery execution.
     local_execution: *LocalExecutionState,
     /// Monolithic managed opens retain the process verifier until workers drain.
+    owned_sql_preparation_authority: ?@import("../../common/sql_preparation_authority_config.zig").Owned = null,
     owned_row_policy_authority_secret: ?[]u8 = null,
     owned_row_policy_authority_issuer: ?[]u8 = null,
     owned_row_policy_table_name: ?[]u8 = null,
@@ -3153,6 +3175,7 @@ pub const DB = struct {
     schema_audit_cache: @import("relational_schema_audit_cache.zig").Cache = .{},
     source_vector_storage: ?*lsm_backend_mod.NativeStorage = null,
     closed: bool = false,
+    close_workers_drained: bool = false,
     stable_address: bool = false,
     graph_cleanup_owner: @import("graph_cleanup_owner.zig").Owner = .{},
     group_source_owner: @import("group_source_owner.zig").Owner = .{},
@@ -3166,6 +3189,8 @@ pub const DB = struct {
     primary_backend: PrimaryBackend,
     primary_lsm_storage: ?lsm_backend_mod.Storage,
     physical_root_mode: OpenOptions.PhysicalRootMode,
+    sql_persistence: ?@import("../../common/relation_persistence.zig").Descriptor = null,
+    sql_native_instance: [16]u8 = @splat(0),
     graph_replacement_mutex: std.Io.Mutex = .init,
     graph_replacement_manager: ?*index_manager_mod.IndexManager = null,
     graph_replacement_catalog_generation: u64 = 0,
@@ -3707,6 +3732,9 @@ pub const DB = struct {
     /// caller must obtain it under a statement capture fence after read-index
     /// admission. It deliberately cannot be serialized across owners.
     pub const RelationalStatementSnapshot = struct {
+        read_at_ns: u64 = 0,
+        graphs: []GraphStatementSnapshot = &.{},
+        graph_allocator: ?Allocator = null,
         row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null,
         row_policy_phase: table_catalog_mod.RowPolicyPhase = .disabled,
         row_policy_generation: u64 = 0,
@@ -3718,6 +3746,8 @@ pub const DB = struct {
         pub fn deinit(self: *@This()) void {
             if (comptime storage_engine.enabled) return storage_engine.call("relationalSnapshotDeinit", .{self}) catch @panic("incompatible storage owner");
             self.read.abort();
+            for (self.graphs) |*graph| graph.read.deinit();
+            if (self.graph_allocator) |alloc| alloc.free(self.graphs);
             if (self.row_policy_lease) |*lease| lease.release();
             self.* = undefined;
         }
@@ -3725,6 +3755,42 @@ pub const DB = struct {
 
     pub fn captureRelationalStatementSnapshot(self: *DB) !RelationalStatementSnapshot {
         if (comptime storage_engine.enabled) return storage_engine.call("captureRelationalStatementSnapshot", .{self});
+        return self.captureRelationalStatementSnapshotWithGraphs(&.{});
+    }
+
+    pub const GraphStatementSnapshot = struct {
+        read: @import("../../graph/graph.zig").GraphIndex.RetainedEdgeRead,
+        proof: @import("../graph_read_snapshot.zig").Proof,
+    };
+
+    pub fn relationalGraphSnapshotPage(self: *DB, cut: *RelationalStatementSnapshot, alloc: Allocator, request: @import("../graph_read_snapshot.zig").Request) !@import("../graph_read_snapshot.zig").Page {
+        if (comptime storage_engine.enabled) return storage_engine.call("relationalGraphSnapshotPage", .{ self, cut, alloc, request });
+        try request.check();
+        for (cut.graphs) |*graph| if (std.mem.eql(u8, graph.read.indexName(), request.index)) {
+            // One paired context contains both directions. Direction is a scan
+            // selector, not an opportunity to capture another graph version.
+            var page = try graph.read.getPageDirected(alloc, request.key, request.edge_types, request.direction, request.cursor, request.limits, graph.proof.ttl_read_at_ns);
+            errdefer page.deinit(alloc);
+            try request.check();
+            const owners = try graph.read.policyOwners(alloc, page.edges, request.limits.max_owned_bytes -| page.owned_bytes, request.limits.max_scanned_rows -| page.scanned_rows);
+            errdefer {
+                for (owners.documents) |group| {
+                    for (group) |owner| alloc.free(owner);
+                    alloc.free(group);
+                }
+                alloc.free(owners.documents);
+            }
+            try request.check();
+            page.owned_bytes += owners.owned_bytes;
+            page.scanned_rows += owners.scanned_rows;
+            return .{ .proof = graph.proof, .page = page, .owner_documents = owners.documents };
+        };
+        return error.SqlStatementSnapshotRequired;
+    }
+
+    pub fn captureRelationalStatementSnapshotWithGraphs(self: *DB, names: []const []const u8) !RelationalStatementSnapshot {
+        if (comptime storage_engine.enabled) return storage_engine.call("captureRelationalStatementSnapshotWithGraphs", .{ self, names });
+        if (names.len > 64) return error.InvalidQueryRequest;
         // Capturing a visibility cut does not expose row bytes. A protected
         // statement captures only the owner policy epoch; each later scan
         // must present an authenticated proof for that same epoch and retain
@@ -3741,6 +3807,10 @@ pub const DB = struct {
         errdefer if (row_policy_lease) |*lease| lease.release();
         const policy_generation = self.local_execution.row_policy_gate.generation.load(.acquire);
         const policy_epoch = self.local_execution.row_policy_gate.catalog_epoch.load(.acquire);
+        if (names.len != 0) {
+            try self.requireGraphEndpointCleanupReady();
+            if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        }
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         var view = self.core.acquireSchemaView();
@@ -3752,7 +3822,53 @@ pub const DB = struct {
             self.local_execution.row_policy_gate.generation.load(.acquire) != policy_generation or
             self.local_execution.row_policy_gate.catalog_epoch.load(.acquire) != policy_epoch)
             return error.RowPolicyCatalogChanged;
+        const graphs = try self.alloc.alloc(GraphStatementSnapshot, names.len);
+        var captured_graphs: usize = 0;
+        errdefer {
+            for (graphs[0..captured_graphs]) |*graph| graph.read.deinit();
+            self.alloc.free(graphs);
+        }
+        const source_sequence = if (names.len == 0) 0 else try self.core.store.lastReplaySequenceFromTxn(&read, 0);
+        const source_graph_sequence = blk: {
+            if (names.len == 0) break :blk @as(u64, 0);
+            const key = @import("../internal_keys.zig").replayLatestSequenceKey(@intCast(@backingInt(@import("derived/change_journal.zig").TargetHint.graph)));
+            const raw = read.get(&key) catch |err| switch (err) {
+                error.NotFound => break :blk @as(u64, 0),
+                else => return err,
+            };
+            if (raw.len != 8) return error.CorruptReplayMetadata;
+            break :blk std.mem.readInt(u64, raw[0..8], .little);
+        };
+        const capture_time = currentTimeNs();
+        for (names, 0..) |name, index| {
+            for (names[0..index]) |prior| if (std.mem.eql(u8, name, prior)) return error.InvalidQueryRequest;
+            try self.failIfIndexQuarantined(name);
+            const entry = self.core.index_manager.graphIndex(name) orelse return error.IndexNotFound;
+            // Never wait for a replay worker while holding a cohort fence.
+            if (!entry.apply_mutex.tryLock()) return error.ReadUnavailable;
+            defer entry.apply_mutex.unlock();
+            const manager = self.core.index_manager;
+            const checkpoint = try apply_state.loadProjectionCheckpointWithSidecarWithStorage(manager.generation_storage, self.alloc, manager.checkpointIo(), self.core.store, manager.applied_sequence_checkpoint_path, name);
+            if (checkpoint.status != .clean or checkpoint.config_hash != types.indexConfigHash(entry.config) or checkpoint.applied_sequence < source_graph_sequence or checkpoint.applied_sequence > source_sequence) return error.ReadUnavailable;
+            var pinned = try entry.index.retainEdgeReadWithProof(.both);
+            errdefer pinned.deinit();
+            graphs[index] = .{ .read = pinned, .proof = .{
+                .source_sequence = source_sequence,
+                .source_graph_sequence = source_graph_sequence,
+                .applied_sequence = checkpoint.applied_sequence,
+                .config_hash = checkpoint.config_hash,
+                .graph_generation = pinned.context.read_generation.?,
+                .reverse_generation = pinned.context.reverse_generation,
+                .owner_generation = pinned.context.owner_generation,
+                .ownership_fingerprint = pinned.context.ownership_fingerprint,
+                .ttl_read_at_ns = capture_time,
+            } };
+            captured_graphs += 1;
+        }
         return .{
+            .graphs = graphs,
+            .read_at_ns = capture_time,
+            .graph_allocator = self.alloc,
             .row_policy_lease = row_policy_lease,
             .row_policy_phase = initial_phase,
             .row_policy_generation = policy_generation,
@@ -3786,7 +3902,7 @@ pub const DB = struct {
         defer if (indexes) |*pinned| pinned.deinit();
         const read_snapshot = if (statement) |cut| try cut.read.forkRead() else try self.core.store.beginReadTxn();
         const authenticated = self.core.store.valuesAreAuthenticated();
-        const now = currentTimeNs();
+        const now = if (statement) |cut| cut.read_at_ns else currentTimeNs();
         self.core.unlockApplyShared();
         locked = false;
         // Immutable pins and the read transaction were captured together.
@@ -3938,6 +4054,46 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("open", .{ alloc, path, requested_opts });
         return blk: {
             var opts = requested_opts;
+            if (opts.sql_persistence) |descriptor| {
+                const context = opts.sql_persistence_context orelse return error.InvalidSqlRelationPersistence;
+                if (opts.identity_namespace == null) return error.InvalidSqlRelationPersistence;
+                // The derived journal contains source row text too. An
+                // explicitly selected LMDB journal would ignore the LSM
+                // no-WAL policy and create a second durable replay path.
+                if (opts.change_journal_backend) |backend| if (std.mem.eql(u8, @tagName(backend), "lmdb")) return error.InvalidSqlRelationPersistence;
+                try descriptor.requireHost(context);
+                const boot = opts.persistence_boot orelse return error.InvalidSqlRelationPersistence;
+                try boot.validate();
+                if (!std.mem.eql(u8, &descriptor.generation_instance, &context.execution_instance) and boot.adoption == null and boot.initialized == null and boot.uninitialized == null)
+                    return error.SqlRelationRecoveryIncomplete;
+                if (boot.uninitialized) |permit| {
+                    try permit.validateFor(descriptor);
+                    const namespace = opts.identity_namespace.?;
+                    if (permit.table_id != namespace.table_id or permit.shard_id != namespace.shard_id or permit.range_id != namespace.range_id) return error.IdentityNamespaceMismatch;
+                }
+                if (boot.initialized) |binding| {
+                    const namespace = opts.identity_namespace.?;
+                    if (!binding.descriptor.eql(descriptor) or namespace.table_id != binding.table_id or
+                        namespace.shard_id != binding.shard_id or namespace.range_id != binding.range_id)
+                        return error.SqlRelationOwnerChanged;
+                    const physical = try loadExistingDurableRootIdentity(alloc, opts.backend_runtime, path);
+                    if (physical.incarnation != binding.physical_root_incarnation) return error.SqlRelationOwnerChanged;
+                }
+                if (boot.adoption) |guard| {
+                    try guard.validateFor(descriptor, boot);
+                    const physical = try loadExistingDurableRootIdentity(alloc, opts.backend_runtime, path);
+                    if (physical.incarnation != guard.physical_root_incarnation) return error.SqlRelationOwnerChanged;
+                    const namespace = opts.identity_namespace orelse return error.InvalidSqlRelationPersistence;
+                    if (!opts.require_existing_catalog or opts.open_mode != .writer_no_replay or opts.start_index_workers or opts.start_optional_runtimes or
+                        namespace.table_id != guard.table_id or namespace.shard_id != guard.shard_id or namespace.range_id != guard.range_id)
+                        return error.InvalidSqlRelationPersistence;
+                }
+                if (!std.mem.eql(u8, &boot.instance, &context.execution_instance) or
+                    opts.online_source_authority != .native or opts.primary_runtime_store != null or
+                    (if (opts.table_storage) |settings| settings.engine != .local else false))
+                    return error.InvalidSqlRelationPersistence;
+            } else if (opts.sql_persistence_context != null or opts.persistence_boot != null)
+                return error.InvalidSqlRelationPersistence;
             if (opts.require_existing_catalog and (opts.identity_namespace == null or opts.online_source_authority == null or opts.table_storage != null or
                 opts.schema_before_index_load != null or opts.initial_owner_range != null or opts.initial_child_bootstrap != null)) return error.InvalidArgument;
             if (opts.initial_child_bootstrap) |bootstrap| {
@@ -4050,6 +4206,8 @@ pub const DB = struct {
                 .mem => {},
             };
             var effective_index_backends = opts.index_backends;
+            if (opts.sql_persistence) |descriptor|
+                try db_config.applyRelationPersistence(&effective_primary_backend, &effective_index_backends, descriptor);
             if (openModeRequiresReadOnlyBackends(opts.open_mode)) {
                 applyReadOnlyToPrimaryBackend(&effective_primary_backend);
                 applyReadOnlyToIndexBackends(&effective_index_backends);
@@ -4072,9 +4230,10 @@ pub const DB = struct {
                 .mem => {},
             }
             installIndexLsmReadRuntime(&effective_index_backends, backend_runtime);
+            const effective_no_sync = opts.no_sync and opts.sql_persistence == null;
             const core_opts: db_config.CoreOpenOptions = .{
                 .map_size = opts.map_size,
-                .no_sync = opts.no_sync,
+                .no_sync = effective_no_sync,
                 .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
                 .primary_backend = effective_primary_backend,
                 .primary_runtime_store = opts.primary_runtime_store,
@@ -4111,6 +4270,34 @@ pub const DB = struct {
                 failed_primary.store.close();
                 failed_primary.owner.close(alloc);
             };
+            // Process-owned row durability is a property of the physical
+            // catalog, not a caller-selected WAL switch. Never reinterpret an
+            // existing permanent image or reopen a volatile image through the
+            // permanent/Raft path. Recovery must publish its successor stamp
+            // through the separately admitted generation transition.
+            const physical_catalog = try table_catalog_mod.load(alloc, &opened_primary.store);
+            if (opts.persistence_boot) |boot| if (boot.initializing) {
+                if ((physical_catalog != null and physical_catalog.?.row_count != 0) or try storeHasUserDataBounded(&opened_primary.store))
+                    return error.SqlRelationRecoveryIncomplete;
+                var initial_read = try opened_primary.store.beginReadTxn();
+                defer initial_read.abort();
+                if (try transactions_mod.hasAnyTransactionStateInView(&initial_read)) return error.SqlRelationRecoveryIncomplete;
+            };
+            if (physical_catalog) |catalog| {
+                // Clean adoption changes the process receipt, never the
+                // immutable data-generation birth or primary catalog bytes.
+                if (!std.meta.eql(catalog.sql_persistence, opts.sql_persistence)) return error.SqlRelationOwnerChanged;
+            } else if (opts.sql_persistence) |descriptor| {
+                if (opts.require_existing_catalog or (opts.persistence_boot != null and opts.persistence_boot.?.initialized != null) or
+                    openModeRequiresReadOnlyBackends(opts.open_mode) or try storeHasUserDataBounded(&opened_primary.store)) return error.InvalidSqlRelationPersistence;
+                const initial_catalog: table_catalog_mod.Catalog = .{ .sql_persistence = descriptor };
+                const encoded_catalog = try initial_catalog.encodeDurable();
+                try opened_primary.store.put(table_catalog_mod.key, encoded_catalog.slice());
+                // No WAL carries this binding. Publish the immutable primary
+                // root and flush it before admitting producers or row writes.
+                try opened_primary.store.flushBufferedWritesWithOptions(.{ .compact = false });
+                try opened_primary.store.sync(true);
+            }
             // Portable publication uses bounded commits guarded by an
             // in-store completion marker. Recover before schema/catalog
             // construction so no runtime can observe a partial generation.
@@ -4147,7 +4334,7 @@ pub const DB = struct {
                 path,
                 opts.index_base_path orelse path,
                 opts.map_size,
-                opts.no_sync,
+                effective_no_sync,
                 resolved_config.primary_backend_kind,
                 resolved_config.primary_lsm_storage,
                 opts.change_journal_backend,
@@ -4155,12 +4342,13 @@ pub const DB = struct {
                 resolved_config.index_backends,
                 opened_primary,
                 opts.identity_namespace,
-                false,
-                if (opts.prefer_existing_identity_namespace) .use_existing else .reject,
+                opts.sql_persistence != null,
+                if (opts.sql_persistence == null and opts.prefer_existing_identity_namespace) .use_existing else .reject,
                 opts.external_derived_checkpoints,
                 opts.index_repair_checkpoint_storage,
                 opts.lsm_root_generation,
                 openModeRequiresReadOnlyBackends(opts.open_mode),
+                opts.sql_persistence == null,
             );
             var core_owned = true;
             errdefer if (core_owned) core.deinit(alloc);
@@ -4188,7 +4376,14 @@ pub const DB = struct {
             const owner_catalog_protected = if (opts.schema_before_index_load != null) protected: {
                 var read = try core_owner.store.beginReadTxn();
                 defer read.abort();
-                break :protected try @import("relational_index_owner_job.zig").protectsOwnerCatalog(&read, core_owner.identity_namespace) or
+                // A catalog descriptor cannot publish a new schema while a
+                // policy still names the durable predecessor. The ordered
+                // policy installer owns their atomic successor publication,
+                // including before its candidate has reached this replica.
+                const policy_schema_pinned = core_owner.table_catalog.row_policy_phase != .disabled and
+                    !try schema_mod.schemasEqual(alloc, core_owner.schema orelse return error.RowPolicyCatalogChanged, opts.schema_before_index_load.?.runtime_schema);
+                break :protected policy_schema_pinned or
+                    try @import("relational_index_owner_job.zig").protectsOwnerCatalog(&read, core_owner.identity_namespace) or
                     try @import("relational_nullability_job.zig").protectedOwnerCatalog(alloc, &read, core_owner.identity_namespace) != null;
             } else false;
             // Reject a stale catalog-authoritative descriptor as soon as the
@@ -4220,10 +4415,14 @@ pub const DB = struct {
             else
                 null;
             errdefer if (policy_authority_owned) if (policy_issuer) |value| alloc.free(value);
+            var sql_authority: ?@import("../../common/sql_preparation_authority_config.zig").Owned = if (comptime builtin.os.tag == .freestanding) null else if (opts.load_sql_preparation_from_secret_store) try @import("../../common/sql_preparation_authority_config.zig").load(alloc, opts.secret_store, false) else null;
+            errdefer if (policy_authority_owned) if (sql_authority) |*authority| authority.deinit(alloc);
             const local_execution = try runtime_alloc.create(LocalExecutionState);
             local_execution.* = .{
                 .artifact_publication_dispatcher = opts.artifact_publication_dispatcher,
                 .row_policy_gate = row_policy_gate_mod.Gate.init(core_owner.table_catalog),
+                .sql_preparation_secret = if (sql_authority) |authority| authority.secret else if (policy_secret != null and policy_issuer != null) policy_secret else null,
+                .sql_preparation_issuer = if (sql_authority) |authority| authority.issuer else if (policy_secret != null and policy_issuer != null) policy_issuer else null,
                 .row_policy_authority_secret = if (policy_secret != null and policy_issuer != null) policy_secret else null,
                 .row_policy_authority_issuer = if (policy_secret != null and policy_issuer != null) policy_issuer else null,
                 .initial_child_hidden = .init(opts.initial_child_bootstrap != null),
@@ -4236,6 +4435,7 @@ pub const DB = struct {
             };
             var db = DB{
                 .local_execution = local_execution,
+                .owned_sql_preparation_authority = sql_authority,
                 .owned_row_policy_authority_secret = policy_secret,
                 .owned_row_policy_authority_issuer = policy_issuer,
                 .alloc = alloc,
@@ -4245,6 +4445,8 @@ pub const DB = struct {
                 .primary_backend = stored_primary_backend,
                 .primary_lsm_storage = resolved_config.primary_lsm_storage,
                 .physical_root_mode = opts.physical_root_mode,
+                .sql_persistence = opts.sql_persistence,
+                .sql_native_instance = if (opts.sql_persistence_context) |host| host.execution_instance else @splat(0),
                 .index_backends = resolved_config.index_backends,
                 .core = core_owner,
                 .async_context = async_context,
@@ -4296,12 +4498,31 @@ pub const DB = struct {
             owned_executor = null;
             generation_read_lease = null;
             policy_authority_owned = false;
-            errdefer db.deinitWrapperState(executor_ready);
+            errdefer db.deinitWrapperState(executor_ready, null);
             if (db.core.table_catalog.row_policy_phase == .active) {
                 const schema = db.core.schema orelse return error.RowPolicyCatalogChanged;
                 db.local_execution.row_policy_bundle = (try row_policy_bundle_mod.load(alloc, db.core.store, db.core.identity_namespace.table_id, schema)) orelse
                     return error.RowPolicyAuthenticationRequired;
                 if (!db.local_execution.row_policy_bundle.?.matchesCatalog(db.core.table_catalog)) return error.RowPolicyCatalogChanged;
+                if (try db.pendingRowPolicyReceipt()) |pending| {
+                    const raw = try db.core.store.get(alloc, row_policy_bundle_mod.candidate_key);
+                    defer alloc.free(raw);
+                    var candidate = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, raw, .{ .ignore_unknown_fields = false });
+                    defer candidate.deinit();
+                    const pair = candidate.value.schema_pair orelse return error.RowPolicyCatalogChanged;
+                    if (pending.phase != .serving_install or candidate.value.phase != .serving_install or
+                        pending.generation != candidate.value.policy_generation or pending.catalog_epoch != candidate.value.catalog_epoch or
+                        pair.before_policy_generation != db.core.table_catalog.row_policy_generation or
+                        pair.before_catalog_epoch != db.core.table_catalog.row_policy_catalog_epoch) return error.RowPolicyCatalogChanged;
+                    var digest: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+                    if (!std.mem.eql(u8, &digest, &pending.bundle_digest)) return error.RowPolicyCatalogChanged;
+                    const encoded = try schema_mod.serializeSchema(alloc, schema);
+                    defer alloc.free(encoded);
+                    std.crypto.hash.Blake3.hash(encoded, &digest, .{});
+                    if (!std.mem.eql(u8, &digest, &pair.before_schema_digest)) return error.RowPolicyCatalogChanged;
+                    try db.local_execution.row_policy_gate.beginPreparing(.active);
+                }
             }
             db.core.index_manager.setIo(db.backend_runtime.io());
             db.core.apply_mutex.io = db.backend_runtime.io();
@@ -4362,6 +4583,7 @@ pub const DB = struct {
                 // establish this receiver's projection evidence again.
                 try apply_state.invalidateProjectionCompletion(alloc, db.core.store);
             }
+            db.core.store.native_relation_pin = try db.relationPhysicalPin();
             db.core.index_manager.artifact_projection_root = db.root_incarnation;
             if (opts.schema_before_index_load) |prepared_schema| {
                 // This option is used by the metadata-authoritative local
@@ -5385,14 +5607,45 @@ pub const DB = struct {
 
     pub fn close(self: *DB) void {
         if (comptime storage_engine.enabled) return storage_engine.call("close", .{self}) catch unreachable;
-        if (self.closed) return;
-        self.closed = true;
-        self.native_index_build_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
-        self.schema_audit_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
-        self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse std.Options.debug_io);
-        self.rewrite_program_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
-        self.rewrite_tail_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
-        self.deinitWrapperState(true);
+        self.closeWithError(null);
+    }
+
+    /// Native volatile owners must prove a successful durable boundary after
+    /// worker drainage before a process shutdown may be recorded as clean.
+    /// Failure retains the quiesced core and its unflushed values. The owner
+    /// stays fenced until another close attempt manifests those values.
+    pub fn closeFallible(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("closeFallible", .{self});
+        // A native participant's durable decision can outlive its request
+        // lease. Retain its counted owner until local intents and coordinator
+        // ACK debt drain, so zero live owners is a sound process clean proof.
+        // Check before quiescing: admitted decision/ACK controls must still be
+        // able to resolve this exact retained physical generation.
+        if (self.sql_persistence != null and !self.closed) {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            if (self.sql_persistence.?.kind == .unlogged) {
+                try transactions_mod.TxnManager.requireCleanNativeRecoveryInView(&read, (try self.relationPhysicalPin()).?);
+            } else if (try transactions_mod.TxnManager.hasRelationLifetimeDebtInView(self.alloc, &read)) return error.SqlRelationRecoveryIncomplete;
+        }
+        var failure: ?anyerror = null;
+        self.closeWithError(&failure);
+        if (failure) |err| return err;
+    }
+
+    fn closeWithError(self: *DB, failure: ?*?anyerror) void {
+        if (self.closed and !self.close_workers_drained) return;
+        if (!self.closed) {
+            self.closed = true;
+            self.native_index_build_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
+            self.schema_audit_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
+            self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse std.Options.debug_io);
+            self.rewrite_program_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
+            self.rewrite_tail_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
+        }
+        self.deinitWrapperState(true, failure);
     }
 
     /// Opens a DB in stable allocator-owned storage. Callers that retain the DB
@@ -6284,111 +6537,135 @@ pub const DB = struct {
         self.embedding_activity.clear(self.alloc);
     }
 
-    fn deinitWrapperState(self: *DB, executor_ready: bool) void {
-        if (self.last_run_until_idle_no_progress) |*diagnostic| diagnostic.deinit(self.alloc);
-        self.last_run_until_idle_no_progress = null;
-        // Stop background workers before tearing down stores, runtimes, and
-        // index state they may inspect.
-        self.async_context.background_closing.store(true, .release);
-        self.native_query_warming.stop(self.backend_runtime);
-        self.local_execution.schema_reconcile.stop();
-        self.stopArtifactRepairMetadataWorker();
-        self.clearGraphReplacementManager();
-        self.artifact_producer_scheduler.deinit(self.alloc);
-        self.stopPortableActivationRetryWorker();
-        self.stopQuarantineRetryWorker();
-        self.group_source_owner.stop(self.backend_runtime.io());
-        self.stopGraphEndpointCleanupWorker();
-        self.transaction_owner.deinitRuntime(self.runtime_alloc);
-        self.transaction_runtime = null;
-        self.local_execution.source_publication.stop(self.backend_runtime.io() orelse std.Options.debug_io);
-        self.local_execution.merge_artifact_layout.clear();
-        self.local_execution.online_merge_reader.retire(self.backend_runtime.io() orelse std.Options.debug_io, null);
-        self.transaction_owner.deinitContext(self.runtime_alloc);
-        self.transaction_recovery_local_context = null;
-        self.transaction_recovery_identity_context = null;
-        // Close may flush/coalesce derived watermarks while workers are
-        // stopping. That must not call back into the write/status cache after
-        // optional runtimes or index state have started tearing down.
-        self.setQueryVisibilityHook(null);
-        self.async_context.background_closing.store(true, .release);
-        stopNativeProjectionMaintenance(self.async_context);
-        self.document_authority_repairs.deinit(self.alloc);
-        self.async_context.enrichment_desired_running.store(false, .release);
-        if (self.algebraic_hll_owner_id != 0) {
-            self.backend_runtime.durable_jobs.closeOwner(self.algebraic_hll_owner_id);
-            self.algebraic_hll_owner_id = 0;
+    fn deinitWrapperState(self: *DB, executor_ready: bool, close_failure: ?*?anyerror) void {
+        if (!self.close_workers_drained) {
+            if (self.last_run_until_idle_no_progress) |*diagnostic| diagnostic.deinit(self.alloc);
+            self.last_run_until_idle_no_progress = null;
+            // Stop background workers before tearing down stores, runtimes, and
+            // index state they may inspect.
+            self.async_context.background_closing.store(true, .release);
+            self.native_query_warming.stop(self.backend_runtime);
+            self.local_execution.schema_reconcile.stop();
+            self.stopArtifactRepairMetadataWorker();
+            self.clearGraphReplacementManager();
+            self.artifact_producer_scheduler.deinit(self.alloc);
+            self.stopPortableActivationRetryWorker();
+            self.stopQuarantineRetryWorker();
+            self.group_source_owner.stop(self.backend_runtime.io());
+            self.stopGraphEndpointCleanupWorker();
+            self.transaction_owner.deinitRuntime(self.runtime_alloc);
+            self.transaction_runtime = null;
+            self.local_execution.source_publication.stop(self.backend_runtime.io() orelse std.Options.debug_io);
+            self.local_execution.merge_artifact_layout.clear();
+            self.local_execution.online_merge_reader.retire(self.backend_runtime.io() orelse std.Options.debug_io, null);
+            self.transaction_owner.deinitContext(self.runtime_alloc);
+            self.transaction_recovery_local_context = null;
+            self.transaction_recovery_identity_context = null;
+            // Close may flush/coalesce derived watermarks while workers are
+            // stopping. That must not call back into the write/status cache after
+            // optional runtimes or index state have started tearing down.
+            self.setQueryVisibilityHook(null);
+            self.async_context.background_closing.store(true, .release);
+            stopNativeProjectionMaintenance(self.async_context);
+            self.document_authority_repairs.deinit(self.alloc);
+            self.async_context.enrichment_desired_running.store(false, .release);
+            if (self.algebraic_hll_owner_id != 0) {
+                self.backend_runtime.durable_jobs.closeOwner(self.algebraic_hll_owner_id);
+                self.algebraic_hll_owner_id = 0;
+            }
+            self.publication_recovery.deinit();
+            self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
+            self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
+            self.clearLiveDocSetCache();
+            self.clearNonVisibleDocSetCache();
+            self.clearEmbeddingActivityCache();
+            self.embedding_activity.deinit(self.alloc);
+            if (self.graph_restore_parse_cache) |*cache| cache.deinit(self.alloc);
+            self.graph_restore_parse_cache = null;
+            self.bulk_identity.deinit(self.alloc);
+            self.clearActiveIndexRepairsLocked();
+            self.active_index_repairs.deinit(self.alloc);
+            self.closeShadowIndexManagerLocked() catch {};
+            self.ttl_owner.deinit(self.runtime_alloc);
+            self.ttl_runtime = null;
+            self.ttl_cleanup_context = null;
+            self.enrichment_owner.deinit(self.runtime_alloc);
+            publishEnrichmentOwner(self);
+            self.resolution_owner.deinitRuntime(self.runtime_alloc);
+            self.resolution_runtime = null;
+            self.async_context.resolution_runtime = null;
+            // After the resolution runtime (its final catch-up may journal
+            // resolution artifacts that notify the promoter) but before the
+            // resolution append context the promoter is wired into is destroyed.
+            self.promotion_owner_bundle.deinit(self.runtime_alloc);
+            self.promotion_runtime = null;
+            self.async_context.promotion_runtime = null;
+            self.resolution_owner.deinitContext(self.runtime_alloc);
+            self.resolution_append_context = null;
+            // Derived full-text publishers may be asleep in merge backpressure
+            // admission. Close that admission before joining their executor: the
+            // merge runtime is the owner of the wakeup predicate, so joining the
+            // publishers first can otherwise strand shutdown behind a predicate
+            // that is not closed until later in this function. Drain the merge
+            // worker too because its tasks borrow inline index generations.
+            if (executor_ready) self.executor.beginShutdown();
+            if (self.text_merge_runtime) |runtime| _ = runtime.stop();
+            if (executor_ready) self.executor.deinit(self.runtime_alloc);
+            self.runtime_alloc.destroy(self.executor);
+            self.async_context.text_merge_runtime = null;
+            self.text_merge_owner.deinit(self.runtime_alloc);
+            self.text_merge_runtime = null;
+            self.async_context.sparse_compaction_runtime = null;
+            self.sparse_compaction_owner.deinit(self.runtime_alloc);
+            self.sparse_compaction_runtime = null;
+            self.core.index_manager.graph_metric_notify = null;
+            self.graph_metric_owner.deinit(self.runtime_alloc);
+            self.graph_metric_runtime = null;
+            if (executor_ready and self.open_mode.allowsIndexWorkers()) {
+                // The executor has published its final HBC coverage. Mirror the
+                // human-facing lifecycle/status view once at graceful shutdown;
+                // a failure cannot invalidate the authoritative posting WAL and
+                // will be repaired from it on the next open.
+                self.saveAllLiveIndexStatusSnapshots(self.alloc) catch |err| {
+                    std.log.warn("index status snapshot persistence deferred during close err={s}", .{@errorName(err)});
+                };
+                self.core.syncStore(true) catch |err| {
+                    std.log.warn("index status snapshot sync deferred during close err={s}", .{@errorName(err)});
+                };
+            }
+            // Async capture leases are capabilities owned by the live index
+            // manager. The executor is stopped above, so no worker can install a
+            // new lease; cancel and release any interrupted catch-up capture while
+            // that manager is still valid. In particular, do not defer this until
+            // after `core.deinit()`, which destroys the manager the leases name.
+            self.async_context.deinit(self.runtime_alloc);
+            self.runtime_alloc.destroy(self.async_context);
+            // A bounded source mark owns a read transaction on core's backend.
+            // Workers are stopped; release it before core destroys that backend.
+            if (self.local_execution.source_vectors.load(.acquire)) |source| source.cancelMarking();
+            self.close_workers_drained = true;
         }
-        self.publication_recovery.deinit();
-        self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
-        self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
-        self.clearLiveDocSetCache();
-        self.clearNonVisibleDocSetCache();
-        self.clearEmbeddingActivityCache();
-        self.embedding_activity.deinit(self.alloc);
-        if (self.graph_restore_parse_cache) |*cache| cache.deinit(self.alloc);
-        self.graph_restore_parse_cache = null;
-        self.bulk_identity.deinit(self.alloc);
-        self.clearActiveIndexRepairsLocked();
-        self.active_index_repairs.deinit(self.alloc);
-        self.closeShadowIndexManagerLocked() catch {};
-        self.ttl_owner.deinit(self.runtime_alloc);
-        self.ttl_runtime = null;
-        self.ttl_cleanup_context = null;
-        self.enrichment_owner.deinit(self.runtime_alloc);
-        publishEnrichmentOwner(self);
-        self.resolution_owner.deinitRuntime(self.runtime_alloc);
-        self.resolution_runtime = null;
-        self.async_context.resolution_runtime = null;
-        // After the resolution runtime (its final catch-up may journal
-        // resolution artifacts that notify the promoter) but before the
-        // resolution append context the promoter is wired into is destroyed.
-        self.promotion_owner_bundle.deinit(self.runtime_alloc);
-        self.promotion_runtime = null;
-        self.async_context.promotion_runtime = null;
-        self.resolution_owner.deinitContext(self.runtime_alloc);
-        self.resolution_append_context = null;
-        // Derived full-text publishers may be asleep in merge backpressure
-        // admission. Close that admission before joining their executor: the
-        // merge runtime is the owner of the wakeup predicate, so joining the
-        // publishers first can otherwise strand shutdown behind a predicate
-        // that is not closed until later in this function. Drain the merge
-        // worker too because its tasks borrow inline index generations.
-        if (executor_ready) self.executor.beginShutdown();
-        if (self.text_merge_runtime) |runtime| _ = runtime.stop();
-        if (executor_ready) self.executor.deinit(self.runtime_alloc);
-        self.runtime_alloc.destroy(self.executor);
-        self.async_context.text_merge_runtime = null;
-        self.text_merge_owner.deinit(self.runtime_alloc);
-        self.text_merge_runtime = null;
-        self.async_context.sparse_compaction_runtime = null;
-        self.sparse_compaction_owner.deinit(self.runtime_alloc);
-        self.sparse_compaction_runtime = null;
-        self.core.index_manager.graph_metric_notify = null;
-        self.graph_metric_owner.deinit(self.runtime_alloc);
-        self.graph_metric_runtime = null;
-        if (executor_ready and self.open_mode.allowsIndexWorkers()) {
-            // The executor has published its final HBC coverage. Mirror the
-            // human-facing lifecycle/status view once at graceful shutdown;
-            // a failure cannot invalidate the authoritative posting WAL and
-            // will be repaired from it on the next open.
-            self.saveAllLiveIndexStatusSnapshots(self.alloc) catch |err| {
-                std.log.warn("index status snapshot persistence deferred during close err={s}", .{@errorName(err)});
+        if (close_failure) |failure| {
+            self.core.index_manager.syncAll(true) catch |err| {
+                if (failure.* == null) failure.* = err;
+            };
+            self.core.index_manager.checkpointAllLsmWalsAfterDurableBoundary() catch |err| {
+                if (failure.* == null) failure.* = err;
+            };
+            self.core.store.runtime_store.flushBufferedWritesWithOptions(.{ .compact = false }) catch |err| {
+                if (failure.* == null) failure.* = err;
             };
             self.core.syncStore(true) catch |err| {
-                std.log.warn("index status snapshot sync deferred during close err={s}", .{@errorName(err)});
+                if (failure.* == null) failure.* = err;
             };
+            self.core.change_journal.checkpointAfterDurableBoundary() catch |err| {
+                if (failure.* == null) failure.* = err;
+            };
+            self.core.change_journal.sync(true) catch |err| {
+                if (failure.* == null) failure.* = err;
+            };
+            if (failure.* != null) return;
         }
-        // Async capture leases are capabilities owned by the live index
-        // manager. The executor is stopped above, so no worker can install a
-        // new lease; cancel and release any interrupted catch-up capture while
-        // that manager is still valid. In particular, do not defer this until
-        // after `core.deinit()`, which destroys the manager the leases name.
-        self.async_context.deinit(self.runtime_alloc);
-        self.runtime_alloc.destroy(self.async_context);
-        // A bounded source mark owns a read transaction on core's backend.
-        // Workers are stopped; release it before core destroys that backend.
-        if (self.local_execution.source_vectors.load(.acquire)) |source| source.cancelMarking();
         const core = self.core;
         core.deinit();
         self.alloc.destroy(core);
@@ -6417,6 +6694,7 @@ pub const DB = struct {
         }
         if (self.local_execution.row_policy_bundle) |*bundle| bundle.deinit();
         self.local_execution.row_policy_bundle = null;
+        if (self.owned_sql_preparation_authority) |*authority| authority.deinit(self.alloc);
         if (self.owned_row_policy_authority_secret) |value| {
             @memset(value, 0);
             self.alloc.free(value);
@@ -6426,6 +6704,7 @@ pub const DB = struct {
         self.runtime_alloc.destroy(self.local_execution);
         self.* = undefined;
         self.closed = true;
+        self.close_workers_drained = false;
     }
 
     /// Admit an external recovery pass without exposing write-gate policy.
@@ -7930,7 +8209,8 @@ pub const DB = struct {
         return self.batchInternal(req, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
-            .native_fk_generation_entry = .{ .term = command.fence.admission_epoch, .index = ordinal },
+            .native_fk_generation_entry = if (self.sql_persistence == null) .{ .term = command.fence.admission_epoch, .index = ordinal } else null,
+            .native_fk_generation_control = self.sql_persistence != null,
         });
     }
 
@@ -8177,6 +8457,7 @@ pub const DB = struct {
     /// This is an owner-local monotone completion of an exact committed Raft
     /// intent, not a new caller-selected policy program.
     pub const finalizePendingRowPolicyReceiptLocked = local_mutation.finalizePendingRowPolicyReceiptLocked;
+    pub const finalizePendingRowPolicySchemaPairLocked = local_mutation.finalizePendingRowPolicySchemaPairLocked;
 
     /// Replicas need not be queried by the coordinator to become serve-ready.
     /// The first subsequent local admission opportunistically completes a
@@ -8290,7 +8571,23 @@ pub const DB = struct {
             self.alloc.free(outbox.key);
             self.alloc.free(outbox.value);
         };
-        const schema = self.core.schema orelse return error.RowPolicyCatalogChanged;
+        if (bundle_bytes.len == 0 or bundle_bytes.len > row_policy_bundle_mod.max_bytes) return error.InvalidRowPolicyBundle;
+        const current_schema = self.core.schema orelse return error.RowPolicyCatalogChanged;
+        var pair_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer pair_arena.deinit();
+        const pair_alloc = pair_arena.allocator();
+        const header = try std.json.parseFromSliceLeaky(@import("../../system_catalog/policies.zig").InstallSnapshot, pair_alloc, bundle_bytes, .{ .ignore_unknown_fields = false });
+        const schema_pair = header.schema_pair;
+        const pair_schemas = if (schema_pair) |pair| try pair.materialize(pair_alloc) else null;
+        if (schema_pair != null and self.sql_persistence != null) return error.RowPolicyUnsupported;
+        const schema = if (pair_schemas) |pair| pair.after else current_schema;
+        if (schema_pair) |pair| {
+            const encoded_current = try schema_mod.serializeSchema(pair_alloc, current_schema);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(encoded_current, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &pair.before_schema_digest) and
+                !std.mem.eql(u8, &digest, &pair.after_schema_digest)) return error.RowPolicyCatalogChanged;
+        }
         var installed = try row_policy_bundle_mod.Installed.init(self.alloc, bundle_bytes, self.core.identity_namespace.table_id, schema);
         defer installed.deinit();
         if (installed.parsed.value.table_id != request.table_id or
@@ -8390,10 +8687,23 @@ pub const DB = struct {
         }).digest();
         if (!std.mem.eql(u8, &actual_descriptor_digest, &request.expected_descriptor_digest))
             return error.RowPolicyCatalogChanged;
-        if (previous.storage_mode != .relational or previous.active_schema_version != publication.schema_version or
+        const expected_current_version = if (pair_schemas) |pair| pair.before.version else publication.schema_version;
+        if (previous.storage_mode != .relational or previous.active_schema_version != expected_current_version or
             publication.policy_generation < previous.row_policy_generation or
             (publication.policy_generation == previous.row_policy_generation and !stage_with_serving and
-                previous.row_policy_phase != .preparing)) return error.RowPolicyCatalogChanged;
+                previous.row_policy_phase != .preparing))
+        {
+            return error.RowPolicyCatalogChanged;
+        }
+        if (schema_pair) |pair| {
+            const encoded = try schema_mod.serializeSchema(pair_alloc, self.core.schema orelse return error.RowPolicyCatalogChanged);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(encoded, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &pair.before_schema_digest) or previous.row_policy_phase != .active or
+                previous.row_policy_generation != pair.before_policy_generation or
+                previous.row_policy_catalog_epoch != pair.before_catalog_epoch or
+                (phase != .pending_install and phase != .serving_install)) return error.RowPolicyCatalogChanged;
+        }
         var receipt_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
         const receipt = orderedApplyReceiptWrite(identity, &receipt_bytes);
         if (stage_with_serving) {
@@ -8452,13 +8762,43 @@ pub const DB = struct {
             const serving_definitions = try std.json.Stringify.valueAlloc(self.alloc, .{ .records = publication.records, .settings = publication.settings }, .{});
             defer self.alloc.free(serving_definitions);
             if (!std.mem.eql(u8, candidate_definitions, serving_definitions)) return error.RowPolicyCatalogChanged;
+            if ((parsed_candidate.parsed.value.schema_pair != null) != (schema_pair != null)) return error.RowPolicyCatalogChanged;
+            if (schema_pair) |pair| if (!std.mem.eql(u8, &try pair.digest(pair_alloc), &try parsed_candidate.parsed.value.schema_pair.?.digest(pair_alloc)))
+                return error.RowPolicyCatalogChanged;
+        }
+        if (schema_pair != null) {
+            // The committed serving intent fences new leases, but preserves
+            // the old durable schema/bundle until the exact local drain can
+            // publish schema, policy and receipt in one metadata transaction.
+            if (phase != .serving_install or self.local_execution.row_policy_gate.currentPhase() != .preparing)
+                return error.RowPolicyCatalogChanged;
+            const encoded_pending = expected_receipt.encode();
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(row_policy_bundle_mod.candidate_key, bundle_bytes);
+            try txn.put(row_policy_bundle_mod.pending_key, &encoded_pending);
+            try txn.put(receipt.key, receipt.value);
+            var replication_lsn_buf: [replication_applied_lsn_value_len]u8 = undefined;
+            if (replication_lsn) |lsn| {
+                const marker = replicationAppliedSequenceWrite(lsn, &replication_lsn_buf);
+                try txn.put(marker.key, marker.value);
+            }
+            if (replication_outbox) |outbox| try txn.put(outbox.key, outbox.value);
+            if (replication_outbox != null) {
+                self.local_execution.durable_replication_outbox_maybe.store(true, .release);
+                self.local_execution.row_policy_replication_outbox_pending.store(true, .release);
+            }
+            try txn.commit();
+            if (replication_outbox != null) schedule_replication_recovery_on_exit = true;
+            try self.finishRowPolicyReplicationCommitLocked(replication_payload, if (replication_outbox) |outbox| outbox.key else null, &apply_held, &replication_mutation);
+            return null;
         }
         var next = previous;
         next.row_policy_generation = publication.policy_generation;
         next.row_policy_catalog_epoch = publication.catalog_epoch;
         next.row_policy_phase = .preparing;
         next.generation +|= 1;
-        const catalog_bytes = next.encode();
+        const catalog_bytes = try next.encodeDurable();
         const encoded_pending = expected_receipt.encode();
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
@@ -8466,7 +8806,7 @@ pub const DB = struct {
         if (pending_phase) try txn.put(row_policy_bundle_mod.candidate_key, bundle_bytes);
         if (phase == .serving_install or phase == .serving_disable) try txn.delete(row_policy_bundle_mod.candidate_key);
         try txn.put(row_policy_bundle_mod.pending_key, &encoded_pending);
-        try txn.put(table_catalog_mod.key, &catalog_bytes);
+        try txn.put(table_catalog_mod.key, catalog_bytes.slice());
         try txn.put(receipt.key, receipt.value);
         var replication_lsn_buf: [replication_applied_lsn_value_len]u8 = undefined;
         if (replication_lsn) |lsn| {
@@ -9806,10 +10146,35 @@ pub const DB = struct {
         defer if (apply_shared) self.core.unlockApplyShared();
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
+        const policy_schema_pinned = self.core.table_catalog.row_policy_phase != .disabled;
         var resident = NativeSchemaOwnerControl.Resident.pin(self.core);
         defer resident.deinit();
         self.core.unlockApplyShared();
         apply_shared = false;
+        if (policy_schema_pinned and schema_json.len != 0) {
+            var parsed = try public_table_schema.parseValidatedTableSchema(self.alloc, schema_json);
+            defer parsed.deinit(self.alloc);
+            const desired = try public_table_schema.deriveRuntimeTableSchema(self.alloc, parsed);
+            defer schema_mod.freeSchema(self.alloc, desired);
+            const current = resident.view orelse return error.RowPolicyCatalogChanged;
+            // Exact current descriptors may rebuild their durable runtime.
+            // Prospective hints remain deferred even before candidate arrival.
+            if (!try schema_mod.schemasEqual(self.alloc, current.tableSchema().*, desired)) return .deferred;
+        }
+        const pair_bytes = read.get(row_policy_bundle_mod.candidate_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (pair_bytes) |bytes| {
+            if (bytes.len > row_policy_bundle_mod.max_bytes) return error.InvalidRowPolicyBundle;
+            var candidate = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, self.alloc, bytes, .{ .ignore_unknown_fields = false });
+            defer candidate.deinit();
+            if (candidate.value.schema_pair) |pair| {
+                if (candidate.value.table_id != self.core.identity_namespace.table_id) return error.RowPolicyCatalogChanged;
+                if (historical or schema_json.len == 0 or std.mem.eql(u8, schema_json, pair.before_schema_json) or std.mem.eql(u8, schema_json, pair.after_schema_json)) return .deferred;
+                return error.RowPolicyCatalogChanged;
+            }
+        }
         const index_job = @import("relational_index_owner_job.zig");
         if (try index_job.protectsOwnerCatalog(&read, self.core.identity_namespace)) {
             const binding = (try index_job.load(&read)) orelse return .deferred;
@@ -10783,6 +11148,15 @@ pub const DB = struct {
     fn applySqlLockBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
         const locks = @import("../pessimistic_lock_control.zig");
         try locks.validateBatch(req);
+        if (self.sql_persistence != null and req.sql_lock.?.native_control == null) switch (req.sql_lock.?.operation) {
+            .prepare, .resolve => return error.ExternalTransactionDecisionChanged,
+            else => {},
+        };
+        const live_native_execution = self.sql_persistence != null and opts.ordered_apply_receipt == null;
+        if (live_native_execution) {
+            try req.sql_lock.?.requireLiveExecution(self.backend_runtime.clock().nowRealtimeMs());
+            if (opts.visibility_cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+        }
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
         defer if (replication) |*lease| lease.release();
@@ -10802,6 +11176,12 @@ pub const DB = struct {
             // leaves the exact Raft entry pending for the progress driver.
             var admission = try self.acquireSqlLockMutation(opts.ordered_apply_receipt != null);
             defer admission.release();
+            // A delayed native request must not reopen custody after terminal
+            // owner/Ref GC. Ordered apply retains its committed admission time.
+            if (live_native_execution) {
+                try req.sql_lock.?.requireLiveExecution(self.backend_runtime.clock().nowRealtimeMs());
+                if (opts.visibility_cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+            }
             if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
             if (opts.ordered_apply_receipt) |entry| if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
             const command = req.sql_lock.?;
@@ -10818,7 +11198,9 @@ pub const DB = struct {
             errdefer control_batch.abort();
             var txn = control_batch.asTxn();
             if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingInProgress;
-            try @import("relational_integrity_topology.zig").requireUnfenced(&txn);
+            try self.requireSqlLockTopologyAdmission(&txn, command);
+            if (command.native_control) |control|
+                try self.requireNativeSqlLockControl(&txn, command.admission.transaction, control);
             try locks.apply(self.alloc, &txn, self.core.identity_namespace, command.admission.binding.namespace.group, self.core.table_catalog.storage_mode, command);
             for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
             if (opts.ordered_apply_receipt) |entry| {
@@ -10837,19 +11219,124 @@ pub const DB = struct {
         if (payload != null) try self.flushDurableReplicationOutboxes();
     }
 
+    fn diagnoseNativeSqlLockMismatch(mask: u8) void {
+        if (comptime @import("builtin").mode == .debug) {
+            const Trace = struct {
+                var reported: std.atomic.Value(bool) = .init(false);
+            };
+            if (!Trace.reported.swap(true, .monotonic))
+                std.debug.print("native lock control mismatch bits={d}\n", .{mask});
+        }
+    }
+    fn diagnoseNativeSqlLockGuard(comptime reason: []const u8) void {
+        if (comptime @import("builtin").mode == .debug) {
+            const Trace = struct {
+                var reported: std.atomic.Value(bool) = .init(false);
+            };
+            if (!Trace.reported.swap(true, .monotonic))
+                std.debug.print("native lock control rejected reason={s}\n", .{reason});
+        }
+    }
+    /// Closing a captured owner is progress UNDER its fence, never permission
+    /// for new execution. Keep the ordinary topology, artifact and validation
+    /// admission unchanged for every other SQL lock operation.
+    fn requireSqlLockTopologyAdmission(self: *DB, txn: anytype, command: @import("../pessimistic_lock_control.zig").Command) !void {
+        const topology = @import("relational_integrity_topology.zig");
+        try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
+        try topology.requireNoActiveValidation(txn);
+        const fence = (try topology.current(txn)) orelse return;
+        const descriptor = self.sql_persistence orelse return error.IntegrityTopologyBusy;
+        try command.validate();
+        if (!fence.namespace.eql(self.core.identity_namespace) or fence.owner_group_id != command.admission.binding.namespace.group) return error.IntegrityTopologyBusy;
+        if (command.retirement_control) |control| {
+            if (command.operation != .close) return error.IntegrityTopologyBusy;
+            try control.requireFence(txn, command.admission);
+            if (control.route.route.execution != .native_local or !control.route.route.execution.native_local.eql(descriptor) or
+                !std.meta.eql(control.route.native_participant, try self.relationPhysicalPin())) return error.ExternalTransactionDecisionChanged;
+            return;
+        }
+        if (command.native_control) |control| {
+            // Already-decided lock custody must drain under any topology role.
+            // Terminal row resolution plus the exact Owner/Pin/Ref proves this
+            // is cleanup, never a new vote or executing statement.
+            if (command.operation != .resolve) return error.IntegrityTopologyBusy;
+            try self.requireNativeSqlLockControl(txn, command.admission.transaction, control);
+            const actual = (try transactions_mod.externalParticipant(txn, command.admission.transaction)) orelse return error.ExternalTransactionDecisionChanged;
+            if (actual.status == .pending) return error.LockOwnerBusy;
+            try transactions_mod.requireResolvedExternalLockControl(txn, command.admission.transaction);
+            var region = std.heap.ArenaAllocator.init(self.alloc);
+            defer region.deinit();
+            if (try @import("../pessimistic_lock_transaction.zig").read(region.allocator(), txn, command.admission.transaction)) |frozen| {
+                if (!std.meta.eql(frozen.ref.admission, command.admission) or !std.meta.eql(frozen.ref.decision, control.decision)) return error.ExternalTransactionDecisionChanged;
+            } else if (actual.status != .aborted) return error.ExternalTransactionDecisionChanged;
+            // locks.apply independently rechecks the exact Ref and native
+            // terminal decision. ABORT-before-BEGIN adoption still requires
+            // the receiving Source's canonical metadata authorization and the
+            // actual aborted native tombstone; no new BEGIN/prepare is allowed.
+            return;
+        }
+        return error.IntegrityTopologyBusy;
+    }
+
+    fn requireNativeSqlLockControl(self: *DB, txn: anytype, id: types.TxnId, control: @import("../pessimistic_lock_control.zig").NativeControl) !void {
+        const descriptor = self.sql_persistence orelse {
+            diagnoseNativeSqlLockGuard("missing_native_descriptor");
+            return error.ExternalTransactionDecisionChanged;
+        };
+        if (control.route.route.execution != .native_local) {
+            diagnoseNativeSqlLockGuard("nonnative_control_route");
+            return error.ExternalTransactionDecisionChanged;
+        }
+        const participant = (try transactions_mod.externalParticipant(txn, id)) orelse return error.TxnNotFound;
+        const held = participant.owner orelse {
+            diagnoseNativeSqlLockGuard("missing_stored_owner");
+            return error.ExternalTransactionDecisionChanged;
+        };
+        const pin = try self.relationPhysicalPin();
+        // Stored Owner, stored Pin, routed Pin, native descriptor. Every
+        // comparison remains mandatory; the diagnostic exposes only bits.
+        const mismatch: u8 = @as(u8, @intFromBool(!held.eql(control.owner))) |
+            (@as(u8, @intFromBool(!std.meta.eql(participant.native_pin, pin))) << 1) |
+            (@as(u8, @intFromBool(!std.meta.eql(control.route.native_participant, pin))) << 2) |
+            (@as(u8, @intFromBool(!control.route.route.execution.native_local.eql(descriptor))) << 3);
+        if (mismatch != 0) {
+            diagnoseNativeSqlLockMismatch(mismatch);
+            return error.ExternalTransactionDecisionChanged;
+        }
+    }
+
     fn lookupSqlLock(self: *DB, a: Allocator, raw: []const u8) !?types.LookupResult {
         if (raw.len > 32768) return error.InvalidLockRecord;
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const locks = @import("../pessimistic_lock_control.zig");
         const query = try std.json.parseFromSliceLeaky(locks.Query, arena.allocator(), raw, .{});
+        try query.validate();
+        if (self.sql_persistence != null and query.admission.purpose == .resolution and
+            query.native_control == null and query.retirement_control == null) return error.ExternalTransactionDecisionChanged;
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
+        if (query.native_control) |control|
+            try self.requireNativeSqlLockControl(&read, query.admission.transaction, control);
         const state = try locks.snapshot(arena.allocator(), &read, self.core.identity_namespace, query);
+        if (self.sql_persistence != null and query.native_control != null and state.frozen == null) {
+            if (comptime @import("builtin").mode == .debug) {
+                const Trace = struct {
+                    var reported: std.atomic.Value(bool) = .init(false);
+                };
+                if (!Trace.reported.swap(true, .monotonic))
+                    std.debug.print("native lock lookup rejected reason=missing_frozen_ref\n", .{});
+            }
+            return error.ExternalTransactionDecisionChanged;
+        }
         return .{ .json = try std.json.Stringify.valueAlloc(a, state, .{}) };
     }
 
     noinline fn batchInternalCommit(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+        if (self.sql_persistence != null and opts.checked_native_atomic == null and req.transaction == null and req.reject_graph_transform_projections) {
+            try req.requireAtomicIntentShape();
+            return self.batchNativeAtomic(req, profile, opts);
+        }
         if (req.sql_lock != null) return self.applySqlLockBatch(req, opts);
         // Only a committed group adapter supplies the actual group and index.
         if (req.relational_index_owner_control != null) return error.InvalidBatchRequest;
@@ -10887,7 +11374,7 @@ pub const DB = struct {
         const sql_drop_control = if (req.relational_topology) |command| command.sql_drop_control else false;
         if (sql_drop_control) {
             try @import("relational_integrity_topology_contract.zig").validateSqlDropBatch(req);
-            if (!trusted_replay and opts.native_fk_generation_entry == null) return error.InvalidControlReceiptPosition;
+            if (!trusted_replay and opts.native_fk_generation_entry == null and !opts.native_fk_generation_control) return error.InvalidControlReceiptPosition;
         }
         if (!trusted_replay and !graph_cleanup_maintenance) try self.maybeFinalizePendingRowPolicyPublication();
         if (req.row_policy_principal_proof.len != 0) {
@@ -11011,6 +11498,12 @@ pub const DB = struct {
                     if (req.writes.len != 0 or req.deletes.len != 0) return error.InvalidRestoreStagingCommand;
                     try install.validate();
                     return self.applyRestoreStagingControl(req, opts);
+                },
+                .install_native_empty => |install| {
+                    if (req.writes.len != 0 or req.deletes.len != 0 or opts.ordered_apply_receipt != null or opts.replication_applied_lsn_marker != null) return error.InvalidRestoreStagingCommand;
+                    try install.validate();
+                    _ = try self.installNativeEmptyTarget(install);
+                    return;
                 },
                 .import_page, .rewrite_page => |page| {
                     if (req.writes.len +| req.deletes.len > 128 or page.timestamps.len != req.writes.len or page.next.len > 8 * 1024 * 1024) return error.InvalidRestoreStagingCommand;
@@ -21511,15 +22004,15 @@ pub const DB = struct {
         const schema = schema_view.tableSchema().*;
         var requirements = try row_policy_bundle_mod.MutationRequirements.init(self.alloc, input_predicates, principal);
         defer requirements.deinit(self.alloc);
-        const select_check = if (requirements.needsSelect()) try bundle.captureEvaluation(self.alloc, schema, principal, .select) else null;
+        const select_check = if (requirements.needsSelect()) try bundle.captureEvaluationAtSchemaView(self.alloc, schema_view, principal, .select) else null;
         defer if (select_check) |evaluation| evaluation.deinit();
-        var insert_check = try bundle.captureEvaluation(self.alloc, schema, principal, .insert);
+        var insert_check = try bundle.captureEvaluationAtSchemaView(self.alloc, schema_view, principal, .insert);
         defer insert_check.deinit();
-        var update_old = try bundle.captureEvaluation(self.alloc, schema, principal, .update_old);
+        var update_old = try bundle.captureEvaluationAtSchemaView(self.alloc, schema_view, principal, .update_old);
         defer update_old.deinit();
-        var update_new = try bundle.captureEvaluation(self.alloc, schema, principal, .update_new);
+        var update_new = try bundle.captureEvaluationAtSchemaView(self.alloc, schema_view, principal, .update_new);
         defer update_new.deinit();
-        var delete_old = try bundle.captureEvaluation(self.alloc, schema, principal, .delete);
+        var delete_old = try bundle.captureEvaluationAtSchemaView(self.alloc, schema_view, principal, .delete);
         defer delete_old.deinit();
         var probe = try self.core.store.beginProbeTxn();
         defer probe.abort();
@@ -21536,11 +22029,9 @@ pub const DB = struct {
             };
             if (old_bytes) |bytes| {
                 if (requirement.isInsert()) return error.RowPolicyDenied;
-                if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
-                const old = if (self.core.store.valuesAreAuthenticated())
-                    try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
-                else
-                    try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
+                var physical = try row_policy_bundle_mod.PhysicalRow.init(self.core, schema_view, bytes);
+                defer physical.deinit();
+                const old = physical.row;
                 if (!try (if (intent.value == null) delete_old else update_old).permits(old)) return error.RowPolicyDenied;
                 if (requirement.requiresSelect() and !try select_check.?.permits(old)) return error.RowPolicyDenied;
             }
@@ -21707,7 +22198,11 @@ pub const DB = struct {
             opts.relational_topology_json.len == 0 and opts.relational_index_status_json.len == 0 and
             !opts.relational_integrity_catalog)
             return error.InitialChildNotPublished;
-        if (self.local_execution.restore_staging_required.load(.acquire) or opts.restore_staging_scope != null) {
+        // The private initialization/adoption port reads only immutable image
+        // facts. It must work before a reserved restore image imports data;
+        // adding any row/index/digest option retains the ordinary scope gate.
+        const binding_only = key.len == 0 and std.meta.eql(opts, types.LookupOptions{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}" });
+        if (!binding_only and (self.local_execution.restore_staging_required.load(.acquire) or opts.restore_staging_scope != null)) {
             var staging_read = try self.core.store.beginProbeTxn();
             defer staging_read.abort();
             try @import("restore_staging.zig").requireScope(alloc, &staging_read, opts.restore_staging_scope, false);
@@ -21795,7 +22290,8 @@ pub const DB = struct {
             const row = ordinal_row orelse return error.RowPolicyCatalogChanged;
             const bundle = if (self.local_execution.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
             if (principal.value.purpose != .integrity) {
-                var evaluation = try bundle.captureReadEvaluation(alloc, row.table_schema, &principal.value);
+                const logical = schema_view orelse return error.RowPolicyCatalogChanged;
+                var evaluation = try bundle.captureReadEvaluationAtSchemaView(alloc, logical, &principal.value);
                 defer evaluation.deinit();
                 if (!try evaluation.permits(row)) return null;
             }
@@ -25311,6 +25807,167 @@ pub const DB = struct {
         return true;
     }
 
+    /// Read only the actual primary catalog/namespace of an unpublished
+    /// native root. It deliberately avoids DB.open: that admission requires a
+    /// live generation and must never be bypassed merely to perform cleanup.
+    pub fn inspectUnpublishedNativeImage(alloc: Allocator, path: []const u8, runtime: *background_runtime_mod.BackendRuntime, expected: ?@import("../../common/relation_persistence.zig").Descriptor, resources: db_config.CoreOpenOptions) !@import("../../common/relation_persistence.zig").UnpublishedImageInspection {
+        if (comptime storage_engine.enabled) return storage_engine.call("inspectUnpublishedNativeImage", .{ alloc, path, runtime, expected, resources });
+        if (expected) |descriptor| try descriptor.validate();
+        const io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return .{ .root_present = false, .primary_present = false },
+            else => return err,
+        };
+        if (stat.kind != .directory) return error.InvalidSqlRelationPersistence;
+        var primary: PrimaryBackend = .{ .lsm = .{} };
+        var indexes: db_config.IndexBackendOptions = .{};
+        if (expected) |descriptor| try db_config.applyRelationPersistence(&primary, &indexes, descriptor);
+        applyReadOnlyToPrimaryBackend(&primary);
+        switch (primary) {
+            .lsm => |*options| installLsmReadRuntime(options, runtime),
+            else => return error.InvalidSqlRelationPersistence,
+        }
+        var options = resources;
+        options.primary_backend = primary;
+        options.primary_runtime_store = null;
+        options.read_only = true;
+        options.no_sync = false;
+        var opened = openPrimaryStore(alloc, path, options) catch |err| switch (err) {
+            // No row/participant ACK preceded this metadata-authorized first
+            // open. An absent primary is a partial image, not an empty binding.
+            error.FileNotFound => return .{ .root_present = true, .primary_present = false },
+            else => return err,
+        };
+        defer {
+            opened.store.close();
+            opened.owner.close(alloc);
+        }
+        const catalog = try table_catalog_mod.load(alloc, &opened.store);
+        const namespace = try doc_identity.loadNamespaceFromStore(&opened.store);
+        const user_data = try storeHasUserDataBounded(&opened.store);
+        var read = try opened.store.beginReadTxn();
+        defer read.abort();
+        const transactions = try transactions_mod.hasAnyTransactionStateInView(&read);
+        const physical: ?u128 = if (loadExistingDurableRootIdentity(alloc, runtime, path)) |value| value.incarnation else |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        const image_attempt = try @import("native_empty_image_attempt.zig").read(&read);
+        if (image_attempt) |attempt| {
+            const current_root = physical orelse return error.InvalidSqlRelationPersistence;
+            const descriptor = if (catalog) |value| value.sql_persistence orelse return error.InvalidSqlRelationPersistence else return error.InvalidSqlRelationPersistence;
+            try attempt.require(descriptor, attempt.scope, attempt.number, attempt.digest, current_root);
+        }
+        var scope: ?[32]u8 = null;
+        if (read.get(@import("restore_staging_contract.zig").bootstrap_key)) |raw| {
+            var parsed = try @import("restore_staging_contract.zig").OwnerBootstrap.decode(alloc, raw);
+            defer parsed.deinit();
+            scope = parsed.value.scope.digest();
+        } else |err| if (err != error.NotFound) return err;
+        if (image_attempt) |attempt| {
+            const actual_scope = scope orelse return error.InvalidSqlRelationPersistence;
+            if (!std.mem.eql(u8, &attempt.scope, &actual_scope)) return error.InvalidSqlRelationPersistence;
+        }
+        return .{ .root_present = true, .primary_present = true, .catalog_present = catalog != null, .descriptor = if (catalog) |value| value.sql_persistence else null, .namespace = if (namespace) |value| .{ .table_id = value.table_id, .shard_id = value.shard_id, .range_id = value.range_id } else null, .has_user_data = user_data, .has_transaction_state = transactions, .bootstrap_scope = scope, .physical_root_incarnation = physical, .image_attempt = if (image_attempt) |value| .{ .number = value.number, .digest = value.digest } else null };
+    }
+
+    /// Replace only a metadata-reserved, unpublished empty target. The caller
+    /// holds the Source publication/producer drain across this operation and
+    /// publication of the signed initialized receipt. Generation lifecycle
+    /// owns directory exchange and retained-root cleanup, including retries.
+    pub fn replaceUnpublishedNativeEmptyImage(alloc: Allocator, path: []const u8, options: OpenOptions, bootstrap: @import("restore_staging_contract.zig").OwnerBootstrap, attempt_number: u64, attempt_digest: [32]u8, previous_root: u128) !@import("../../common/relation_persistence.zig").NativeBinding {
+        if (comptime storage_engine.enabled) return storage_engine.call("replaceUnpublishedNativeEmptyImage", .{ alloc, path, options, bootstrap, attempt_number, attempt_digest, previous_root });
+        const marker = @import("native_empty_image_attempt.zig");
+        const descriptor = options.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+        const boot = options.persistence_boot orelse return error.InvalidSqlRelationPersistence;
+        const permit = boot.uninitialized orelse return error.InvalidSqlRelationPersistence;
+        const runtime = options.backend_runtime orelse return error.MissingBackendRuntimeIo;
+        try descriptor.validate();
+        try bootstrap.validate();
+        try permit.validateFor(descriptor);
+        if (descriptor.kind != .unlogged or bootstrap.native_empty_source == null or !bootstrap.scope.empty_generation or
+            attempt_number < 2 or previous_root == 0 or !boot.initializing or !boot.unclean_restart or
+            options.identity_namespace == null or !options.identity_namespace.?.eql(bootstrap.scope.target_namespace) or
+            options.start_index_workers or options.start_optional_runtimes or options.start_independent_maintenance) return error.InvalidSqlRelationPersistence;
+        var exclusive = try generation_lifecycle.beginProcessExclusiveWithRuntime(path, runtime);
+        defer exclusive.deinit();
+        try exclusive.reconcilePublished();
+        // The read-only inspection never opens an old generation as a writer.
+        // A same-attempt canonical marker proves an exchange already committed
+        // before its initialized reply was lost. No marker means build a new
+        // candidate; an older marker is not an initialized successor proof.
+        const inspected = try inspectUnpublishedNativeImage(alloc, path, runtime, descriptor, .{ .resource_manager = options.resource_manager, .lsm_cache = options.lsm_cache, .hbc_cache = options.hbc_cache });
+        if (inspected.primary_present) {
+            // Metadata names the lost image, not arbitrary data at its path.
+            // A different UUID is allowed only for an actual prior reserved
+            // image attempt whose durable marker/bootstrap were read together.
+            if (inspected.physical_root_incarnation == null or inspected.descriptor == null or !inspected.descriptor.?.eql(descriptor) or
+                inspected.namespace == null or !std.meta.eql(inspected.namespace.?, .{ .table_id = bootstrap.scope.target_namespace.table_id, .shard_id = bootstrap.scope.target_namespace.shard_id, .range_id = bootstrap.scope.target_namespace.range_id }) or
+                inspected.bootstrap_scope == null or !std.mem.eql(u8, &inspected.bootstrap_scope.?, &bootstrap.scope.digest()) or
+                (inspected.image_attempt == null and inspected.physical_root_incarnation.? != previous_root)) return error.SqlRelationOwnerChanged;
+        }
+        if (inspected.image_attempt) |image| {
+            if (image.number == attempt_number and std.mem.eql(u8, &image.digest, &attempt_digest)) {
+                if (inspected.physical_root_incarnation == null or inspected.physical_root_incarnation.? == previous_root or
+                    inspected.namespace == null or !std.meta.eql(inspected.namespace.?, .{ .table_id = bootstrap.scope.target_namespace.table_id, .shard_id = bootstrap.scope.target_namespace.shard_id, .range_id = bootstrap.scope.target_namespace.range_id }) or
+                    inspected.descriptor == null or !inspected.descriptor.?.eql(descriptor) or inspected.has_user_data != false or inspected.has_transaction_state != false or
+                    inspected.bootstrap_scope == null or !std.mem.eql(u8, &inspected.bootstrap_scope.?, &bootstrap.scope.digest())) return error.SqlRelationOwnerChanged;
+                var reopen = options;
+                reopen.exclusive_generation = &exclusive;
+                var db = try DB.open(alloc, path, reopen);
+                var alive = true;
+                defer if (alive) db.closeImmutableSnapshot();
+                const binding = try captureNativeEmptyImageBinding(&db, alloc);
+                try permit.requireBinding(binding);
+                try db.closeFallible();
+                alive = false;
+                return binding;
+            }
+            if (image.number >= attempt_number) return error.SqlRelationOwnerChanged;
+        }
+        var stage = try exclusive.beginStaging();
+        defer stage.deinit();
+        var candidate_options = options;
+        candidate_options.staged_generation = &stage;
+        candidate_options.exclusive_generation = null;
+        var db = try DB.open(alloc, stage.path(), candidate_options);
+        var alive = true;
+        defer if (alive) db.closeImmutableSnapshot();
+        try db.installRestoreStagingReadSchema(alloc, bootstrap.scope, bootstrap.read_schema_json);
+        try db.updateRange(bootstrap.byte_range);
+        try db.reserveRestoreStagingScoped(alloc, bootstrap.scope);
+        try db.installRestoreStagingBootstrap(alloc, bootstrap);
+        const binding = try captureNativeEmptyImageBinding(&db, alloc);
+        try permit.requireBinding(binding);
+        if (binding.physical_root_incarnation == previous_root) return error.SqlRelationOwnerChanged;
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            var active = true;
+            defer if (active) txn.abort();
+            try marker.stage(&txn, .{ .scope = bootstrap.scope.digest(), .descriptor_fingerprint = try descriptor.fingerprint(), .number = attempt_number, .digest = attempt_digest, .physical_root_incarnation = binding.physical_root_incarnation });
+            try txn.commit();
+            active = false;
+        }
+        try db.closeFallible();
+        alive = false;
+        try stage.seal();
+        _ = try stage.publishPrepared();
+        // The durable metadata reservation already fences the old image. A
+        // prepared directory must not roll back to it after process loss.
+        // No row admission occurs until the new signed binding is committed.
+        try stage.commitPublication();
+        return binding;
+    }
+
+    fn captureNativeEmptyImageBinding(db: *DB, alloc: Allocator) !@import("../../common/relation_persistence.zig").NativeBinding {
+        var value = (try db.lookup(alloc, "", .{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}" })) orelse return error.InvalidSqlRelationPersistence;
+        defer value.deinit(alloc);
+        var parsed = try std.json.parseFromSlice(@import("../../common/relation_persistence.zig").NativeBinding, alloc, value.json, .{});
+        defer parsed.deinit();
+        try parsed.value.validate();
+        return parsed.value;
+    }
+
     pub fn readRestoreStateForPath(alloc: Allocator, path: []const u8) !?RestoreState {
         if (comptime storage_engine.enabled) return storage_engine.call("readRestoreStateForPath", .{ alloc, path });
         return try readRestoreStateForPathAlloc(alloc, path);
@@ -26308,6 +26965,7 @@ pub const DB = struct {
         after_catalog_digest: [32]u8,
         ordered_receipt: OrderedApplyReceipt,
         native: bool = false,
+        native_control: ?@import("relational_integrity_topology_contract.zig").Command = null,
     };
 
     pub const InitialHiddenChild = struct {
@@ -26705,8 +27363,11 @@ pub const DB = struct {
                 const expected = try admission.sourceInstallDigest(publication.fence, publication.before_schema_json_digest, publication.schema_json_digest, publication.before_catalog_digest, publication.after_catalog_digest);
                 if (std.mem.eql(u8, &receipt.digest, &expected)) {
                     const completed = (try @import("relational_integrity_topology.zig").completed(&read)) orelse return error.GenerationAdmissionChanged;
-                    if (!completed.eql(publication.fence) or receipt.term != publication.ordered_receipt.term or receipt.index != publication.ordered_receipt.index)
-                        return error.GenerationAdmissionChanged;
+                    if (!completed.eql(publication.fence)) return error.GenerationAdmissionChanged;
+                    if (publication.native_control != null) {
+                        try (try receipt.position()).requireNamespace(publication.fence.namespace);
+                        if (receipt.native_position == null) return error.GenerationAdmissionChanged;
+                    } else if (receipt.term != publication.ordered_receipt.term or receipt.index != publication.ordered_receipt.index) return error.GenerationAdmissionChanged;
                     const actual = try read.get(public_schema_json_key);
                     if (!std.mem.eql(u8, actual, schema_json)) return error.IntegrityCatalogChanged;
                     var actual_digest: [32]u8 = undefined;
@@ -26817,6 +27478,11 @@ pub const DB = struct {
         else
             try self.core.prepareSchemaMetadata(runtime_schema, schema_metadata_writes[0..schema_metadata_write_count]);
         defer prepared_schema.deinit();
+        if (publication) |published| if (published.native_control) |command| {
+            if (!published.native or self.sql_persistence == null or command.action != .install_child_schema or !command.fence.eql(published.fence)) return error.InvalidControlReceiptPosition;
+            prepared_schema.native_child_control = command;
+            prepared_schema.native_child_digest = try @import("native_topology_receipt.zig").commandDigest(self.alloc, command);
+        };
         if (publication) |published| {
             const current_catalog = (try self.core.getStoreValue(self.alloc, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
             defer self.alloc.free(current_catalog);
@@ -27044,6 +27710,7 @@ pub const DB = struct {
         }
         return self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(request.txn_id, request.begin_timestamp, request.created_at_ns, request.participants, request.coordinator, true, .{
             .external_decision_owner = request.owner,
+            .native_pin = try self.relationPhysicalPin(),
             .writes = writes.items,
         });
     }
@@ -27121,6 +27788,9 @@ pub const DB = struct {
         predicates: []const transactions_mod.VersionPredicate,
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("writeIntents", .{ self, txn_id, intents, predicates });
+        // Graph attachments are a native preparation result, not a public
+        // alternative to capturing schema/index and endpoint dependencies.
+        for (intents) |intent| if (intent.prepared_graph_effects != null) return error.PreparedIntentRequiresMaterialization;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -27163,6 +27833,9 @@ pub const DB = struct {
         const binding = try self.core.transactionSchemaBinding(preparation_alloc, txn_id);
         var view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (view) |*pinned| pinned.release();
+        if (view) |pinned| if (pinned.triggerState()) |state| if (state.entries.len != 0) {
+            for (intents) |intent| if (!isMetadataKey(intent.key)) return error.SqlTriggerCoordinationRequired;
+        };
         for (intents) |intent| {
             if (isProtectedIntegrityKey(intent.key) or isProtectedRangeWriteKey(intent.key)) return error.InvalidIntegrityOperation;
             if (hasCoordinatedConstraints(view) and !isMetadataKey(intent.key)) return error.ForeignKeyCoordinationRequired;
@@ -27223,13 +27896,155 @@ pub const DB = struct {
         try self.writeTransactionInternal(txn_id, req, identity);
     }
 
+    const NativeAtomicExecution = struct {
+        snapshot_owner: *snapshot_admission_mod.SnapshotAdmission.MutationLease,
+        snapshot_parent: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease,
+        replication_mutation: ?MutationBarrier.SharedLease = null,
+        request: types.BatchRequest,
+        profile: ?*BatchProfile,
+        options: BatchExecutionOptions,
+    };
+
+    fn batchNativeAtomic(self: *DB, request: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) !void {
+        const descriptor = self.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+        try descriptor.validate();
+        const intent = try types.TransactionIntentRequest.fromAtomicBatch(request);
+        if (opts.transaction_resolution != null or opts.ordered_apply_receipt != null or opts.restore_staging != null or opts.checked_native_atomic != null) return error.InvalidBatchRequest;
+        var mutation: snapshot_admission_mod.SnapshotAdmission.MutationLease = .{ .admission = self.core.snapshot_admission, .active = false };
+        defer mutation.release();
+        var local_committed = false;
+        var execution: NativeAtomicExecution = .{ .request = request, .profile = profile, .options = opts, .snapshot_owner = &mutation, .snapshot_parent = opts.snapshot_mutation };
+        defer if (execution.replication_mutation) |*lease| lease.release();
+        execution.options.primary_committed = opts.primary_committed orelse &local_committed;
+        execution.options.snapshot_mutation = &mutation;
+        // This nonce is an exclusion identity for read/lock validation only.
+        // No BEGIN, participant record, vote or decision is persisted.
+        var id: types.TxnId = undefined;
+        try (self.backend_runtime.io() orelse std.Options.debug_io).randomSecure(&id);
+        var retries: usize = 0;
+        while (true) {
+            // Drain and wait before any per-attempt row-policy read gate,
+            // preparation budget, snapshot or apply admission is retained.
+            execution.snapshot_owner.release();
+            if (execution.replication_mutation) |*lease| lease.release();
+            execution.replication_mutation = null;
+            if (self.core.index_manager.resource_manager) |manager|
+                try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(request));
+            if (!opts.bypass_replication_write_gate) {
+                try self.enforceReplicationWriteGate();
+                try self.ensureDurableReplicationStartupBarrier();
+                try self.preflightReplicationBatchSyncCommit();
+                execution.replication_mutation = self.acquireReplicationMutationShared();
+            }
+            execution.snapshot_owner.* = if (execution.snapshot_parent) |parent| parent.retain() else self.core.snapshot_admission.acquireMutation();
+            self.writeTransactionInternalMode(id, intent, null, &execution) catch |err| switch (err) {
+                error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
+                    if (execution.options.primary_committed.?.*) return err;
+                    if (retries == 2) return err;
+                    retries += 1;
+                    continue;
+                },
+                else => return err,
+            };
+            return;
+        }
+    }
+
+    fn commitNativeAtomicIntents(self: *DB, execution: *NativeAtomicExecution, alloc: Allocator, intents: []const transactions_mod.WriteIntent, checked: *const execution_resources.CheckedNativeAtomic, principal: ?*const row_policy_authority_mod.Payload, policy_lease: ?*const row_policy_gate_mod.Gate.Lease) !void {
+        if (self.sql_persistence == null or checked.schema_namespace_generation != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+        var writes: std.ArrayList(types.BatchWrite) = .empty;
+        defer writes.deinit(alloc);
+        var deletes: std.ArrayList([]const u8) = .empty;
+        defer deletes.deinit(alloc);
+        var metadata_writes: std.ArrayList(docstore_mod.KVPair) = .empty;
+        defer metadata_writes.deinit(alloc);
+        var metadata_deletes: std.ArrayList([]const u8) = .empty;
+        defer metadata_deletes.deinit(alloc);
+        var durable_rows = std.StringHashMapUnmanaged([]const u8).empty;
+        defer durable_rows.deinit(alloc);
+        try metadata_writes.appendSlice(alloc, execution.options.extra_store_writes);
+        try metadata_deletes.appendSlice(alloc, execution.options.extra_store_deletes);
+        for (intents) |intent| {
+            // Native graph participants require their independent graph-effect
+            // reader. Never discard a prepared graph half in this row lane.
+            if (intent.prepared_graph_effects != null) return error.UnsupportedTransformOperation;
+            if (isMetadataKey(intent.key)) {
+                // Metadata is finalized after provider preparation, under the
+                // common apply fence, and returned by the checked callback.
+                continue;
+            } else if (intent.value) |value| {
+                if (intent.prepared_row) |row| {
+                    // The shared typed planner has already verified domains and
+                    // encoded JSON-null vs SQL-null into this owned AROW. Any
+                    // leftover origin markers mean preparation was incomplete.
+                    if (intent.prepared_domain != null or intent.json_null_fields.len != 0) return error.InvalidBatchRequest;
+                    try writes.append(alloc, .{ .key = intent.key, .value = value });
+                    try durable_rows.put(alloc, intent.key, row);
+                } else try writes.append(alloc, .{ .key = intent.key, .value = value, .json_null_fields = intent.json_null_fields });
+            } else try deletes.append(alloc, intent.key);
+        }
+        var request = execution.request;
+        request.writes = writes.items;
+        request.deletes = deletes.items;
+        request.transforms = &.{};
+        // Keep the original authenticated row-policy observations too; the
+        // complete internal exact-value read set is checked separately.
+        request.integrity = &.{};
+        request.integrity_commands = &.{};
+        request.range_guards = &.{};
+        request.relational_activation = null;
+        request.relational_retirement = null;
+        request.relational_index_maintenance = null;
+        var options = execution.options;
+        options.checked_native_atomic = checked;
+        options.row_policy_principal = principal;
+        options.row_policy_lease = policy_lease;
+        options.extra_store_writes = metadata_writes.items;
+        options.extra_store_deletes = metadata_deletes.items;
+        options.durable_rows = &durable_rows;
+        var all_rows_packed = writes.items.len != 0;
+        for (writes.items) |write| if (!durable_rows.contains(write.key)) {
+            all_rows_packed = false;
+            break;
+        };
+        if (durable_rows.count() != 0 and !all_rows_packed) return error.InvalidBatchRequest;
+        // Relational AROW was prepared under the exact schema above. Select
+        // the existing FromIntent row reuse path, not preserved-JSON parsing.
+        // Normalized document rows have no AROW and retain preservation.
+        options.preserve_logical_values = !all_rows_packed;
+        // The shared commit pipeline prepares derived artifacts without apply,
+        // then invokes the same locked integrity finalizer as transaction prepare.
+        // Its one apply lease is released before derived visibility waits. All prepared metadata and rows enter its
+        // one primary store transaction; no participant journal is created.
+        try self.batchInternal(request, execution.profile, options);
+    }
+
     fn writeTransactionInternal(
         self: *DB,
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
         ordered_receipt: ?OrderedApplyReceipt,
     ) !void {
+        return self.writeTransactionInternalMode(txn_id, req, ordered_receipt, null);
+    }
+
+    const TransactionPolicyPhase = enum { shape, verify, principal_gate, raw_gate, prepare };
+    fn writeTransactionInternalMode(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, ordered_receipt: ?OrderedApplyReceipt, atomic_execution: ?*NativeAtomicExecution) !void {
         if (req.external_activation) return self.activateExternalTransaction(txn_id, req, ordered_receipt);
+        var policy_phase: TransactionPolicyPhase = .shape;
+        return self.writeTransactionInternalModePolicyObserved(txn_id, req, ordered_receipt, atomic_execution, &policy_phase) catch |err| {
+            if (comptime @import("builtin").mode == .debug) {
+                const Trace = struct {
+                    var reported: std.atomic.Value(bool) = .init(false);
+                };
+                if (err == error.RowPolicyAuthenticationRequired and !Trace.reported.swap(true, .monotonic))
+                    std.debug.print("transaction policy admission rejected phase={s} proof={} database={} timestamp={} restore={} ordered={}\n", .{ @tagName(policy_phase), req.row_policy_principal_proof.len != 0, req.row_policy_database.len != 0, req.row_policy_admitted_at_seconds > 0, req.restore_staging_scope != null, ordered_receipt != null });
+            }
+            return err;
+        };
+    }
+
+    fn writeTransactionInternalModePolicyObserved(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, ordered_receipt: ?OrderedApplyReceipt, atomic_execution: ?*NativeAtomicExecution, policy_phase: *TransactionPolicyPhase) !void {
         if (req.external_decision_owner) |owner|
             try owner.requireFreshVoteAt(if (ordered_receipt != null) req.timestamp_ns else @max(1, currentTimeNs()));
         if (ordered_receipt == null) try self.maybeFinalizePendingRowPolicyPublication();
@@ -27240,7 +28055,9 @@ pub const DB = struct {
             if (req.row_policy_database.len == 0 or req.row_policy_admitted_at_seconds <= 0 or
                 req.restore_staging_scope != null) return error.RowPolicyAuthenticationRequired;
             const now_seconds: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s));
+            policy_phase.* = .verify;
             verified_principal = try self.verifyRowPolicyPrincipal(self.alloc, req.row_policy_principal_proof, req.row_policy_database, .write, if (ordered_receipt != null) req.row_policy_admitted_at_seconds else now_seconds);
+            policy_phase.* = .principal_gate;
             row_policy_lease = if (ordered_receipt != null)
                 try self.local_execution.row_policy_gate.enterReplicatedPrincipal(&verified_principal.?.value)
             else
@@ -27248,6 +28065,7 @@ pub const DB = struct {
         } else if (req.row_policy_database.len != 0 or req.row_policy_admitted_at_seconds != 0) {
             return error.RowPolicyAuthenticationRequired;
         } else if (ordered_receipt == null) {
+            policy_phase.* = .raw_gate;
             row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         } else if (self.local_execution.row_policy_gate.currentPhase() != .disabled and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0))
@@ -27255,14 +28073,16 @@ pub const DB = struct {
             return error.RowPolicyAuthenticationRequired;
         }
         defer if (row_policy_lease) |*lease| lease.release();
+        policy_phase.* = .prepare;
         var preparation: RequestPreparationContext = undefined;
         preparation.init(self);
         defer preparation.deinit();
         const max_prepared_retries = 2;
         var retries: usize = 0;
         while (true) {
-            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
+            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null, atomic_execution) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
+                    if (atomic_execution != null) return err;
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;
                     continue;
@@ -27281,6 +28101,7 @@ pub const DB = struct {
         preparation_alloc: Allocator,
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
+        atomic_execution: ?*NativeAtomicExecution,
     ) !void {
         if (req.relational_index_maintenance != null and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
@@ -27310,12 +28131,14 @@ pub const DB = struct {
             &transform_snapshot,
         );
         defer effective_ops.deinit(preparation_alloc);
-        // Graph projections are maintained as artifact deltas, while the
-        // transaction intent format currently carries only primary key/value
-        // rows. Refuse this combination rather than acknowledging a transform
-        // whose graph half cannot participate in the transaction commit.
-        if (effective_ops.graph_writes.items.len != 0 or effective_ops.graph_deletes.items.len != 0)
-            return error.UnsupportedTransformOperation;
+        var graph_writes: std.ArrayList(types.GraphEdgeWrite) = .empty;
+        defer graph_writes.deinit(preparation_alloc);
+        try graph_writes.appendSlice(preparation_alloc, req.graph_writes);
+        try graph_writes.appendSlice(preparation_alloc, effective_ops.graph_writes.items);
+        var graph_deletes: std.ArrayList(types.GraphEdgeDelete) = .empty;
+        defer graph_deletes.deinit(preparation_alloc);
+        try graph_deletes.appendSlice(preparation_alloc, req.graph_deletes);
+        try graph_deletes.appendSlice(preparation_alloc, effective_ops.graph_deletes.items);
 
         var intents = std.ArrayListUnmanaged(transactions_mod.WriteIntent).empty;
         defer intents.deinit(preparation_alloc);
@@ -27402,6 +28225,24 @@ pub const DB = struct {
             const view = prepared_schema_view orelse return error.PreparedGenerationChanged;
             if (view.version() != version) return error.PreparedGenerationChanged;
         }
+        try @import("../../sql/trigger_native_admission.zig").requireSchemaView(req.asBatch(txn_id, 0), prepared_schema_view != null);
+        try @import("../../sql/trigger_native_admission.zig").requireOwnerTable(req.asBatch(txn_id, 0), self.core.identity_namespace.table_id);
+        if (prepared_schema_view) |view| try @import("../../sql/trigger_native_admission.zig").verify(
+            preparation_alloc,
+            view,
+            req.asBatch(txn_id, 0),
+            self.local_execution.sql_preparation_secret,
+            self.local_execution.sql_preparation_issuer,
+            @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)),
+            ordered_receipt != null,
+        ) else try @import("../../sql/trigger_native_admission.zig").verifyNoSchema(
+            preparation_alloc,
+            req.asBatch(txn_id, 0),
+            self.local_execution.sql_preparation_secret,
+            self.local_execution.sql_preparation_issuer,
+            @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)),
+            ordered_receipt != null,
+        );
         if ((hasCoordinatedConstraints(prepared_schema_view) or req.relational_repair) and
             (req.relational_schema_version == null or req.relational_integrity_generation_set == null) and
             (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0)) return error.ForeignKeyCoordinationRequired;
@@ -27489,134 +28330,261 @@ pub const DB = struct {
             }
         }
 
+        const LockedPreparation = struct {
+            db: *DB,
+            arena: std.heap.ArenaAllocator,
+            txn_id: types.TxnId,
+            req: types.TransactionIntentRequest,
+            schema_namespace: u64,
+            binding: ?transactions_mod.SchemaBinding,
+            prepared_schema_view: ?schema_registry_mod.SchemaView,
+            integrity_catalog: ?@import("relational_integrity_catalog.zig").Catalog,
+            integrity_catalog_digest: ?[32]u8,
+            initial_intents: []const transactions_mod.WriteIntent,
+            initial_predicates: []const transactions_mod.VersionPredicate,
+            identity_upsert_keys: []const []const u8,
+            graph_writes: []const types.GraphEdgeWrite,
+            graph_deletes: []const types.GraphEdgeDelete,
+            write_count: usize,
+            delete_count: usize,
+            transform_snapshot: TransformReadSnapshot,
+            candidate_snapshot: GeneratedWriteReadSnapshot = .{},
+            row_policy_principal: ?*const row_policy_authority_mod.Payload,
+            row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
+            final_intents: []const transactions_mod.WriteIntent = &.{},
+            final_predicates: []const transactions_mod.VersionPredicate = &.{},
+            index_spans: []const [@import("../range_protection.zig").index_span_digest_bytes]u8 = &.{},
+
+            fn finalizeLocked(context: *@This()) !void {
+                const owner_db = context.db;
+                const plan_alloc = context.arena.allocator();
+                const transaction_id = context.txn_id;
+                const request = context.req;
+                const observed_namespace = context.schema_namespace;
+                const schema_binding = context.binding;
+                const view_snapshot = context.prepared_schema_view;
+                const catalog_snapshot = context.integrity_catalog;
+                const catalog_digest = context.integrity_catalog_digest;
+                const transform_reads = context.transform_snapshot;
+                const policy_principal = context.row_policy_principal;
+                const policy_lease = context.row_policy_lease;
+                // Copy only list storage; the original prepared AROWs stay owned
+                // by this attempt and are never re-evaluated as logical writes.
+                var planned_intents: std.ArrayListUnmanaged(transactions_mod.WriteIntent) = .empty;
+                try planned_intents.appendSlice(plan_alloc, context.initial_intents);
+                var planned_predicates: std.ArrayListUnmanaged(transactions_mod.VersionPredicate) = .empty;
+                try planned_predicates.appendSlice(plan_alloc, context.initial_predicates);
+                try owner_db.validateGeneratedWriteReadSnapshot(context.candidate_snapshot);
+                if (owner_db.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+                if (observed_namespace != owner_db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+                if (schema_binding == null) try owner_db.validatePreparedSchemaViewLocked(view_snapshot);
+                if (policy_principal) |principal| {
+                    const view = view_snapshot orelse return error.RowPolicyCatalogChanged;
+                    try owner_db.enforceRowPolicyIntentsLocked(view, planned_intents.items, request.predicates, principal);
+                }
+                const integrity_mod = @import("relational_integrity.zig");
+                const activation_mod = @import("relational_integrity_activation.zig");
+                var repair_checkpoint: ?[]const u8 = null;
+                var restore_checkpoint: ?[]const u8 = null;
+                var topology_manager = try owner_db.core.initTxnManager();
+                defer topology_manager.deinit();
+                {
+                    var topology_read = try owner_db.core.store.beginProbeTxn();
+                    defer topology_read.abort();
+                    if (owner_db.local_execution.materialized_view_read_only.load(.acquire) and (context.write_count != 0 or context.delete_count != 0)) try @import("restore_staging.zig").requirePrimaryWritable(plan_alloc, &topology_read);
+                    try @import("restore_staging.zig").requireMutableScope(plan_alloc, &topology_read, request.restore_staging_scope);
+                    if (request.restore_staging_scope != null and (context.write_count != 0 or context.delete_count != 0 or request.relational_repair or request.relational_retirement != null)) return error.InvalidRestoreStagingCommand;
+                    if (request.restore_staging_scope != null) {
+                        const checkpoint = (try @import("restore_staging.zig").optional(&topology_read)) orelse return error.RestoreStagingScopeChanged;
+                        restore_checkpoint = try plan_alloc.dupe(u8, checkpoint);
+                        try planned_predicates.append(plan_alloc, .{ .key = @import("restore_staging.zig").key, .comparison = .exact_value, .expected_value = restore_checkpoint });
+                    }
+                    try @import("relational_integrity_topology.zig").admitPrepare(&topology_read, &topology_manager, plan_alloc, transaction_id);
+                }
+                var maintenance_preparation: ?@import("relational_index_maintenance.zig").Prepared = null;
+                if (request.relational_index_maintenance) |command| {
+                    const view = view_snapshot orelse return error.RelationalTableRequired;
+                    if (view.version() != command.schema_version) return error.PreparedGenerationChanged;
+                    var plan = owner_db.core.relational_indexes.acquire() orelse return error.PreparedGenerationChanged;
+                    defer plan.deinit();
+                    if (plan.plan.schemaView().epoch != view.epoch) return error.PreparedGenerationChanged;
+                    var maintenance_read = try owner_db.core.store.beginProbeTxn();
+                    defer maintenance_read.abort();
+                    maintenance_preparation = try @import("relational_index_maintenance.zig").prepareCommand(
+                        plan_alloc,
+                        &maintenance_read,
+                        plan.plan,
+                        owner_db.core.identity_namespace.table_id,
+                        command,
+                    );
+                    try planned_intents.append(plan_alloc, maintenance_preparation.?.intent);
+                    try planned_predicates.append(plan_alloc, maintenance_preparation.?.predicate);
+                }
+                var integrity_effects: ?integrity_mod.Effects = null;
+                if (request.integrity.len != 0 or request.integrity_commands.len != 0 or request.relational_activation != null or request.relational_retirement != null or catalog_snapshot != null) {
+                    var integrity_read = try integrity_mod.CurrentView.initForTransaction(owner_db.core.store, plan_alloc, transaction_id);
+                    defer integrity_read.deinit();
+                    // Shadow claims must remain unobservable even to a participant
+                    // whose stale route happens to name this receiver. Check before
+                    // any claim/reference lookup or semantic preparation occurs.
+                    for (request.integrity_commands) |command| try @import("online_integrity_shadow.zig").requireServing(&integrity_read, owner_db.core.byteRange(), &command.address.routing);
+                    for (request.integrity) |operation| try @import("online_integrity_shadow.zig").requireServing(&integrity_read, owner_db.core.byteRange(), operation.routing_key);
+                    // Layout epochs alone do not fence changes to UNIQUE/FK declarations.
+                    // Compare the exact catalog observed during preparation under apply.
+                    const current_catalog = integrity_read.get(integrity_catalog_mod.key) catch |err| switch (err) {
+                        error.NotFound => return error.IntegrityCatalogChanged,
+                        else => return err,
+                    };
+                    var current_digest: [32]u8 = undefined;
+                    std.crypto.hash.Blake3.hash(current_catalog, &current_digest, .{});
+                    if (!std.mem.eql(u8, &current_digest, &catalog_digest.?)) return error.IntegrityCatalogChanged;
+                    if (request.relational_retirement) |command| {
+                        if (context.write_count != 0 or context.delete_count != 0 or request.relational_activation != null or request.relational_repair) return error.InvalidConstraintRetirementCommand;
+                        try @import("online_integrity_shadow.zig").requireCatalogMutable(&integrity_read);
+                        try @import("online_integrity_shadow.zig").requireServing(&integrity_read, owner_db.core.byteRange(), command.routing_key);
+                        const retirement = try @import("relational_integrity_retirement.zig").prepareCommand(plan_alloc, &integrity_read, catalog_snapshot.?, command);
+                        const after = try @import("relational_integrity_retirement.zig").Progress.decode(command.next);
+                        if (command.expected) |expected| {
+                            const before = try @import("relational_integrity_retirement.zig").Progress.decode(expected);
+                            if (schema_binding == null and before.phase == .fenced and after.phase != .fenced and try topology_manager.hasSchemaLeases()) return error.SchemaInUse;
+                        }
+                        try planned_intents.append(plan_alloc, retirement.intent);
+                        try planned_predicates.append(plan_alloc, retirement.predicate);
+                    }
+                    if (request.relational_activation) |command| {
+                        try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
+                        try @import("online_integrity_shadow.zig").requireCatalogMutable(&integrity_read);
+                        // A backfill page changes claims and its durable cursor, never
+                        // primary rows. Its observed rows are retained read guards.
+                        if (context.write_count != 0 or context.delete_count != 0) return error.InvalidConstraintActivationCommand;
+                        try @import("online_integrity_shadow.zig").requireServing(&integrity_read, owner_db.core.byteRange(), command.routing_key);
+                        const activation = try activation_mod.prepareCommandForOwner(plan_alloc, &integrity_read, catalog_snapshot.?, command, owner_db.root_incarnation);
+                        try planned_intents.append(plan_alloc, activation.intent);
+                        if (activation.inputs) |inputs| try planned_intents.append(plan_alloc, inputs);
+                        try planned_predicates.append(plan_alloc, activation.predicate);
+                    } else if (context.write_count != 0 or context.delete_count != 0) {
+                        try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
+                        if (request.relational_repair) {
+                            const repair_guard = try activation_mod.repairPredicate(plan_alloc, &integrity_read, catalog_snapshot.?);
+                            repair_checkpoint = repair_guard.expected_value;
+                            try planned_predicates.append(plan_alloc, repair_guard);
+                        } else try activation_mod.requireReady(&integrity_read, catalog_snapshot.?);
+                    }
+                    if (request.integrity.len != 0 and request.integrity_commands.len != 0) return error.InvalidIntegrityOperation;
+                    if (request.integrity.len != 0) try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
+                    try @import("relational_integrity_retirement.zig").admitCommands(&integrity_read, request.integrity_commands);
+                    const integrity_operations = if (request.integrity_commands.len != 0) operations: {
+                        integrity_effects = try integrity_mod.prepare(plan_alloc, &integrity_read, request.integrity_commands);
+                        break :operations integrity_effects.?.operations;
+                    } else request.integrity;
+                    try integrity_mod.validatePreparedEffects(plan_alloc, &integrity_read, integrity_operations);
+                    for (integrity_operations) |operation| {
+                        try @import("online_integrity_shadow.zig").requireServing(&integrity_read, owner_db.core.byteRange(), operation.routing_key);
+                        const parsed_key = try integrity_mod.parseKey(operation.key);
+                        const generation = catalog_snapshot.?.findGeneration(parsed_key.address.generation) orelse return error.IntegrityCatalogChanged;
+                        if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;
+                        if (request.integrity_commands.len == 0 and generation.retired and operation.kind != .delete) return error.IntegrityCatalogChanged;
+                        try planned_predicates.append(plan_alloc, integrity_mod.predicate(operation));
+                        if (operation.kind != .guard) try planned_intents.append(plan_alloc, .{ .key = operation.key, .value = operation.value });
+                    }
+                }
+                try owner_db.validateTransformReadSnapshot(transform_reads);
+                try owner_db.failIfIdentityOrdinalExhaustedForNewUpserts(context.identity_upsert_keys);
+                const index_spans = try owner_db.collectIndexSpanReservations(plan_alloc, planned_intents.items, view_snapshot);
+                try owner_db.prepareOnlineVectorIntentBoundsLocked(plan_alloc, planned_intents.items, view_snapshot);
+                if (context.graph_writes.len != 0 or context.graph_deletes.len != 0) {
+                    var graph_admission = try owner_db.core.store.beginReadTxn();
+                    defer graph_admission.abort();
+                    // Server-owned roots require the actual protected preparation
+                    // envelope. Public transform JSON cannot opt into a newer reader.
+                    // Embedded roots without a server authority use the atomic ATBL5
+                    // decoder fence in the vote batch instead of pretending metadata.
+                    if (try @import("../source_authority.zig").load(&graph_admission) != null and (request.trigger_receipts.len == 0 or request.graph_preparation == null)) return error.SqlTriggerCoordinationRequired;
+                }
+                if (request.graph_preparation) |proof| {
+                    const schema_digest = if (view_snapshot) |view| view.validator().?.source_digest orelse return error.PreparedGenerationChanged else @import("relational_schema_owner_contract.zig").hash("");
+                    if (!std.mem.eql(u8, &proof.schema_digest, &schema_digest)) return error.PreparedGenerationChanged;
+                }
+                try owner_db.prepareGraphIntentEffectsLocked(plan_alloc, planned_intents.items, context.graph_writes, context.graph_deletes, request.graph_preparation);
+                try owner_db.prepareGraphEndpointDependenciesLocked(plan_alloc, plan_alloc, transaction_id, planned_intents.items, view_snapshot, &planned_predicates);
+                if (policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+                context.final_intents = planned_intents.items;
+                context.final_predicates = planned_predicates.items;
+                context.index_spans = index_spans;
+            }
+
+            fn finalizeNative(ptr: *anyopaque) anyerror!execution_resources.NativeAtomicEffects {
+                const context: *@This() = @ptrCast(@alignCast(ptr));
+                if (context.db.sql_persistence == null) return error.InvalidSqlRelationPersistence;
+                try context.finalizeLocked();
+                try context.db.core.checkVersionPredicates(context.final_predicates, null);
+                const a = context.arena.allocator();
+                var writes: std.ArrayList(docstore_mod.KVPair) = .empty;
+                var deletes: std.ArrayList([]const u8) = .empty;
+                for (context.final_intents) |intent| {
+                    if (intent.prepared_graph_effects != null) return error.UnsupportedTransformOperation;
+                    if (!isMetadataKey(intent.key)) continue;
+                    if (intent.value) |value| try writes.append(a, .{ .key = intent.key, .value = value }) else try deletes.append(a, intent.key);
+                }
+                return .{ .writes = writes.items, .deletes = deletes.items };
+            }
+        };
+        var locked: LockedPreparation = .{
+            .db = self,
+            .arena = std.heap.ArenaAllocator.init(preparation_alloc),
+            .txn_id = txn_id,
+            .req = req,
+            .schema_namespace = schema_namespace,
+            .binding = binding,
+            .prepared_schema_view = prepared_schema_view,
+            .integrity_catalog = integrity_catalog,
+            .integrity_catalog_digest = integrity_catalog_digest,
+            .initial_intents = intents.items,
+            .initial_predicates = predicates.items,
+            .identity_upsert_keys = identity_upsert_keys.items,
+            .graph_writes = graph_writes.items,
+            .graph_deletes = graph_deletes.items,
+            .write_count = effective_ops.writes.len,
+            .delete_count = effective_ops.deletes.len,
+            .transform_snapshot = transform_snapshot,
+            .row_policy_principal = row_policy_principal,
+            .row_policy_lease = row_policy_lease,
+        };
+        defer locked.arena.deinit();
+        if (atomic_execution) |execution| {
+            // Authorize OLD/NEW before any provider sees a candidate. Capture
+            // every touched key under this same short shared apply cut, including
+            // absence/deletes; the finalizer rechecks revisions and policy after
+            // providers, before primary/integrity effects become possible.
+            {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+                if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+                try self.validatePreparedSchemaViewLocked(prepared_schema_view);
+                const a = locked.arena.allocator();
+                const keys = try a.alloc(types.BatchWrite, intents.items.len);
+                for (intents.items, keys) |intent, *key| key.* = .{ .key = intent.key, .value = "" };
+                locked.candidate_snapshot = try self.captureGeneratedWriteReadSnapshot(a, keys);
+                if (row_policy_principal) |principal| {
+                    const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
+                    try self.enforceRowPolicyIntentsLocked(view, intents.items, req.predicates, principal);
+                }
+                if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            }
+            const checked: execution_resources.CheckedNativeAtomic = .{
+                .snapshot_owner = execution.snapshot_owner,
+                .replication_owner = &execution.replication_mutation,
+                .schema_namespace_generation = schema_namespace,
+                .ptr = &locked,
+                .finalize_fn = LockedPreparation.finalizeNative,
+            };
+            return self.commitNativeAtomicIntents(execution, preparation_alloc, intents.items, &checked, row_policy_principal, row_policy_lease);
+        }
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
-        if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-        if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
-        if (row_policy_principal) |principal| {
-            const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
-            try self.enforceRowPolicyIntentsLocked(view, intents.items, req.predicates, principal);
-        }
-        const integrity_mod = @import("relational_integrity.zig");
-        const activation_mod = @import("relational_integrity_activation.zig");
-        var repair_checkpoint: ?[]const u8 = null;
-        defer if (repair_checkpoint) |bytes| preparation_alloc.free(bytes);
-        var restore_checkpoint: ?[]const u8 = null;
-        defer if (restore_checkpoint) |bytes| preparation_alloc.free(bytes);
-        var topology_manager = try self.core.initTxnManager();
-        defer topology_manager.deinit();
-        {
-            var topology_read = try self.core.store.beginProbeTxn();
-            defer topology_read.abort();
-            if (self.local_execution.materialized_view_read_only.load(.acquire) and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0)) try @import("restore_staging.zig").requirePrimaryWritable(preparation_alloc, &topology_read);
-            try @import("restore_staging.zig").requireMutableScope(preparation_alloc, &topology_read, req.restore_staging_scope);
-            if (req.restore_staging_scope != null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0 or req.relational_repair or req.relational_retirement != null)) return error.InvalidRestoreStagingCommand;
-            if (req.restore_staging_scope != null) {
-                const checkpoint = (try @import("restore_staging.zig").optional(&topology_read)) orelse return error.RestoreStagingScopeChanged;
-                restore_checkpoint = try preparation_alloc.dupe(u8, checkpoint);
-                try predicates.append(preparation_alloc, .{ .key = @import("restore_staging.zig").key, .comparison = .exact_value, .expected_value = restore_checkpoint });
-            }
-            try @import("relational_integrity_topology.zig").admitPrepare(&topology_read, &topology_manager, preparation_alloc, txn_id);
-        }
-        var maintenance_preparation: ?@import("relational_index_maintenance.zig").Prepared = null;
-        defer if (maintenance_preparation) |*value| value.deinit();
-        if (req.relational_index_maintenance) |command| {
-            const view = prepared_schema_view orelse return error.RelationalTableRequired;
-            if (view.version() != command.schema_version) return error.PreparedGenerationChanged;
-            var plan = self.core.relational_indexes.acquire() orelse return error.PreparedGenerationChanged;
-            defer plan.deinit();
-            if (plan.plan.schemaView().epoch != view.epoch) return error.PreparedGenerationChanged;
-            var maintenance_read = try self.core.store.beginProbeTxn();
-            defer maintenance_read.abort();
-            maintenance_preparation = try @import("relational_index_maintenance.zig").prepareCommand(
-                preparation_alloc,
-                &maintenance_read,
-                plan.plan,
-                self.core.identity_namespace.table_id,
-                command,
-            );
-            try intents.append(preparation_alloc, maintenance_preparation.?.intent);
-            try predicates.append(preparation_alloc, maintenance_preparation.?.predicate);
-        }
-        var integrity_effects: ?integrity_mod.Effects = null;
-        defer if (integrity_effects) |*effects| effects.deinit();
-        if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or integrity_catalog != null) {
-            var integrity_read = try integrity_mod.CurrentView.initForTransaction(self.core.store, preparation_alloc, txn_id);
-            defer integrity_read.deinit();
-            // Shadow claims must remain unobservable even to a participant
-            // whose stale route happens to name this receiver. Check before
-            // any claim/reference lookup or semantic preparation occurs.
-            for (req.integrity_commands) |command| try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), &command.address.routing);
-            for (req.integrity) |operation| try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), operation.routing_key);
-            // Layout epochs alone do not fence changes to UNIQUE/FK declarations.
-            // Compare the exact catalog observed during preparation under apply.
-            const current_catalog = integrity_read.get(integrity_catalog_mod.key) catch |err| switch (err) {
-                error.NotFound => return error.IntegrityCatalogChanged,
-                else => return err,
-            };
-            var current_digest: [32]u8 = undefined;
-            std.crypto.hash.Blake3.hash(current_catalog, &current_digest, .{});
-            if (!std.mem.eql(u8, &current_digest, &integrity_catalog_digest.?)) return error.IntegrityCatalogChanged;
-            if (req.relational_retirement) |command| {
-                if (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0 or req.relational_activation != null or req.relational_repair) return error.InvalidConstraintRetirementCommand;
-                try @import("online_integrity_shadow.zig").requireCatalogMutable(&integrity_read);
-                try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), command.routing_key);
-                const retirement = try @import("relational_integrity_retirement.zig").prepareCommand(preparation_alloc, &integrity_read, integrity_catalog.?, command);
-                const after = try @import("relational_integrity_retirement.zig").Progress.decode(command.next);
-                if (command.expected) |expected| {
-                    const before = try @import("relational_integrity_retirement.zig").Progress.decode(expected);
-                    if (binding == null and before.phase == .fenced and after.phase != .fenced and try topology_manager.hasSchemaLeases()) return error.SchemaInUse;
-                }
-                try intents.append(preparation_alloc, retirement.intent);
-                try predicates.append(preparation_alloc, retirement.predicate);
-            }
-            if (req.relational_activation) |command| {
-                try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
-                try @import("online_integrity_shadow.zig").requireCatalogMutable(&integrity_read);
-                // A backfill page changes claims and its durable cursor, never
-                // primary rows. Its observed rows are retained read guards.
-                if (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0) return error.InvalidConstraintActivationCommand;
-                try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), command.routing_key);
-                const activation = try activation_mod.prepareCommandForOwner(preparation_alloc, &integrity_read, integrity_catalog.?, command, self.root_incarnation);
-                try intents.append(preparation_alloc, activation.intent);
-                if (activation.inputs) |inputs| try intents.append(preparation_alloc, inputs);
-                try predicates.append(preparation_alloc, activation.predicate);
-            } else if (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0) {
-                try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
-                if (req.relational_repair) {
-                    const repair_guard = try activation_mod.repairPredicate(preparation_alloc, &integrity_read, integrity_catalog.?);
-                    repair_checkpoint = repair_guard.expected_value;
-                    try predicates.append(preparation_alloc, repair_guard);
-                } else try activation_mod.requireReady(&integrity_read, integrity_catalog.?);
-            }
-            if (req.integrity.len != 0 and req.integrity_commands.len != 0) return error.InvalidIntegrityOperation;
-            if (req.integrity.len != 0) try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
-            try @import("relational_integrity_retirement.zig").admitCommands(&integrity_read, req.integrity_commands);
-            const integrity_operations = if (req.integrity_commands.len != 0) operations: {
-                integrity_effects = try integrity_mod.prepare(preparation_alloc, &integrity_read, req.integrity_commands);
-                break :operations integrity_effects.?.operations;
-            } else req.integrity;
-            try integrity_mod.validatePreparedEffects(preparation_alloc, &integrity_read, integrity_operations);
-            for (integrity_operations) |operation| {
-                try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), operation.routing_key);
-                const parsed_key = try integrity_mod.parseKey(operation.key);
-                const generation = integrity_catalog.?.findGeneration(parsed_key.address.generation) orelse return error.IntegrityCatalogChanged;
-                if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;
-                if (req.integrity_commands.len == 0 and generation.retired and operation.kind != .delete) return error.IntegrityCatalogChanged;
-                try predicates.append(preparation_alloc, integrity_mod.predicate(operation));
-                if (operation.kind != .guard) try intents.append(preparation_alloc, .{ .key = operation.key, .value = operation.value });
-            }
-        }
-        try self.validateTransformReadSnapshot(transform_snapshot);
-        try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
-        const index_spans = try self.collectIndexSpanReservations(preparation_alloc, intents.items, prepared_schema_view);
-        defer if (index_spans.len != 0) preparation_alloc.free(index_spans);
-        try self.prepareOnlineVectorIntentBoundsLocked(preparation_alloc, intents.items, prepared_schema_view);
-        var endpoint_dependencies = std.heap.ArenaAllocator.init(preparation_alloc);
-        defer endpoint_dependencies.deinit();
-        try self.prepareGraphEndpointDependenciesLocked(preparation_alloc, endpoint_dependencies.allocator(), txn_id, intents.items, prepared_schema_view, &predicates);
-        if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        try locked.finalizeLocked();
+        const index_spans = locked.index_spans;
         if (ordered_receipt) |identity| {
             switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
                 .already_applied => return,
@@ -27626,13 +28594,14 @@ pub const DB = struct {
             const marker = orderedApplyReceiptWrite(identity, &value_buf);
             try self.core.writeIntentsExtraBatch(
                 txn_id,
-                intents.items,
-                predicates.items,
-                .{ .external_decision_owner = req.external_decision_owner, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans },
+                locked.final_intents,
+                locked.final_predicates,
+                .{ .external_decision_owner = req.external_decision_owner, .native_pin = try self.relationPhysicalPin(), .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans },
             );
         } else {
-            try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+            try self.core.writeIntentsExtraBatch(txn_id, locked.final_intents, locked.final_predicates, .{
                 .external_decision_owner = req.external_decision_owner,
+                .native_pin = try self.relationPhysicalPin(),
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
                 .index_span_digests = index_spans,
@@ -27650,7 +28619,87 @@ pub const DB = struct {
 
     pub const validatePreparedSchemaViewLocked = local_mutation.validatePreparedSchemaViewLocked;
 
+    fn prepareGraphIntentEffectsLocked(self: *DB, alloc: Allocator, intents: []transactions_mod.WriteIntent, writes: []const types.GraphEdgeWrite, deletes: []const types.GraphEdgeDelete, admission: ?@import("prepared_graph_effects.zig").Admission) !void {
+        const effects = @import("prepared_graph_effects.zig");
+        if (writes.len == 0 and deletes.len == 0) return;
+        if (admission) |proof| {
+            try proof.validate();
+            if (proof.table_id != self.core.identity_namespace.table_id) return error.PreparedGenerationChanged;
+        }
+        if (writes.len + deletes.len > effects.max_operations) return error.TransactionTooLarge;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const Group = struct {
+            intent: *transactions_mod.WriteIntent,
+            indexes: std.StringHashMapUnmanaged(effects.Index) = .empty,
+            writes: std.ArrayList(types.GraphEdgeWrite) = .empty,
+            deletes: std.ArrayList(types.GraphEdgeDelete) = .empty,
+        };
+        var groups: std.StringHashMapUnmanaged(*Group) = .empty;
+        for (intents) |*intent| {
+            if (intent.prepared_graph_effects != null) return error.InvalidPreparedGraphEffects;
+            if (intent.value == null or isMetadataKey(intent.key)) continue;
+            const entry = try groups.getOrPut(a, intent.key);
+            if (entry.found_existing) return error.InvalidPreparedGraphEffects;
+            const group = try a.create(Group);
+            group.* = .{ .intent = intent };
+            entry.value_ptr.* = group;
+        }
+        var bindings: std.StringHashMapUnmanaged(effects.Index) = .empty;
+        inline for (.{ writes, deletes }) |operations| for (operations) |operation| {
+            const owner = if (operation.owner_document.len != 0) operation.owner_document else if (operation.owner.len != 0) operation.owner else operation.source;
+            const group = groups.get(owner) orelse return error.InvalidPreparedGraphEffects;
+            const binding = if (bindings.get(operation.index_name)) |known| known else capture: {
+                const index = self.core.index_manager.graphIndex(operation.index_name) orelse return error.IndexNotFound;
+                const digest = (try @import("graph_retirement_config.zig").fromLoaded(a, &.{index.config})).?;
+                if (admission) |proof| try proof.requireIndex(operation.index_name, digest);
+                const bound: effects.Index = .{ .name = operation.index_name, .generation = index.config.coverage_generation, .definition_digest = digest };
+                try bindings.put(a, operation.index_name, bound);
+                break :capture bound;
+            };
+            try group.indexes.put(a, operation.index_name, binding);
+            if (@TypeOf(operation) == types.GraphEdgeWrite) try group.writes.append(a, operation) else try group.deletes.append(a, operation);
+            // Reserve the fixed artifact/contender/TTL companions plus encoded
+            // identity and metadata bytes before the prepare vote. The backend
+            // still enforces actual frame/key bounds at the native commit.
+            const names: u64 = @intCast(operation.index_name.len + operation.source.len + operation.target.len + operation.edge_type.len + operation.edge_id.len + operation.owner_document.len + operation.owner.len);
+            const metadata: u64 = if (@TypeOf(operation) == types.GraphEdgeWrite) @intCast(operation.metadata_json.len) else 0;
+            const bytes = std.math.add(u64, std.math.mul(u64, names, 16) catch return error.TransactionTooLarge, std.math.mul(u64, metadata, 4) catch return error.TransactionTooLarge) catch return error.TransactionTooLarge;
+            group.intent.retained_artifact_bytes = std.math.add(u64, group.intent.retained_artifact_bytes, std.math.add(u64, bytes, 4096) catch return error.TransactionTooLarge) catch return error.TransactionTooLarge;
+            group.intent.retained_artifact_keys = std.math.add(u64, group.intent.retained_artifact_keys, 32) catch return error.TransactionTooLarge;
+        };
+        errdefer for (intents) |*intent| if (intent.prepared_graph_effects) |bytes| {
+            alloc.free(bytes);
+            intent.prepared_graph_effects = null;
+        };
+        var iterator = groups.iterator();
+        while (iterator.next()) |entry| {
+            const group = entry.value_ptr.*;
+            if (group.writes.items.len == 0 and group.deletes.items.len == 0) continue;
+            const indexes = try a.alloc(effects.Index, group.indexes.count());
+            var index_iterator = group.indexes.valueIterator();
+            for (indexes) |*index| index.* = index_iterator.next().?.*;
+            // Stable order is part of the prepared intent's immutable bytes.
+            std.mem.sort(effects.Index, indexes, {}, struct {
+                fn less(_: void, x: effects.Index, y: effects.Index) bool {
+                    return std.mem.lessThan(u8, x.name, y.name);
+                }
+            }.less);
+            const selected_admission: ?effects.Admission = if (admission) |proof| selected: {
+                var narrow = proof;
+                const definitions = try a.alloc(effects.Definition, indexes.len);
+                for (definitions, indexes) |*definition, index| definition.* = .{ .name = index.name, .digest = index.definition_digest };
+                narrow.indexes = definitions;
+                break :selected narrow;
+            } else null;
+            const prepared: effects.Effects = .{ .admission = selected_admission, .owner = entry.key_ptr.*, .indexes = indexes, .writes = group.writes.items, .deletes = group.deletes.items };
+            group.intent.prepared_graph_effects = try prepared.encode(alloc, entry.key_ptr.*);
+        }
+    }
+
     fn freePreparedIntentRows(alloc: Allocator, intents: []const transactions_mod.WriteIntent) void {
+        for (intents) |intent| if (intent.prepared_graph_effects) |effects| alloc.free(effects);
         for (intents) |intent| if (intent.prepared_row) |row| {
             alloc.free(@constCast(row));
             alloc.free(@constCast(intent.value.?));
@@ -27712,7 +28761,15 @@ pub const DB = struct {
             var extracted = if (prepared) |*row| row.takeExtracted() else try mapper.extractWriteFromParsed(row_alloc, intent.key, value, root);
             defer extracted.deinit(row_alloc);
             try augmentExtractedWriteWithGraphFieldEdgesParsed(self, row_alloc, intent.key, root, &extracted);
-            for (extracted.graph_writes) |edge| {
+            var graph_writes: std.ArrayList(types.GraphEdgeWrite) = .empty;
+            try graph_writes.appendSlice(row_alloc, extracted.graph_writes);
+            var attached: ?std.json.Parsed(@import("prepared_graph_effects.zig").Effects) = if (intent.prepared_graph_effects) |bytes|
+                try @import("prepared_graph_effects.zig").decode(row_alloc, bytes, intent.key)
+            else
+                null;
+            defer if (attached) |*effects| effects.deinit();
+            if (attached) |effects| try graph_writes.appendSlice(row_alloc, effects.value.writes);
+            for (graph_writes.items) |edge| {
                 if (edge.owner_document.len != 0 and !std.mem.eql(u8, edge.owner_document, edge.source)) continue;
                 if (edge.owner.len != 0 and !std.mem.eql(u8, edge.owner, edge.source)) continue;
                 var table_scratch = graph_metadata_tables.Scratch.init(row_alloc, null);
@@ -28082,11 +29139,7 @@ pub const DB = struct {
 
     fn activateExternalTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, ordered: ?OrderedApplyReceipt) !void {
         const owner = req.external_decision_owner orelse return error.InvalidBatchRequest;
-        if (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or
-            req.integrity.len != 0 or req.integrity_commands.len != 0 or req.range_guards.len != 0 or
-            req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or
-            req.restore_staging_scope != null or req.relational_repair or req.row_policy_principal_proof.len != 0 or
-            req.row_policy_database.len != 0 or req.row_policy_admitted_at_seconds != 0) return error.InvalidBatchRequest;
+        if (req.asBatch(txn_id, 0).externalActivationOwner() == null) return error.InvalidBatchRequest;
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         var marker: [ordered_apply_receipt_value_len]u8 = undefined;
@@ -28113,6 +29166,50 @@ pub const DB = struct {
     pub fn getTransactionStatus(self: *DB, txn_id: transactions_mod.TxnId) !transactions_mod.TxnStatus {
         if (comptime storage_engine.enabled) return storage_engine.call("getTransactionStatus", .{ self, txn_id });
         return try self.core.getTransactionStatus(txn_id);
+    }
+
+    /// Immutable local participant image. A clean process restart changes its
+    /// execution epoch while preserving these actual primary facts.
+    pub fn relationPhysicalPin(self: *const DB) !?@import("../../common/relation_persistence.zig").PhysicalPin {
+        if (comptime storage_engine.enabled) return storage_engine.call("relationPhysicalPin", .{self});
+        const descriptor = self.sql_persistence orelse return null;
+        const pin: @import("../../common/relation_persistence.zig").PhysicalPin = .{
+            .physical_root_incarnation = self.root_incarnation,
+            .table_id = self.core.identity_namespace.table_id,
+            .shard_id = self.core.identity_namespace.shard_id,
+            .range_id = self.core.identity_namespace.range_id,
+            .data_generation = descriptor.data_generation,
+        };
+        try pin.validate();
+        return pin;
+    }
+
+    /// Private existing-participant observation. A transaction ID is a
+    /// locator; its immutable metadata decision owner is the authority.
+    pub fn externalTransactionStatus(self: *DB, txn_id: types.TxnId, owner: transactions_mod.ExternalDecisionOwner) !transactions_mod.TxnStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("externalTransactionStatus", .{ self, txn_id, owner });
+        try owner.validate();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const participant = (try transactions_mod.externalParticipant(&read, txn_id)) orelse return error.TxnNotFound;
+        const held = participant.owner orelse return error.ExternalTransactionDecisionChanged;
+        if (!held.eql(owner)) return error.ExternalTransactionDecisionChanged;
+        if (!std.meta.eql(participant.native_pin, try self.relationPhysicalPin())) return error.ExternalTransactionDecisionChanged;
+        return participant.status;
+    }
+
+    pub fn externalTransactionRetentionSnapshot(self: *DB, a: Allocator, id: types.TxnId, owner: transactions_mod.ExternalDecisionOwner, expected: transactions_mod.NativePhysicalPin) !transactions_mod.ExternalRetentionSnapshot {
+        if (comptime storage_engine.enabled) return storage_engine.call("externalTransactionRetentionSnapshot", .{ self, a, id, owner, expected });
+        try owner.validate();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        const actual = (try self.relationPhysicalPin()) orelse return error.ExternalTransactionDecisionChanged;
+        if (!actual.eql(expected)) return error.ExternalTransactionDecisionChanged;
+        var manager = try self.core.initTxnManager();
+        defer manager.deinit();
+        return manager.externalRetentionSnapshot(a, id, owner, actual);
     }
 
     pub fn getCommitVersion(self: *DB, txn_id: transactions_mod.TxnId) !u64 {
@@ -28142,7 +29239,7 @@ pub const DB = struct {
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
-            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt, schema_owner },
+            mode: enum { identity, status, retirement_status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt, schema_owner, sql_relation_binding },
             scope: ?@import("online_source_contract.zig").Scope = null,
         }, alloc, request_json, .{});
         defer request.deinit();
@@ -28171,6 +29268,54 @@ pub const DB = struct {
                 try @import("relational_integrity_json.zig").write(try self.relationalTopologyIdentity(), &stream);
             },
             .status => try @import("relational_integrity_json.zig").write(try self.relationalTopologyStatus(), &stream),
+            .retirement_status => {
+                if (!opts.fk_generation_source_control) return error.InvalidSqlRelationPersistence;
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                const descriptor = self.core.table_catalog.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+                if (descriptor.kind == .permanent or !std.meta.eql(self.sql_persistence, @as(?@import("../../common/relation_persistence.zig").Descriptor, descriptor))) return error.SqlRelationOwnerChanged;
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                const fence = try @import("relational_integrity_topology.zig").current(&read);
+                if (fence) |actual| switch (actual.role) {
+                    .document_retirement_source, .child_generation_source, .child_generation_dual => {},
+                    else => return error.InvalidIntegrityTopologyFence,
+                };
+                const status: RelationalTopologyStatus = .{ .fence = fence, .drained = !try transactions_mod.TxnManager.hasRelationLifetimeDebtInView(alloc, &read) };
+                try @import("relational_integrity_json.zig").write(status, &stream);
+            },
+            .sql_relation_binding => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                const descriptor = self.core.table_catalog.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+                if (!std.meta.eql(self.sql_persistence, @as(?@import("../../common/relation_persistence.zig").Descriptor, descriptor))) return error.SqlRelationOwnerChanged;
+                const encoded = try self.core.table_catalog.encodeDurable();
+                var fingerprint: [32]u8 = undefined;
+                std.crypto.hash.Blake3.hash(encoded.slice(), &fingerprint, .{});
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                const has_transaction_state = try transactions_mod.hasAnyTransactionStateInView(&read);
+                const schema_bytes = read.get(@import("../schema.zig").schema_key) catch |err| switch (err) {
+                    error.NotFound => "",
+                    else => return err,
+                };
+                const binding: @import("../../common/relation_persistence.zig").NativeBinding = .{
+                    .descriptor = descriptor,
+                    .native_instance = self.sql_native_instance,
+                    .table_id = self.core.identity_namespace.table_id,
+                    .shard_id = self.core.identity_namespace.shard_id,
+                    .range_id = self.core.identity_namespace.range_id,
+                    .physical_root_incarnation = self.root_incarnation,
+                    .schema_version = self.core.table_catalog.active_schema_version,
+                    .schema_digest = @import("restore_staging_contract.zig").digest(schema_bytes),
+                    .catalog_generation = self.core.table_catalog.generation,
+                    .catalog_fingerprint = fingerprint,
+                    .has_user_data = self.core.table_catalog.row_count != 0,
+                    .has_transaction_state = has_transaction_state,
+                };
+                try binding.validate();
+                try @import("relational_integrity_json.zig").write(binding, &stream);
+            },
             .schema_owner => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
@@ -30021,7 +31166,7 @@ pub const DB = struct {
                 command.transfer != null or command.parent_retirement != null or command.parent_activation != null or
                 command.child_generations != null) return error.InvalidBatchRequest;
             const install = command.child_schema_install.?;
-            const entry = opts.ordered_apply_receipt orelse opts.native_fk_generation_entry orelse return error.InvalidBatchRequest;
+            const entry = opts.ordered_apply_receipt orelse opts.native_fk_generation_entry orelse if (opts.native_fk_generation_control and self.sql_persistence != null) OrderedApplyReceipt{ .term = 0, .index = 0 } else return error.InvalidBatchRequest;
             return self.installPublishedChildSchema(self.alloc, install.schema_json, .{
                 .fence = command.fence,
                 .before_schema_json_digest = install.before_schema_json_digest,
@@ -30029,7 +31174,8 @@ pub const DB = struct {
                 .before_catalog_digest = install.before_catalog_digest,
                 .after_catalog_digest = install.after_catalog_digest,
                 .ordered_receipt = entry,
-                .native = opts.native_fk_generation_entry != null,
+                .native = opts.native_fk_generation_entry != null or opts.native_fk_generation_control,
+                .native_control = if (opts.native_fk_generation_control) command else null,
             });
         };
         if (req.relational_topology) |command| if (command.action == .provision_initial_child) {
@@ -30097,8 +31243,12 @@ pub const DB = struct {
             try self.flushDurableReplicationOutboxes();
             try self.preflightReplicationBatchSyncCommit();
         }
+        if (self.sql_persistence != null and !opts.native_fk_generation_control) if (req.relational_topology) |command| {
+            if (@import("native_topology_receipt.zig").fkGeneration(command)) return error.InvalidControlReceiptPosition;
+        };
         const native_control = opts.ordered_apply_receipt == null and opts.native_fk_generation_entry == null and
-            (if (req.relational_topology) |command| @import("native_topology_receipt.zig").supports(command) else false);
+            (if (req.relational_topology) |command| @import("native_topology_receipt.zig").supports(command) and
+                (!@import("native_topology_receipt.zig").fkGeneration(command) or opts.native_fk_generation_control) else false);
         if (native_control) try @import("native_topology_receipt.zig").validateRequest(self.alloc, req);
         const mirror_control = !opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null;
         const payload = if (mirror_control and !native_control)
@@ -30113,7 +31263,7 @@ pub const DB = struct {
             null;
         defer if (payload) |bytes| self.alloc.free(bytes);
         if (req.relational_topology) |command| {
-            try self.applyRelationalTopologyControlWithReplication(command, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload, opts.native_fk_generation_entry, if (native_control) .{ .request = req, .replay = opts.native_topology_position, .mirror = mirror_control } else null);
+            try self.applyRelationalTopologyControlWithReplication(command, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload, opts.native_fk_generation_entry, if (native_control) .{ .request = req, .replay = opts.native_topology_position, .mirror = mirror_control, .command_digest = if (opts.native_fk_generation_control) try @import("native_topology_receipt.zig").commandDigest(self.alloc, command) else null } else null);
         } else {
             try self.applyRangeFinalization(req.split_transition.?, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload);
         }
@@ -30124,6 +31274,7 @@ pub const DB = struct {
         request: types.BatchRequest,
         replay: ?@import("receipt_position.zig").Native,
         mirror: bool,
+        command_digest: ?[32]u8 = null,
     };
 
     fn applyRelationalTopologyControlWithReplication(
@@ -30188,7 +31339,10 @@ pub const DB = struct {
                 if (control.replay != null) return error.InvalidControlReceiptPosition;
                 break :blk null;
             }
-            break :blk try @import("native_topology_receipt.zig").stage(self.alloc, &txn, command, control.replay);
+            break :blk if (control.command_digest) |digest|
+                try @import("native_topology_receipt.zig").stageWithDigest(&txn, command, digest, control.replay)
+            else
+                try @import("native_topology_receipt.zig").stage(self.alloc, &txn, command, control.replay);
         } else null;
         const stamp: ?@import("receipt_position.zig").Position = if (native_prepared) |prepared|
             .{ .native = prepared.receipt }
@@ -30263,8 +31417,8 @@ pub const DB = struct {
                         else => return err,
                     };
                     if (raw == null) {
-                        const encoded = self.core.table_catalog.encode();
-                        try txn.put(table.key, &encoded);
+                        const encoded = try self.core.table_catalog.encodeDurable();
+                        try txn.put(table.key, encoded.slice());
                     }
                 }
                 try topology.stageBeginWithHandoff(&txn, command.fence, command.generation_handoff);
@@ -30517,6 +31671,19 @@ pub const DB = struct {
             const marker = replicationAppliedSequenceWrite(lsn, &marker_buf);
             try txn.put(marker.key, marker.value);
         }
+        if (native_prepared) |prepared| {
+            const admission = @import("relational_integrity_generation_admission.zig");
+            const key: ?[]const u8 = switch (command.action) {
+                .begin => if (command.fence.role == .child_generation_source or command.fence.role == .child_generation_dual or command.fence.role == .document_retirement_source) admission.source_fence_receipt_key else null,
+                .stage_child_generation => admission.staged_receipt_key,
+                .activate_child_generation => admission.activation_receipt_key,
+                .acknowledge_child_generation => admission.acknowledged_receipt_key,
+                .cancel => if (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_dual) admission.cancel_receipt_key else null,
+                .cancel_child_generation_source => admission.source_cancel_receipt_key,
+                else => null,
+            };
+            if (key) |selected| try admission.AppliedReceipt.stageNative(&txn, selected, prepared.receipt);
+        }
         try self.stageRestoreStagingReplicationOutbox(&txn, native_payload orelse replication_payload);
         try txn.commit();
         if (close_graph_after_commit) self.core.index_manager.setGraphRetirementAdmissionAssumeCatalogLock(false);
@@ -30541,6 +31708,17 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.markTransactionParticipantsResolvedExtraBatch(txn_id, participants, .{});
+    }
+
+    pub fn markExternalTransactionParticipantsResolved(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8, owner: transactions_mod.ExternalDecisionOwner) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("markExternalTransactionParticipantsResolved", .{ self, txn_id, participants, owner });
+        try owner.validate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.core.markTransactionParticipantsResolvedExtraBatch(txn_id, participants, .{ .external_decision_owner = owner, .native_pin = try self.relationPhysicalPin() });
     }
 
     pub fn markReplicatedTransactionParticipantResolvedAtOrderedReceipt(
@@ -31705,6 +32883,7 @@ pub const DB = struct {
     }
 
     fn addIndexForReconciliation(self: *DB, cfg: types.IndexConfig, admission_mode: IndexAdmissionMode, context: ?@import("artifact_reconcile_intent.zig").Context, replaces: ?[]const u8, prepared: ?*PreparedGraphReplacement) !?u128 {
+        if (self.sql_persistence != null and cfg.kind == .graph) return error.InvalidSqlRelationPersistence;
         if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyUnsupported;
         var row_policy_lease = self.local_execution.row_policy_gate.enterRaw() catch return error.RowPolicyUnsupported;
         defer row_policy_lease.release();
@@ -41223,6 +42402,31 @@ pub const DB = struct {
         if (!ready) return error.RestoreProjectionCatchUpPending;
     }
 
+    fn installNativeEmptyTarget(self: *DB, command: @import("native_empty_generation.zig").Install) !@import("native_empty_generation.zig").Receipt {
+        const descriptor = self.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+        if (descriptor.kind != .unlogged or self.local_execution.replication_async_batch_mirror != null or self.local_execution.replication_async_metadata_mirror != null) return error.InvalidSqlRelationPersistence;
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var txn = try self.core.store.beginWriteTxn();
+        var txn_open = true;
+        defer if (txn_open) txn.abort();
+        const bytes = txn.get(@import("restore_staging_contract.zig").bootstrap_key) catch return error.RestoreStagingScopeChanged;
+        var bootstrap = try @import("restore_staging_contract.zig").OwnerBootstrap.decode(self.alloc, bytes);
+        defer bootstrap.deinit();
+        if (!bootstrap.value.scope.target_namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        const owner = try @import("../source_authority.zig").require(&txn, .native, namespace);
+        const existing = try @import("native_empty_generation.zig").load(&txn);
+        const sequence = if (existing) |receipt| receipt.position.sequence else try @import("../source_authority.zig").advance(&txn, namespace, null);
+        if (sequence == 0 or (existing != null and sequence > owner.sequence)) return error.InvalidControlReceiptPosition;
+        const receipt = try @import("native_empty_generation.zig").stageInstall(self.alloc, &txn, bootstrap.value, command, .{ .namespace = self.core.identity_namespace, .sequence = sequence });
+        if (existing != null) return receipt;
+        try txn.commit();
+        txn_open = false;
+        try self.core.store.sync(true);
+        return receipt;
+    }
+
     fn installRestoreGenerationAdmissionsWithMarker(
         self: *DB,
         alloc: Allocator,
@@ -41309,6 +42513,7 @@ pub const DB = struct {
             .begin => |scope| try self.beginRestoreStagingWithMarker(self.alloc, scope, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
             .finish => |finish| _ = try self.finishRestoreStagingWithMarker(self.alloc, finish.scope, finish.phase, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
             .install_generation_admissions => |install| _ = try self.installRestoreGenerationAdmissionsWithMarker(self.alloc, install, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
+            .install_native_empty => unreachable, // Dedicated native-only transaction above.
             .import_page, .rewrite_page => unreachable,
         }
         if (payload != null) try self.flushDurableReplicationOutboxes();
@@ -41847,6 +43052,22 @@ pub const DB = struct {
             (next.phase == .imported or next.phase == .validated or next.phase == .published) and
             !try self.restoreStagingIndexesReadyAssumeApply(alloc))
             return if (marker != null or replication_lsn != null) error.RestoreProjectionCatchUpPending else error.IndexRebuilding;
+        if (phase == .published) {
+            const bootstrap_raw = txn.get(staging.bootstrap_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (bootstrap_raw) |bytes| {
+                var bootstrap = try staging.OwnerBootstrap.decode(alloc, bytes);
+                defer bootstrap.deinit();
+                if (bootstrap.value.native_empty_source) |loss| {
+                    const installed = (try @import("native_empty_generation.zig").load(&txn)) orelse return error.RestoreSourceProofMissing;
+                    if (!installed.position.namespace.eql(self.core.identity_namespace) or installed.origin_kind != loss.origin.kind() or
+                        !std.mem.eql(u8, &installed.scope, &scope) or !std.mem.eql(u8, &installed.origin_digest, &try loss.origin.digest()) or
+                        !std.mem.eql(u8, &installed.install_digest, &loss.expected_install_digest)) return error.RestoreStagingScopeChanged;
+                }
+            }
+        }
         if (next.phase == phase) {
             if (marker != null or replication_lsn != null or replication_payload != null) {
                 if (marker) |entry| {
@@ -43544,6 +44765,12 @@ pub const DB = struct {
     /// every fence before reading rows. A busy participant requires releasing
     /// ALL earlier fences before retrying: a prepared transaction may need one
     /// of those owners to finish resolution. Never drain it under this fence.
+    pub fn statementFenceSequence(self: *DB, fence: *const StatementReadFence) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("statementFenceSequence", .{ self, fence });
+        if (!fence.primary.active or !fence.replay.active or fence.primary.admission != self.core.snapshot_admission or fence.replay.admission != self.core.snapshot_replay_admission) return error.SqlStatementSnapshotRequired;
+        return self.core.nextDerivedSequence();
+    }
+
     pub fn tryStatementReadFence(self: *DB) !?StatementReadFence {
         if (comptime storage_engine.enabled) return storage_engine.call("tryStatementReadFence", .{self});
         return self.tryPrimaryReadFence(false);
@@ -43627,7 +44854,7 @@ pub const DB = struct {
         const end = try alloc.dupe(u8, borrowed.end);
         defer alloc.free(end);
         const txn = if (statement) |cut| try cut.read.forkRead() else try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
-        const now = currentTimeNs();
+        const now = if (statement) |cut| cut.read_at_ns else currentTimeNs();
         self.core.unlockApplyShared();
         locked = false;
         const session = try DocumentReadSession.openSnapshot(alloc, self.core.store, txn, schema, .{ .start = start, .end = end }, from_key, to_key, opts, now);
@@ -43860,7 +45087,7 @@ pub const DB = struct {
             if (verified_principal) |*proof| {
                 const bundle = if (self.local_execution.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
                 if (proof.value.purpose != .normalize)
-                    active.policy = try bundle.captureReadEvaluation(alloc, view.tableSchema().*, &proof.value);
+                    active.policy = try bundle.captureReadEvaluationAtSchemaView(alloc, view, &proof.value);
             }
             break :blk active;
         } else null;
@@ -44702,6 +45929,27 @@ pub const DB = struct {
             self.* = undefined;
         }
     };
+
+    /// Raw graph artifacts have no principal-proof filtering. Keep their
+    /// admission in the physical owner; policy activation drains these leases.
+    pub const RawGraphReadLease = struct {
+        policy: row_policy_gate_mod.Gate.Lease,
+
+        pub fn check(self: *const RawGraphReadLease) !void {
+            if (comptime storage_engine.enabled) return storage_engine.call("rawGraphReadLeaseCheck", .{self});
+            try self.policy.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        }
+        pub fn release(self: *RawGraphReadLease) void {
+            if (comptime storage_engine.enabled) return storage_engine.call("rawGraphReadLeaseRelease", .{self}) catch @panic("incompatible storage owner");
+            self.policy.release();
+        }
+    };
+
+    pub fn beginRawGraphReadLease(self: *DB) !RawGraphReadLease {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginRawGraphReadLease", .{self});
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        return .{ .policy = try self.local_execution.row_policy_gate.enterUnsupportedSearch() };
+    }
 
     /// Own one primary read generation across a local query's selection and
     /// aggregation collection. Acquire only after the Raft read barrier; never
@@ -49283,6 +50531,8 @@ pub const DB = struct {
         keys: []const []const u8,
     ) ![]types.SearchHit {
         if (comptime storage_engine.enabled) return storage_engine.call("graphHydrateKeysForInternalRead", .{ self, alloc, req, keys });
+        var raw_graph = try self.beginRawGraphReadLease();
+        defer raw_graph.release();
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         try self.requireGraphEndpointCleanupReady();
@@ -49404,6 +50654,8 @@ pub const DB = struct {
 
     pub fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
         if (comptime storage_engine.enabled) return storage_engine.call("searchGraph", .{ self, alloc, req, graph_query, base_hits });
+        var raw_graph = try self.beginRawGraphReadLease();
+        defer raw_graph.release();
         _ = req.index_name;
         const predicate_aware = graphRequestRequiresAdmission(req, graph_query.params.node_filter);
         var admission = GraphNodeAdmissionCache.init(self, alloc, req, graph_query.index_name, graph_query.params.node_filter);
@@ -54986,7 +56238,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     );
     try delete_keys.appendSlice(ctx.alloc, identity_visibility_deletes.items);
     var next_table_catalog: ?table_catalog_mod.Catalog = null;
-    var table_catalog_value: [table_catalog_mod.encoded_len]u8 = undefined;
+    var table_catalog_value: table_catalog_mod.Encoded = undefined;
     if (pending_identity_visibility_summary != null) {
         if (ctx.table_catalog) |current| {
             const row_count: u64 = @intFromBool(try range_cardinality.afterIdentityTransition(ctx.alloc, ctx.store, identity_writes.items) != 0);
@@ -54994,9 +56246,9 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
                 var next = current.*;
                 next.row_count = row_count;
                 next.generation +|= 1;
-                table_catalog_value = next.encode();
+                table_catalog_value = try next.encodeDurable();
                 next_table_catalog = next;
-                try store_writes.append(ctx.alloc, .{ .key = table_catalog_mod.key, .value = &table_catalog_value });
+                try store_writes.append(ctx.alloc, .{ .key = table_catalog_mod.key, .value = table_catalog_value.slice() });
             }
         }
     } else if (ctx.table_catalog) |current| {
@@ -55006,9 +56258,9 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
             var next = current.*;
             next.row_count = 1;
             next.generation +|= 1;
-            table_catalog_value = next.encode();
+            table_catalog_value = try next.encodeDurable();
             next_table_catalog = next;
-            try store_writes.append(ctx.alloc, .{ .key = table_catalog_mod.key, .value = &table_catalog_value });
+            try store_writes.append(ctx.alloc, .{ .key = table_catalog_mod.key, .value = table_catalog_value.slice() });
         }
     }
     if (index_stage) |*stage| {
@@ -125245,20 +126497,27 @@ test "db owner open does not downgrade a newer durable schema for Raft catch-up"
 }
 
 test "db owner reopen pins old child schema until exact generation install" {
-    try testChildGenerationInstall(false);
+    try testChildGenerationInstall(false, false);
 }
 
 test "db native FK generation receipts survive restart without Raft watermark" {
-    try testChildGenerationInstall(true);
+    try testChildGenerationInstall(true, false);
 }
 
-fn testChildGenerationInstall(native: bool) !void {
+test "db SQL relation lifetime FK receipt positions commit with schema and survive replay restart" {
+    try testChildGenerationInstall(true, true);
+}
+
+fn testChildGenerationInstall(native: bool, lifetime: bool) !void {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db-child-generation-owner-reopen");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     const namespace: doc_identity.Namespace = .{ .table_id = 17, .shard_id = 19, .range_id = 19 };
+    const descriptor: ?@import("../../common/relation_persistence.zig").Descriptor = if (lifetime) .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(7), .data_generation = 1 } else null;
+    const host: ?@import("../../common/relation_persistence.zig").Context = if (lifetime) .{ .node_id = 9, .store_id = 11, .execution_instance = @splat(7), .generation_instance = @splat(7), .data_generation = 1 } else null;
+    const boot: ?@import("../../common/relation_persistence.zig").Boot = if (lifetime) .{ .instance = @splat(7), .unclean_restart = false } else null;
     const old_json =
         \\{"version":0,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
@@ -125271,7 +126530,7 @@ fn testChildGenerationInstall(native: bool) !void {
     defer schema_mod.freeSchema(alloc, next_schema);
     var fence: @import("relational_integrity_topology.zig").Fence = undefined;
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .online_source_authority = if (native) .native else .raft, .start_optional_runtimes = false });
+        var db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .online_source_authority = if (native) .native else .raft, .sql_persistence = descriptor, .sql_persistence_context = host, .persistence_boot = boot, .start_optional_runtimes = false });
         defer db.close();
         try db.setSchemaJson(alloc, old_json);
         const catalog = try db.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
@@ -125299,6 +126558,9 @@ fn testChildGenerationInstall(native: bool) !void {
         var reopened = try DB.open(alloc, std.mem.span(path), .{
             .identity_namespace = namespace,
             .online_source_authority = if (native) .native else .raft,
+            .sql_persistence = descriptor,
+            .sql_persistence_context = host,
+            .persistence_boot = boot,
             .start_optional_runtimes = false,
             .schema_before_index_load = .{ .runtime_schema = next_schema, .public_schema_json = next_json },
         });
@@ -125338,6 +126600,9 @@ fn testChildGenerationInstall(native: bool) !void {
     var installed = try DB.open(alloc, std.mem.span(path), .{
         .identity_namespace = namespace,
         .online_source_authority = if (native) .native else .raft,
+        .sql_persistence = descriptor,
+        .sql_persistence_context = host,
+        .persistence_boot = boot,
         .start_optional_runtimes = false,
         .schema_before_index_load = .{ .runtime_schema = next_schema, .public_schema_json = next_json },
     });
@@ -125355,8 +126620,20 @@ fn testChildGenerationInstall(native: bool) !void {
     const receipt_bytes = try installed.core.store.get(alloc, @import("relational_integrity_generation_admission.zig").source_install_receipt_key);
     defer alloc.free(receipt_bytes);
     const receipt = try @import("relational_integrity_generation_admission.zig").AppliedReceipt.decode(receipt_bytes);
-    try std.testing.expectEqual(@as(u64, 1), receipt.term);
-    try std.testing.expectEqual(@as(u64, if (native) 5 else 1), receipt.index);
+    if (lifetime) {
+        try std.testing.expectEqual(@as(u64, 0), receipt.term);
+        try std.testing.expectEqual(@as(u64, 0), receipt.index);
+        try std.testing.expect(receipt.native_position != null);
+        try std.testing.expect(receipt.native_position.?.namespace.eql(namespace));
+        try std.testing.expectEqual(@as(u64, 2), receipt.native_position.?.sequence);
+        var snapshot = try installed.core.store.beginReadTxn();
+        defer snapshot.abort();
+        const authority = try @import("../source_authority.zig").require(&snapshot, .native, @import("online_source_contract.zig").namespaceBytes(namespace));
+        try std.testing.expectEqual(receipt.native_position.?.sequence, authority.sequence);
+    } else {
+        try std.testing.expectEqual(@as(u64, 1), receipt.term);
+        try std.testing.expectEqual(@as(u64, if (native) 5 else 1), receipt.index);
+    }
     if (native) try std.testing.expect((try readOrderedApplyReceipt(alloc, installed.core.store)) == null);
     // A later DROP publication fences the already-installed v1 layout. The
     // schema pin is intentionally false for an equal version, but cold owner
@@ -125371,7 +126648,7 @@ fn testChildGenerationInstall(native: bool) !void {
         .namespace = namespace,
         .catalog_digest = installed_digest,
     };
-    try installed.batch(.{ .relational_topology = .{ .action = .begin, .fence = dual_fence } });
+    if (lifetime) try installed.batchNativeFkGenerationApply(.{ .relational_topology = .{ .action = .begin, .fence = dual_fence } }) else try installed.batch(.{ .relational_topology = .{ .action = .begin, .fence = dual_fence } });
     try std.testing.expect(!(try installed.childGenerationSourcePinsSchemaJson(next_json)));
     try std.testing.expect(try installed.childGenerationSourceDefersOwnerCatalog());
 }
@@ -150549,4 +151826,948 @@ test "db document retirement waits for producer replay before durable source adm
     }
     try db.runUntilIdle();
     try db.batchNativeFkGenerationApply(.{ .relational_topology = .{ .action = .begin, .fence = fence, .sql_drop_control = true, .document_schema_digest = schema_digest } });
+}
+
+test "db native lost-image target installs actual local receipt before publication and preserves it on reopen" {
+    try qualifyNativeEmptyTarget(false);
+}
+
+test "db native schema-only snapshot target installs actual empty image scopes without a source pin" {
+    try qualifyNativeEmptyTarget(true);
+}
+
+fn qualifyNativeEmptyTarget(schema_only: bool) !void {
+    const a = std.testing.allocator;
+    const persistence = @import("../../common/relation_persistence.zig");
+    const staging = @import("restore_staging_contract.zig");
+    const loss = @import("native_empty_generation.zig");
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var public_schema = try public_table_schema.parseValidatedTableSchema(a, schema_json);
+    defer public_schema.deinit(a);
+    const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(a, public_schema);
+    defer schema_mod.freeSchema(a, runtime_schema);
+    const encoded_schema = try schema_mod.serializeSchema(a, runtime_schema);
+    defer a.free(encoded_schema);
+    var schema_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(encoded_schema, &schema_digest, .{});
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-empty-{s}", .{ tmp.sub_path, if (schema_only) "snapshot" else "loss" });
+    defer a.free(path);
+    const namespace: doc_identity.Namespace = .{ .table_id = 201, .shard_id = 202, .range_id = 202 };
+    const descriptor: persistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(1), .data_generation = 2 };
+    var options: OpenOptions = .{
+        .identity_namespace = namespace,
+        .primary_backend = .{ .lsm = .{} },
+        .sql_persistence = descriptor,
+        .sql_persistence_context = .{ .node_id = 9, .store_id = 11, .execution_instance = @splat(1), .generation_instance = @splat(1), .data_generation = 2 },
+        .persistence_boot = .{ .instance = @splat(1), .unclean_restart = true, .initializing = true },
+        .online_source_authority = .native,
+        .schema_before_index_load = .{ .runtime_schema = runtime_schema, .public_schema_json = schema_json },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    };
+    const origin: loss.Origin = if (schema_only) .{ .schema_only_snapshot = .{ .manifest_digest = @splat(66), .schema_digest = schema_digest, .source_table_id = 101 } } else .{ .lost_source = .{ .checkpoint_digest = @splat(3), .source = .{ .physical_root_incarnation = std.math.maxInt(u128) - 1, .table_id = 101, .shard_id = 102, .range_id = 102, .data_generation = 1 } } };
+    const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(0), .source_namespace = if (schema_only) .{} else .{ .table_id = 101, .shard_id = 102, .range_id = 102 }, .target_namespace = namespace, .target_schema_digest = schema_digest, .empty_generation = true, .native_empty_origin = origin };
+    const transitions = [_]@import("relational_integrity_generation_admission.zig").Transition{.{ .child_table_id = 301, .child_table_name = "children", .constraint_name = "fk_lost", .expected_generation = null, .next_generation = @splat(4), .plan_id = scope.plan_id, .decision_digest = scope.digest() }};
+    const command: loss.Install = .{ .scope = scope.digest(), .origin = origin, .transitions = &transitions };
+    const bootstrap: staging.OwnerBootstrap = .{
+        .scope = scope,
+        .table_name = "rows",
+        .schema_json = schema_json,
+        .indexes_json = "{}",
+        .byte_range = .{ .start = "", .end = "" },
+        .native_empty_source = .{ .origin = origin, .expected_install_digest = try command.digest() },
+    };
+    var installed: loss.Receipt = undefined;
+    var binding: persistence.NativeBinding = undefined;
+    {
+        var target = try DB.open(a, path, options);
+        defer target.close();
+        const catalog_before = try target.core.table_catalog.encodeDurable();
+        try std.testing.expectError(error.InvalidSqlRelationPersistence, target.addIndex(.{ .name = "unsupported_native_edges", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"cites\",\"field\":\"related_to\"}]}" }));
+        const catalog_after = try target.core.table_catalog.encodeDurable();
+        try std.testing.expectEqualSlices(u8, catalog_before.slice(), catalog_after.slice());
+        try target.reserveRestoreStagingScoped(a, scope);
+        try target.installRestoreStagingBootstrap(a, bootstrap);
+        try target.beginRestoreStaging(a, scope);
+        _ = try target.finishRestoreStaging(a, scope.digest(), .validated);
+        try std.testing.expectError(error.RestoreSourceProofMissing, target.finishRestoreStaging(a, scope.digest(), .published));
+        const request: types.BatchRequest = .{ .restore_staging = .{ .install_native_empty = command }, .restore_staging_scope = scope.digest(), .restore_staging_plan_id = scope.plan_id };
+        try target.batch(request);
+        {
+            var read = try target.core.store.beginReadTxn();
+            defer read.abort();
+            installed = (try loss.requireInstalled(&read, command)).?;
+            try std.testing.expect(installed.position.namespace.eql(namespace));
+            try std.testing.expect(installed.position.sequence != 0);
+            try std.testing.expect((try readOrderedApplyReceipt(a, target.core.store)) == null);
+        }
+        try target.batch(request);
+        {
+            var read = try target.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqualDeep(installed, (try loss.load(&read)).?);
+            const owner = (try @import("../source_authority.zig").load(&read)).?;
+            try std.testing.expectEqual(installed.position.sequence, owner.sequence);
+        }
+        _ = try target.finishRestoreStaging(a, scope.digest(), .published);
+        var observed = (try target.lookup(a, "", .{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}" })) orelse return error.TestUnexpectedResult;
+        defer observed.deinit(a);
+        var decoded = try std.json.parseFromSlice(persistence.NativeBinding, a, observed.json, .{});
+        defer decoded.deinit();
+        binding = decoded.value;
+        try std.testing.expect(!binding.has_user_data);
+        try target.closeFallible();
+    }
+    options.persistence_boot = .{ .instance = @splat(1), .unclean_restart = true, .initialized = binding };
+    var reopened = try DB.open(a, path, options);
+    defer reopened.close();
+    {
+        var read = try reopened.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualDeep(installed, (try loss.requireInstalled(&read, command)).?);
+        try std.testing.expectEqual(@as(u64, 0), (try @import("table_catalog.zig").Catalog.decode(try read.get(@import("table_catalog.zig").key))).row_count);
+    }
+    {
+        var corrupt = try reopened.core.store.beginWriteTxn();
+        defer corrupt.abort();
+        const acceptance = @import("relational_integrity_generation_admission.zig");
+        const key = try acceptance.scopeKey("children", "fk_lost");
+        const saved = try a.dupe(u8, try corrupt.get(&key));
+        defer a.free(saved);
+        try corrupt.delete(&key);
+        try std.testing.expectError(error.GenerationAdmissionChanged, loss.requireInstalled(&corrupt, command));
+        try corrupt.put(&key, saved);
+        const authority = @import("../source_authority.zig");
+        var clock = (try authority.load(&corrupt)).?;
+        clock.sequence = installed.position.sequence - 1;
+        try corrupt.put(authority.key, &clock.encode());
+        try std.testing.expectError(error.OnlineSourceCorrupt, loss.requireInstalled(&corrupt, command));
+        // Neither fault is committed: the genuine image/receipt remains valid.
+    }
+    {
+        var read = try reopened.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualDeep(installed, (try loss.requireInstalled(&read, command)).?);
+    }
+}
+
+test "db native never acknowledged generation initializes an actual empty image after process loss" {
+    const a = std.testing.allocator;
+    const p = @import("../../common/relation_persistence.zig");
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var public_schema = try public_table_schema.parseValidatedTableSchema(a, schema_json);
+    defer public_schema.deinit(a);
+    const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(a, public_schema);
+    defer schema_mod.freeSchema(a, runtime_schema);
+    const encoded_schema = try schema_mod.serializeSchema(a, runtime_schema);
+    defer a.free(encoded_schema);
+    var schema_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(encoded_schema, &schema_digest, .{});
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/never-ack", .{tmp.sub_path});
+    defer a.free(path);
+    const descriptor: p.Descriptor = .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(1), .data_generation = 3 };
+    const permit: p.UninitializedAdmission = .{ .metadata_group_id = 1, .boot_generation = 4, .table_id = 201, .shard_id = 202, .range_id = 202, .descriptor_fingerprint = try descriptor.fingerprint(), .schema_digest = schema_digest };
+    const context: p.Context = .{ .node_id = 9, .store_id = 11, .execution_instance = @splat(2), .generation_instance = descriptor.generation_instance, .data_generation = descriptor.data_generation };
+    var options: OpenOptions = .{
+        .identity_namespace = .{ .table_id = 201, .shard_id = 202, .range_id = 202 },
+        .primary_backend = .{ .lsm = .{} },
+        .sql_persistence = descriptor,
+        .sql_persistence_context = context,
+        .persistence_boot = .{ .instance = context.execution_instance, .unclean_restart = true, .initializing = true },
+        .online_source_authority = .native,
+        .schema_before_index_load = .{ .runtime_schema = runtime_schema, .public_schema_json = schema_json },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    };
+    try std.testing.expectError(error.SqlRelationRecoveryIncomplete, DB.open(a, path, options));
+    options.persistence_boot.?.uninitialized = permit;
+    var physical: u128 = undefined;
+    {
+        var db = try DB.open(a, path, options);
+        var db_open = true;
+        defer if (db_open) db.close();
+        var observed = (try db.lookup(a, "", .{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}" })) orelse return error.TestUnexpectedResult;
+        defer observed.deinit(a);
+        var parsed = try std.json.parseFromSlice(p.NativeBinding, a, observed.json, .{});
+        defer parsed.deinit();
+        try permit.requireBinding(parsed.value);
+        physical = parsed.value.physical_root_incarnation;
+        try db.closeFallible();
+        db_open = false;
+    }
+    {
+        var db = try DB.open(a, path, options);
+        defer db.close();
+        var observed = (try db.lookup(a, "", .{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}" })) orelse return error.TestUnexpectedResult;
+        defer observed.deinit(a);
+        var parsed = try std.json.parseFromSlice(p.NativeBinding, a, observed.json, .{});
+        defer parsed.deinit();
+        try permit.requireBinding(parsed.value);
+        try std.testing.expectEqual(physical, parsed.value.physical_root_incarnation);
+    }
+}
+
+test "db native source retirement waits terminal external ACKs while ordinary topology remains quiescent" {
+    const a = std.testing.allocator;
+    const persistence = @import("../../common/relation_persistence.zig");
+    const topology = @import("relational_integrity_topology.zig");
+    for ([_]persistence.Kind{ .temporary, .unlogged }) |kind| {
+        var temporary = try TestDirectory.init("db-native-retirement-ack-debt");
+        defer temporary.cleanup();
+        const path = temporary.path().ptr;
+        defer cleanupTempDir(path);
+        const namespace: doc_identity.Namespace = .{ .table_id = 717, .shard_id = 719, .range_id = 719 };
+        const descriptor: persistence.Descriptor = .{ .kind = kind, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(1), .data_generation = 1, .owner = if (kind == .temporary) .{ .issuer_node_id = 7, .connection_id = @splat('a'), .wire_epoch = @splat(2), .execution_instance = @splat(3), .connection_generation = 1, .principal_digest = @splat(4) } else null };
+        var db = try DB.open(a, std.mem.span(path), .{ .identity_namespace = namespace, .online_source_authority = .native, .sql_persistence = descriptor, .sql_persistence_context = .{ .node_id = 9, .store_id = 11, .execution_instance = descriptor.generation_instance, .generation_instance = descriptor.generation_instance, .data_generation = descriptor.data_generation }, .persistence_boot = .{ .instance = descriptor.generation_instance, .initializing = true, .unclean_restart = false }, .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        const pin = (try db.relationPhysicalPin()).?;
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        const txn_id: types.TxnId = @splat(21);
+        const owner: transactions_mod.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(22), .admission_digest = @splat(23), .expires_at_unix_ns = 10000 };
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(txn_id, 100, 1, &.{ "data:719", "data:720" }, false, true, .{ .external_decision_owner = owner, .native_pin = pin });
+        try manager.writeIntentsExtraBatch(txn_id, &.{}, &.{}, .{ .external_decision_owner = owner, .native_pin = pin });
+        const identity = try db.relationalTopologyIdentity();
+        const fence: topology.Fence = .{ .transition_id = 71, .attempt = 72, .admission_epoch = identity.next_epoch, .owner_group_id = 719, .peer_group_id = 719, .role = .document_retirement_source, .namespace = namespace, .catalog_digest = identity.catalog_digest };
+        var schema_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash("", &schema_digest, .{});
+        try db.batchNativeFkGenerationApply(.{ .relational_topology = .{ .action = .begin, .fence = fence, .sql_drop_control = true, .document_schema_digest = schema_digest } });
+        _ = try manager.resolveIntentsWithExtraBatch(txn_id, .aborted, 200, .{ .external_decision_owner = owner, .native_pin = pin });
+        // The ordinary topology promise is unchanged: terminal bookkeeping is
+        // not outstanding row work. Deleting its native owner is stricter.
+        try std.testing.expect((try db.relationalTopologyStatus()).drained);
+        const options: types.LookupOptions = .{ .relational_topology_json = "{\"mode\":\"retirement_status\"}", .fk_generation_source_control = true };
+        {
+            var response = (try db.lookup(a, "", options)).?;
+            defer response.deinit(a);
+            var status = try std.json.parseFromSlice(DB.RelationalTopologyStatus, a, response.json, .{});
+            defer status.deinit();
+            try std.testing.expect(status.value.fence.?.eql(fence));
+            try std.testing.expect(!status.value.drained);
+        }
+        try manager.markParticipantResolvedExtraBatch(txn_id, "data:719", .{ .external_decision_owner = owner, .native_pin = pin });
+        {
+            var response = (try db.lookup(a, "", options)).?;
+            defer response.deinit(a);
+            var status = try std.json.parseFromSlice(DB.RelationalTopologyStatus, a, response.json, .{});
+            defer status.deinit();
+            try std.testing.expect(!status.value.drained);
+        }
+        try manager.markParticipantResolvedExtraBatch(txn_id, "data:720", .{ .external_decision_owner = owner, .native_pin = pin });
+        {
+            var response = (try db.lookup(a, "", options)).?;
+            defer response.deinit(a);
+            var status = try std.json.parseFromSlice(DB.RelationalTopologyStatus, a, response.json, .{});
+            defer status.deinit();
+            try std.testing.expect(status.value.drained);
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect(try transactions_mod.hasAnyTransactionStateInView(&read));
+        }
+        try std.testing.expectError(error.InvalidSqlRelationPersistence, db.lookup(a, "", .{ .relational_topology_json = "{\"mode\":\"retirement_status\"}" }));
+    }
+}
+
+test "db native unpublished empty image replacement uses real new roots and preserves exact attempt retries across reopen" {
+    const a = std.testing.allocator;
+    const p = @import("../../common/relation_persistence.zig");
+    const restore = @import("restore_staging_contract.zig");
+    const definition = "{}";
+    var public_schema = try public_table_schema.parseValidatedTableSchema(a, definition);
+    defer public_schema.deinit(a);
+    const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(a, public_schema);
+    defer schema_mod.freeSchema(a, runtime_schema);
+    const encoded_schema = try schema_mod.serializeSchema(a, runtime_schema);
+    defer a.free(encoded_schema);
+    const schema_digest = restore.digest(encoded_schema);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/empty-image", .{tmp.sub_path});
+    defer a.free(path);
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer runtime.deinit();
+    const descriptor: p.Descriptor = .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(1), .data_generation = 3 };
+    const namespace: doc_identity.Namespace = .{ .table_id = 201, .shard_id = 202, .range_id = 202 };
+    const scope: restore.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(0), .source_namespace = .{ .table_id = 0, .shard_id = 0, .range_id = 0 }, .target_namespace = namespace, .target_schema_digest = schema_digest, .empty_generation = true, .native_empty_origin = .{ .schema_only_snapshot = .{ .manifest_digest = @splat(3), .schema_digest = schema_digest, .source_table_id = 7 } } };
+    const install: @import("native_empty_generation.zig").Install = .{ .scope = scope.digest(), .origin = scope.native_empty_origin.?, .transitions = &.{} };
+    const bootstrap: restore.OwnerBootstrap = .{ .scope = scope, .table_name = "native", .schema_json = definition, .indexes_json = "{}", .byte_range = .{ .start = "", .end = "" }, .native_empty_source = .{ .origin = install.origin, .expected_install_digest = try install.digest() } };
+    var options: OpenOptions = .{ .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .sql_persistence = descriptor, .sql_persistence_context = .{ .node_id = 9, .store_id = 11, .execution_instance = @splat(1), .generation_instance = descriptor.generation_instance, .data_generation = descriptor.data_generation }, .persistence_boot = .{ .instance = @splat(1), .unclean_restart = false, .initializing = true }, .online_source_authority = .native, .schema_before_index_load = .{ .runtime_schema = runtime_schema, .public_schema_json = definition }, .backend_runtime = runtime.ptr(), .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false };
+    const original_root = original: {
+        var db = try DB.open(a, path, options);
+        var alive = true;
+        defer if (alive) db.closeImmutableSnapshot();
+        try db.reserveRestoreStagingScoped(a, scope);
+        try db.installRestoreStagingBootstrap(a, bootstrap);
+        try std.testing.expectError(error.RestoreStagingInProgress, db.lookup(a, "hidden-row", .{}));
+        try std.testing.expectError(error.RestoreStagingInProgress, db.lookup(a, "", .{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}", .include_primary_digest = true }));
+        const root = db.root_incarnation;
+        try db.closeFallible();
+        alive = false;
+        break :original root;
+    };
+    options.sql_persistence_context.?.execution_instance = @splat(2);
+    options.persistence_boot = .{ .instance = @splat(2), .unclean_restart = true, .initializing = true, .uninitialized = .{ .metadata_group_id = 1, .boot_generation = 2, .table_id = namespace.table_id, .shard_id = namespace.shard_id, .range_id = namespace.range_id, .descriptor_fingerprint = try descriptor.fingerprint(), .schema_digest = schema_digest } };
+    // A path is not proof of image ownership. Every rejection precedes any
+    // exchange and leaves the acknowledged canonical image unchanged.
+    try std.testing.expectError(error.SqlRelationOwnerChanged, DB.replaceUnpublishedNativeEmptyImage(a, path, options, bootstrap, 2, @splat(4), original_root ^ 1));
+    var wrong_scope = bootstrap;
+    wrong_scope.scope.plan_digest = @splat(9);
+    wrong_scope.native_empty_source.?.expected_install_digest = try (@import("native_empty_generation.zig").Install{ .scope = wrong_scope.scope.digest(), .origin = wrong_scope.scope.native_empty_origin.?, .transitions = &.{} }).digest();
+    try std.testing.expectError(error.SqlRelationOwnerChanged, DB.replaceUnpublishedNativeEmptyImage(a, path, options, wrong_scope, 2, @splat(4), original_root));
+    var wrong_descriptor = options;
+    wrong_descriptor.sql_persistence.?.data_generation += 1;
+    wrong_descriptor.sql_persistence_context.?.data_generation += 1;
+    wrong_descriptor.persistence_boot.?.uninitialized.?.descriptor_fingerprint = try wrong_descriptor.sql_persistence.?.fingerprint();
+    try std.testing.expectError(error.SqlRelationOwnerChanged, DB.replaceUnpublishedNativeEmptyImage(a, path, wrong_descriptor, bootstrap, 2, @splat(4), original_root));
+    const retained = try DB.inspectUnpublishedNativeImage(a, path, runtime.ptr(), descriptor, .{});
+    try std.testing.expectEqual(original_root, retained.physical_root_incarnation.?);
+    try std.testing.expect(retained.image_attempt == null);
+    const second = try DB.replaceUnpublishedNativeEmptyImage(a, path, options, bootstrap, 2, @splat(4), original_root);
+    try std.testing.expect(second.physical_root_incarnation != original_root);
+    try std.testing.expect(!second.has_user_data and !second.has_transaction_state);
+    const retry = try DB.replaceUnpublishedNativeEmptyImage(a, path, options, bootstrap, 2, @splat(4), original_root);
+    try std.testing.expectEqual(second.physical_root_incarnation, retry.physical_root_incarnation);
+    options.sql_persistence_context.?.execution_instance = @splat(3);
+    options.persistence_boot.?.instance = @splat(3);
+    options.persistence_boot.?.uninitialized.?.boot_generation = 3;
+    const third = try DB.replaceUnpublishedNativeEmptyImage(a, path, options, bootstrap, 3, @splat(5), second.physical_root_incarnation);
+    try std.testing.expect(third.physical_root_incarnation != second.physical_root_incarnation and third.physical_root_incarnation != original_root);
+    try std.testing.expect(third.descriptor.eql(descriptor));
+    try std.testing.expectError(error.SqlRelationOwnerChanged, DB.replaceUnpublishedNativeEmptyImage(a, path, options, bootstrap, 2, @splat(4), original_root));
+}
+
+test "db graph transaction effects atomically recover source rows edges and endpoint guards across cold commit abort and lost reply" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-transaction-effects");
+    defer directory.cleanup();
+    var prepared: types.TxnId = undefined;
+    {
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"count\":1}" }, .{ .key = "b", .value = "{\"name\":\"B\"}" } }, .sync_level = .write });
+        prepared = try db.beginTransaction(21_000);
+        try db.writeTransaction(prepared, .{ .transforms = &.{.{ .key = "a", .operations = &.{
+            .{ .op = .inc, .path = "count", .value_json = "1" },
+            .{ .op = .push, .path = "_edges.g.R", .value_json = "{\"target\":\"b\",\"weight\":2}" },
+        } }} });
+        var captured = try db.core.collectTransactionIntentBatch(a, prepared);
+        defer captured.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), captured.writes.len);
+        try std.testing.expectEqual(@as(usize, 1), captured.prepared_graph_effects.len);
+        try std.testing.expect(captured.prepared_graph_effects[0] != null);
+        try std.testing.expectEqual(@as(u8, 1), (try table_catalog_mod.load(a, db.core.store)).?.transaction_effect_format);
+        const before = (try db.get(a, "a")).?;
+        defer a.free(before);
+        try std.testing.expectEqualStrings("{\"count\":1}", before);
+        const edges = try db.getEdges(a, "g", "a", "R", .out);
+        defer graph_mod.GraphIndex.freeEdges(a, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+        try std.testing.expectError(error.IntentConflict, graphTestApplyOrdered(&db, .{ .deletes = &.{"b"} }, .{ .term = 1, .index = 1 }));
+        try std.testing.expectError(error.SchemaInUse, db.deleteIndex("g"));
+    }
+    {
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        // Neither a generic manager nor a failed primary write may consume
+        // the captured attachment or publish either half of the mutation.
+        var raw_manager = try db.core.initTxnManager();
+        defer raw_manager.deinit();
+        const pending_status = try db.getTransactionStatus(prepared);
+        try std.testing.expectError(error.PreparedIntentRequiresMaterialization, raw_manager.resolveIntents(prepared, .committed, 21_001));
+        try std.testing.expectEqual(pending_status, try db.getTransactionStatus(prepared));
+        const Fault = struct {
+            fn fail(_: *anyopaque) !void {
+                return error.NoSpaceLeft;
+            }
+        };
+        var token: u8 = 0;
+        const hooks = @import("mutation_commit.zig");
+        hooks.test_before_primary_commit = .{ .ptr = &token, .run = Fault.fail };
+        defer hooks.test_before_primary_commit = null;
+        try std.testing.expectError(error.NoSpaceLeft, db.commitTransaction(prepared, 21_001));
+        try std.testing.expectEqual(pending_status, try db.getTransactionStatus(prepared));
+        const unchanged = (try db.get(a, "a")).?;
+        defer a.free(unchanged);
+        try std.testing.expectEqualStrings("{\"count\":1}", unchanged);
+        const absent_edges = try db.getEdges(a, "g", "a", "R", .out);
+        defer graph_mod.GraphIndex.freeEdges(a, absent_edges);
+        try std.testing.expectEqual(@as(usize, 0), absent_edges.len);
+        try std.testing.expectError(error.IntentConflict, graphTestApplyOrdered(&db, .{ .deletes = &.{"b"} }, .{ .term = 1, .index = 1 }));
+    }
+    {
+        // Retry after another real cold open; no transform or VM is rerun.
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try std.testing.expectError(error.IntentConflict, graphTestApplyOrdered(&db, .{ .deletes = &.{"b"} }, .{ .term = 1, .index = 1 }));
+        try db.commitTransaction(prepared, 21_001);
+        try db.runUntilIdle();
+        const after = (try db.get(a, "a")).?;
+        defer a.free(after);
+        try std.testing.expectEqualStrings("{\"count\":2}", after);
+        const edges = try db.getEdges(a, "g", "a", "R", .out);
+        defer graph_mod.GraphIndex.freeEdges(a, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expectEqualStrings("b", edges[0].target);
+        try std.testing.expectEqual(@as(f64, 2), edges[0].weight);
+        const aborting = try db.beginTransaction(22_000);
+        try db.writeTransaction(aborting, .{ .transforms = &.{.{ .key = "a", .operations = &.{
+            .{ .op = .inc, .path = "count", .value_json = "1" },
+            .{ .op = .pull, .path = "_edges.g.R", .value_json = "{\"target\":\"b\"}" },
+        } }} });
+        try db.abortTransaction(aborting, 22_001);
+        try db.runUntilIdle();
+        const retained = (try db.get(a, "a")).?;
+        defer a.free(retained);
+        try std.testing.expectEqualStrings("{\"count\":2}", retained);
+        const retained_edges = try db.getEdges(a, "g", "a", "R", .out);
+        defer graph_mod.GraphIndex.freeEdges(a, retained_edges);
+        try std.testing.expectEqual(@as(usize, 1), retained_edges.len);
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"count\":77}" }}, .sync_level = .write });
+        try db.commitTransaction(prepared, 21_001);
+        const newest = (try db.get(a, "a")).?;
+        defer a.free(newest);
+        try std.testing.expectEqualStrings("{\"count\":77}", newest);
+        try std.testing.expectEqual(@as(u8, 1), (try table_catalog_mod.load(a, db.core.store)).?.transaction_effect_format);
+    }
+}
+
+test "db graph schema NONE protected prepare pins actual absence through cold atomic resolution" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-schema-none-transaction");
+    defer directory.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const handoff = @import("../../sql/trigger_handoff.zig");
+    const manifests = @import("../../sql/trigger_manifest.zig");
+    const native = @import("../../sql/trigger_native_admission.zig");
+    const authority = @import("../../common/trigger_preparation_authority.zig");
+    const Signer = struct {
+        now: i64,
+        fn sign(raw: *anyopaque, alloc: Allocator, scope: authority.Scope) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return authority.sign(alloc, "native-schema-none-test-key", "native-test", scope, self.now);
+        }
+    };
+    var prepared: types.TxnId = undefined;
+    {
+        var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 27 }, .load_sql_preparation_from_secret_store = false, .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        db.local_execution.sql_preparation_secret = "native-schema-none-test-key";
+        db.local_execution.sql_preparation_issuer = "native-test";
+        {
+            var actual_schema = db.core.acquireSchemaView();
+            defer if (actual_schema) |*view| view.release();
+            try std.testing.expect(actual_schema == null);
+        }
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"n\":1}" }, .{ .key = "b", .value = "{}" } }, .sync_level = .write });
+        var old = (try db.lookup(a, "a", .{ .include_primary_digest = true })).?;
+        defer old.deinit(a);
+        const index = db.core.index_manager.graphIndex("g").?;
+        const index_digest = (try @import("graph_retirement_config.zig").fromLoaded(scratch, &.{index.config})).?;
+        const proof: @import("prepared_graph_effects.zig").Admission = .{ .metadata_group_id = 11, .incarnation = @splat(1), .source_revision = 9, .table_id = 7, .schema_digest = @import("relational_schema_owner_contract.zig").hash(""), .indexes = &.{.{ .name = "g", .digest = index_digest }} };
+        var absent = try manifests.Absence.fromAdmission(proof, 0);
+        absent.schema_present = false;
+        const program: manifests.Manifest = .{ .format = 2, .metadata_incarnation = proof.incarnation, .catalog_revision = 9, .table = try absent.table(), .absence = absent, .routines = &.{} };
+        const receipt: handoff.Receipt = .{ .program = program, .processed = .{ .header = .{ .statement_id = @splat(4), .metadata_incarnation = program.metadata_incarnation, .table = program.table, .program_digest = try program.digest(), .events = .{ .update = true } }, .rows = &.{.{ .key = "a", .event = .update, .preimage = .{ .present = .{ .version = old.version.?, .digest = old.expected_content_digest.? } }, .after = try handoff.rowDigest("a", "{\"n\":2}", &.{}) }} } };
+        prepared = try db.beginTransaction(23000);
+        var signer: Signer = .{ .now = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)) };
+        const minter: authority.Minter = .{ .ptr = &signer, .sign_fn = Signer.sign, .table_id = 7, .table_fingerprint = try program.table.fingerprint(), .receipts_digest = try handoff.receiptsDigest(scratch, &.{receipt}) };
+        const sealed = try native.seal(scratch, minter, 71, signer.now, .{ .transaction = .{ .prepare = .{ .txn_id = prepared, .topology_epoch = 0 } }, .graph_preparation = proof, .trigger_receipts = &.{receipt}, .writes = &.{.{ .key = "a", .value = "{\"n\":2}" }}, .predicates = &.{.{ .key = "a", .expected_version = old.version.?, .expected_content_digest = old.expected_content_digest }}, .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} });
+        try db.writeTransaction(prepared, try types.TransactionIntentRequest.fromBatch(sealed));
+        try std.testing.expectError(error.SchemaInUse, db.setSchema(.{ .version = 1 }));
+        const edges = try db.getEdges(a, "g", "a", "R", .out);
+        defer graph_mod.GraphIndex.freeEdges(a, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+        const value = (try db.get(a, "a")).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("{\"n\":1}", value);
+    }
+    {
+        var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 27 }, .load_sql_preparation_from_secret_store = false, .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        // The durable NONE lease blocks a first document schema after cold
+        // open, not only conversion to relational storage.
+        try std.testing.expectError(error.SchemaInUse, db.setSchema(.{ .version = 1 }));
+        // Only the admitted literal image and graph attachment are recovered;
+        // neither the producer key, a VM nor the original arithmetic is needed.
+        {
+            var actual_schema = db.core.acquireSchemaView();
+            defer if (actual_schema) |*view| view.release();
+            try std.testing.expect(actual_schema == null);
+        }
+        try db.commitTransaction(prepared, 23001);
+        try db.runUntilIdle();
+        const value = (try db.get(a, "a")).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("{\"n\":2}", value);
+        const edges = try db.getEdges(a, "g", "a", "R", .out);
+        defer graph_mod.GraphIndex.freeEdges(a, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expectEqualStrings("b", edges[0].target);
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":77}" }}, .sync_level = .write });
+        try db.commitTransaction(prepared, 23001);
+        const newest = (try db.get(a, "a")).?;
+        defer a.free(newest);
+        try std.testing.expectEqualStrings("{\"n\":77}", newest);
+        // Resolution removes the absence lease; this is a bounded transaction
+        // fence, not a permanent prohibition on document schema installation.
+        try db.setSchema(.{ .version = 1 });
+    }
+}
+test "db native checked atomic intent commits rows and unique effects once without participant records" {
+    const a = std.testing.allocator;
+    // The process-local finalizer contract is independently fingerprinted;
+    // an old checked-held-apply callback can never enter the new pipeline.
+    var checked_contract = storage_engine.checked_native_atomic_layout;
+    try storage_engine.validateCheckedNativeAtomicContract(60, checked_contract);
+    try std.testing.expectError(error.UnsupportedVersion, storage_engine.validateCheckedNativeAtomicContract(57, checked_contract));
+    checked_contract.layout_id ^= 1;
+    try std.testing.expectError(error.UnsupportedVersion, storage_engine.validateCheckedNativeAtomicContract(60, checked_contract));
+    try std.testing.expectError(error.UnsupportedVersion, storage_engine.validateCheckedNativeAtomicContract(58, storage_engine.checked_native_atomic_layout));
+    try std.testing.expectError(error.UnsupportedVersion, storage_engine.validateLookupOptionsContract(58, storage_engine.lookup_options_layout));
+    var policy_contract = storage_engine.row_policy_installed_layout;
+    try storage_engine.validateRowPolicyInstalledContract(60, policy_contract);
+    try std.testing.expectError(error.UnsupportedVersion, storage_engine.validateRowPolicyInstalledContract(58, policy_contract));
+    policy_contract.layout_id ^= 1;
+    try std.testing.expectError(error.UnsupportedVersion, storage_engine.validateRowPolicyInstalledContract(60, policy_contract));
+    var physical_contract = storage_engine.physical_row_layout;
+    try storage_engine.validatePhysicalRowLayoutContract(60, physical_contract);
+    try std.testing.expectError(error.UnsupportedVersion, storage_engine.validatePhysicalRowLayoutContract(58, physical_contract));
+    physical_contract.layout_id ^= 1;
+    try std.testing.expectError(error.UnsupportedVersion, storage_engine.validatePhysicalRowLayoutContract(60, physical_contract));
+    var lookup_contract = storage_engine.lookup_options_layout;
+    try storage_engine.validateLookupOptionsContract(60, lookup_contract);
+    try std.testing.expectError(error.UnsupportedVersion, storage_engine.validateLookupOptionsContract(57, lookup_contract));
+    lookup_contract.layout_id ^= 1;
+    try std.testing.expectError(error.UnsupportedVersion, storage_engine.validateLookupOptionsContract(60, lookup_contract));
+    var retention_contract = storage_engine.external_retention_layout;
+    try storage_engine.validateExternalRetentionContract(60, retention_contract);
+    try std.testing.expectError(error.UnsupportedVersion, storage_engine.validateExternalRetentionContract(59, retention_contract));
+    retention_contract.layout_id ^= 1;
+    try std.testing.expectError(error.UnsupportedVersion, storage_engine.validateExternalRetentionContract(60, retention_contract));
+    const persistence = @import("../../common/relation_persistence.zig");
+    const integrity = @import("relational_integrity.zig");
+    const catalog_mod = @import("relational_integrity_catalog.zig");
+    const codec = @import("../../api/batch.zig");
+    var directory = try TestDirectory.init("native-checked-atomic");
+    defer directory.cleanup();
+    const descriptor: persistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(1), .data_generation = 1 };
+    var options: OpenOptions = .{ .identity_namespace = .{ .table_id = 100, .shard_id = 101, .range_id = 101 }, .online_source_authority = .native, .sql_persistence = descriptor, .sql_persistence_context = .{ .node_id = 9, .store_id = 11, .execution_instance = descriptor.generation_instance, .generation_instance = descriptor.generation_instance, .data_generation = 1 }, .persistence_boot = .{ .instance = descriptor.generation_instance, .initializing = true, .unclean_restart = false }, .start_optional_runtimes = false, .start_index_workers = false };
+    var initial_physical_root: u128 = undefined;
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        initial_physical_root = db.root_incarnation;
+        try db.setSchemaJson(a,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"d","expression":{"op":"literal","type":"integer","value":"41"}}],"generated_columns":[{"column":"g","expression":{"op":"add","args":[{"op":"column","column":"id"},{"op":"literal","type":"integer","value":1}]}}],"unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"payload":{"type":"json","x-antfly-sql-type":"jsonb","nullable":true},"sql_null":{"type":["keyword","null"]},"g":{"type":"integer"},"d":{"type":"integer"}},"required":["g","d"],"additionalProperties":false}}}}
+        );
+        const raw = (try db.core.getStoreValue(a, catalog_mod.key)).?;
+        defer a.free(raw);
+        var catalog = try catalog_mod.decode(a, raw);
+        defer catalog.deinit();
+        const generation_set = @import("relational_integrity_activation.zig").generationSet(catalog);
+        var view = db.core.acquireSchemaView().?;
+        defer view.release();
+        var plan = try @import("relational_index_keys.zig").TuplePlan.init(a, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
+        defer plan.deinit();
+        var tuple: std.ArrayList(u8) = .empty;
+        defer tuple.deinit(a);
+        _ = try plan.appendValues(a, &tuple, &.{.{ .integer = 17 }});
+        const address = try integrity.Address.init(catalog.find(.unique, "pk").?.generation, tuple.items);
+        var intent: types.TransactionIntentRequest = .{ .timestamp_ns = 100, .schema_version = 1, .relational_schema_version = 1, .relational_integrity_generation_set = generation_set, .writes = &.{.{ .key = "parent", .value = "{\"id\":17,\"payload\":null,\"sql_null\":null}", .json_null_fields = &.{"payload"} }}, .predicates = &.{.{ .key = "parent", .expected_version = 0, .unique_absence = true }}, .integrity_commands = &.{.{ .address = address, .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "parents", .parent_key = "parent", .schema_version = 1 } } }} };
+        try std.testing.expectError(error.InvalidBatchRequest, codec.encodeBatchRequest(a, try intent.asAtomicBatch()));
+        const body = try codec.encodeOwnerBatchRequest(a, try intent.asAtomicBatch());
+        defer a.free(body);
+        try std.testing.expectError(error.InvalidBatchRequest, codec.parseBatchRequest(a, body));
+        try std.testing.expectError(error.InvalidBatchRequest, codec.parseInternalBatchRequest(a, body));
+        var parsed = try codec.parseOwnerBatchRequest(a, body);
+        defer parsed.deinit(a);
+        var committed = false;
+        db.local_execution.durable_replication_startup_barrier_pending.store(true, .release);
+        parsed.req.sync_level = .full_index;
+        const Fault = struct {
+            fn fail(_: *anyopaque) !void {
+                return error.NoSpaceLeft;
+            }
+        };
+        var fault: u8 = 0;
+        @import("mutation_commit.zig").test_before_primary_commit = .{ .ptr = &fault, .run = Fault.fail };
+        defer @import("mutation_commit.zig").test_before_primary_commit = null;
+        try std.testing.expectError(error.NoSpaceLeft, db.batchTracked(parsed.req, &committed));
+        try std.testing.expect(!db.local_execution.durable_replication_startup_barrier_pending.load(.acquire));
+        try std.testing.expect(!committed);
+        try std.testing.expect((try db.get(a, "parent")) == null);
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.NotFound, read.get(&address.claimKey()));
+            try std.testing.expect(!try transactions_mod.hasAnyTransactionStateInView(&read));
+        }
+        @import("mutation_commit.zig").test_fail_after_primary_commit = error.PreparedGenerationChanged;
+        defer @import("mutation_commit.zig").test_fail_after_primary_commit = null;
+        try std.testing.expectError(error.PreparedGenerationChanged, db.batchTracked(parsed.req, &committed));
+        try std.testing.expect(committed);
+        try std.testing.expect(@import("mutation_commit.zig").test_fail_after_primary_commit == null);
+        try std.testing.expectEqual(@as(u64, 100), try db.getTimestamp(a, "parent"));
+        var visible_request = parsed.req;
+        visible_request.timestamp_ns = 101;
+        visible_request.predicates = &.{.{ .key = "parent", .expected_version = 100 }};
+        try db.batchTracked(visible_request, &committed);
+        try std.testing.expect(committed);
+        try std.testing.expectEqual(@as(u64, 101), try db.getTimestamp(a, "parent"));
+        intent.writes = &.{.{ .key = "duplicate", .value = "{\"id\":17}" }};
+        intent.predicates = &.{};
+        intent.integrity_commands = &.{.{ .address = address, .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "parents", .parent_key = "duplicate", .schema_version = 1 } } }};
+        try std.testing.expectError(error.UniqueConstraintViolation, db.batch(try intent.asAtomicBatch()));
+        try std.testing.expect((try db.get(a, "duplicate")) == null);
+        var second_tuple: std.ArrayList(u8) = .empty;
+        defer second_tuple.deinit(a);
+        _ = try plan.appendValues(a, &second_tuple, &.{.{ .integer = 18 }});
+        const second_address = try integrity.Address.init(catalog.find(.unique, "pk").?.generation, second_tuple.items);
+        intent.writes = &.{.{ .key = "unchanged", .value = "{\"id\":18}" }};
+        intent.integrity_commands = &.{.{ .address = second_address, .operation = .{ .establish = .{ .tuple = second_tuple.items, .parent_table = "parents", .parent_key = "unchanged", .schema_version = 1 } } }};
+        intent.predicates = &.{.{ .key = "parent", .expected_version = 99 }};
+        try std.testing.expectError(error.VersionConflict, db.batch(try intent.asAtomicBatch()));
+        try std.testing.expect((try db.get(a, "unchanged")) == null);
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(&second_address.claimKey()));
+        try std.testing.expect(!try transactions_mod.hasAnyTransactionStateInView(&read));
+    }
+    options.persistence_boot.?.initializing = false;
+    var reopened = try DB.open(a, directory.path(), options);
+    defer reopened.close();
+    try std.testing.expectEqual(initial_physical_root, reopened.root_incarnation);
+    const row = (try reopened.get(a, "parent")).?;
+    defer a.free(row);
+    var logical = try std.json.parseFromSlice(std.json.Value, a, row, .{});
+    defer logical.deinit();
+    try std.testing.expectEqual(@as(i64, 17), logical.value.object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 18), logical.value.object.get("g").?.integer);
+    try std.testing.expectEqual(@as(i64, 41), logical.value.object.get("d").?.integer);
+    try std.testing.expect(logical.value.object.get("payload").? == .null);
+    const reader = try reopened.openRelationalReadSession(a, "", "", .{ .relational_query = .{ .fields = &.{ "id", "payload", "sql_null", "g", "d" }, .schema_version = 1 } });
+    defer reader.deinit();
+    var page = try reader.nextTypedPage(a, null, .{ .rows = 2 });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true, false, false }, page.rows[0].sql_nulls.?);
+    try std.testing.expect((try reopened.get(a, "duplicate")) == null);
+    try std.testing.expectEqual(@as(u64, 101), try reopened.getTimestamp(a, "parent"));
+    var read = try reopened.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(!try transactions_mod.hasAnyTransactionStateInView(&read));
+}
+
+test "db native checked atomic providers run without apply and reject changed policy candidates before primary" {
+    const a = std.testing.allocator;
+    const persistence = @import("../../common/relation_persistence.zig");
+    const policies = @import("../../system_catalog/policies.zig");
+    const Probe = struct {
+        db: ?*DB = null,
+        calls: usize = 0,
+        concurrent_calls: usize = 0,
+        mode: enum { unrelated, same_key, none } = .none,
+        token: []const u8 = "",
+        fn embedControlled(ptr: *anyopaque, alloc: Allocator, name: []const u8, text: []const u8, dims: u32, context: @import("antfly_inference_execution_context").RequestContext) ![]f32 {
+            try context.check();
+            const vector = try embed(ptr, alloc, name, text, dims);
+            errdefer alloc.free(vector);
+            try context.check();
+            return vector;
+        }
+        fn embed(ptr: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, dims: u32) ![]f32 {
+            const probe: *@This() = @ptrCast(@alignCast(ptr));
+            const owner = probe.db orelse return error.TestUnexpectedResult;
+            // A real provider invocation must be outside the exclusive apply
+            // fence. This would fail immediately in the old recursive path.
+            try std.testing.expect(owner.core.tryLockApplyShared());
+            owner.core.unlockApplyShared();
+            probe.calls += 1;
+            if (probe.mode != .none) {
+                probe.concurrent_calls += 1;
+                const same_key = probe.mode == .same_key;
+                if (!same_key) probe.mode = .none;
+                const update: types.TransactionIntentRequest = .{
+                    .timestamp_ns = 900 + probe.concurrent_calls,
+                    .schema_version = 1,
+                    .relational_schema_version = 1,
+                    .writes = &.{.{ .key = if (same_key) "candidate" else "unrelated", .value = "{\"id\":9,\"body\":\"concurrent\"}" }},
+                    .row_policy_principal_proof = probe.token,
+                    .row_policy_database = "main",
+                    .row_policy_admitted_at_seconds = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)),
+                };
+                // Unrelated native work can finish while the provider is on
+                // the stack. sync=write does not recursively invoke inference.
+                try owner.batch(try update.asAtomicBatch());
+            }
+            const vector = try alloc.alloc(f32, dims);
+            @memset(vector, 1);
+            return vector;
+        }
+    };
+    var directory = try TestDirectory.init("native-atomic-provider-apply");
+    defer directory.cleanup();
+    const descriptor: persistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(1), .data_generation = 1 };
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var probe: Probe = .{};
+    var db = try DB.open(a, directory.path(), .{
+        .identity_namespace = .{ .table_id = 100, .shard_id = 101, .range_id = 101 },
+        .online_source_authority = .native,
+        .sql_persistence = descriptor,
+        .sql_persistence_context = .{ .node_id = 9, .store_id = 11, .execution_instance = descriptor.generation_instance, .generation_instance = descriptor.generation_instance, .data_generation = 1 },
+        .persistence_boot = .{ .instance = descriptor.generation_instance, .initializing = true, .unclean_restart = false },
+        .start_optional_runtime_workers = false,
+        .start_index_workers = false,
+        .executor = .{ .backend = .manual },
+        .backend_runtime = runtime.ptr(),
+        .enrichment = .{ .owner_id = "native-provider-probe", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .dense_embed_with_context_fn = Probe.embedControlled, .foreground_bounded = true } },
+    });
+    defer db.close();
+    probe.db = &db;
+    try db.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"body":{"type":"keyword"}},"required":["id","body"],"additionalProperties":false}}}}
+    );
+    try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense\"}}" });
+    var view = db.core.acquireSchemaView().?;
+    defer view.release();
+    const schema = view.tableSchema().*;
+    const schema_json = try schema_mod.serializeSchema(a, schema);
+    defer a.free(schema_json);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema_json, &digest, .{});
+    const allow: policies.Predicate = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } }}, .root = 0 };
+    const record: policies.Record = .{ .id = 1, .generation = 1, .table_id = 100, .schema_version = 1, .schema_digest = digest, .name = "allowed_role", .commands = .{ .select = true, .insert = true, .update = true, .delete = true }, .roles = &.{"allowed"}, .using = allow, .with_check = allow };
+    const bundle = try std.json.Stringify.valueAlloc(a, policies.InstallSnapshot{ .table_id = 100, .schema_version = 1, .schema_digest = digest, .policy_generation = 1, .catalog_epoch = 1, .phase = .active, .records = &.{record}, .settings = &.{} }, .{});
+    defer a.free(bundle);
+    var catalog = (try table_catalog_mod.load(a, db.core.store)).?;
+    catalog.row_policy_phase = .active;
+    catalog.row_policy_generation = 1;
+    catalog.row_policy_catalog_epoch = 1;
+    const catalog_bytes = try catalog.encodeDurable();
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(table_catalog_mod.key, catalog_bytes.slice());
+        try txn.put(row_policy_bundle_mod.key, bundle);
+        try txn.commit();
+    }
+    db.core.table_catalog = catalog;
+    db.local_execution.row_policy_gate = row_policy_gate_mod.Gate.init(catalog);
+    db.local_execution.row_policy_bundle = try row_policy_bundle_mod.Installed.init(a, bundle, 100, schema);
+    const secret = "0123456789abcdef0123456789abcdef";
+    db.local_execution.row_policy_authority_secret = secret;
+    db.local_execution.row_policy_authority_issuer = "native-probe";
+    db.local_execution.row_policy_table_name = "native:100";
+    const now: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s));
+    const scope: row_policy_authority_mod.Scope = .{ .table_id = 100, .table = "native:100", .database = "main", .policy_generation = 1, .catalog_epoch = 1, .access = .write };
+    const allowed = try row_policy_authority_mod.sign(a, secret, "native-probe", .{ .principal = "alice", .roles = &.{"allowed"}, .auth_revision = 1 }, scope, now);
+    defer a.free(allowed);
+    const denied = try row_policy_authority_mod.sign(a, secret, "native-probe", .{ .principal = "bob", .roles = &.{}, .auth_revision = 1 }, scope, now);
+    defer a.free(denied);
+    probe.token = allowed;
+    var intent: types.TransactionIntentRequest = .{
+        .timestamp_ns = 100,
+        .schema_version = 1,
+        .relational_schema_version = 1,
+        .writes = &.{.{ .key = "candidate", .value = "{\"id\":1,\"body\":\"first candidate\"}" }},
+        .row_policy_principal_proof = denied,
+        .row_policy_database = "main",
+        .row_policy_admitted_at_seconds = now,
+    };
+    var request = try intent.asAtomicBatch();
+    request.sync_level = .full_index;
+    try std.testing.expectError(error.RowPolicyDenied, db.batch(request));
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try std.testing.expectEqual(@as(u64, 0), try db.core.readTimestamp(a, "candidate"));
+    intent.row_policy_principal_proof = allowed;
+    request = try intent.asAtomicBatch();
+    request.sync_level = .full_index;
+    probe.mode = .unrelated;
+    try db.batch(request);
+    try std.testing.expect(probe.calls > 0);
+    try std.testing.expectEqual(@as(usize, 1), probe.concurrent_calls);
+    try std.testing.expectEqual(@as(u64, 901), try db.core.readTimestamp(a, "unrelated"));
+    try std.testing.expectEqual(@as(u64, 100), try db.core.readTimestamp(a, "candidate"));
+    // Each real provider call changes precisely the authorized OLD image.
+    // All bounded attempts must reject that captured image and preserve the
+    // independently committed native update; no outer primary commit occurs.
+    probe.mode = .same_key;
+    intent.timestamp_ns = 200;
+    intent.writes = &.{.{ .key = "candidate", .value = "{\"id\":2,\"body\":\"changed candidate\"}" }};
+    request = try intent.asAtomicBatch();
+    request.sync_level = .full_index;
+    var committed = false;
+    const before = probe.concurrent_calls;
+    try std.testing.expectError(error.PreparedReadSetChanged, db.batchTracked(request, &committed));
+    try std.testing.expect(!committed);
+    try std.testing.expectEqual(before + 3, probe.concurrent_calls);
+    try std.testing.expectEqual(@as(u64, 900) + probe.concurrent_calls, try db.core.readTimestamp(a, "candidate"));
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(!try transactions_mod.hasAnyTransactionStateInView(&read));
+}
+
+test "db graph transaction effects preserve internal producer transport across cold LSM policy snapshots" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-producer-transport");
+    defer directory.cleanup();
+    const batch_api = @import("../../api/batch.zig");
+    const request: types.BatchRequest = .{ .graph_writes = &.{
+        .{ .index_name = "g", .source = "root", .target = "tuple", .edge_type = "R", .owner = "fact:tuple" },
+        .{ .index_name = "g", .source = "root", .target = "explicit", .edge_type = "R", .edge_id = "relationship", .owner_document = "fact:explicit" },
+        .{ .index_name = "g", .source = "root", .target = "implicit", .edge_type = "R" },
+    }, .sync_level = .full_index };
+    {
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        const encoded = try batch_api.encodeBatchRequest(a, request);
+        defer a.free(encoded);
+        var transported = try batch_api.parseInternalBatchRequest(a, encoded);
+        defer transported.deinit(a);
+        try db.batch(transported.req);
+    }
+    var reopened = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer reopened.close();
+    var cut = try reopened.captureRelationalStatementSnapshotWithGraphs(&.{"g"});
+    defer cut.deinit();
+    var page = try reopened.relationalGraphSnapshotPage(&cut, a, .{ .index = "g", .key = "root", .edge_types = &.{"R"} });
+    defer page.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), page.page.edges.len);
+    for (page.page.edges, page.owner_documents.?) |edge, owners| {
+        try std.testing.expectEqual(@as(usize, 1), owners.len);
+        const expected = if (std.mem.eql(u8, edge.target, "tuple")) "fact:tuple" else if (std.mem.eql(u8, edge.target, "explicit")) "fact:explicit" else "root";
+        try std.testing.expectEqualStrings(expected, owners[0]);
+    }
+}
+
+test "db native source retirement admits only exact captured close and resolved native decision cleanup" {
+    const a = std.testing.allocator;
+    const persistence = @import("../../common/relation_persistence.zig");
+    const topology = @import("relational_integrity_topology.zig");
+    const locks = @import("../pessimistic_lock_control.zig");
+    const scopes = @import("../pessimistic_lock_authority.zig");
+    const frozen = @import("../pessimistic_lock_transaction.zig");
+    const realm: [16]u8 = @splat(1);
+    const namespace: doc_identity.Namespace = .{ .table_id = 717, .shard_id = 172, .range_id = 272 };
+    const group: u64 = 719;
+    const Helper = struct {
+        fn drained(db: *DB, alloc: Allocator) !bool {
+            var result = (try db.lookup(alloc, "", .{ .relational_topology_json = "{\"mode\":\"retirement_status\"}", .fk_generation_source_control = true })).?;
+            defer result.deinit(alloc);
+            var decoded = try std.json.parseFromSlice(DB.RelationalTopologyStatus, alloc, result.json, .{});
+            defer decoded.deinit();
+            return decoded.value.drained;
+        }
+    };
+    for ([_]persistence.Kind{ .temporary, .unlogged }) |kind| {
+        var temporary = try TestDirectory.init("db-native-fenced-lock-cleanup");
+        defer temporary.cleanup();
+        const path = temporary.path().ptr;
+        defer cleanupTempDir(path);
+        const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+        const descriptor: persistence.Descriptor = .{ .kind = kind, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(1), .data_generation = 1, .owner = if (kind == .temporary) .{ .issuer_node_id = 7, .connection_id = @splat('a'), .wire_epoch = @splat(2), .execution_instance = @splat(3), .connection_generation = 1, .principal_digest = @splat(4) } else null };
+        var db = try DB.open(a, std.mem.span(path), .{ .identity_namespace = namespace, .online_source_authority = .native, .sql_persistence = descriptor, .sql_persistence_context = .{ .node_id = 9, .store_id = 11, .execution_instance = descriptor.generation_instance, .generation_instance = descriptor.generation_instance, .data_generation = descriptor.data_generation }, .persistence_boot = .{ .instance = descriptor.generation_instance, .initializing = true, .unclean_restart = false }, .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        const pin = (try db.relationPhysicalPin()).?;
+        const route: @import("../../metadata/catalog_route_contract.zig").CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = std.fmt.bytesToHex(realm, .lower), .catalog_revision = 2, .table_id = namespace.table_id, .topology_epoch = 1, .route = .{ .group_id = group, .range_id = namespace.range_id, .identity_namespace = .{ .table_id = namespace.table_id, .shard_id = namespace.shard_id, .range_id = namespace.range_id }, .execution = .{ .native_local = descriptor } }, .native_participant = pin };
+        const admission: @import("../pessimistic_lock_participant.zig").Admission = .{ .purpose = .execution, .binding = .{ .namespace = .{ .home = .data, .group = group, .incarnation = realm }, .identity = namespace }, .source = .{ .group = 1, .lease = .{ .backend = .{ .incarnation = realm, .id = @splat(2), .fence = 1 }, .database = 4, .node = 7, .principal = @splat(4), .expires_at_ms = now + 60_000 }, .connection = @splat('a'), .nonce = @splat(8), .standalone = false }, .transaction = @splat(9), .generation = 1, .parent_command = .{ .sequence = 1, .nonce = @splat(10), .executor = @splat(3) }, .serial = 1 };
+        const participant: scopes.Data.Participant = .{ .spec = .{ .table_name = "rows", .route = route, .schema_version = db.core.index_manager.activeSchemaVersion() }, .admission = admission };
+        var directory: scopes.Data.Header = .{ .next_generation = 2, .open = 1 };
+        directory.slots[0] = 1;
+        const checked: locks.Checked = .{ .source = .{ .registration = admission.source, .data = directory, .command = admission.parent_command, .transaction = .{ .id = admission.transaction } }, .participant = participant, .admitted_at_ms = now };
+        try checked.requireExecuting(admission);
+        // Real primary scope admission precedes the physical fence. Checked is
+        // the existing component receiver input, never a fabricated ACK.
+        if (kind == .temporary) try db.batch(.{ .sql_lock = .{ .admission = admission, .checked = checked, .operation = .begin } });
+        const identity = try db.relationalTopologyIdentity();
+        const fence: topology.Fence = .{ .transition_id = 71, .attempt = 72, .admission_epoch = identity.next_epoch, .owner_group_id = group, .peer_group_id = group, .role = .document_retirement_source, .namespace = namespace, .catalog_digest = identity.catalog_digest };
+        var schema_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash("", &schema_digest, .{});
+        try db.batchNativeFkGenerationApply(.{ .relational_topology = .{ .action = .begin, .fence = fence, .sql_drop_control = true, .document_schema_digest = schema_digest } });
+        try std.testing.expectError(error.IntegrityTopologyBusy, db.batch(.{ .sql_lock = .{ .admission = admission, .checked = checked, .operation = .begin } }));
+        try std.testing.expectError(error.IntegrityTopologyBusy, db.batch(.{ .writes = &.{.{ .key = "blocked", .value = "{\"n\":1}" }}, .reject_graph_transform_projections = true }));
+        if (kind == .temporary) {
+            try std.testing.expect(!try Helper.drained(&db, a));
+            const close: locks.Command = .{ .admission = admission, .retirement_control = .{ .route = route, .scope_id = @splat(11), .scope_revision = 1, .abandonment_digest = @splat(12), .physical_fence = fence, .participant = participant }, .operation = .close };
+            try close.validate();
+            var wrong = close;
+            wrong.retirement_control.?.physical_fence.transition_id += 1;
+            try std.testing.expectError(error.IntegrityTopologyChanged, db.batch(.{ .sql_lock = wrong }));
+            wrong = close;
+            wrong.retirement_control.?.physical_fence.admission_epoch += 1;
+            try std.testing.expectError(error.IntegrityTopologyChanged, db.batch(.{ .sql_lock = wrong }));
+            wrong = close;
+            wrong.retirement_control.?.route.native_participant.?.physical_root_incarnation += 1;
+            wrong.retirement_control.?.participant.spec.route.native_participant = wrong.retirement_control.?.route.native_participant;
+            try std.testing.expectError(error.ExternalTransactionDecisionChanged, db.batch(.{ .sql_lock = wrong }));
+            wrong = close;
+            wrong.retirement_control.?.route.route.execution.native_local.data_generation += 1;
+            wrong.retirement_control.?.route.native_participant.?.data_generation += 1;
+            wrong.retirement_control.?.participant.spec.route = wrong.retirement_control.?.route;
+            try std.testing.expectError(error.ExternalTransactionDecisionChanged, db.batch(.{ .sql_lock = wrong }));
+            wrong = close;
+            wrong.admission.binding.identity.table_id += 1;
+            try std.testing.expectError(error.LockOwnerChanged, db.batch(.{ .sql_lock = wrong }));
+            var attempts: usize = 0;
+            while (!try Helper.drained(&db, a) and attempts < 64) : (attempts += 1) try db.batch(.{ .sql_lock = close });
+            try std.testing.expect(try Helper.drained(&db, a));
+            // Lost response replay cannot revive the retired source.
+            try db.batch(.{ .sql_lock = close });
+        }
+        // A canonical phase-two ABORT can arrive before native BEGIN. The
+        // actual primary tombstone+Owner+Pin precede adoption of the missing Ref.
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        const id: types.TxnId = @splat(21);
+        const owner: transactions_mod.ExternalDecisionOwner = .{ .metadata_incarnation = std.fmt.bytesToHex(realm, .lower), .operation_id = @splat(22), .admission_digest = @splat(23), .expires_at_unix_ns = (now + 60_000) * std.time.ns_per_ms };
+        var resolution = admission;
+        resolution.purpose = .resolution;
+        resolution.transaction = id;
+        resolution.generation = 2;
+        // Data backend identity includes transaction+enrollment generation;
+        // this is indexed absence, never reuse of the earlier retired owner.
+        try std.testing.expect(!(try resolution.registration()).lease.backend.eql((try admission.registration()).lease.backend));
+        const control: locks.NativeControl = .{ .route = route, .owner = owner, .decision = .{ .operation = owner.operation_id, .admission = owner.admission_digest } };
+        const resolve: locks.Command = .{ .admission = resolution, .native_control = control, .operation = .{ .resolve = control.decision } };
+        try resolve.validate();
+        var prepare = resolve;
+        prepare.operation = .{ .prepare = control.decision };
+        try std.testing.expectError(error.IntegrityTopologyBusy, db.batch(.{ .sql_lock = prepare }));
+        _ = try manager.resolveIntentsWithExtraBatch(id, .aborted, 200, .{ .external_decision_owner = owner, .native_pin = pin, .resolved_participant = "data:719" });
+        var wrong = resolve;
+        wrong.native_control.?.owner.admission_digest[0] ^= 1;
+        wrong.native_control.?.decision.admission = wrong.native_control.?.owner.admission_digest;
+        wrong.operation = .{ .resolve = wrong.native_control.?.decision };
+        try std.testing.expectError(error.ExternalTransactionDecisionChanged, db.batch(.{ .sql_lock = wrong }));
+        wrong = resolve;
+        wrong.native_control.?.route.native_participant.?.physical_root_incarnation += 1;
+        try std.testing.expectError(error.ExternalTransactionDecisionChanged, db.batch(.{ .sql_lock = wrong }));
+        try db.batch(.{ .sql_lock = resolve });
+        try db.batch(.{ .sql_lock = resolve });
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            const actual = (try frozen.read(a, &read, id)).?;
+            try std.testing.expect(actual.retired);
+            try std.testing.expectEqualDeep(resolution, actual.ref.admission);
+        }
+        // ACK debt is still real; cleanup does not fake the metadata handoff.
+        try std.testing.expect(!try Helper.drained(&db, a));
+        try manager.markParticipantResolvedExtraBatch(id, "data:719", .{ .external_decision_owner = owner, .native_pin = pin });
+        try std.testing.expect(try Helper.drained(&db, a));
+    }
 }

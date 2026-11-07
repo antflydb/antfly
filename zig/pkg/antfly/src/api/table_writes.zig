@@ -17147,7 +17147,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.notifyLocalChange(table_name, .runtime_status);
     }
 
-    fn notifyLocalIndexRepairDebt(
+    pub fn notifyLocalIndexRepairDebt(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         group_id: u64,
@@ -20133,6 +20133,8 @@ pub const ProvisionedTableWriteSource = struct {
                 .graph_metric_action_with_cancellation = graphMetricActionWithCancellation,
                 .drop_table = dropTable,
                 .sql_maintenance_group = sqlMaintenanceGroup,
+                .sql_maintenance_group_routed = sqlMaintenanceGroupRouted,
+                .sql_maintenance_group_local_routed = sqlMaintenanceGroupLocalRouted,
                 .sql_maintenance_group_local = sqlMaintenanceGroupLocal,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .resolver_operation_group_local = resolverOperationGroupLocal,
@@ -20153,6 +20155,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .finish_bulk_ingest = finishBulkIngest,
                 .abort_bulk_ingest = abortBulkIngest,
                 .batch_group_local = batchGroupLocal,
+                .batch_group_local_routed = batchGroupLocalRouted,
                 .replicated_batch_group_local = replicatedPolicyControlGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
@@ -20194,6 +20197,23 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn sqlMaintenanceGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
         try cancellation.check();
+        return sqlMaintenanceGroupLocal(ptr, alloc, group_id, table_name, body);
+    }
+
+    fn sqlMaintenanceGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        return sqlMaintenanceGroupLocalRouted(ptr, alloc, fence, group_id, table_name, body, cancellation);
+    }
+
+    fn sqlMaintenanceGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try cancellation.check();
+        try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, self.catalog.routeFenceDeadline(fence));
+        if (fence.route.group_id != group_id) return error.TopologyChanged;
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return local_source.sqlMaintenanceGroupLocalRouted(alloc, fence, group_id, table_name, body, cancellation);
+        }
+        if (fence.route.execution == .native_local) return error.CatalogRouteFenceUnsupported;
         return sqlMaintenanceGroupLocal(ptr, alloc, group_id, table_name, body);
     }
 
@@ -21162,6 +21182,9 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn canCoalesceProvisionedGroupBatch(self: *ProvisionedTableWriteSource, group: GroupBatch, req: db_mod.types.BatchRequest) bool {
+        // Native admission is bound to a request's owner and cancellation.
+        // A shared queue cannot substitute another request's authority.
+        if (group.route_fence) |fence| if (fence.route.execution == .native_local) return false;
         if (self.write_cache == null) return false;
         if (group.transforms.items.len != 0) return false;
         if (req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0) return false;
@@ -21530,6 +21553,20 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
         cancellation: db_mod.types.CancellationToken,
     ) !void {
+        if (group.route_fence) |captured| if (captured.route.execution == .native_local) {
+            // The local fast path must consume the same owner-bound route as
+            // the distributed writer. Dropping it turns an authorized native
+            // write into an unbound physical-owner acquisition.
+            var fence = captured;
+            fence.admission_cancellation = cancellation;
+            var grouped_request = req;
+            grouped_request.writes = group.writes.items;
+            grouped_request.deletes = group.deletes.items;
+            grouped_request.transforms = group.transforms.items;
+            if ((try batchGroupLocalRouted(self, alloc, group.group_id, table_name, grouped_request, fence)) == null)
+                return error.TableNotFound;
+            return;
+        };
         if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
@@ -21608,8 +21645,13 @@ pub const ProvisionedTableWriteSource = struct {
             fence.admission_deadline_ns = context.deadline_ns;
             fence.admission_deadline_io = context.deadline_io;
             fence.admission_cancellation = context.cancellation;
+            try bindRangeActivationOwner(&fence, context);
             if (batcher) |owner| {
                 try owner.batchGroupRoutedWithCancellation(alloc, fence, table, .{ .activate_range_tracking = true }, context.cancellation);
+            } else if (fence.route.execution == .native_local) {
+                // This entry owns routed admission itself; do not recursively
+                // acquire it, or fall back to an unbound native owner.
+                _ = (try batchGroupLocalRouted(self, alloc, route.group_id, table, .{ .activate_range_tracking = true }, fence)) orelse return error.StorageKernelOwnerUnavailable;
             } else {
                 // Standalone owns every local range directly. Hold the same
                 // table admission used by restore and split while validating
@@ -22334,6 +22376,8 @@ pub const ProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        const atomic_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
+        if (try distributed_txn.executeNativeAtomicBatch(alloc, self.catalog, .{ .ptr = self, .apply = nativeAtomicApply }, tables, nextTxnTimestamp(atomic_io), sync_level, cancellation)) |outcome| return outcome;
         if (try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation)) |outcome| return outcome;
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
@@ -22342,6 +22386,12 @@ pub const ProvisionedTableWriteSource = struct {
                 public_table_http.setLastAmbiguousBatchTxnId(distributed_txn.encodeTxnIdHex(txn_id));
             return err;
         };
+    }
+
+    fn nativeAtomicApply(ptr: *anyopaque, alloc: std.mem.Allocator, route: metadata_api.CatalogRouteFence, table: []const u8, request: db_mod.types.BatchRequest, cancellation: db_mod.types.CancellationToken) !void {
+        var scoped = route;
+        scoped.admission_cancellation = cancellation;
+        if ((try batchGroupLocalRouted(ptr, alloc, scoped.route.group_id, table, request, scoped)) == null) return error.TableNotFound;
     }
 
     /// A transaction with one participant is already atomic at the shard DB
@@ -22367,7 +22417,8 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len != 1) return null;
 
         const table_req = tables[0];
-        if (table_req.range_guards.len != 0) return null;
+        if (table_req.sql_persistence != null) return null;
+        if (table_req.range_guards.len != 0 or table_req.trigger_receipts.len != 0 or table_req.graph_preparation != null or table_req.graph_writes.len != 0 or table_req.graph_deletes.len != 0) return null;
         if (table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null or table_req.schema_version != null) return null;
         const has_mutations = table_req.writes.len != 0 or
             table_req.deletes.len != 0 or
@@ -22387,6 +22438,8 @@ pub const ProvisionedTableWriteSource = struct {
             table_req.table_name,
         )) orelse return null;
         defer routing.deinit(alloc);
+        const captured_table = tables_api.findTableByName(&routing.snapshot, table_req.table_name) orelse return null;
+        if (captured_table.sql_persistence != null) return null;
 
         var group_id_opt: ?u64 = null;
         const resolveOpGroup = struct {
@@ -22451,9 +22504,16 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len == 0) return .{ .committed = .{ .participant_count = 0 } };
         if (tables.len != 1) return null;
         const table_req = tables[0];
-        if (table_req.range_guards.len != 0) return null;
+        if (table_req.sql_persistence != null) return null;
+        if (table_req.range_guards.len != 0 or table_req.trigger_receipts.len != 0 or table_req.graph_preparation != null or table_req.graph_writes.len != 0 or table_req.graph_deletes.len != 0) return null;
         if (table_req.predicates.len != 0 or table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null or table_req.schema_version != null) return null;
-        if (try tableCommitHasGraphProjectionTransform(table_req)) return null;
+        // Keep ordinary single-owner transforms (including _edges projections) in
+        // the existing atomic Raft batch. A coordinated vote requires protected
+        // graph preparation; moving this request there invents that requirement.
+        // Never discard private authority, policy, restore, or integrity evidence.
+        if (table_req.trigger_minter != null or table_req.relation_owner_minter != null or
+            table_req.row_policy_principal_proof.len != 0 or table_req.row_policy_database.len != 0 or table_req.row_policy_admitted_at_seconds != 0 or
+            table_req.relational_integrity_generation_set != null or table_req.restore_staging_scope != null or table_req.restore_staging_plan_id != null or table_req.relational_repair) return null;
 
         var routing = (try table_catalog.tableRoutingSnapshotForWrite(
             alloc,
@@ -22462,6 +22522,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.catalog.budget(null).nowNs() +| write_routing_snapshot_timeout_ns,
         )) orelse return null;
         defer routing.deinit(alloc);
+        if (routing.execution == .native_local) return null;
 
         var selected_route: ?table_catalog.CatalogGroupRoute = null;
         const resolveOpGroup = struct {
@@ -22501,6 +22562,18 @@ pub const ProvisionedTableWriteSource = struct {
             else => return err,
         };
         return .{ .committed = .{ .participant_count = 1 } };
+    }
+
+    fn batchGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest, route: metadata_api.CatalogRouteFence) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (route.route.execution != .native_local) return batchGroupLocal(ptr, alloc, group_id, table_name, req);
+        if (route.route.group_id != group_id) return error.TopologyChanged;
+        const deadline = self.catalog.routeFenceDeadline(route) orelse self.catalog.budget(null).nowNs() +| 5 * std.time.ns_per_s;
+        var admission = try self.acquireRoutedWriteAdmission(alloc, table_name, route, deadline, route.admission_cancellation);
+        defer admission.deinit();
+        try enforceReplicationWriteGateOptional(self.replication_write_gate);
+        const native = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+        return native.batchGroupLocalRouted(alloc, group_id, table_name, req, route);
     }
 
     fn batchGroupLocal(
@@ -23359,6 +23432,11 @@ pub const ProvisionedTableWriteSource = struct {
         if (context.route_fence == null)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         try ensurePreDecisionContextActive(context);
+        if (context.route_fence) |fence| if (fence.route.execution == .native_local) {
+            if (context.external_decision_owner == null) return error.InvalidExternalDecisionOwner;
+            const native = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return native.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants, context);
+        };
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, .{
                 .transaction = .{ .begin = .{
@@ -23463,6 +23541,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try ensurePreDecisionContextActive(context);
+        try @import("sql_graph_vote.zig").require(alloc, self.catalog, table_name, req.asBatch(txn_id, topology_epoch), context.deadline_ns);
         if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
         var guarded_admission: ?RoutedWriteAdmission = null;
         defer if (guarded_admission) |*admission| admission.deinit();
@@ -23483,6 +23562,11 @@ pub const ProvisionedTableWriteSource = struct {
         if (context.route_fence == null)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         try ensurePreDecisionContextActive(context);
+        if (context.route_fence) |fence| if (fence.route.execution == .native_local) {
+            if (req.external_decision_owner == null) return error.InvalidExternalDecisionOwner;
+            const native = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return native.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, txn_id, topology_epoch, req, context);
+        };
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.asBatch(txn_id, topology_epoch), context);
             return {};
@@ -23576,6 +23660,11 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.endGroupOperation(table_name, group_id);
         if (topology_epoch != 0)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        if (request.route_fence) |fence| if (fence.route.execution == .native_local) {
+            if (request.external_decision_owner == null) return error.InvalidExternalDecisionOwner;
+            const native = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return native.txnResolveGroupLocalWithRequest(alloc, group_id, table_name, request, cancellation);
+        };
         if (self.raft_batcher) |batcher| {
             // Resolution is idempotent and may arrive through a stale hosted
             // route after leadership changes. Use the same leader-aware Raft
@@ -25006,6 +25095,18 @@ fn selectHostedBackupFanoutError(result_slots: anytype, workers: anytype, await_
     return await_err;
 }
 
+fn bindRangeActivationOwner(fence: *metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
+    if (fence.route.execution != .native_local) return;
+    const descriptor = fence.route.execution.native_local;
+    try descriptor.requireConnectionOwner(context.sql_relation_owner);
+    fence.admission_sql_relation_owner = context.sql_relation_owner;
+    fence.admission_relation_minter = context.sql_relation_owner_minter;
+    if (descriptor.kind == .temporary) {
+        const minter = context.sql_relation_owner_minter orelse return error.SqlTemporaryRelationNotOwned;
+        try descriptor.requireConnectionOwner(minter.owner);
+    }
+}
+
 pub const HostedProvisionedTableWriteSource = struct {
     /// Retains a hosted writer while a production-shaped structural operation
     /// uses the DB directly. The caller must already own the corresponding
@@ -25644,6 +25745,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .graph_metric_action = graphMetricAction,
                 .graph_metric_action_with_cancellation = graphMetricActionWithCancellation,
                 .sql_maintenance_group = sqlMaintenanceGroup,
+                .sql_maintenance_group_routed = sqlMaintenanceGroupRouted,
+                .sql_maintenance_group_local_routed = sqlMaintenanceGroupLocalRouted,
                 .sql_maintenance_group_local = sqlMaintenanceGroupLocal,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .resolver_operation_group_local = resolverOperationGroupLocal,
@@ -25661,6 +25764,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .restore_table = restoreTable,
                 .batch = batch,
                 .batch_group_local = batchGroupLocal,
+                .batch_group_local_routed = batchGroupLocalRouted,
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
@@ -25723,7 +25827,12 @@ pub const HostedProvisionedTableWriteSource = struct {
         for (routing.ranges) |range| {
             try normalized.ensureActive();
             const selected = routing.resolveRouteForKey(range.start_key) orelse return error.CatalogGenerationChanged;
-            const fence = routing.fenceForRoute(selected);
+            var fence = routing.fenceForRoute(selected);
+            fence.admission_deadline_ns = normalized.deadline_ns;
+            fence.admission_cancellation = normalized.cancellation;
+            try bindRangeActivationOwner(&fence, normalized);
+            client.relation_owner_route = if (fence.route.execution == .native_local) fence else null;
+            client.relation_owner_purpose = .write;
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, range.group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
             defer route.deinit(alloc);
             const remote = switch (route) {
@@ -25757,6 +25866,42 @@ pub const HostedProvisionedTableWriteSource = struct {
                 break :remote try alloc.dupe(u8, response.body);
             },
         };
+    }
+
+    fn sqlMaintenanceGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try cancellation.check();
+        if (fence.route.group_id != group_id) return error.TopologyChanged;
+        var target = (try table_router.resolveCapturedGroupRoute(alloc, self.catalog, self.router, fence, .prefer_leader)) orelse return error.LeaderUnavailable;
+        defer target.deinit(alloc);
+        return switch (target) {
+            .local => sqlMaintenanceGroupLocalRouted(ptr, alloc, fence, group_id, table_name, body, cancellation),
+            .remote => |remote| remote: {
+                var client = self.httpClient(alloc);
+                client.relation_owner_route = fence;
+                var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").api_sql_maintenance_contract.Request, alloc, body, .{});
+                defer parsed.deinit();
+                try parsed.value.validate();
+                client.relation_owner_purpose = if (parsed.value.operation == .statistics) .read else .write;
+                var control = http_common.RequestCancellation.fromToken(cancellation);
+                var response = try client.fetchGroupSqlMaintenanceRoutedWithCancellation(remote.base_uri, fence, group_id, table_name, body, &control);
+                defer response.deinit(alloc);
+                break :remote try alloc.dupe(u8, response.body);
+            },
+        };
+    }
+
+    fn sqlMaintenanceGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try cancellation.check();
+        try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, self.catalog.routeFenceDeadline(fence));
+        if (fence.route.group_id != group_id) return error.TopologyChanged;
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return local_source.sqlMaintenanceGroupLocalRouted(alloc, fence, group_id, table_name, body, cancellation);
+        }
+        if (fence.route.execution == .native_local) return error.CatalogRouteFenceUnsupported;
+        return sqlMaintenanceGroupLocal(ptr, alloc, group_id, table_name, body);
     }
 
     fn sqlMaintenanceGroupLocal(
@@ -26365,9 +26510,49 @@ pub const HostedProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        const atomic_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
+        if (try distributed_txn.executeNativeAtomicBatch(alloc, self.catalog, .{ .ptr = self, .apply = nativeAtomicApply }, tables, nextTxnTimestamp(atomic_io), sync_level, cancellation)) |outcome| return outcome;
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
         return try commitHostedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+    }
+
+    fn batchGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, request: db_mod.types.BatchRequest, route: metadata_api.CatalogRouteFence) !?void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (route.route.group_id != group or route.route.execution != .native_local) return error.TopologyChanged;
+        try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table, route, self.catalog.routeFenceDeadline(route));
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return owner.batchGroupLocalRouted(alloc, group, table, request, route);
+        } else return error.CatalogRouteFenceUnsupported;
+    }
+
+    fn nativeAtomicApply(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: db_mod.types.BatchRequest, cancellation: db_mod.types.CancellationToken) !void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try cancellation.check();
+        var route = (try table_router.resolveCapturedGroupRoute(alloc, self.catalog, self.router, fence, .prefer_leader)) orelse return error.LeaderUnavailable;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => {
+                if (comptime control_only_storage_sources) {
+                    const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+                    if ((try owner.batchGroupLocalRouted(alloc, fence.route.group_id, table, request, fence)) == null) return error.TableNotFound;
+                } else return error.CatalogRouteFenceUnsupported;
+            },
+            .remote => |remote| {
+                const body = try encodeStorageKernelBatchRequest(alloc, request);
+                defer alloc.free(body);
+                const encoded = try std.json.Stringify.valueAlloc(alloc, fence, .{});
+                defer alloc.free(encoded);
+                var client = self.httpClient(alloc);
+                client.relation_owner_route = fence;
+                client.relation_owner_purpose = .write;
+                var control = http_common.RequestCancellation.fromToken(cancellation);
+                const budget: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = cancellation };
+                var response = try client.fetchGroupBatchWithForwarding(remote.base_uri, fence.route.group_id, table, body, try budget.remainingTimeoutMs(), null, &control, encoded);
+                defer response.deinit(alloc);
+            },
+        }
     }
 
     fn commitTransactionWithId(
@@ -27984,15 +28169,6 @@ fn statelessBatchMayRetry(tables: []const distributed_txn.TableCommitRequest) bo
         if (table.predicates.len != 0 or table.integrity.len != 0 or table.integrity_commands.len != 0 or table.relational_activation != null or table.relational_retirement != null or table.relational_index_maintenance != null) return false;
     }
     return true;
-}
-
-fn tableCommitHasGraphProjectionTransform(table: distributed_txn.TableCommitRequest) !bool {
-    for (table.transforms) |transform| {
-        for (transform.operations) |operation| {
-            if (try db_mod.transform.graphProjectionPath(operation.path) != null) return true;
-        }
-    }
-    return false;
 }
 
 fn statelessBatchRetryDelayNs(attempt: u8) u64 {
@@ -33946,7 +34122,64 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 0), clock.calls);
         }
 
-        test "raft single-group fast path excludes graph projection transforms only" {
+        test "SQL relation lifetime native fast paths retain owner authority by declining both Raft and local shortcuts" {
+            const p = @import("antfly_local_sources").common_topology_records.RelationPersistence;
+            const Catalog = struct {
+                native: [1]metadata_table_manager.TableRecord,
+                calls: usize = 0,
+                fn adminSnapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    var result = try ProvisionedWriteCoalesceTestCatalog.adminSnapshot(undefined);
+                    result.tables = &self.native;
+                    return result;
+                }
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn source(self: *@This()) table_catalog.CatalogSource {
+                    return .{ .ptr = self, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot, .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot, .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot, .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot } };
+                }
+            };
+            const Effects = struct {
+                calls: usize = 0,
+                fn group(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                }
+                fn routed(raw: *anyopaque, a: std.mem.Allocator, route: metadata_api.CatalogRouteFence, name: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
+                    return group(raw, a, route.route.group_id, name, req);
+                }
+            };
+            inline for (.{ p.Kind.unlogged, p.Kind.temporary }) |kind| {
+                const descriptor: p.Descriptor = .{ .kind = kind, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(1), .data_generation = 1, .owner = if (kind == .temporary) .{ .issuer_node_id = 5, .connection_id = @splat(2), .wire_epoch = @splat(3), .execution_instance = @splat(4), .connection_generation = 1, .principal_digest = @splat(5) } else null };
+                var catalog = Catalog{ .native = .{.{ .table_id = 7, .name = "docs", .placement_role = "data", .indexes_json = tables_api.default_indexes_json, .sql_persistence = descriptor }} };
+                var effects: Effects = .{};
+                var local_source = ProvisionedTableWriteSource.init("unused-native-fast-path", catalog.source());
+                defer local_source.deinit();
+                const req: distributed_txn.TableCommitRequest = .{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} };
+                // Even an older caller with no captured optional descriptor
+                // must discover native kind in the existing routing snapshot.
+                try std.testing.expect((try local_source.commitSingleGroupBatch(std.testing.allocator, &.{req}, .write, .none)) == null);
+                var routed_source = ProvisionedTableWriteSource.init("unused-native-fast-path", catalog.source());
+                defer routed_source.deinit();
+                _ = routed_source.withRaftBatcher(.{ .ptr = &effects, .vtable = &.{ .batch_group = Effects.group, .batch_group_routed_with_cancellation = Effects.routed, .batch_group_local = Effects.group } });
+                try std.testing.expect((try routed_source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{req}, .write, .none)) == null);
+                var captured = req;
+                captured.sql_persistence = descriptor;
+                try std.testing.expect((try local_source.commitSingleGroupBatch(std.testing.allocator, &.{captured}, .write, .none)) == null);
+                try std.testing.expect((try routed_source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{captured}, .write, .none)) == null);
+                try std.testing.expectEqual(@as(usize, 0), effects.calls);
+                try std.testing.expect(catalog.calls >= 2);
+            }
+            var ordinary_effects: Effects = .{};
+            var ordinary = ProvisionedTableWriteSource.init("unused-native-fast-path", ProvisionedWriteCoalesceTestCatalog.iface());
+            defer ordinary.deinit();
+            _ = ordinary.withRaftBatcher(.{ .ptr = &ordinary_effects, .vtable = &.{ .batch_group = Effects.group, .batch_group_routed_with_cancellation = Effects.routed, .batch_group_local = Effects.group } });
+            const result = (try ordinary.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} }}, .write, .none)) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(result == .committed);
+            try std.testing.expectEqual(@as(usize, 1), ordinary_effects.calls);
+        }
+
+        test "raft single-group fast path retains ordinary graph transforms and rejects protected effects" {
             const Capture = struct {
                 calls: usize = 0,
                 transforms: usize = 0,
@@ -33959,11 +34192,22 @@ fn consumerTests() type {
                     req: db_mod.types.BatchRequest,
                 ) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(req.transaction == null);
+                    try std.testing.expect(req.graph_preparation == null);
+                    try std.testing.expectEqual(@as(usize, 0), req.trigger_receipts.len);
                     self.calls += 1;
                     self.transforms = req.transforms.len;
                 }
 
                 fn batchGroupRouted(ptr: *anyopaque, allocator: std.mem.Allocator, route_capability: metadata_api.CatalogRouteFence, table_name: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
+                    try std.testing.expectEqual(@as(u64, 7), route_capability.table_id);
+                    try std.testing.expect(req.transforms.len == 1);
+                    if (req.transforms[0].operations.len == 2) {
+                        try std.testing.expectEqual(.inc, req.transforms[0].operations[0].op);
+                        try std.testing.expectEqualStrings("n", req.transforms[0].operations[0].path);
+                        try std.testing.expectEqual(.push, req.transforms[0].operations[1].op);
+                        try std.testing.expectEqualStrings("$._edges.graph.FRIEND", req.transforms[0].operations[1].path);
+                    }
                     return batchGroup(ptr, allocator, route_capability.route.group_id, table_name, req);
                 }
 
@@ -33990,19 +34234,31 @@ fn consumerTests() type {
                 },
             });
 
-            const graph = try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{.{
+            const graph_request: distributed_txn.TableCommitRequest = .{
                 .table_name = "docs",
                 .transforms = &.{.{
                     .key = "doc:a",
-                    .operations = &.{.{
-                        .op = .push,
-                        .path = "$._edges.graph.FRIEND",
-                        .value_json = "{\"target\":\"doc:b\"}",
-                    }},
+                    .operations = &.{
+                        .{ .op = .inc, .path = "n", .value_json = "1" },
+                        .{ .op = .push, .path = "$._edges.graph.FRIEND", .value_json = "{\"target\":\"doc:b\"}" },
+                    },
                 }},
-            }}, .write, .none);
-            try std.testing.expect(graph == null);
-            try std.testing.expectEqual(@as(usize, 0), capture.calls);
+            };
+            const graph = (try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{graph_request}, .write, .none)) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(graph == .committed);
+            try std.testing.expectEqual(@as(usize, 1), capture.calls);
+            try std.testing.expectEqual(@as(usize, 1), capture.transforms);
+
+            var protected = graph_request;
+            protected.row_policy_principal_proof = "must-not-drop";
+            try std.testing.expect((try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{protected}, .write, .none)) == null);
+            protected = graph_request;
+            protected.schema_version = 1;
+            try std.testing.expect((try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{protected}, .write, .none)) == null);
+            protected = graph_request;
+            protected.restore_staging_plan_id = @splat(1);
+            try std.testing.expect((try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{protected}, .write, .none)) == null);
+            try std.testing.expectEqual(@as(usize, 1), capture.calls);
 
             const ordinary = (try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{.{
                 .table_name = "docs",
@@ -34012,7 +34268,7 @@ fn consumerTests() type {
                 }},
             }}, .write, .none)) orelse return error.TestUnexpectedResult;
             try std.testing.expect(ordinary == .committed);
-            try std.testing.expectEqual(@as(usize, 1), capture.calls);
+            try std.testing.expectEqual(@as(usize, 2), capture.calls);
             try std.testing.expectEqual(@as(usize, 1), capture.transforms);
         }
 

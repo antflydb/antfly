@@ -286,7 +286,8 @@ test "relational index system online admission facts are unbound read only and r
     inconsistent.storage_mode = .relational;
     try db.core.store.put(table.key, &inconsistent.encode());
     try std.testing.expectError(error.IntegrityCatalogChanged, Fetch.run(&db, request));
-    try db.core.store.put(table.key, &db.core.table_catalog.encode());
+    const encoded_catalog = try db.core.table_catalog.encodeDurable();
+    try db.core.store.put(table.key, encoded_catalog.slice());
     var invalid = request;
     invalid.scope.consumer_epoch = 1;
     try std.testing.expectError(error.InvalidOnlineSourceCommand, Fetch.run(&db, invalid));

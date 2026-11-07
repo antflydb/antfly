@@ -53,10 +53,9 @@ pub const Transport = struct {
         for (ranges, self.groups) |range, *group| group.* = range.group_id;
         if (self.server.cfg.deployment_mode == .standalone) return;
         if (self.server.cfg.deployment_mode != .distributed) return error.UnsupportedSqlExecution;
-        try self.refreshRoutes(context);
     }
 
-    fn refreshRoutes(self: *@This(), context: local.api_operation.RequestContext) !void {
+    fn refreshRoutes(self: *@This(), table: []const u8, context: local.api_operation.RequestContext) !void {
         var fallback = router.CatalogBackedGroupRouter.init(self.server.catalogSource(), self.server.localSessionNodeId());
         const io = self.server.sharedApiIo() orelse return error.UnsupportedSqlExecution;
         const platform = @import("antfly_platform");
@@ -69,7 +68,7 @@ pub const Transport = struct {
         // never retry submission or retain a partially resolved cohort.
         while (true) {
             try context.ensureActive();
-            if (try router.resolveGroupRoutes(self.alloc, self.server.catalogSource(), hosted, self.groups, .prefer_leader)) |routes| {
+            if (try router.resolveTableGroupRoutes(self.alloc, self.server.catalogSource(), hosted, table, self.groups, .prefer_leader)) |routes| {
                 if (self.routes) |previous| router.freeGroupRoutes(self.alloc, previous);
                 self.routes = routes;
                 return;
@@ -84,6 +83,7 @@ pub const Transport = struct {
     pub fn prepare(self: *@This(), a: std.mem.Allocator, group: u64, table: []const u8, request: preparation.Request, context: local.api_operation.RequestContext) ![]u8 {
         try context.ensureActive();
         if (self.next >= self.groups.len or self.groups[self.next] != group) return error.InvalidGenerationPublication;
+        if (self.routes == null and self.server.cfg.deployment_mode == .distributed) try self.refreshRoutes(table, context);
         const index = self.next;
         self.next += 1;
         const io = self.server.sharedApiIo() orelse return error.UnsupportedSqlExecution;
@@ -103,7 +103,7 @@ pub const Transport = struct {
                     if (remaining == 0) return error.CatalogPublicationProofPending;
                     io.sleep(.fromNanoseconds(@min(remaining, retry_ns)), .awake) catch return error.Canceled;
                     retry_ns = @min(retry_ns * 2, 250 * std.time.ns_per_ms);
-                    if (self.server.cfg.deployment_mode == .distributed) try self.refreshRoutes(bounded);
+                    if (self.server.cfg.deployment_mode == .distributed) try self.refreshRoutes(table, bounded);
                     continue;
                 },
                 else => return err,

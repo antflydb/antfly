@@ -96,6 +96,7 @@ pub const State = struct {
     }
 };
 pub const Owner = struct {
+    native_scope: ?struct { descriptor: local.common_topology_records.RelationPersistence.Descriptor, namespace: local.storage_db_doc_identity_namespace.Namespace } = null,
     ordinal: u16,
     group: u64,
     table: u64,
@@ -104,7 +105,21 @@ pub const Owner = struct {
     coverage: bool = false,
     source_fence: [32]u8 = @splat(0),
     transitions: [32]u8 = @splat(0),
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (!((comptime std.mem.eql(u8, field, "native_scope")) and self.native_scope == null)) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
     pub fn validate(self: @This()) !void {
+        if (self.native_scope) |scope| {
+            try scope.descriptor.validate();
+            if (scope.namespace.table_id != self.table or scope.namespace.shard_id == 0 or scope.namespace.range_id == 0) return error.InvalidCatalogRecord;
+        }
         if (self.ordinal >= manifests.max_ranges or self.group == 0 or self.table == 0 or (!self.source and !self.parent) or
             (self.coverage and (!self.parent or self.source)) or self.source == std.mem.allEqual(u8, &self.source_fence, 0) or
             self.parent == std.mem.allEqual(u8, &self.transitions, 0)) return error.InvalidCatalogRecord;
@@ -117,7 +132,7 @@ pub const Owner = struct {
         };
     }
 };
-pub const OwnerRecord = records.Record(Owner, "TRPO", 1024);
+pub const OwnerRecord = records.Record(Owner, "TRPO", 4096);
 pub const Evidence = union(enum) {
     source: wire.SourceReceipt,
     parent: wire.Receipt,
@@ -144,7 +159,7 @@ pub fn prepare(a: A, scratch: A, plan: fk.Plan) !Prepared {
         std.crypto.hash.Blake3.hash(&bytes, &digest, .{});
         if ((try by_group.getOrPut(scratch, range.group_id)).found_existing) return error.InvalidGenerationPublication;
         by_group.getPtr(range.group_id).?.* = list.items.len;
-        try list.append(a, .{ .ordinal = 0, .group = range.group_id, .table = range.table_id, .source = true, .source_fence = digest });
+        try list.append(a, .{ .ordinal = 0, .group = range.group_id, .table = range.table_id, .source = true, .source_fence = digest, .native_scope = if (plan.child_before.sql_persistence) |native| .{ .descriptor = native, .namespace = fence.namespace } else null });
     }
     const digest = try plan.digest(scratch);
     for (plan.parents) |parent| {
@@ -166,7 +181,7 @@ pub fn prepare(a: A, scratch: A, plan: fk.Plan) !Prepared {
                 owner.transitions = transition_digest;
             } else {
                 try by_group.put(scratch, range.group_id, list.items.len);
-                try list.append(a, .{ .ordinal = 0, .group = range.group_id, .table = parent.table.table_id, .parent = true, .coverage = plan.needsParentCoverage(parent), .transitions = transition_digest });
+                try list.append(a, .{ .ordinal = 0, .group = range.group_id, .table = parent.table.table_id, .parent = true, .coverage = plan.needsParentCoverage(parent), .transitions = transition_digest, .native_scope = if (parent.table.sql_persistence) |native| .{ .descriptor = native, .namespace = .{ .table_id = parent.table.table_id, .shard_id = tables.rangeDocIdentityShardId(range), .range_id = tables.rangeDocIdentityRangeId(range) } } else null });
             }
         }
     }
@@ -269,15 +284,17 @@ pub fn verifyEvidence(lookup: Lookup, state: State, owner: Owner, step: Step, ev
     if (!owner.applies(step) or owner.ordinal >= state.summary.owner_count or (step == .source_fenced) != (evidence == .source)) return error.InvalidGenerationPublication;
     switch (evidence) {
         .source => |receipt| {
+            if (owner.native_scope) |scope| try wire.requireCapturedPosition(receipt, scope.descriptor, scope.namespace) else if ((try receipt.position()) != .raft) return error.InvalidGenerationPublication;
             const child = state.summary.child;
             if (!std.mem.eql(u8, &receipt.plan_id, &lookup.id) or receipt.child_table_id != lookup.table or receipt.child_group_id != owner.group or
-                receipt.document_source != state.summary.document_source or receipt.action != .fence or receipt.reference_coverage_ready or receipt.applied_term == 0 or receipt.applied_index == 0 or
+                receipt.document_source != state.summary.document_source or receipt.action != .fence or receipt.reference_coverage_ready or
                 !std.mem.eql(u8, &receipt.plan_digest, &state.summary.plan_digest) or !std.mem.eql(u8, &receipt.fence_digest, &owner.source_fence) or
                 receipt.before_schema_version != child.before_schema_version or receipt.after_schema_version != child.after_schema_version or
                 !std.mem.eql(u8, &receipt.before_schema_digest, &child.before_schema_digest) or !std.mem.eql(u8, &receipt.after_schema_digest, &child.after_schema_digest) or
                 !std.mem.eql(u8, &receipt.before_catalog_digest, &child.before_catalog_digest) or !std.mem.eql(u8, &receipt.after_catalog_digest, &child.after_catalog_digest)) return error.InvalidGenerationPublication;
         },
         .parent => |receipt| {
+            if (owner.native_scope) |scope| try wire.requireCapturedPosition(receipt, scope.descriptor, scope.namespace) else if ((try receipt.position()) != .raft) return error.InvalidGenerationPublication;
             const action: wire.Action = switch (step) {
                 .parent_staged => .stage,
                 .parent_activated => .activate,
@@ -285,7 +302,7 @@ pub fn verifyEvidence(lookup: Lookup, state: State, owner: Owner, step: Step, ev
                 else => unreachable,
             };
             if (!std.mem.eql(u8, &receipt.plan_id, &lookup.id) or receipt.child_table_id != lookup.table or receipt.parent_table_id != owner.table or receipt.parent_group_id != owner.group or
-                receipt.action != action or receipt.reference_coverage_ready != (step == .parent_coverage) or receipt.applied_term == 0 or receipt.applied_index == 0 or
+                receipt.action != action or receipt.reference_coverage_ready != (step == .parent_coverage) or
                 !std.mem.eql(u8, &receipt.decision_digest, &state.summary.plan_digest) or !std.mem.eql(u8, &receipt.transitions_digest, &owner.transitions)) return error.InvalidGenerationPublication;
         },
     }

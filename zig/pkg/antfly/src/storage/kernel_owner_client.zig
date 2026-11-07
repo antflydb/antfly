@@ -125,6 +125,14 @@ pub const Context = struct {
         return result;
     }
 
+    pub fn relationLifetime(self: *Context, action: abi.RelationLifetimeContextAction, execution_instance: [16]u8) !abi.RelationLifetimeContextResult {
+        try self.ensure();
+        var result: abi.RelationLifetimeContextResult = .{};
+        try statusToError(abi.antfly_storage_context_relation_lifetime(self.handle, &.{ .action = action, .execution_instance = execution_instance }, &result));
+        if (result.version != abi.abi_version or !std.mem.eql(u8, &execution_instance, &result.execution_instance)) return error.InvalidAbiVersion;
+        return result;
+    }
+
     pub fn invalidateCaches(self: *Context) !void {
         try self.ensure();
         try statusToError(abi.antfly_storage_context_invalidate_caches(self.handle));
@@ -396,6 +404,12 @@ pub const Owner = struct {
         self.* = undefined;
     }
 
+    pub fn deinitFallible(self: *Owner) !void {
+        const status = abi.antfly_storage_owner_close_fallible(self.handle);
+        try statusToError(status);
+        self.* = undefined;
+    }
+
     pub fn configure(
         self: *Owner,
         table_name: []const u8,
@@ -489,6 +503,28 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_bulk_abort(self.handle, &.{
             .table_name = .fromSlice(table_name),
         }));
+    }
+
+    /// Private fixed observation on an authenticated retained native scope.
+    /// Public lookup JSON intentionally cannot carry the internal read grant.
+    pub fn nativeRetirementStatusJson(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").storage_db_relational_transition_contract.NativeRetirementStatusRequest) !Response {
+        try request.validate();
+        const contract = @import("antfly_local_sources").storage_db_relational_transition_contract;
+        const body = try std.json.Stringify.valueAlloc(alloc, contract.Request{ .native_retirement_status = request }, .{});
+        defer alloc.free(body);
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_relational_transition_read(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(body) }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeRelationBinding(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8) !@import("antfly_local_sources").common_topology_records.RelationPersistence.NativeBinding {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_relational_transition_read(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice("{\"sql_relation_binding\":{}}") }, &response.buffer));
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").common_topology_records.RelationPersistence.NativeBinding, alloc, response.bytes(), .{});
+        defer parsed.deinit();
+        try parsed.value.validate();
+        return parsed.value;
     }
 
     pub fn batchJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
@@ -1225,6 +1261,47 @@ pub const Owner = struct {
         return result.status;
     }
 
+    pub fn externalTransactionStatus(self: *Owner, table_name: []const u8, txn_id: [16]u8, owner: @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner) !abi.TxnStatus {
+        const encoded = try owner.encode();
+        var result: abi.TransactionStatusResult = .{};
+        try statusToError(abi.antfly_storage_owner_transaction_status(self.handle, &.{ .table_name = .fromSlice(table_name), .txn_id = .{ .bytes = txn_id }, .external_owner = .fromSlice(&encoded) }, &result));
+        if (result.version != abi.abi_version) return error.InvalidAbi;
+        return result.status;
+    }
+
+    pub const ExternalRetention = struct {
+        status: abi.TxnStatus,
+        coordinator: bool,
+        prepared: bool,
+        intents_resolved: bool,
+        participants: std.json.Parsed([]const []const u8),
+        pub fn deinit(self: *ExternalRetention) void {
+            self.participants.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub fn externalTransactionRetention(self: *Owner, a: std.mem.Allocator, table: []const u8, group: u64, id: [16]u8, owner: @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner, pin: @import("antfly_local_sources").storage_transactions.NativePhysicalPin) !ExternalRetention {
+        const encoded_owner = try owner.encode();
+        const encoded_pin = try pin.encode();
+        var result: abi.TransactionStatusResult = .{};
+        defer abi.antfly_storage_owner_buffer_destroy(&result.participants_json);
+        try statusToError(abi.antfly_storage_owner_transaction_status(self.handle, &.{ .table_name = .fromSlice(table), .txn_id = .{ .bytes = id }, .external_owner = .fromSlice(&encoded_owner), .include_retention = 1, .retention_group_id = group, .retention_native_pin = .fromSlice(&encoded_pin) }, &result));
+        return decodeExternalRetention(a, &result);
+    }
+
+    fn decodeExternalRetention(a: std.mem.Allocator, result: *const abi.TransactionStatusResult) !ExternalRetention {
+        if (result.version != abi.abi_version or result.retention_included != 1 or result.coordinator > 1 or result.prepared > 1 or result.intents_resolved > 1 or result.participant_count > 64 or result.participants_json.len > abi.max_retention_participants_bytes) return error.InvalidResponse;
+        var parsed = try std.json.parseFromSlice([]const []const u8, a, result.participants_json.slice(), .{ .allocate = .alloc_always });
+        errdefer parsed.deinit();
+        if (parsed.value.len != result.participant_count) return error.InvalidResponse;
+        for (parsed.value, 0..) |member, index| {
+            if (member.len == 0) return error.InvalidResponse;
+            for (parsed.value[0..index]) |previous| if (std.mem.eql(u8, member, previous)) return error.InvalidResponse;
+        }
+        return .{ .status = result.status, .coordinator = result.coordinator == 1, .prepared = result.prepared == 1, .intents_resolved = result.intents_resolved == 1, .participants = parsed };
+    }
+
     pub fn waitForSync(self: *Owner, table_name: []const u8, sync_level: abi.SyncLevel) !void {
         return try self.waitForSyncWithCancellation(table_name, sync_level, .none);
     }
@@ -1930,4 +2007,32 @@ test "storage kernel aggregation statuses preserve error identity" {
     try std.testing.expectError(error.AlgebraicResultBucketLimit, statusToError(.algebraic_result_bucket_limit));
     try std.testing.expectError(error.InvalidAlgebraicTensorExpr, statusToError(.invalid_algebraic_tensor_expr));
     try std.testing.expectError(error.InvalidAlgebraicTensorRow, statusToError(.invalid_algebraic_tensor_row));
+}
+
+test "SQL relation lifetime native retained status requires explicit complete role and exact bounded roster" {
+    const a = std.testing.allocator;
+    var result: abi.TransactionStatusResult = .{};
+    try std.testing.expectError(error.InvalidResponse, Owner.decodeExternalRetention(a, &result));
+    result.retention_included = 1;
+    result.status = .aborted;
+    result.intents_resolved = 1;
+    const body = try a.dupe(u8, "[\"rows:72\"]");
+    defer a.free(body);
+    result.participant_count = 1;
+    result.participants_json = .{ .ptr = body.ptr, .len = body.len };
+    var valid = try Owner.decodeExternalRetention(a, &result);
+    defer valid.deinit();
+    try std.testing.expect(!valid.coordinator and valid.status == .aborted and valid.intents_resolved);
+    try std.testing.expectEqualStrings("rows:72", valid.participants.value[0]);
+    result.coordinator = 2;
+    try std.testing.expectError(error.InvalidResponse, Owner.decodeExternalRetention(a, &result));
+    result.coordinator = 0;
+    result.participant_count = 2;
+    try std.testing.expectError(error.InvalidResponse, Owner.decodeExternalRetention(a, &result));
+    const duplicate = try a.dupe(u8, "[\"rows:72\",\"rows:72\"]");
+    defer a.free(duplicate);
+    result.participants_json = .{ .ptr = duplicate.ptr, .len = duplicate.len };
+    try std.testing.expectError(error.InvalidResponse, Owner.decodeExternalRetention(a, &result));
+    result.retention_included = 0;
+    try std.testing.expectError(error.InvalidResponse, Owner.decodeExternalRetention(a, &result));
 }

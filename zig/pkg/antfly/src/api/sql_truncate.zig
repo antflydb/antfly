@@ -269,9 +269,10 @@ fn freeReceipt(alloc: std.mem.Allocator, receipt: catalog.DdlReceipt) void {
     alloc.free(receipt.table);
     alloc.free(receipt.table_id);
     if (receipt.restore_job_id) |id| alloc.free(id);
+    if (receipt.idempotency_key) |key| alloc.free(key);
 }
 
-fn pendingReceipt(alloc: std.mem.Allocator, target: domain.Target, source_id: u64, schema_version: u32, job_id: u64) !catalog.DdlReceipt {
+fn pendingReceipt(alloc: std.mem.Allocator, target: domain.Target, source_id: u64, schema_version: u32, job_id: u64, key: []const u8) !catalog.DdlReceipt {
     var result: catalog.DdlReceipt = .{ .database = "", .namespace = "", .table = "", .table_id = "", .schema_version = schema_version, .state = .pending, .diagnostic = "TRUNCATE barrier admitted. Follow restore_job_id until publication; do not replay the statement." };
     errdefer freeReceipt(alloc, result);
     result.database = try alloc.dupe(u8, target.database);
@@ -279,6 +280,7 @@ fn pendingReceipt(alloc: std.mem.Allocator, target: domain.Target, source_id: u6
     result.table = try alloc.dupe(u8, target.table);
     result.table_id = try std.fmt.allocPrint(alloc, "{d}", .{source_id});
     result.restore_job_id = try std.fmt.allocPrint(alloc, "{d}", .{job_id});
+    result.idempotency_key = try alloc.dupe(u8, key);
     return result;
 }
 
@@ -304,6 +306,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     defer logical_index.deinit(a);
     for (resolved.tables, targets) |resolved_table, target| {
         const bound = resolved_table orelse return error.TableNotFound;
+        try bound.requireRequestAccess(context.native_service, context.sql_relation_owner);
         const ns = try logical_index.namespaceFor(target.database, target.namespace);
         const current = logical_index.find(.table, ns.id, target.table) orelse return error.CatalogGenerationChanged;
         if (current.id != bound.table_id or !std.mem.eql(u8, current.storage_name, bound.name)) return error.CatalogGenerationChanged;
@@ -322,6 +325,9 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const names = try a.alloc([]const u8, selected.len);
     for (selected, names) |table, *name| {
         if (table.storage_migration != null or table.relational_retirement_json.len != 0 or table.restore_backup_id.len != 0) return error.TableTransitionActive;
+        const binding = logical_index.byId(.table, table.table_id) orelse return error.CatalogGenerationChanged;
+        const access: domain.ResolvedTable = .{ .table_id = table.table_id, .name = table.name, .native_service = binding.native_service, .sql_persistence = table.sql_persistence };
+        try access.requireRequestAccess(context.native_service, context.sql_relation_owner);
         name.* = table.name;
     }
     for (try server.logicalTableNamesInArena(a, context, names)) |name| {
@@ -331,12 +337,13 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const principal = server_mod.storedDestinationPrincipal(identity);
     try server.requireEmptyGenerationAuthority(principal, names);
     var random: [16]u8 = undefined;
-    try (server.restore_job_store.io orelse return error.AsyncRestoreUnavailable).randomSecure(&random);
+    try (server.sharedApiIo() orelse return error.AsyncRestoreUnavailable).randomSecure(&random);
     const key = std.fmt.bytesToHex(random, .lower);
     const idempotency_namespace = try std.fmt.allocPrint(a, "sql-truncate:{s}", .{principal});
     const job_id = try jobs.jobIdForIdempotency(a, idempotency_namespace, &key);
     const id = try stages.idForAttempt(job_id, 1);
     var planned: []const stages.Target = try a.alloc(stages.Target, selected.len);
+    var next_relation_oid = logical_state.next_id;
     var total_ranges: usize = 0;
     for (selected, @constCast(planned)) |before, *target| {
         var old_ranges: std.ArrayList(records.RangeRecord) = .empty;
@@ -349,6 +356,19 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         const handoffs = try a.alloc(stages.GenerationHandoffRange, ranges.len);
         var table = before;
         table.table_id = generation(id, before.table_id, 0, "table");
+        if (before.sql_persistence) |previous| {
+            var lifecycle_context = context;
+            lifecycle_context.setting_admin = true;
+            const bytes = try server.source.systemCatalog(a, lifecycle_context, .{ .sql_relation_boot_read = .{ .node = previous.owner_node_id } });
+            const observed = try std.json.parseFromSliceLeaky(@import("../metadata/sql_relation_boots.zig").Observation, a, bytes, .{});
+            const current = try observed.requireReady();
+            if (current.identity.store_id != previous.owner_store_id or
+                (previous.kind == .temporary and !std.mem.eql(u8, &previous.generation_instance, &current.instance))) return error.SqlRelationOwnerChanged;
+            var successor = previous;
+            successor.generation_instance = current.instance;
+            successor.data_generation = std.math.add(u64, previous.data_generation, 1) catch return error.CatalogGenerationExhausted;
+            table.sql_persistence = successor;
+        }
         table.min_ranges = @intCast(ranges.len);
         for (old_ranges.items, ranges, fences, handoffs, 0..) |old, *range, *fence, *handoff, ordinal| {
             try context.ensureActive();
@@ -381,7 +401,13 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         }
         var binding = logical_index.byId(.table, before.table_id) orelse return error.CatalogGenerationChanged;
         if (!std.mem.eql(u8, binding.storage_name, before.name)) return error.CatalogGenerationChanged;
-        binding.id = table.table_id;
+        if (binding.sql_relation_id == null) {
+            try domain.requireRelationOid(next_relation_oid);
+            if (logical_index.tableByLogicalRelationId(next_relation_oid) != null) return error.InvalidCatalogRecord;
+            binding.sql_relation_id = next_relation_oid;
+            next_relation_oid += 1;
+        }
+        binding = try binding.withPhysicalRelationId(table.table_id);
         target.* = .{ .source_table_id = before.table_id, .table = table, .catalog_binding = binding, .ranges = ranges, .empty_generation = true, .graph_retirement_digest = try stages.graphRetirementDigest(a, before.table_id, table.table_id, table.indexes_json), .generation_handoffs = handoffs, .replace = .{ .table = before, .ranges = old_ranges.items, .fences = fences } };
     }
     var sequence_context = context;
@@ -405,13 +431,16 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     } else return error.InvalidRestoreStaging;
     var primary_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, @import("tables.zig").effectiveSchemaJson(primary_target.schema_json));
     defer primary_schema.deinit(a);
-    const receipt = try pendingReceipt(alloc, targets[0], resolved.tables[0].?.table_id, primary_schema.version, job_id);
+    const receipt = try pendingReceipt(alloc, targets[0], resolved.tables[0].?.table_id, primary_schema.version, job_id, &key);
     errdefer freeReceipt(alloc, receipt);
     // Allocate every receipt field before durable admission. There must be no
     // fallible result construction after an accepted (or unknown) proposal.
     try context.ensureActive();
     const location = try std.fmt.allocPrint(a, "metadata://empty-generation/{s}", .{std.fmt.bytesToHex(id, .lower)});
     const generation_plan = try std.json.Stringify.valueAlloc(a, plan, .{});
+    const job_control = @import("../metadata/query_population_job.zig");
+    const start_request: jobs.StartRequest = .{ .scope = .cluster, .source_kind = .empty_generation, .routine_actor = if (try @import("sql_trigger_restore.zig").needsActorForPlan(a, plan)) try @import("sql_trigger_restore.zig").actorForAdmission(server, identity) else null, .backup_id = &std.fmt.bytesToHex(digest, .lower), .location = location, .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = idempotency_namespace, .idempotency_key = &key, .destination_authorization_principal = principal, .generation_plan_json = generation_plan };
+    const reference: job_control.Reference = .{ .job_id = job_id, .namespace = idempotency_namespace, .key = &key, .fingerprint = try jobs.requestFingerprintAlloc(a, start_request), .plan_digest = try plan.digest(a) };
     const completion_owner: operation.SQLCompletionOwner = .{ .id = job_id, .schema_version = primary_schema.version, .kind = .restore };
     try @import("sql_completion.zig").prepareMetadataWithContext(context, completion_owner);
     context.ensureActive() catch |err| {
@@ -419,18 +448,45 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         return err;
     };
     var submitted = false;
-    const accepted = server.restore_job_store.startRecoverableObserved(a, .{ .scope = .cluster, .source_kind = .empty_generation, .backup_id = &std.fmt.bytesToHex(digest, .lower), .location = location, .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = idempotency_namespace, .idempotency_key = &key, .destination_authorization_principal = principal, .generation_plan_json = generation_plan }, true, &submitted) catch |err| {
+    defer if (submitted) context.markSQLSubmission();
+    var admission_context = context;
+    admission_context.setting_admin = true;
+    admission_context.sql_completion_submission = &submitted;
+    const admission = job_control.admit(server, a, admission_context, start_request) catch |err| {
+        if (err == error.MetadataMutationOutcomeUnknown) {
+            submitted = true;
+            var unknown = receipt;
+            unknown.state = .admission_unknown;
+            unknown.diagnostic = "TRUNCATE admission is unresolved. Reconcile restore_job_id; do not replay the statement.";
+            return .{ .mutation_outcome = null, .receipt = unknown };
+        }
         if (!submitted) try @import("sql_completion.zig").rejectMetadataBeforeSubmission(context, completion_owner);
         try @import("sql_completion.zig").rejectMetadataWithContext(context, completion_owner, err);
         return err;
     };
-    server.schedulePendingRestoreJobs() catch {};
+    const accepted = admission.result;
+    const state_bytes = switch (accepted) {
+        inline else => |bytes| bytes,
+    };
+    defer a.free(state_bytes);
+    var unknown_admission = accepted == .unknown;
+    if (!unknown_admission) {
+        const state = std.json.parseFromSliceLeaky(jobs.JobState, a, state_bytes, .{}) catch null;
+        if (state) |actual| {
+            reference.requireState(a, actual) catch {
+                unknown_admission = true;
+            };
+            if (actual.phase != .failed and (admission.plan_digest == null or !std.mem.eql(u8, &admission.plan_digest.?, &reference.plan_digest))) unknown_admission = true;
+        } else unknown_admission = true;
+    }
+    if (server.restore_job_store.replicated != null) server.schedulePendingRestoreJobs() catch {};
     var result = receipt;
-    if (accepted == .unknown) {
+    if (unknown_admission) {
+        submitted = true;
         result.state = .admission_unknown;
         result.diagnostic = "TRUNCATE admission is unresolved. Reconcile restore_job_id; do not replay the statement.";
     }
-    return .{ .mutation_outcome = if (accepted == .unknown) null else .committed_pending, .receipt = result };
+    return .{ .mutation_outcome = if (unknown_admission) null else .committed_pending, .receipt = result };
 }
 
 test "SQL TRUNCATE closure follows incoming FKs without emptying an untouched parent" {
@@ -492,4 +548,310 @@ test "SQL TRUNCATE unknown target fails before unrelated schema parsing" {
     defer arena.deinit();
     const tables = [_]records.TableRecord{.{ .table_id = 10, .name = "unrelated", .schema_json = "not json" }};
     try std.testing.expectError(error.TableNotFound, select(arena.allocator(), &tables, &.{"missing"}, false));
+}
+
+const NativeResetDiagnosticStage = enum { planning, existing_job, admitted };
+var native_reset_job_observations: std.atomic.Value(u16) = .init(0);
+fn diagnoseNativeResetJob(a: std.mem.Allocator, bytes: []const u8) void {
+    if (comptime @import("builtin").mode == .debug) {
+        var parsed = std.json.parseFromSlice(jobs.JobState, a, bytes, .{}) catch return;
+        defer parsed.deinit();
+        const job = parsed.value;
+        const has_reason = job.last_error != null or job.staging_failure.len != 0;
+        const bit = @as(u16, 1) << @as(u4, @intCast(@as(u16, @backingInt(job.phase)) * 2 + @as(u16, @intFromBool(has_reason))));
+        if (native_reset_job_observations.fetchOr(bit, .monotonic) & bit != 0) return;
+        const errors = @import("antfly_runtime_abi").error_abi;
+        const last = if (job.last_error) |reason| errors.errorFromStableName(reason) else null;
+        const failure = errors.errorFromStableName(job.staging_failure);
+        // Only registered error symbols are printable. Arbitrary persisted
+        // repository/user messages never enter this diagnostic.
+        std.debug.print("native reset job phase={s} attempt={d} staged={any} resolution={s} owner_phase={d} owner_cursor={d} validation_phase={d} validation_owner={d} last_error={s} last_error_bytes={d} failure={s} failure_bytes={d}\n", .{ @tagName(job.phase), job.attempt_id, job.staging_attempt_id != 0, @tagName(job.staging_resolution), job.staging_owner_phase, job.staging_owner_cursor, job.staging_validation_phase, job.staging_validation_owner, if (last) |err| @errorName(err) else "none_or_unregistered", if (job.last_error) |reason| reason.len else 0, if (failure) |err| @errorName(err) else "none_or_unregistered", job.staging_failure.len });
+    }
+}
+
+var native_reset_trace_seen: [3]std.atomic.Value(bool) = .{ .init(false), .init(false), .init(false) };
+fn diagnoseNativeReset(stage: NativeResetDiagnosticStage, err: anyerror, _: ?*std.builtin.StackTrace) void {
+    if (comptime @import("builtin").mode == .debug) {
+        if (native_reset_trace_seen[@backingInt(stage)].swap(true, .monotonic)) return;
+        std.debug.print("native reset catch stage={s} err={s}\n", .{ @tagName(stage), @errorName(err) });
+    }
+}
+
+/// Native restart origin. No user trigger, RLS bypass masquerading as a SQL
+/// principal, source JSON scan, or source-row replay participates in this path.
+/// Every irreversible loss is independently rejoined by native metadata admit.
+pub fn recoverNativeLoss(server: *server_mod.ApiHttpServer, backing: std.mem.Allocator, boot: @import("../metadata/sql_relation_boots.zig").Record, entry: @import("../metadata/sql_relation_lifetimes.zig").Entry, input: operation.RequestContext) !void {
+    var diagnostic_stage: NativeResetDiagnosticStage = .planning;
+    return recoverNativeLossObserved(server, backing, boot, entry, input, &diagnostic_stage) catch |err| {
+        diagnoseNativeReset(diagnostic_stage, err, @errorReturnTrace());
+        return err;
+    };
+}
+
+fn recoverNativeLossObserved(server: *server_mod.ApiHttpServer, backing: std.mem.Allocator, boot: @import("../metadata/sql_relation_boots.zig").Record, entry: @import("../metadata/sql_relation_lifetimes.zig").Entry, input: operation.RequestContext, diagnostic_stage: *NativeResetDiagnosticStage) !void {
+    const persistence = @import("antfly_local_sources").common_topology_records.RelationPersistence;
+    const recovery = @import("../metadata/sql_relation_recovery.zig");
+    try input.ensureActive();
+    try entry.validate();
+    const original = entry.initialized orelse return error.SqlRelationRecoveryIncomplete;
+    if (entry.descriptor.kind != .unlogged or boot.phase != .recovering or !boot.unclean_restart) return error.InvalidSqlRelationPersistence;
+    const old_pin = try persistence.PhysicalPin.fromBinding(original.binding);
+    // This operation's immutable identity is independent of catalog revision;
+    // a lost admission reply must discover the admitted job before replanning.
+    var key_hash = std.crypto.hash.Blake3.init(.{});
+    key_hash.update("antfly/native-unlogged-reset-job/v1\x00");
+    key_hash.update(&try old_pin.encode());
+    key_hash.update(&boot.instance);
+    var generation_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation_bytes, boot.generation, .little);
+    key_hash.update(&generation_bytes);
+    var operation_digest: [32]u8 = undefined;
+    key_hash.final(&operation_digest);
+    const key = std.fmt.bytesToHex(operation_digest, .lower);
+    const idempotency_namespace = "native-unlogged-recovery";
+    const job_id = try jobs.jobIdForIdempotency(backing, idempotency_namespace, &key);
+    if (try server.restore_job_store.load(backing, job_id)) |existing| {
+        diagnoseNativeResetJob(backing, existing);
+        backing.free(existing);
+        diagnostic_stage.* = .existing_job;
+        try server.schedulePendingRestoreJobs();
+        return error.SqlRelationRecoveryIncomplete;
+    }
+    var region = std.heap.ArenaAllocator.init(backing);
+    defer region.deinit();
+    const a = region.allocator();
+    var context = input;
+    context.setting_admin = true;
+    var captures: std.ArrayList(RecoveryCapture) = .empty;
+    const root = try loadRecoveryCapture(server, a, context, &captures, .{ .table_id = entry.table_id });
+    const revision = root.relation.revision;
+    if (root.relation.record.sql_persistence == null or !root.relation.record.sql_persistence.?.eql(entry.descriptor)) return error.SqlRelationOwnerChanged;
+    var selected_tables: std.ArrayList(records.TableRecord) = .empty;
+    try selectRecoveryTable(a, &selected_tables, root.relation.record);
+    var position: usize = 0;
+    while (position < selected_tables.items.len) : (position += 1) {
+        const table = selected_tables.items[position];
+        const capture = try loadRecoveryCapture(server, a, context, &captures, .{ .table_id = table.table_id, .expected_revision = revision });
+        for (capture.relation.incoming_tables) |child_id| {
+            const child = try loadRecoveryCapture(server, a, context, &captures, .{ .table_id = child_id, .expected_revision = revision });
+            try selectRecoveryTable(a, &selected_tables, child.relation.record);
+        }
+        var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, @import("tables.zig").effectiveSchemaJson(table.schema_json));
+        defer schema.deinit(a);
+        if (schema.foreign_keys) |foreign_keys| for (foreign_keys.value) |foreign| {
+            const parent = try loadRecoveryCapture(server, a, context, &captures, .{ .storage_name = foreign.parent_table, .expected_revision = revision });
+            if (parent.boot) |observed| {
+                const current = observed.record orelse return error.SqlRelationOwnerUnavailable;
+                const initialized = observed.initialized orelse return error.SqlRelationRecoveryIncomplete;
+                if (!observed.registration_current) return error.SqlRelationOwnerChanged;
+                if (current.phase == .recovering and current.unclean_restart and !std.mem.eql(u8, &initialized.binding.native_instance, &current.instance)) try selectRecoveryTable(a, &selected_tables, parent.relation.record);
+            }
+        };
+    }
+    const selected = selected_tables.items;
+    std.mem.sort(records.TableRecord, selected, {}, struct {
+        fn less(_: void, left: records.TableRecord, right: records.TableRecord) bool {
+            return left.table_id < right.table_id;
+        }
+    }.less);
+    const all_tables = try a.alloc(records.TableRecord, captures.items.len);
+    var all_ranges: std.ArrayList(records.RangeRecord) = .empty;
+    for (captures.items, all_tables) |captured, *table| {
+        table.* = captured.relation.record;
+        try all_ranges.appendSlice(a, captured.ranges);
+    }
+    const snapshot: RecoveryCatalog = .{ .tables = all_tables, .ranges = all_ranges.items };
+    const names = try a.alloc([]const u8, selected.len);
+    const id = try stages.idForAttempt(job_id, 1);
+    const planned = try a.alloc(stages.Target, selected.len);
+    for (selected, planned, names) |before, *target, *name| {
+        if (before.storage_migration != null or before.relational_retirement_json.len != 0 or before.restore_backup_id.len != 0) return error.TableTransitionActive;
+        name.* = before.name;
+        const prior = before.sql_persistence orelse return error.SqlRelationPersistenceForeignKeyMismatch;
+        if (prior.kind != .unlogged) return error.SqlRelationPersistenceForeignKeyMismatch;
+        const captured = try loadRecoveryCapture(server, a, context, &captures, .{ .table_id = before.table_id, .expected_revision = revision });
+        const observed = captured.boot orelse return error.InvalidSqlRelationPersistence;
+        const current = observed.record orelse return error.SqlRelationOwnerUnavailable;
+        if (!observed.registration_current) return error.SqlRelationOwnerChanged;
+        const initialized = observed.initialized orelse return error.SqlRelationRecoveryIncomplete;
+        if (!initialized.binding.descriptor.eql(prior)) return error.SqlRelationOwnerChanged;
+        const lost = current.phase == .recovering and current.unclean_restart and !std.mem.eql(u8, &current.instance, &initialized.binding.native_instance);
+        if (!lost and current.phase != .ready) return error.SqlRelationRecoveryIncomplete;
+        var old_ranges: std.ArrayList(records.RangeRecord) = .empty;
+        for (snapshot.ranges) |range| if (range.table_id == before.table_id) try old_ranges.append(a, range);
+        if (old_ranges.items.len != 1) return error.InvalidSqlRelationPersistence;
+        const ranges = try a.alloc(records.RangeRecord, 1);
+        const group = generation(id, before.table_id, 0, "group");
+        const table_id = generation(id, before.table_id, 0, "table");
+        ranges[0] = .{ .table_id = table_id, .group_id = group, .range_id = group, .doc_identity_shard_id = group, .doc_identity_range_id = group, .start_key = old_ranges.items[0].start_key, .end_key = old_ranges.items[0].end_key };
+        var next = prior;
+        next.generation_instance = current.instance;
+        next.data_generation = std.math.add(u64, prior.data_generation, 1) catch return error.CatalogGenerationExhausted;
+        var table = before;
+        table.table_id = table_id;
+        table.sql_persistence = next;
+        table.min_ranges = 1;
+        var binding = captured.resource;
+        if (!std.mem.eql(u8, binding.storage_name, before.name)) return error.CatalogGenerationChanged;
+        binding = try binding.withPhysicalRelationId(table_id);
+        const graph_digest = try stages.graphRetirementDigest(a, before.table_id, table_id, table.indexes_json);
+        var guard: ?recovery.Guard = null;
+        const fences = try a.alloc(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence, if (lost) 0 else 1);
+        const handoffs = try a.alloc(stages.GenerationHandoffRange, if (lost) 0 else 1);
+        if (lost) {
+            guard = .{ .before = initialized, .source_group_id = old_ranges.items[0].group_id, .lost_boot_generation = current.generation, .lost_native_instance = current.instance, .catalog_revision = revision };
+            try guard.?.requireLostBoot(current);
+            try guard.?.requireSuccessor(next, current);
+        } else {
+            const old = old_ranges.items[0];
+            const reads = server.table_reads orelse return error.UnsupportedSqlExecution;
+            var identity_response = (try reads.lookup(a, before.name, old.start_key, .{ .relational_topology_json = "{\"mode\":\"identity\"}", .execution_deadline_ns = (try context.platformDeadline()).deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return error.TableGenerationChanged;
+            defer identity_response.deinit(a);
+            const Native = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity;
+            const native = try std.json.parseFromSliceLeaky(Native, a, identity_response.json, .{ .ignore_unknown_fields = true });
+            if (native.namespace.table_id != before.table_id or native.namespace.shard_id != metadata.rangeDocIdentityShardId(old) or native.namespace.range_id != metadata.rangeDocIdentityRangeId(old)) return error.TableGenerationChanged;
+            try native.requireGenerationHandoffReceipts();
+            fences[0] = .{ .transition_id = std.mem.readInt(u64, id[0..8], .little), .attempt = 1, .admission_epoch = native.next_epoch, .owner_group_id = old.group_id, .peer_group_id = group, .role = .rewrite_source, .namespace = native.namespace, .catalog_digest = native.catalog_digest };
+            var response = (try reads.lookup(a, before.name, old.start_key, .{ .relational_topology_json = "{\"mode\":\"generation_handoff_summary\"}", .execution_deadline_ns = (try context.platformDeadline()).deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return error.TableGenerationChanged;
+            defer response.deinit(a);
+            const summary = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").storage_db_empty_generation_handoff.Summary, a, response.json, .{ .allocate = .alloc_always });
+            if (!summary.namespace.eql(native.namespace) or summary.intent != null or summary.seal != null) return error.TableGenerationChanged;
+            handoffs[0] = .{ .source_group_id = old.group_id, .target_group_id = group, .source_namespace = summary.namespace, .admissions = summary.admissions, .admissions_digest = summary.admissions_digest, .retired_digest = summary.retired_digest, .retired_count = summary.retired_count };
+        }
+        target.* = .{ .source_table_id = before.table_id, .table = table, .catalog_binding = binding, .ranges = ranges, .empty_generation = true, .graph_retirement_digest = graph_digest, .generation_handoffs = handoffs, .native_reset = guard, .replace = .{ .table = before, .ranges = old_ranges.items, .fences = fences } };
+    }
+    const sequence_bytes = try server.source.systemCatalog(a, context, .{ .sql_column_sequence_handoffs = .{ .targets = planned, .restart = false } });
+    const with_sequences = try std.json.parseFromSliceLeaky([]stages.Target, a, sequence_bytes, .{});
+    // Trigger provenance shares the actual native source directory; neither
+    // recovery nor an ordinal-derived reconstruction invents old column IDs.
+    var incarnation: [16]u8 = undefined;
+    _ = std.fmt.hexToBytes(&incarnation, &boot.identity.metadata_incarnation) catch return error.MetadataIncarnationMismatch;
+    for (selected, with_sequences) |before, *target| {
+        if (!try stages.needsTriggerHandoff(a, before.schema_json)) continue;
+        const captured = try loadRecoveryCapture(server, a, context, &captures, .{ .table_id = before.table_id, .expected_revision = revision });
+        if (captured.relation.source.value != .table) return error.CatalogGenerationChanged;
+        const columns = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").system_catalog_column_identities.State, a, captured.relation.source.value.table.column_identities_json orelse return error.CatalogGenerationChanged, .{});
+        try stages.prepareTargetTriggersAlloc(a, target, .{ .source_schema_json = before.schema_json, .source_columns = columns, .destination_incarnation = incarnation });
+    }
+    try stages.prepareEmptyGenerationHandoffMappingsAlloc(a, with_sequences);
+    try stages.prepareNativeLossGenerationsAlloc(a, with_sequences);
+    const parents = try buildRecoveryExternalParents(server, context, a, snapshot, selected, with_sequences, id);
+    const cohort = try std.json.Stringify.valueAlloc(a, .{ .targets = with_sequences, .external_fk_parents = parents }, .{});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(cohort, &digest, .{});
+    const plan: stages.Plan = .{ .id = id, .cohort_digest = digest, .targets = with_sequences, .external_fk_parents = parents };
+    try plan.validate(a);
+    const location = try std.fmt.allocPrint(a, "metadata://native-unlogged-recovery/{s}", .{std.fmt.bytesToHex(id, .lower)});
+    // No native image has been opened and no user SQL effect has occurred.
+    // The existing metadata job admission rechecks all lost epochs, closure,
+    // catalog revision and native capabilities before loss fence publication.
+    const admission = try server.restore_job_store.startRecoverableObserved(a, .{ .scope = .cluster, .source_kind = .empty_generation, .backup_id = &std.fmt.bytesToHex(digest, .lower), .location = location, .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = idempotency_namespace, .idempotency_key = &key, .destination_authorization_principal = "", .generation_plan_json = try std.json.Stringify.valueAlloc(a, plan, .{}) }, true, null);
+    if (comptime @import("builtin").mode == .debug) {
+        const Once = struct {
+            var outcomes: std.atomic.Value(u8) = .init(0);
+        };
+        const bit: u8 = if (admission == .accepted) 1 else 2;
+        if (Once.outcomes.fetchOr(bit, .monotonic) & bit == 0)
+            std.debug.print("native reset submission outcome={s}\n", .{@tagName(admission)});
+    }
+    diagnostic_stage.* = .admitted;
+    try server.schedulePendingRestoreJobs();
+    return error.SqlRelationRecoveryIncomplete;
+}
+
+/// The healthy parent's own accepted-generation summary is the authority for
+/// retiring an old child generation. A lost child's missing ICatalog cannot
+/// be reconstructed from a schema declaration or guessed generation counter.
+fn buildRecoveryExternalParents(server: *server_mod.ApiHttpServer, context: operation.RequestContext, a: std.mem.Allocator, snapshot: RecoveryCatalog, selected: []const records.TableRecord, planned: []const stages.Target, id: stages.Id) ![]stages.ExternalFkParent {
+    const reads = server.table_reads orelse return error.UnsupportedSqlExecution;
+    var drafts: std.ArrayList(ExternalParentDraft) = .empty;
+    for (selected, planned) |child, replacement| {
+        var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, @import("tables.zig").effectiveSchemaJson(child.schema_json));
+        defer schema.deinit(a);
+        if (schema.storage_mode != .relational) continue;
+        var next_catalog = try plannedIntegrityCatalog(a, replacement.table.table_id, replacement.table.schema_json);
+        defer next_catalog.deinit();
+        for (try schema.relationalForeignKeyDefinitions(a)) |fk| {
+            if (for (selected) |other| {
+                if (std.mem.eql(u8, other.name, fk.parent_table)) break true;
+            } else false) continue;
+            const parent = for (snapshot.tables) |candidate| {
+                if (std.mem.eql(u8, candidate.name, fk.parent_table)) break candidate;
+            } else return error.ForeignKeyParentTableNotFound;
+            if (parent.storage_migration != null or parent.relational_retirement_json.len != 0 or parent.restore_backup_id.len != 0) return error.TableTransitionActive;
+            var old_generation: ?[16]u8 = null;
+            var parent_ranges: usize = 0;
+            for (snapshot.ranges) |range| if (range.table_id == parent.table_id) {
+                parent_ranges += 1;
+                if (parent_ranges > 4096) return error.SqlProgramLimitExceeded;
+                var response = (try reads.lookup(a, parent.name, range.start_key, .{ .relational_topology_json = "{\"mode\":\"generation_handoff_summary\"}", .execution_deadline_ns = (try context.platformDeadline()).deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return error.TableGenerationChanged;
+                defer response.deinit(a);
+                const summary = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").storage_db_empty_generation_handoff.Summary, a, response.json, .{ .allocate = .alloc_always });
+                if (summary.namespace.table_id != parent.table_id or summary.namespace.shard_id != metadata.rangeDocIdentityShardId(range) or summary.namespace.range_id != metadata.rangeDocIdentityRangeId(range) or summary.intent != null or summary.seal != null) return error.TableGenerationChanged;
+                const accepted = for (summary.admissions) |scope| {
+                    if (scope.child_table_id == child.table_id and std.mem.eql(u8, scope.child_table_name, child.name) and std.mem.eql(u8, scope.constraint_name, fk.name)) break scope.active_generation orelse return error.GenerationAdmissionChanged;
+                } else return error.GenerationAdmissionChanged;
+                if (old_generation) |prior| {
+                    if (!std.mem.eql(u8, &prior, &accepted)) return error.GenerationAdmissionChanged;
+                } else old_generation = accepted;
+            };
+            if (parent_ranges == 0) return error.TableGenerationChanged;
+            const next = next_catalog.catalog.find(.foreign_key, fk.name) orelse return error.CatalogGenerationChanged;
+            var draft: ?*ExternalParentDraft = null;
+            for (drafts.items) |*existing| if (existing.table.table_id == parent.table_id) {
+                draft = existing;
+                break;
+            };
+            if (draft == null) {
+                if (drafts.items.len >= 128) return error.SqlProgramLimitExceeded;
+                try drafts.append(a, .{ .table = parent });
+                draft = &drafts.items[drafts.items.len - 1];
+            }
+            if (draft.?.foreign_keys.items.len >= 128) return error.SqlProgramLimitExceeded;
+            try draft.?.foreign_keys.append(a, .{ .child_table_id = child.table_id, .child_table_name = child.name, .constraint_name = fk.name, .generation = old_generation.?, .next_generation = next.generation });
+        }
+    }
+    const result = try a.alloc(stages.ExternalFkParent, drafts.items.len);
+    var range_count: usize = 0;
+    for (drafts.items, result) |draft, *parent| {
+        var ranges: std.ArrayList(records.RangeRecord) = .empty;
+        for (snapshot.ranges) |range| if (range.table_id == draft.table.table_id) try ranges.append(a, range);
+        range_count += ranges.items.len;
+        if (ranges.items.len == 0 or range_count > 4096) return error.SqlProgramLimitExceeded;
+        metadata.sortKeyspaceRanges(records.RangeRecord, ranges.items);
+        const fences = try a.alloc(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence, ranges.items.len);
+        for (ranges.items, fences) |range, *fence| {
+            var response = (try reads.lookup(a, draft.table.name, range.start_key, .{ .relational_topology_json = "{\"mode\":\"identity\"}", .execution_deadline_ns = (try context.platformDeadline()).deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return error.TableGenerationChanged;
+            defer response.deinit(a);
+            const Native = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity;
+            const native = try std.json.parseFromSliceLeaky(Native, a, response.json, .{ .ignore_unknown_fields = true });
+            if (native.namespace.table_id != draft.table.table_id or native.namespace.shard_id != metadata.rangeDocIdentityShardId(range) or native.namespace.range_id != metadata.rangeDocIdentityRangeId(range)) return error.TableGenerationChanged;
+            try native.requireGenerationHandoffReceipts();
+            fence.* = .{ .transition_id = std.mem.readInt(u64, id[0..8], .little), .attempt = 1, .admission_epoch = native.next_epoch, .owner_group_id = range.group_id, .peer_group_id = range.group_id, .role = .truncate_parent, .namespace = native.namespace, .catalog_digest = native.catalog_digest };
+        }
+        parent.* = .{ .table = draft.table, .ranges = ranges.items, .fences = fences, .foreign_keys = draft.foreign_keys.items };
+    }
+    return result;
+}
+
+const RecoveryCapture = @import("../metadata/sql_relation_recovery_capture.zig").Capture;
+const RecoveryCatalog = struct { tables: []const records.TableRecord, ranges: []const records.RangeRecord };
+fn loadRecoveryCapture(server: *server_mod.ApiHttpServer, a: std.mem.Allocator, context: operation.RequestContext, captures: *std.ArrayList(RecoveryCapture), request: @import("../metadata/sql_relation_recovery_capture.zig").Request) !RecoveryCapture {
+    for (captures.items) |value| {
+        if ((request.table_id != null and request.table_id.? == value.relation.record.table_id) or
+            (request.storage_name != null and std.mem.eql(u8, request.storage_name.?, value.relation.record.name))) return value;
+    }
+    if (captures.items.len == 256) return error.SqlProgramLimitExceeded;
+    const bytes = try server.source.systemCatalog(a, context, .{ .sql_relation_boot_read = .{ .recovery_capture = request } });
+    const value = try std.json.parseFromSliceLeaky(RecoveryCapture, a, bytes, .{});
+    if (captures.items.len != 0 and (value.relation.revision != captures.items[0].relation.revision or !std.meta.eql(value.relation.epoch, captures.items[0].relation.epoch))) return error.CatalogGenerationChanged;
+    try captures.append(a, value);
+    return value;
+}
+fn selectRecoveryTable(a: std.mem.Allocator, selected: *std.ArrayList(records.TableRecord), table: records.TableRecord) !void {
+    for (selected.items) |before| if (before.table_id == table.table_id) return;
+    if (selected.items.len == 128) return error.SqlProgramLimitExceeded;
+    const descriptor = table.sql_persistence orelse return error.SqlRelationPersistenceForeignKeyMismatch;
+    if (descriptor.kind != .unlogged) return error.SqlRelationPersistenceForeignKeyMismatch;
+    try selected.append(a, table);
 }

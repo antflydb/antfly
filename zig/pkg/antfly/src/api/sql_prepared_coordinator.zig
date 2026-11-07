@@ -23,6 +23,16 @@ const transactions = @import("transactions.zig");
 const http = @import("http_server.zig");
 const A = std.mem.Allocator;
 
+const ScopedFailureStage = enum { payload, cohort, admit, prepare, recover, session, session_receipt, session_scope, session_outbox_ack, session_native_recover, session_index_scope };
+var scoped_failure_stages: std.atomic.Value(u16) = .init(0);
+fn diagnoseScopedFailure(stage: ScopedFailureStage, err: anyerror, _: ?*std.builtin.StackTrace) void {
+    if (comptime @import("builtin").mode == .debug) {
+        const bit = @as(u16, 1) << @backingInt(stage);
+        if (scoped_failure_stages.fetchOr(bit, .monotonic) & bit != 0) return;
+        std.debug.print("scoped SQL admission failure stage={s} err={s}\n", .{ @tagName(stage), @errorName(err) });
+    }
+}
+
 pub const Registry = struct {
     server: *http.ApiHttpServer,
     context: local.api_operation.RequestContext,
@@ -35,7 +45,7 @@ pub const Registry = struct {
     anchor: ?struct { incarnation: [16]u8, standalone: bool, head: u64 } = null,
 
     pub fn authority(self: *@This()) distributed.ExternalAuthority {
-        return .{ .ptr = self, .read = read, .admit = admit, .advance = advance, .next_version = nextVersion, .prepare_locks = prepareLocks, .resolve_locks = resolveLocks };
+        return .{ .ptr = self, .read = read, .admit = admit, .advance = advance, .next_version = nextVersion, .prepare_locks = prepareLocks, .resolve_locks = resolveLocks, .retire_native = retireNative };
     }
 
     pub fn snapshot(self: *@This(), a: A, lookup: registry.Read) !registry.Snapshot {
@@ -132,6 +142,21 @@ pub const Registry = struct {
     fn resolveLocks(raw: *anyopaque, a: A, record: registry.Record) anyerror!bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         return @import("sql_data_locks.zig").transactionQuantum(self.server, a, self.context, record, record.mask());
+    }
+
+    fn retireNative(raw: *anyopaque, a: A, record: registry.Record) anyerror!registry.Record {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var claims: std.ArrayListUnmanaged(registry.NativeRetirement) = .empty;
+        defer claims.deinit(a);
+        const retired = record.nativeRetirementMask();
+        for (record.participants, 0..) |part, index| {
+            if (part.route.route.execution != .native_local or retired & (@as(u64, 1) << @intCast(index)) != 0) continue;
+            if (try @import("sql_native_recovery.zig").retiredGeneration(a, self.server.catalogSource(), part.route, self.context)) |loss| {
+                try claims.append(a, .{ .member = @intCast(index), .digest = try loss.identityDigest(a) });
+            }
+        }
+        if (claims.items.len == 0) return record;
+        return advance(raw, a, record, .{ .native_retired = claims.items });
     }
 
     fn advance(raw: *anyopaque, a: A, record: registry.Record, action: registry.Action) anyerror!registry.Record {
@@ -270,13 +295,20 @@ pub const Registry = struct {
         return after.scope != null and after.scope.?.transaction == null and std.meta.eql(after.scope.?.released_transaction, @as(?types.scopes.Transaction, expected));
     }
     pub fn acknowledgeReceipt(self: *@This(), a: A, identity: registry.Identity) !void {
-        if (!try self.releaseScopeQuantum(a, identity)) return error.MetadataMutationOutcomeUnknown;
+        const scope_released = self.releaseScopeQuantum(a, identity) catch |err| {
+            diagnoseScopedFailure(.session_scope, err, @errorReturnTrace());
+            return err;
+        };
+        if (!scope_released) return error.MetadataMutationOutcomeUnknown;
         const cut = try self.snapshot(a, .{ .receipt = identity.operation_id });
         try checkRealm(cut, identity);
         if (cut.receipts.len == 0) return;
         var nonce: [16]u8 = undefined;
         try self.server.embedding_provider_runtime.io.randomSecure(&nonce);
-        try self.mutate(a, .{ .notification_control = if (identity.notification_plan != null) true else null, .admission = .{ .nonce = nonce, .head = cut.head }, .incarnation = cut.incarnation, .actor = .{ .session_user = .bootstrap, .credential = "" }, .standalone = cut.standalone, .database_id = identity.database_id, .operation = .{ .acknowledge_receipt = .{ .owner = try identity.owner(a), .txn_id = identity.txn_id } } });
+        self.mutate(a, .{ .notification_control = if (identity.notification_plan != null) true else null, .admission = .{ .nonce = nonce, .head = cut.head }, .incarnation = cut.incarnation, .actor = .{ .session_user = .bootstrap, .credential = "" }, .standalone = cut.standalone, .database_id = identity.database_id, .operation = .{ .acknowledge_receipt = .{ .owner = try identity.owner(a), .txn_id = identity.txn_id } } }) catch |err| {
+            diagnoseScopedFailure(.session_outbox_ack, err, @errorReturnTrace());
+            return err;
+        };
     }
 };
 
@@ -311,6 +343,45 @@ pub fn drainSessionCompletion(server: *http.ApiHttpServer, txn_id: [16]u8, conte
     }
 }
 
+/// A sealed request can have a definite admission rejection while its old
+/// native locks still require several cancellation/release quanta. Finish only
+/// that persisted purpose; never rebuild its cohort or evaluate the SQL again.
+fn drainSealedSessionCompletion(server: *http.ApiHttpServer, txn_id: [16]u8, expected_seal: []const u8, context: local.api_operation.RequestContext) !void {
+    var bounded = try context.platformDeadline();
+    const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_s;
+    bounded.deadline_ns = @min(bounded.deadline_ns orelse deadline, deadline);
+    const Driver = struct {
+        server: *http.ApiHttpServer,
+        txn_id: [16]u8,
+        expected_seal: []const u8,
+        context: local.api_operation.RequestContext,
+
+        pub fn check(self: *@This()) !void {
+            try self.context.ensureActive();
+        }
+        pub fn step(self: *@This()) !bool {
+            const store = self.server.txn_sessions.durable orelse return error.SqlPreparedDurabilityUnavailable;
+            var state = (try store.loadInto(self.server.alloc, self.txn_id)) orelse return error.SqlTransactionNotActive;
+            defer state.deinit(self.server.alloc);
+            const retained = state.external_preparation orelse return error.InvalidTransactionSessionRecord;
+            if (!std.mem.eql(u8, retained, self.expected_seal)) return error.ExternalTransactionDecisionChanged;
+            if (state.external_preparation_prepared) return error.SqlTransactionOutcomeUnknown;
+            if ((state.terminal_abort or state.terminal_commit != null) and state.external_receipt_acknowledged) return true;
+            try recoverSessionWithContext(self.server, self.txn_id, retained, false, state.terminal_abort, state.terminal_commit != null, self.context);
+            return false;
+        }
+        pub fn pause(self: *@This()) !void {
+            try self.server.embedding_provider_runtime.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    };
+    var driver: Driver = .{ .server = server, .txn_id = txn_id, .expected_seal = expected_seal, .context = bounded };
+    try session_completion.drainSealedSession(&driver);
+}
+
+const session_completion = @import("../sql/session_completion.zig");
+pub const sessionRequiresPhysicalRecovery = session_completion.sessionRequiresPhysicalRecovery;
+pub const sessionPhysicalRecoveryFailure = session_completion.sessionPhysicalRecoveryFailure;
+
 fn recoverSessionWithContext(server: *http.ApiHttpServer, txn_id: [16]u8, bytes: []const u8, prepared: bool, aborted: bool, committed: bool, context: local.api_operation.RequestContext) !void {
     var region = std.heap.ArenaAllocator.init(server.alloc);
     defer region.deinit();
@@ -343,8 +414,13 @@ fn recoverSessionWithContext(server: *http.ApiHttpServer, txn_id: [16]u8, bytes:
             return error.MetadataMutationOutcomeUnknown;
         }
         if (seal.identity.kind == .session_commit) {
-            _ = (try server.txn_sessions.recordExternalCommitReceipt(server.alloc, txn_id, cut.receipts[0])) orelse return error.SqlTransactionNotActive;
-            if (cut.receipts[0].progress == .resolving or (cut.records.len == 1 and cut.records[0].native_lock_releases != cut.records[0].nativeLockMask())) {
+            _ = (server.txn_sessions.recordExternalCommitReceipt(server.alloc, txn_id, cut.receipts[0]) catch |err| {
+                diagnoseScopedFailure(.session_receipt, err, @errorReturnTrace());
+                return err;
+            }) orelse return error.SqlTransactionNotActive;
+            if (cut.receipts[0].progress == .resolving or (cut.records.len == 1 and
+                sessionRequiresPhysicalRecovery(cut.receipts[0].progress, cut.records[0])))
+            {
                 // The synchronous caller owns this exact durable purpose. It
                 // can advance its admitted control graph directly rather than
                 // flooding metadata reads while waiting for a global worker.
@@ -355,18 +431,21 @@ fn recoverSessionWithContext(server: *http.ApiHttpServer, txn_id: [16]u8, bytes:
                 const deadline = if (context.deadline_ns) |value| @min(value, pass_deadline) else pass_deadline;
                 transport.local_worker.recovery_deadline_ns = deadline;
                 if (transport.hosted) transport.hosted_worker.recovery_deadline_ns = deadline;
-                _ = distributed.recoverExternalTransaction(a, transport.worker(), source.authority(), seal.identity.operation_id, @import("antfly_platform").time.realtimeNs(), .{ .fanout_io = server.sharedApiIo(), .external_deadline_ns = deadline }) catch |err| switch (err) {
-                    // A concurrent controller can advance the same immutable
-                    // purpose. Reload its record on the next control pass.
-                    error.CatalogGenerationChanged => return error.MetadataMutationOutcomeUnknown,
-                    else => return err,
+                _ = distributed.recoverExternalTransaction(a, transport.worker(), source.authority(), seal.identity.operation_id, @import("antfly_platform").time.realtimeNs(), .{ .fanout_io = server.sharedApiIo(), .external_deadline_ns = deadline }) catch |err| {
+                    const classified = sessionPhysicalRecoveryFailure(err);
+                    if (classified == error.MetadataMutationOutcomeUnknown) return classified;
+                    diagnoseScopedFailure(.session_native_recover, err, @errorReturnTrace());
+                    return classified;
                 };
                 return error.MetadataMutationOutcomeUnknown;
             }
             if (cut.receipts[0].progress == .indexing) {
                 // Row intents have resolved: release transactional locks while
                 // the independent index barrier remains durable recovery debt.
-                _ = try source.releaseScopeQuantum(a, seal.identity);
+                _ = source.releaseScopeQuantum(a, seal.identity) catch |err| {
+                    diagnoseScopedFailure(.session_index_scope, err, @errorReturnTrace());
+                    return err;
+                };
                 return error.MetadataMutationOutcomeUnknown;
             }
         } else {
@@ -522,6 +601,10 @@ pub fn commitScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdenti
     var state = (try server.txn_sessions.getSqlState(server.alloc, id)) orelse return error.SqlTransactionNotActive;
     defer state.deinit(server.alloc);
     const connection_id = state.connection_id orelse return error.SqlConnectionNotFound;
+    if (!abort and !state.volatile_payload_available) {
+        diagnoseScopedFailure(.payload, error.SqlRelationRecoveryIncomplete, null);
+        return error.SqlRelationRecoveryIncomplete;
+    }
     if (state.owner_node_id != server.localSessionNodeId() or (state.metadata.accepted_lake_reads and tables.len != 0)) return error.UnsupportedSqlExecution;
     var region = std.heap.ArenaAllocator.init(server.alloc);
     defer region.deinit();
@@ -530,7 +613,11 @@ pub fn commitScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdenti
     var root: execution.Adapter = .{ .server = server, .identity = &current_user, .context = context, .database = state.metadata.database };
     var source: Registry = .{ .server = server, .context = context, .database_id = try databaseIdentity(&root, a) };
     if (source.database_id != frame.database) return error.InvalidLockScope;
-    var cohort = try distributed.ExternalPreparation.init(a, server.catalogSource(), tables);
+    const captured_tables = try @import("sql_relation_lifetimes.zig").attachOwnerMinters(server, a, context, tables);
+    var cohort = distributed.ExternalPreparation.init(a, server.catalogSource(), captured_tables) catch |err| {
+        diagnoseScopedFailure(.cohort, err, @errorReturnTrace());
+        return err;
+    };
     defer cohort.deinit(a);
     try @import("sql_data_locks.zig").attachPreparation(server, a, context, id, &cohort);
     var transport: ParticipantTransport = undefined;
@@ -575,9 +662,15 @@ pub fn commitScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdenti
     // table participant or constructing a transport that will never be called.
     deliver: {
         var record = if (abort or cohort.manifest.len == 0)
-            Registry.admit(&source, a, identity, cohort.manifest) catch break :deliver
+            Registry.admit(&source, a, identity, cohort.manifest) catch |err| {
+                diagnoseScopedFailure(.admit, err, @errorReturnTrace());
+                break :deliver;
+            }
         else
-            cohort.prepare(a, transport.worker(), source.authority(), identity, .{ .fanout_io = server.sharedApiIo(), .external_deadline_ns = context.deadline_ns }) catch break :deliver;
+            cohort.prepare(a, transport.worker(), source.authority(), identity, .{ .fanout_io = server.sharedApiIo(), .external_deadline_ns = context.deadline_ns }) catch |err| {
+                diagnoseScopedFailure(.prepare, err, @errorReturnTrace());
+                break :deliver;
+            };
         if (cohort.manifest.len == 0) {
             if (abort) {
                 record = Registry.advance(&source, a, record, .{ .abort = distributed.commitVersion(info.begin_timestamp) catch break :deliver }) catch break :deliver;
@@ -594,23 +687,32 @@ pub fn commitScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdenti
     defer server.alloc.free(bytes);
     // Exact native receipt adoption persists the terminal result before ACK.
     // Lost admission/reply and incomplete lock cleanup are owned by maintenance.
-    recoverSessionWithContext(server, id, bytes, false, false, false, context) catch {};
-    var observed = (server.txn_sessions.getSqlState(server.alloc, id) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
+    drainSealedSessionCompletion(server, id, bytes, context) catch |err| {
+        // A deadline or lost authority still leaves the same sealed purpose
+        // pending. Only an authenticated terminal journal below is definitive.
+        diagnoseScopedFailure(.session, err, @errorReturnTrace());
+    };
+    // Read the retained seal and terminal decision from ONE durable session
+    // observation. externalPreparationSeal is deliberately admission-only and
+    // refuses terminal sessions; it cannot be used to observe completion.
+    var observed = (server.txn_sessions.durable.?.loadInto(server.alloc, id) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
     defer observed.deinit(server.alloc);
+    const terminal = session_completion.sealedTerminalOutcome(observed, bytes);
+    if (terminal == .unknown) return .{ .outcome = .unknown, .reconciliation_id = id };
     // A terminal decision is durable before native lock retirement. Keep the
     // SQL command loan until its exact completion is acknowledged: otherwise a
     // successful ROLLBACK/COMMIT can leave locks visible to the next command.
-    // Recovery resumes the same decision if the caller's deadline expires.
-    if (observed.terminal_abort or observed.terminal != null) {
-        drainSessionCompletion(server, id, context) catch return .{
-            .outcome = if (observed.terminal_abort) .unknown else .committed_pending,
-            .reconciliation_id = id,
-        };
-    }
-    return .{ .outcome = if (observed.terminal_abort) .aborted else if (observed.terminal) |terminal| switch (terminal) {
-        .committed => if (observed.terminal_repair_required) .committed_repair_required else .committed,
-        .committed_recovery_pending, .committed_visibility_pending => .committed_pending,
-    } else .unknown, .reconciliation_id = id };
+    drainSessionCompletion(server, id, context) catch return .{
+        .outcome = if (terminal == .aborted) .unknown else .committed_pending,
+        .reconciliation_id = id,
+    };
+    return .{ .outcome = switch (terminal) {
+        .aborted => .aborted,
+        .committed => .committed,
+        .committed_pending => .committed_pending,
+        .committed_repair_required => .committed_repair_required,
+        .unknown => unreachable,
+    }, .reconciliation_id = id };
 }
 
 /// Session ownership, current schema/RLS, predicates and FK/UNIQUE preparation
@@ -725,11 +827,17 @@ pub fn execute(root: *execution.Adapter, session: *sql_session.Session, coordina
     const info = server.txn_sessions.getInfo(id) orelse return error.SqlTransactionNotActive;
     var state = (try server.txn_sessions.getSqlState(server.alloc, id)) orelse return error.SqlTransactionNotActive;
     defer state.deinit(server.alloc);
-    if (state.metadata.accepted_lake_reads) return error.UnsupportedSqlExecution;
+    if (state.metadata.accepted_lake_reads or state.metadata.temporary_relation_access) return error.UnsupportedSqlExecution;
     if (state.metadata.notifications.commands.items.len != 0) return error.UnsupportedSqlExecution;
     try root.validateAcceptedSerializable(server.alloc, id);
     var request = try server.txn_sessions.cloneCommitRequest(server.alloc, id, null);
     defer if (request) |*value| value.deinit(server.alloc);
+    // A named prepared transaction may outlive its SQL connection. PostgreSQL
+    // refuses TEMP dependencies, including reads with no mutation participant.
+    if (request) |value| for (value.catalog_bindings.items) |binding| {
+        if (binding.sql_persistence) |persistence| if (persistence.kind == .temporary)
+            return error.UnsupportedSqlExecution;
+    };
     var region = std.heap.ArenaAllocator.init(server.alloc);
     defer region.deinit();
     const scratch = region.allocator();

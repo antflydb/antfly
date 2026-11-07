@@ -751,3 +751,36 @@ test "SQL catalog ordinary schema preparation retries owner readiness but never 
     try std.testing.expectEqual(@as(usize, 0), source.prepares);
     try std.testing.expectEqual(@as(usize, 0), source.attempts);
 }
+
+test "SQL catalog ordinary connectionless generated constraints use native namespace name admission" {
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try storage.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/generated-create", .{tmp.sub_path}) });
+    defer store.deinit();
+    var source: Source = .{ .store = &store };
+    _ = try source.setup(alloc);
+    var server = source.server();
+    defer server.deinit();
+    const schema =
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer","nullable":false}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"sql_primary_0","primary":true,"columns":["id"]}]}
+    ;
+    const body = try std.fmt.allocPrint(alloc, "{{\"schema\":{s},\"indexes\":{{}}}}", .{schema});
+    for ([_][]const u8{ "generated_first", "generated_second" }, 0..) |name, ordinal| {
+        var reply = try ordinary.submit(&server, null, .{}, .{ .result = alloc, .scratch = a }, .{
+            .mutation = .{ .kind = .table, .action = .create, .name = name },
+            .physical_name = try std.fmt.allocPrint(alloc, "table:generated-{d}", .{ordinal}),
+            .create_table_json = body,
+            .generated_constraint_names = &.{"sql_primary_0"},
+        });
+        defer reply.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, ordinal + 1), source.prepares);
+        try std.testing.expectEqual(.committed, reply.receipt.?.state);
+        const table = (try store.resolveSystemCatalogTable(alloc, group, .{ .table = name })) orelse return error.MissingGeneratedTable;
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, table.schema_json, .{});
+        const rule = parsed.object.get("unique_constraints").?.array.items[0];
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(alloc, "{s}_pkey", .{name}), rule.object.get("name").?.string);
+    }
+}

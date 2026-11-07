@@ -29,7 +29,14 @@ pub const StatusDetail = error_abi.Detail;
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
 // Combines the current control contract with retained document capabilities.
-pub const abi_version: u32 = 25;
+// Stable relation identities change typed scope-manifest Resource elements.
+// Native range activation carries body-bound owner signers in request contexts.
+// Lookup callbacks carry borrowed native owner minters through checked preparation.
+// Captured schema publication carries the authenticated optional policy pair.
+// Required core callback drains durable SQL sources before native close.
+// Config callbacks add exact reserved-retirement owner preparation.
+// Borrowed StatusSource adds exact native node/store endpoint discovery.
+pub const abi_version: u32 = 34;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -226,6 +233,7 @@ pub const FunctionTable = extern struct {
     handler_authorize_internal_service: *const fn (*const InternalServiceAuthContext) callconv(.c) Status,
     query_population_job: *const fn (*const CallContext) callconv(.c) Status,
     authorize_sql_lock: *const fn (*const CallContext) callconv(.c) Status,
+    drain_sql_connections: *const fn (*const CallContext) callconv(.c) Status,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
@@ -251,7 +259,7 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
     if (required_capabilities & ~known != 0) return null;
     var required = functionTableFieldEnd("capabilities");
     if (required_capabilities & Capability.core != 0)
-        required = @max(required, functionTableFieldEnd("handler_destroy"));
+        required = @max(required, functionTableFieldEnd("drain_sql_connections"));
     if (required_capabilities & Capability.route_manifest != 0)
         required = @max(required, functionTableFieldEnd("handler_route_manifest"));
     if (required_capabilities & Capability.inference_admission_stats != 0)
@@ -280,6 +288,8 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     const std = @import("std");
     try std.testing.expect(validContext(CallContext, abi_version, @sizeOf(CallContext)));
     try std.testing.expect(!validContext(CallContext, abi_version - 1, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, 29, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, 30, @sizeOf(CallContext)));
     try std.testing.expect(!validContext(CallContext, abi_version, @sizeOf(CallContext) - 1));
 
     var table: FunctionTable = undefined;
@@ -287,6 +297,12 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     table.struct_size = @sizeOf(FunctionTable);
     table.capabilities = Capability.core;
     try std.testing.expect(validFunctionTable(&table, Capability.core));
+    table.abi_version = abi_version - 1; // Previous StatusSource lacks exact native owner endpoint discovery.
+    try std.testing.expect(!validFunctionTable(&table, Capability.core));
+    table.abi_version = abi_version;
+    table.struct_size = functionTableFieldEnd("authorize_sql_lock");
+    try std.testing.expect(!validFunctionTable(&table, Capability.core));
+    table.struct_size = @sizeOf(FunctionTable);
     try std.testing.expect(!validFunctionTable(&table, Capability.route_manifest));
     try std.testing.expect(!validFunctionTable(&table, Capability.inference_admission_stats));
     try std.testing.expect(!validFunctionTable(&table, Capability.internal_service_ingress));

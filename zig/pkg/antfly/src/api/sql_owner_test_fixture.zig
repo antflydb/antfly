@@ -114,8 +114,16 @@ fn metadataRaft(ptr: *anyopaque) !void {
 }
 fn metadataControl(ptr: *anyopaque) !void {
     const server: *metadata_runtime.Server = @ptrCast(@alignCast(ptr));
-    server.runControlRoundOnly() catch |err| return progressFailure("metadataControl/runControlRoundOnly", err, @errorReturnTrace());
-    server.runCdcRound() catch |err| return progressFailure("metadataControl/runCdcRound", err, @errorReturnTrace());
+    server.runControlRoundOnly() catch |err| {
+        // Match the production metadata supervisor's idempotent control-loop
+        // deferrals; request completion and mutation retries stay strict.
+        if (!metadata_runtime.isExpectedControlRoundError(err))
+            return progressFailure("metadataControl/runControlRoundOnly", err, @errorReturnTrace());
+    };
+    server.runCdcRound() catch |err| {
+        if (!metadata_runtime.isExpectedControlRoundError(err))
+            return progressFailure("metadataControl/runCdcRound", err, @errorReturnTrace());
+    };
 }
 fn dataRaft(ptr: *anyopaque) !void {
     const server: *data_runtime.DataServer = @ptrCast(@alignCast(ptr));
@@ -248,6 +256,12 @@ pub const Context = struct {
 
     /// Authenticated private transport for mounted owner campaigns. These
     /// credentials belong only to this disposable fixture deployment.
+    pub fn internalDataClient(self: *const Context) @import("http_client.zig").ApiHttpClient {
+        var value = @import("http_client.zig").ApiHttpClient.init(self.alloc, self.transport);
+        _ = value.withInternalServiceAuth(internal_secret, issuer);
+        return value;
+    }
+
     pub fn catalogClient(self: *const Context) @import("../metadata/http_client.zig").MetadataHttpClient {
         var value = @import("../metadata/http_client.zig").MetadataHttpClient.init(self.alloc, self.transport);
         _ = value.withInternalServiceAuth(internal_secret, issuer);
@@ -404,6 +418,7 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
     var session_store: ?local.storage_backend_erased.Store = if (session_backend) |*backend| try backend.backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" }) else null;
     defer if (session_store) |*store| store.deinit();
     var sessions = if (session_store) |*store| @import("transactions.zig").DurableSessionStore.initRuntime(alloc, store) else null;
+    defer if (sessions) |*store| store.deinitVolatilePayloads();
     const metadata_cfg: metadata_runtime.ServerConfig = .{
         .local_node_id = 1,
         .metadata_group_id = 2188,
@@ -411,7 +426,7 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
         .replica_catalog_path = meta_catalog,
         .snapshot_root_dir = snapshots,
         .observe_local_replica_root = true,
-        .api_server_cfg = .{ .auth_enabled = true, .user_manager = &auth_manager, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
+        .api_server_cfg = .{ .node_config = if (@hasDecl(Campaign, "nodeConfig")) campaign.nodeConfig() else null, .auth_enabled = true, .user_manager = &auth_manager, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
     };
     var metadata = try metadata_runtime.Server.init(process_alloc, metadata_cfg);
     var metadata_live = true;
@@ -436,7 +451,7 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
         .replica_root_dir = data_root,
         .replica_catalog_path = data_catalog,
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
-        .api_server_cfg = .{ .deployment_mode = .distributed, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = if (public_anonymous) null else trusted_secret, .trusted_principal_issuer = issuer, .setting_authority_secret = if (public_anonymous) trusted_secret else null, .setting_authority_issuer = if (public_anonymous) issuer else null, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
+        .api_server_cfg = .{ .node_config = if (@hasDecl(Campaign, "nodeConfig")) campaign.nodeConfig() else null, .deployment_mode = .distributed, .sql_preparation_secret = "fixture-private-sql-preparation-key-v1-32bytes", .sql_preparation_issuer = issuer, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = if (public_anonymous) null else trusted_secret, .trusted_principal_issuer = issuer, .setting_authority_secret = if (public_anonymous) trusted_secret else null, .setting_authority_issuer = if (public_anonymous) issuer else null, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
     }, metadata_uri);
     var data_live = true;
     defer if (data_live) data.deinit();
@@ -497,10 +512,27 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
     // All borrowers drain before any durable owner closes. Ordinary data
     // campaigns keep metadata live; catalog campaigns reopen all three stores
     // independently. Authentication remains deliberately outside this fixture.
+    // Keep ordered progress through logical scope retirement. Join those
+    // external callers before the idempotent provider drain destroys API state.
+    const shutdown_deadline = @import("../common/runtime_lifecycle.zig").ShutdownDeadline.afterMilliseconds(30_000);
+    data.drainSqlConnectionsWithDeadline(shutdown_deadline);
     data_control.deinit();
     data_control_live = false;
     data_raft.deinit();
     data_raft_live = false;
+    try data.quiesceExternalProviderUsersWithDeadline(shutdown_deadline);
+    if (@hasDecl(Campaign, "require_clean_native_shutdown") and Campaign.require_clean_native_shutdown) {
+        const source = http_server.StatusSource.fromMetadataHttpService(metadata.server.svc);
+        const registration = data.store_registration orelse return error.StoreRegistrationRequired;
+        const bytes = try source.systemCatalog(alloc, .{ .setting_admin = true }, .{ .sql_relation_boot_read = .{ .node = registration.node_id } });
+        defer alloc.free(bytes);
+        var observed = try std.json.parseFromSlice(@import("../metadata/sql_relation_boots.zig").Observation, alloc, bytes, .{});
+        defer observed.deinit();
+        const boot = observed.value.record orelse return error.SqlRelationOwnerUnavailable;
+        try boot.validate();
+        try std.testing.expect(observed.value.registration_current);
+        try std.testing.expectEqual(@import("../metadata/sql_relation_boots.zig").Phase.clean, boot.phase);
+    }
     data.deinit();
     data_live = false;
     if (cold_catalog) {
@@ -510,11 +542,14 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
         meta_raft_live = false;
         metadata.deinit();
         metadata_live = false;
+        // All API/metadata borrowers are gone. Retire process-local capsule
+        // ownership before dropping/replacing this durable facade and backend.
+        if (sessions) |*store| store.deinitVolatilePayloads();
+        sessions = null;
         if (session_store) |*store| store.deinit();
         session_store = null;
         if (session_backend) |*backend| backend.close();
         session_backend = null;
-        sessions = null;
         if (native_sessions) {
             session_backend = try local.storage_lsm_backend.BackendHandle.open(alloc, session_path, .{});
             session_store = try session_backend.?.backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" });
@@ -543,7 +578,7 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
         .replica_root_dir = data_root,
         .replica_catalog_path = data_catalog,
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
-        .api_server_cfg = .{ .deployment_mode = .distributed, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = if (public_anonymous) null else trusted_secret, .trusted_principal_issuer = issuer, .setting_authority_secret = if (public_anonymous) trusted_secret else null, .setting_authority_issuer = if (public_anonymous) issuer else null, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
+        .api_server_cfg = .{ .node_config = if (@hasDecl(Campaign, "nodeConfig")) campaign.nodeConfig() else null, .deployment_mode = .distributed, .sql_preparation_secret = "fixture-private-sql-preparation-key-v1-32bytes", .sql_preparation_issuer = issuer, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = if (public_anonymous) null else trusted_secret, .trusted_principal_issuer = issuer, .setting_authority_secret = if (public_anonymous) trusted_secret else null, .setting_authority_issuer = if (public_anonymous) issuer else null, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
     }, metadata_uri);
     data_live = true;
     if (@hasDecl(Campaign, "configureData")) try campaign.configureData(&data, io_impl.io());

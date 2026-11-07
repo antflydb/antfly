@@ -312,15 +312,39 @@ pub fn resolve(context: anytype, table: catalog.Table, clause: ast.Conflict, bin
     const prepare = context.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution;
     const normalized = try prepare(context.backend.ptr, context.arena, table, proposed);
     if (normalized.len != proposed.len) return error.InvalidSqlBackendResponse;
-    const owners = if (!physicalArbiter(table, clause)) try (context.backend.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, context.alloc, table, .{ .columns = clause.columns, .expressions = binding.arbiter_expressions, .conditions = binding.arbiter_conditions, .constraint_name = clause.constraint_name }, normalized) else null;
-    if (owners) |items| if (items.len != normalized.len) return error.InvalidSqlBackendResponse;
+    var live_proposed = proposed;
+    var live_normalized = normalized;
+    var live_captured = captured;
+    var remaining: usize = 0;
+    for (normalized) |mutation| if (!mutation.trigger_suppressed) {
+        remaining += 1;
+    };
+    if (remaining != normalized.len) {
+        const original = try context.arena.alloc(catalog.Mutation, remaining);
+        const ready = try context.arena.alloc(catalog.Mutation, remaining);
+        const captures: [][]const scalar.Datum = if (captured.len != 0) try context.arena.alloc([]const scalar.Datum, remaining) else &.{};
+        var next: usize = 0;
+        for (proposed, normalized, 0..) |source, mutation, i| {
+            if (mutation.trigger_suppressed) continue;
+            original[next] = source;
+            ready[next] = mutation;
+            if (captured.len != 0) captures[next] = captured[i];
+            next += 1;
+        }
+        live_proposed = original;
+        live_normalized = ready;
+        live_captured = captures;
+    }
+    if (live_normalized.len == 0) return live_normalized;
+    const owners = if (!physicalArbiter(table, clause)) try (context.backend.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, context.alloc, table, .{ .columns = clause.columns, .expressions = binding.arbiter_expressions, .conditions = binding.arbiter_conditions, .constraint_name = clause.constraint_name }, live_normalized) else null;
+    if (owners) |items| if (items.len != live_normalized.len) return error.InvalidSqlBackendResponse;
     if (table.storage_mode == .relational and clause.constraint_name == null and clause.columns.len == 0 and clause.expressions.len == 0) {
-        for (proposed, normalized) |original, value| {
+        for (live_proposed, live_normalized) |original, value| {
             if (!std.mem.eql(u8, original.key, value.key) or value.row == null or value.expected_version != 0) return error.InvalidSqlBackendResponse;
         }
-        return resolveAny(context, table, binding, normalized, owners.?);
+        return resolveAny(context, table, binding, live_normalized, owners.?);
     }
-    return resolvePrepared(context, table, clause, binding, proposed, normalized, owners, captured);
+    return resolvePrepared(context, table, clause, binding, live_proposed, live_normalized, owners, live_captured);
 }
 
 fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict, binding: Bound, proposed: []const catalog.Mutation, normalized: []const catalog.Mutation, owners: ?[]const catalog.ConflictOwner, captured: []const []const scalar.Datum) ![]const catalog.Mutation {
@@ -361,7 +385,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         // recomputed natively and fetched only if old-row expressions need one.
         const width = binding.row_width;
         const needed = binding.required_cells.len == 0 or binding.required_cells[ordinal] or binding.required_cells[width + ordinal];
-        if (needed) try fields.append(context.arena, column.path);
+        if (needed or table.has_triggers) try fields.append(context.arena, column.path);
     };
     // The conflict-resolution scan-page budget belongs to the whole mutation
     // batch, not each conflicted key. Otherwise a bounded batch can multiply
@@ -379,6 +403,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
     var pending: std.ArrayList(DecisionConflictRow) = .empty;
     var page_budget: decision_eval.PageBudget = .{ .row_limit = if (ordered) 1 else context.limits.page_rows, .byte_limit = context.limits.page_bytes };
     var point_pages: usize = 0;
+    var previous_layout: ?*const catalog.Row.TypedLayout = null;
     for (result, captured_buffer[0..count]) |*mutation, captured_row| {
         try context.checkpoint();
         const conflict_owner = owner_by_key.get(mutation.key);
@@ -443,6 +468,14 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         mutation.expected_version = previous.version;
         mutation.unique_absence = false;
         mutation.expected_content_digest = previous.expected_content_digest;
+        if (table.has_triggers and clause.assignments.len != 0) {
+            if (previous.typed_cells) |cells| if (previous_layout == null) {
+                previous_layout = try cells.layout.clone(context.arena);
+            };
+            const old = try context.arena.create(catalog.Row);
+            old.* = try previous.cloneWithLayout(context.arena, previous_layout);
+            mutation.previous = old;
+        }
         if (clause.assignments.len == 0) {
             mutation.predicate_only = true;
             mutation.row = null;
@@ -599,6 +632,7 @@ fn applyDecisionConflicts(context: anytype, scratch: std.mem.Allocator, table: c
 
 fn needsOldDocument(table: catalog.Table, clause: ast.Conflict, binding: Bound) bool {
     if (table.storage_mode != .document or clause.assignments.len == 0) return false;
+    if (table.has_triggers) return true;
     if (binding.document_assignment == null) return true;
     const ordinal = table.columns.len + 1;
     for (binding.assignments) |optional| if (optional) |program| for (program.required_columns) |required| {
@@ -632,7 +666,9 @@ fn installPostimage(context: anytype, table: catalog.Table, clause: ast.Conflict
         row = (try @import("../storage/typed_json.zig").clone(context.arena, cells[ordinal].value)).object;
     }
     var nulls: std.ArrayList([]const u8) = .empty;
-    for (table.columns, 0..) |column, ordinal| {
+    for (table.columns, 0..) |declared_column, ordinal| {
+        var column = declared_column;
+        if (table.has_triggers) column.nullable = true;
         const assigned = binding.column_assignments[ordinal];
         if (column.generated or (assigned != null and clause.assignments[assigned.?].use_default)) {
             // Omission, not NULL: native preparation owns defaults/generated

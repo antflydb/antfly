@@ -1167,6 +1167,53 @@ pub fn parseStoredCreateTableRequest(alloc: std.mem.Allocator, body: []const u8)
     return parseCreateTableRequestWithOptions(alloc, body, true);
 }
 
+test "SQL relation lifetime private create preserves full width identities and rejects public injection" {
+    const descriptor: @import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor = .{
+        .kind = .unlogged,
+        .owner_node_id = std.math.maxInt(u64) - 7,
+        .owner_store_id = std.math.maxInt(u64) - 9,
+        .generation_instance = @splat(5),
+        .data_generation = std.math.maxInt(u64) - 11,
+    };
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator, expected: @TypeOf(descriptor)) !void {
+            const request: CreateTableRequest = .{ .sql_persistence = expected, .indexes_json = @constCast("{}") };
+            const body = try encodeStoredCreateTableRequestAlloc(a, request);
+            defer a.free(body);
+            var restored = try parseStoredCreateTableRequest(a, body);
+            defer restored.deinit(a);
+            try std.testing.expectEqualDeep(expected, restored.sql_persistence.?);
+            const record = deriveTableRecord("lifetime-native", restored);
+            try std.testing.expectEqualDeep(expected, record.sql_persistence.?);
+            try std.testing.expectEqual(@as(u16, 1), record.desired_replica_count);
+            // Manager insertion, rollback and snapshot projections all use
+            // this owned clone. Losing the descriptor here routes a native
+            // relation through permanent durability before its first write.
+            const owned = try metadata_table_manager.cloneTable(a, record);
+            defer metadata_table_manager.freeTable(a, owned);
+            try std.testing.expectEqualDeep(expected, owned.sql_persistence.?);
+            const encoded = try std.json.Stringify.valueAlloc(a, owned, .{});
+            defer a.free(encoded);
+            var cold = try std.json.parseFromSlice(metadata_table_manager.TableRecord, a, encoded, .{});
+            defer cold.deinit();
+            try std.testing.expectEqualDeep(expected, cold.value.sql_persistence.?);
+            const routing = try metadata_table_manager.cloneRoutingTable(a, record);
+            defer metadata_table_manager.freeTable(a, routing);
+            try std.testing.expectEqualDeep(expected, routing.sql_persistence.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{descriptor});
+    const a = std.testing.allocator;
+    const request: CreateTableRequest = .{ .sql_persistence = descriptor };
+    const body = try encodeStoredCreateTableRequestAlloc(a, request);
+    defer a.free(body);
+    try std.testing.expectError(error.InvalidCreateTableRequest, parseCreateTableRequest(a, body));
+    try std.testing.expectError(error.InvalidCreateTableRequest, @import("table_contract.zig").parseCreateTableRequest(a, body));
+    try std.testing.expectError(error.InvalidCreateTableRequest, @import("table_contract.zig").encodeCreateTableRequest(a, request));
+    try std.testing.expectError(error.InvalidCreateTableRequest, parseCreateTableRequest(std.testing.allocator, "{\"sql_persistence\":null}"));
+    try std.testing.expectError(error.InvalidCreateTableRequest, @import("table_contract.zig").parseCreateTableRequest(std.testing.allocator, "{\"sql_persistence\":null}"));
+}
+
 /// Encodes an already-normalized request for the trusted internal metadata
 /// hop. The output must round-trip through `parseStoredCreateTableRequest`;
 /// the stricter public parser intentionally rejects normalized artifacts such
@@ -1176,6 +1223,11 @@ pub fn encodeStoredCreateTableRequestAlloc(alloc: std.mem.Allocator, req: Create
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
     var root = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{}", .{});
+    if (req.sql_persistence) |descriptor| {
+        try descriptor.validate();
+        const encoded = try std.json.Stringify.valueAlloc(arena, descriptor, .{});
+        try root.object.put(arena, "sql_persistence", try std.json.parseFromSliceLeaky(std.json.Value, arena, encoded, .{ .parse_numbers = false }));
+    }
     if (req.tablespace_name) |name| try root.object.put(arena, "tablespace_name", .{ .string = name });
     if (req.storage) |storage|
         try root.object.put(arena, "storage", try std.json.parseFromSliceLeaky(std.json.Value, arena, try std.json.Stringify.valueAlloc(arena, storage, .{}), .{}));
@@ -1218,7 +1270,7 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
     defer parsed.deinit();
     // Keep typed expression operands exact without changing the numeric value
     // representation expected by storage settings and artifact index parsers.
-    var exact_schema = try std.json.parseFromSlice(struct { schema: ?std.json.Value = null }, alloc, body, .{ .ignore_unknown_fields = true, .parse_numbers = false });
+    var exact_schema = try std.json.parseFromSlice(struct { schema: ?std.json.Value = null, sql_persistence: ?std.json.Value = null }, alloc, body, .{ .ignore_unknown_fields = true, .parse_numbers = false });
     defer exact_schema.deinit();
 
     const root = switch (parsed.value) {
@@ -1228,6 +1280,14 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
 
     var req: CreateTableRequest = .{};
     errdefer req.deinit(alloc);
+
+    if (root.get("sql_persistence") != null) {
+        if (!allow_private_index_fields) return error.InvalidCreateTableRequest;
+        if (exact_schema.value.sql_persistence) |value| {
+            req.sql_persistence = std.json.parseFromValueLeaky(@import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor, alloc, value, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCreateTableRequest;
+            req.sql_persistence.?.validate() catch return error.InvalidCreateTableRequest;
+        } else return error.InvalidCreateTableRequest;
+    }
 
     if (root.get("tablespace_name")) |value| {
         if (value != .null) {
@@ -1664,6 +1724,8 @@ pub fn mergeSchemaPatchDocumentAlloc(
     const patch = std.json.parseFromSliceLeaky(std.json.Value, arena, patch_json, .{ .parse_numbers = false }) catch
         return error.InvalidSchemaUpdateRequest;
     if (current != .object or patch != .object) return error.InvalidSchemaUpdateRequest;
+    try schema_mod.table_triggers.rejectPublic(patch);
+    _ = current.object.orderedRemove("sql_triggers");
     if (patch.object.get("version")) |version| {
         if (version != .null) return error.SchemaVersionManagedByBackend;
     }
@@ -1707,7 +1769,23 @@ pub fn applySchemaMutationRecord(
         .merge_patch => try mergeSchemaPatchRequest(alloc, table.schema_json, body),
     };
     defer alloc.free(schema_json);
-    return try applySchemaUpdateRecord(alloc, table, schema_json);
+    const preserved = try schema_mod.table_triggers.preserve(alloc, table.schema_json, schema_json);
+    defer alloc.free(preserved);
+    return try applySchemaUpdateRecord(alloc, table, preserved);
+}
+
+/// Only the private SQL attachment intent can change executable references.
+/// The native catalog transaction rechecks actual routine IDs and dependencies.
+pub fn applySqlSchemaMutationRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, body: []const u8) !metadata_table_manager.TableRecord {
+    const public = try schema_mod.table_triggers.stripUnchanged(alloc, table.schema_json, body);
+    defer alloc.free(public);
+    return applySchemaMutationRecord(alloc, table, .replace, public);
+}
+
+pub fn applyTriggerSchemaMutationRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, body: []const u8) !metadata_table_manager.TableRecord {
+    const parsed = try @import("antfly_local_sources").schema_table_schema_impl.parseStoredCreateSchemaRequest(alloc, body);
+    defer alloc.free(parsed);
+    return applySchemaUpdateRecord(alloc, table, parsed);
 }
 
 pub const parseValidatedTableSchema = @import("antfly_local_sources").api_local_tables.parseValidatedTableSchema;

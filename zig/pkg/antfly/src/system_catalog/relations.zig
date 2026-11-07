@@ -25,6 +25,8 @@ const A = std.mem.Allocator;
 
 pub const Intent = union(enum) {
     schema: calls.RelationSchemaMutation,
+    /// Private SQL attachment intent; native publication validates routine refs.
+    trigger: calls.RelationTriggerMutation,
     description: calls.RelationDescriptionMutation,
     pub fn guard(self: @This()) domain.RelationMutationGuard {
         return switch (self) {
@@ -32,7 +34,7 @@ pub const Intent = union(enum) {
         };
     }
     pub fn action(self: @This()) domain.Action {
-        return if (self == .schema) .alter else .comment;
+        return if (self == .schema or self == .trigger) .alter else .comment;
     }
     pub fn digest(self: @This()) ![32]u8 {
         return catalog.canonicalDigest("antfly:sql-relation-intent:v1", self);
@@ -44,9 +46,25 @@ pub const Intent = union(enum) {
     }
 };
 pub const Prepared = struct {
+    pub const Definition = struct {
+        guard: domain.RelationMutationGuard,
+        expected: [32]u8,
+        table: tables.TableRecord,
+        policy_pair: ?local.system_catalog_policies.SchemaPair = null,
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            try writer.beginObject();
+            inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+                if (!(comptime std.mem.eql(u8, field, "policy_pair")) or self.policy_pair != null) {
+                    try writer.objectField(field);
+                    try writer.write(@field(self, field));
+                }
+            }
+            try writer.endObject();
+        }
+    };
     intent_digest: [32]u8,
     change: union(enum) {
-        definition: struct { guard: domain.RelationMutationGuard, expected: [32]u8, table: tables.TableRecord },
+        definition: Definition,
         description: struct { guard: domain.RelationMutationGuard, expected: [32]u8, value: []const u8 },
         column: contract.ColumnDescriptionCommand,
         object: contract.ObjectDescriptionCommand,
@@ -63,7 +81,7 @@ pub const Prepared = struct {
     pub fn matches(self: @This(), intent: Intent) !bool {
         if (!std.mem.eql(u8, &self.intent_digest, &try intent.digest()) or
             !std.mem.eql(u8, &try catalog.canonicalDigest("antfly:sql-relation-guard:v1", self.guard()), &try catalog.canonicalDigest("antfly:sql-relation-guard:v1", intent.guard()))) return false;
-        if (intent == .schema) return self.change == .definition;
+        if (intent == .schema or intent == .trigger) return self.change == .definition;
         const request = intent.description;
         if (request.object) |key| return self.change == .object and self.change.object.request.key.eql(key) and std.mem.eql(u8, self.change.object.description orelse "", request.description);
         if (request.column) |name| return self.change == .column and std.mem.eql(u8, self.change.column.column.name, name) and std.mem.eql(u8, self.change.column.column.value orelse "", request.description);
@@ -79,6 +97,11 @@ pub const Prepared = struct {
                     else => return error.InvalidCatalogMutation,
                 }
                 if (value.table.table_id != value.guard.owner.table_id or std.mem.allEqual(u8, &value.expected, 0)) return error.InvalidCatalogMutation;
+                if (value.policy_pair) |pair| {
+                    if (value.table.sql_persistence != null or !std.mem.eql(u8, value.table.schema_json, pair.after_schema_json) or
+                        !std.mem.eql(u8, value.table.read_schema_json, pair.before_schema_json) or pair.before_policy_generation == 0 or pair.before_catalog_epoch == 0)
+                        return error.InvalidCatalogMutation;
+                }
             },
             .description => |value| {
                 try (calls.RelationDescriptionMutation{ .guard = value.guard, .description = value.value }).validate();
@@ -125,12 +148,16 @@ pub fn prepare(a: A, store: anytype, group: u64, input: catalog.Preparation) ![]
         const before = (try store.getTable(scratch, group, guard.owner.table_id)) orelse return error.CatalogGenerationChanged;
         if (try @import("../api/tables.zig").schemaVersion(before.schema_json) != guard.owner.schema_version) return error.CatalogGenerationChanged;
         if (intent == .description) break :change .{ .description = .{ .guard = guard, .expected = try tableDigest(before), .value = intent.description.description } };
-        var after = try @import("../api/tables.zig").applySchemaMutationRecord(scratch, &before, .replace, intent.schema.schema_json);
+        var after = if (intent == .trigger)
+            try @import("../metadata/trigger_ddl.zig").prepare(scratch, store, group, intent.trigger, before)
+        else
+            try @import("../api/tables.zig").applySqlSchemaMutationRecord(scratch, &before, intent.schema.schema_json);
         const names = local.system_catalog_relation_names.native_indexes;
         if (after.sql_native_indexes_json.len != 0) after.sql_native_indexes_json = try names.prune(scratch, after.sql_native_indexes_json, after.indexes_json);
         try @import("../api/indexes.zig").validateArtifactEnrichmentsForTableIndexesJson(scratch, after.indexes_json);
         try local.inference_managed_embedder.validateEmbeddingProducerOwnershipJson(scratch, after.indexes_json);
-        break :change .{ .definition = .{ .guard = guard, .expected = try tableDigest(before), .table = after } };
+        const policy_pair = if (intent == .trigger) try store.prepareTriggerPolicySchema(scratch, group, before, &after) else null;
+        break :change .{ .definition = .{ .guard = guard, .expected = try tableDigest(before), .table = after, .policy_pair = policy_pair } };
     } };
     try prepared.validate();
     const cut = try store.systemCatalogAdmission(scratch, group, label);

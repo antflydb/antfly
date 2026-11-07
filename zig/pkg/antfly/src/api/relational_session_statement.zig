@@ -21,6 +21,18 @@ const integrity = @import("antfly_local_sources").api_relational_integrity_commi
 const contract = @import("antfly_local_sources").api_distributed_txn_contract;
 const types = @import("antfly_local_sources").storage_db_types;
 
+/// Statement-only trigger effects have no row key to create a table entry.
+/// Retain their exact server-resolved physical binding in the same durable
+/// session candidate; the coordinator later enlists one native owner.
+pub fn enlistStatementTables(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionCommitRequest, tables: []const contract.TableCommitRequest) !void {
+    for (tables) |table| {
+        var entry = [_]sessions.TableCommitRequest{.{ .table_name = @constCast(table.table_name), .schema_version = table.schema_version, .relational_schema_version = table.relational_schema_version }};
+        var bindings = [_]sessions.CatalogBinding{.{ .logical = table.table_name, .physical = table.table_name, .sql_persistence = table.sql_persistence }};
+        const header: sessions.OwnedTransactionCommitRequest = .{ .tables = &entry, .catalog_bindings = .{ .items = &bindings, .capacity = bindings.len, .pointer_stability = .{} } };
+        try candidate.mergeFrom(alloc, &header);
+    }
+}
+
 /// Retroactive timing validation observes existing staged rows; it does not
 /// normalize or replace them. Its result can borrow candidate row storage.
 /// Retain only physical observations so validation neither recopies the batch
@@ -38,6 +50,14 @@ pub fn retainObservations(alloc: std.mem.Allocator, candidate: *sessions.OwnedTr
 pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionCommitRequest, updates: []const contract.TableCommitRequest) !void {
     for (updates) |update| {
         if (update.writes.len == 0 and update.deletes.len == 0 and update.predicates.len == 0) continue;
+        const label = candidate.logicalName(update.table_name);
+        // Preparation may project row effects without repeating the immutable
+        // descriptor already authenticated and bound on this candidate.
+        const persistence = for (candidate.catalog_bindings.items) |binding| {
+            if (std.mem.eql(u8, binding.logical, label)) break binding.sql_persistence;
+        } else update.sql_persistence;
+        if (update.sql_persistence != null and !std.meta.eql(update.sql_persistence, persistence)) return error.CatalogGenerationChanged;
+        try candidate.bindWithPersistence(alloc, label, update.table_name, persistence);
         for (candidate.tables) |*table| if (std.mem.eql(u8, candidate.physicalName(table.table_name), update.table_name)) {
             var writes: std.ArrayList(types.BatchWrite) = .empty;
             defer writes.deinit(alloc);
@@ -72,10 +92,6 @@ pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionComm
         const writes = try alloc.alloc(types.BatchWrite, update.writes.len);
         defer alloc.free(writes);
         for (writes, update.writes) |*out, input| out.* = .{ .key = input.key, .value = input.value, .json_null_fields = input.json_null_fields };
-        const label = candidate.logicalName(update.table_name);
-        // New cascade participants also receive a server-authored binding;
-        // never reinterpret their physical identity as a public table name.
-        try candidate.bind(alloc, label, update.table_name);
         // These are observations of the live rows used to derive the staged
         // result, not observations of the staged result itself. Keep them even
         // for read-only dependencies and across subsequent statements.
@@ -90,7 +106,7 @@ pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionComm
             .batch = .{ .writes = writes, .deletes = @constCast(update.deletes) },
             .predicates = .{ .items = @constCast(update.predicates), .capacity = update.predicates.len, .pointer_stability = .{} },
         }};
-        var binding = [_]sessions.CatalogBinding{.{ .logical = label, .physical = update.table_name }};
+        var binding = [_]sessions.CatalogBinding{.{ .logical = label, .physical = update.table_name, .sql_persistence = persistence }};
         const request: sessions.OwnedTransactionCommitRequest = .{ .tables = &entry, .catalog_bindings = .{ .items = &binding, .capacity = binding.len, .pointer_stability = .{} } };
         try candidate.mergeFrom(alloc, &request);
     }
@@ -126,7 +142,7 @@ pub fn validateWithEvents(server: anytype, alloc: std.mem.Allocator, previous: ?
         // This is read-only preparation of an unpublished session candidate,
         // not a retry of staging or commit. Share REST's bounded authoritative
         // refresh when a data-node metadata cache trails a completed DDL.
-        if (err != error.PreparedGenerationChanged) return err;
+        if (err != error.PreparedGenerationChanged or context.table_triggers != null) return err;
         const authoritative = try server.authoritativeIntegritySnapshot(context);
         server.source.freeAdminSnapshot(&snapshot);
         snapshot = authoritative;
@@ -230,4 +246,57 @@ test "SQL privileges integrity normalization preserves admitted intent and disco
     try std.testing.expectEqual(Access.bit(.insert), candidate.tables[0].sql_authorization.?.required);
     try std.testing.expect(!candidate.tables[0].sql_authorization.?.native_write);
     try std.testing.expect(candidate.tables[1].sql_authorization == null);
+}
+
+test "SQL relation lifetime statement normalization and savepoint observations preserve native binding and reject image substitution" {
+    const a = std.testing.allocator;
+    const P = @import("antfly_local_sources").common_topology_records.RelationPersistence;
+    var candidate = try sessions.parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{\"id\":1}}}}}");
+    defer candidate.deinit(a);
+    const p: P.Descriptor = .{ .kind = .unlogged, .owner_node_id = 7, .owner_store_id = 8, .generation_instance = @splat(9), .data_generation = 10 };
+    try candidate.bindWithPersistence(a, "docs", "table:17", p);
+    var saved = try candidate.clone(a);
+    defer saved.deinit(a);
+    // The real preparation output may omit a repeated descriptor; the
+    // authenticated candidate binding remains the identity of these effects.
+    try apply(a, &candidate, &.{.{ .table_name = "table:17", .writes = &.{.{ .key = "a", .value = "{\"id\":2}" }} }});
+    try std.testing.expectEqualStrings("{\"id\":2}", candidate.tables[0].batch.writes[0].value);
+    const ranges = @import("antfly_local_sources").api_range_read_guards;
+    const observation: ranges.OwnerRangeProof = .{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 17, .topology_epoch = 3, .route = .{ .group_id = 18, .range_id = 19, .identity_namespace = .{ .table_id = 17, .shard_id = 18, .range_id = 19 }, .execution = .{ .native_local = p } }, .native_participant = .{ .physical_root_incarnation = 20, .table_id = 17, .shard_id = 18, .range_id = 19, .data_generation = p.data_generation } }, .proofs = &.{.{ .bucket = 1, .generation = 2 }} };
+    try candidate.tables[0].mergeRangeGuards(a, &.{observation});
+    try saved.retainRangeGuards(a, &candidate);
+    try std.testing.expectEqualStrings("{\"id\":1}", saved.tables[0].batch.writes[0].value);
+    try std.testing.expectEqual(@as(usize, 1), saved.tables[0].range_guards.?.value.len);
+    var cloned = try saved.clone(a);
+    defer cloned.deinit(a);
+    const view = try cloned.distributedTables(a);
+    defer view.deinit();
+    try std.testing.expect(view.tables[0].sql_persistence.?.eql(p));
+    try std.testing.expect(view.tables[0].range_guards[0].fence.route.execution.native_local.eql(p));
+    var changed = p;
+    changed.data_generation += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, apply(a, &candidate, &.{.{ .table_name = "table:17", .sql_persistence = changed, .writes = &.{.{ .key = "a", .value = "{\"id\":99}" }} }}));
+    try std.testing.expectEqualStrings("{\"id\":2}", candidate.tables[0].batch.writes[0].value);
+    var substituted = try candidate.clone(a);
+    defer substituted.deinit(a);
+    substituted.catalog_bindings.items[0].sql_persistence = changed;
+    try std.testing.expectError(error.CatalogGenerationChanged, saved.retainRangeGuards(a, &substituted));
+    try std.testing.expect(saved.catalog_bindings.items[0].sql_persistence.?.eql(p));
+    // Physical participants coalesce across logical aliases, including a
+    // rename after a savepoint. A new spelling cannot replace their image.
+    try saved.bindWithPersistence(a, "renamed", "table:17", p);
+    const binding_count = saved.catalog_bindings.items.len;
+    try std.testing.expectError(error.CatalogGenerationChanged, saved.bindWithPersistence(a, "foreign", "table:17", changed));
+    try std.testing.expectEqual(binding_count, saved.catalog_bindings.items.len);
+    var renamed = try sessions.parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"renamed-after-savepoint\":{}}}");
+    defer renamed.deinit(a);
+    try renamed.bindWithPersistence(a, "renamed-after-savepoint", "table:17", changed);
+    var changed_observation = observation;
+    changed_observation.fence.route.execution.native_local = changed;
+    changed_observation.fence.native_participant.?.data_generation = changed.data_generation;
+    try renamed.tables[0].mergeRangeGuards(a, &.{changed_observation});
+    try std.testing.expectError(error.CatalogGenerationChanged, saved.retainRangeGuards(a, &renamed));
+    try std.testing.expectEqual(binding_count, saved.catalog_bindings.items.len);
+    try std.testing.expectEqualStrings("{\"id\":1}", saved.tables[0].batch.writes[0].value);
+    try std.testing.expectError(error.CatalogGenerationChanged, candidate.bind(a, "docs", "table:17"));
 }

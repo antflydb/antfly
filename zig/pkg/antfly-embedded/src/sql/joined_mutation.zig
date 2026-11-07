@@ -136,6 +136,7 @@ pub const Bound = struct {
     returning_scope: []const @import("relation_binding.zig").Column = &.{},
     returning_sources: []const usize = &.{},
     target_qualifier: []const u8 = "",
+    trigger_old_offset: ?usize = null,
 };
 
 fn column(alloc: Allocator, qualifier: []const u8, name: []const u8) !*const ast.Scalar {
@@ -172,7 +173,9 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
     var preserve: std.ArrayList(bool) = .empty;
     var default_paths: std.ArrayList([]const u8) = .empty;
     const update_fields = if (root_assignment) try alloc.dupe(catalog.Column, &.{try table.column("_doc")}) else table.columns;
-    for (update_fields) |field| {
+    for (update_fields) |declared_field| {
+        var field = declared_field;
+        if (table.has_triggers) field.nullable = true;
         if (deleting and returning == null) continue;
         if (!deleting and field.generated) continue;
         var expression: ?*const ast.Scalar = null;
@@ -342,7 +345,20 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
             input.parameter_types = parameters;
         }
     }
-    return .{ .input = input, .query = query, .fields = fields.items, .preserve = preserve.items, .default_paths = default_paths.items, .deleting = deleting, .returning = returning, .returning_plan = returning_plan, .returning_binding = returning_binding, .returning_query = returning_query, .returning_scope = scope, .returning_sources = captured.items, .target_qualifier = alias };
+    const trigger_old_offset: ?usize = if (table.has_triggers) old: {
+        const offset = projections.items.len;
+        for (table.columns) |field| try projections.append(alloc, .{ .expression = try column(alloc, alias, field.name) });
+        query.columns = projections.items;
+        if (deleting and captured.items.len == 0) {
+            const keys = try alloc.alloc(*const ast.Scalar, projections.items.len);
+            for (projections.items, keys) |projection, *key| key.* = projection.expression.?;
+            query.group_by = keys;
+        }
+        const expanded: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = query }, .parameter_count = compiled.parameter_count };
+        input.* = try describe.bind(alloc, adapter.iface(), &expanded, parameters);
+        break :old offset;
+    } else null;
+    return .{ .trigger_old_offset = trigger_old_offset, .input = input, .query = query, .fields = fields.items, .preserve = preserve.items, .default_paths = default_paths.items, .deleting = deleting, .returning = returning, .returning_plan = returning_plan, .returning_binding = returning_binding, .returning_query = returning_query, .returning_scope = scope, .returning_sources = captured.items, .target_qualifier = alias };
 }
 
 fn equalityConjuncts(alloc: Allocator, expression: *const ast.Scalar) anyerror!?*const ast.Scalar {
@@ -452,14 +468,16 @@ const Collector = struct {
                 if (declared) |field| if (field.type == .json and member.value_ptr.* == .null) try json_null_fields.append(context.arena, field.path);
             }
         }
-        const previous = if (bound.deleting and bound.returning != null) blk: {
+        const previous = if (table.has_triggers or (bound.deleting and bound.returning != null)) blk: {
             const old = try context.arena.create(catalog.Row);
-            old.* = try catalog.Row.fromDatums(context.arena, key, old_layout.?, values[5..][0..bound.fields.len]);
+            const old_fields = if (table.has_triggers) table.columns else bound.fields;
+            const old_offset = bound.trigger_old_offset orelse 5;
+            old.* = try catalog.Row.fromDatums(context.arena, key, old_layout.?, values[old_offset..][0..old_fields.len]);
             old.version = version;
             old.expected_content_digest = digest;
             if (!values[3].sql_null) old.document = try runtime.clone(context.arena, values[3].value);
-            const presence = try context.arena.alloc(bool, bound.fields.len);
-            for (bound.fields, presence) |field, *flag| flag.* = present.contains(field.name);
+            const presence = try context.arena.alloc(bool, old_fields.len);
+            for (old_fields, presence) |field, *flag| flag.* = present.contains(field.name);
             old.typed_cells.?.presence = presence;
             break :blk old;
         } else null;
@@ -475,8 +493,8 @@ const Collector = struct {
             if (field.type == .json and !datum.sql_null and datum.value == .null) try json_null_fields.append(context.arena, field.path);
         };
         try mutations.append(context.alloc, .{ .key = key, .expected_version = version, .expected_content_digest = digest, .row = if (bound.deleting) null else .{ .object = object }, .json_null_fields = json_null_fields.items, .previous = previous, .domain_admission = self.domain_admission });
-        self.last_source = values[5 + bound.fields.len ..];
-        if (self.sources) |capture| try Capture.append(capture, values[5 + bound.fields.len ..]);
+        self.last_source = values[5 + bound.fields.len ..][0..bound.returning_sources.len];
+        if (self.sources) |capture| try Capture.append(capture, values[5 + bound.fields.len ..][0..bound.returning_sources.len]);
     }
 };
 
@@ -494,9 +512,10 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
     defer visited.deinit(execution.alloc);
     const target = execution.binding.table.?;
     var previous_layout: ?*const catalog.Row.TypedLayout = null;
-    if (definition_.deleting and definition_.returning != null) {
-        const names = try execution.arena.alloc([]const u8, definition_.fields.len);
-        for (definition_.fields, names) |field, *name| name.* = field.path;
+    if (target.has_triggers or (definition_.deleting and definition_.returning != null)) {
+        const old_fields = if (target.has_triggers) target.columns else definition_.fields;
+        const names = try execution.arena.alloc([]const u8, old_fields.len);
+        for (old_fields, names) |field, *name| name.* = field.path;
         previous_layout = try catalog.Row.TypedLayout.init(execution.arena, names);
     }
     const sources = if (definition_.returning_sources.len == 0) null else if (execution.spill) |manager| try Capture.create(execution.alloc, manager, definition_.returning_sources.len) else try Capture.createMemory(execution.alloc, definition_.returning_sources.len, execution.limits.retained_bytes / 2);
@@ -714,9 +733,10 @@ pub const Stream = struct {
         read.binding = bound.input.*;
         self.input = try @import("mutation_input.zig").Input.init(read, a);
         const target = context.binding.table.?;
-        const old_layout = if (bound.deleting and bound.returning != null) layout: {
-            const fields = try a.alloc([]const u8, bound.fields.len);
-            for (bound.fields, fields) |field, *name| name.* = field.path;
+        const old_layout = if (target.has_triggers or (bound.deleting and bound.returning != null)) layout: {
+            const old_fields = if (target.has_triggers) target.columns else bound.fields;
+            const fields = try a.alloc([]const u8, old_fields.len);
+            for (old_fields, fields) |field, *name| name.* = field.path;
             break :layout try catalog.Row.TypedLayout.init(a, fields);
         } else null;
         const provenance = try @import("domain_mutation.zig").Builder.init(a, target, true);

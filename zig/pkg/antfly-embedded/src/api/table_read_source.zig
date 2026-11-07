@@ -168,6 +168,7 @@ pub const RelationalStatementSnapshot = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: Abi.Dispatch = Abi.local_dispatch,
+    pub const GraphRead = @import("../storage/statement_read_fence.zig").GraphRead;
     pub const GuardedRead = struct {
         view: RelationalReadView,
         /// Issued by the authenticated routed owner for this exact delayed
@@ -182,6 +183,10 @@ pub const RelationalStatementSnapshot = struct {
         /// owner-local snapshot without a route-fenced commit proof is useful
         /// for read-only scans but is NOT a serializable SQL read set.
         open_guarded: ?*const fn (*anyopaque, std.mem.Allocator, RelationalStatementScan) anyerror!GuardedRead = null,
+        /// Adjacency must come from the same retained owner cut as row reads.
+        /// Group zero resolves the source key against the captured topology;
+        /// it never acquires a replacement storage snapshot.
+        graph_page: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, u64, GraphRead.Request) anyerror!GraphRead.Page = null,
         close: *const fn (*anyopaque) void,
     };
     const Abi = @import("../runtime_callback_abi.zig").Boundary(VTable);
@@ -204,6 +209,15 @@ pub const RelationalStatementSnapshot = struct {
         const callback = self.vtable.renew orelse return;
         return Abi.call("renew", self.boundary_dispatch, callback, .{ self.ptr, deadline_ns });
     }
+    pub fn graphPage(self: @This(), alloc: std.mem.Allocator, table: []const u8, group_id: u64, request: GraphRead.Request) !GraphRead.Page {
+        try request.check();
+        const callback = self.vtable.graph_page orelse return error.SqlStatementSnapshotRequired;
+        var page = try Abi.call("graph_page", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, group_id, request });
+        errdefer page.deinit(alloc);
+        try page.proof.validate();
+        try request.check();
+        return page;
+    }
     pub fn deinit(self: @This()) void {
         Abi.call("close", self.boundary_dispatch, self.vtable.close, .{self.ptr}) catch unreachable;
     }
@@ -212,9 +226,13 @@ pub const RelationalStatementSnapshot = struct {
 /// Complete native table cohort selected before publishing a transaction cut.
 /// Bounds apply to targets and aggregate owners, not to rows in those tables.
 pub const RelationalSnapshotTarget = struct {
+    relation_owner_minter: ?@import("../common/relation_owner_authority.zig").Minter = null,
     table: []const u8,
     schema_version: u32,
     table_id: ?u64 = null,
+    /// Union of graph indexes used by all aliases of this physical table.
+    /// Captured under its row fence before the statement cut is published.
+    graph_indexes: []const []const u8 = &.{},
 };
 
 pub const TableReadSource = struct {

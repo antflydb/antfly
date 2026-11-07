@@ -52,6 +52,11 @@ fn close(self: *DB) engine.Outcome(void) {
     return .{ .value = self.close() };
 }
 
+fn closeFallible(self: *DB) engine.Outcome(void) {
+    self.closeFallible() catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = {} };
+}
+
 fn closeOwned(self: *DB) engine.Outcome(void) {
     return .{ .value = self.closeOwned() };
 }
@@ -190,11 +195,15 @@ fn get(self: *DB, alloc: Allocator, key: []const u8) engine.Outcome(?[]u8) {
 }
 
 fn getDocument(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) engine.Outcome(?types.LookupResult) {
-    return .{ .value = self.getDocument(alloc, key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.getDocument(alloc, key, opts) catch |err| {
+        return .{ .failure = .init(@errorName(err)) };
+    } };
 }
 
 fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) engine.Outcome(?types.LookupResult) {
-    return .{ .value = self.lookup(alloc, key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.lookup(alloc, key, opts) catch |err| {
+        return .{ .failure = .init(@errorName(err)) };
+    } };
 }
 
 fn scan(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) engine.Outcome(types.ScanResult) {
@@ -621,6 +630,13 @@ fn waitForResolvedTransactionSyncTargetWithCancellation(self: *DB, sync_level: t
     return .{ .value = self.waitForResolvedTransactionSyncTargetWithCancellation(sync_level, sequence, phase, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn captureRelationalStatementSnapshotWithGraphs(self: *DB, names: []const []const u8) engine.Outcome(DB.RelationalStatementSnapshot) {
+    return .{ .value = self.captureRelationalStatementSnapshotWithGraphs(names) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn relationalGraphSnapshotPage(self: *DB, cut: *DB.RelationalStatementSnapshot, alloc: Allocator, request: @import("graph_read_snapshot.zig").Request) engine.Outcome(@import("graph_read_snapshot.zig").Page) {
+    return .{ .value = self.relationalGraphSnapshotPage(cut, alloc, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn captureRelationalStatementSnapshot(self: *DB) engine.Outcome(DB.RelationalStatementSnapshot) {
     return .{ .value = self.captureRelationalStatementSnapshot() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -822,6 +838,9 @@ fn catchUpPendingDerivedReplayWithProgress(self: *DB, context: *anyopaque, hook:
 }
 fn relationalSnapshotDeinit(cut: *DB.RelationalStatementSnapshot) engine.Outcome(void) {
     return .{ .value = cut.deinit() };
+}
+fn statementFenceSequence(self: *DB, fence: *const DB.StatementReadFence) engine.Outcome(u64) {
+    return .{ .value = self.statementFenceSequence(fence) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 fn statementFenceRelease(fence: *DB.StatementReadFence) engine.Outcome(void) {
     return .{ .value = fence.release() };
@@ -1103,6 +1122,22 @@ fn markTransactionParticipantsResolved(self: *DB, txn_id: @import("transactions.
     return .{ .value = self.markTransactionParticipantsResolved(txn_id, participants) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn relationPhysicalPin(self: *const DB) engine.Outcome(?@import("../common/relation_persistence.zig").PhysicalPin) {
+    return .{ .value = self.relationPhysicalPin() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn externalTransactionStatus(self: *DB, txn_id: @import("transactions.zig").TxnId, owner: @import("transactions.zig").ExternalDecisionOwner) engine.Outcome(@import("transactions.zig").TxnStatus) {
+    return .{ .value = self.externalTransactionStatus(txn_id, owner) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn externalTransactionRetentionSnapshot(self: *DB, a: Allocator, id: @import("transactions.zig").TxnId, owner: @import("transactions.zig").ExternalDecisionOwner, pin: @import("transactions.zig").NativePhysicalPin) engine.Outcome(@import("transactions.zig").ExternalRetentionSnapshot) {
+    return .{ .value = self.externalTransactionRetentionSnapshot(a, id, owner, pin) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn markExternalTransactionParticipantsResolved(self: *DB, txn_id: @import("transactions.zig").TxnId, participants: []const []const u8, owner: @import("transactions.zig").ExternalDecisionOwner) engine.Outcome(void) {
+    return .{ .value = self.markExternalTransactionParticipantsResolved(txn_id, participants, owner) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn markReplicatedTransactionParticipantResolvedAtOrderedReceipt(self: *DB, txn_id: @import("transactions.zig").TxnId, participant: []const u8, identity: db.OrderedApplyReceipt) engine.Outcome(void) {
     return .{ .value = self.markReplicatedTransactionParticipantResolvedAtOrderedReceipt(txn_id, participant, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -1263,6 +1298,15 @@ fn ensureGeneratedCoverageRecoveryIntents(self: *DB, alloc: std.mem.Allocator) e
     return .{ .value = self.ensureGeneratedCoverageRecoveryIntents(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn beginRawGraphReadLease(self: *DB) engine.Outcome(DB.RawGraphReadLease) {
+    return .{ .value = self.beginRawGraphReadLease() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn rawGraphReadLeaseCheck(lease: *const DB.RawGraphReadLease) engine.Outcome(void) {
+    return .{ .value = lease.check() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn rawGraphReadLeaseRelease(lease: *DB.RawGraphReadLease) engine.Outcome(void) {
+    return .{ .value = lease.release() };
+}
 fn beginQueryReadLease(self: *DB) engine.Outcome(DB.QueryReadLease) {
     return .{ .value = self.beginQueryReadLease() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -1408,6 +1452,13 @@ fn getSplitBootstrapMarker(self: *DB, alloc: std.mem.Allocator) engine.Outcome(?
 
 fn setSplitBootstrapMarker(self: *DB, marker: @import("db/range_state.zig").SplitBootstrapMarker) engine.Outcome(void) {
     return .{ .value = self.setSplitBootstrapMarker(marker) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn inspectUnpublishedNativeImage(alloc: std.mem.Allocator, path: []const u8, runtime: *@import("background_runtime.zig").BackendRuntime, expected: ?@import("../common/relation_persistence.zig").Descriptor, resources: @import("db/config.zig").CoreOpenOptions) engine.Outcome(@import("../common/relation_persistence.zig").UnpublishedImageInspection) {
+    return .{ .value = DB.inspectUnpublishedNativeImage(alloc, path, runtime, expected, resources) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn replaceUnpublishedNativeEmptyImage(alloc: Allocator, path: []const u8, options: db.OpenOptions, bootstrap: @import("db/restore_staging_contract.zig").OwnerBootstrap, attempt_number: u64, attempt_digest: [32]u8, previous_root: u128) engine.Outcome(@import("../common/relation_persistence.zig").NativeBinding) {
+    return .{ .value = DB.replaceUnpublishedNativeEmptyImage(alloc, path, options, bootstrap, attempt_number, attempt_digest, previous_root) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn readRestoreStateForPath(alloc: std.mem.Allocator, path: []const u8) engine.Outcome(?db.RestoreState) {
@@ -1609,7 +1660,9 @@ fn batchReplicatedApply(self: *DB, req: types.BatchRequest) engine.Outcome(void)
 }
 
 fn applyReplicatedRowPolicyPublication(self: *DB, bundle_bytes: []const u8, request: @import("../system_catalog/policies.zig").InstallRequest, identity: db.OrderedApplyReceipt) engine.Outcome(?@import("db/row_policy_bundle.zig").Receipt) {
-    return .{ .value = self.applyReplicatedRowPolicyPublication(bundle_bytes, request, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    return .{ .value = self.applyReplicatedRowPolicyPublication(bundle_bytes, request, identity) catch |err| {
+        return .{ .failure = .init(@errorName(err)) };
+    } };
 }
 
 fn recoverReplicatedRestoreFinish(self: *DB, finish: @FieldType(@import("db/restore_staging_contract.zig").Control, "finish")) engine.Outcome(void) {
@@ -2098,6 +2151,11 @@ const descriptor: engine.Descriptor = .{
     .resource_manager_layout = engine.resource_manager_layout,
     .prepared_owner_layout = engine.prepared_owner_layout,
     .prepared_allocator_layout = engine.prepared_allocator_layout,
+    .checked_native_atomic_layout = engine.checked_native_atomic_layout,
+    .lookup_options_layout = engine.lookup_options_layout,
+    .row_policy_installed_layout = engine.row_policy_installed_layout,
+    .physical_row_layout = engine.physical_row_layout,
+    .external_retention_layout = engine.external_retention_layout,
     .embedding_memo_layout = engine.embedding_memo_layout,
     .async_context_layout = engine.async_context_layout,
     .enrichment_runtime_layout = engine.enrichment_runtime_layout,

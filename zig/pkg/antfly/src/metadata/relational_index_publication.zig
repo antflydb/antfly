@@ -217,7 +217,7 @@ pub const SignedAudit = struct {
         if ((self.proof.authority == .native) != (outcome.binding.authority == .native) or !std.mem.eql(u8, &actual, &self.outcome_digest) or
             self.proof.identity.root_incarnation != outcome.audit.root_incarnation or
             !std.mem.eql(u8, &self.proof.identity.metadata_incarnation, &outcome.expected.metadata_incarnation)) return error.InvalidIndexOwnerReceipt;
-        if (self.proof.authority == .native) try (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(outcome.expected.metadata_incarnation);
+        if (self.proof.authority == .native) try (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native, .native_pin = self.proof.native_pin }).validate(outcome.expected.metadata_incarnation);
         self.proof.verify(actual) catch return error.InvalidIndexOwnerReceipt;
         return actual;
     }
@@ -248,7 +248,7 @@ pub const SignedSourceBatch = struct {
         const batch = if (read.batch) |*value| value else return error.InvalidPrivateIndexClaimReceipt;
         if ((self.proof.authority == .native) != (read.binding.authority == .native) or !std.mem.eql(u8, &try self.binding.encode(), &try read.binding.encode()) or
             !std.mem.eql(u8, &self.header.bytes, &batch.header.bytes)) return error.InvalidPrivateIndexClaimReceipt;
-        if (self.proof.authority == .native) (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
+        if (self.proof.authority == .native) (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native, .native_pin = self.proof.native_pin }).validate(self.proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
         const logical_digest = try read.digest();
         self.proof.verify(logical_digest) catch return error.InvalidPrivateIndexClaimReceipt;
         return logical_digest;
@@ -269,7 +269,7 @@ pub const SignedClaimDelivery = struct {
     pub fn verifyFor(self: SignedClaimDelivery, command: native_control.ClaimCommand) !void {
         try self.outcome.validateFor(command);
         if ((self.proof.authority == .native) != (self.outcome.binding.authority == .native)) return error.InvalidPrivateIndexClaimReceipt;
-        if (self.proof.authority == .native) (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch
+        if (self.proof.authority == .native) (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native, .native_pin = self.proof.native_pin }).validate(self.proof.identity.metadata_incarnation) catch
             return error.InvalidPrivateIndexClaimReceipt;
         self.proof.verify(try self.outcome.deliveryDigest()) catch return error.InvalidPrivateIndexClaimReceipt;
     }
@@ -294,7 +294,7 @@ pub const SignedClaimDelivery = struct {
         if (logical_rows == 0 or logical_rows > local.storage_db_relational_index_owner_job.private_claims.max_claims or
             self.outcome.claims_added > logical_rows or self.outcome.duplicate != (self.outcome.claims_added == 0) or (self.proof.authority == .native) != (self.outcome.binding.authority == .native))
             return error.InvalidPrivateIndexClaimReceipt;
-        if (self.proof.authority == .native) (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
+        if (self.proof.authority == .native) (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native, .native_pin = self.proof.native_pin }).validate(self.proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
         _ = try self.outcome.deliveryDigest();
     }
 };
@@ -324,6 +324,10 @@ pub const SignedReceipt = struct {
             .raft => progress.Authority.raft,
             .native => progress.Authority.native,
         }) return error.InvalidIndexOwnerReceipt;
+        if (self.proof.native_pin) |pin| {
+            const namespace = self.receipt.owner.namespace;
+            if (pin.table_id != namespace.table_id or pin.shard_id != namespace.shard_id or pin.range_id != namespace.range_id) return error.InvalidIndexOwnerReceipt;
+        }
         switch (self.proof.authority) {
             .raft => |replica| if (replica == 0) return error.InvalidIndexOwnerReceipt,
             .native => |binding| if (std.mem.allEqual(u8, &binding, 0)) return error.InvalidIndexOwnerReceipt,
@@ -338,7 +342,31 @@ pub const SignedReceipt = struct {
 
     /// Canonical physical representation, not an ownership grant. Admission
     /// verifies the signature/current root before staging this fixed record.
+    pub const pinned_encoded_len = encoded_len + 48;
+    pub const Encoded = struct {
+        bytes: [pinned_encoded_len]u8,
+        len: usize,
+        pub fn slice(self: *const @This()) []const u8 {
+            return self.bytes[0..self.len];
+        }
+    };
     pub fn encode(self: SignedReceipt) ![encoded_len]u8 {
+        if (self.proof.native_pin != null) return error.InvalidIndexOwnerReceipt;
+        return self.encodeFixed();
+    }
+    pub fn encodeDurable(self: SignedReceipt) !Encoded {
+        const fixed = try self.encodeFixed();
+        var result: Encoded = .{ .bytes = undefined, .len = encoded_len };
+        @memcpy(result.bytes[0..encoded_len], &fixed);
+        if (self.proof.native_pin) |pin| {
+            result.len = pinned_encoded_len;
+            result.bytes[4] = 2;
+            @memcpy(result.bytes[480..528], &try pin.encode());
+            @memcpy(result.bytes[528..560], &digest(result.bytes[0..528]));
+        }
+        return result;
+    }
+    fn encodeFixed(self: SignedReceipt) ![encoded_len]u8 {
         try self.validateShape();
         var bytes: [encoded_len]u8 = @splat(0);
         @memcpy(bytes[0..4], "AIPR");
@@ -373,6 +401,20 @@ pub const SignedReceipt = struct {
     }
 
     pub fn decode(bytes: []const u8) !SignedReceipt {
+        if (bytes.len == pinned_encoded_len) {
+            if (!std.mem.eql(u8, bytes[0..4], "AIPR") or bytes[4] != 2 or !std.mem.eql(u8, &digest(bytes[0..528]), bytes[528..560])) return error.InvalidCatalogRecord;
+            var legacy: [encoded_len]u8 = undefined;
+            @memcpy(legacy[0..480], bytes[0..480]);
+            legacy[4] = 1;
+            @memcpy(legacy[480..512], &digest(legacy[0..480]));
+            var value = try decodeFixed(&legacy, false);
+            value.proof.native_pin = @import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin.decode(bytes[480..528]) catch return error.InvalidCatalogRecord;
+            value.verifySignature() catch return error.InvalidCatalogRecord;
+            return value;
+        }
+        return decodeFixed(bytes, true);
+    }
+    fn decodeFixed(bytes: []const u8, verify: bool) !SignedReceipt {
         if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIPR") or bytes[4] != 1 or bytes[7] != 0 or
             !std.mem.allEqual(u8, bytes[58..64], 0) or !std.mem.allEqual(u8, bytes[161..168], 0) or
             !std.mem.allEqual(u8, bytes[369..376], 0) or !std.mem.eql(u8, &digest(bytes[0..480]), bytes[480..512])) return error.InvalidCatalogRecord;
@@ -406,7 +448,7 @@ pub const SignedReceipt = struct {
                 .signature = bytes[416..480].*,
             },
         };
-        value.verifySignature() catch return error.InvalidCatalogRecord;
+        if (verify) value.verifySignature() catch return error.InvalidCatalogRecord;
         return value;
     }
 };
@@ -567,28 +609,30 @@ pub const StoredProof = struct {
     }
     fn encodeCanonical(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness, terminal: ?TerminalWitness) !StoredProof {
         var result: @This() = .{ .bytes = undefined, .len = 0 };
-        const fixed = try signed.encode();
+        const fixed = try signed.encodeDurable();
         if (validation != null or installation != null or cancellation != null or terminal != null) {
             @memcpy(result.bytes[0..8], magic);
-            @memcpy(result.bytes[8..][0..SignedReceipt.encoded_len], &fixed);
-            var writer = std.Io.Writer.fixed(result.bytes[8 + SignedReceipt.encoded_len ..]);
+            @memcpy(result.bytes[8..][0..fixed.len], fixed.slice());
+            var writer = std.Io.Writer.fixed(result.bytes[8 + fixed.len ..]);
             std.json.Stringify.value(Witnesses{ .validation = validation, .installation = installation, .cancellation = cancellation, .terminal = terminal }, .{}, &writer) catch return error.InvalidIndexOwnerReceipt;
-            result.len = 8 + SignedReceipt.encoded_len + writer.end;
+            result.len = 8 + fixed.len + writer.end;
         } else {
-            @memcpy(result.bytes[0..SignedReceipt.encoded_len], &fixed);
+            @memcpy(result.bytes[0..fixed.len], fixed.slice());
             result.len = fixed.len;
         }
         return result;
     }
     pub fn decode(alloc: Allocator, raw: []const u8) !Decoded {
-        if (raw.len == SignedReceipt.encoded_len) {
+        if ((raw.len == SignedReceipt.encoded_len or raw.len == SignedReceipt.pinned_encoded_len) and std.mem.eql(u8, raw[0..4], "AIPR")) {
             const signed = try SignedReceipt.decode(raw);
             requireWitnesses(signed, null, null, null, null) catch return error.InvalidCatalogRecord;
             return .{ .signed = signed, .validation = null };
         }
         if (raw.len <= 8 + SignedReceipt.encoded_len or raw.len > max_ack_bytes or !std.mem.eql(u8, raw[0..8], magic)) return error.InvalidCatalogRecord;
-        const signed = try SignedReceipt.decode(raw[8..][0..SignedReceipt.encoded_len]);
-        var parsed = std.json.parseFromSlice(Witnesses, alloc, raw[8 + SignedReceipt.encoded_len ..], .{ .ignore_unknown_fields = false, .max_value_len = 128 }) catch |err| switch (err) {
+        const receipt_len: usize = if (raw[12] == 2) SignedReceipt.pinned_encoded_len else SignedReceipt.encoded_len;
+        if (raw.len <= 8 + receipt_len) return error.InvalidCatalogRecord;
+        const signed = try SignedReceipt.decode(raw[8..][0..receipt_len]);
+        var parsed = std.json.parseFromSlice(Witnesses, alloc, raw[8 + receipt_len ..], .{ .ignore_unknown_fields = false, .max_value_len = 128 }) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidCatalogRecord,
         };
@@ -3163,6 +3207,37 @@ test "relational index publication signatures bind owner authority position and 
         const encoded = try signed.encode();
         try std.testing.expectEqual(@as(usize, 512), encoded.len);
         try std.testing.expectEqualDeep(signed, try SignedReceipt.decode(&encoded));
+        if (authority == .native) {
+            const pin: local.common_topology_records.RelationPersistence.PhysicalPin = .{ .physical_root_incarnation = std.math.maxInt(u128) - 1, .table_id = namespace.table_id, .shard_id = namespace.shard_id, .range_id = namespace.range_id, .data_generation = 9 };
+            var pinned = signed;
+            pinned.proof.native_pin = pin;
+            pinned.proof.authority = .{ .native = try @import("sql_relation_attestation.zig").nativeAuthorityDigest(pinned.proof.identity, pin) };
+            pinned.proof = try pinned.proof.sign(root, try receipt.digest());
+            try pinned.verifySignature();
+            const durable = try pinned.encodeDurable();
+            try std.testing.expectEqual(@as(usize, SignedReceipt.pinned_encoded_len), durable.len);
+            try std.testing.expectEqualDeep(pinned, try SignedReceipt.decode(durable.slice()));
+            const stored = try StoredProof.encode(pinned, null, null, null, null);
+            try std.testing.expectEqualDeep(pinned, (try StoredProof.decode(std.testing.allocator, stored.slice())).signed);
+            var stripped = pinned;
+            stripped.proof.native_pin = null;
+            try std.testing.expectError(error.InvalidIndexOwnerReceipt, stripped.verifySignature());
+            var replaced = durable;
+            replaced.bytes[480] ^= 1;
+            @memcpy(replaced.bytes[528..560], &digest(replaced.bytes[0..528]));
+            try std.testing.expectError(error.InvalidCatalogRecord, SignedReceipt.decode(replaced.slice()));
+            try std.testing.expectError(error.InvalidIndexOwnerReceipt, pinned.encode());
+            const legacy_wire = try std.json.Stringify.valueAlloc(std.testing.allocator, signed.proof, .{});
+            defer std.testing.allocator.free(legacy_wire);
+            try std.testing.expect(std.mem.indexOf(u8, legacy_wire, "native_pin") == null);
+            const wire = try std.json.Stringify.valueAlloc(std.testing.allocator, pinned.proof, .{});
+            defer std.testing.allocator.free(wire);
+            var parsed = try std.json.parseFromSlice(RootProof, std.testing.allocator, wire, .{});
+            defer parsed.deinit();
+            try parsed.value.verify(try receipt.digest());
+            try std.testing.expectEqualDeep(pinned.proof, parsed.value);
+        }
+
         for (0..encoded.len) |offset| {
             var damaged = encoded;
             damaged[offset] ^= 1;

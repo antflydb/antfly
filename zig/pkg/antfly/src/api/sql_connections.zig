@@ -472,8 +472,9 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
             break :blk 0;
         },
         .terminal => |binding| blk: {
-            if ((next.state != .active and next.state != .uncertain) or
-                !std.mem.eql(u8, &next.active_txn.?, &binding.txn_id)) return error.SqlConnectionBusy;
+            const already_detached = next.state == .idle and next.active_txn == null;
+            if (!already_detached and ((next.state != .active and next.state != .uncertain) or
+                !std.mem.eql(u8, &next.active_txn.?, &binding.txn_id))) return error.SqlConnectionBusy;
             var session = (try store.loadSessionTxn(txn, binding.txn_id)) orelse return error.SqlTransactionOutcomeUnknown;
             defer session.deinit(alloc);
             if (session.connection_id == null or !std.mem.eql(u8, &session.connection_id.?, &id) or
@@ -481,6 +482,10 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
                 return error.SqlTransactionOutcomeUnknown;
             if (session.terminal_commit == null and !session.external_preparation_prepared and !session.terminal_abort) return error.SqlTransactionOutcomeUnknown;
             if (session.terminal_commit != null and session.terminal_abort) return error.InvalidTransactionSessionRecord;
+            // A lost detach reply may arrive after another idle setting update.
+            // Only this exact retained terminal session proves the no-op; never
+            // restore its old overlay or advance the connection revision again.
+            if (already_detached) break :blk 0;
             next.state = .idle;
             next.active_txn = null;
             if (next.revision == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
@@ -838,4 +843,117 @@ test "pgwire notifications renew only the live socket epoch without changing SQL
     try std.testing.expectEqual(@as(u64, 1), current.value.generation);
     try keepWireAlive(&store, a, id, "alice", 7, epoch, current.value.expires_at_ms + 1);
     try std.testing.expectError(error.SqlConnectionNotFound, keepWireAlive(&store, a, id, "bob", 7, epoch, record.ttl_ms));
+}
+
+test "HTTP connection publishes terminal detachment once across lost replies and cold replay without releasing a successor" {
+    const a = std.testing.allocator;
+    const Native = @import("antfly_local_sources").storage_docstore.DocStore;
+    const Helper = struct {
+        fn bytes(native: *Native, alloc: std.mem.Allocator, id: [32]u8) ![]u8 {
+            var read = try native.beginReadTxn();
+            defer read.abort();
+            return alloc.dupe(u8, try read.get(&try record.key(&id)));
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ true, false }) |aborted| {
+        const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/terminal-detach-{any}", .{ tmp.sub_path, aborted }, 0);
+        defer a.free(path);
+        var primary = try Native.open(a, path.ptr, .{});
+        var live = true;
+        defer if (live) primary.close();
+        var store = transactions.DurableSessionStore.init(a, &primary);
+        defer store.deinitVolatilePayloads();
+        const connection: [32]u8 = @splat('a');
+        const id: [16]u8 = @splat(31);
+        const terminal: Action = .{ .terminal = .{ .id = connection, .txn_id = id } };
+        _ = try mutate(&store, .{ .create = .{ .id = connection, .principal = "alice", .owner_node_id = 7, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", 7, 1);
+        const initial = [_]settings.OverlayEntry{.{ .identity = .{ .id = 17, .generation = 1 }, .value = .{ .integer = 10 } }};
+        _ = try mutate(&store, .{ .overlay = .{ .id = connection, .expected_revision = 1, .entries = &initial } }, "alice", 7, 2);
+        _ = try mutate(&store, .{ .begin = .{ .id = connection, .expected_revision = 2, .txn_id = id } }, "alice", 7, 2);
+        _ = try mutate(&store, .{ .bind = .{ .id = connection, .txn_id = id } }, "alice", 7, 2);
+        var session: transactions.Session = .{
+            .txn_id = id,
+            .owner_node_id = 7,
+            .principal = try a.dupe(u8, "alice"),
+            .connection_id = connection,
+            .begin_timestamp = 1,
+            .last_touched_timestamp = 1,
+            .sync_level = .propose,
+            .commit_body_digest = @splat(4),
+            .commit_execution_started = true,
+            .sql = .{ .database = try a.dupe(u8, "main"), .namespace = try a.dupe(u8, "public"), .isolation = .read_committed, .mode = .read_write },
+        };
+        defer session.deinit(a);
+        try session.setting_committed.append(a, .{ .identity = .{ .id = 17, .generation = 1 }, .value = .{ .integer = 5 } });
+        try store.save(session, null);
+        try std.testing.expectError(error.SqlTransactionOutcomeUnknown, mutate(&store, terminal, "alice", 7, 2));
+        {
+            var registry = transactions.SessionRegistry.init(&store);
+            defer registry.deinit(a);
+            if (aborted) _ = (try registry.recordTerminalAbort(a, id)).? else _ = (try registry.recordTerminalCommit(a, id, .committed, null, null)).?;
+        }
+        const active_bytes = try Helper.bytes(&primary, a, connection);
+        defer a.free(active_bytes);
+        // Real native writer rollback after staging a valid detach must leave
+        // both attachment and overlay untouched; no completion is fabricated.
+        {
+            var writer = try primary.beginWriteTxn();
+            defer writer.abort();
+            _ = try mutateTxn(&store, &writer, a, terminal, "alice", 7, 2, null, false);
+            var staged = try record.loadTxn(&writer, a, &connection);
+            defer staged.deinit();
+            try std.testing.expectEqual(record.State.idle, staged.value.state);
+        }
+        const after_abort = try Helper.bytes(&primary, a, connection);
+        defer a.free(after_abort);
+        try std.testing.expectEqualStrings(active_bytes, after_abort);
+        store.fail_writes_for_test = true;
+        try std.testing.expectError(error.InjectedSessionStoreFailure, mutate(&store, terminal, "alice", 7, 2));
+        store.fail_writes_for_test = false;
+        _ = try mutate(&store, terminal, "alice", 7, 2); // Accept; lose its reply.
+        var detached = try load(&store, a, connection, "alice", 7, 2);
+        try std.testing.expectEqual(record.State.idle, detached.value.state);
+        try std.testing.expectEqual(@as(i64, if (aborted) 10 else 5), detached.value.overlay[0].value.integer);
+        const revision = detached.value.revision;
+        detached.deinit();
+        const newer = [_]settings.OverlayEntry{.{ .identity = .{ .id = 17, .generation = 1 }, .value = .{ .integer = 99 } }};
+        _ = try mutate(&store, .{ .overlay = .{ .id = connection, .expected_revision = revision, .entries = &newer } }, "alice", 7, 2);
+        const idle_bytes = try Helper.bytes(&primary, a, connection);
+        defer a.free(idle_bytes);
+        _ = try mutate(&store, terminal, "alice", 7, 2);
+        const warm = try Helper.bytes(&primary, a, connection);
+        defer a.free(warm);
+        try std.testing.expectEqualStrings(idle_bytes, warm);
+        store.deinitVolatilePayloads();
+        primary.close();
+        live = false;
+        primary = try Native.open(a, path.ptr, .{});
+        live = true;
+        store = transactions.DurableSessionStore.init(a, &primary);
+        _ = try mutate(&store, terminal, "alice", 7, 2);
+        const cold = try Helper.bytes(&primary, a, connection);
+        defer a.free(cold);
+        try std.testing.expectEqualStrings(idle_bytes, cold);
+        const other_connection: [32]u8 = @splat('b');
+        _ = try mutate(&store, .{ .create = .{ .id = other_connection, .principal = "alice", .owner_node_id = 7, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", 7, 2);
+        // Even a genuine terminal session cannot detach another connection.
+        try std.testing.expectError(error.SqlTransactionOutcomeUnknown, mutate(&store, .{ .terminal = .{ .id = other_connection, .txn_id = id } }, "alice", 7, 2));
+        try std.testing.expectError(error.SqlConnectionNotFound, mutate(&store, terminal, "bob", 7, 2));
+        try std.testing.expectError(error.SqlConnectionWrongOwner, mutate(&store, terminal, "alice", 8, 2));
+        try std.testing.expectError(error.SqlTransactionOutcomeUnknown, mutate(&store, .{ .terminal = .{ .id = connection, .txn_id = @splat(99) } }, "alice", 7, 2));
+        var idle = try load(&store, a, connection, "alice", 7, 2);
+        const successor: [16]u8 = @splat(32);
+        const begin: Action = .{ .begin = .{ .id = connection, .expected_revision = idle.value.revision, .txn_id = successor } };
+        idle.deinit();
+        _ = try mutate(&store, begin, "alice", 7, 2);
+        _ = try mutate(&store, .{ .bind = .{ .id = connection, .txn_id = successor } }, "alice", 7, 2);
+        const successor_bytes = try Helper.bytes(&primary, a, connection);
+        defer a.free(successor_bytes);
+        try std.testing.expectError(error.SqlConnectionBusy, mutate(&store, terminal, "alice", 7, 2));
+        const unchanged = try Helper.bytes(&primary, a, connection);
+        defer a.free(unchanged);
+        try std.testing.expectEqualStrings(successor_bytes, unchanged);
+    }
 }

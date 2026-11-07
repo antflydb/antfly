@@ -72,15 +72,36 @@ pub fn percentEncodePathComponent(alloc: std.mem.Allocator, value: []const u8) !
     return try out.toOwnedSlice(alloc);
 }
 
+/// Raw preparation already limits retained source documents to 16 MiB.
+/// The wire additionally accommodates worst-case JSON string escaping, every
+/// distinct null field name (a subset of document keys), and framing.
+pub const TypedLookup = struct {
+    pub const max_document_bytes = 16 * 1024 * 1024;
+    pub const max_response_bytes = 8 * max_document_bytes + 4096;
+
+    pub fn requireCanonical(json: []const u8, fields: []const []const u8) !void {
+        if (json.len > max_document_bytes or fields.len > json.len) return error.InvalidResponse;
+        var total: usize = 0;
+        for (fields, 0..) |field, i| {
+            if (field.len == 0 or field.len > json.len -| total or !std.unicode.utf8ValidateSlice(field)) return error.InvalidResponse;
+            total += field.len;
+            if (i != 0 and std.mem.order(u8, fields[i - 1], field) != .lt) return error.InvalidResponse;
+        }
+    }
+};
+
 pub const LookupResponse = struct {
     status: u16 = 200,
     version: ?[]u8 = null,
     expected_content_digest: ?[32]u8 = null,
+    json_null_fields: []const []const u8 = &.{},
     body: []u8,
 
     pub fn deinit(self: *LookupResponse, alloc: std.mem.Allocator) void {
         if (self.version) |version| alloc.free(version);
         alloc.free(self.body);
+        for (self.json_null_fields) |field| alloc.free(field);
+        if (self.json_null_fields.len != 0) alloc.free(self.json_null_fields);
         self.* = undefined;
     }
 };
@@ -520,6 +541,12 @@ pub const ApiHttpClient = struct {
     /// Borrowed, scoped to one internal query/preflight client.
     prepared_query_routing: ?[]const u8 = null,
 
+    /// Scoped user authority; native owner grants are minted only after the
+    /// exact outgoing body exists. Neither keys nor borrowed request state
+    /// enter this client or the catalog route wire representation.
+    relation_owner_route: ?route_metadata_api.CatalogRouteFence = null,
+    relation_owner_purpose: @import("antfly_local_sources").common_relation_owner_authority.Purpose = .read,
+
     pub fn init(alloc: std.mem.Allocator, executor: http_common.RequestExecutor) ApiHttpClient {
         return .{
             .alloc = alloc,
@@ -547,16 +574,64 @@ pub const ApiHttpClient = struct {
     /// shared client boundary prevents new internal RPCs from silently omitting
     /// authentication and prevents the credential from leaking to public API
     /// requests made through the same client.
-    pub fn executeRequest(self: *ApiHttpClient, request: http_common.HttpRequest) !http_common.HttpResponse {
+    const PreparedEnvelope = struct {
+        region: std.heap.ArenaAllocator,
+        request: http_common.HttpRequest,
+        fn deinit(self: *@This()) void {
+            self.region.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// The final body and captured route are identical for buffered and stream
+    /// transports. Envelope-owned grants/headers outlive every synchronous
+    /// executor/writer callback, including fallback and error unwinding.
+    fn prepareEnvelope(self: *ApiHttpClient, request: http_common.HttpRequest) !PreparedEnvelope {
         var forwarded = request;
+        var region = std.heap.ArenaAllocator.init(self.alloc);
+        errdefer region.deinit();
+        const a = region.allocator();
         var headers: std.ArrayListUnmanaged(http_common.RequestHeader) = .empty;
-        defer headers.deinit(self.alloc);
-        if (self.prepared_query_routing) |value| if (internal_service_auth.requestTargetsInternalApi(request.uri)) {
-            try headers.appendSlice(self.alloc, request.headers);
-            try headers.append(self.alloc, .{ .name = @import("prepared_query_routing.zig").header_name, .value = value });
+        const authority = @import("antfly_local_sources").common_relation_owner_authority;
+
+        if (self.relation_owner_route) |fence| if (fence.route.execution == .native_local and fence.route.execution.native_local.kind == .temporary) {
+            if (!internal_service_auth.requestTargetsInternalApi(request.uri)) return error.Forbidden;
+            const minter = fence.admission_relation_minter orelse return error.SqlTemporaryRelationNotOwned;
+            try fence.route.execution.native_local.requireConnectionOwner(minter.owner);
+            const owner_grant = try minter.mint(a, .{ .purpose = self.relation_owner_purpose, .table_id = fence.table_id, .group_id = fence.route.group_id, .descriptor_fingerprint = try fence.route.execution.native_local.fingerprint(), .body_digest = authority.bodyDigest(request.body) });
+            try headers.appendSlice(a, request.headers);
+            try headers.append(a, .{ .name = authority.header, .value = owner_grant });
+            if (minter.command_fence_digest) |digest| {
+                const command_hex = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+                try headers.append(a, .{ .name = authority.command_digest_header, .value = command_hex });
+            }
             forwarded.headers = headers.items;
         };
-        return internal_service_auth.executeRequest(self.alloc, self.executor, forwarded, self.internal_service);
+
+        if (self.relation_owner_route) |fence| if (fence.admission_trigger_minter) |minter| {
+            if (!internal_service_auth.requestTargetsInternalApi(request.uri)) return error.Forbidden;
+            const trigger_authority = @import("antfly_local_sources").common_trigger_preparation_authority;
+            const trigger_grant = try minter.mint(a, .{ .purpose = if (self.relation_owner_purpose == .prepare) .prepare else .batch, .table_id = fence.table_id, .group_id = fence.route.group_id, .table_fingerprint = minter.table_fingerprint, .receipts_digest = minter.receipts_digest, .body_digest = trigger_authority.bodyDigest(request.body) });
+            if (headers.items.len == 0) try headers.appendSlice(a, request.headers);
+            try headers.append(a, .{ .name = trigger_authority.header, .value = trigger_grant });
+            if (minter.command_fence_digest) |digest| {
+                const trigger_command_hex = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+                try headers.append(a, .{ .name = trigger_authority.command_digest_header, .value = trigger_command_hex });
+            }
+            forwarded.headers = headers.items;
+        };
+        if (self.prepared_query_routing) |value| if (internal_service_auth.requestTargetsInternalApi(request.uri)) {
+            if (headers.items.len == 0) try headers.appendSlice(a, request.headers);
+            try headers.append(a, .{ .name = @import("prepared_query_routing.zig").header_name, .value = value });
+            forwarded.headers = headers.items;
+        };
+        return .{ .region = region, .request = forwarded };
+    }
+
+    pub fn executeRequest(self: *ApiHttpClient, request: http_common.HttpRequest) !http_common.HttpResponse {
+        var prepared = try self.prepareEnvelope(request);
+        defer prepared.deinit();
+        return internal_service_auth.executeRequest(self.alloc, self.executor, prepared.request, self.internal_service);
     }
 
     pub fn executeRequestStream(
@@ -564,13 +639,9 @@ pub const ApiHttpClient = struct {
         request: http_common.HttpRequest,
         writer: http_common.StreamWriter,
     ) !?bool {
-        return try internal_service_auth.executeRequestStream(
-            self.alloc,
-            self.executor,
-            request,
-            writer,
-            self.internal_service,
-        );
+        var prepared = try self.prepareEnvelope(request);
+        defer prepared.deinit();
+        return internal_service_auth.executeRequestStream(self.alloc, self.executor, prepared.request, writer, self.internal_service);
     }
 
     /// Public generated operations live below `/db/v1`. Internal forwarding
@@ -724,6 +795,9 @@ pub const ApiHttpClient = struct {
     }
 
     pub const GroupLookupOptions = struct {
+        /// Process-local captured route; transported through the existing
+        /// private route header and requiring receiver acknowledgement.
+        catalog_route_fence: ?route_metadata_api.CatalogRouteFence = null,
         relational_integrity_catalog: bool = false,
         relational_integrity_action: bool = false,
         relational_integrity_jobs_json: []const u8 = "",
@@ -735,6 +809,7 @@ pub const ApiHttpClient = struct {
         restore_staging_scope: ?[32]u8 = null,
         restore_staging_plan_id: ?[16]u8 = null,
         include_primary_digest: bool = false,
+        include_json_null_fields: bool = false,
         row_policy_principal_proof: []const u8 = "",
         row_policy_database: []const u8 = "",
     };
@@ -763,6 +838,25 @@ pub const ApiHttpClient = struct {
             .{ .name = authority.principal_header, .value = options.row_policy_principal_proof },
             .{ .name = authority.database_header, .value = policy_database orelse "" },
         };
+        const route_header = if (options.catalog_route_fence) |fence| encoded: {
+            if (fence.route.group_id != group_id) return error.IdentityNamespaceMismatch;
+            break :encoded try std.json.Stringify.valueAlloc(self.alloc, fence, .{});
+        } else null;
+        defer if (route_header) |value| self.alloc.free(value);
+        var headers: [4]http_common.RequestHeader = undefined;
+        var route_timeout_buffer: [16]u8 = undefined;
+        var header_count: usize = 0;
+        if (options.row_policy_principal_proof.len != 0) {
+            @memcpy(headers[0..2], &policy_headers);
+            header_count = 2;
+        }
+        if (route_header) |encoded| {
+            headers[header_count] = .{ .name = route_metadata_api.catalog_route_fence_header, .value = encoded };
+            header_count += 1;
+            const route_budget_ms = @max(@as(u32, 1), @min(timeout_ms orelse route_metadata_api.catalog_route_default_deadline_ms, route_metadata_api.catalog_route_max_deadline_ms));
+            headers[header_count] = .{ .name = route_metadata_api.catalog_route_deadline_ms_header, .value = try std.fmt.bufPrint(&route_timeout_buffer, "{d}", .{route_budget_ms}) };
+            header_count += 1;
+        }
         // Group lookups are also used for routed derived-artifact hydration.
         // Those storage keys are binary and contain namespace bytes and NUL
         // component terminators, so every externally represented component
@@ -836,7 +930,9 @@ pub const ApiHttpClient = struct {
         defer if (sql_lock.len != 0) self.alloc.free(sql_lock);
         const sql_lock_path = if (sql_lock.len != 0) try std.fmt.allocPrint(self.alloc, "{s}&_sql_lock={s}", .{ group_path orelse index_path orelse observation_path orelse path, sql_lock }) else null;
         defer if (sql_lock_path) |value| self.alloc.free(value);
-        const uri = try self.joinRoute(base_uri, sql_lock_path orelse group_path orelse index_path orelse observation_path orelse path);
+        const null_path = if (options.include_json_null_fields) try std.fmt.allocPrint(self.alloc, "{s}&_json_null_fields=true", .{sql_lock_path orelse group_path orelse index_path orelse observation_path orelse path}) else null;
+        defer if (null_path) |value| self.alloc.free(value);
+        const uri = try self.joinRoute(base_uri, null_path orelse sql_lock_path orelse group_path orelse index_path orelse observation_path orelse path);
         defer self.alloc.free(uri);
 
         var resp = try self.executeRequest(.{
@@ -844,9 +940,10 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .body = if (body_control) relational_integrity_jobs_json else "",
             .content_type = if (body_control) "application/json" else null,
-            .headers = if (options.row_policy_principal_proof.len != 0) &policy_headers else &.{},
+            .headers = headers[0..header_count],
             .timeout_ms = timeout_ms,
             .cancellation = cancellation,
+            .max_response_bytes = if (options.include_json_null_fields) TypedLookup.max_response_bytes else null,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
@@ -862,6 +959,7 @@ pub const ApiHttpClient = struct {
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
+        if (route_header != null and !std.mem.eql(u8, resp.header(route_metadata_api.catalog_route_fence_ack_header) orelse "", route_metadata_api.catalog_route_fence_ack_value)) return error.CatalogRouteFenceUnsupported;
         const version = for (resp.headers) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Version")) break try self.alloc.dupe(u8, header.value);
         } else null;
@@ -874,6 +972,26 @@ pub const ApiHttpClient = struct {
             digest = parsed;
         };
         if (include_primary_digest and digest == null) return error.InvalidResponse;
+        if (options.include_json_null_fields) {
+            var acknowledged = false;
+            for (resp.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Typed-Nulls")) {
+                if (acknowledged or !std.mem.eql(u8, header.value, "1")) return error.InvalidResponse;
+                acknowledged = true;
+            };
+            if (!acknowledged or resp.body.len > TypedLookup.max_response_bytes) return error.InvalidResponse;
+            // An old reader's ordinary document is never accepted as a typed
+            // observation. The private envelope preserves exact document bytes.
+            const Typed = struct { json: []const u8, json_null_fields: []const []const u8 };
+            var typed = std.json.parseFromSlice(Typed, self.alloc, resp.body, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidResponse;
+            defer typed.deinit();
+            try TypedLookup.requireCanonical(typed.value.json, typed.value.json_null_fields);
+            const flags = try db_mod.types.cloneJsonNullFields(self.alloc, typed.value.json_null_fields);
+            errdefer {
+                for (flags) |field| self.alloc.free(field);
+                if (flags.len != 0) self.alloc.free(flags);
+            }
+            return .{ .version = version, .body = try self.alloc.dupe(u8, typed.value.json), .expected_content_digest = digest, .json_null_fields = flags };
+        }
         return .{ .version = version, .body = try self.alloc.dupe(u8, resp.body), .expected_content_digest = digest };
     }
 
@@ -1066,6 +1184,9 @@ pub const ApiHttpClient = struct {
         var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
         var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
         defer response.deinit(self.alloc);
+        if (comptime Response == @import("relational_fk_generation_publication.zig").SourceReceipt) {
+            if (@import("relational_fk_generation_publication.zig").isSourceDrainingFailure(response.status, response.body)) return error.TransactionTopologyBusy;
+        }
         switch (response.status) {
             200 => {},
             400, 409 => return error.GenerationAdmissionChanged,
@@ -1145,6 +1266,55 @@ pub const ApiHttpClient = struct {
         const value = try preparation.decode(response.body);
         try value.requireFor(group, request);
         return .{ .alloc = self.alloc, .transport = response, .value = value };
+    }
+
+    /// The caller verifies Response.requireFor against the actual captured
+    /// descriptor. Transport retains the exact response bytes and allocator.
+    pub fn fetchTableRetirementPreparation(self: *ApiHttpClient, base_uri: []const u8, group: u64, table: []const u8, request: @import("table_retirement_preparation.zig").Request, input: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        const preparation = @import("table_retirement_preparation.zig");
+        const transport = @import("schema_validation_preparation.zig");
+        const context = try input.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group);
+        if (table.len == 0) return error.InvalidCatalogRecord;
+        if (self.internal_service == null) return error.Unauthorized;
+        const name = try percentEncodePathComponent(self.alloc, table);
+        defer self.alloc.free(name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group, routes.Routes.tables_prefix, name, routes.Routes.schema_validation_prepare_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, .{ .retirement = request }, .{});
+        defer self.alloc.free(body);
+        if (body.len > preparation.max_request_bytes) return error.TransactionTooLarge;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse platform_time.monotonicNs() +| transport.max_budget_ms * std.time.ns_per_ms, .cancellation = context.cancellation };
+        const remaining = @min(transport.max_budget_ms, try control.remainingTimeoutMs());
+        var buffer: [20]u8 = undefined;
+        const budget = try std.fmt.bufPrint(&buffer, "{d}", .{remaining});
+        var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = remaining, .cancellation = &cancellation, .max_response_bytes = preparation.max_response_bytes, .headers = &.{.{ .name = transport.remaining_ms_header, .value = budget }} });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            401, 403 => return error.Unauthorized,
+            400 => return error.InvalidCatalogRecord,
+            409 => return error.CatalogGenerationChanged,
+            413 => return error.TransactionTooLarge,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.GenerationAdmissionPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        if (response.body.len == 0 or response.body.len > preparation.max_response_bytes) return error.InvalidResponse;
+        const content_type = response.content_type orelse response.header("content-type") orelse return error.InvalidResponse;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " \t"), "application/json")) return error.InvalidResponse;
+        // A linked executor may own its response with a different allocator.
+        // Transfer only compatible custody; otherwise retain one owned copy.
+        const owner = response.owner_allocator orelse self.alloc;
+        if (owner.ptr != self.alloc.ptr or owner.vtable != self.alloc.vtable)
+            return self.alloc.dupe(u8, response.body);
+        const result = response.body;
+        response.body = &.{};
+        return result;
     }
 
     fn fetchRelationalIndexOwner(self: *ApiHttpClient, comptime claims: bool, base_uri: []const u8, group_id: u64, table_name: []const u8, request: if (claims) @import("relational_index_owner_execution.zig").ClaimRequest else @import("relational_index_owner_execution.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(if (claims) @import("relational_index_owner_execution.zig").ClaimResponse else @import("relational_index_owner_execution.zig").ControlResponse) {
@@ -2456,6 +2626,14 @@ pub const ApiHttpClient = struct {
         return self.fetchGroupGraphMetricMaintenanceWithCancellation(base_uri, group_id, table_name, body, null);
     }
 
+    pub fn fetchGroupSqlMaintenanceRoutedWithCancellation(self: *ApiHttpClient, base_uri: []const u8, fence: route_metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, cancellation: ?*const http_common.RequestCancellation) !QueryResponse {
+        const encoded = try std.json.Stringify.valueAlloc(self.alloc, fence, .{});
+        defer self.alloc.free(encoded);
+        const request: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation };
+        const timeout = @min(try request.remainingTimeoutMs() orelse route_metadata_api.catalog_route_default_deadline_ms, route_metadata_api.catalog_route_max_deadline_ms);
+        return self.fetchGroupSqlMaintenanceControlled(base_uri, group_id, table_name, body, cancellation, encoded, timeout);
+    }
+
     pub fn fetchGroupSqlMaintenanceWithCancellation(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -2464,6 +2642,10 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         cancellation: ?*const http_common.RequestCancellation,
     ) !QueryResponse {
+        return self.fetchGroupSqlMaintenanceControlled(base_uri, group_id, table_name, body, cancellation, null, null);
+    }
+
+    fn fetchGroupSqlMaintenanceControlled(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, body: []const u8, cancellation: ?*const http_common.RequestCancellation, encoded_route: ?[]const u8, timeout_ms: ?u32) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -2475,7 +2657,14 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
+        var timeout_buffer: [16]u8 = undefined;
+        const route_headers = if (encoded_route) |encoded| [_]http_common.RequestHeader{
+            .{ .name = route_metadata_api.catalog_route_fence_header, .value = encoded },
+            .{ .name = route_metadata_api.catalog_route_deadline_ms_header, .value = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{timeout_ms orelse route_metadata_api.catalog_route_default_deadline_ms}) },
+        } else undefined;
         var resp = try self.executeRequest(.{
+            .headers = if (encoded_route != null) &route_headers else &.{},
+            .timeout_ms = timeout_ms,
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -4588,6 +4777,10 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 }
 
 fn remoteGroupConflictError(body: []const u8) anyerror {
+    inline for (.{ error.SqlRelationOwnerChanged, error.SqlTemporaryRelationNotOwned, error.SqlRelationRecoveryIncomplete, error.InvalidSqlRelationPersistence }) |native_error| {
+        if (std.mem.eql(u8, std.mem.trim(u8, body, " \t\r\n"), @errorName(native_error))) return native_error;
+    }
+
     if (@import("external_transaction_errors.zig").decode(body)) |reason| return reason;
     if (@import("relational_integrity_errors.zig").decode(body)) |reason| return reason;
     if (std.mem.eql(u8, body, "DocumentArtifactPublicationFailed")) return error.DocumentArtifactPublicationFailed;
@@ -7112,4 +7305,316 @@ test "raft batch round trips external transaction rejection identities across ow
     }
     try std.testing.expect(errors.classify(error.OutOfMemory) == null);
     try std.testing.expect(errors.decode("forged outcome") == null);
+}
+
+test "SQL relation lifetime routed maintenance bounds HTTP timeout by inherited native deadline" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            try std.testing.expect(request.header(route_metadata_api.catalog_route_fence_header) != null);
+            const millis = try std.fmt.parseUnsigned(u32, request.header(route_metadata_api.catalog_route_deadline_ms_header).?, 10);
+            try std.testing.expect(millis > 0 and millis <= 25);
+            try std.testing.expectEqual(@as(?u32, millis), request.timeout_ms);
+            try std.testing.expectEqualStrings("{}", request.body);
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{}") };
+        }
+    };
+    var fixture: Fixture = .{};
+    var client = ApiHttpClient.init(a, .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } });
+    _ = client.withInternalServiceAuth("0123456789abcdef0123456789abcdef", "maintenance-test");
+    var fence: route_metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 2, .table_id = 3, .topology_epoch = 4, .route = .{ .group_id = 5, .range_id = 6, .identity_namespace = .{ .table_id = 3, .shard_id = 5, .range_id = 6 }, .execution = .{ .native_local = .{ .kind = .unlogged, .owner_node_id = 7, .owner_store_id = 9, .generation_instance = @splat(3), .data_generation = 4 } } }, .admission_deadline_ns = platform_time.monotonicNs() + 25 * std.time.ns_per_ms };
+    var response = try client.fetchGroupSqlMaintenanceRoutedWithCancellation("http://owner", fence, 5, "docs", "{}", null);
+    defer response.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    fence.admission_deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, client.fetchGroupSqlMaintenanceRoutedWithCancellation("http://owner", fence, 5, "docs", "{}", null));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "SQL relation lifetime buffered and streamed envelopes bind exact owner trigger body generation and command and release on failure" {
+    const a = std.testing.allocator;
+    const authority = @import("antfly_local_sources").common_relation_owner_authority;
+    const trigger = @import("antfly_local_sources").common_trigger_preparation_authority;
+    const persistence = @import("antfly_local_sources").common_topology_records.RelationPersistence;
+    const Fixture = struct {
+        const secret = "owner-stream-authority-secret";
+        const issuer = "stream-test";
+        owner: persistence.Owner = .{ .issuer_node_id = 1, .connection_id = @splat(1), .wire_epoch = @splat(2), .execution_instance = @splat(3), .connection_generation = 4, .principal_digest = @splat(5) },
+        actual: persistence.Descriptor = undefined,
+        calls: usize = 0,
+        minted: usize = 0,
+        changed_body: bool = false,
+        command: [32]u8 = @splat(7),
+        purpose: authority.Purpose = .prepare,
+        fn sign(raw: *anyopaque, alloc: std.mem.Allocator, owner: persistence.Owner, scope: authority.Scope) anyerror![]u8 {
+            const fixture: *@This() = @ptrCast(@alignCast(raw));
+            fixture.minted += 1;
+            return authority.sign(alloc, secret, issuer, owner, scope, 100);
+        }
+        fn signTrigger(_: *anyopaque, alloc: std.mem.Allocator, scope: trigger.Scope) anyerror![]u8 {
+            return trigger.sign(alloc, secret, issuer, scope, 100);
+        }
+        fn validate(fixture: *@This(), alloc: std.mem.Allocator, request: http_common.HttpRequest) !void {
+            fixture.calls += 1;
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            try std.testing.expectEqualStrings("prepared-read", request.header(@import("prepared_query_routing.zig").header_name).?);
+            try std.testing.expectEqualStrings("unchanged", request.header("X-Ordinary").?);
+            try std.testing.expectEqual(@as(?u32, 50), request.timeout_ms);
+            const body = if (fixture.changed_body) "substituted" else request.body;
+            const scope: authority.Scope = .{ .purpose = fixture.purpose, .table_id = 3, .group_id = 5, .descriptor_fingerprint = try fixture.actual.fingerprint(), .body_digest = authority.bodyDigest(body), .command_fence_digest = fixture.command };
+            const owner = try authority.verify(alloc, secret, issuer, scope, fixture.actual, 101, request.header(authority.header) orelse return error.Forbidden);
+            try std.testing.expect(fixture.owner.eql(owner));
+            try std.testing.expectEqualStrings(&std.fmt.bytesToHex(fixture.command, .lower), request.header(authority.command_digest_header).?);
+            _ = try trigger.verify(alloc, secret, issuer, .{ .purpose = if (fixture.purpose == .prepare) .prepare else .batch, .table_id = 3, .group_id = 5, .table_fingerprint = @splat(8), .receipts_digest = @splat(9), .body_digest = trigger.bodyDigest(body), .command_fence_digest = fixture.command }, 101, request.header(trigger.header) orelse return error.Forbidden);
+            try std.testing.expectEqualStrings(&std.fmt.bytesToHex(fixture.command, .lower), request.header(trigger.command_digest_header).?);
+        }
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const fixture: *@This() = @ptrCast(@alignCast(raw));
+            try fixture.validate(alloc, request);
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{}") };
+        }
+        fn stream(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest, writer: http_common.StreamWriter) anyerror!bool {
+            const fixture: *@This() = @ptrCast(@alignCast(raw));
+            try fixture.validate(alloc, request);
+            try writer.start(alloc, .{ .status = 200 });
+            try writer.writeAll("streamed");
+            try writer.flush();
+            return true;
+        }
+    };
+    const Sink = struct {
+        started: usize = 0,
+        bytes: usize = 0,
+        reject: bool = false,
+        fn start(raw: *anyopaque, _: std.mem.Allocator, response: http_common.StreamingResponse) anyerror!void {
+            const sink: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            sink.started += 1;
+        }
+        fn write(raw: *anyopaque, bytes: []const u8) anyerror!void {
+            const sink: *@This() = @ptrCast(@alignCast(raw));
+            if (sink.reject) return error.Canceled;
+            sink.bytes += bytes.len;
+        }
+        fn flush(_: *anyopaque) anyerror!void {}
+        fn writer(sink: *@This()) http_common.StreamWriter {
+            return .{ .ptr = sink, .vtable = &.{ .start = start, .write_all = write, .flush = flush } };
+        }
+    };
+    var fixture: Fixture = .{};
+    fixture.actual = .{ .kind = .temporary, .owner_node_id = 7, .owner_store_id = 9, .generation_instance = @splat(3), .data_generation = 4, .owner = fixture.owner };
+    const captured: route_metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 2, .table_id = 3, .topology_epoch = 4, .route = .{ .group_id = 5, .range_id = 6, .identity_namespace = .{ .table_id = 3, .shard_id = 5, .range_id = 6 }, .execution = .{ .native_local = fixture.actual } }, .admission_relation_minter = .{ .ptr = &fixture, .owner = fixture.owner, .command_fence_digest = fixture.command, .sign_fn = Fixture.sign }, .admission_trigger_minter = .{ .ptr = &fixture, .table_id = 3, .table_fingerprint = @splat(8), .receipts_digest = @splat(9), .command_fence_digest = fixture.command, .sign_fn = Fixture.signTrigger } };
+    var client = ApiHttpClient.init(a, .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute, .execute_stream = Fixture.stream } });
+    _ = client.withInternalServiceAuth("node-auth-key", "node-test");
+    client.relation_owner_route = captured;
+    client.relation_owner_purpose = .prepare;
+    client.prepared_query_routing = "prepared-read";
+    const request: http_common.HttpRequest = .{ .method = .POST, .uri = "http://owner/internal/v1/groups/5/tables/docs/query", .body = "{\"exact\":true}", .headers = &.{.{ .name = "X-Ordinary", .value = "unchanged" }}, .timeout_ms = 50 };
+    var sink: Sink = .{};
+    var response = try client.executeRequest(request);
+    response.deinit(a);
+    try std.testing.expectEqual(@as(?bool, true), try client.executeRequestStream(request, sink.writer()));
+    try std.testing.expectEqual(@as(usize, 1), sink.started);
+    try std.testing.expectEqual(@as(usize, 8), sink.bytes);
+    // Hosted streaming scans use read purpose; mutation preparation uses the
+    // distinct prepare purpose above. Both pass through the same envelope.
+    fixture.purpose = .read;
+    client.relation_owner_purpose = .read;
+    try std.testing.expectEqual(@as(?bool, true), try client.executeRequestStream(request, sink.writer()));
+    fixture.purpose = .prepare;
+    client.relation_owner_purpose = .prepare;
+    // Verification uses the actual received body/current generation, not the
+    // signer's captured values. Neither mismatch may reach a stream callback.
+    fixture.changed_body = true;
+    try std.testing.expectError(error.Forbidden, client.executeRequest(request));
+    try std.testing.expectError(error.Forbidden, client.executeRequestStream(request, sink.writer()));
+    fixture.changed_body = false;
+    fixture.actual.data_generation += 1;
+    try std.testing.expectError(error.Forbidden, client.executeRequest(request));
+    try std.testing.expectError(error.Forbidden, client.executeRequestStream(request, sink.writer()));
+    fixture.actual.data_generation -= 1;
+    const before = fixture.calls;
+    client.relation_owner_route.?.admission_relation_minter = null;
+    try std.testing.expectError(error.SqlTemporaryRelationNotOwned, client.executeRequest(request));
+    try std.testing.expectError(error.SqlTemporaryRelationNotOwned, client.executeRequestStream(request, sink.writer()));
+    client.relation_owner_route = captured;
+    client.relation_owner_route.?.admission_relation_minter.?.owner.wire_epoch = @splat(99);
+    try std.testing.expectError(error.SqlTemporaryRelationNotOwned, client.executeRequest(request));
+    try std.testing.expectError(error.SqlTemporaryRelationNotOwned, client.executeRequestStream(request, sink.writer()));
+    try std.testing.expectEqual(before, fixture.calls);
+    client.relation_owner_route = captured;
+    sink.reject = true;
+    try std.testing.expectError(error.Canceled, client.executeRequestStream(request, sink.writer()));
+    // testing.allocator verifies all envelope headers/tokens are released on
+    // both receiver rejection and downstream writer failure.
+    sink.reject = false;
+    try std.testing.expectEqual(@as(?bool, true), try client.executeRequestStream(request, sink.writer()));
+    // No streaming callback means a bounded fallback may be selected by the
+    // caller. Its independently minted buffered request uses the same body.
+    client.executor.vtable = &.{ .execute = Fixture.execute };
+    try std.testing.expectEqual(@as(?bool, null), try client.executeRequestStream(request, sink.writer()));
+    var fallback = try client.executeRequest(request);
+    fallback.deinit(a);
+    var public = request;
+    public.uri = "http://owner/db/v1/query";
+    const calls = fixture.calls;
+    try std.testing.expectError(error.Forbidden, client.executeRequest(public));
+    try std.testing.expectError(error.Forbidden, client.executeRequestStream(public, sink.writer()));
+    try std.testing.expectEqual(calls, fixture.calls);
+}
+
+test "SQL relation lifetime envelope keeps ordinary public wire and stream fallback unchanged" {
+    const authority = @import("antfly_local_sources").common_relation_owner_authority;
+    const trigger = @import("antfly_local_sources").common_trigger_preparation_authority;
+    const Spy = struct {
+        calls: usize = 0,
+        fn check(spy: *@This(), request: http_common.HttpRequest) !void {
+            spy.calls += 1;
+            try std.testing.expectEqualStrings("opaque exact body", request.body);
+            try std.testing.expectEqual(@as(usize, 1), request.headers.len);
+            try std.testing.expectEqualStrings("keep", request.header("X-Ordinary").?);
+            try std.testing.expect(request.header(authority.header) == null);
+            try std.testing.expect(request.header(trigger.header) == null);
+            try std.testing.expect(request.header(internal_service_auth.header_name) == null);
+            try std.testing.expect(request.header(@import("prepared_query_routing.zig").header_name) == null);
+        }
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, request: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const spy: *@This() = @ptrCast(@alignCast(raw));
+            try spy.check(request);
+            return .{ .status = 200, .body = &.{} };
+        }
+        fn stream(raw: *anyopaque, _: std.mem.Allocator, request: http_common.HttpRequest, _: http_common.StreamWriter) anyerror!bool {
+            const spy: *@This() = @ptrCast(@alignCast(raw));
+            try spy.check(request);
+            return false;
+        }
+        fn start(_: *anyopaque, _: std.mem.Allocator, _: http_common.StreamingResponse) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+        fn write(_: *anyopaque, _: []const u8) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+        fn flush(_: *anyopaque) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const a = std.testing.allocator;
+    var spy: Spy = .{};
+    var client = ApiHttpClient.init(a, .{ .ptr = &spy, .vtable = &.{ .execute = Spy.execute, .execute_stream = Spy.stream } });
+    _ = client.withInternalServiceAuth("node-key", "node");
+    client.prepared_query_routing = "internal-only";
+    const request: http_common.HttpRequest = .{ .method = .POST, .uri = "http://owner/db/v1/query", .body = "opaque exact body", .headers = &.{.{ .name = "X-Ordinary", .value = "keep" }} };
+    var response = try client.executeRequest(request);
+    response.deinit(a);
+    const writer: http_common.StreamWriter = .{ .ptr = &spy, .vtable = &.{ .start = Spy.start, .write_all = Spy.write, .flush = Spy.flush } };
+    try std.testing.expectEqual(@as(?bool, false), try client.executeRequestStream(request, writer));
+    try std.testing.expectEqual(@as(usize, 2), spy.calls);
+}
+
+test "SQL native lock lookup transports captured route and rejects unacknowledged reader" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        expected: ?[]const u8 = null,
+        ack: bool = true,
+        expected_budget: u32 = 17,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.expected) |expected| {
+                try std.testing.expectEqualStrings(expected, request.header(route_metadata_api.catalog_route_fence_header) orelse return error.TestMissingCapturedRoute);
+                const budget = try std.fmt.parseUnsigned(u32, request.header(route_metadata_api.catalog_route_deadline_ms_header) orelse return error.TestMissingCapturedDeadline, 10);
+                try std.testing.expectEqual(self.expected_budget, budget);
+            } else {
+                try std.testing.expect(request.header(route_metadata_api.catalog_route_fence_header) == null);
+                try std.testing.expect(request.header(route_metadata_api.catalog_route_deadline_ms_header) == null);
+            }
+            const headers = if (self.ack) try alloc.alloc(http_common.Header, 1) else try alloc.alloc(http_common.Header, 0);
+            if (self.ack) headers[0] = .{ .name = try alloc.dupe(u8, route_metadata_api.catalog_route_fence_ack_header), .value = try alloc.dupe(u8, route_metadata_api.catalog_route_fence_ack_value) };
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{}"), .headers = headers };
+        }
+    };
+    const fence: route_metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 2, .table_id = 3, .topology_epoch = 4, .route = .{ .group_id = 72, .range_id = 272, .identity_namespace = .{ .table_id = 3, .shard_id = 172, .range_id = 272 }, .execution = .{ .native_local = .{ .kind = .unlogged, .owner_node_id = 7, .owner_store_id = 9, .generation_instance = @splat(3), .data_generation = 4 } } } };
+    const encoded = try std.json.Stringify.valueAlloc(a, fence, .{});
+    defer a.free(encoded);
+    var probe: Probe = .{ .expected = encoded };
+    var client = ApiHttpClient.init(a, .{ .ptr = &probe, .vtable = &.{ .execute = Probe.execute } });
+    var response = try client.fetchGroupLookupWithOptions("http://owner", 72, "docs", "", null, "read_index", 17, null, .{ .catalog_route_fence = fence, .sql_lock_query_json = "lock-control" });
+    response.deinit(a);
+    for ([_]u32{ 0, std.math.maxInt(u32) }) |timeout| {
+        probe.expected_budget = if (timeout == 0) 1 else route_metadata_api.catalog_route_max_deadline_ms;
+        var bounded = try client.fetchGroupLookupWithOptions("http://owner", 72, "docs", "", null, "read_index", timeout, null, .{ .catalog_route_fence = fence, .sql_lock_query_json = "lock-control" });
+        bounded.deinit(a);
+    }
+    probe.expected_budget = 17;
+    probe.ack = false;
+    try std.testing.expectError(error.CatalogRouteFenceUnsupported, client.fetchGroupLookupWithOptions("http://owner", 72, "docs", "", null, "read_index", 17, null, .{ .catalog_route_fence = fence, .sql_lock_query_json = "lock-control" }));
+    try std.testing.expectError(error.IdentityNamespaceMismatch, client.fetchGroupLookupWithOptions("http://owner", 172, "docs", "", null, "read_index", null, null, .{ .catalog_route_fence = fence }));
+    try std.testing.expectEqual(@as(usize, 4), probe.calls);
+    probe.expected = null;
+    var ordinary = try client.fetchGroupLookupWithOptions("http://owner", 72, "docs", "", null, "read_index", null, null, .{});
+    defer ordinary.deinit(a);
+}
+
+test "table retirement preparation transport reuses strict private schema route without replay" {
+    const a = std.testing.allocator;
+    const preparation = @import("table_retirement_preparation.zig");
+    const schema_preparation = @import("schema_validation_preparation.zig");
+    const request: preparation.Request = .{ .lookup = .{ .group = 2188, .table = 3, .id = @splat(1) }, .expected_revision = 1, .effects = .{ .digest = @splat(2), .root_table = 3, .survivors = 0, .counters = 0, .views = 0 }, .metadata_incarnation = "11111111111111111111111111111111".*, .table_id = 3, .owner_group_id = 7, .namespace = .{ .table_id = 3, .shard_id = 72, .range_id = 172 } };
+    const Fixture = struct {
+        calls: usize = 0,
+        mode: enum { valid, foreign_allocator, wrong_media, changed, lost_reply } = .valid,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, value: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(http_common.Method.POST, value.method);
+            try std.testing.expect(std.mem.endsWith(u8, value.uri, "/groups/7/tables/items%2Fquoted/schema-validation-prepare"));
+            try std.testing.expect(value.header(internal_service_auth.header_name) != null);
+            const budget = try std.fmt.parseUnsigned(u32, value.header(schema_preparation.remaining_ms_header).?, 10);
+            try std.testing.expect(budget > 0 and budget <= 1000);
+            try std.testing.expectEqual(@as(?u32, budget), value.timeout_ms);
+            try std.testing.expectEqual(@as(?usize, preparation.max_response_bytes), value.max_response_bytes);
+            var parsed = try std.json.parseFromSlice(struct { retirement: preparation.Request }, alloc, value.body, .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            try std.testing.expectEqualDeep(request, parsed.value.retirement);
+            // Old strict schema receivers reject this new alternative.
+            try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(schema_preparation.Request, alloc, value.body, .{ .ignore_unknown_fields = false }));
+            if (self.mode == .lost_reply) return error.ConnectionResetByPeer;
+            if (self.mode == .changed) return .{ .status = 409, .body = try alloc.dupe(u8, "changed") };
+            const owner = if (self.mode == .foreign_allocator) std.heap.page_allocator else alloc;
+            const media = try owner.dupe(u8, if (self.mode == .wrong_media) "text/plain" else "application/json");
+            errdefer owner.free(media);
+            // Opaque bytes here prove transport ownership, not native truth;
+            // the consumer must call Response.requireFor on the actual result.
+            return .{ .status = 200, .owner_allocator = owner, .content_type = media, .body = try owner.dupe(u8, "{}") };
+        }
+    };
+    var fixture: Fixture = .{};
+    var client = ApiHttpClient.init(a, .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } });
+    try std.testing.expectError(error.Unauthorized, client.fetchTableRetirementPreparation("http://owner", 7, "items/quoted", request, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    _ = client.withInternalServiceAuth("retirement-private-service-secret-0123456789", "retirement-test");
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| std.time.ns_per_s };
+    for ([_]@FieldType(Fixture, "mode"){ .valid, .foreign_allocator }) |mode| {
+        fixture.mode = mode;
+        const bytes = try client.fetchTableRetirementPreparation("http://owner", 7, "items/quoted", request, context);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("{}", bytes);
+    }
+    fixture.mode = .wrong_media;
+    try std.testing.expectError(error.InvalidResponse, client.fetchTableRetirementPreparation("http://owner", 7, "items/quoted", request, context));
+    fixture.mode = .changed;
+    try std.testing.expectError(error.CatalogGenerationChanged, client.fetchTableRetirementPreparation("http://owner", 7, "items/quoted", request, context));
+    fixture.mode = .lost_reply;
+    const before = fixture.calls;
+    try std.testing.expectError(error.ConnectionResetByPeer, client.fetchTableRetirementPreparation("http://owner", 7, "items/quoted", request, context));
+    try std.testing.expectEqual(before + 1, fixture.calls);
+    var foreign = request;
+    foreign.owner_group_id = 72;
+    try std.testing.expectError(error.InvalidCatalogRecord, client.fetchTableRetirementPreparation("http://owner", 7, "items/quoted", foreign, context));
+    try std.testing.expectEqual(before + 1, fixture.calls);
 }

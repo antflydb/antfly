@@ -22,6 +22,53 @@ const callback_abi = @import("antfly_local_sources").runtime_callback_abi;
 const integrity = @import("antfly_local_sources").storage_db_relational_integrity_contract;
 const identity = @import("antfly_local_sources").storage_db_doc_identity_namespace;
 
+const receipt_position = @import("antfly_local_sources").storage_db_receipt_position;
+const persistence = @import("antfly_local_sources").common_topology_records.RelationPersistence;
+pub const NativeBoot = struct {
+    generation: u64,
+    instance: [16]u8,
+    pub fn requireCurrent(self: NativeBoot, current: @import("../metadata/sql_relation_boots.zig").Record) !void {
+        try current.validate();
+        if (current.phase != .ready or self.generation != current.generation or !std.mem.eql(u8, &self.instance, &current.instance)) return error.InvalidGenerationPublication;
+    }
+};
+pub const NativeProof = @import("../metadata/store_root_attestation.zig").ProofFor("antfly/fk-generation-native-receipt/signature/v1", "antfly/fk-generation-native-receipt/accepted/v1");
+
+fn receiptPosition(receipt: anytype) !receipt_position.Position {
+    const stamp = try receipt_position.fromFields(receipt.applied_term, receipt.applied_index, receipt.native_position);
+    if ((receipt.native_position == null) != (receipt.native_proof == null) or (receipt.native_position == null) != (receipt.native_descriptor_fingerprint == null) or (receipt.native_position == null) != (receipt.native_boot == null)) return error.InvalidGenerationPublication;
+    if (receipt.native_boot) |boot| if (boot.generation == 0 or std.mem.allEqual(u8, &boot.instance, 0)) return error.InvalidGenerationPublication;
+    if (receipt.native_proof) |proof| {
+        if (proof.authority != .native or proof.native_pin == null) return error.InvalidGenerationPublication;
+        try stamp.requireNamespace(.{ .table_id = proof.native_pin.?.table_id, .shard_id = proof.native_pin.?.shard_id, .range_id = proof.native_pin.?.range_id });
+        try proof.verify(receipt.digest());
+    }
+    return stamp;
+}
+
+fn hashNativePosition(hash: *std.crypto.hash.Blake3, native: receipt_position.Native) void {
+    var bytes: [33]u8 = undefined;
+    bytes[0] = 2;
+    std.mem.writeInt(u64, bytes[1..9], native.namespace.table_id, .little);
+    std.mem.writeInt(u64, bytes[9..17], native.namespace.shard_id, .little);
+    std.mem.writeInt(u64, bytes[17..25], native.namespace.range_id, .little);
+    std.mem.writeInt(u64, bytes[25..33], native.sequence, .little);
+    hash.update(&bytes);
+}
+
+pub fn requireCapturedPosition(receipt: anytype, descriptor: ?persistence.Descriptor, namespace: identity.Namespace) !void {
+    const stamp = try receiptPosition(receipt);
+    try stamp.requireNamespace(namespace);
+    if (descriptor) |native| {
+        const proof = receipt.native_proof orelse return error.InvalidGenerationPublication;
+        const pin = proof.native_pin orelse return error.InvalidGenerationPublication;
+        const fingerprint = receipt.native_descriptor_fingerprint orelse return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, &fingerprint, &try native.fingerprint())) return error.InvalidGenerationPublication;
+        if (stamp != .native or pin.data_generation != native.data_generation or pin.table_id != namespace.table_id or pin.shard_id != namespace.shard_id or pin.range_id != namespace.range_id or
+            proof.identity.node_id != native.owner_node_id or proof.identity.store_id != native.owner_store_id) return error.InvalidGenerationPublication;
+    } else if (stamp != .raft or receipt.native_proof != null) return error.InvalidGenerationPublication;
+}
+
 pub const Action = enum { stage, activate, acknowledge, cancel };
 
 /// A child owner first fences old-generation writes, then installs the exact
@@ -135,28 +182,33 @@ pub const SourceReceipt = struct {
     after_catalog_digest: integrity.Digest,
     applied_term: u64,
     applied_index: u64,
+    native_position: ?receipt_position.Native = null,
+    native_proof: ?NativeProof = null,
+    native_descriptor_fingerprint: ?[32]u8 = null,
+    native_boot: ?NativeBoot = null,
 
     reference_coverage_ready: bool = false,
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return (std.mem.eql(u8, field, "native_position") and self.native_position == null) or
+            (std.mem.eql(u8, field, "native_proof") and self.native_proof == null) or
+            (std.mem.eql(u8, field, "native_descriptor_fingerprint") and self.native_descriptor_fingerprint == null) or
+            (std.mem.eql(u8, field, "native_boot") and self.native_boot == null) or
+            (std.mem.eql(u8, field, "reference_coverage_ready") and !self.reference_coverage_ready) or
+            (std.mem.eql(u8, field, "document_source") and !self.document_source);
+    }
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            if (comptime std.mem.eql(u8, field, "document_source")) {
-                if (self.document_source) {
-                    try writer.objectField(field);
-                    try writer.write(true);
-                }
-            } else if (comptime !std.mem.eql(u8, field, "reference_coverage_ready")) {
+            if (!self.nativeJsonSkipField(field)) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
-            } else if (self.reference_coverage_ready) {
-                try writer.objectField(field);
-                try writer.write(true);
             }
         }
         try writer.endObject();
     }
 
     pub fn validate(self: SourceReceipt, request: SourceRequest) !void {
+        _ = try self.position();
         if (self.reference_coverage_ready and self.action != .install) return error.InvalidGenerationPublication;
         if (!std.mem.eql(u8, &self.plan_id, &request.plan_id) or
             self.child_table_id != request.child_table_id or
@@ -165,7 +217,6 @@ pub const SourceReceipt = struct {
             (if (self.document_source) self.action != .fence or self.after_schema_version != self.before_schema_version or
                 !std.mem.eql(u8, &self.before_schema_digest, &self.after_schema_digest) or
                 !std.mem.eql(u8, &self.before_catalog_digest, &self.after_catalog_digest) else self.after_schema_version <= self.before_schema_version) or
-            self.applied_term == 0 or self.applied_index == 0 or
             std.mem.allEqual(u8, &self.plan_digest, 0) or
             std.mem.allEqual(u8, &self.fence_digest, 0) or
             std.mem.allEqual(u8, &self.before_schema_digest, 0) or
@@ -173,6 +224,10 @@ pub const SourceReceipt = struct {
             std.mem.allEqual(u8, &self.before_catalog_digest, 0) or
             std.mem.allEqual(u8, &self.after_catalog_digest, 0))
             return error.InvalidGenerationPublication;
+    }
+
+    pub fn position(self: @This()) !receipt_position.Position {
+        return receiptPosition(self);
     }
 
     pub fn digest(self: SourceReceipt) integrity.Digest {
@@ -197,6 +252,17 @@ pub const SourceReceipt = struct {
         hash.update(&self.after_catalog_digest);
         if (self.document_source) hash.update("document-retirement-source/v1");
         if (self.reference_coverage_ready) hash.update("reference-coverage-ready/v1");
+        if (self.native_position) |native| {
+            hash.update("native-fk-position/v1\x00");
+            hashNativePosition(&hash, native);
+            if (self.native_descriptor_fingerprint) |fingerprint| hash.update(&fingerprint);
+            if (self.native_boot) |boot| {
+                var generation: [8]u8 = undefined;
+                std.mem.writeInt(u64, &generation, boot.generation, .little);
+                hash.update(&generation);
+                hash.update(&boot.instance);
+            }
+        }
         var result: integrity.Digest = undefined;
         hash.final(&result);
         return result;
@@ -229,33 +295,45 @@ pub const Receipt = struct {
     decision_digest: integrity.Digest,
     applied_term: u64,
     applied_index: u64,
+    native_position: ?receipt_position.Native = null,
+    native_proof: ?NativeProof = null,
+    native_descriptor_fingerprint: ?[32]u8 = null,
+    native_boot: ?NativeBoot = null,
 
     reference_coverage_ready: bool = false,
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return (std.mem.eql(u8, field, "native_position") and self.native_position == null) or
+            (std.mem.eql(u8, field, "native_proof") and self.native_proof == null) or
+            (std.mem.eql(u8, field, "native_descriptor_fingerprint") and self.native_descriptor_fingerprint == null) or
+            (std.mem.eql(u8, field, "native_boot") and self.native_boot == null) or
+            (std.mem.eql(u8, field, "reference_coverage_ready") and !self.reference_coverage_ready);
+    }
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            if (comptime !std.mem.eql(u8, field, "reference_coverage_ready")) {
+            if (!self.nativeJsonSkipField(field)) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
-            } else if (self.reference_coverage_ready) {
-                try writer.objectField(field);
-                try writer.write(true);
             }
         }
         try writer.endObject();
     }
 
     pub fn validate(self: Receipt, request: Request) !void {
+        _ = try self.position();
         if (self.reference_coverage_ready and self.action != .acknowledge) return error.InvalidGenerationPublication;
         if (!std.mem.eql(u8, &self.plan_id, &request.plan_id) or
             self.parent_table_id != request.parent_table_id or
             self.parent_group_id != request.parent_group_id or
             self.child_table_id != request.child_table_id or
             self.action != request.action or
-            self.applied_term == 0 or self.applied_index == 0 or
             std.mem.allEqual(u8, &self.transitions_digest, 0) or
             std.mem.allEqual(u8, &self.decision_digest, 0))
             return error.InvalidGenerationPublication;
+    }
+
+    pub fn position(self: @This()) !receipt_position.Position {
+        return receiptPosition(self);
     }
 
     pub fn digest(self: Receipt) integrity.Digest {
@@ -271,6 +349,17 @@ pub const Receipt = struct {
         hash.update(&self.transitions_digest);
         hash.update(&self.decision_digest);
         if (self.reference_coverage_ready) hash.update("reference-coverage-ready/v1");
+        if (self.native_position) |native| {
+            hash.update("native-fk-position/v1\x00");
+            hashNativePosition(&hash, native);
+            if (self.native_descriptor_fingerprint) |fingerprint| hash.update(&fingerprint);
+            if (self.native_boot) |boot| {
+                var generation: [8]u8 = undefined;
+                std.mem.writeInt(u64, &generation, boot.generation, .little);
+                hash.update(&generation);
+                hash.update(&boot.instance);
+            }
+        }
         var result: integrity.Digest = undefined;
         hash.final(&result);
         return result;
@@ -443,4 +532,89 @@ test "FK generation schema Raft command keeps canonical JSON bytes on wire" {
     var parsed = try std.json.parseFromSlice(topology.Command, alloc, encoded, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings(schema_json, parsed.value.child_schema_install.?.schema_json);
+}
+
+test "SQL relation lifetime FK receipts bind actual native position descriptor and enrolled signer" {
+    const a = std.testing.allocator;
+    const seed: [32]u8 = @splat(7);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const root: @import("antfly_local_sources").storage_db_root_signing_identity.State = .{ .root_incarnation = 11, .seed = seed, .public_key = pair.public_key.toBytes() };
+    const native: persistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(1), .data_generation = 3 };
+    const pin: persistence.PhysicalPin = .{ .physical_root_incarnation = 99, .table_id = 7, .shard_id = 17, .range_id = 27, .data_generation = 3 };
+    const enrolled: @import("../metadata/store_root_enrollment.zig").Identity = .{ .metadata_incarnation = @splat('a'), .node_id = 9, .store_id = 11, .root_incarnation = root.root_incarnation, .public_key = root.public_key };
+    const template: NativeProof = .{ .identity = enrolled, .reporter_incarnation = 3, .authority = .{ .native = try @import("../metadata/sql_relation_attestation.zig").nativeAuthorityDigest(enrolled, pin) }, .native_pin = pin, .root_generation = 1, .signature = @splat(0) };
+    const request: SourceRequest = .{ .plan_id = @splat(2), .child_table_id = 7, .child_table_name = "native", .child_group_id = 17, .action = .fence };
+    var receipt: SourceReceipt = .{ .plan_id = request.plan_id, .child_table_id = 7, .child_group_id = 17, .action = .fence, .plan_digest = @splat(3), .fence_digest = @splat(4), .before_schema_version = 1, .before_schema_digest = @splat(5), .before_catalog_digest = @splat(6), .after_schema_version = 2, .after_schema_digest = @splat(7), .after_catalog_digest = @splat(8), .applied_term = 0, .applied_index = 0, .native_position = .{ .namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 27 }, .sequence = 9 }, .native_descriptor_fingerprint = try native.fingerprint(), .native_boot = .{ .generation = 2, .instance = @splat(1) } };
+    receipt.native_proof = try template.sign(root, receipt.digest());
+    try receipt.validate(request);
+    try requireCapturedPosition(receipt, native, receipt.native_position.?.namespace);
+    var current_boot: @import("../metadata/sql_relation_boots.zig").Record = .{ .node_id = enrolled.node_id, .identity = enrolled, .reporter_incarnation = template.reporter_incarnation, .generation = 2, .instance = @splat(1), .claim_digest = @splat(2), .unclean_restart = false, .phase = .ready };
+    try receipt.native_boot.?.requireCurrent(current_boot);
+    current_boot.generation += 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, receipt.native_boot.?.requireCurrent(current_boot));
+    current_boot.generation -= 1;
+    current_boot.instance = @splat(9);
+    try std.testing.expectError(error.InvalidGenerationPublication, receipt.native_boot.?.requireCurrent(current_boot));
+    current_boot.instance = @splat(1);
+    current_boot.phase = .draining;
+    try std.testing.expectError(error.InvalidGenerationPublication, receipt.native_boot.?.requireCurrent(current_boot));
+    const bytes = try std.json.Stringify.valueAlloc(a, receipt, .{});
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(SourceReceipt, a, bytes, .{});
+    defer parsed.deinit();
+    try parsed.value.validate(request);
+    var altered = receipt;
+    altered.native_position.?.sequence += 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, altered.validate(request));
+    altered = receipt;
+    altered.applied_term = 1;
+    try std.testing.expectError(error.InvalidControlReceiptPosition, altered.validate(request));
+    altered = receipt;
+    altered.native_descriptor_fingerprint.?[0] ^= 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, altered.validate(request));
+    var successor = native;
+    successor.generation_instance = @splat(9);
+    try std.testing.expectError(error.InvalidGenerationPublication, requireCapturedPosition(receipt, successor, receipt.native_position.?.namespace));
+    try std.testing.expectError(error.InvalidGenerationPublication, requireCapturedPosition(receipt, null, receipt.native_position.?.namespace));
+    var ordinary = receipt;
+    ordinary.native_position = null;
+    ordinary.native_proof = null;
+    ordinary.native_descriptor_fingerprint = null;
+    ordinary.native_boot = null;
+    ordinary.applied_term = 1;
+    ordinary.applied_index = 2;
+    try ordinary.validate(request);
+    const previous = try std.json.Stringify.valueAlloc(a, .{ .plan_id = ordinary.plan_id, .child_table_id = ordinary.child_table_id, .child_group_id = ordinary.child_group_id, .action = ordinary.action, .plan_digest = ordinary.plan_digest, .fence_digest = ordinary.fence_digest, .before_schema_version = ordinary.before_schema_version, .before_schema_digest = ordinary.before_schema_digest, .before_catalog_digest = ordinary.before_catalog_digest, .after_schema_version = ordinary.after_schema_version, .after_schema_digest = ordinary.after_schema_digest, .after_catalog_digest = ordinary.after_catalog_digest, .applied_term = ordinary.applied_term, .applied_index = ordinary.applied_index }, .{});
+    defer a.free(previous);
+    const current = try std.json.Stringify.valueAlloc(a, ordinary, .{});
+    defer a.free(current);
+    try std.testing.expectEqualStrings(previous, current);
+}
+
+/// Private source-control result: the actual fence was installed, but its
+/// native transaction/lock custody is still draining. This grants no receipt.
+pub const source_draining_error_json = "{\"error_code\":\"transaction_topology_busy\"}";
+pub fn isSourceDrainingFailure(status: u16, body: []const u8) bool {
+    return status == 503 and std.mem.eql(u8, body, source_draining_error_json);
+}
+test "SQL relation lifetime source draining transport preserves only exact actual busy diagnosis" {
+    try std.testing.expect(isSourceDrainingFailure(503, source_draining_error_json));
+    try std.testing.expect(!isSourceDrainingFailure(200, source_draining_error_json));
+    try std.testing.expect(!isSourceDrainingFailure(503, "FK generation source unavailable"));
+    try std.testing.expect(!isSourceDrainingFailure(503, "{\"error_code\":\"another_failure\"}"));
+}
+
+pub fn requireDrainedSource(status: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Status, expected: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence) !void {
+    if (status.fence == null or !status.fence.?.eql(expected)) return error.GenerationAdmissionPending;
+    if (!status.drained) return error.TransactionTopologyBusy;
+}
+test "SQL relation lifetime source draining requires the exact installed fence before exposing cleanup" {
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+    const fence: topology.Fence = .{ .transition_id = 1, .attempt = 1, .peer_group_id = 2, .owner_group_id = 2, .role = .document_retirement_source, .namespace = .{ .table_id = 3, .shard_id = 2, .range_id = 2 }, .catalog_digest = @splat(4) };
+    try std.testing.expectError(error.GenerationAdmissionPending, requireDrainedSource(.{ .fence = null, .drained = false }, fence));
+    var wrong = fence;
+    wrong.attempt += 1;
+    try std.testing.expectError(error.GenerationAdmissionPending, requireDrainedSource(.{ .fence = wrong, .drained = false }, fence));
+    try std.testing.expectError(error.TransactionTopologyBusy, requireDrainedSource(.{ .fence = fence, .drained = false }, fence));
+    try requireDrainedSource(.{ .fence = fence, .drained = true }, fence);
 }

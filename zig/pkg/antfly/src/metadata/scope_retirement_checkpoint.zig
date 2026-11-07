@@ -27,8 +27,8 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
     const base = try ledger.prefix(&base_buffer, group);
     // The sibling member/queue/counter namespaces share this exact stem.
     const stem = base[0 .. base.len - 1];
-    var expected: [12]u64 = @splat(0); // body, member, queue, cancellation outcome/link, view edges, children, drain outcome/link
-    var received: [12]u64 = @splat(0);
+    var expected: [13]u64 = @splat(0); // body, member, queue, cancellation outcome/link, view edges, children, drain outcome/link
+    var received: [13]u64 = @splat(0);
     var heads: u64 = 0;
     var maximum_sequence: u64 = 0;
     var counter: ?u64 = null;
@@ -81,7 +81,12 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
             try outcome.validate();
             if (outcome.query.lookup.group != group or !std.mem.eql(u8, row.key, try wire.outcomeKey(&buffer, outcome.query))) return error.InvalidScopeRetirement;
             try (wire.Observation{ .outcome = outcome, .current = try ledger.head(reader, outcome.query.lookup) }).requireFor(outcome.query);
-            if (outcome.result == .accepted) switch (outcome.result.accepted.progress.phase) {
+            if (outcome.result == .accepted and outcome.native_operation == .source_lost) {
+                const child = (try ledger.child(reader, outcome.query.lookup, outcome.loss_ordinal.?)) orelse return error.InvalidScopeRetirement;
+                const checkpoint = (try @import("temporary_relation_retirement.zig").read(reader, child)) orelse return error.InvalidScopeRetirement;
+                if (outcome.result.accepted.native_losses == null or outcome.result.accepted.native_losses.?.count < checkpoint.sequence) return error.InvalidScopeRetirement;
+                try @import("temporary_relation_retirement.zig").verifySummary(reader, outcome.query.lookup, outcome.result.accepted.native_losses);
+            } else if (outcome.result == .accepted) switch (outcome.result.accepted.progress.phase) {
                 .draining_connections => if (!std.mem.eql(u8, &outcome.query.nonce, &outcome.query.lookup.reference.id)) return error.InvalidScopeRetirement,
                 .canceled, .published => {
                     if (!std.meta.eql(try wire.terminalQuery(reader, outcome.query.lookup), outcome.query)) return error.InvalidScopeRetirement;
@@ -118,6 +123,22 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
             const head = (try ledger.head(reader, query.lookup)) orelse return error.InvalidScopeRetirement;
             if (head.progress.phase != .canceled and head.progress.phase != .published) return error.InvalidScopeRetirement;
             try increment(&received[4], 1);
+        } else if (try @import("abandoned_temporary_retirement.zig").verifyAuxiliary(backing, reader, row.key, row.value)) {
+            // Individual old participant bodies and scoped completion records
+            // remain owned by their original immutable abandonment checkpoint.
+        } else if (std.mem.startsWith(u8, suffix, ":") and std.mem.endsWith(u8, suffix, ":temporary_abandonment")) {
+            var saved_key: [320]u8 = undefined;
+            if (row.key.len > saved_key.len) return error.InvalidScopeRetirement;
+            @memcpy(saved_key[0..row.key.len], row.key);
+            const archive_key = saved_key[0..row.key.len];
+            const archive = @import("abandoned_temporary_retirement.zig");
+            const checkpoint = try archive.Record.decode(row.value);
+            try checkpoint.validate();
+            const owned = (try ledger.head(reader, checkpoint.lookup)) orelse return error.InvalidScopeRetirement;
+            if (owned.temporary_abandonment == null or checkpoint.lookup.group != group or
+                !std.mem.eql(u8, archive_key, try ledger.key(&buffer, checkpoint.lookup, .temporary_abandonment))) return error.InvalidScopeRetirement;
+            try archive.verifyHead(backing, reader, owned);
+            try increment(&received[12], 1);
         } else if (std.mem.startsWith(u8, suffix, ":") and std.mem.endsWith(u8, suffix, ":manifest")) {
             // A corresponding head must read this exact canonical key below.
             try increment(&received[0], 1);
@@ -126,6 +147,11 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
             try head.validate();
             if (head.lookup.group != group or !std.mem.eql(u8, row.key, try ledger.key(&buffer, head.lookup, .head))) return error.InvalidScopeRetirement;
             try context.verifyHead(reader, head);
+            if (head.temporary_abandonment != null) {
+                try @import("abandoned_temporary_retirement.zig").verifyHead(backing, reader, head);
+                try increment(&expected[12], 1);
+            }
+            try @import("temporary_relation_retirement.zig").verifyHead(backing, reader, head);
             try increment(&heads, 1);
             maximum_sequence = @max(maximum_sequence, head.sequence);
             // Every admitted head has its original, atomically retained result.
@@ -133,13 +159,18 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
             try admitted.validate();
             var initial = head;
             initial.progress = .{ .reference = head.lookup.reference };
+            initial.native_losses = null;
+            if (head.native_loss_requested != (admitted.native_operation == .reserve_lost_temporary)) return error.InvalidScopeRetirement;
+            if ((head.temporary_abandonment != null) != (admitted.native_operation == .reserve_abandoned_temporary)) return error.InvalidScopeRetirement;
             if (admitted.result != .accepted or !std.meta.eql(admitted.query.lookup, head.lookup) or
                 !std.meta.eql(admitted.result.accepted, initial)) return error.InvalidScopeRetirement;
             // Drainage has its own exact native outcome. No physical child
             // progress is admitted by that receipt or by a journal phase.
             switch (head.progress.phase) {
                 .draining_connections => {
-                    if (!std.meta.eql(head, initial)) return error.InvalidScopeRetirement;
+                    var expected_head = initial;
+                    expected_head.native_losses = head.native_losses;
+                    if (!std.meta.eql(head, expected_head)) return error.InvalidScopeRetirement;
                     if (try ledger.sourceCursor(reader, head.lookup)) |cursor| {
                         if (!head.force) return error.InvalidScopeRetirement;
                         try context.verifySourceCursor(reader, head, cursor);
@@ -162,7 +193,11 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
                     const query = try wire.drainQuery(reader, head.lookup);
                     const outcome = try wire.OutcomeRecord.decode(try reader.get(try wire.outcomeKey(&buffer, query)));
                     try outcome.validate();
-                    if (!std.meta.eql(outcome.query, query) or outcome.result != .accepted or !std.meta.eql(outcome.result.accepted, drained)) return error.InvalidScopeRetirement;
+                    if (!std.meta.eql(outcome.query, query) or outcome.result != .accepted) return error.InvalidScopeRetirement;
+                    drained.native_losses = outcome.result.accepted.native_losses;
+                    try @import("temporary_relation_retirement.zig").verifySummary(reader, head.lookup, drained.native_losses);
+                    if (!std.meta.eql(outcome.result.accepted, drained) or
+                        (head.native_loss_requested and (if (drained.native_losses) |losses| losses.count else 0) != head.lookup.reference.tables)) return error.InvalidScopeRetirement;
                     try context.verifyDrained(reader, head);
                     try increment(&expected[7], 1);
                     try increment(&expected[8], 1);
@@ -172,7 +207,11 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
                         const child_query = try wire.childQuery(reader, head.lookup, @intCast(ordinal));
                         const child_outcome = try wire.OutcomeRecord.decode(try reader.get(try wire.outcomeKey(&buffer, child_query)));
                         try child_outcome.validate();
-                        if (!std.meta.eql(child_outcome.query, child_query) or child_outcome.result != .accepted or !std.meta.eql(child_outcome.result.accepted, completed)) return error.InvalidScopeRetirement;
+                        if (!std.meta.eql(child_outcome.query, child_query) or child_outcome.result != .accepted) return error.InvalidScopeRetirement;
+                        if (completed.native_losses) |prior| if (child_outcome.result.accepted.native_losses == null or child_outcome.result.accepted.native_losses.?.count < prior.count) return error.InvalidScopeRetirement;
+                        completed.native_losses = child_outcome.result.accepted.native_losses;
+                        try @import("temporary_relation_retirement.zig").verifySummary(reader, head.lookup, completed.native_losses);
+                        if (!std.meta.eql(child_outcome.result.accepted, completed)) return error.InvalidScopeRetirement;
                         try context.verifyChildReady(reader, head, @intCast(ordinal));
                         try increment(&expected[10], 1);
                         try increment(&expected[11], 1);
@@ -186,6 +225,8 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
                         try increment(&expected[3], 1);
                         try increment(&expected[4], 1);
                     }
+                    if (completed.native_losses) |prior| if (head.native_losses == null or head.native_losses.?.count < prior.count) return error.InvalidScopeRetirement;
+                    completed.native_losses = head.native_losses;
                     if (!std.meta.eql(completed, head)) return error.InvalidScopeRetirement;
                 },
             }
@@ -200,7 +241,8 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
                 if (!std.meta.eql(prepared.lookup, head.lookup) or
                     !std.mem.eql(u8, prepared.encoded, body.?) or
                     !std.mem.eql(u8, &prepared.manifest.metadata_incarnation, &head.metadata_incarnation) or
-                    !prepared.manifest.creator.eql(head.creator) or !std.mem.eql(u8, &prepared.manifest.scope.labelsDigest(), &head.target_digest) or prepared.manifest.force != head.force) return error.InvalidScopeRetirement;
+                    !prepared.manifest.creator.eql(head.creator) or !std.mem.eql(u8, &prepared.manifest.scope.labelsDigest(), &head.target_digest) or
+                    !std.meta.eql(head.temporary_owner, if (prepared.manifest.scope.namespace) |namespace| namespace.sql_temporary_owner else null) or prepared.manifest.force != head.force) return error.InvalidScopeRetirement;
                 if (head.progress.phase == .published) {
                     try context.verifyPublished(reader, head, prepared.manifest);
                     try increment(&expected[0], 1);
@@ -241,6 +283,7 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
             }
         } else return error.InvalidScopeRetirement;
     }
+    try @import("temporary_relation_retirement.zig").verifyDirectory(backing, reader, group, rows, canceled);
     // Inactive catalogs pay no lease lookup per unrelated FK/view edge. While
     // a scope is active, one reverse pass proves no dependent escaped its cut.
     if (expected[1] != 0) {

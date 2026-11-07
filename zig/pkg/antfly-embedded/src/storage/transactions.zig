@@ -39,6 +39,7 @@ const ttl = @import("ttl.zig");
 const retained_effects = @import("retained_effects.zig");
 pub const topology_debt = @import("transaction_debt.zig");
 pub const ExternalDecisionOwner = @import("transaction_decision_owner.zig").External;
+pub const NativePhysicalPin = @import("../common/relation_persistence.zig").PhysicalPin;
 
 // ============================================================================
 // Key prefixes
@@ -312,6 +313,7 @@ pub const TxnStatus = enum(u8) {
 };
 
 pub const WriteIntent = struct {
+    prepared_graph_effects: ?[]const u8 = null,
     /// Transient internal origin marker, consumed by canonical AROW materialization
     /// before voting prepared. It is never an alternative journal value format.
     prepared_domain: ?*const @import("../schema/domain_handoff.zig").Contract = null,
@@ -335,12 +337,17 @@ pub const WriteIntent = struct {
 };
 
 pub const IntentValue = struct {
+    prepared_graph_effects: ?[]const u8 = null,
     row_policy_requirement: @import("../usermgr/row_policy_authority.zig").MutationRequirement = .native,
     value: ?[]const u8,
     prepared_row: ?[]const u8 = null,
 
     pub fn decode(bytes: []const u8) !IntentValue {
-        if (bytes.len == 0) return error.InvalidTxnRecord;
+        return decodeAt(bytes, 0);
+    }
+
+    fn decodeAt(bytes: []const u8, depth: u8) !IntentValue {
+        if (depth > 2 or bytes.len == 0) return error.InvalidTxnRecord;
         return switch (bytes[0]) {
             0 => .{ .value = bytes[1..] },
             1 => if (bytes.len == 1) .{ .value = null } else error.InvalidTxnRecord,
@@ -354,12 +361,57 @@ pub const IntentValue = struct {
                 if (bytes.len < 3 or bytes[2] > 2) return error.InvalidTxnRecord;
                 const requirement = std.enums.fromInt(@import("../usermgr/row_policy_authority.zig").MutationRequirement, bytes[1]) orelse return error.InvalidTxnRecord;
                 if (requirement == .native) return error.InvalidTxnRecord;
-                var value = try decode(bytes[2..]);
+                var value = try decodeAt(bytes[2..], depth + 1);
+                if (value.row_policy_requirement != .native) return error.InvalidTxnRecord;
                 value.row_policy_requirement = requirement;
                 break :blk value;
             },
+            4 => blk: {
+                if (bytes.len < 7) return error.InvalidTxnRecord;
+                const length = std.mem.readInt(u32, bytes[1..5], .little);
+                if (length == 0 or length > @import("db/prepared_graph_effects.zig").max_encoded_bytes or length >= bytes.len - 5) return error.InvalidTxnRecord;
+                var base = try decodeAt(bytes[5 + length ..], depth + 1);
+                if (base.value == null or base.prepared_graph_effects != null) return error.InvalidTxnRecord;
+                base.prepared_graph_effects = bytes[5..][0..length];
+                break :blk base;
+            },
             else => error.InvalidTxnRecord,
         };
+    }
+
+    pub fn encode(alloc: Allocator, intent: WriteIntent) ![]u8 {
+        const policy: usize = if (intent.row_policy_requirement == .native) 0 else 2;
+        const graph: usize = if (intent.prepared_graph_effects) |effects| 5 + effects.len else 0;
+        if (intent.prepared_graph_effects) |effects| {
+            if (intent.value == null or effects.len == 0 or effects.len > @import("db/prepared_graph_effects.zig").max_encoded_bytes) return error.InvalidPreparedGraphEffects;
+        }
+        const base_len = if (intent.value) |v| if (intent.prepared_row) |row| 5 + v.len + row.len else 1 + v.len else 1;
+        const bytes = try alloc.alloc(u8, graph + policy + base_len);
+        errdefer alloc.free(bytes);
+        const base = bytes[graph..];
+        if (policy != 0) {
+            base[0] = 3;
+            base[1] = @backingInt(intent.row_policy_requirement);
+        }
+        const payload = base[policy..];
+        if (intent.value) |v| {
+            if (intent.prepared_row) |row| {
+                const json_len = std.math.cast(u32, v.len) orelse return error.TransactionTooLarge;
+                payload[0] = 2;
+                std.mem.writeInt(u32, payload[1..5], json_len, .little);
+                @memcpy(payload[5..][0..v.len], v);
+                @memcpy(payload[5 + v.len ..], row);
+            } else {
+                payload[0] = 0;
+                @memcpy(payload[1..], v);
+            }
+        } else payload[0] = 1;
+        if (intent.prepared_graph_effects) |effects| {
+            bytes[0] = 4;
+            std.mem.writeInt(u32, bytes[1..5], @intCast(effects.len), .little);
+            @memcpy(bytes[5..][0..effects.len], effects);
+        }
+        return bytes;
     }
 };
 
@@ -369,7 +421,8 @@ pub const IntentValue = struct {
 /// worst case. Limits apply across prepares; replacing a key releases credits.
 pub fn intentAdmissionBytes(intent: WriteIntent) !u64 {
     var payload: u64 = (if (intent.value) |value| value.len else 0) +
-        (if (intent.prepared_row) |row| row.len else 0);
+        (if (intent.prepared_row) |row| row.len else 0) +
+        (if (intent.prepared_graph_effects) |effects| effects.len else 0);
     for (intent.json_null_fields) |field| payload = std.math.add(u64, payload, field.len + @sizeOf([]const u8)) catch return error.TransactionTooLarge;
     const bytes = payload;
     const keys = std.math.mul(u64, intent.key.len, 16) catch return error.TransactionTooLarge;
@@ -495,11 +548,21 @@ fn readPredicateIdentity(predicate: VersionPredicate, out: *[33]u8) []const u8 {
     }
 }
 
+/// First-native-root admission must not re-attest a stale image that has
+/// already accepted transaction work, even when its rows are still invisible.
+pub fn hasAnyTransactionStateInView(read: anytype) !bool {
+    return try readHasPrefix(read, records_prefix) or try readHasPrefix(read, intents_prefix) or
+        try readHasPrefix(read, intent_locks_prefix) or try readHasPrefix(read, read_guards_prefix) or
+        try readHasPrefix(read, read_members_prefix) or try readHasPrefix(read, hot_standby_batch_outbox_prefix) or
+        try readHasPrefix(read, hot_standby_replay_outbox_prefix);
+}
+
 /// Compact native decision state for control journals that share this 2PC
 /// owner. Read it through the accepting write transaction, without materializing
 /// plans or sampling a different snapshot while transferring resource custody.
 pub const ExternalParticipant = struct {
     owner: ?ExternalDecisionOwner,
+    native_pin: ?NativePhysicalPin = null,
     status: TxnStatus,
     prepared: bool,
     commit_version: u64,
@@ -510,7 +573,18 @@ pub fn externalParticipant(txn: anytype, id: TxnId) !?ExternalParticipant {
         else => return err,
     };
     const record = try decodeRecord(bytes);
-    return .{ .owner = record.external_decision_owner, .status = record.status, .prepared = record.prepared, .commit_version = record.commit_version };
+    return .{ .owner = record.external_decision_owner, .native_pin = record.native_pin, .status = record.status, .prepared = record.prepared, .commit_version = record.commit_version };
+}
+
+/// Phase-two lock cleanup under a topology fence must follow actual row
+/// intent resolution, read from the SAME accepting writer as that cleanup.
+pub fn requireResolvedExternalLockControl(txn: anytype, id: TxnId) !void {
+    const bytes = txn.get(&makeRecordKey(id)) catch |err| switch (err) {
+        error.NotFound => return error.ExternalTransactionDecisionChanged,
+        else => return err,
+    };
+    const record = try decodeRecord(bytes);
+    if (record.external_decision_owner == null or record.status == .pending or !record.intents_resolved_known or !record.intents_resolved) return error.LockOwnerBusy;
 }
 
 pub const TxnError = error{
@@ -553,9 +627,23 @@ pub const TxnSummary = struct {
     coordinator_known: bool,
     retain_terminal: bool = false,
     external_decision_owner: ?ExternalDecisionOwner = null,
+    native_pin: ?NativePhysicalPin = null,
     external_commit_started: bool = false,
     intents_resolved: bool = false,
     intents_resolved_known: bool = false,
+};
+
+/// Owned same-apply snapshot for exact existing native retention custody.
+pub const ExternalRetentionSnapshot = struct {
+    status: TxnStatus,
+    coordinator: bool,
+    prepared: bool,
+    intents_resolved: bool,
+    participants: [][]u8,
+    pub fn deinit(self: *ExternalRetentionSnapshot, a: Allocator) void {
+        freeParticipantList(a, self.participants);
+        self.* = undefined;
+    }
 };
 
 pub const TxnSummaryPage = struct {
@@ -564,7 +652,9 @@ pub const TxnSummaryPage = struct {
 };
 
 pub const ResolutionExtraBatch = struct {
+    prepared_graph_effects_checked: bool = false,
     external_decision_owner: ?ExternalDecisionOwner = null,
+    native_pin: ?NativePhysicalPin = null,
     /// Borrowed through this resolution attempt. Terminal-decision retries do
     /// not attach it: they must never re-certify already applied row effects.
     commit_participant: ?@import("commit_participant.zig").Participant = null,
@@ -602,6 +692,7 @@ pub const ResolutionExtraBatch = struct {
 /// entry without a crash window between the transaction and its replay marker.
 pub const MutationExtraBatch = struct {
     external_decision_owner: ?ExternalDecisionOwner = null,
+    native_pin: ?NativePhysicalPin = null,
     writes: []const docstore.KVPair = &.{},
     deletes: []const []const u8 = &.{},
     /// DB preparation supplies a binding (including explicit schemaless).
@@ -656,12 +747,14 @@ pub const IntentBatch = struct {
     revision: u64 = 0,
     schema_binding: ?SchemaBinding = null,
     prepared_rows: []?[]const u8 = &.{},
+    prepared_graph_effects: []?[]const u8 = &.{},
     // Primary slices borrow this owned snapshot. Do not duplicate every
     // payload merely to strip the one-byte intent envelope.
     owned_entries: ?[]backend_scan.OwnedKVPair = null,
 
     pub fn deinit(self: *IntentBatch, alloc: Allocator) void {
         if (self.prepared_rows.len != 0) alloc.free(self.prepared_rows);
+        if (self.prepared_graph_effects.len != 0) alloc.free(self.prepared_graph_effects);
         if (self.owned_entries) |entries| {
             backend_scan.freeResults(alloc, entries);
             alloc.free(self.writes);
@@ -697,6 +790,7 @@ const TxnRecord = struct {
     /// A prepared external coordinator retains its vote until the exact
     /// metadata decision owner explicitly resolves it. Age is not a decision.
     external_decision_owner: ?ExternalDecisionOwner = null,
+    native_pin: ?NativePhysicalPin = null,
     external_commit_started: bool = false,
     /// Older encodings did not persist the prepare vote. Recovery treats
     /// distributed records from those versions conservatively rather than
@@ -733,6 +827,7 @@ const txn_record_v4_size = 51;
 const txn_record_v5_size = 52;
 const txn_record_v6_size = 53;
 const txn_record_v7_size = txn_record_v6_size + ExternalDecisionOwner.encoded_len + 1;
+const txn_record_v8_size = txn_record_v7_size + NativePhysicalPin.encoded_len;
 
 // ============================================================================
 // TxnManager
@@ -800,6 +895,7 @@ pub const TxnManager = struct {
     store: backend_erased.Store,
     owns_store: bool,
     alloc: Allocator,
+    native_relation_pin: ?NativePhysicalPin = null,
     trace_writer: ?tracing.AntflyTraceWriter = null,
     shard_id: []const u8 = "local",
 
@@ -821,6 +917,7 @@ pub const TxnManager = struct {
             .alloc = alloc,
             .store = runtime_store.store,
             .owns_store = runtime_store.owned,
+            .native_relation_pin = nativePinForStore(store),
             .trace_writer = if (comptime build_options.with_tla) stderr_writer.stderrAntflyTraceWriter() else null,
         };
     }
@@ -954,6 +1051,7 @@ pub const TxnManager = struct {
         retain_terminal: bool,
         extra_batch: MutationExtraBatch,
     ) !void {
+        try self.requireNativeMutationPin(extra_batch.native_pin);
         if (extra_batch.external_decision_owner) |owner| {
             try owner.validate();
             if (!retain_terminal) return error.ExternalTransactionDecisionRequired;
@@ -998,6 +1096,7 @@ pub const TxnManager = struct {
         }
         const record = TxnRecord{
             .external_decision_owner = extra_batch.external_decision_owner,
+            .native_pin = if (extra_batch.external_decision_owner != null) extra_batch.native_pin orelse self.native_relation_pin else null,
             .status = .pending,
             .begin_timestamp = timestamp,
             .commit_version = 0,
@@ -1073,8 +1172,13 @@ pub const TxnManager = struct {
         predicates: []const VersionPredicate,
         extra_batch: MutationExtraBatch,
     ) !void {
+        try self.requireNativeMutationPin(extra_batch.native_pin);
         if (extra_batch.index_span_digests.len > max_read_guards_per_transaction) return error.TransactionTooLarge;
         for (intents) |intent| {
+            if (intent.prepared_graph_effects) |effects| {
+                var parsed_effects = try @import("db/prepared_graph_effects.zig").decode(extra_batch.preparation_allocator orelse self.alloc, effects, intent.key);
+                defer parsed_effects.deinit();
+            }
             if (intent.prepared_domain != null or (intent.json_null_fields.len != 0 and intent.prepared_row == null)) return error.PreparedIntentRequiresMaterialization;
         }
         var record = try self.loadTransactionRecord(txn_id);
@@ -1253,30 +1357,7 @@ pub const TxnManager = struct {
             // SQL provenance prefixes the existing immutable value envelope.
             // It is committed atomically with the prepare vote and survives
             // journal replay, restart and replacement of the same intent key.
-            var val: []u8 = undefined;
-            const prefix: usize = if (intent.row_policy_requirement == .native) 0 else 2;
-            if (intent.value) |v| {
-                if (intent.prepared_row) |row| {
-                    const json_len = std.math.cast(u32, v.len) orelse return error.TransactionTooLarge;
-                    val = try self.alloc.alloc(u8, prefix + 5 + v.len + row.len);
-                    const payload = val[prefix..];
-                    payload[0] = 2;
-                    std.mem.writeInt(u32, payload[1..5], json_len, .little);
-                    @memcpy(payload[5..][0..v.len], v);
-                    @memcpy(payload[5 + v.len ..], row);
-                } else {
-                    val = try self.alloc.alloc(u8, prefix + 1 + v.len);
-                    val[prefix] = 0;
-                    @memcpy(val[prefix + 1 ..], v);
-                }
-            } else {
-                val = try self.alloc.alloc(u8, prefix + 1);
-                val[prefix] = 1; // is a delete
-            }
-            if (prefix != 0) {
-                val[0] = 3;
-                val[1] = @backingInt(intent.row_policy_requirement);
-            }
+            const val = try IntentValue.encode(self.alloc, intent);
             try appendOwnedBytes(self.alloc, &write_vals, val);
 
             try writes.append(self.alloc, .{ .key = intent_key, .value = val });
@@ -1308,6 +1389,27 @@ pub const TxnManager = struct {
         if (extra_batch.schema_binding != null)
             try writes.append(self.alloc, .{ .key = &schema_lease_key, .value = &schema_lease_value });
 
+        // The embedded reader fence is irreversible and committed with this
+        // exact vote. Older DB.open decoders reject ATBL5 before recovering or
+        // serving a root containing graph-bearing intent envelopes.
+        var graph_catalog: ?@import("db/table_catalog.zig").Encoded = null;
+        for (intents) |intent| if (intent.prepared_graph_effects != null) {
+            const table_catalog = @import("db/table_catalog.zig");
+            const current_bytes = self.getAlloc(self.alloc, table_catalog.key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (current_bytes) |bytes| self.alloc.free(bytes);
+            var current = if (current_bytes) |bytes| try table_catalog.Catalog.decode(bytes) else table_catalog.Catalog{};
+            for (extra_batch.writes) |write| if (std.mem.eql(u8, write.key, table_catalog.key)) return error.InvalidTxnRecord;
+            if (current.transaction_effect_format == 0) {
+                current.transaction_effect_format = 1;
+                graph_catalog = try current.encodeDurable();
+                try writes.append(self.alloc, .{ .key = table_catalog.key, .value = graph_catalog.?.slice() });
+            }
+            break;
+        };
+
         try writes.appendSlice(self.alloc, extra_batch.writes);
 
         try self.applyBatchWithReservation(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() });
@@ -1320,6 +1422,7 @@ pub const TxnManager = struct {
     /// before resolving the first. Existing coordinated read fences then see
     /// an old immutable cut, a retryable barrier, or fully committed rows.
     pub fn activateExternalDecision(self: *TxnManager, txn_id: TxnId, owner: ExternalDecisionOwner, extra: MutationExtraBatch) !void {
+        try self.requireNativeMutationPin(extra.native_pin);
         try owner.validate();
         var record = try self.loadTransactionRecord(txn_id);
         const held = record.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
@@ -1366,7 +1469,7 @@ pub const TxnManager = struct {
             return .{ .applied = false, .replay_sequence = 0 };
         }
         const key = makeRecordKey(id);
-        const record: TxnRecord = .{ .status = .aborted, .begin_timestamp = timestamp, .commit_version = 0, .created_at = timestamp, .finalized_at = timestamp, .retain_terminal = true, .intents_resolved = true, .intents_resolved_known = true, .external_decision_owner = owner };
+        const record: TxnRecord = .{ .status = .aborted, .begin_timestamp = timestamp, .commit_version = 0, .created_at = timestamp, .finalized_at = timestamp, .retain_terminal = true, .intents_resolved = true, .intents_resolved_known = true, .external_decision_owner = owner, .native_pin = extra.native_pin orelse self.native_relation_pin };
         const bytes = try self.encodeRecord(record);
         defer self.alloc.free(bytes);
         var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
@@ -1378,7 +1481,12 @@ pub const TxnManager = struct {
         defer if (participants) |value| self.alloc.free(value);
         if (participants) |value| {
             try writes.append(self.alloc, .{ .key = &participant_key, .value = value });
-            try writes.append(self.alloc, .{ .key = &resolved_key, .value = value });
+            // Native metadata-owned resolution is not the durable metadata
+            // handoff ACK. In particular ABORT may precede BEGIN and its reply
+            // may be lost after admission expiry. Keep the actual local roster
+            // unresolved until the existing explicit external ACK arrives.
+            if (record.native_pin == null)
+                try writes.append(self.alloc, .{ .key = &resolved_key, .value = value });
         }
         try writes.appendSlice(self.alloc, extra.completion_writes);
         try self.applyBatch(writes.items, extra.completion_deletes, null);
@@ -1400,6 +1508,7 @@ pub const TxnManager = struct {
         timestamp: u64,
         extra_batch: ResolutionExtraBatch,
     ) !ResolutionOutcome {
+        try self.requireNativeMutationPin(extra_batch.native_pin);
         const rec_key = makeRecordKey(txn_id);
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var record = self.loadTransactionRecord(txn_id) catch |err| {
@@ -1407,6 +1516,7 @@ pub const TxnManager = struct {
                 return self.fenceMissingExternalAbort(txn_id, timestamp, extra_batch);
             return err;
         };
+        const retain_metadata_ack = record.native_pin != null and record.external_decision_owner != null;
         var resolved_participant_key: [resolved_participants_prefix.len + 16]u8 = undefined;
         var resolved_participant_value: ?[]u8 = null;
         defer if (resolved_participant_value) |value| self.alloc.free(value);
@@ -1473,10 +1583,10 @@ pub const TxnManager = struct {
             var completion_writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
             defer completion_writes.deinit(self.alloc);
             try completion_writes.appendSlice(self.alloc, extra_batch.completion_writes);
-            try indexed_ack.append(self.alloc, &completion_writes);
-            if (resolved_participant_value) |value| {
+            if (!retain_metadata_ack) try indexed_ack.append(self.alloc, &completion_writes);
+            if (!retain_metadata_ack) if (resolved_participant_value) |value| {
                 try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
-            }
+            };
             if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0) {
                 try self.applyBatch(completion_writes.items, extra_batch.completion_deletes, null);
             }
@@ -1495,7 +1605,7 @@ pub const TxnManager = struct {
 
         if (extra_batch.captured_intents != null and extra_batch.expected_intent_revision == null) return error.InvalidArgument;
         const intent_entries = if (extra_batch.captured_intents) |entries| entries else if (extra_batch.known_intent_keys) |keys|
-            if (extra_batch.skip_all_intent_application and extra_batch.expected_intent_revision != null)
+            if (extra_batch.skip_all_intent_application and extra_batch.expected_intent_revision != null and extra_batch.prepared_graph_effects_checked)
                 try intentRetirementEntries(self.alloc, scan_prefix, keys)
             else
                 try self.loadIntentEntriesByKeys(self.alloc, scan_prefix, keys)
@@ -1526,10 +1636,10 @@ pub const TxnManager = struct {
             defer completion_writes.deinit(self.alloc);
             try completion_writes.append(self.alloc, .{ .key = &rec_key, .value = marker_value });
             try completion_writes.appendSlice(self.alloc, extra_batch.completion_writes);
-            try indexed_ack.append(self.alloc, &completion_writes);
-            if (resolved_participant_value) |value| {
+            if (!retain_metadata_ack) try indexed_ack.append(self.alloc, &completion_writes);
+            if (!retain_metadata_ack) if (resolved_participant_value) |value| {
                 try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
-            }
+            };
             var completion_deletes = std.ArrayListUnmanaged([]const u8).empty;
             defer completion_deletes.deinit(self.alloc);
             try completion_deletes.append(self.alloc, &stale_manifest_key);
@@ -1619,9 +1729,14 @@ pub const TxnManager = struct {
                 // Extract user key from intent key:
                 // intents_prefix(20) + txn_id(16) + ':'(1) + user_key
                 const user_key = entry.key[intents_prefix.len + 17 ..];
-                if (extra_batch.skip_all_intent_application or skipped_intent_keys.contains(user_key)) continue;
-
+                if (extra_batch.skip_all_intent_application and extra_batch.prepared_graph_effects_checked) continue;
                 const intent = try IntentValue.decode(entry.value);
+                if (intent.prepared_graph_effects != null and !extra_batch.prepared_graph_effects_checked) return error.PreparedIntentRequiresMaterialization;
+                if (extra_batch.skip_all_intent_application or skipped_intent_keys.contains(user_key)) continue;
+                // The checked graph attachment has already been materialized
+                // into this same atomic extra batch. Its literal JSON primary
+                // value still follows the ordinary document-intent path.
+                // Prepared native rows require their separate primary mapper.
                 if (intent.prepared_row != null) return error.PreparedIntentRequiresMaterialization;
                 // Integrity participants store private physical records, not
                 // primary JSON rows. Recovery without a DB materialization
@@ -1668,10 +1783,10 @@ pub const TxnManager = struct {
         try writes.append(self.alloc, .{ .key = &rec_key, .value = rec_val });
         try writes.appendSlice(self.alloc, extra_batch.writes);
         try writes.appendSlice(self.alloc, extra_batch.completion_writes);
-        try indexed_ack.append(self.alloc, &writes);
-        if (resolved_participant_value) |value| {
+        if (!retain_metadata_ack) try indexed_ack.append(self.alloc, &writes);
+        if (!retain_metadata_ack) if (resolved_participant_value) |value| {
             try writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
-        }
+        };
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
         try deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
 
@@ -1713,14 +1828,19 @@ pub const TxnManager = struct {
         const intent_entries = try self.loadIntentEntries(alloc, txn_id, scan_prefix);
         errdefer backend_scan.freeResults(alloc, intent_entries);
 
+        var has_graph_effects = false;
         var write_count: usize = 0;
         for (intent_entries) |entry| {
-            if ((try IntentValue.decode(entry.value)).value != null) write_count += 1;
+            const value = try IntentValue.decode(entry.value);
+            if (value.value != null) write_count += 1;
+            has_graph_effects = has_graph_effects or value.prepared_graph_effects != null;
         }
         const writes = try alloc.alloc(docstore.KVPair, write_count);
         errdefer alloc.free(writes);
         const prepared_rows = try alloc.alloc(?[]const u8, write_count);
         errdefer alloc.free(prepared_rows);
+        const graph_effects: []?[]const u8 = if (has_graph_effects) try alloc.alloc(?[]const u8, write_count) else &.{};
+        errdefer if (graph_effects.len != 0) alloc.free(graph_effects);
         const deletes = try alloc.alloc([]const u8, intent_entries.len - write_count);
         errdefer alloc.free(deletes);
         var writes_initialized: usize = 0;
@@ -1735,10 +1855,11 @@ pub const TxnManager = struct {
             } else {
                 writes[writes_initialized] = .{ .key = user_key, .value = intent.value.? };
                 prepared_rows[writes_initialized] = intent.prepared_row;
+                if (has_graph_effects) graph_effects[writes_initialized] = intent.prepared_graph_effects;
                 writes_initialized += 1;
             }
         }
-        return .{ .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries };
+        return .{ .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .prepared_graph_effects = graph_effects, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries };
     }
 
     pub fn loadSchemaBinding(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?SchemaBinding {
@@ -1885,7 +2006,7 @@ pub const TxnManager = struct {
             errdefer if (owned_value) |value| alloc.free(value);
             // A typed intent's value is a special-field sidecar, not a logical
             // document. Callers must use the schema-aware IntentBatch path.
-            if (intent.prepared_row != null) return error.PreparedIntentRequiresMaterialization;
+            if (intent.prepared_row != null or intent.prepared_graph_effects != null) return error.PreparedIntentRequiresMaterialization;
             try out.append(alloc, .{ .key = owned_key.?, .value = owned_value });
             owned_key = null;
             owned_value = null;
@@ -1940,13 +2061,77 @@ pub const TxnManager = struct {
     /// Reuse the caller's pinned snapshot or writer view. Schema publication
     /// must not validate its directory against a second, differently cut read.
     pub fn hasTopologySensitiveTransactionsInView(alloc: Allocator, read: anytype) !bool {
+        return hasTopologySensitiveTransactionsPolicy(alloc, read, false);
+    }
+
+    /// A clean process epoch cannot strand even terminal external ACK debt.
+    /// Ordinary topology work may move that bookkeeping; native restart
+    /// changes its execution epoch and therefore must wait for exact ACKs.
+    pub fn hasRelationLifetimeDebtInView(alloc: Allocator, read: anytype) !bool {
+        return hasTopologySensitiveTransactionsPolicy(alloc, read, true);
+    }
+
+    /// Preserve PostgreSQL UNLOGGED prepared transactions on a clean restart.
+    /// Every persisted effect must belong to an actual root-pinned external
+    /// decision. This streams keys without materializing intents or history;
+    /// orphan effects and unrelated pessimistic owners remain fail-closed.
+    pub fn requireCleanNativeRecoveryInView(read: anytype, pin: NativePhysicalPin) !void {
+        try pin.validate();
+        if (try readHasPrefix(read, hot_standby_batch_outbox_prefix) or try readHasPrefix(read, hot_standby_replay_outbox_prefix))
+            return error.SqlRelationRecoveryIncomplete;
+        if (try @import("pessimistic_lock_resource.zig").Binding.load(read)) |binding| {
+            if (try @import("pessimistic_lock_authority.zig").activeCount(read, binding.namespace) != 0) return error.SqlRelationRecoveryIncomplete;
+        }
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        inline for (.{ records_prefix, intents_prefix, intent_locks_prefix, read_guards_prefix, read_members_prefix, schema_leases_prefix }) |prefix| {
+            var next = try cursor.seekAtOrAfter(prefix);
+            while (next) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                if (comptime std.mem.eql(u8, prefix, records_prefix)) {
+                    if (entry.key.len != prefix.len + 16) return error.InvalidTxnRecord;
+                }
+                if (comptime std.mem.eql(u8, prefix, intents_prefix)) {
+                    if (entry.key.len < prefix.len + 17 or entry.key[prefix.len + 16] != ':') return error.InvalidTxnRecord;
+                }
+                const id: TxnId = if (comptime std.mem.eql(u8, prefix, intent_locks_prefix)) blk: {
+                    if (entry.value.len != 16) return error.InvalidTxnRecord;
+                    break :blk entry.value[0..16].*;
+                } else if (comptime std.mem.eql(u8, prefix, read_guards_prefix)) blk: {
+                    if (entry.key.len < prefix.len + 4 + 16) return error.InvalidTxnRecord;
+                    const length = std.mem.readInt(u32, entry.key[prefix.len..][0..4], .big);
+                    if (entry.key.len - prefix.len - 4 - 16 != length) return error.InvalidTxnRecord;
+                    break :blk entry.key[entry.key.len - 16 ..][0..16].*;
+                } else blk: {
+                    if (entry.key.len < prefix.len + 16) return error.InvalidTxnRecord;
+                    break :blk entry.key[prefix.len..][0..16].*;
+                };
+                const key = makeSidecarKey(records_prefix, id);
+                const bytes = read.get(&key) catch |err| switch (err) {
+                    error.NotFound => return error.SqlRelationRecoveryIncomplete,
+                    else => return err,
+                };
+                const record = try decodeRecord(bytes);
+                if (comptime !std.mem.eql(u8, prefix, records_prefix)) {
+                    if (record.intents_resolved_known and record.intents_resolved) return error.InvalidTxnRecord;
+                }
+                const actual = record.native_pin orelse return error.SqlRelationRecoveryIncomplete;
+                const owner = record.external_decision_owner orelse return error.SqlRelationRecoveryIncomplete;
+                try owner.validate();
+                if (!actual.eql(pin)) return error.SqlRelationRecoveryIncomplete;
+                next = try cursor.next();
+            }
+        }
+    }
+
+    fn hasTopologySensitiveTransactionsPolicy(alloc: Allocator, read: anytype, include_external_ack: bool) !bool {
         // Enrollment owns identity before the first row grant. Moving or
         // restoring that owner must not strand even an empty, fenced scope.
         if (try @import("pessimistic_lock_resource.zig").Binding.load(read)) |binding| {
             if (try @import("pessimistic_lock_authority.zig").activeCount(read, binding.namespace) != 0) return true;
         }
 
-        return hasRowTransactionStateInView(alloc, read);
+        return hasRowTransactionStateInView(alloc, read, include_external_ack);
     }
 
     /// Range tracking adds row-version barriers; pure pessimistic owners do
@@ -1955,10 +2140,10 @@ pub const TxnManager = struct {
     pub fn hasRangeActivationTransactions(self: *TxnManager) !bool {
         var read = try self.store.beginRead();
         defer read.abort();
-        return hasRowTransactionStateInView(self.alloc, &read);
+        return hasRowTransactionStateInView(self.alloc, &read, false);
     }
 
-    fn hasRowTransactionStateInView(alloc: Allocator, read: anytype) !bool {
+    fn hasRowTransactionStateInView(alloc: Allocator, read: anytype, include_external_ack: bool) !bool {
         // Resolution normally removes intents and HA outboxes atomically before
         // a transaction becomes quiescent. Check the global prefixes once rather
         // than opening an intent cursor for every retained terminal record.
@@ -1984,7 +2169,7 @@ pub const TxnManager = struct {
                 // A terminal native participant with all local intents drained
                 // carries retention/ACK bookkeeping, not outstanding row work.
                 // Its copied roster is not a native coordinator resolution set.
-                if (record.external_decision_owner != null and record.intents_resolved_known and record.intents_resolved) {
+                if (!include_external_ack and record.external_decision_owner != null and record.intents_resolved_known and record.intents_resolved) {
                     entry = try cursor.next();
                     continue;
                 }
@@ -2071,6 +2256,7 @@ pub const TxnManager = struct {
                 .coordinator_known = record.coordinator_known,
                 .retain_terminal = record.retain_terminal,
                 .external_decision_owner = record.external_decision_owner,
+                .native_pin = record.native_pin,
                 .external_commit_started = record.external_commit_started,
                 .intents_resolved = record.intents_resolved,
                 .intents_resolved_known = record.intents_resolved_known,
@@ -2096,6 +2282,7 @@ pub const TxnManager = struct {
         participant: []const u8,
         extra_batch: MutationExtraBatch,
     ) !void {
+        try self.requireNativeMutationPin(extra_batch.native_pin);
         const index_key = makeSidecarKey(participant_index_prefix, txn_id);
         if (try self.keyExists(&index_key)) return self.markParticipantsResolvedExtraBatch(txn_id, &.{participant}, extra_batch);
         // A replicated acknowledgement can be retried after the coordinator
@@ -2147,8 +2334,14 @@ pub const TxnManager = struct {
     }
 
     pub fn markParticipantsResolvedExtraBatch(self: *TxnManager, txn_id: TxnId, acknowledgements: []const []const u8, extra_batch: MutationExtraBatch) !void {
+        try self.requireNativeMutationPin(extra_batch.native_pin);
         if (acknowledgements.len == 0 or acknowledgements.len > 64) return error.InvalidParticipant;
-        _ = try self.loadTransactionRecord(txn_id);
+        const record = try self.loadTransactionRecord(txn_id);
+        if (extra_batch.external_decision_owner) |expected| {
+            const held = record.external_decision_owner orelse return error.ExternalTransactionDecisionChanged;
+            if (!held.eql(expected)) return error.ExternalTransactionDecisionChanged;
+            if (record.status == .pending) return error.ExternalTransactionDecisionRequired;
+        }
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
@@ -2228,6 +2421,19 @@ pub const TxnManager = struct {
         // Membership migration, resolution entries, count proof and the Raft
         // replay marker publish in one storage batch. No growing list rewrite.
         try self.applyBatch(writes.items, deletes.items, null);
+    }
+
+    /// Caller holds its DB apply fence across record and roster observation.
+    pub fn externalRetentionSnapshot(self: *TxnManager, a: Allocator, id: TxnId, owner: ExternalDecisionOwner, pin: NativePhysicalPin) !ExternalRetentionSnapshot {
+        try owner.validate();
+        const record = try self.loadTransactionRecord(id);
+        const held = record.external_decision_owner orelse return error.ExternalTransactionDecisionChanged;
+        if (!held.eql(owner) or !std.meta.eql(record.native_pin, @as(?NativePhysicalPin, pin))) return error.ExternalTransactionDecisionChanged;
+        if (!record.coordinator_known or !record.prepared_known or !record.intents_resolved_known) return error.InvalidTxnRecord;
+        const participants = try self.getParticipants(a, id);
+        errdefer freeParticipantList(a, participants);
+        if (participants.len > 64) return error.InvalidTxnRecord;
+        return .{ .status = record.status, .coordinator = record.coordinator, .prepared = record.prepared, .intents_resolved = record.intents_resolved, .participants = participants };
     }
 
     pub fn getParticipants(self: *TxnManager, alloc: Allocator, txn_id: TxnId) ![][]u8 {
@@ -2809,6 +3015,13 @@ pub const TxnManager = struct {
         return key;
     }
 
+    fn requireNativeMutationPin(self: *const TxnManager, requested: ?NativePhysicalPin) !void {
+        const pin = requested orelse return;
+        try pin.validate();
+        const actual = self.native_relation_pin orelse return error.ExternalTransactionDecisionChanged;
+        if (!actual.eql(pin)) return error.ExternalTransactionDecisionChanged;
+    }
+
     fn loadTransactionRecord(self: *TxnManager, txn_id: TxnId) !TxnRecord {
         const key = makeRecordKey(txn_id);
         const val = self.getAlloc(self.alloc, &key) catch |err| switch (err) {
@@ -2816,7 +3029,14 @@ pub const TxnManager = struct {
             else => return err,
         };
         defer self.alloc.free(val);
-        return try decodeRecord(val);
+        const record = try decodeRecord(val);
+        if (self.native_relation_pin) |actual| {
+            if (record.external_decision_owner != null) {
+                const pin = record.native_pin orelse return error.ExternalTransactionDecisionChanged;
+                if (!pin.eql(actual)) return error.ExternalTransactionDecisionChanged;
+            }
+        }
+        return record;
     }
 
     fn saveTransactionRecord(self: *TxnManager, key: [records_prefix.len + 16]u8, record: TxnRecord) !void {
@@ -2826,7 +3046,12 @@ pub const TxnManager = struct {
     }
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
-        const buf = try self.alloc.alloc(u8, if (record.external_decision_owner != null) txn_record_v7_size else txn_record_v6_size);
+        if (record.native_pin != null and record.external_decision_owner == null) return error.InvalidTxnRecord;
+        if (self.native_relation_pin) |actual| if (record.external_decision_owner != null) {
+            const pin = record.native_pin orelse return error.ExternalTransactionDecisionChanged;
+            if (!pin.eql(actual)) return error.ExternalTransactionDecisionChanged;
+        };
+        const buf = try self.alloc.alloc(u8, if (record.native_pin != null) txn_record_v8_size else if (record.external_decision_owner != null) txn_record_v7_size else txn_record_v6_size);
         errdefer self.alloc.free(buf);
         buf[0] = @backingInt(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
@@ -2846,6 +3071,7 @@ pub const TxnManager = struct {
             @memcpy(buf[txn_record_v6_size..][0..ExternalDecisionOwner.encoded_len], &try owner.encode());
             buf[txn_record_v7_size - 1] = @intFromBool(record.external_commit_started);
         }
+        if (record.native_pin) |pin| @memcpy(buf[txn_record_v7_size..][0..NativePhysicalPin.encoded_len], &try pin.encode());
         return buf;
     }
 
@@ -2872,6 +3098,7 @@ pub const TxnManager = struct {
         retained_cutoff_timestamp: u64,
         extra_batch: MutationExtraBatch,
     ) !bool {
+        try self.requireNativeMutationPin(extra_batch.native_pin);
         const record = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
             TxnError.TxnNotFound => {
                 try self.applyMutationExtraBatch(extra_batch);
@@ -3392,6 +3619,12 @@ const RuntimeStoreHandle = struct {
     owned: bool,
 };
 
+fn nativePinForStore(store: anytype) ?NativePhysicalPin {
+    const T = @TypeOf(store);
+    if (T == docstore.DocStore or T == *docstore.DocStore or T == *const docstore.DocStore) return store.native_relation_pin;
+    return null;
+}
+
 fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
     const T = @TypeOf(store);
     if (T == backend_erased.Store) return .{ .store = store, .owned = true };
@@ -3639,6 +3872,11 @@ fn resolveDecisionConflictReason(current: TxnStatus, requested: TxnStatus) []con
 
 fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == 0 or raw[0] > @backingInt(TxnStatus.aborted)) return TxnError.InvalidTxnRecord;
+    if (raw.len == txn_record_v8_size) {
+        var record = try decodeRecord(raw[0..txn_record_v7_size]);
+        record.native_pin = NativePhysicalPin.decode(raw[txn_record_v7_size..]) catch return error.InvalidTxnRecord;
+        return record;
+    }
     if (raw.len == txn_record_v7_size) {
         var record = try decodeRecord(raw[0..txn_record_v6_size]);
         if (raw[txn_record_v7_size - 1] > 1) return error.InvalidTxnRecord;
@@ -6714,6 +6952,174 @@ test "external prepared enlistment survives cold recovery before the first vote"
     }
 }
 
+test "external decision ACK validates exact terminal owner before changing retention" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "external-owner-ack");
+    cleanupTestDir(path);
+    defer a.free(path);
+    defer cleanupTestDir(path);
+    const id: TxnId = @splat(87);
+    const owner: ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 100 };
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 1, &.{"self"}, true, true, .{ .external_decision_owner = owner });
+    try std.testing.expectError(error.ExternalTransactionDecisionRequired, manager.markParticipantsResolvedExtraBatch(id, &.{"self"}, .{ .external_decision_owner = owner }));
+    _ = try manager.resolveIntentsWithExtraBatch(id, .aborted, 20, .{ .external_decision_owner = owner });
+    var wrong = owner;
+    wrong.operation_id[0] ^= 1;
+    try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.markParticipantsResolvedExtraBatch(id, &.{"self"}, .{ .external_decision_owner = wrong }));
+    const pending = try manager.getResolvedParticipants(a, id);
+    defer freeParticipantList(a, pending);
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
+    try manager.markParticipantsResolvedExtraBatch(id, &.{"self"}, .{ .external_decision_owner = owner });
+    const resolved = try manager.getResolvedParticipants(a, id);
+    defer freeParticipantList(a, resolved);
+    try std.testing.expectEqual(@as(usize, 1), resolved.len);
+}
+
 comptime {
     if (@import("builtin").is_test) _ = @import("pessimistic_lock_native_test.zig");
+}
+
+test "SQL relation lifetime native participant records pin actual images across every decision mutation" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var store = try docstore.DocStore.openRuntime(a, &runtime);
+    defer store.close();
+    const pin: NativePhysicalPin = .{ .physical_root_incarnation = std.math.maxInt(u128) - 3, .table_id = 7, .shard_id = 172, .range_id = 272, .data_generation = 9 };
+    store.native_relation_pin = pin;
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    try std.testing.expect(manager.native_relation_pin.?.eql(pin));
+    const id: TxnId = @splat(11);
+    const owner: ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 100 };
+    const extra: MutationExtraBatch = .{ .external_decision_owner = owner, .native_pin = pin };
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 1, &.{"self"}, true, true, extra);
+    {
+        const raw = try manager.getAlloc(a, &makeRecordKey(id));
+        defer a.free(raw);
+        try std.testing.expectEqual(@as(usize, txn_record_v8_size), raw.len);
+        const record = try decodeRecord(raw);
+        try std.testing.expect(record.native_pin.?.eql(pin));
+        try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(raw[0 .. raw.len - 1]));
+    }
+    try manager.writeIntentsExtraBatch(id, &.{.{ .key = "row", .value = "held" }}, &.{}, extra);
+    var wrong = pin;
+    wrong.data_generation += 1;
+    const wrong_extra: MutationExtraBatch = .{ .external_decision_owner = owner, .native_pin = wrong };
+    {
+        var pinned = try store.beginReadTxn();
+        defer pinned.abort();
+        try TxnManager.requireCleanNativeRecoveryInView(&pinned, pin);
+        try std.testing.expectError(error.SqlRelationRecoveryIncomplete, TxnManager.requireCleanNativeRecoveryInView(&pinned, wrong));
+    }
+    try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.writeIntentsExtraBatch(id, &.{}, &.{}, wrong_extra));
+    try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.activateExternalDecision(id, owner, wrong_extra));
+    try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.resolveIntentsWithExtraBatch(id, .aborted, 20, .{ .external_decision_owner = owner, .native_pin = wrong }));
+    try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.markParticipantsResolvedExtraBatch(id, &.{"self"}, wrong_extra));
+    // A copied record under a successor empty generation cannot be adopted by
+    // presenting its still-valid decision owner or omitting request pin facts.
+    manager.native_relation_pin = wrong;
+    try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.getTransactionStatus(id));
+    try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.writeIntentsExtraBatch(id, &.{}, &.{}, .{ .external_decision_owner = owner }));
+    try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.activateExternalDecision(id, owner, .{}));
+    try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.resolveIntentsWithExtraBatch(id, .aborted, 20, .{ .external_decision_owner = owner }));
+    try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.markParticipantsResolvedExtraBatch(id, &.{"self"}, .{ .external_decision_owner = owner }));
+    manager.native_relation_pin = pin;
+    try manager.activateExternalDecision(id, owner, extra);
+    _ = try manager.resolveIntentsWithExtraBatch(id, .committed, 20, .{ .external_decision_owner = owner, .native_pin = pin });
+    try manager.markParticipantsResolvedExtraBatch(id, &.{"self"}, extra);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    const participant = (try externalParticipant(&read, id)).?;
+    try std.testing.expect(participant.native_pin.?.eql(pin));
+    try std.testing.expectEqual(TxnStatus.committed, participant.status);
+    try std.testing.expect(participant.owner.?.eql(owner));
+}
+
+test "prepared graph intent envelope preserves ordinary bytes and binds attachment to the same immutable row revision" {
+    const a = std.testing.allocator;
+    const plain: WriteIntent = .{ .key = "a", .value = "{\"n\":1}" };
+    const original = try IntentValue.encode(a, plain);
+    defer a.free(original);
+    try std.testing.expectEqualSlices(u8, "\x00{\"n\":1}", original);
+    var graph = plain;
+    graph.prepared_graph_effects = "immutable-native-graph-effects";
+    const encoded = try IntentValue.encode(a, graph);
+    defer a.free(encoded);
+    const decoded = try IntentValue.decode(encoded);
+    try std.testing.expectEqualStrings(plain.value.?, decoded.value.?);
+    try std.testing.expectEqualStrings(graph.prepared_graph_effects.?, decoded.prepared_graph_effects.?);
+    try std.testing.expectEqual(try intentAdmissionBytes(plain) + graph.prepared_graph_effects.?.len, try intentAdmissionBytes(graph));
+    var deleted = graph;
+    deleted.value = null;
+    try std.testing.expectError(error.InvalidPreparedGraphEffects, IntentValue.encode(a, deleted));
+    try std.testing.expectError(error.InvalidTxnRecord, IntentValue.decode(encoded[0..5]));
+    // An attacker-controlled recursive wrapper must never consume unbounded
+    // decoder stack or produce nested attachments with ambiguous ownership.
+    const nested = try a.alloc(u8, 6 + encoded.len);
+    defer a.free(nested);
+    nested[0] = 4;
+    std.mem.writeInt(u32, nested[1..5], 1, .little);
+    nested[5] = 'x';
+    @memcpy(nested[6..], encoded);
+    try std.testing.expectError(error.InvalidTxnRecord, IntentValue.decode(nested));
+}
+
+test "SQL relation lifetime native missing BEGIN retention snapshots preserve exact singleton and full coordinator rosters across cold ACK" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "native-retention-roster");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    const pin: NativePhysicalPin = .{ .physical_root_incarnation = 17, .table_id = 7, .shard_id = 172, .range_id = 272, .data_generation = 1 };
+    const owner: ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+    const id: TxnId = @splat(4);
+    for (0..2) |pass| {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        store.native_relation_pin = pin;
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        if (pass == 0) _ = try manager.resolveIntentsWithExtraBatch(id, .aborted, 10, .{ .external_decision_owner = owner, .native_pin = pin, .resolved_participant = "local" });
+        var retained = try manager.externalRetentionSnapshot(a, id, owner, pin);
+        defer retained.deinit(a);
+        try std.testing.expect(retained.status == .aborted and !retained.coordinator and !retained.prepared and retained.intents_resolved);
+        try std.testing.expectEqual(@as(usize, 1), retained.participants.len);
+        try std.testing.expectEqualStrings("local", retained.participants[0]);
+        var changed = owner;
+        changed.operation_id = @splat(9);
+        try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.externalRetentionSnapshot(a, id, changed, pin));
+        var wrong = pin;
+        wrong.data_generation += 1;
+        try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.externalRetentionSnapshot(a, id, owner, wrong));
+        // A normal global ACK remains rejected atomically by this singleton;
+        // the authenticated upper layer must select its actual local roster.
+        try std.testing.expectError(error.InvalidParticipant, manager.markParticipantsResolvedExtraBatch(id, &.{ "local", "foreign" }, .{ .external_decision_owner = owner, .native_pin = pin }));
+        const unresolved = try manager.getUnresolvedParticipants(a, id);
+        defer freeParticipantList(a, unresolved);
+        try std.testing.expectEqual(@as(usize, 1), unresolved.len);
+        if (pass == 1) {
+            try manager.markParticipantsResolvedExtraBatch(id, &.{"local"}, .{ .external_decision_owner = owner, .native_pin = pin });
+            try manager.markParticipantsResolvedExtraBatch(id, &.{"local"}, .{ .external_decision_owner = owner, .native_pin = pin });
+            const resolved = try manager.getResolvedParticipants(a, id);
+            defer freeParticipantList(a, resolved);
+            try std.testing.expectEqual(@as(usize, 1), resolved.len);
+        }
+        const coordinator: TxnId = @splat(5);
+        if (pass == 0) {
+            try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(coordinator, 20, 19, &.{ "local", "remote" }, true, true, .{ .external_decision_owner = owner, .native_pin = pin });
+            _ = try manager.resolveIntentsWithExtraBatch(coordinator, .aborted, 30, .{ .external_decision_owner = owner, .native_pin = pin, .resolved_participant = "local" });
+        }
+        var global = try manager.externalRetentionSnapshot(a, coordinator, owner, pin);
+        defer global.deinit(a);
+        try std.testing.expect(global.coordinator and global.status == .aborted);
+        try std.testing.expectEqual(@as(usize, 2), global.participants.len);
+        if (pass == 1) try manager.markParticipantsResolvedExtraBatch(coordinator, &.{ "local", "remote" }, .{ .external_decision_owner = owner, .native_pin = pin });
+    }
 }

@@ -86,6 +86,11 @@ test "distributed txn integrity preparation preserves the caller deadline and ca
 
 fn authorizedLookupOptions(control: RequestContext, alloc: Allocator, table: []const u8, options: types.LookupOptions) !types.LookupOptions {
     var result = options;
+    if (control.sql_relation_owner_minter) |minter| {
+        if (control.sql_relation_owner) |owner| if (!owner.eql(minter.owner)) return error.SqlTemporaryRelationNotOwned;
+        if (result.relation_owner_minter) |previous| if (!previous.owner.eql(minter.owner)) return error.SqlTemporaryRelationNotOwned;
+        result.relation_owner_minter = minter;
+    }
     // Batched observations delegate to the same full-primary reader inside
     // the owner. Carry its scoped integrity proof through that envelope too;
     // metadata-only job selectors do not turn it into mutation authority.
@@ -187,6 +192,7 @@ pub fn authorizePrimaryMutations(request: RequestContext, authentication_require
 
 pub const Prepared = struct {
     arena: std.heap.ArenaAllocator,
+    retained_arena: ?std.heap.ArenaAllocator = null,
     /// Original primary request bytes remain borrowed through commit. Added
     /// predicates and commands are owned by this preparation arena.
     tables: []const contract.TableCommitRequest,
@@ -198,6 +204,7 @@ pub const Prepared = struct {
     backfill_partial: bool = false,
     pub fn deinit(self: *Prepared) void {
         self.arena.deinit();
+        if (self.retained_arena) |*arena| arena.deinit();
         self.* = undefined;
     }
 };
@@ -232,6 +239,17 @@ const Work = struct {
     // Immutable statement input, before any cascading edge changes `after`.
     explicit_after: ?[]const u8 = null,
     expansion: ?planner.Expansion = null,
+    event_expansion: ?planner.Expansion = null,
+    base_prepared: ?*mapper.PreparedRelationalWrite = null,
+    current_prepared: ?*mapper.PreparedRelationalWrite = null,
+    logical_before: ?*mapper.PreparedRelationalWrite = null,
+    base_prepared_ready: bool = false,
+    trigger_stage: ?*anyopaque = null,
+    trigger_columns: []const []const u8 = &.{},
+    trigger_adopt: bool = false,
+    trigger_candidate_prepared: bool = false,
+    trigger_suppressed: bool = false,
+    trigger_selected: bool = false,
 };
 
 // Use the same scalar coercions as row preparation. JSON spelling is not
@@ -362,9 +380,12 @@ const Builder = struct {
     discovered_repairs: std.StringHashMapUnmanaged(bool) = .empty,
     statement: bool = false,
     unique_only: bool = false,
+    owned_prepared_rows: std.ArrayList(*mapper.PreparedRelationalWrite) = .empty,
+    reference_states: std.AutoHashMapUnmanaged(planner.storage.Address, *ReferenceState) = .empty,
     constraint_timing: []const native.ConstraintTiming = &.{},
     previous: []const contract.TableCommitRequest = &.{},
     previous_rows: ?std.StringHashMapUnmanaged(PreviousRow) = null,
+    const ReferenceState = struct { table: []const u8, state: StatementState };
     const PreviousRow = struct { value: ?[]const u8, json_null_fields: []const []const u8 = &.{} };
 
     fn indexPreviousRows(self: *Builder) !void {
@@ -416,6 +437,7 @@ const Builder = struct {
         var opts = options;
         opts.include_primary_digest = !options.relational_integrity_catalog and !options.relational_integrity_action and
             options.relational_integrity_jobs_json.len == 0 and options.relational_index_status_json.len == 0 and options.relational_activation_json.len == 0 and options.relational_topology_json.len == 0;
+        opts.include_json_null_fields = opts.include_primary_digest;
         opts.execution_deadline_ns = self.control.deadline_ns;
         opts.execution_io = self.control.deadline_io;
         opts.cancellation = self.control.cancellation;
@@ -682,7 +704,7 @@ const Builder = struct {
             row: ?reads.LookupResponse = null,
             failure: ?anyerror = null,
             fn run(slot: *@This(), source: reads.TableReadSource, name: []const u8, key: []const u8, control: RequestContext) void {
-                const options = authorizedLookupOptions(control, slot.arena.allocator(), name, .{ .include_primary_digest = true, .execution_deadline_ns = control.deadline_ns, .execution_io = control.deadline_io, .cancellation = control.cancellation }) catch |err| {
+                const options = authorizedLookupOptions(control, slot.arena.allocator(), name, .{ .include_primary_digest = true, .include_json_null_fields = true, .execution_deadline_ns = control.deadline_ns, .execution_io = control.deadline_io, .cancellation = control.cancellation }) catch |err| {
                     slot.failure = err;
                     return;
                 };
@@ -831,6 +853,7 @@ const Builder = struct {
 
     fn expandWork(self: *Builder, item: *Work) !planner.Expansion {
         if (item.expansion) |expansion| return expansion;
+        if (self.control.table_triggers != null and item.dirty and !self.unique_only) return self.expandTriggeredWork(item);
         const plan = try self.bindingPlan(item.table);
         const view = item.table.view;
         var scratch = std.heap.ArenaAllocator.init(self.scratch_alloc orelse self.alloc);
@@ -859,12 +882,178 @@ const Builder = struct {
         return item.expansion.?;
     }
 
+    fn ownPreparedRow(self: *Builder, row: mapper.PreparedRelationalWrite) !*mapper.PreparedRelationalWrite {
+        var owned = row;
+        errdefer owned.deinit(self.alloc);
+        const retained = owned.packed_row.len + if (owned.parsed) |value| value.arena.queryCapacity() else @as(usize, 0);
+        try self.charge(retained);
+        const pointer = try self.alloc.create(mapper.PreparedRelationalWrite);
+        pointer.* = owned;
+        try self.owned_prepared_rows.append(self.alloc, pointer);
+        return pointer;
+    }
+    fn ensurePreparedBase(self: *Builder, item: *Work) !void {
+        if (item.base_prepared_ready) return;
+        if (item.before) |row| {
+            const view = item.table.view;
+            item.base_prepared = try self.ownPreparedRow(try mapper.PreparedRelationalWrite.initTyped(self.alloc, self.alloc, self.scratch_alloc orelse self.alloc, false, item.key, row.json, null, view.tableSchema().*, view.physicalLayout(), row.json_null_fields, true));
+        }
+        item.current_prepared = item.base_prepared;
+        item.logical_before = item.base_prepared;
+        item.base_prepared_ready = true;
+    }
+    fn beginTriggerMutation(self: *Builder, item: *Work, columns: []const []const u8, adopt: bool, candidate_prepared: bool) !void {
+        if (self.control.table_triggers == null or self.unique_only) return;
+        try self.ensurePreparedBase(item);
+        item.logical_before = item.current_prepared;
+        item.trigger_columns = try self.alloc.dupe([]const u8, columns);
+        item.trigger_stage = null;
+        item.trigger_adopt = adopt;
+        item.trigger_candidate_prepared = candidate_prepared;
+    }
+    fn expandTriggeredWork(self: *Builder, item: *Work) !planner.Expansion {
+        const provider = self.control.table_triggers orelse return error.SqlTriggerCoordinationRequired;
+        try self.ensurePreparedBase(item);
+        const view = item.table.view;
+        const record = try self.metadataTable(item.table.name);
+        var parsed: ?std.json.Parsed(std.json.Value) = if (item.after) |json| try std.json.parseFromSlice(std.json.Value, self.alloc, json, .{ .allocate = .alloc_always, .parse_numbers = false }) else null;
+        defer if (parsed) |*value| value.deinit();
+        const old_flags = if (item.logical_before) |row| try (try row.typedView(view.tableSchema().*, view.physicalLayout())).jsonNullFieldsAlloc(self.alloc) else &.{};
+        const event: @import("../sql/trigger_definition.zig").Event = if (item.after == null) .delete else if (item.logical_before != null) .update else .insert;
+        const prepared = try provider.before(provider.ptr, self.alloc, .{ .table = record, .key = item.key, .event = event, .before_parsed = if (item.logical_before) |row| .{ .value = row.parsedValue(), .json_null_fields = old_flags, .version = item.observed_version, .digest = item.observed_digest } else null, .after = if (parsed) |*value| &value.value else null, .json_null_fields = item.after_json_null_fields, .update_columns = item.trigger_columns, .candidate_prepared = item.trigger_candidate_prepared, .adopt_existing = item.trigger_adopt, .domain_admission = if (item.after_domain_inputs) |inputs| .{ .schema_version = view.version(), .inputs = inputs, .complete_row = false } else null });
+        item.trigger_stage = prepared.stage;
+        if (prepared.skipped) {
+            item.current_prepared = item.logical_before;
+            item.trigger_suppressed = !item.trigger_selected;
+            if (!item.trigger_selected) {
+                item.explicit = false;
+                item.assignments.clearRetainingCapacity();
+            }
+        } else {
+            item.trigger_selected = true;
+            item.trigger_suppressed = false;
+            item.current_prepared = if (parsed) |value| selected: {
+                parsed = null; // initParsedTyped consumes the owned DOM on all paths.
+                break :selected try self.ownPreparedRow(try mapper.PreparedRelationalWrite.initParsedTyped(self.alloc, self.scratch_alloc orelse self.alloc, false, item.key, item.after.?, null, view.tableSchema().*, view.physicalLayout(), prepared.json_null_fields, true, value));
+            } else null;
+        }
+        if (item.current_prepared) |row| {
+            item.after = try std.json.Stringify.valueAlloc(self.alloc, row.parsedValue(), .{});
+            try self.charge(item.after.?.len);
+            item.after_json_null_fields = try types.cloneJsonNullFields(self.alloc, try (try row.typedView(view.tableSchema().*, view.physicalLayout())).jsonNullFieldsAlloc(self.alloc));
+            try self.chargeJsonNullFields(item.after_json_null_fields);
+            item.after_prepared_domain = try self.domainContract(item.table);
+        } else {
+            item.after = null;
+            item.after_json_null_fields = &.{};
+            item.after_prepared_domain = null;
+        }
+        item.after_domain_inputs = null;
+        const plan = try self.bindingPlan(item.table);
+        item.expansion = try plan.expand(self.alloc, &.{.{ .key = item.key, .before = if (item.base_prepared) |row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .after = if (item.current_prepared) |row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .repair = self.repairing(item.table.name) }});
+        try self.charge(item.expansion.?.arena.queryCapacity());
+        item.event_expansion = try plan.expand(self.alloc, &.{.{ .key = item.key, .before = if (item.logical_before) |row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .after = if (item.current_prepared) |row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .repair = self.repairing(item.table.name) }});
+        try self.charge(item.event_expansion.?.arena.queryCapacity());
+        if (!prepared.skipped) {
+            try self.recordReferenceDeltas(item.event_expansion.?);
+            try provider.after(provider.ptr, prepared.stage);
+        }
+        return item.expansion.?;
+    }
+
+    /// Load each generation-bound reverse-reference page once. Event deltas
+    /// update this statement-owned overlay rather than repeatedly scanning all
+    /// previous row work whenever another ordered FK continuation runs.
+    fn referenceState(self: *Builder, table: []const u8, address: planner.storage.Address) !*StatementState {
+        if (self.reference_states.get(address)) |cached| {
+            if (!std.mem.eql(u8, cached.table, table)) return error.InvalidIntegrityRecord;
+            return &cached.state;
+        }
+        if (self.reference_states.count() >= 4096) return error.TransactionTooLarge;
+        const cached = try self.alloc.create(ReferenceState);
+        cached.* = .{ .table = table, .state = try self.statementState(table, address) };
+        try self.reference_states.put(self.alloc, address, cached);
+        return &cached.state;
+    }
+    fn recordReferenceDeltas(self: *Builder, expansion: planner.Expansion) !void {
+        for (expansion.commands) |routed| switch (routed.command.operation) {
+            .attach, .detach, .repair_detach => try self.applyStatementCommands(try self.referenceState(routed.table_name, routed.command.address), routed.command.address, &.{routed.command}, false),
+            else => {},
+        };
+    }
+    const OrderedForeignKey = struct {
+        builder: *Builder,
+        parent: *Work,
+        transition: planner.ParentTransition,
+        child: *Loaded,
+        definition: native.ForeignKey,
+        generation: planner.storage.Generation,
+        fn run(raw: *anyopaque) !void {
+            const job: *@This() = @ptrCast(@alignCast(raw));
+            const self = job.builder;
+            try self.control.ensureActive();
+            const provider = self.control.table_triggers orelse return error.SqlTriggerCoordinationRequired;
+            const action = if (job.parent.after == null) job.definition.on_delete else job.definition.on_update;
+            const modifies = action == .cascade or action == .set_null;
+            const event: @import("../sql/trigger_definition.zig").Event = if (action == .cascade and job.parent.after == null) .delete else .update;
+            const record = try self.metadataTable(job.child.name);
+            if (modifies) {
+                _ = try self.outputIndex(job.child.name, job.child.view.version());
+                const begin = provider.begin_statement orelse return error.SqlTriggerCoordinationRequired;
+                try begin(provider.ptr, record, event, if (event == .update) job.definition.child_columns else &.{});
+            }
+            // Applying a child event updates the overlay. Keep this bounded
+            // query's selected keys immutable while those updates are made.
+            const state = try self.referenceState(job.parent.table.name, job.transition.address);
+            const selected = try self.alloc.dupe(planner.storage.Reference, state.references.items);
+            try self.charge(selected.len * @sizeOf(planner.storage.Reference));
+            for (selected) |reference| {
+                if (!std.mem.eql(u8, reference.child_table, job.child.name) or !std.mem.eql(u8, &reference.constraint_generation, &job.generation)) continue;
+                try self.applyReference(job.parent, job.transition, reference);
+            }
+            if (modifies) {
+                const end = provider.end_statement orelse return error.SqlTriggerCoordinationRequired;
+                try end(provider.ptr, record, event, if (event == .update) job.definition.child_columns else &.{});
+            }
+        }
+    };
+    fn queueForeignKeyActions(self: *Builder, item: *Work, transition: planner.ParentTransition) !void {
+        const provider = self.control.table_triggers orelse return error.SqlTriggerCoordinationRequired;
+        const incoming = provider.incoming orelse return error.SqlTriggerCoordinationRequired;
+        const queue = provider.queue_action orelse return error.SqlTriggerCoordinationRequired;
+        const stage = item.trigger_stage orelse return error.InvalidSqlTriggerManifest;
+        const parent = try self.alloc.create(Work);
+        parent.* = item.*;
+        if (item.logical_before) |old| parent.before = .{ .json = try std.json.Stringify.valueAlloc(self.alloc, old.parsedValue(), .{}), .version = item.observed_version, .expected_content_digest = item.observed_digest };
+        for (try incoming(provider.ptr, try self.metadataTable(item.table.name))) |record| {
+            const child = try self.load(record.name);
+            for (child.foreign) |definition| {
+                if (!std.mem.eql(u8, definition.parent_table, item.table.name)) continue;
+                const target = try @import("../schema/relational_foreign_key_target.zig").resolveUnique(item.table.uniques, definition.parent_columns);
+                const parent_binding = item.table.catalog.find(.unique, target.name) orelse return error.PreparedGenerationChanged;
+                if (!std.mem.eql(u8, &parent_binding.generation, &transition.address.generation)) continue;
+                const binding = child.catalog.find(.foreign_key, definition.name) orelse return error.PreparedGenerationChanged;
+                const job = try self.alloc.create(OrderedForeignKey);
+                job.* = .{ .builder = self, .parent = parent, .transition = transition, .child = child, .definition = definition, .generation = binding.generation };
+                try self.charge(@sizeOf(OrderedForeignKey));
+                try queue(provider.ptr, stage, .{ .child_table_id = child.table_id, .allocation = binding.allocation, .ptr = job, .run = OrderedForeignKey.run });
+            }
+        }
+    }
+    fn completeTriggeredChild(self: *Builder, item: *Work) !void {
+        if (self.control.table_triggers == null) return;
+        _ = try self.expandWork(item);
+        item.parent_expanded = true;
+        const event = item.event_expansion orelse return error.InvalidIntegrityRecord;
+        for (event.parents) |transition| try self.expandParent(item, transition);
+    }
+
     fn childStillReferences(self: *Builder, item: *Work, definition: native.ForeignKey, address: planner.storage.Address, final_row: bool) !bool {
         const after = item.after orelse return false;
         // Explicit moves sever their old relationship. A row already moved by
         // another cascading edge still participates in its original edges, so
         // contradictory cascades are detected rather than silently skipped.
-        const json = if (final_row) after else if (item.explicit) item.explicit_after orelse return false else if (item.before) |before| before.json else after;
+        const json = if (final_row or self.control.table_triggers != null) after else if (item.explicit) item.explicit_after orelse return false else if (item.before) |before| before.json else after;
         const view = item.table.view;
         var row = try mapper.PreparedRelationalWrite.init(self.alloc, item.key, json, null, view.tableSchema().*, view.physicalLayout());
         defer row.deinit(self.alloc);
@@ -934,10 +1123,13 @@ const Builder = struct {
         // reverse reference may not force a mutation of its new relationship.
         if (definition.match != .partial and !try self.childStillReferences(child, definition, transition.address, false)) return;
         if (action == .cascade and parent.after == null) {
+            try self.beginTriggerMutation(child, &.{}, false, true);
             child.after = null;
             try self.enqueue(child);
+            try self.completeTriggeredChild(child);
             return;
         }
+        try self.beginTriggerMutation(child, definition.child_columns, false, true);
         var child_json = try std.json.parseFromSliceLeaky(std.json.Value, self.alloc, child.after.?, .{ .allocate = .alloc_always, .parse_numbers = false });
         // Parsed values are retained in the shared request arena by assignments.
         const object = &child_json.object;
@@ -948,9 +1140,9 @@ const Builder = struct {
             // CASCADE only transports components the child actually supplies.
             if (definition.match == .partial and action == .cascade and (object.get(child_column) orelse .null) == .null) continue;
             const next: std.json.Value = if (action == .set_null) .null else parent_json.?.object.get(parent_column) orelse return error.InvalidIntegrityRecord;
-            if (child.assignments.get(child_column)) |prior| {
+            if (self.control.table_triggers == null) if (child.assignments.get(child_column)) |prior| {
                 if (!try assignmentEqual(child.table, child_column, prior, next)) return error.ForeignKeyActionConflict;
-            }
+            };
             const existing = object.get(child_column) orelse .null;
             if (try assignmentEqual(child.table, child_column, existing, next)) continue;
             try self.domainAction(child, object, child_column, parent, parent_column, action == .cascade);
@@ -962,6 +1154,7 @@ const Builder = struct {
             child.after = try std.json.Stringify.valueAlloc(self.alloc, child_json, .{});
             try self.charge(child.after.?.len);
             try self.enqueue(child);
+            try self.completeTriggeredChild(child);
         }
     }
 
@@ -1123,7 +1316,8 @@ const Builder = struct {
         return false;
     }
 
-    fn expandParent(self: *Builder, item: *Work, transition: planner.ParentTransition) !void {
+    fn expandParent(self: *Builder, item: *Work, transition: planner.ParentTransition) anyerror!void {
+        if (self.control.table_triggers != null and !self.unique_only) return self.queueForeignKeyActions(item, transition);
         if (self.statement) {
             // Deferrable UNIQUE keys cannot be FK targets. Intermediate
             // duplicate owners live only in the session's guarded row overlay;
@@ -1163,6 +1357,7 @@ const Builder = struct {
 
     pub fn deinit(self: *Builder) void {
         if (self.read_view) |view| view.deinit();
+        for (self.owned_prepared_rows.items) |row| row.deinit(self.alloc);
         for (self.loaded.items) |table| {
             if (table.plan) |*plan| plan.deinit();
             table.view.release();
@@ -1171,6 +1366,7 @@ const Builder = struct {
     }
 
     fn metadataTable(self: *Builder, name: []const u8) !TableRecord {
+        if (self.control.table_triggers) |provider| if (provider.table_record) |resolve| if (try resolve(provider.ptr, name)) |record| return record;
         for (self.metadata) |table| if (std.mem.eql(u8, name, table.name)) return table;
         return error.TableNotFound;
     }
@@ -1410,6 +1606,7 @@ fn prepareModeSelected(alloc: Allocator, source: reads.TableReadSource, metadata
         var it = writes.iterator();
         while (it.next()) |entry| {
             const item = try builder.getWork(table, entry.key_ptr.*);
+            if (builder.control.table_triggers) |provider| try builder.beginTriggerMutation(item, &.{}, provider.reuse_explicit, provider.reuse_explicit);
             item.explicit = true;
             item.after = if (entry.value_ptr.*) |write| write.value else null;
             item.after_json_null_fields = if (entry.value_ptr.*) |write| write.json_null_fields else &.{};
@@ -1424,6 +1621,7 @@ fn prepareModeSelected(alloc: Allocator, source: reads.TableReadSource, metadata
             if (events.len != 0) {
                 const event = try builder.alloc.create(Work);
                 event.* = item.*;
+                if (item.event_expansion) |logical| event.expansion = logical;
                 try parent_events.append(builder.alloc, event);
                 item.parent_expanded = true;
             }
@@ -1469,11 +1667,16 @@ fn prepareModeSelected(alloc: Allocator, source: reads.TableReadSource, metadata
         const item = builder.queue.items[queue_index];
         item.queued = false;
         if (!item.parent_expanded) {
-            const expansion = try builder.expandWork(item);
+            const net = try builder.expandWork(item);
+            const expansion = item.event_expansion orelse net;
             item.parent_expanded = true;
             if (!unique_only) for (expansion.parents) |transition| try builder.expandParent(item, transition);
         }
     }
+    // Trusted planner continuations borrow this live Builder and read cut.
+    // Drain before assembling final writes or releasing either owner. They may
+    // append child events, whose BEFORE preparation happens synchronously.
+    if (builder.control.table_triggers) |provider| if (provider.drain) |drain| try drain(provider.ptr);
     // Replace only coordinated primary tables with their final row work set.
     // Unrelated document tables keep their existing primary request envelopes.
     for (builder.work.items) |item| {
@@ -1490,6 +1693,7 @@ fn prepareModeSelected(alloc: Allocator, source: reads.TableReadSource, metadata
         if (!item.dirty) continue;
         const i = try builder.outputIndex(item.table.name, item.table.view.version());
         try builder.appendPredicate(i, item.key, item.observed_version, item.observed_digest);
+        if (item.trigger_suppressed) continue;
         if (item.after) |json| try final_writes[i].append(builder.alloc, .{ .key = item.key, .value = json, .json_null_fields = item.after_json_null_fields, .prepared_domain = item.after_prepared_domain }) else try final_deletes[i].append(builder.alloc, item.key);
         // This arena is owned transitively by the returned request arena.
         const expansion = try builder.expandWork(item);
@@ -4537,4 +4741,153 @@ test "distributed txn command unique admission retains caller deadlines across o
     now += 5 * std.time.ns_per_s;
     try std.testing.expectError(error.DeadlineExceeded, unscoped.admitPrepared(&write));
     try std.testing.expectError(error.DeadlineExceeded, UniqueAdmission.create(a, fixture.source(), &metadata, &.{}, &.{}, .{ .deadline_ns = now, .deadline_io = clock }, &.{}));
+}
+
+// Append to api/relational_integrity_commit.zig after the shared type gate.
+test "distributed txn trigger coordinator prepares generated FK rows once and runs empty child statements" {
+    const trigger = @import("../sql/trigger_provider.zig");
+    const shape = @import("../sql/trigger_definition.zig");
+    const parent_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const child_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"p","parent_columns":["id"],"on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"status":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const Fixture = struct {
+        const Stage = struct { table: u64, actions: std.ArrayList(trigger.ReferentialAction) = .empty };
+        p: []const u8,
+        c: []const u8,
+        metadata: []const TableRecord,
+        stages: std.ArrayList(*Stage) = .empty,
+        position: usize = 0,
+        events: std.ArrayList(u8) = .empty,
+        parent_rows: usize = 0,
+        child_rows: usize = 0,
+        child_statements: usize = 0,
+        child_completed: usize = 0,
+        reference_reads: usize = 0,
+        a: Allocator,
+        fn ptr(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn lookup(raw: *anyopaque, a: Allocator, table: []const u8, _: []const u8, options: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
+            const self = ptr(raw);
+            if (options.relational_integrity_catalog) return .{ .json = try a.dupe(u8, if (std.mem.eql(u8, table, "p")) self.p else self.c), .version = 0 };
+            if (options.relational_integrity_jobs_json.len != 0) self.reference_reads += 1;
+            return null;
+        }
+        fn before(raw: *anyopaque, a: Allocator, input: trigger.Input) !trigger.Prepared {
+            const self = ptr(raw);
+            try std.testing.expect(input.before_parsed != null);
+            try std.testing.expect(input.before == null and input.before_typed == null);
+            try std.testing.expectEqual(shape.Event.update, input.event);
+            const stage = try a.create(Stage);
+            stage.* = .{ .table = input.table.table_id };
+            if (stage.table == 1) {
+                self.parent_rows += 1;
+                try self.events.append(self.a, 'P');
+            } else {
+                self.child_rows += 1;
+                const raw_id = input.before_parsed.?.value.object.get("id") orelse return error.MissingOldId;
+                const old_id = switch (raw_id) {
+                    .integer => |value| value,
+                    .number_string => |value| try std.fmt.parseInt(i64, value, 10),
+                    else => return error.UnexpectedOldIdType,
+                };
+                try std.testing.expectEqual(@as(i64, 1), old_id);
+                try std.testing.expectEqualStrings("id", input.update_columns[0]);
+                try input.after.?.object.put(a, "status", .{ .integer = 42 });
+                try self.events.append(self.a, 'B');
+            }
+            return .{ .skipped = false, .json_null_fields = &.{}, .stage = stage };
+        }
+        fn after(raw: *anyopaque, token: *anyopaque) !void {
+            const self = ptr(raw);
+            const stage: *Stage = @ptrCast(@alignCast(token));
+            try self.stages.append(self.a, stage);
+        }
+        fn incoming(raw: *anyopaque, table: TableRecord) ![]const TableRecord {
+            const self = ptr(raw);
+            return if (table.table_id == 1) self.metadata[1..] else &.{};
+        }
+        fn queue(raw: *anyopaque, token: ?*anyopaque, action: trigger.ReferentialAction) !void {
+            const self = ptr(raw);
+            const stage: *Stage = @ptrCast(@alignCast(token orelse return error.MissingStage));
+            try std.testing.expectEqual(@as(u64, 1), stage.table);
+            try std.testing.expectEqual(@as(u64, 2), action.child_table_id);
+            try stage.actions.append(self.a, action);
+        }
+        fn begin(raw: *anyopaque, table: TableRecord, event: shape.Event, columns: []const []const u8) !void {
+            const self = ptr(raw);
+            try std.testing.expectEqual(@as(u64, 2), table.table_id);
+            try std.testing.expectEqual(shape.Event.update, event);
+            try std.testing.expectEqualStrings("id", columns[0]);
+            self.child_statements += 1;
+            try self.events.append(self.a, 'S');
+        }
+        fn end(raw: *anyopaque, _: TableRecord, _: shape.Event, _: []const []const u8) !void {
+            ptr(raw).child_completed += 1;
+        }
+        fn drain(raw: *anyopaque) !void {
+            const self = ptr(raw);
+            while (self.position < self.stages.items.len) {
+                const stage = self.stages.items[self.position];
+                self.position += 1;
+                try self.events.append(self.a, if (stage.table == 1) 'A' else 'C');
+                for (stage.actions.items) |action| try action.run(action.ptr);
+                if (stage.table == 1) try self.events.append(self.a, 'Z');
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |with_child| {
+        var region: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer region.deinit();
+        const a = region.allocator();
+        const metadata = [_]TableRecord{ .{ .table_id = 1, .name = "p", .schema_json = parent_schema }, .{ .table_id = 2, .name = "c", .schema_json = child_schema } };
+        var fixture: Fixture = .{ .a = a, .metadata = &metadata, .p = try testCatalogEnvelope(a, 1, parent_schema), .c = try testCatalogEnvelope(a, 2, child_schema) };
+        const source: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } };
+        const initial = [_]contract.TableCommitRequest{ .{ .table_name = "p", .writes = &.{.{ .key = "parent", .value = "{\"id\":1}" }} }, .{ .table_name = "c", .writes = &.{.{ .key = "child", .value = "{\"id\":1,\"status\":0}" }} } };
+        var previous = try prepareModeInternal(std.testing.allocator, source, &metadata, initial[0..if (with_child) 2 else 1], .{}, &.{}, true, &.{}, true);
+        defer previous.deinit();
+        const control: RequestContext = .{ .table_triggers = .{ .ptr = &fixture, .before = Fixture.before, .after = Fixture.after, .incoming = Fixture.incoming, .queue_action = Fixture.queue, .drain = Fixture.drain, .begin_statement = Fixture.begin, .end_statement = Fixture.end } };
+        var result = try prepareModeInternal(std.testing.allocator, source, &metadata, &.{.{ .table_name = "p", .writes = &.{.{ .key = "parent", .value = "{\"id\":2}" }} }}, control, &.{}, true, previous.tables, true);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fixture.parent_rows);
+        try std.testing.expectEqual(@as(usize, @intFromBool(with_child)), fixture.child_rows);
+        try std.testing.expectEqual(@as(usize, 1), fixture.child_statements);
+        try std.testing.expectEqual(@as(usize, 1), fixture.child_completed);
+        try std.testing.expectEqualStrings(if (with_child) "PASBZC" else "PASZ", fixture.events.items);
+        if (with_child) {
+            const child = for (result.tables) |table| {
+                if (std.mem.eql(u8, table.table_name, "c")) break table;
+            } else return error.MissingChild;
+            try std.testing.expectEqualStrings("{\"id\":2,\"status\":42}", child.writes[0].value);
+            try std.testing.expectEqual(@as(u64, 0), child.predicates[0].expected_version);
+        }
+    }
+}
+
+test "SQL relation lifetime integrity preparation retains trusted lookup minter and rejects owner substitution" {
+    const persistence = @import("../common/relation_persistence.zig");
+    const authority = @import("../common/relation_owner_authority.zig");
+    const Fixture = struct {
+        fn sign(_: *anyopaque, _: Allocator, _: persistence.Owner, _: authority.Scope) ![]u8 {
+            return error.UnexpectedMintBeforeRouting;
+        }
+    };
+    var fixture: u8 = 0;
+    const owner: persistence.Owner = .{ .issuer_node_id = 1, .connection_id = @splat(1), .wire_epoch = @splat(2), .execution_instance = @splat(3), .connection_generation = 1, .principal_digest = @splat(4) };
+    const minter: authority.Minter = .{ .ptr = &fixture, .sign_fn = Fixture.sign, .owner = owner };
+    const control: RequestContext = .{ .sql_relation_owner = owner, .sql_relation_owner_minter = minter };
+    const options = try authorizedLookupOptions(control, std.testing.allocator, "owned", .{ .relational_integrity_catalog = true });
+    try std.testing.expect(options.relation_owner_minter.?.owner.eql(owner));
+    try std.testing.expect(options.relation_owner_minter.?.ptr == minter.ptr);
+    var foreign = control;
+    foreign.sql_relation_owner.?.wire_epoch = @splat(8);
+    try std.testing.expectError(error.SqlTemporaryRelationNotOwned, authorizedLookupOptions(foreign, std.testing.allocator, "owned", .{ .relational_integrity_catalog = true }));
+    var conflicting = options;
+    conflicting.relation_owner_minter.?.owner.wire_epoch = @splat(9);
+    try std.testing.expectError(error.SqlTemporaryRelationNotOwned, authorizedLookupOptions(control, std.testing.allocator, "owned", conflicting));
+    const absent = try authorizedLookupOptions(.{}, std.testing.allocator, "owned", .{ .relational_integrity_catalog = true });
+    try std.testing.expect(absent.relation_owner_minter == null);
 }

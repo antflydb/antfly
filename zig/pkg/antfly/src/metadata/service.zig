@@ -3583,16 +3583,69 @@ test "relation mutation admission projects naming capability without materializi
 }
 
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
-    const native_index = nativeIndexRequiredCoordinatedDecoderVersion(command);
+    const paired = switch (command) {
+        .apply_system_catalog, .apply_sql_policy_publication => |bytes| @import("schema_reader_wire.zig").requiresCoupledSchemaPolicy(bytes),
+        else => false,
+    };
+    if (paired) return metadata_topology_protocol.coupled_schema_policy_version;
+    const native_index = @max(nativeIndexRequiredCoordinatedDecoderVersion(command), relationPersistenceRequiredDecoderVersion(command), tableTriggersRequiredDecoderVersion(command));
     const envelope: ?[]const u8 = switch (command) {
         .apply_system_catalog, .apply_fk_initial_create, .apply_fk_generation_publication, .apply_restore_staging, .begin_relational_index_publication => |bytes| bytes,
         .create_restore_job_with_staging => |request| request.plan_json,
         else => null,
     };
-    if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresStrongestDecoder(bytes)) return metadata_topology_protocol.current_version;
+    if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresStrongestDecoder(bytes)) return @max(native_index, metadata_topology_protocol.current_version);
     if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresInitialCreationCopy(bytes)) return @max(native_index, metadata_topology_protocol.initial_fk_creation_copy_version);
     if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresInitialCounterEffects(bytes)) return @max(native_index, metadata_topology_protocol.initial_fk_column_sequences_version);
     return @max(native_index, resolverRequiredCoordinatedDecoderVersion(command), baseRequiredCoordinatedDecoderVersion(command), clockReadersRequiredDecoderVersion(command), nativeServiceRequiredDecoderVersion(command), objectRenameRequiredDecoderVersion(command));
+}
+
+fn tableTriggersRequiredDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const Wire = @import("schema_reader_wire.zig");
+    const required = switch (command) {
+        .apply_sql_graph_preparation => true,
+        .upsert_table => |table| table.schema_json.len != 0 and Wire.requiresSqlTableTriggers(table.schema_json),
+        .compare_and_replace_table => |value| (value.expected.schema_json.len != 0 and Wire.requiresSqlTableTriggers(value.expected.schema_json)) or (value.replacement.schema_json.len != 0 and Wire.requiresSqlTableTriggers(value.replacement.schema_json)),
+        .apply_table_topology => |value| switch (value) {
+            .create => |create| create.table.schema_json.len != 0 and Wire.requiresSqlTableTriggers(create.table.schema_json),
+            .drop => false,
+        },
+        .apply_system_catalog, .apply_fk_initial_create, .apply_fk_generation_publication, .apply_restore_staging, .apply_schema_validation, .begin_relational_index_publication => |bytes| Wire.requiresSqlTableTriggers(bytes),
+        .create_restore_job_with_staging => |value| Wire.requiresSqlTableTriggers(value.plan_json) or Wire.requiresSqlTableTriggers(value.value),
+        .create_restore_job, .upsert_restore_job => |value| Wire.requiresSqlTableTriggers(value.value),
+        .compare_and_set_backup_cohort => |value| Wire.requiresSqlTableTriggers(value.value),
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |value| for (value.upsert_tables) |table| {
+            if (table.schema_json.len != 0 and Wire.requiresSqlTableTriggers(table.schema_json)) break true;
+        } else false,
+        else => false,
+    };
+    return if (required) metadata_topology_protocol.sql_table_triggers_version else 0;
+}
+
+fn relationPersistenceRequiredDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const required = switch (command) {
+        .apply_sql_relation_boot => true,
+        .upsert_table => |table| table.sql_persistence != null,
+        .compare_and_replace_table => |value| value.expected.sql_persistence != null or value.replacement.sql_persistence != null,
+        .apply_table_topology => |value| switch (value) {
+            .create => |create| create.table.sql_persistence != null,
+            .drop => false,
+        },
+        .apply_system_catalog, .apply_sql_prepared_transaction, .apply_fk_initial_create, .apply_fk_generation_publication, .apply_restore_staging, .apply_schema_validation, .apply_table_retirement, .apply_scope_retirement, .begin_relational_index_publication => |bytes| @import("schema_reader_wire.zig").requiresSqlRelationPersistence(bytes),
+        .create_restore_job_with_staging => |value| @import("schema_reader_wire.zig").requiresSqlRelationPersistence(value.plan_json),
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |value| for (value.upsert_tables) |table| {
+            if (table.sql_persistence != null) break true;
+        } else false,
+        else => false,
+    };
+    return if (required) metadata_topology_protocol.sql_relation_persistence_version else 0;
+}
+
+test "SQL relation persistence decoder leaves incarnation bootstrap unguarded and gates only owned rows" {
+    try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .initialize_metadata_incarnation = "0123456789abcdef0123456789abcdef".* }));
+    try std.testing.expectEqual(metadata_topology_protocol.sql_relation_persistence_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_sql_relation_boot = "signed" }));
+    try std.testing.expectEqual(@as(u16, 0), relationPersistenceRequiredDecoderVersion(.{ .upsert_table = .{ .table_id = 7, .name = "ordinary" } }));
+    try std.testing.expectEqual(metadata_topology_protocol.sql_gin_index_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = .{ .table_id = 7, .name = "ordinary", .sql_native_indexes_json = "owned" } }));
 }
 
 // The opaque native configuration can contain newer SQL operator classes.
@@ -8419,6 +8472,14 @@ pub const MetadataService = struct {
         return current_status;
     }
 
+    pub fn nativeOwnerDataUri(self: *MetadataService, alloc: std.mem.Allocator, node_id: u64, store_id: u64, context: api_operation.RequestContext) !?[]u8 {
+        try context.ensureActive();
+        const records = try self.listProjectedStores(alloc);
+        defer self.freeProjectedStores(alloc, records);
+        try context.ensureActive();
+        return metadata_api.nativeOwnerDataUri(alloc, records, node_id, store_id);
+    }
+
     pub fn adminSnapshot(self: *MetadataService) !metadata_api.AdminSnapshot {
         return try metadata_api.captureSnapshot(self.alloc, self);
     }
@@ -11189,6 +11250,23 @@ pub const MetadataHttpService = struct {
         return self.ensureTableTopologyProtocolReadyMode(request, required_version, false, false);
     }
 
+    // Diagnostic-only bounded observation: one line per actual failure stage in
+    // a test process, never one line per request/retry and never a second read.
+    const ReadinessFailureDiagnostic = struct {
+        const Stage = enum(u3) { requirement, membership, incarnation, cached, route, transport, member };
+        var emitted: std.atomic.Value(u8) = .init(0);
+
+        fn report(stage: Stage, minimum: u16, schema_floor: u16, relation_floor: u16, required: u16, node: ?u64, version: ?u16) void {
+            if (!builtin.is_test or stage == .cached) return;
+            const mask = @as(u8, 1) << @backingInt(stage);
+            if (emitted.fetchOr(mask, .monotonic) & mask != 0) return;
+            std.debug.print("metadata readiness failure stage={s} minimum={d} schema_floor={d} relation_floor={d} required={d} current={d} member={?d} member_version={?d}\n", .{
+                @tagName(stage),                            minimum, schema_floor, relation_floor, required,
+                metadata_topology_protocol.current_version, node,    version,
+            });
+        }
+    };
+
     // Proposal-time admission must not instantiate the network/activation path:
     // activation itself proposes a command, and callers may hold mutation locks.
     fn ensureTableTopologyProtocolReadyMode(self: *MetadataHttpService, request: api_operation.RequestContext, minimum_version: u16, comptime cached_only: bool, comptime commit_activation: bool) !TableTopologyProtocolReadiness {
@@ -11197,7 +11275,16 @@ pub const MetadataHttpService = struct {
             zig017_return_error = zig017_err;
             return zig017_err;
         });
-        const required_version = @max(minimum_version, try schemaReaderDecoderFloor(self), try relationSourceDecoderFloor(self));
+        const schema_floor = try schemaReaderDecoderFloor(self);
+        const relation_floor = try relationSourceDecoderFloor(self);
+        const required_version = @max(minimum_version, schema_floor, relation_floor);
+        var diagnostic_stage: ReadinessFailureDiagnostic.Stage = .requirement;
+        var diagnostic_member: ?u64 = null;
+        var diagnostic_version: ?u16 = null;
+        defer if (zig017_return_error) |failure| {
+            if (failure == error.TableTopologyProtocolUpgradeRequired)
+                ReadinessFailureDiagnostic.report(diagnostic_stage, minimum_version, schema_floor, relation_floor, required_version, diagnostic_member, diagnostic_version);
+        };
         if (required_version == 0 or required_version > metadata_topology_protocol.current_version)
             return zig017_failure: {
                 zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
@@ -11207,6 +11294,7 @@ pub const MetadataHttpService = struct {
         // Status.conf_state borrows the Raft group's membership arrays. Copy
         // the required IDs while the runtime lock protects those arrays, then
         // release it before any network I/O.
+        diagnostic_stage = .membership;
         const observation = locked: {
             self.lockRuntime();
             defer self.unlockRuntime();
@@ -11235,6 +11323,7 @@ pub const MetadataHttpService = struct {
         };
         const required_node_ids = observation.required_node_ids;
         defer self.alloc.free(required_node_ids);
+        diagnostic_stage = .incarnation;
         const incarnation = ((self.metadataIncarnation() catch |zig017_err| {
             zig017_return_error = zig017_err;
             return zig017_err;
@@ -11272,6 +11361,7 @@ pub const MetadataHttpService = struct {
         // Preserve the completion epoch from the first contention. Consumers
         // do not advance it, so every caller queued behind the actual network
         // probe can share its outcome even after scheduler delays.
+        diagnostic_stage = .cached;
         var joined_completion_epoch: ?u32 = null;
         var probe_lease = while (true) {
             (request.ensureActive() catch |zig017_err| {
@@ -11360,7 +11450,9 @@ pub const MetadataHttpService = struct {
         });
         defer self.alloc.free(slots);
         for (slots) |*slot| slot.* = .{};
+        diagnostic_stage = .route;
         for (required_node_ids, slots) |node_id, *slot| {
+            diagnostic_member = node_id;
             (request.ensureActive() catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
@@ -11395,6 +11487,8 @@ pub const MetadataHttpService = struct {
         }
         // Validate the complete route set before scheduling any fibers so an
         // early configuration error can never leave work borrowing `slots`.
+        diagnostic_stage = .transport;
+        diagnostic_member = null;
         const probe_io = self.raft.host.http_host.outboundIo();
         var batch_start: usize = 0;
         while (batch_start < slots.len) : (batch_start += table_topology_protocol_probe_concurrency) {
@@ -11427,6 +11521,9 @@ pub const MetadataHttpService = struct {
             return zig017_err;
         });
         for (slots) |slot| {
+            diagnostic_stage = .member;
+            diagnostic_member = slot.node_id;
+            diagnostic_version = slot.status.table_topology_protocol_version;
             if (slot.err) |err| {
                 std.log.warn("table topology protocol probe failed member={d} err={s}", .{ slot.node_id, @errorName(err) });
                 return zig017_failure: {
@@ -12482,6 +12579,15 @@ pub const MetadataHttpService = struct {
         );
     }
 
+    pub fn nativeOwnerDataUri(self: *MetadataHttpService, alloc: std.mem.Allocator, node_id: u64, store_id: u64, context: api_operation.RequestContext) !?[]u8 {
+        try context.ensureActive();
+        if (!self.projection_mutex.tryLock()) return error.ResourceTemporarilyUnavailable;
+        defer self.unlockProjection();
+        try context.ensureActive();
+        const core = try self.projectedCoreComponentsLocked(.initMany(&.{.store}));
+        return metadata_api.nativeOwnerDataUri(alloc, core.stores, node_id, store_id);
+    }
+
     pub fn adminSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
         return try self.buildAdminSnapshot(true);
     }
@@ -12538,6 +12644,12 @@ pub const MetadataHttpService = struct {
         };
     }
 
+    /// Planning deliberately omits heavy schema/index payloads, but native
+    /// execution class is part of routing identity, not optional display data.
+    fn clonePlanningTable(a: std.mem.Allocator, table: metadata_table_manager.TableRecord) !metadata_table_manager.TableRecord {
+        return metadata_table_manager.cloneTable(a, .{ .table_id = table.table_id, .name = table.name, .sql_persistence = table.sql_persistence });
+    }
+
     pub fn planningSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
         var inputs = try self.captureTransitionReadinessInputs();
         defer inputs.deinit(self.alloc);
@@ -12568,7 +12680,7 @@ pub const MetadataHttpService = struct {
             tables.deinit(self.alloc);
         }
         try tables.ensureTotalCapacity(self.alloc, source.tables.len);
-        for (source.tables) |table| tables.appendAssumeCapacity(try metadata_table_manager.cloneTable(self.alloc, .{ .table_id = table.table_id, .name = table.name }));
+        for (source.tables) |table| tables.appendAssumeCapacity(try clonePlanningTable(self.alloc, table));
         snapshot.tables = try tables.toOwnedSlice(self.alloc);
         // Ownership transferred; an error later must not free the table array twice.
         tables = .empty;
@@ -18905,6 +19017,12 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
         hashProjectedProvisioningBytes(&hasher, table.restore_location);
         hasher.update(std.mem.asBytes(&table.desired_replica_count));
         hasher.update(std.mem.asBytes(&table.min_ranges));
+        if (table.sql_persistence) |descriptor| {
+            // Absence retains the historical permanent-table head bytes.
+            // Native placement/lifetime changes are provisioning authority.
+            hasher.update("antfly/native-relation-provisioning/v1\x00");
+            hasher.update(&try descriptor.fingerprint());
+        }
     }
 
     const ranges = try service.listProjectedRanges(alloc);
@@ -18977,6 +19095,51 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
     }
 
     return hasher.final();
+}
+
+test "SQL relation lifetime provisioning head binds native descriptor and preserves permanent legacy bytes" {
+    const table_manager = @import("table_manager.zig");
+    const Placement = @typeInfo(@FieldType(metadata_api.AdminSnapshot, "placement_intents")).pointer.child;
+    const Fixture = struct {
+        table: table_manager.TableRecord = .{ .table_id = 7, .name = "records" },
+        pub fn listProjectedTables(self: *@This(), a: std.mem.Allocator) ![]table_manager.TableRecord {
+            return a.dupe(table_manager.TableRecord, &.{self.table});
+        }
+        pub fn freeProjectedTables(_: *@This(), a: std.mem.Allocator, tables: []table_manager.TableRecord) void {
+            a.free(tables);
+        }
+        pub fn listProjectedRanges(_: *@This(), a: std.mem.Allocator) ![]table_manager.RangeRecord {
+            return a.alloc(table_manager.RangeRecord, 0);
+        }
+        pub fn freeProjectedRanges(_: *@This(), a: std.mem.Allocator, ranges: []table_manager.RangeRecord) void {
+            a.free(ranges);
+        }
+        pub fn listProjectedPlacementIntents(_: *@This(), a: std.mem.Allocator) ![]Placement {
+            return a.alloc(Placement, 0);
+        }
+        pub fn freeProjectedPlacementIntents(_: *@This(), a: std.mem.Allocator, intents: []Placement) void {
+            a.free(intents);
+        }
+    };
+    var fixture: Fixture = .{};
+    const permanent = try projectedProvisioningFingerprint(std.testing.allocator, &fixture);
+    // Historical one-table projection, without a newly inserted nil marker.
+    var legacy = std.hash.Wyhash.init(0x8f6b4f5a2c13d9e1);
+    legacy.update(std.mem.asBytes(&fixture.table.table_id));
+    for ([_][]const u8{ fixture.table.name, fixture.table.schema_json, fixture.table.read_schema_json, fixture.table.indexes_json, fixture.table.replication_sources_json, fixture.table.placement_role, fixture.table.restore_backup_id, fixture.table.restore_location }) |bytes| hashProjectedProvisioningBytes(&legacy, bytes);
+    legacy.update(std.mem.asBytes(&fixture.table.desired_replica_count));
+    legacy.update(std.mem.asBytes(&fixture.table.min_ranges));
+    try std.testing.expectEqual(legacy.final(), permanent);
+    fixture.table.sql_persistence = .{ .kind = .unlogged, .owner_node_id = 2, .owner_store_id = 3, .generation_instance = @splat(1), .data_generation = 1 };
+    const native = try projectedProvisioningFingerprint(std.testing.allocator, &fixture);
+    try std.testing.expect(native != permanent);
+    fixture.table.sql_persistence.?.data_generation += 1;
+    const next = try projectedProvisioningFingerprint(std.testing.allocator, &fixture);
+    try std.testing.expect(next != native);
+    fixture.table.sql_persistence.?.generation_instance[0] ^= 1;
+    try std.testing.expect(next != try projectedProvisioningFingerprint(std.testing.allocator, &fixture));
+    fixture.table.sql_persistence = null;
+    try std.testing.expectEqual(permanent, try projectedProvisioningFingerprint(std.testing.allocator, &fixture));
 }
 
 fn hashProjectedProvisioningBytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
@@ -24475,7 +24638,13 @@ test "SQL command fence decoder admission dominates legacy catalog and counter f
     try std.testing.expectEqual(metadata_topology_protocol.sql_lock_authority_version, baseRequiredCoordinatedDecoderVersion(.{ .apply_sql_lock_scope = "{\"admission\":{\"command_fence\":null}}" }));
 }
 
-pub fn proposeCatalogWithContext(service: anytype, context: api_operation.RequestContext, command: metadata_storage.TransitionCommand) @TypeOf(service.proposeTransitionCommandWithReceipt(command)) {
+fn proposalWithContextResult(comptime ProposalResult: type) type {
+    const proposal = @typeInfo(ProposalResult).error_union;
+    const admission = @typeInfo(@TypeOf(@as(api_operation.RequestContext, .{}).ensureActive())).error_union;
+    return (proposal.error_set || admission.error_set)!proposal.payload;
+}
+
+pub fn proposeCatalogWithContext(service: anytype, context: api_operation.RequestContext, command: metadata_storage.TransitionCommand) proposalWithContextResult(@TypeOf(service.proposeTransitionCommandWithReceipt(command))) {
     try context.ensureActive();
     if (comptime @hasDecl(@TypeOf(service.*), "proposeTransitionCommandWithReceiptObserved"))
         return service.proposeTransitionCommandWithReceiptObserved(command, context.sql_completion_submission);
@@ -24489,4 +24658,66 @@ test "SQL scope retirement document source markers require newest decoder" {
     try std.testing.expectEqual(version, baseRequiredCoordinatedDecoderVersion(.{ .apply_table_retirement = "{\"physical\":{\"summary\":{\"document_source\":true}}}" }));
     try std.testing.expectEqual(version, baseRequiredCoordinatedDecoderVersion(.{ .apply_fk_generation_publication = "{\"document_source\":true}" }));
     try std.testing.expectEqual(version, baseRequiredCoordinatedDecoderVersion(.{ .apply_fk_generation_publication = "{\"document_schema_digest\":[1]}" }));
+}
+
+test "SQL table trigger restore and backup provenance require decoder174 without changing routine ABI151" {
+    const version = metadata_topology_protocol.sql_table_triggers_version;
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = .{ .table_id = 7, .name = "t", .schema_json = "{\"sql_triggers\":{}}" } }));
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{\"trigger_handoff\":{}}" }));
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_set_backup_cohort = .{ .job_id = 7, .expected_revision = 0, .value = "{\"trigger_source_columns_digest\":[1]}" } }));
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .create_restore_job = .{ .key = "job", .value = "{\"routine_mappings\":[{}]}" } }));
+    try std.testing.expectEqual(@as(u16, 0), tableTriggersRequiredDecoderVersion(.{ .create_restore_job = .{ .key = "job", .value = "{}" } }));
+    try std.testing.expectEqual(@as(u16, 0), tableTriggersRequiredDecoderVersion(.{ .apply_system_catalog = "{\"sql_routine\":{\"returns_trigger\":true}}" }));
+}
+
+test "SQL table trigger decoder preserves ordinary schema-free CREATE preflight without weakening real feature guards" {
+    const Table = metadata_table_manager.TableRecord;
+    const empty: Table = .{ .table_id = 0, .name = "new_table", .schema_json = "", .indexes_json = "{}" };
+    // mutateOrPrepare deliberately supplies this metadata-only projection
+    // before binding a schema without named types. Empty means absent here;
+    // malformed nonempty control envelopes remain conservatively guarded.
+    try std.testing.expectEqual(@as(u16, 0), tableTriggersRequiredDecoderVersion(.{ .upsert_table = empty }));
+    try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = empty }) < metadata_topology_protocol.sql_table_triggers_version);
+    var ordinary = empty;
+    ordinary.schema_json = "{}";
+    try std.testing.expectEqual(@as(u16, 0), tableTriggersRequiredDecoderVersion(.{ .upsert_table = ordinary }));
+    const Peer = struct {
+        requested: u16 = 0,
+        pub fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: api_operation.RequestContext, version: u16) !bool {
+            self.requested = version;
+            if (version > metadata_topology_protocol.current_version) return error.TableTopologyProtocolUpgradeRequired;
+            return true;
+        }
+    };
+    var peer: Peer = .{};
+    try preflightTableRecordWithContextImpl(&peer, .{}, empty);
+    try std.testing.expect(peer.requested < metadata_topology_protocol.sql_table_triggers_version);
+    var attached = empty;
+    attached.schema_json = "{\"sql_triggers\":{}}";
+    try std.testing.expectEqual(metadata_topology_protocol.sql_table_triggers_version, tableTriggersRequiredDecoderVersion(.{ .upsert_table = attached }));
+    try std.testing.expectEqual(metadata_topology_protocol.sql_table_triggers_version, tableTriggersRequiredDecoderVersion(.{ .compare_and_replace_table = .{ .expected = empty, .replacement = attached } }));
+    try std.testing.expectEqual(metadata_topology_protocol.sql_table_triggers_version, tableTriggersRequiredDecoderVersion(.{ .compare_and_replace_table = .{ .expected = attached, .replacement = empty } }));
+    var malformed = empty;
+    malformed.schema_json = "{";
+    try std.testing.expectEqual(metadata_topology_protocol.sql_table_triggers_version, tableTriggersRequiredDecoderVersion(.{ .upsert_table = malformed }));
+    try std.testing.expectEqual(metadata_topology_protocol.sql_table_triggers_version, tableTriggersRequiredDecoderVersion(.{ .apply_system_catalog = "" }));
+}
+
+test "SQL relation lifetime compact planning preserves native execution class and ordinary omission" {
+    const a = std.testing.allocator;
+    const p: @import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(1), .data_generation = 1 };
+    const original: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "native_planning", .schema_json = "heavy", .sql_persistence = p };
+    const native = try MetadataHttpService.clonePlanningTable(a, original);
+    defer metadata_table_manager.freeTable(a, native);
+    try std.testing.expect(native.sql_persistence.?.eql(p));
+    try std.testing.expectEqualStrings("", native.schema_json);
+    const ordinary = try MetadataHttpService.clonePlanningTable(a, .{ .table_id = 8, .name = "ordinary" });
+    defer metadata_table_manager.freeTable(a, ordinary);
+    try std.testing.expect(ordinary.sql_persistence == null);
+}
+
+test "row-policy coupled schema metadata175 is selected before historical catalog profiles" {
+    try std.testing.expectEqual(metadata_topology_protocol.coupled_schema_policy_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"sql_relation\":{\"change\":{\"definition\":{\"policy_pair\":{}}}}}" }));
+    try std.testing.expectEqual(metadata_topology_protocol.coupled_schema_policy_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_sql_policy_publication = "{\"change\":{\"begin\":{\"schema_pair\":{}}}}" }));
+    try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"schema_json\":\"schema_pair\",\"policy_pair\":null}" }) < metadata_topology_protocol.coupled_schema_policy_version);
 }

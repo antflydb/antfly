@@ -25,7 +25,9 @@ const A = std.mem.Allocator;
 pub const max_steps = 256;
 pub const Notice = @import("notices.zig").Notice;
 pub const TriggerReturn = enum { new, old, skip };
-const SyntaxStep = union(enum) { perform: compiler.CompiledScalar, notice: []const u8, return_void, return_trigger: TriggerReturn };
+pub const TriggerImage = enum { new, old };
+const Assignment = struct { image: TriggerImage, column: []const u8, expression: compiler.CompiledScalar };
+const SyntaxStep = union(enum) { perform: compiler.CompiledScalar, notice: []const u8, assign: Assignment, return_void, return_trigger: TriggerReturn };
 pub const Syntax = struct {
     allocator: A,
     steps: []const SyntaxStep,
@@ -36,6 +38,11 @@ pub const Syntax = struct {
                 owned.deinit();
             },
             .notice => |text| self.allocator.free(text),
+            .assign => |value| {
+                var expression = value.expression;
+                expression.deinit();
+                self.allocator.free(value.column);
+            },
             .return_void, .return_trigger => {},
         };
         self.allocator.free(self.steps);
@@ -69,6 +76,11 @@ pub fn compileBody(a: A, record: routines.records.Record) !Syntax {
                 parsed.deinit();
             },
             .notice => |text| a.free(text),
+            .assign => |value| {
+                var expression = value.expression;
+                expression.deinit();
+                a.free(value.column);
+            },
             .return_void, .return_trigger => {},
         };
         steps.deinit(a);
@@ -99,6 +111,27 @@ pub fn compileBody(a: A, record: routines.records.Record) !Syntax {
             errdefer a.free(text);
             try steps.append(a, .{ .notice = text });
             pos += 1;
+        } else if (record.definition.returns_trigger and (word(tokens[pos], "NEW") or word(tokens[pos], "OLD"))) {
+            const image: TriggerImage = if (word(tokens[pos], "NEW")) .new else .old;
+            pos += 1;
+            if (pos + 3 >= tokens.len or tokens[pos].kind != .dot or tokens[pos + 1].kind != .identifier or tokens[pos + 2].kind != .colon or tokens[pos + 3].kind != .eq) return error.UnsupportedSqlShape;
+            const column = if (tokens[pos + 1].owned) try a.dupe(u8, tokens[pos + 1].text) else try std.ascii.allocLowerString(a, tokens[pos + 1].text);
+            errdefer a.free(column);
+            pos += 4;
+            const start = pos;
+            var depth: usize = 0;
+            while (pos < tokens.len) : (pos += 1) {
+                if (tokens[pos].kind == .semicolon and depth == 0) break;
+                if (tokens[pos].kind == .lparen) depth += 1;
+                if (tokens[pos].kind == .rparen) {
+                    if (depth == 0) return error.InvalidSqlSyntax;
+                    depth -= 1;
+                }
+            }
+            if (pos == start or depth != 0) return error.InvalidSqlSyntax;
+            var expression = try compiler.compileScalar(a, record.definition.body[tokens[start].source_start..tokens[pos - 1].source_end], .{ .max_bytes = routines.records.max_body_bytes, .max_parameters = 0 });
+            errdefer expression.deinit();
+            try steps.append(a, .{ .assign = .{ .image = image, .column = column, .expression = expression } });
         } else if (word(tokens[pos], "PERFORM")) {
             pos += 1;
             const start = pos;
@@ -126,7 +159,7 @@ pub fn compileBody(a: A, record: routines.records.Record) !Syntax {
     return .{ .allocator = a, .steps = try steps.toOwnedSlice(a) };
 }
 
-pub const Step = union(enum) { perform: struct { syntax: usize, program: ?scalar.Program = null }, notice: []const u8, return_void, return_trigger: TriggerReturn };
+pub const Step = union(enum) { perform: struct { syntax: usize, program: ?scalar.Program = null }, assign: struct { syntax: usize, program: ?scalar.Program = null }, notice: []const u8, return_void, return_trigger: TriggerReturn };
 pub const Resolved = struct {
     allocator: A,
     id: u64,
@@ -138,7 +171,45 @@ pub const Resolved = struct {
     steps: []Step,
     invocation: *@import("parameter_binding.zig").Invocation,
     settings: ?*const @import("setting_catalog.zig").View,
+    /// Scalar caches belong to one pinned statement/table environment.
+    trigger_columns: ?[]const scalar.Column = null,
 };
+/// Resolve the immutable callable closure without evaluating scalar effects.
+/// Binding failures stay demand-driven in the actual VM; metadata, authority,
+/// resource and cancellation failures abort capture rather than publish an
+/// incomplete executable authority. This never fills the receiver's caches.
+pub fn captureTriggerFunctions(prepared: *Resolved, frame: TriggerFrame) !void {
+    for (prepared.syntax.steps) |step| switch (step) {
+        .return_void, .return_trigger => break,
+        .notice => {},
+        .perform => |instruction| {
+            _ = scalar.bindTypedExpectedWithSettings(prepared.allocator, instruction.expression, frame.columns, prepared.arguments, null, .{ .invocation = prepared.invocation }, prepared.settings) catch |err| {
+                try deferCaptureBindingError(err);
+                continue;
+            };
+        },
+        .assign => |instruction| {
+            const target = frame.target(instruction.image, instruction.column) catch |err| {
+                try deferCaptureBindingError(err);
+                continue;
+            };
+            const column = frame.columns[target];
+            const cast: ast.Scalar = .{ .cast = .{ .operand = instruction.expression.expression, .type = column.type, .element_type = column.element_type, .temporal_kind = column.temporal_kind, .enum_view = column.enum_view, .domain_view = column.domain_view, .numeric_modifier = column.numeric_modifier, .context = .assignment } };
+            _ = scalar.bindTypedExpectedWithSettings(prepared.allocator, &cast, frame.columns, prepared.arguments, scalar.Type{ .kind = column.type, .element_type = column.element_type, .temporal_kind = column.temporal_kind, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_binding = scalar.domainBindingOf(column) }, .{ .invocation = prepared.invocation }, prepared.settings) catch |err| {
+                try deferCaptureBindingError(err);
+                continue;
+            };
+        },
+    };
+}
+fn deferCaptureBindingError(err: anyerror) !void {
+    const diagnostic = @import("errors.zig").describe(err);
+    // A denied metadata lookup cannot be forged into a missing declaration.
+    if (std.mem.eql(u8, diagnostic.code, "42501")) return err;
+    if (std.mem.startsWith(u8, diagnostic.code, "42") or std.mem.startsWith(u8, diagnostic.code, "22") or std.mem.eql(u8, diagnostic.code, "0A000")) return;
+    return err;
+}
+
 pub const Resolver = struct { ptr: *anyopaque, resolve: *const fn (*anyopaque, A, []const u8, []const routines.bindings.Argument) anyerror!*Resolved };
 
 /// Statement-owned syntax and declared domains. SQL names/types are bound only
@@ -159,6 +230,7 @@ pub fn prepare(a: A, record: routines.records.Record, functions: ?routines.bindi
         .return_void => .return_void,
         .return_trigger => |selection| .{ .return_trigger = selection },
         .perform => .{ .perform = .{ .syntax = ordinal } },
+        .assign => .{ .assign = .{ .syntax = ordinal } },
     };
     const invocation = try @import("parameter_binding.zig").Invocation.initLeaky(a, types.len);
     try invocation.mergeInferred(types);
@@ -200,17 +272,54 @@ pub fn execute(context: @import("runtime.zig").Context, call: Call) anyerror!@im
     limits.effect_work = &work;
     limits.effect_bytes = &bytes;
     for (call.arguments, arguments) |*program, *value| value.* = try decision.evaluateWithLimits(a, context.backend.decision_provider, program, &.{}, context.parameters, limits);
-    const result = try run(context, call.procedure, arguments, limits);
+    const result = try run(context, call.procedure, arguments, limits, null);
     return .{ .command_tag = "CALL", .notices = result.notices };
 }
+
+/// Mutable invocation cells are owned by the mutation frame, not a shared
+/// procedure plan. The owner supplies copy-on-write row assignment, preserving
+/// its original MVCC image and typed storage/domain conversion boundary.
+pub const TriggerFrame = struct {
+    columns: []const scalar.Column,
+    values: []scalar.Datum,
+    width: usize,
+    new_offset: usize,
+    old_offset: usize,
+    new: ?*const @import("catalog.zig").Row,
+    old: ?*const @import("catalog.zig").Row,
+    ptr: *anyopaque,
+    assign: *const fn (*anyopaque, A, TriggerImage, usize, scalar.Datum) anyerror!*const @import("catalog.zig").Row,
+
+    fn validate(self: TriggerFrame) !void {
+        if (self.columns.len != self.values.len or self.new_offset > self.values.len or self.old_offset > self.values.len or self.width > self.values.len - self.new_offset or self.width > self.values.len - self.old_offset or
+            (self.width != 0 and self.new_offset < self.old_offset + self.width and self.old_offset < self.new_offset + self.width)) return error.InvalidSqlBackendResponse;
+        // Trigger records keep the table's tuple descriptor when their image
+        // is NULL (statement level, OLD on INSERT, NEW on DELETE). Their fields
+        // are nullable input cells and local assignments materialize a record.
+        for ([_]usize{ self.new_offset, self.old_offset }, [_]?*const @import("catalog.zig").Row{ self.new, self.old }) |offset, image| {
+            for (self.columns[offset..][0..self.width], self.values[offset..][0..self.width]) |column, value| {
+                if (!column.nullable or (image == null and !value.sql_null)) return error.InvalidSqlBackendResponse;
+            }
+        }
+    }
+    fn target(self: TriggerFrame, image: TriggerImage, name: []const u8) !usize {
+        const offset = if (image == .new) self.new_offset else self.old_offset;
+        for (self.columns[offset..][0..self.width], 0..) |column, i| {
+            const separator = std.mem.lastIndexOfScalar(u8, column.name, 0) orelse return error.InvalidSqlBackendResponse;
+            if (std.mem.eql(u8, column.name[separator + 1 ..], name)) return offset + i;
+        }
+        return error.UnknownColumn;
+    }
+};
 
 /// Borrowed row images, pinned by the mutation owner for this invocation. The
 /// function never clones an unchanged row or transfers ownership of its image.
 pub const TriggerContext = struct {
-    event: enum { insert, update, delete },
+    event: enum { insert, update, delete, truncate },
     level: enum { row, statement } = .row,
     new: ?*const @import("catalog.zig").Row = null,
     old: ?*const @import("catalog.zig").Row = null,
+    frame: ?*TriggerFrame = null,
 
     fn validate(self: TriggerContext) !void {
         if (self.level == .statement) {
@@ -221,6 +330,7 @@ pub const TriggerContext = struct {
             .insert => self.new != null and self.old == null,
             .update => self.new != null and self.old != null,
             .delete => self.new == null and self.old != null,
+            .truncate => false,
         };
         if (!valid) return error.InvalidSqlBackendResponse;
     }
@@ -241,17 +351,24 @@ pub fn executeTrigger(context: @import("runtime.zig").Context, prepared: *Resolv
     var limits = decision.limitsFor(context.backend);
     limits.effect_work = &work;
     limits.effect_bytes = &bytes;
-    const result = try run(context, prepared, &.{}, limits);
+    if (images.frame) |frame| {
+        try frame.validate();
+        if (frame.new != images.new or frame.old != images.old) return error.InvalidSqlBackendResponse;
+        if (prepared.trigger_columns) |columns| {
+            if (columns.ptr != frame.columns.ptr or columns.len != frame.columns.len) return error.CatalogGenerationChanged;
+        } else prepared.trigger_columns = frame.columns;
+    }
+    const result = try run(context, prepared, &.{}, limits, images.frame);
     const selection = result.selection orelse return error.SqlTriggerReturnedNoValue;
     return .{ .row = switch (selection) {
-        .new => images.new,
-        .old => images.old,
+        .new => if (images.frame) |frame| frame.new else images.new,
+        .old => if (images.frame) |frame| frame.old else images.old,
         .skip => null,
     }, .notices = result.notices };
 }
 
 const RunOutput = struct { selection: ?TriggerReturn = null, notices: []const Notice };
-fn run(context: @import("runtime.zig").Context, prepared: *Resolved, arguments: []const scalar.Datum, limits: scalar.EvalLimits) !RunOutput {
+fn run(context: @import("runtime.zig").Context, prepared: *Resolved, arguments: []const scalar.Datum, limits: scalar.EvalLimits, frame: ?*TriggerFrame) !RunOutput {
     const a = context.arena;
     var notices: std.ArrayList(Notice) = .empty;
     var selection: ?TriggerReturn = null;
@@ -269,9 +386,25 @@ fn run(context: @import("runtime.zig").Context, prepared: *Resolved, arguments: 
                 try notices.append(a, .{ .message = try a.dupe(u8, text) });
             },
             .perform => |*instruction| {
-                if (instruction.program == null) instruction.program = try scalar.bindTypedExpectedWithSettings(prepared.allocator, prepared.syntax.steps[instruction.syntax].perform.expression, prepared.columns, prepared.arguments, null, .{ .invocation = prepared.invocation }, prepared.settings);
+                if (instruction.program == null) instruction.program = try scalar.bindTypedExpectedWithSettings(prepared.allocator, prepared.syntax.steps[instruction.syntax].perform.expression, if (frame) |value| value.columns else prepared.columns, prepared.arguments, null, .{ .invocation = prepared.invocation }, prepared.settings);
                 const evaluation: scalar.PreparedEvaluation = .{ .program = &instruction.program.?, .parameters = arguments };
-                _ = try @import("decision_eval.zig").evaluatePreparedWithLimits(a, context.backend.decision_provider, evaluation, arguments, limits);
+                _ = try @import("decision_eval.zig").evaluatePreparedWithLimits(a, context.backend.decision_provider, evaluation, if (frame) |value| value.values else arguments, limits);
+            },
+            .assign => |*instruction| {
+                const owner = frame orelse return error.InvalidSqlBackendResponse;
+                const syntax = prepared.syntax.steps[instruction.syntax].assign;
+                const target = try owner.target(syntax.image, syntax.column);
+                if (instruction.program == null) {
+                    const column = owner.columns[target];
+                    const cast: ast.Scalar = .{ .cast = .{ .operand = syntax.expression.expression, .type = column.type, .element_type = column.element_type, .temporal_kind = column.temporal_kind, .enum_view = column.enum_view, .domain_view = column.domain_view, .numeric_modifier = column.numeric_modifier, .context = .assignment } };
+                    instruction.program = try scalar.bindTypedExpectedWithSettings(prepared.allocator, &cast, owner.columns, prepared.arguments, scalar.Type{ .kind = column.type, .element_type = column.element_type, .temporal_kind = column.temporal_kind, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_binding = scalar.domainBindingOf(column) }, .{ .invocation = prepared.invocation }, prepared.settings);
+                }
+                const evaluation: scalar.PreparedEvaluation = .{ .program = &instruction.program.?, .parameters = arguments };
+                const value = try @import("decision_eval.zig").evaluatePreparedWithLimits(a, context.backend.decision_provider, evaluation, owner.values, limits);
+                const offset = if (syntax.image == .new) owner.new_offset else owner.old_offset;
+                const row = try owner.assign(owner.ptr, a, syntax.image, target - offset, value);
+                owner.values[target] = value;
+                if (syntax.image == .new) owner.new = row else owner.old = row;
             },
         }
     }
@@ -409,4 +542,74 @@ test "SQL trigger row-return fast path allocates no row memory and preserves eve
     try std.testing.expect((try executeTrigger(context, plan, .{ .event = .update, .level = .statement })).row == null);
     const fallthrough = try prepare(a, .{ .id = 2, .generation = 1, .definition = .{ .returns_trigger = true, .language = .plpgsql, .arguments = &.{}, .body = "BEGIN NULL; END", .owner = .auth_disabled } }, null, null, null);
     try std.testing.expectError(error.SqlTriggerReturnedNoValue, executeTrigger(context, fallthrough, .{ .event = .insert, .new = &row }));
+}
+
+test "SQL trigger assignments share typed scalar programs and preserve original images and statement nulls" {
+    const catalog = @import("catalog.zig");
+    const runtime = @import("runtime.zig");
+    const Fixture = struct {
+        modified: catalog.Row = .{ .id = "one", .version = 1, .value = .null },
+        writes: usize = 0,
+        fn assign(raw: *anyopaque, _: A, image: TriggerImage, ordinal: usize, value: scalar.Datum) !*const catalog.Row {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(TriggerImage.new, image);
+            try std.testing.expectEqual(@as(usize, 0), ordinal);
+            self.writes += 1;
+            self.modified.value = value.value;
+            return &self.modified;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture: Fixture = .{};
+    const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = Fixture.checkpoint } };
+    const context: runtime.Context = .{ .alloc = a, .arena = a, .backend = backend, .binding = undefined, .parameters = &.{}, .limits = .{} };
+    const original: catalog.Row = .{ .id = "one", .version = 1, .value = .{ .integer = 10 } };
+    const old: catalog.Row = .{ .id = "one", .version = 1, .value = .{ .integer = 1 } };
+    const plan = try prepare(a, .{ .id = 1, .generation = 1, .definition = .{ .returns_trigger = true, .language = .plpgsql, .arguments = &.{}, .body = "BEGIN NEW.n := OLD.n + 2; NEW.n := NEW.n + 3; RETURN NEW; END", .owner = .auth_disabled } }, null, null, null);
+    const columns = [_]scalar.Column{ .{ .name = "new\x00n", .type = .integer, .element_type = .int64 }, .{ .name = "old\x00n", .type = .integer, .element_type = .int64 } };
+    var values = [_]scalar.Datum{ scalar.Datum.json(.{ .integer = 10 }), scalar.Datum.json(.{ .integer = 1 }) };
+    var frame: TriggerFrame = .{ .columns = &columns, .values = &values, .width = 1, .new_offset = 0, .old_offset = 1, .new = &original, .old = &old, .ptr = &fixture, .assign = Fixture.assign };
+    const output = try executeTrigger(context, plan, .{ .event = .update, .new = &original, .old = &old, .frame = &frame });
+    try std.testing.expectEqual(&fixture.modified, output.row.?);
+    try std.testing.expectEqual(@as(i64, 6), output.row.?.value.integer);
+    try std.testing.expectEqual(@as(i64, 10), original.value.integer);
+    try std.testing.expectEqual(@as(i64, 1), old.value.integer);
+    try std.testing.expectEqual(@as(usize, 2), fixture.writes);
+    try std.testing.expect(plan.steps[0].assign.program != null);
+    try std.testing.expect(plan.steps[1].assign.program != null);
+    var incompatible_columns = columns;
+    incompatible_columns[0].element_type = .int32;
+    var incompatible = frame;
+    incompatible.columns = &incompatible_columns;
+    try std.testing.expectError(error.CatalogGenerationChanged, executeTrigger(context, plan, .{ .event = .update, .new = frame.new, .old = frame.old, .frame = &incompatible }));
+    try std.testing.expectEqual(@as(usize, 2), fixture.writes);
+    frame.new = null;
+    frame.old = null;
+    @memset(&values, scalar.Datum{});
+    const statement = try executeTrigger(context, plan, .{ .event = .update, .level = .statement, .frame = &frame });
+    try std.testing.expect(statement.row != null);
+    try std.testing.expect(statement.row.?.value == .null);
+    try std.testing.expectEqual(@as(usize, 4), fixture.writes);
+    frame.new = &original;
+    frame.old = null;
+    values[0] = scalar.Datum.json(.{ .integer = 10 });
+    values[1] = .{};
+    const inserted = try executeTrigger(context, plan, .{ .event = .insert, .new = &original, .frame = &frame });
+    try std.testing.expect(inserted.row.?.value == .null);
+    try std.testing.expectEqual(@as(usize, 6), fixture.writes);
+    // Even a NULL trigger record has a known tuple descriptor. An undeclared
+    // field is 42703, whereas an existing field simply evaluates SQL NULL.
+    const null_read = try prepare(a, .{ .id = 2, .generation = 1, .definition = .{ .returns_trigger = true, .language = .plpgsql, .arguments = &.{}, .body = "BEGIN PERFORM OLD.n; RETURN NEW; END", .owner = .auth_disabled } }, null, null, null);
+    frame.new = &original;
+    try std.testing.expectEqual(&original, (try executeTrigger(context, null_read, .{ .event = .insert, .new = &original, .frame = &frame })).row.?);
+    const absent = try prepare(a, .{ .id = 3, .generation = 1, .definition = .{ .returns_trigger = true, .language = .plpgsql, .arguments = &.{}, .body = "BEGIN PERFORM CASE WHEN false THEN OLD.unknown ELSE 0 END; RETURN NEW; END", .owner = .auth_disabled } }, null, null, null);
+    try std.testing.expectError(error.UnknownColumn, executeTrigger(context, absent, .{ .event = .insert, .new = &original, .frame = &frame }));
+    const division = try prepare(a, .{ .id = 4, .generation = 1, .definition = .{ .returns_trigger = true, .language = .plpgsql, .arguments = &.{}, .body = "BEGIN NEW.n := 1/0; RETURN NEW; END", .owner = .auth_disabled } }, null, null, null);
+    frame.new = null;
+    values[0] = .{};
+    try std.testing.expectError(error.SqlDivisionByZero, executeTrigger(context, division, .{ .event = .insert, .level = .statement, .frame = &frame }));
+    try std.testing.expectEqual(@as(usize, 6), fixture.writes);
 }

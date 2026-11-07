@@ -6162,7 +6162,10 @@ pub const Backend = struct {
     }
 
     pub fn checkpointWalAfterDurableBoundary(self: *Backend) !void {
-        if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
+        // A no-WAL owner still needs a manifested immutable boundary for
+        // clean shutdown and physical capture. Only WAL retirement below is
+        // conditional on WAL ownership; flushing user values is not.
+        if (self.root_dir == null or self.options.backend.read_only) return;
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
 
@@ -11882,6 +11885,32 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
             try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
             try std.testing.expectEqualStrings("alpha", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+        }
+
+        test "lsm backend no WAL durable boundary survives cold reopen without destructor flush" {
+            var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer storage.deinit();
+            const root_dir = "/lsm-no-wal-durable-boundary";
+            const options: Options = .{ .flush_threshold = 1024, .wal_enabled = false, .storage = storage.storage() };
+            var first = try Backend.open(std.testing.allocator, root_dir, options);
+            var first_open = true;
+            defer if (first_open) first.close();
+            {
+                var txn = try first.beginWrite();
+                defer txn.abort();
+                try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+                try txn.commit();
+            }
+            try std.testing.expectEqual(@as(usize, 1), first.mutable.entryCount());
+            try std.testing.expectEqual(@as(u64, 0), first.snapshotMaintenanceStats().wal_retained_bytes);
+            try first.checkpointWalAfterDurableBoundary();
+            try std.testing.expectEqual(@as(usize, 0), first.mutable.entryCount());
+            first.abandonAfterCrash();
+            first_open = false;
+            var second = try Backend.open(std.testing.allocator, root_dir, options);
+            defer second.close();
+            try std.testing.expectEqualStrings("alpha", try second.getMergedWithMutable(&second.mutable, .{ .name = "docs" }, "doc:a"));
+            try std.testing.expectEqual(@as(u64, 0), second.snapshotMaintenanceStats().wal_retained_bytes);
         }
 
         test "lsm backend accounts in-memory recovery state in the resource manager and releases it on close" {

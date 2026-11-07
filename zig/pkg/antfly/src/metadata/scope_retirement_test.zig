@@ -377,6 +377,7 @@ test "SQL scope retirement native admission fences capability stale cuts nonce s
     contender.operation.reserve.catalog_revision = contender.admission.head;
     const rejected = (try AdmissionHarness.apply(&store, scratch, contender, 3, false)).outcome.?;
     try std.testing.expectEqual(wire.Rejection.TableTransitionActive, rejected.result.rejected);
+    try std.testing.expectEqualDeep(@as(?[32]u8, contender.operation.reserve.scope.labelsDigest()), rejected.target_digest);
     _ = try AdmissionHarness.apply(&store, scratch, AdmissionHarness.cancel(original.query.lookup, 83), 4, false);
     // A new attempt based on the old cut is durably rejected. Replaying the
     // accepted original still observes its original acceptance after release.
@@ -384,6 +385,7 @@ test "SQL scope retirement native admission fences capability stale cuts nonce s
     stale.admission.nonce = @splat(84);
     const changed = (try AdmissionHarness.apply(&store, scratch, stale, 5, false)).outcome.?;
     try std.testing.expectEqual(wire.Rejection.CatalogGenerationChanged, changed.result.rejected);
+    try std.testing.expectEqualDeep(@as(?[32]u8, stale.operation.reserve.scope.labelsDigest()), changed.target_digest);
     try std.testing.expectEqualDeep(original, (try AdmissionHarness.apply(&store, scratch, request, 6, false)).outcome.?);
     // Fresh nonce/cut can reserve after cancellation, but the original
     // rejected nonce must keep its earlier result through the new ownership.
@@ -1266,5 +1268,231 @@ test "SQL scope retirement physical children borrow exact root custody without i
             try std.testing.expect(cloned.accepted);
             try std.testing.expectEqualDeep(head, cloned.head.?);
         }
+    }
+}
+
+const TemporaryNamespaceFixture = struct {
+    const owner: local.common_topology_records.RelationPersistence.Owner = .{ .issuer_node_id = 7, .connection_id = @splat('1'), .wire_epoch = @splat(2), .execution_instance = @splat(3), .connection_generation = 1, .principal_digest = @splat(4) };
+    fn install(store: *native.RaftApplyStore, a: std.mem.Allocator) ![2]domain.Resource {
+        const catalog = @import("../system_catalog/storage.zig");
+        var second = owner;
+        // Two independent sources owned by the same issuer, rather than an
+        // impossible simultaneous reuse of one live backend after DISCARD.
+        second.connection_id = @splat('2');
+        second.connection_generation += 1;
+        var first_name: [72]u8 = undefined;
+        var second_name: [72]u8 = undefined;
+        const values: [2]domain.Resource = .{
+            .{ .kind = .namespace, .id = 901, .parent_id = 1, .name = try a.dupe(u8, try owner.namespace(&first_name)), .sql_temporary_owner = owner },
+            .{ .kind = .namespace, .id = 902, .parent_id = 1, .name = try a.dupe(u8, try second.namespace(&second_name)), .sql_temporary_owner = second },
+        };
+        var write = try store.store.beginWriteTxn();
+        errdefer write.abort();
+        const authority = @import("../system_catalog/lock_authority.zig");
+        const sources = @import("../system_catalog/temporary_source_binding.zig");
+        const incarnation: [16]u8 = @splat(0x11); // initialized metadata '1111…'
+        const source_ns: authority.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = incarnation };
+        for (values, 0..) |resource, i| {
+            const selected = resource.sql_temporary_owner.?;
+            const registration: authority.scopes.Registration = .{ .group = group, .connection = selected.connection_id, .nonce = @splat(@as(u8, @intCast(31 + i))), .standalone = false, .lease = .{
+                .backend = .{ .incarnation = incarnation, .id = @splat(@as(u8, @intCast(41 + i))), .fence = 1 },
+                .database = resource.parent_id,
+                .node = selected.issuer_node_id,
+                .principal = try authority.principalDigest(a, .bootstrap),
+                .expires_at_ms = 1000,
+            } };
+            const context: authority.Context = .{ .a = a, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database = resource.parent_id, .standalone = false };
+            try authority.scopes.register(a, &write, source_ns, registration, context);
+            const command: authority.scopes.Command = .{ .sequence = 1, .nonce = @splat(@as(u8, @intCast(51 + i))), .executor = selected.execution_instance };
+            const fence: authority.scopes.CommandFence = .{ .group = group, .backend = registration.lease.backend, .command = command, .database = resource.parent_id, .principal = registration.lease.principal, .standalone = false };
+            _ = try authority.scopes.begin(a, &write, source_ns, registration.lease.backend, command, fence);
+            try sources.stage(a, &write, try sources.prepare(a, &write, group, resource, fence));
+        }
+        const meta = try catalog.readMeta(a, &write, group);
+        try catalog.applyDelta(a, &write, group, .{ .upserts = @constCast(&values), .removes = &.{}, .next_id = @max(meta.next_id, 903) }, meta, std.fmt.bytesToHex(incarnation, .lower));
+        try write.commit();
+        return values;
+    }
+};
+
+test "SQL scope retirement temporary namespace secondary ownership survives empty rollback cold reopen and rejects orphan keys" {
+    const catalog = @import("../system_catalog/storage.zig");
+    const index = @import("../system_catalog/temporary_namespace_index.zig");
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/temporary-namespaces", .{tmp.sub_path});
+    {
+        var store = try native.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = @splat('1') });
+        const values = try TemporaryNamespaceFixture.install(&store, scratch);
+        {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            const lookup: catalog.TemporaryNamespaceLookup = .{ .alloc = a, .txn = &read, .group_id = group };
+            const selected = try index.list(scratch, &read, group, .{ .connection = TemporaryNamespaceFixture.owner }, null, 1, lookup);
+            try std.testing.expectEqual(@as(usize, 1), selected.entries.len);
+            try std.testing.expectEqual(@as(u64, 901), selected.entries[0].namespace_id);
+            try std.testing.expect(selected.next == null);
+            const first = try index.list(scratch, &read, group, .{ .issuer = 7 }, null, 1, lookup);
+            try std.testing.expectEqual(@as(?u64, 901), first.next);
+            const second = try index.list(scratch, &read, group, .{ .issuer = 7 }, first.next, 1, lookup);
+            try std.testing.expectEqual(@as(u64, 902), second.entries[0].namespace_id);
+            try std.testing.expect(second.next == null);
+            try index.validate(a, &read, group, lookup);
+        }
+        {
+            var write = try store.store.beginWriteTxn();
+            defer write.abort();
+            try catalog.removeResource(a, &write, group, values[0]);
+            const lookup: catalog.TemporaryNamespaceLookup = .{ .alloc = a, .txn = &write, .group_id = group };
+            const absent_page = try index.list(scratch, &write, group, .{ .connection = TemporaryNamespaceFixture.owner }, null, 1, lookup);
+            try std.testing.expectEqual(@as(usize, 0), absent_page.entries.len);
+        }
+        {
+            var write = try store.store.beginWriteTxn();
+            defer write.abort();
+            var forged = values[0];
+            forged.id = 999;
+            try index.stage(a, &write, group, forged, true);
+            try std.testing.expectError(error.InvalidSqlTemporaryNamespace, index.validate(a, &write, group, catalog.TemporaryNamespaceLookup{ .alloc = a, .txn = &write, .group_id = group }));
+        }
+    }
+    {
+        var store = try native.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        const lookup: catalog.TemporaryNamespaceLookup = .{ .alloc = a, .txn = &read, .group_id = group };
+        const retained = try index.list(scratch, &read, group, .{ .connection = TemporaryNamespaceFixture.owner }, null, 1, lookup);
+        try std.testing.expectEqual(@as(usize, 1), retained.entries.len);
+        try catalog.validateNameIndex(a, &read, group);
+    }
+}
+
+test "SQL scope retirement temporary nonce recovers canonical ownership after namespace publication" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/temporary-nonce", .{tmp.sub_path});
+    var store = try native.RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = @splat('1') });
+    try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(scratch, topology.Activation{ .version = topology.current_version, .incarnation = @splat('1'), .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+    const values = try TemporaryNamespaceFixture.install(&store, scratch);
+    const specification: contract.Prepare = .{ .kind = .namespace, .name = values[0].name, .creator = .bootstrap, .cascade = true, .sql_temporary_owner = TemporaryNamespaceFixture.owner };
+    var forbidden = specification;
+    forbidden.sql_temporary_owner = null;
+    try std.testing.expectError(error.Forbidden, store.prepareScopeRetirementManifestJsonWithContext(scratch, group, forbidden, .{}));
+    const manifest = try std.json.parseFromSliceLeaky(contract.Manifest, scratch, try store.prepareScopeRetirementManifestJsonWithContext(scratch, group, specification, .{}), .{});
+    const request: wire.Request = .{ .admission = .{ .nonce = @splat(91), .head = manifest.catalog_revision }, .operation = .{ .reserve = manifest } };
+    const admitted = try AdmissionHarness.apply(&store, scratch, request, 1, false);
+    const head = admitted.current.?;
+    try std.testing.expect(head.temporary_owner.?.eql(TemporaryNamespaceFixture.owner));
+    const drained = try AdmissionHarness.apply(&store, scratch, .{ .admission = .{ .nonce = @splat(92), .head = 0 }, .operation = .{ .drain = .{ .lookup = head.lookup, .expected_revision = head.progress.revision } } }, 2, false);
+    const published = try AdmissionHarness.apply(&store, scratch, .{ .admission = .{ .nonce = @splat(93), .head = 0 }, .operation = .{ .publish = .{ .lookup = head.lookup, .expected_revision = drained.current.?.progress.revision } } }, 3, false);
+    try std.testing.expectEqual(contract.Phase.published, published.current.?.progress.phase);
+    var read = try store.store.beginReadTxn();
+    defer read.abort();
+    const probe: wire.TemporaryProbe = .{ .owner = TemporaryNamespaceFixture.owner, .database_id = 1, .namespace_id = 901, .nonce = @splat(91) };
+    const recovered = (try wire.temporaryObservation(&read, group, probe)).?;
+    try std.testing.expectEqualDeep(admitted.outcome.?.query, recovered.outcome.?.query);
+    try std.testing.expectEqual(contract.Phase.published, recovered.current.?.progress.phase);
+    var wrong = probe;
+    wrong.owner.connection_generation += 1;
+    try std.testing.expectError(error.InvalidSqlTemporaryNamespace, wire.temporaryObservation(&read, group, wrong));
+    wrong = probe;
+    wrong.nonce = @splat(94);
+    try std.testing.expect(try wire.temporaryObservation(&read, group, wrong) == null);
+    const catalog = @import("../system_catalog/storage.zig");
+    try std.testing.expect(try catalog.getById(a, &read, group, .namespace, 901) == null);
+}
+
+test "SQL scope retirement abandoned TEMP checkpoint aborts atomically and retains exact ended source across cold reopen" {
+    const catalog = @import("../system_catalog/storage.zig");
+    const bindings = @import("../system_catalog/temporary_source_binding.zig");
+    const abandonment = @import("abandoned_temporary_retirement.zig");
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/abandoned-temporary", .{tmp.sub_path});
+    var retained_head: ledger.Head = undefined;
+    var retained_query: wire.Query = undefined;
+    {
+        var store = try native.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = @splat('1') });
+        try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(scratch, topology.Activation{ .version = topology.current_version, .incarnation = @splat('1'), .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+        const resources = try TemporaryNamespaceFixture.install(&store, scratch);
+        const reference = (try @import("../system_catalog/temporary_namespace_index.zig").reference(resources[0])).?;
+        const captured = capture: {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try std.testing.expect(try bindings.captureAbandoned(scratch, &txn, group, reference.namespace_id) == null);
+            try bindings.fenceOwner(scratch, &txn, group, @splat(0x11), reference);
+            const ended = (try bindings.captureAbandoned(scratch, &txn, group, reference.namespace_id)).?;
+            try txn.commit();
+            break :capture ended;
+        };
+        const specification: contract.Prepare = .{ .kind = .namespace, .name = resources[0].name, .creator = .bootstrap, .cascade = true, .sql_temporary_owner = reference.owner };
+        const manifest = try std.json.parseFromSliceLeaky(contract.Manifest, scratch, try store.prepareScopeRetirementManifestJsonWithContext(scratch, group, specification, .{}), .{});
+        const request: wire.Request = .{ .admission = .{ .nonce = @splat(121), .head = manifest.catalog_revision }, .operation = .{ .reserve = manifest }, .temporary_abandonment = try captured.guard() };
+        var input = try wire.Input.parse(a, group, try request.encodeAlloc(scratch));
+        defer input.deinit();
+        retained_query = input.query;
+        // Production cannot turn this internal future decoder into an active
+        // feature until the actual membership has activated its real floor.
+        if (topology.current_version < topology.sql_relation_persistence_version)
+            try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.scopeRetirementPreflightJson(scratch, group, try request.encodeAlloc(scratch)));
+        var prepared = try ledger.prepare(a, group, request.admission.nonce, try std.json.Stringify.valueAlloc(scratch, manifest, .{}));
+        defer prepared.deinit();
+        // Native transaction rollback includes the ordinary scope leases/head
+        // as well as BOTH checkpoint writes; there is no partial API cleanup.
+        for (0..2) |fail_at| {
+            var txn = try store.store.beginWriteTxn();
+            var open = true;
+            defer if (open) txn.abort();
+            const initial = try ledger.stageBegin(&txn, &prepared);
+            var fault: Fault = .{ .txn = &txn, .remaining = fail_at };
+            try std.testing.expectError(error.InjectedFailure, abandonment.stage(scratch, &fault, initial, captured));
+            txn.abort();
+            open = false;
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect(try ledger.head(&read, prepared.lookup) == null);
+        }
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            retained_head = try abandonment.stage(scratch, &txn, try ledger.stageBegin(&txn, &prepared), captured);
+            try wire.stageOutcome(&txn, .{ .query = input.query, .native_operation = .reserve_abandoned_temporary, .target_digest = retained_head.target_digest, .result = .{ .accepted = retained_head } });
+            try abandonment.verifyHead(scratch, &txn, retained_head);
+            try std.testing.expectError(error.ScopeRetirementChanged, ledger.stageAdvance(&txn, &prepared, retained_head, try retained_head.progress.cancelBeforeEffects()));
+            try txn.commit();
+        }
+    }
+    {
+        var store = try native.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        const observed = try wire.observation(&read, retained_query);
+        try std.testing.expectEqualDeep(retained_head, observed.current.?);
+        try abandonment.verifyHead(scratch, &read, observed.current.?);
+        try std.testing.expect(try ledger.member(&read, group, .namespace, 901) != null);
+        // The independent namespace/connection and its source remain intact.
+        var sibling = (try catalog.getById(scratch, &read, group, .namespace, 902)).?;
+        defer sibling.deinit();
+        try std.testing.expect(try bindings.captureAbandoned(scratch, &read, group, sibling.value.id) == null);
     }
 }

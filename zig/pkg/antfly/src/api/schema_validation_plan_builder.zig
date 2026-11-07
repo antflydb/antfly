@@ -266,7 +266,7 @@ fn prepareCatalogOwners(owners: anytype, alloc: std.mem.Allocator, a: std.mem.Al
         defer alloc.free(frame);
         const value = try transport.decode(frame);
         try value.requireFor(range.group_id, query);
-        if (value.signed.value.binding.authority != activation.authority) return error.SchemaValidationJobChanged;
+        if (value.signed.value.binding.authority != activation.authorityFor(range.table_id)) return error.SchemaValidationJobChanged;
         const digest = value.signed.value.binding.inputs;
         const entry = try digests.getOrPut(alloc, digest);
         if (!entry.found_existing) {
@@ -379,7 +379,9 @@ pub fn buildTableRetirement(owners: anytype, alloc: std.mem.Allocator, io: std.I
         }
     }.less);
     if (comptime @hasDecl(@typeInfo(@TypeOf(owners)).pointer.child, "prepareCohort")) try owners.prepareCohort(ranges, context);
-    const activation: @import("../metadata/schema_validation_publication.zig").OwnerCut = .{ .metadata_group_id = manifest.metadata_group_id, .metadata_incarnation = manifest.metadata_incarnation, .ranges = ranges, .authority = authority_kind };
+    var native_tables: std.ArrayList(u64) = .empty;
+    for (pairs) |pair| if (pair.before.sql_persistence != null) try native_tables.append(a, pair.before.table_id);
+    const activation: @import("../metadata/schema_validation_publication.zig").OwnerCut = .{ .metadata_group_id = manifest.metadata_group_id, .metadata_incarnation = manifest.metadata_incarnation, .ranges = ranges, .authority = authority_kind, .native_tables = native_tables.items };
     const captured = try prepareCatalogOwners(owners, alloc, a, context, activation, pairs, selection, id, contract.hash(&id), std.mem.readInt(u64, id[8..16], .little));
     const plan: plans.Plan = .{ .version = 5, .metadata_group_id = manifest.metadata_group_id, .metadata_incarnation = manifest.metadata_incarnation, .id = id, .before = pairs[0].before, .after = pairs[0].after, .additional_tables = pairs[1..], .selection = selection, .owners = captured.intents, .retirement_root = root };
     var prepared = try plans.Prepared.init(alloc, plan);

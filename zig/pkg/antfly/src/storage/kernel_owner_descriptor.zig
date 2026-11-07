@@ -33,6 +33,10 @@ pub const Descriptor = struct {
     identity: Identity,
     schema_json: []const u8 = "",
     indexes_json: []const u8 = "",
+    sql_persistence: ?@import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor = null,
+    /// Process-local authority from an already admitted reset plan. This is
+    /// never serialized into a native row/bootstrap or accepted from users.
+    native_reset_source: ?@import("../metadata/sql_relation_recovery.zig").Guard = null,
     /// Authenticated first-open hint, not an instruction to replace a durable
     /// range subsequently changed by replicated split/merge commands.
     initial_range: ?@import("antfly_local_sources").storage_byte_range.ByteRange = null,

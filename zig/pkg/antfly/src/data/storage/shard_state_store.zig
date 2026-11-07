@@ -4884,3 +4884,61 @@ test "shard state store captures right-hand split handoff and filters delta catc
     try std.testing.expectEqualStrings("doc:x", dst_state[1].key);
     try std.testing.expectEqualStrings("right-2", dst_state[1].value);
 }
+
+test "graph batch34 replay requires durable serving floor and cold owners reject unsupported floors" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/graph34-floor", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    {
+        var store = try docstore.DocStore.open(a, path.ptr, .{});
+        defer store.close();
+        var writes: std.ArrayListUnmanaged(docstore.OwnedKVPair) = .empty;
+        defer freeOwnedWrites(a, &writes);
+        var deletes: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (deletes.items) |key| a.free(key);
+            deletes.deinit(a);
+        }
+        const missing = [_]DataOperation{ .{ .require_raft_batch_protocol = .{ .version = 34 } }, .{ .put = .{ .key = @constCast("a"), .value = @constCast("{}") } } };
+        try std.testing.expectError(error.UnsupportedBatchProtocolVersion, appendOperationEffects(&store, a, 91, &missing, &writes, &deletes));
+        try std.testing.expectEqual(@as(usize, 0), writes.items.len);
+        const activate = [_]DataOperation{.{ .set_raft_batch_protocol = 34 }};
+        if (data_raft_protocol.batch_protocol_version < 34) {
+            try std.testing.expectError(error.InvalidRaftBatchProtocolVersion, appendOperationEffects(&store, a, 91, &activate, &writes, &deletes));
+            try std.testing.expectEqual(@as(usize, 0), writes.items.len);
+            const key = try groupRaftBatchProtocolKeyAlloc(a, 91);
+            defer a.free(key);
+            var value: [2]u8 = undefined;
+            // Deliberate stored future-version corruption exercises the real
+            // cold reader; it grants no admitted activation or write success.
+            std.mem.writeInt(u16, &value, 34, .little);
+            try store.put(key, &value);
+        } else {
+            try appendOperationEffects(&store, a, 91, &activate, &writes, &deletes);
+            try putOwnedBatch(&store, a, writes.items, deletes.items);
+            freeOwnedWrites(a, &writes);
+            writes = .empty;
+            try appendOperationEffects(&store, a, 91, &missing, &writes, &deletes);
+            try putOwnedBatch(&store, a, writes.items, deletes.items);
+            freeOwnedWrites(a, &writes);
+            writes = .empty;
+            // Ordered replay of the same retained effect is idempotent.
+            try appendOperationEffects(&store, a, 91, &missing, &writes, &deletes);
+            try putOwnedBatch(&store, a, writes.items, deletes.items);
+        }
+    }
+    var cold = try docstore.DocStore.open(a, path.ptr, .{});
+    defer cold.close();
+    if (data_raft_protocol.batch_protocol_version < 34) {
+        try std.testing.expectError(error.InvalidRaftBatchProtocolVersion, currentRaftBatchProtocolVersion(&cold, a, 91));
+    } else {
+        try std.testing.expectEqual(@as(u16, 34), try currentRaftBatchProtocolVersion(&cold, a, 91));
+        const key = try groupDocumentStoreKeyAlloc(a, 91, "a");
+        defer a.free(key);
+        const value = try cold.get(a, key);
+        defer a.free(value);
+        try std.testing.expectEqualStrings("{}", value);
+    }
+}

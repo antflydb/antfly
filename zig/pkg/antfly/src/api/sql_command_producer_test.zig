@@ -42,6 +42,7 @@ const Native = struct {
     expiry_ms: u64 = 1000,
     database: []const u8 = "main",
     principal: []const u8 = "alice",
+    wire_epoch: ?[16]u8 = null,
     before: bool = false,
     after: bool = false,
     calls: usize = 0,
@@ -172,7 +173,7 @@ fn setup(metadata: *storage.RaftApplyStore, source: *transactions.DurableSession
     try metadata.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
     const node: u64 = if (standalone) 0 else 9;
     const created_at_ms = if (native.expiry_ms == 1000) 1 else native.expiry_ms - 60000;
-    _ = try connections.mutate(source, .{ .create = .{ .id = connection, .principal = native.principal, .owner_node_id = node, .expires_at_ms = native.expiry_ms, .database = native.database, .namespace = "public" } }, native.principal, node, created_at_ms);
+    _ = try connections.mutate(source, .{ .create = .{ .id = connection, .wire_epoch = native.wire_epoch, .principal = native.principal, .owner_node_id = node, .expires_at_ms = native.expiry_ms, .database = native.database, .namespace = "public" } }, native.principal, node, created_at_ms);
     const registration: authority.scopes.Registration = .{ .lease = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 }, .database = 1, .node = node, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = native.expiry_ms }, .connection = connection, .nonce = id(3), .standalone = standalone };
     try producer.create(source, native.principal, registration, actor, instance, try native.head(), native.nonce(), created_at_ms);
 }
@@ -1598,8 +1599,18 @@ const IngressRuntime = struct {
     now_ms: u64 = 2,
     cancelled: bool = false,
     cancel_on_begin: bool = false,
+    owner_context: ?*?@import("sql_relation_lifetimes.zig").Owner = null,
+    expected_owner: ?@import("sql_relation_lifetimes.zig").Owner = null,
+    owner_calls: usize = 0,
+    pauses: usize = 0,
+    pause_error: ?anyerror = null,
     fn call(raw: *anyopaque, alloc: A, input: Call) anyerror![]u8 {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.owner_context) |slot| {
+            const owner = slot.* orelse return error.SqlTemporaryRelationNotOwned;
+            try std.testing.expect(owner.eql(self.expected_owner.?));
+            self.owner_calls += 1;
+        }
         const cancel = self.cancel_on_begin and input == .sql_lock_mutate and input.sql_lock_mutate.operation == .begin;
         defer if (cancel) {
             self.cancelled = true;
@@ -1619,7 +1630,11 @@ const IngressRuntime = struct {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (self.cancelled) return error.Canceled;
     }
-    fn pause(_: *anyopaque, _: u32) !void {}
+    fn pause(raw: *anyopaque, _: u32) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.pauses += 1;
+        if (self.pause_error) |err| return err;
+    }
     fn runtime(self: *@This()) @import("sql_command_execution.zig").Runtime {
         return .{ .ptr = self, .now_ms = now, .nonce = nonce, .active = active, .pause = pause };
     }
@@ -1642,9 +1657,13 @@ test "SQL command producer native ingress discovers one database enrolls exact o
         defer a.free(activation);
         try metadata.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
         const node: u64 = if (standalone) 0 else 9;
-        _ = try connections.mutate(&source, .{ .create = .{ .id = connection, .principal = "alice", .owner_node_id = node, .expires_at_ms = 1000, .database = "default", .namespace = "public" } }, "alice", node, 1);
-        var hooks: IngressRuntime = .{ .native = &native };
-        const owner: execution.Controller = .{ .store = &source, .connection = connection, .principal = "alice", .actor = actor, .instance = instance, .node = node, .standalone = standalone, .port = native.port(), .runtime = hooks.runtime() };
+        _ = try connections.mutate(&source, .{ .create = .{ .id = connection, .principal = "alice", .owner_node_id = node, .wire_epoch = instance, .expires_at_ms = 1000, .database = "default", .namespace = "public" } }, "alice", node, 1);
+        var owner_context: ?@import("sql_relation_lifetimes.zig").Owner = null;
+        var logical = try connections.load(&source, a, connection, "alice", node, 2);
+        defer logical.deinit();
+        const expected_owner = try @import("sql_relation_lifetimes.zig").ownerFromConnection(logical.value, instance, node);
+        var hooks: IngressRuntime = .{ .native = &native, .owner_context = &owner_context, .expected_owner = expected_owner };
+        const owner: execution.Controller = .{ .store = &source, .connection = connection, .principal = "alice", .actor = actor, .instance = instance, .node = node, .standalone = standalone, .port = .{ .ptr = &hooks, .call = IngressRuntime.call }, .runtime = hooks.runtime(), .relation_owner_context = &owner_context };
         native.after = true;
         try owner.enroll(a, "default");
         try std.testing.expectEqual(producer.Phase.idle, try phase(&source));
@@ -1652,6 +1671,8 @@ test "SQL command producer native ingress discovers one database enrolls exact o
         try owner.enroll(a, "default");
         try std.testing.expectEqual(registered, native.calls);
         var first = try owner.take(a, @splat(8));
+        try std.testing.expectEqual(owner.instance, first.ticket.command.executor);
+        try std.testing.expectEqual(first.ticket.command.executor, first.fence.command.executor);
         var pool: @import("sql_connection_admission.zig").Pool = .{};
         defer pool.deinit(a);
         const key = @import("sql_connection_admission.zig").Key.init(connection, "alice");
@@ -1688,8 +1709,27 @@ test "SQL command producer native ingress discovers one database enrolls exact o
         metadata.deinit();
         metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
         source = transactions.DurableSessionStore.init(a, &metadata.store);
+        // Taking the next body first drains the previous FINISH through
+        // the production Controller's port. No Request.attach has happened.
+        owner_context = null;
+        const observed_before = hooks.owner_calls;
         var second = try owner.take(a, @splat(8));
+        try std.testing.expect(hooks.owner_calls > observed_before);
+        try std.testing.expect(second.relation_owner.?.eql(expected_owner));
+        var foreign_owner = owner;
+        foreign_owner.principal = "mallory";
+        const before_foreign = native.calls;
+        try std.testing.expectError(error.SqlConnectionNotFound, foreign_owner.take(a, @splat(8)));
+        try std.testing.expect(owner_context == null);
+        try std.testing.expectEqual(before_foreign, native.calls);
+        // take revalidates the genuine capsule but cannot issue another body
+        // while the second command is already executing. enroll is an idle
+        // registration operation, so it is not the revalidation API here.
+        try std.testing.expectError(error.SqlConnectionBusy, owner.take(a, @splat(8)));
+        try std.testing.expect(owner_context.?.eql(expected_owner));
         try std.testing.expectEqual(first.ticket.command.sequence + 1, second.ticket.command.sequence);
+        try std.testing.expectEqual(owner.instance, second.ticket.command.executor);
+        try std.testing.expect(!std.mem.eql(u8, &first.ticket.command.nonce, &second.ticket.command.nonce));
         try std.testing.expect(!std.meta.eql(first.ticket.command, second.ticket.command));
         const before_old_finish = native.calls;
         admitted = try pool.acquire(a, std.testing.io, key);
@@ -2852,4 +2892,243 @@ test "SQL command producer native atomically publish failure rollback and resume
         try finishBody(&native, &source, ticket);
         try native.until(&source, .idle, 2);
     };
+}
+
+test "SQL relation lifetime source outbox owns TEMP through discard generation failure and retired cleanup" {
+    const lifetimes = @import("sql_relation_lifetimes.zig");
+    const Cleanup = struct {
+        native: *Native,
+        complete: bool = false,
+        calls: usize = 0,
+        fail: bool = false,
+        unknown: bool = false,
+        remaining: usize = 0,
+        fn port(self: *@This()) producer.Port {
+            return .{ .ptr = self, .call = call, .retire_temporary = retire };
+        }
+        fn call(raw: *anyopaque, alloc: A, input: Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return Native.call(self.native, alloc, input);
+        }
+        fn retire(raw: *anyopaque, _: A, value: producer.Record) !producer.TemporaryProgress {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.fail) return error.CatalogPublicationProofPending;
+            if (self.unknown) return error.MetadataMutationOutcomeUnknown;
+            if (self.remaining != 0) {
+                self.remaining -= 1;
+                return .pending;
+            }
+            try std.testing.expect(value.temporary_retirement != null);
+            return if (self.complete) .complete else .pending;
+        }
+        fn step(self: *@This(), source: *transactions.DurableSessionStore) !void {
+            var value = (try producer.load(source, a, connection)).?;
+            defer value.deinit();
+            try producer.advance(source, a, "alice", value.value, instance, 2, self.native.nonce(), self.port());
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/temporary-source-owner", .{tmp.sub_path});
+    defer a.free(path);
+    var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+    defer metadata.deinit();
+    var source = transactions.DurableSessionStore.init(a, &metadata.store);
+    var native: Native = .{ .metadata = &metadata, .wire_epoch = instance };
+    var cleanup: Cleanup = .{ .native = &native };
+    try setup(&metadata, &source, false, &native);
+    try native.until(&source, .idle, 2);
+    const first = try begin(&native, &source, 400);
+    const fence = try execute(&source, first);
+    var logical = try connections.load(&source, a, connection, "alice", 9, 2);
+    defer logical.deinit();
+    const owner = try lifetimes.ownerFromConnection(logical.value, instance, 9);
+    const previous_calls = native.calls;
+    source.fail_writes_for_test = true;
+    try std.testing.expectError(error.InjectedSessionStoreFailure, producer.markTemporaryOwner(&source, owner, fence, "main", 2));
+    source.fail_writes_for_test = false;
+    {
+        var unchanged = (try producer.load(&source, a, connection)).?;
+        defer unchanged.deinit();
+        try std.testing.expect(unchanged.value.temporary_owner == null);
+    }
+    try producer.markTemporaryOwner(&source, owner, fence, "main", 2);
+    var revision: u64 = undefined;
+    {
+        var marked = (try producer.load(&source, a, connection)).?;
+        defer marked.deinit();
+        revision = marked.value.revision;
+        try std.testing.expect(marked.value.temporary_owner.?.eql(owner));
+        try producer.finish(&source, "alice", marked.value, instance, first, try native.head(), native.nonce());
+    }
+    try std.testing.expectEqual(previous_calls, native.calls);
+    try native.until(&source, .idle, 2);
+    const second = try begin(&native, &source, 500);
+    const discard_fence = try execute(&source, second);
+    {
+        var current = (try producer.load(&source, a, connection)).?;
+        defer current.deinit();
+        try std.testing.expect(current.value.revision > revision);
+        const plan = try producer.observeControlPlan(a, current.value, instance, null, 2, native.nonce(), cleanup.port());
+        _ = try connections.mutateWithCommand(&source, .{ .discard_scoped = .{ .id = connection, .expected_revision = logical.value.revision, .plan = plan } }, "alice", 9, 2, &discard_fence);
+    }
+    {
+        var current = (try producer.load(&source, a, connection)).?;
+        defer current.deinit();
+        try std.testing.expect(current.value.temporary_owner == null);
+        try std.testing.expect(current.value.temporary_retirement.?.owner.eql(owner));
+        try producer.finish(&source, "alice", current.value, instance, second, try native.head(), native.nonce());
+    }
+    for (0..16) |_| try cleanup.step(&source);
+    try std.testing.expect(cleanup.calls > 0);
+    {
+        var waiting = (try producer.load(&source, a, connection)).?;
+        defer waiting.deinit();
+        try std.testing.expectEqual(producer.Phase.finishing, waiting.value.phase);
+        try std.testing.expect(waiting.value.temporary_retirement.?.owner.eql(owner));
+        try std.testing.expectError(error.SqlConnectionBusy, producer.begin(&source, "alice", waiting.value, instance, .{ .sequence = waiting.value.next_command, .nonce = id(600), .executor = id(601) }, @splat(8), try native.head(), native.nonce(), 2));
+    }
+    cleanup.complete = true;
+    for (0..16) |_| try cleanup.step(&source);
+    try std.testing.expectEqual(producer.Phase.idle, try phase(&source));
+    var refreshed = try connections.load(&source, a, connection, "alice", 9, 2);
+    defer refreshed.deinit();
+    try std.testing.expectEqual(@as(u64, 2), refreshed.value.generation);
+    const third = try begin(&native, &source, 700);
+    const close_fence = try execute(&source, third);
+    const successor = try lifetimes.ownerFromConnection(refreshed.value, instance, 9);
+    try producer.markTemporaryOwner(&source, successor, close_fence, "main", 2);
+    {
+        var current = (try producer.load(&source, a, connection)).?;
+        defer current.deinit();
+        try producer.requestRecovery(&source, "alice", current.value);
+    }
+    cleanup.complete = false;
+    try native.until(&source, .retired, 2);
+    try std.testing.expectError(error.SqlConnectionBusy, connections.mutate(&source, .{ .close = connection }, "alice", 9, 2));
+    const queued = try producer.scanWork(&source, a, null, 8);
+    defer a.free(queued.ids);
+    try std.testing.expectEqual(@as(usize, 1), queued.ids.len);
+    var hooks: IngressRuntime = .{ .native = &native };
+    const controller: @import("sql_command_execution.zig").Controller = .{
+        .store = &source,
+        .connection = connection,
+        .principal = "alice",
+        .actor = actor,
+        .instance = instance,
+        .node = 9,
+        .standalone = false,
+        .port = cleanup.port(),
+        .runtime = hooks.runtime(),
+    };
+    const metadata_calls = native.calls;
+    const pending_calls = cleanup.calls;
+    // Logical retirement is not physical TEMP completion. The bounded public
+    // close assists only the retained child, never the original SQL body.
+    try std.testing.expectError(error.SqlConnectionBusy, controller.retireAndWait(a));
+    try std.testing.expectEqual(pending_calls + 16, cleanup.calls);
+    try std.testing.expectEqual(metadata_calls, native.calls);
+    hooks.cancelled = true;
+    try std.testing.expectError(error.Canceled, controller.retireAndWait(a));
+    hooks.cancelled = false;
+    cleanup.fail = true;
+    try std.testing.expectError(error.CatalogPublicationProofPending, controller.retireAndWait(a));
+    cleanup.fail = false;
+    cleanup.unknown = true;
+    try std.testing.expectError(error.SqlConnectionBusy, controller.retireAndWait(a));
+    hooks.pause_error = error.DeadlineExceeded;
+    try std.testing.expectError(error.DeadlineExceeded, controller.awaitRetirement(a));
+    hooks.pause_error = error.Canceled;
+    try std.testing.expectError(error.Canceled, controller.awaitRetirement(a));
+    hooks.pause_error = null;
+    cleanup.unknown = false;
+    cleanup.complete = true;
+    source.fail_writes_for_test = true;
+    // Physical completion with a lost local publication remains retryable.
+    try std.testing.expectError(error.InjectedSessionStoreFailure, controller.retireAndWait(a));
+    source.fail_writes_for_test = false;
+    try std.testing.expectError(error.SqlConnectionBusy, connections.mutate(&source, .{ .close = connection }, "alice", 9, 2));
+    cleanup.remaining = 33;
+    const pauses_before = hooks.pauses;
+    try controller.awaitRetirement(a);
+    try std.testing.expectEqual(@as(usize, 0), cleanup.remaining);
+    try std.testing.expect(hooks.pauses >= pauses_before + 2);
+    const completed_calls = cleanup.calls;
+    try controller.retireAndWait(a);
+    try std.testing.expectEqual(completed_calls, cleanup.calls);
+    try std.testing.expectEqual(metadata_calls, native.calls);
+    _ = try connections.mutate(&source, .{ .close = connection }, "alice", 9, 2);
+    try std.testing.expect(try producer.load(&source, a, connection) == null);
+}
+
+// The shutdown owner uses the same durable source planner as disconnect,
+// rather than deleting local capsules or declaring empty physical hosts clean.
+test "SQL command producer native shutdown drains only current issuer and retains unknown custody across cold reopen" {
+    const Server = @import("http_server.zig").ApiHttpServer;
+    const Deadline = @import("../common/runtime_lifecycle.zig").ShutdownDeadline;
+    const Forward = struct {
+        native: *Native,
+        reject: bool = false,
+        fn status(_: *anyopaque) anyerror!@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedStatusRead;
+        }
+        fn catalog(raw: *anyopaque, alloc: A, context: local.api_operation.RequestContext, input: Call) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.ensureActive();
+            if (self.reject) return error.MetadataMutationOutcomeUnknown;
+            return Native.call(self.native, alloc, input);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/shutdown-sources", .{tmp.sub_path});
+    defer a.free(path);
+    {
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var durable = transactions.DurableSessionStore.init(a, &metadata.store);
+        var native: Native = .{ .metadata = &metadata, .standalone = true, .expiry_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60000 };
+        try setup(&metadata, &durable, true, &native);
+        try native.until(&durable, .idle, 2);
+        var runtime = try local.storage_db_selected_root.db.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+        defer runtime.deinit();
+        var forward: Forward = .{ .native = &native };
+        var server = Server.init(a, .{ .backend_runtime = runtime.ptr(), .session_store = &durable, .session_maintenance_local_only = true, .deployment_mode = .standalone }, .{ .ptr = &forward, .vtable = &.{ .status = Forward.status, .system_catalog = Forward.catalog } }, null, null);
+        defer server.deinit();
+        server.sql_connection_admission.instance = id(900);
+        const calls = native.calls;
+        try server.drainSqlConnections(Deadline.afterMilliseconds(1000));
+        try std.testing.expectEqual(calls, native.calls);
+        {
+            var foreign = (try producer.load(&durable, a, connection)).?;
+            defer foreign.deinit();
+            try std.testing.expect(!foreign.value.recovery);
+            try std.testing.expectEqual(producer.Phase.idle, foreign.value.phase);
+        }
+        server.sql_connection_admission.instance = instance;
+        forward.reject = true;
+        try std.testing.expectError(error.SqlRelationRecoveryIncomplete, server.drainSqlConnections(Deadline.afterMilliseconds(20)));
+        {
+            var unknown = (try producer.load(&durable, a, connection)).?;
+            defer unknown.deinit();
+            try std.testing.expect(unknown.value.recovery);
+            try std.testing.expect(unknown.value.phase != .retired);
+        }
+        forward.reject = false;
+        try server.drainSqlConnections(Deadline.afterMilliseconds(1000));
+        var retired = (try producer.load(&durable, a, connection)).?;
+        defer retired.deinit();
+        try std.testing.expectEqual(producer.Phase.retired, retired.value.phase);
+        try std.testing.expect(retired.value.temporaryRetirementComplete());
+        try server.drainSqlConnections(Deadline.afterMilliseconds(1000));
+    }
+    var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+    defer metadata.deinit();
+    var durable = transactions.DurableSessionStore.init(a, &metadata.store);
+    var retained = (try producer.load(&durable, a, connection)).?;
+    defer retained.deinit();
+    try std.testing.expectEqual(producer.Phase.retired, retained.value.phase);
+    try std.testing.expect(retained.value.recovery);
+    try std.testing.expect(retained.value.temporaryRetirementComplete());
 }

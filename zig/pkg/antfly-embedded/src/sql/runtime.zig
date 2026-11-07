@@ -320,7 +320,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
         const dispatch = backend.vtable.ddl orelse return error.UnsupportedSqlExecution;
         // Persistence is a lifecycle contract. Never turn TEMP or UNLOGGED
         // syntax into an ordinary global durable table.
-        if (intent.persistence != .permanent) return error.UnsupportedSqlExecution;
+        if (intent.persistence != .permanent and !backend.supports_native_relation_lifetimes) return error.UnsupportedSqlExecution;
         const source = if (intent.query != null)
             try @import("relation_population.zig").Source.init(arena, backend, compiled, intent, parameters, limits)
         else
@@ -1684,6 +1684,7 @@ pub const Context = struct {
     }
 
     fn validateInsertRequired(self: Context, table: catalog.Table, object: std.json.ObjectMap) !void {
+        if (table.has_triggers) return;
         for (table.columns) |column| {
             if (column.nullable or column.generated or column.defaulted or std.mem.eql(u8, column.name, "_id")) continue;
             const present = if (column.document_path.len != 0) @import("document_path.zig").get(.{ .object = object }, column.document_path) != null else object.contains(column.path);
@@ -1734,7 +1735,7 @@ pub const Context = struct {
         defer if (shared) |owner| {
             owner.owner = preparation;
         } else if (preparation) |owner| owner.close(owner.ptr);
-        var stateful_defaults = false;
+        var stateful_defaults = table_def.has_triggers;
         for (table_def.columns) |column| stateful_defaults = stateful_defaults or column.sequence_default != null;
         var first: usize = first_row;
         while (first < statement.rows.len) {
@@ -1888,7 +1889,7 @@ pub const Context = struct {
 
     pub fn insertSourceRow(self: Context, statement: ast.Insert, builder: InsertSourceBuilder, row: []const Datum, row_index: usize) !catalog.Mutation {
         const table = self.binding.table orelse return error.InvalidSqlBackendResponse;
-        var stateful_defaults = false;
+        var stateful_defaults = table.has_triggers;
         for (table.columns) |column| stateful_defaults = stateful_defaults or column.sequence_default != null;
         var object: std.json.ObjectMap = .empty;
         var json_null_fields: std.ArrayList([]const u8) = .empty;
@@ -2046,7 +2047,8 @@ pub const Context = struct {
         const bound_assignments = try self.arena.alloc(Assignment, if (assignments) |items| items.len else 0);
         var replaced: std.StringHashMapUnmanaged(void) = .empty;
         if (assignments) |items| for (items, bound_assignments, 0..) |item, *bound, i| {
-            const column = try table_def.column(item.field);
+            var column = try table_def.column(item.field);
+            if (table_def.has_triggers) column.nullable = true;
             if (std.mem.eql(u8, column.name, "_id")) return error.UnsupportedSqlExecution;
             for (items[0..i]) |previous| if (std.mem.eql(u8, previous.field, item.field)) return error.DuplicateColumn;
             var program = if (i < self.binding.scalars.assignments.len) self.binding.scalars.assignments[i] else null;
@@ -2083,11 +2085,12 @@ pub const Context = struct {
         // postimage below, not from independently coerced SQL projections.
         // Fetch only expression/predicate inputs; cold schema fields may be
         // large or may not satisfy a later SQL view's declared scalar type.
+        if (table_def.has_triggers) for (table_def.columns) |column| try fields.append(self.arena, column.path);
         if (assignments != null and table_def.storage_mode != .document) for (table_def.columns) |column| {
             // The native row version still fences the entire row. Loading an
             // overwritten value adds no conflict protection and can dominate
             // I/O/memory for wide JSON/blob-like columns.
-            if (!column.generated and !replaced.contains(column.path)) try fields.append(self.arena, column.path);
+            if (!column.generated and !replaced.contains(column.path) and !contains(fields.items, column.path)) try fields.append(self.arena, column.path);
         };
         if (assignments == null and returning != null) {
             if (returning.?.len == 0) {
@@ -2133,7 +2136,7 @@ pub const Context = struct {
             if (page_count > self.limits.scan_pages) return error.SqlProgramLimitExceeded;
             var page_arena = std.heap.ArenaAllocator.init(self.alloc);
             defer page_arena.deinit();
-            const page = try scan_state.page(self, page_arena.allocator(), table_def, .{ .fields = fields.items, .include_primary_digest = true, .include_document = table_def.storage_mode == .document and assignments != null, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = self.limits.page_rows });
+            const page = try scan_state.page(self, page_arena.allocator(), table_def, .{ .fields = fields.items, .include_primary_digest = true, .include_document = table_def.storage_mode == .document and (assignments != null or table_def.has_triggers), .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = self.limits.page_rows });
             defer page.deinit();
             if (page.rows.len > self.limits.page_rows) return error.InvalidSqlBackendResponse;
             if (page.rows.len > self.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
@@ -2211,7 +2214,7 @@ pub const Context = struct {
                     if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
                     const key = try self.arena.dupe(u8, row.id);
                     if (table_def.storage_mode == .document and row.expected_content_digest == null and row.version != 0) return error.InvalidSqlBackendResponse;
-                    const previous = if (assignments == null and returning != null) blk: {
+                    const previous = if (table_def.has_triggers or (assignments == null and returning != null)) blk: {
                         const owned = try self.arena.create(catalog.Row);
                         if (row.typed_cells) |cells| if (retained_layout == null) {
                             retained_layout = try cells.layout.clone(self.arena);
@@ -2265,11 +2268,19 @@ pub const Context = struct {
             };
             break :blk effective;
         };
-        input = try self.claimStatementMutations(table, input, tag);
+        if (table.has_triggers) {
+            if (self.backend.statement_effect_execution) |execution| {
+                const eligible = execution.eligible orelse return error.InvalidSqlBackendResponse;
+                input = try eligible(execution.ptr, self.arena, table, input, tag);
+            }
+        } else input = try self.claimStatementMutations(table, input, tag);
         var output: Output = .{ .command_tag = tag, .rows_affected = input.len };
         var prepared = input;
         var did_prepare = already_prepared;
-        if (!already_prepared and table.storage_mode == .document and input.len != 0) {
+        const needs_trigger_preparation = table.has_triggers and for (input) |mutation| {
+            if (mutation.prepared_trigger == null) break true;
+        } else false;
+        if ((needs_trigger_preparation or (!already_prepared and table.storage_mode == .document)) and input.len != 0) {
             const prepare = self.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution;
             prepared = try prepare(self.backend.ptr, self.arena, table, input);
             did_prepare = true;
@@ -2285,8 +2296,33 @@ pub const Context = struct {
         for (input, prepared) |original, mutation| {
             if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or
                 !std.meta.eql(mutation.expected_content_digest, original.expected_content_digest) or
-                mutation.unique_absence != original.unique_absence or mutation.predicate_only != original.predicate_only or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
+                mutation.unique_absence != original.unique_absence) return error.InvalidSqlBackendResponse;
+            if (mutation.trigger_suppressed) {
+                if (!table.has_triggers or mutation.prepared_trigger == null or !mutation.predicate_only or mutation.row != null) return error.InvalidSqlBackendResponse;
+            } else if (mutation.predicate_only != original.predicate_only or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
             if (mutation.conflict_guard != original.conflict_guard) return error.InvalidSqlBackendResponse;
+        }
+        if (table.has_triggers) {
+            var originals: std.ArrayList(catalog.Mutation) = .empty;
+            var selected: std.ArrayList(catalog.Mutation) = .empty;
+            for (input, prepared) |original, mutation| {
+                if (mutation.trigger_suppressed) {
+                    // A skipped row still observes its source tuple. Retain
+                    // that atomic guard, but neither delete it nor expose it
+                    // through RETURNING or the affected-row count.
+                    var fence = mutation;
+                    fence.trigger_suppressed = false;
+                    fence.prepared_trigger = null;
+                    try fences.append(self.arena, fence);
+                    continue;
+                }
+                try originals.append(self.arena, original);
+                try selected.append(self.arena, mutation);
+            }
+            input = originals.items;
+            prepared = try self.claimStatementMutations(table, selected.items, tag);
+            if (prepared.len != input.len) return error.InvalidSqlBackendResponse;
+            output.rows_affected = prepared.len;
         }
         // Command-private admission must precede RETURNING: its expressions
         // can pull sibling producers whose unique lookups depend on this row.
@@ -8604,12 +8640,16 @@ const EffectTestBackend = struct {
     active: bool = false,
     fail_finish: bool = false,
     deny_write: bool = false,
+    protected_mutation: bool = false,
+    triggered_mutation: bool = false,
+    statement_begins: usize = 0,
+    statement_ends: usize = 0,
     fn owner(raw: *anyopaque) *@This() {
         const base: *TestBackend = @ptrCast(@alignCast(raw));
         return @fieldParentPtr("base", base);
     }
     fn backend(self: *@This()) catalog.Backend {
-        return .{ .ptr = &self.base, .atomic_statement_read_set = true, .predicate_only_mutations = true, .statement_mutations = .{ .ptr = &self.base, .begin = begin }, .vtable = &.{ .resolve = resolve, .scan = TestBackend.scan, .open_scan = openPoint, .open_statement = TestBackend.openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepare, .open_mutation_preparation = openPreparation, .checkpoint = TestBackend.checkpoint } };
+        return .{ .ptr = &self.base, .atomic_statement_read_set = true, .predicate_only_mutations = true, .statement_mutations = .{ .ptr = &self.base, .begin = begin }, .vtable = &.{ .resolve = resolve, .scan = TestBackend.scan, .open_scan = openScan, .open_statement = TestBackend.openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepare, .open_mutation_preparation = openPreparation, .checkpoint = TestBackend.checkpoint } };
     }
     const Point = struct {
         owner: *EffectTestBackend,
@@ -8636,6 +8676,30 @@ const EffectTestBackend = struct {
             self.allocator.destroy(self);
         }
     };
+    const BroadScan = struct {
+        a: std.mem.Allocator,
+        read: catalog.StatementRead,
+        fn next(raw: *anyopaque, a: std.mem.Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const cursor = self.read.cursors[0];
+            return cursor.next(cursor.ptr, a, limit);
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.read.close(self.read.ptr);
+            self.a.destroy(self);
+        }
+    };
+    fn openScan(raw: *anyopaque, a: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+        if (request.primary_key != null) return openPoint(raw, a, table, request);
+        const self = owner(raw);
+        if ((!self.protected_mutation and !self.triggered_mutation) or !request.include_primary_digest) return error.UnexpectedBackendCall;
+        try std.testing.expect(self.active);
+        const cursor = try a.create(BroadScan);
+        errdefer a.destroy(cursor);
+        cursor.* = .{ .a = a, .read = try TestBackend.openStatement(raw, a, &.{.{ .table = table, .request = request }}) };
+        return .{ .ptr = cursor, .next = BroadScan.next, .close = BroadScan.close };
+    }
     fn openPoint(raw: *anyopaque, a: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         if (request.primary_key == null or !request.include_primary_digest) return error.UnexpectedBackendCall;
         const cursor = try a.create(Point);
@@ -8645,14 +8709,23 @@ const EffectTestBackend = struct {
     }
     fn resolve(raw: *anyopaque, a: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         if (action != .read and owner(raw).deny_write) return error.Forbidden;
-        return TestBackend.resolve(raw, a, name, action);
+        var table = try TestBackend.resolve(raw, a, name, action);
+        table.has_incoming_foreign_keys = owner(raw).protected_mutation;
+        table.has_triggers = owner(raw).triggered_mutation;
+        return table;
     }
     fn begin(raw: *anyopaque, _: std.mem.Allocator) !catalog.Backend.StatementMutations {
         const self = owner(raw);
         try std.testing.expect(!self.active);
         self.active = true;
         self.begins += 1;
-        return .{ .ptr = raw, .finish = finish, .abort = abort };
+        return .{ .ptr = raw, .begin_step = beginStep, .end_step = endStep, .finish = finish, .abort = abort };
+    }
+    fn beginStep(raw: *anyopaque, _: usize, _: @import("describe.zig").BoundStatement, _: ast.Statement) !void {
+        owner(raw).statement_begins += 1;
+    }
+    fn endStep(raw: *anyopaque, _: usize, _: @import("describe.zig").BoundStatement, _: ast.Statement) !void {
+        owner(raw).statement_ends += 1;
     }
     fn finish(raw: *anyopaque) !void {
         const self = owner(raw);
@@ -9305,5 +9378,52 @@ test "SQL LockRows skips contenders refills LIMIT locks OFFSET and defers fallib
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
         try std.testing.expectEqual(@as(usize, 3), fixture.locks);
+    }
+}
+
+test "SQL protected ordinary mutations use one command including zero-row statement phases" {
+    for ([_][]const u8{
+        "INSERT INTO things (_id,id) VALUES ('a',7)",
+        "UPDATE things SET id=id+1",
+        "DELETE FROM things",
+        "INSERT INTO things (_id,id) VALUES ('a',7) RETURNING id",
+        "UPDATE things SET id=id+1 RETURNING id",
+        "DELETE FROM things RETURNING id",
+    }) |sql| {
+        for ([_]usize{ 0, 2 }) |rows| {
+            var provider: EffectTestBackend = .{ .base = .{ .row_count = rows, .group_every = 1 }, .protected_mutation = true };
+            var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+            defer compiled.deinit();
+            var result = try execute(std.testing.allocator, provider.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqualStrings(if (std.mem.startsWith(u8, sql, "INSERT")) "INSERT" else if (std.mem.startsWith(u8, sql, "UPDATE")) "UPDATE" else "DELETE", result.output.command_tag);
+            try std.testing.expectEqual(@as(usize, 1), provider.begins);
+            try std.testing.expectEqual(@as(usize, 1), provider.statement_begins);
+            try std.testing.expectEqual(@as(usize, 1), provider.statement_ends);
+            try std.testing.expectEqual(@as(usize, 1), provider.finishes);
+            try std.testing.expect(!provider.active);
+            try std.testing.expectEqual(provider.base.statement_opens, provider.base.statement_closes);
+        }
+    }
+}
+
+test "SQL protected ordinary zero-row triggers finish once and failed completion publishes no effects" {
+    for ([_]bool{ false, true }) |fail| {
+        var provider: EffectTestBackend = .{ .base = .{ .row_count = 0 }, .triggered_mutation = true, .fail_finish = fail };
+        var compiled = try compiler.compile(std.testing.allocator, "UPDATE things SET id=id+1 RETURNING id", .{});
+        defer compiled.deinit();
+        if (fail) {
+            try std.testing.expectError(error.ForeignKeyParentMissing, execute(std.testing.allocator, provider.backend(), &compiled, &.{}, .{}));
+        } else {
+            var result = try execute(std.testing.allocator, provider.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 0), result.output.rows_affected);
+            try std.testing.expectEqual(@as(usize, 1), provider.finishes);
+        }
+        try std.testing.expectEqual(@as(usize, 1), provider.statement_begins);
+        try std.testing.expectEqual(@as(usize, 1), provider.statement_ends);
+        try std.testing.expectEqual(@as(usize, 1), provider.aborts);
+        try std.testing.expectEqual(@as(usize, 0), provider.published);
+        try std.testing.expect(!provider.active);
     }
 }

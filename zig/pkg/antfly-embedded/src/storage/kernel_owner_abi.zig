@@ -20,7 +20,20 @@ const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
 // Main owns published job projections 72..74. Schema preflight appends at 75.
-pub const abi_version: u32 = 112;
+// v116 also versions JSON semantics: v115 accepts the existing receipt-v3
+// wrapper but can ignore its new graph_preparation root. Engine descriptors
+// stay inside the provider and cannot protect this opaque JSON boundary.
+// Context/Open/Batch request versions must reject a v115 provider before any
+// graph-bearing work, even when no fixed field layout changed.
+pub const prepared_graph_effects_abi_version: u32 = 116;
+/// Older providers ignore SchemaPair inside the opaque policy install snapshot.
+pub const coupled_schema_policy_abi_version: u32 = 117;
+/// Typed native retained-state status extends both fixed request/result layouts.
+pub const native_retention_status_abi_version: u32 = 118;
+/// Strict private transition-read selector derives native retirement authority
+/// in the receiver. Older providers must reject before opening this operation.
+pub const native_retirement_status_abi_version: u32 = 119;
+pub const abi_version: u32 = native_retirement_status_abi_version;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -421,9 +434,30 @@ pub const ContextMetricsResult = extern struct {
     resource_memory: ContextResourceBudgetStats = .{},
     resource_slice_count: u32 = 0,
     resource_slices: [context_resource_slice_capacity]ContextResourceBudgetStats = @splat(ContextResourceBudgetStats{}),
+    /// Generated inside the compiled storage context, independently of SQL
+    /// connection issuers and catalog descriptors. Never supplied by a caller.
+    execution_instance: [16]u8 = @splat(0),
 };
 
 pub const context_resource_slice_capacity: usize = 64;
+
+pub const RelationLifetimeContextAction = enum(u8) { observe = 0, begin_drain = 1, _ };
+pub const RelationLifetimeContextRequest = extern struct {
+    version: u32 = abi_version,
+    action: RelationLifetimeContextAction = .observe,
+    _reserved: [3]u8 = @splat(0),
+    execution_instance: [16]u8,
+};
+pub const RelationLifetimeContextResult = extern struct {
+    version: u32 = abi_version,
+    admission_closed: u8 = 0,
+    _reserved: [3]u8 = @splat(0),
+    execution_instance: [16]u8 = @splat(0),
+    live_owners: u64 = 0,
+    opening_owners: u64 = 0,
+    failed_closes: u64 = 0,
+    clean_digest: [32]u8 = @splat(0),
+};
 
 pub const ContextResourceBudgetStats = extern struct {
     used_bytes: u64 = 0,
@@ -1143,6 +1177,9 @@ pub const OwnerCatalogMode = enum(u8) {
     /// Existing durable catalog only, unpublished and without autonomous
     /// replay/derived workers. No schema/index/bootstrap hints are accepted.
     durable_only = 1,
+    /// Signed metadata Boot recovery, with an exact old primary stamp and no
+    /// autonomous producer/replay workers. Ordinary opens cannot set its guard.
+    lifetime_recovery = 2,
     _,
 };
 
@@ -1162,6 +1199,11 @@ pub const OpenRequest = extern struct {
     schema_json: BorrowedBytes = .{},
     indexes_json: BorrowedBytes = .{},
     dense_embedding_storage: DenseEmbeddingStorage = .persisted,
+    /// Metadata-bound local lifetime and real host/boot admission. These are
+    /// private native-owner fields, never public row-request options.
+    sql_persistence_json: BorrowedBytes = .{},
+    sql_persistence_context_json: BorrowedBytes = .{},
+    persistence_boot_json: BorrowedBytes = .{},
     /// Exact private metadata-authorized hidden owner bootstrap. Never set by
     /// ordinary public catalog opens; durable scope is checked before adoption.
     restore_bootstrap_json: BorrowedBytes = .{},
@@ -1190,6 +1232,9 @@ pub const OpenRequest = extern struct {
     /// Immutable owner-local verifier for authenticated, statement-scoped
     /// row-policy principal proofs. Absent for Lite and legacy runtimes, which
     /// must reject active-policy reads and writes rather than assume a role.
+    /// Dedicated SQL preparation USER grant verifier; never public RLS auth.
+    sql_preparation_secret: BorrowedBytes = .{},
+    sql_preparation_issuer: BorrowedBytes = .{},
     row_policy_authority_secret: BorrowedBytes = .{},
     row_policy_authority_issuer: BorrowedBytes = .{},
 };
@@ -1544,7 +1589,7 @@ pub const HASeedOperation = enum(u32) {
 /// Private owner discovery is physical metadata, not public catalog routing.
 pub const HiddenRestoreRequest = extern struct {
     version: u32 = abi_version,
-    operation: enum(u32) { read_bootstrap = 0, capture_snapshot = 1, capture_public_snapshot = 2, read_initial_child = 3, cancel_initial_child_retirement = 4 },
+    operation: enum(u32) { read_bootstrap = 0, capture_snapshot = 1, capture_public_snapshot = 2, read_initial_child = 3, cancel_initial_child_retirement = 4, inspect_native_root = 5, replace_native_empty = 6 },
     context: ?*anyopaque = null,
     path: BorrowedBytes = .{},
     table_name: BorrowedBytes = .{},
@@ -1552,6 +1597,8 @@ pub const HiddenRestoreRequest = extern struct {
     scope: [32]u8 = @splat(0),
     snapshot_token: BorrowedBytes = .{},
     destination_root: BorrowedBytes = .{},
+    native_inspection_json: BorrowedBytes = .{},
+    native_image_json: BorrowedBytes = .{},
 };
 
 pub extern fn antfly_storage_owner_hidden_restore_json(owner: ?*anyopaque, request: *const HiddenRestoreRequest, out_result: *OwnedBytes) Status;
@@ -1737,16 +1784,30 @@ pub const MaintenanceResult = extern struct {
     next_wake_delay_ns: u64 = 0,
 };
 
+pub const max_retention_participants_bytes: usize = 1024 * 1024;
 pub const TransactionStatusRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
     table_name: BorrowedBytes = .{},
     txn_id: TxnId = .{},
+    /// Private exact existing-participant owner, fixed canonical 88 bytes.
+    external_owner: BorrowedBytes = .{},
+    include_retention: u32 = 0,
+    _reserved1: u32 = 0,
+    retention_group_id: u64 = 0,
+    retention_native_pin: BorrowedBytes = .{},
 };
 
 pub const TransactionStatusResult = extern struct {
     version: u32 = abi_version,
     status: TxnStatus = .pending,
+    retention_included: u32 = 0,
+    coordinator: u32 = 0,
+    prepared: u32 = 0,
+    intents_resolved: u32 = 0,
+    participant_count: u32 = 0,
+    _reserved0: u32 = 0,
+    participants_json: OwnedBytes = .{},
 };
 
 pub const BulkProgressPhase = enum(u32) {
@@ -2048,6 +2109,8 @@ pub extern fn antfly_storage_context_metrics(
     context: ?*anyopaque,
     out_result: *ContextMetricsResult,
 ) callconv(.c) Status;
+pub extern fn antfly_storage_context_relation_lifetime(context: ?*anyopaque, request: *const RelationLifetimeContextRequest, out_result: *RelationLifetimeContextResult) callconv(.c) Status;
+pub extern fn antfly_storage_owner_close_fallible(owner: ?*anyopaque) callconv(.c) Status;
 
 /// Retires process-wide decoded storage state after an atomic generation
 /// replacement. Existing borrowers remain valid; subsequent owners must load

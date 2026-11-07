@@ -35,8 +35,9 @@ pub const Diagnostic = struct {
         if (std.mem.startsWith(u8, self.code, "40")) return 409;
         if (std.mem.eql(u8, self.code, "XX000") or std.mem.eql(u8, self.code, "53200") or std.mem.eql(u8, self.code, "58000")) return 500;
         if (std.mem.eql(u8, self.code, "53100")) return 507;
-        // Refused until an earlier unknown outcome is reconciled.
-        if (std.mem.eql(u8, self.code, "55000")) return 409;
+        // Native owner recovery is temporary unavailability. Other object
+        // state failures, including unresolved outcomes, remain conflicts.
+        if (std.mem.eql(u8, self.code, "55000")) return if (self.retryable orelse false) 503 else 409;
         // Committed; derived visibility still pending. Not a client error.
         if (std.mem.eql(u8, self.code, "AF001")) return 202;
         return 400;
@@ -84,6 +85,29 @@ pub fn notNull(context: ?*Context, name: []const u8) anyerror {
     return error.SqlNotNullViolation;
 }
 
+test "SQL native recovery is unavailable while owner fencing and unresolved outcomes remain conflicts" {
+    for ([_]anyerror{ error.SqlRelationRecoveryIncomplete, error.SqlRelationOwnerUnavailable }) |err| {
+        const recovery = describe(err);
+        try std.testing.expectEqualStrings("55000", recovery.code);
+        try std.testing.expectEqual(@as(?bool, true), recovery.retryable);
+        try std.testing.expectEqual(@as(u16, 503), recovery.httpStatus());
+    }
+    // These are exact ownership or retained-decision failures, not evidence
+    // that a background native Boot recovery is still progressing.
+    for ([_]anyerror{ error.SqlRelationOwnerChanged, error.SqlConnectionWrongOwner, error.SqlPreparedWrongOwner, error.OutcomeReconciliationRequired, error.SqlReconciliationRequired, error.SqlMutationOutcomeUnknown, error.SqlPreparationAuthorityNotConfigured, error.ConstraintActivationInvalid }) |err| {
+        try std.testing.expectEqual(@as(u16, 409), describe(err).httpStatus());
+    }
+    try std.testing.expectEqual(@as(u16, 403), describe(error.SqlTemporaryRelationNotOwned).httpStatus());
+}
+
+test "SQL relation persistence diagnostics retain PostgreSQL classes" {
+    try std.testing.expectEqualStrings("42P16", describe(error.InvalidSqlTemporaryNamespace).code);
+    try std.testing.expectEqualStrings("42P16", describe(error.SqlRelationPersistenceForeignKeyMismatch).code);
+    try std.testing.expectEqualStrings("42501", describe(error.SqlTemporaryRelationNotOwned).code);
+    try std.testing.expectEqualStrings("40001", describe(error.SqlRelationOwnerChanged).code);
+    try std.testing.expectEqualStrings("55000", describe(error.SqlRelationRecoveryIncomplete).code);
+}
+
 /// Data/cardinality failures belong to their logical row. Speculative batch
 /// evaluation must replay its scalar prefix; resource and control errors abort.
 pub fn isRowEvaluationError(err: anyerror) bool {
@@ -111,14 +135,27 @@ pub fn notApplied(err: anyerror) anyerror {
     if (isUnknownOutcome(err)) return error.SqlReconciliationRequired;
     if (!std.mem.eql(u8, describe(err).code, "XX000")) return err;
     return switch (err) {
-        error.Busy, error.WriterLocked, error.ConcurrencyUnavailable, error.CapacityUnavailable, error.CapacityObservationStale, error.LiteRetirementBacklogExceeded, error.TextMergeBackpressureTimeout, error.SourceFileChanged, error.GenerationTransitionActive, error.IndexArtifactCleanupPending, error.EmbeddingProbeUnavailable, error.InferenceProviderCallCapacityExhausted, error.IntegrityCatalogUnavailable, error.ResourceTemporarilyUnavailable, error.StorageReadTemporarilyUnavailable => error.SqlMutationNotAppliedBusy,
+        error.Busy, error.StorageBusy, error.WriterLocked, error.ConcurrencyUnavailable, error.CapacityUnavailable, error.CapacityObservationStale, error.LiteRetirementBacklogExceeded, error.TextMergeBackpressureTimeout, error.SourceFileChanged, error.GenerationTransitionActive, error.IndexArtifactCleanupPending, error.EmbeddingProbeUnavailable, error.InferenceProviderCallCapacityExhausted, error.IntegrityCatalogUnavailable, error.ResourceTemporarilyUnavailable, error.StorageReadTemporarilyUnavailable => error.SqlMutationNotAppliedBusy,
         error.LiteStorageBudgetExceeded, error.LiteInsufficientDiskSpace, error.NoSpaceLeft, error.DiskQuota => error.SqlMutationNotAppliedNoSpace,
         else => error.SqlMutationNotApplied,
     };
 }
 
 pub fn describe(err: anyerror) Diagnostic {
+    if (comptime @import("builtin").mode == .debug) {
+        const Once = struct {
+            var seen: std.atomic.Value(bool) = .init(false);
+        };
+        if ((err == error.CatalogGenerationChanged or err == error.PreparedGenerationChanged or err == error.GenerationRetired or err == error.IntegrityCatalogChanged) and !Once.seen.swap(true, .monotonic))
+            std.debug.print("SQL catalog conflict cause={s}\n", .{@errorName(err)});
+    }
     return switch (err) {
+        error.InvalidSqlRelationPersistence => .{ .code = "22023", .message = "The relation persistence binding is invalid.", .retryable = false },
+        error.SqlRelationOwnerChanged => .{ .code = "40001", .message = "The native relation owner changed during this operation.", .hint = "Refresh the table binding and check the previous request outcome before retrying.", .retryable = true },
+        error.SqlTemporaryRelationNotOwned => .{ .code = "42501", .message = "The temporary relation requires its owning SQL connection.", .hint = "Open or use the connection that owns this temporary relation.", .retryable = false },
+        error.InvalidSqlTemporaryNamespace => .{ .code = "42P16", .message = "Cannot create a temporary relation in a non-temporary schema.", .retryable = false },
+        error.SqlRelationPersistenceForeignKeyMismatch => .{ .code = "42P16", .message = "The foreign key crosses incompatible relation persistence classes.", .hint = "Temporary foreign keys must stay within their SQL connection; permanent tables cannot reference unlogged tables.", .retryable = false },
+        error.SqlRelationRecoveryIncomplete, error.SqlRelationOwnerUnavailable => .{ .code = "55000", .message = "The native relation owner is not ready.", .hint = "Wait for owner recovery or use an available primary.", .retryable = true },
         error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => .{ .code = "22023", .message = "The read requirements or write receipt do not match this table generation.", .retryable = false },
         error.UnsupportedReadVisibility => .{ .code = "0A000", .message = "This execution path does not support the requested read visibility.", .retryable = false },
         error.ReadRequirementNotReady => .{ .code = "53300", .message = "The requested write is not yet visible within the readiness budget.", .retryable = true },
@@ -169,6 +206,11 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlConcurrentRefreshIndexRequired => .{ .code = "55000", .message = "Concurrent refresh requires a ready unique index covering all rows.", .retryable = false },
         error.SqlMaterializedViewNotPopulated => .{ .code = "55000", .message = "Materialized view has not been populated.", .hint = "Use REFRESH MATERIALIZED VIEW to populate it.", .retryable = false },
         error.SqlTriggerDeclaredArguments => .{ .code = "42P13", .message = "Trigger functions cannot have declared arguments." },
+        error.InvalidSqlTriggerManifest => .{ .code = "22023", .message = "Invalid trigger execution manifest." },
+        error.InvalidPreparedGraphEffects => .{ .code = "22023", .message = "Invalid prepared graph effects." },
+        error.SqlPreparationAuthorityNotConfigured => .{ .code = "55000", .message = "SQL preparation authority is not configured.", .hint = "Configure antfly.sql_preparation.secret and antfly.sql_preparation.issuer on API and native receivers, or the existing explicit trusted-principal pair. Node transport credentials cannot authorize SQL execution.", .retryable = false },
+        error.SqlTriggerCoordinationRequired => .{ .code = "0A000", .message = "Table triggers require coordinated mutation preparation.", .hint = "Use the coordinated table or SQL mutation API." },
+        error.InvalidSqlTriggerDefinition => .{ .code = "42P17", .message = "Invalid trigger definition." },
         error.SqlTriggerSqlLanguage => .{ .code = "42P13", .message = "SQL functions cannot return type trigger." },
         error.SqlTriggerReturnValueRequired => .{ .code = "42P13", .message = "RETURN in a trigger function requires a row value or NULL." },
         error.SqlInvalidTableDefinition => .{ .code = "42P16", .message = "A stored column cannot have pseudo-type void." },
@@ -380,7 +422,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlInvalidRegularExpression => .{ .code = "2201B", .message = "The regular expression is invalid.", .hint = "Use PostgreSQL-compatible regular expression syntax." },
         error.SqlTypeMismatch, error.InvalidSqlParameters, error.InvalidBatchRequest, error.InvalidRelationalExpressionInput, error.InvalidRelationalGeneratedValue => .{ .code = "22023", .message = "A parameter or row value does not match the required type.", .hint = "Check parameter count, nullability, and the current column types." },
         error.InvalidCatalogName => .{ .code = "22023", .message = "The database, namespace, or table name is invalid.", .hint = "Use a valid catalog name without empty components." },
-        error.CatalogGenerationExhausted => .{ .code = "54000", .message = "The catalog identity or generation capacity was exhausted.", .retryable = false },
+        error.CatalogGenerationExhausted, error.CatalogIdExhausted => .{ .code = "54000", .message = "The catalog identity or generation capacity was exhausted.", .retryable = false },
         error.SqlWorkingMemoryLimitExceeded => .{ .code = "54000", .message = "The statement exceeds its working-memory limit (default: 256 MiB, 268435456 bytes).", .hint = "Reduce the number and size of simultaneously retained rows or increase the runtime retained-byte limit.", .retryable = false },
         error.SqlRequestTooLarge => .{ .code = "54000", .message = "The SQL JSON request exceeds the 64 MiB (67108864 byte) limit.", .hint = "Reduce the statement and parameter payload size.", .retryable = false },
         error.CatalogCommandTooLarge, error.RelationPopulationPageTooLarge, error.QueryCandidateBudgetExceeded, error.SqlProgramLimitExceeded, error.ProgramLimitExceeded, error.SqlLimitExceeded, error.SqlResultTooLarge, error.RelationalRowResultTooLarge, error.RelationalExpressionBudgetExceeded, error.TransactionTooLarge, error.IntegrityRecordTooLarge, error.RelationalIndexKeyTooLarge, error.SettingLimitExceeded => .{ .code = "54000", .message = "The statement exceeds the supported work, result, or mutation limit.", .hint = "Narrow the predicate or reduce the number and size of rows." },

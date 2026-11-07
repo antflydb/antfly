@@ -37,6 +37,12 @@ pub const Evaluation = struct {
     scratch: std.heap.ArenaAllocator,
 
     pub fn init(alloc: std.mem.Allocator, server: *http.ApiHttpServer, context: operation.RequestContext, table: catalog.Table, caller: []const u8, token: []const u8, overlay: []const settings.OverlayEntry) !*Evaluation {
+        return initAccess(alloc, server, context, table, caller, token, overlay, .read);
+    }
+    pub fn initForWrite(alloc: std.mem.Allocator, server: *http.ApiHttpServer, context: operation.RequestContext, table: catalog.Table, caller: []const u8, token: []const u8, overlay: []const settings.OverlayEntry) !*Evaluation {
+        return initAccess(alloc, server, context, table, caller, token, overlay, .write);
+    }
+    fn initAccess(alloc: std.mem.Allocator, server: *http.ApiHttpServer, context: operation.RequestContext, table: catalog.Table, caller: []const u8, token: []const u8, overlay: []const settings.OverlayEntry, access: authority.Access) !*Evaluation {
         try context.ensureActive();
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         var authenticated = context;
@@ -57,6 +63,7 @@ pub const Evaluation = struct {
             .database = scope.database,
             .policy_generation = header.value.policy_generation,
             .catalog_epoch = header.value.catalog_epoch,
+            .access = access,
         }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)), token);
         errdefer self.principal.deinit();
         if (!std.mem.eql(u8, self.principal.value.principal, caller)) return error.RowPolicyAuthenticationRequired;
@@ -115,6 +122,22 @@ pub const Evaluation = struct {
             cells[ordinal] = try local.sql_document_row.declaredCell(a, column, cell);
         }
         return evaluator.permitsWithScratch(a, cells);
+    }
+
+    /// Prepared trigger rows already own exact SQL cells and NULL provenance.
+    /// Reuse the native policy evaluator without projecting back through JSON.
+    pub fn permitsTyped(self: *Evaluation, action: policies.Evaluator.Action, row: catalog.Row) !bool {
+        try self.context.ensureActive();
+        const index = @backingInt(action);
+        if (self.evaluators[index] == null) self.evaluators[index] = try policies.Evaluator.initForAuthenticatedPrincipal(self.alloc, &self.policies, &self.settings, action, self.principal.value.policy_principal orelse self.principal.value.principal, self.principal.value.roles);
+        const evaluator = &self.evaluators[index].?;
+        _ = self.scratch.reset(.retain_capacity);
+        const a = self.scratch.allocator();
+        defer for (evaluator.required_columns) |ordinal| {
+            self.cells[ordinal] = .{};
+        };
+        for (evaluator.required_columns) |ordinal| self.cells[ordinal] = try local.sql_document_row.declaredCell(a, self.table.columns[ordinal], try row.cell(self.table.columns[ordinal].name));
+        return evaluator.permitsWithScratch(a, self.cells);
     }
 
     pub fn permitsScan(self: *Evaluation, key: []const u8, value: std.json.Value, null_fields: []const []const u8) !bool {

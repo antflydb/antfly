@@ -167,6 +167,8 @@ pub const TableWriteSource = struct {
             cancellation: db_mod.types.CancellationToken,
         ) anyerror!?db_mod.types.GraphMetricStatus = null,
         sql_maintenance_group: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, []const u8, db_mod.types.CancellationToken) anyerror!?[]u8 = null,
+        sql_maintenance_group_routed: ?*const fn (*anyopaque, std.mem.Allocator, @import("../metadata/catalog_route_contract.zig").CatalogRouteFence, u64, []const u8, []const u8, db_mod.types.CancellationToken) anyerror!?[]u8 = null,
+        sql_maintenance_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, @import("../metadata/catalog_route_contract.zig").CatalogRouteFence, u64, []const u8, []const u8, db_mod.types.CancellationToken) anyerror!?[]u8 = null,
         sql_maintenance_group_local: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, []const u8) anyerror!?[]u8 = null,
         graph_metric_maintenance_group_local: ?*const fn (
             ptr: *anyopaque,
@@ -299,6 +301,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             req: db_mod.types.BatchRequest,
         ) anyerror!?void = null,
+        batch_group_local_routed: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest, route: @import("../metadata/catalog_route_contract.zig").CatalogRouteFence) anyerror!?void = null,
         txn_begin_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -820,6 +823,15 @@ pub const TableWriteSource = struct {
         const callback = self.vtable.sql_maintenance_group orelse return null;
         return BoundaryAbi.call("sql_maintenance_group", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, body, cancellation });
     }
+    pub fn sqlMaintenanceGroupRouted(self: TableWriteSource, alloc: std.mem.Allocator, route: @import("../metadata/catalog_route_contract.zig").CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        const callback = self.vtable.sql_maintenance_group_routed orelse return error.CatalogRouteFenceUnsupported;
+        return BoundaryAbi.call("sql_maintenance_group_routed", self.boundary_dispatch, callback, .{ self.ptr, alloc, route, group_id, table_name, body, cancellation });
+    }
+    pub fn sqlMaintenanceGroupLocalRouted(self: TableWriteSource, alloc: std.mem.Allocator, route: @import("../metadata/catalog_route_contract.zig").CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        const callback = self.vtable.sql_maintenance_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
+        return BoundaryAbi.call("sql_maintenance_group_local_routed", self.boundary_dispatch, callback, .{ self.ptr, alloc, route, group_id, table_name, body, cancellation });
+    }
+
     pub fn sqlMaintenanceGroupLocal(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8) !?[]u8 {
         const callback = self.vtable.sql_maintenance_group_local orelse return null;
         return BoundaryAbi.call("sql_maintenance_group_local", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, body });
@@ -1050,6 +1062,12 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.batch_group_local orelse return null;
         return try BoundaryAbi.call("batch_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req });
+    }
+
+    pub fn batchGroupLocalRouted(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest, route: @import("../metadata/catalog_route_contract.zig").CatalogRouteFence) !?void {
+        if (self.vtable.batch_group_local_routed) |apply| return apply(self.ptr, alloc, group_id, table_name, req, route);
+        if (route.route.execution == .native_local) return error.StorageKernelOwnerUnavailable;
+        return self.batchGroupLocal(alloc, group_id, table_name, req);
     }
 
     pub fn txnBeginGroupLocal(

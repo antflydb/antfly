@@ -37,6 +37,7 @@ pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metada
     const storage: @import("../common/table_storage.zig").Settings = req.storage orelse .{};
     const min_ranges = if (storage.engine == .object) 0 else req.num_shards orelse 1;
     return .{
+        .sql_persistence = req.sql_persistence,
         .storage = storage,
         .table_id = deriveId(table_name, 0x54424c45),
         .name = table_name,
@@ -46,7 +47,7 @@ pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metada
         .sql_native_indexes_json = req.sql_native_indexes_json orelse "",
         .replication_sources_json = req.replication_sources_json orelse "[]",
         .placement_role = "data",
-        .desired_replica_count = if (storage.engine == .object) 0 else 3,
+        .desired_replica_count = if (storage.engine == .object) 0 else if (req.sql_persistence != null) 1 else 3,
         .min_ranges = min_ranges,
     };
 }

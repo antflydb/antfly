@@ -90,9 +90,20 @@ test "retained read admission is independent of RLS primary lookup and fails clo
 
 pub const max_response_bytes = 32 << 20;
 pub const max_lease_ms: u32 = 30_000;
+const GraphRead = @import("antfly_local_sources").storage_statement_read_fence.GraphRead;
+pub const GraphRequest = struct {
+    index: []const u8,
+    key: []const u8,
+    edge_types: []const []const u8 = &.{},
+    direction: GraphRead.graph.EdgeDirection = .out,
+    cursor: ?GraphRead.graph.EdgeScanCursor = null,
+    limits: GraphRead.graph.EdgePageLimits = .{ .max_edges = 128, .max_owned_bytes = 4 << 20 },
+};
 pub const Request = struct {
-    operation: enum { admit, capture, validate, snapshot, open, open_snapshot, next, normalize, range_proofs, close, cancel, renew_snapshot },
+    operation: enum { admit, capture, validate, snapshot, open, open_snapshot, next, normalize, range_proofs, close, cancel, renew_snapshot, graph_page },
     schema_version: u32,
+    graph_indexes: []const []const u8 = &.{},
+    graph: ?GraphRequest = null,
     token: ?registry.Token = null,
     connection: u128 = 0,
     lease_ms: u32 = 5000,
@@ -110,6 +121,19 @@ pub const Request = struct {
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     writes: []const types.BatchWrite = &.{},
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            const omit = (comptime std.mem.eql(u8, field, "graph_indexes")) and self.graph_indexes.len == 0 or
+                (comptime std.mem.eql(u8, field, "graph")) and self.graph == null;
+            if (!omit) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 // The legacy wire shape deliberately excludes native pointers/directories.
@@ -125,6 +149,7 @@ pub const WireRow = struct {
 const native_page = @import("retained_read_page.zig");
 
 pub const Response = struct {
+    graph_page: ?GraphRead.Page = null,
     text_filter_digest: ?[32]u8 = null,
     range_proofs: []const @import("antfly_local_sources").storage_range_protection.Proof = &.{},
     token: ?registry.Token = null,
@@ -133,6 +158,18 @@ pub const Response = struct {
     rows: []const WireRow = &.{},
     after: ?[]const u8 = null,
     writes: []const types.BatchWrite = &.{},
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            const omit = (comptime std.mem.eql(u8, field, "graph_page")) and self.graph_page == null;
+            if (!omit) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 /// Scope is constructed by authenticated ingress, never deserialized from a
@@ -175,9 +212,23 @@ pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope:
             return encode(alloc, .{});
         },
         .snapshot => {
-            const token = try owner.captureSnapshot(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, deadline);
+            const token = try owner.captureSnapshotWithGraphs(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, deadline, input.graph_indexes);
             errdefer owner.registry.close(token, scope) catch {};
             return encode(alloc, .{ .token = token });
+        },
+        .graph_page => {
+            const graph = input.graph orelse return error.InvalidRetainedReadQuery;
+            var page = try owner.graphPage(alloc, scope, input.token orelse return error.InvalidRetainedReadToken, .{
+                .index = graph.index,
+                .key = graph.key,
+                .edge_types = graph.edge_types,
+                .direction = graph.direction,
+                .cursor = graph.cursor,
+                .limits = graph.limits,
+                .execution_deadline_ns = deadline,
+            });
+            defer page.deinit(alloc);
+            return encode(alloc, .{ .graph_page = page });
         },
         .renew_snapshot => {
             // Build the acknowledgement before mutation: allocation failure
@@ -444,4 +495,31 @@ fn consumerTests() type {
             try std.testing.expectError(error.InvalidRetainedReadPage, decodePage(std.testing.allocator, "{\"rows\":[{\"id\":\"a\",\"version\":1,\"schema_version\":3,\"value\":{\"j\":2},\"sql_nulls\":[true]}]}", 0, 3, 1));
         }
     };
+}
+
+test "retained graph request keeps ordinary wire unchanged and explicitly selects graph snapshots" {
+    const a = std.testing.allocator;
+    const request: Request = .{ .operation = .snapshot, .schema_version = 1 };
+    const ordinary = try std.json.Stringify.valueAlloc(a, request, .{});
+    defer a.free(ordinary);
+    try std.testing.expect(std.mem.indexOf(u8, ordinary, "graph_indexes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ordinary, "\"graph\"") == null);
+    var selected = request;
+    selected.graph_indexes = &.{"g"};
+    const bytes = try std.json.Stringify.valueAlloc(a, selected, .{});
+    defer a.free(bytes);
+    var decoded = try std.json.parseFromSlice(Request, a, bytes, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("g", decoded.value.graph_indexes[0]);
+    const ordinary_response = try encode(a, .{});
+    defer a.free(ordinary_response);
+    try std.testing.expect(std.mem.indexOf(u8, ordinary_response, "graph_page") == null);
+    const graph_response = try encode(a, .{ .graph_page = .{
+        .proof = .{ .source_sequence = 1, .source_graph_sequence = 1, .applied_sequence = 1, .config_hash = 1, .graph_generation = 1, .reverse_generation = 1, .owner_generation = 1, .ownership_fingerprint = 1, .ttl_read_at_ns = 1 },
+        .page = .{ .edges = &.{} },
+    } });
+    defer a.free(graph_response);
+    var graph_decoded = try std.json.parseFromSlice(Response, a, graph_response, .{});
+    defer graph_decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 1), graph_decoded.value.graph_page.?.proof.source_sequence);
 }

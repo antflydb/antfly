@@ -50,6 +50,8 @@ test {
     _ = @import("api/sql_connection_record.zig");
     _ = @import("api/sql_connections.zig");
     _ = @import("api/sql_command_producer_test.zig");
+    _ = @import("api/native_sql_lock_read.zig");
+    _ = @import("api/sql_data_locks.zig");
     _ = @import("api/sql_ordinary_catalog_test.zig");
     _ = @import("api/sql_execution.zig");
     _ = @import("api/kernel_owner_source.zig");

@@ -86,3 +86,39 @@ Ten thousand summary point reads took 14.27–16.53 ms locally — a bounded-rea
 - Each binding carries a physical catalog digest and a canonical logical-definition digest; compatibility ignores ordering and owner-local generations, so a healthy receiver does not rebuild merely because the donor assigned generations independently.
 - Replica-local drift does not determine the replicated decision: apply persists a reconciliation intent and retries until physically ready. Portable export, backup and restore reject a pending intent.
 - Evidence: one mounted fault case (`test_online_merge_recovers_after_owner_link_outage_and_crash[accept-accept_reply_restart]`), not a repeated matrix. Direct-vector native suite 15 tests plus five receiver soaks (65 total); Debug receiver timings 9.30–9.84 s (large/full-index), 5.06–5.43 s (default sync), 2.27–2.44 s (fulltext-only). Sparse compatibility suite 23 tests. Compaction/selective-query performance comparison remained unmeasured.
+
+
+## Native atomic preparation and graph admission qualification — 2026-11-06
+
+Native owner writes now reuse one checked preparation pipeline: typed AROW
+preparation and provider work occur outside exclusive apply. A short shared
+cut authorizes OLD/NEW policy images and captures mutation revisions for every
+touched key, including absence and deletes. The common commit path acquires
+apply once, revalidates those revisions, schema and policy, invokes the shared
+integrity finalizer, and commits row/index/catalog effects in one primary
+transaction without creating participant journal records. Snapshot and
+replication admission transfer to that commit path and release before derived
+visibility waits. Post-primary failures cannot start a new attempt.
+
+`antfly-native-fk-generation-test -Doptimize=Debug -j1` passed 35 tests with no
+skips or leaks. The actual provider callback verifies that shared apply can be
+acquired, commits an unrelated native write while the provider is on stack,
+and changes the same key on all three bounded attempts to prove the outer
+request never commits a stale candidate. The signed RLS fixture also proves a
+denied candidate invokes no provider. Existing startup-barrier, full-index,
+pre/post-primary fault, typed-null/default/generated-cell, cold owner, FK
+receipt and snapshot-admission tests remain green.
+
+Metadata graph logical-identity qualification passed seven tests across the
+actual owner roots; private graph preparation API qualification passed 17 tests,
+with no skips or leaks. Serving graph capability floors have not been advanced
+on the strength of these component tests alone.
+
+Public native lifetime campaigns remain incomplete: the mounted original TEMP
+campaign reproduced missing connection ownership, and all four real-process
+UNLOGGED originals reached connected reads but failed before clean/crash
+qualification. Native range activation has been corrected to preserve the
+fenced route and body-bound owner signer, including the standalone path;
+linked/public runtime verification is still required. These implementation and
+component results grant no new original-case dispositions. Generation-transaction,
+artifact restore and publication/subscription activation are still unfinished.

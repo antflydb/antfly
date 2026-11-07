@@ -16,6 +16,11 @@
 const std = @import("std");
 const storage_schema = @import("../storage/schema.zig");
 const impl = @import("table_schema_impl.zig");
+pub const table_triggers = @import("table_triggers.zig");
+pub const table_trigger_semantic_version: u32 = 43;
+test {
+    _ = table_triggers;
+}
 
 /// Durable public-schema generations. The singleton remains the active schema
 /// pointer for compatibility; versioned entries make historical relational
@@ -93,7 +98,7 @@ pub const PreparedSchemaDefinition = struct {
     /// decoder identity must instead come from that actual frame's header.
     pub fn readerRequirements(self: *const PreparedSchemaDefinition) storage_schema.ReaderRequirements {
         return .{
-            .semantic_version = storage_schema.requiredReaderVersion(self.runtime_schema),
+            .semantic_version = @max(storage_schema.requiredReaderVersion(self.runtime_schema), if (self.public_schema.sql_triggers != null) table_trigger_semantic_version else 0),
             .encoding_version = storage_schema.storage_format_version,
         };
     }
@@ -204,6 +209,9 @@ pub const CompiledTableValidator = struct {
     uuid_columns: []const []const u8,
     document_layout: ?*@import("../sql/document_row.zig").Layout = null,
     owns_schema: bool,
+    /// Digest of the authoritative public schema bytes pinned by this epoch.
+    /// Parsed-only validators cannot attest a publication identity.
+    source_digest: ?[32]u8 = null,
     preparation_runtime: ?@import("relational_expression.zig").PreparationRuntime = null,
 
     /// Borrow this validated epoch with request-owned preparation resources.
@@ -225,7 +233,9 @@ pub const CompiledTableValidator = struct {
     pub fn init(alloc: std.mem.Allocator, schema_json: []const u8) !CompiledTableValidator {
         var schema = try parseValidatedTableSchema(alloc, schema_json);
         errdefer schema.deinit(alloc);
-        return takeParsed(alloc, schema);
+        var compiled = try takeParsed(alloc, schema);
+        compiled.source_digest = @import("../storage/db/relational_schema_owner_contract.zig").hash(schema_json);
+        return compiled;
     }
 
     pub fn initParsed(alloc: std.mem.Allocator, schema: ParsedTableSchema) !CompiledTableValidator {
@@ -2061,7 +2071,7 @@ fn expressionCapabilitySchema(schema: ParsedTableSchema) storage_schema.TableSch
             .document => .document,
             .relational => .relational,
         },
-        .requires_public_schema = schema.storage_mode == .relational or impl.hasDocumentExpressions(schema),
+        .requires_public_schema = schema.storage_mode == .relational or impl.hasDocumentExpressions(schema) or schema.sql_triggers != null,
         .requires_document_expressions = impl.hasDocumentExpressions(schema),
         .requires_typed_expressions = requiresTypedExpressions(schema, false),
         .requires_predicate_expressions = requiresTypedExpressions(schema, true),

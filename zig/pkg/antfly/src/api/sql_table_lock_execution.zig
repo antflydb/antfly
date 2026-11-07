@@ -88,6 +88,9 @@ pub const Owner = struct {
             if (!std.meta.eql(route, previous.route.route)) return error.CatalogGenerationChanged;
             var result = previous;
             result.route = routing.fenceForRoute(route);
+            result.route.native_participant = previous.route.native_participant;
+            const routing_source = self.root.server.catalogSource();
+            try routing_source.pinNativeParticipant(a, &result.route, routing_source.deadlineFrom(.{ .deadline_ns = self.root.context.deadline_ns, .io = self.root.context.deadline_io }));
             return result;
         }
         return error.CatalogGenerationChanged;
@@ -95,6 +98,9 @@ pub const Owner = struct {
     fn enroll(self: *Owner, initial_spec: scopes.Data.Spec, range: local.storage_db_types.ByteRange) !*Participant {
         var spec = initial_spec;
         try self.checkpoint();
+        const routing_source = self.root.server.catalogSource();
+        const deadline = routing_source.deadlineFrom(.{ .deadline_ns = self.root.context.deadline_ns, .io = self.root.context.deadline_io });
+        try routing_source.pinNativeParticipant(self.arena.allocator(), &spec.route, deadline);
         for (self.participants.items) |item| if (item.value.spec.route.route.group_id == spec.route.route.group_id) {
             if (item.value.spec.route.table_id != spec.route.table_id or item.value.spec.schema_version != spec.schema_version or item.value.spec.route.topology_epoch != spec.route.topology_epoch) return error.LockOwnerChanged;
             return item;

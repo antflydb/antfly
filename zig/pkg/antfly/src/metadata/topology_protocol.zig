@@ -168,7 +168,13 @@ const std = @import("std");
 // unreleased SQL profile reserves floors above 78; historical notes above
 // describe its development sequence before this rebasing. Published transition
 // tag 81 remains SQL completion references; private SQL tags begin at 82.
-pub const current_version: u16 = 172;
+pub const current_version: u16 = coupled_schema_policy_version;
+/// Atomically acknowledged trigger-schema and active row-policy pairs.
+pub const coupled_schema_policy_version: u16 = 175;
+/// Native TEMP/UNLOGGED process ownership and authenticated boot recovery.
+pub const sql_relation_persistence_version: u16 = 173;
+/// Reserved until all table-trigger receiver and recovery paths qualify.
+pub const sql_table_triggers_version: u16 = 174;
 pub const sql_population_coordinator_version: u16 = 169;
 /// SQL GIN operator classes bind to typed algebraic sidecars under catalog custody.
 pub const sql_gin_index_version: u16 = 165;

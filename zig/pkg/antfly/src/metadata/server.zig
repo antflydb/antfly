@@ -626,17 +626,17 @@ pub const MetadataServer = struct {
         host: *IndexWorkHost,
         client: @import("../api/http_client.zig").ApiHttpClient,
 
-        fn route(self: *@This(), alloc: std.mem.Allocator, group: u64, input: api_operation.RequestContext) !api_table_router.GroupRoute {
+        fn route(self: *@This(), alloc: std.mem.Allocator, table: []const u8, group: u64, input: api_operation.RequestContext) !api_table_router.GroupRoute {
             try self.host.requireCurrent();
             const context = try input.platformDeadline();
             try context.ensureActive();
-            return (try api_table_router.resolveGroupRoute(alloc, api_table_catalog.CatalogSource.fromMetadataHttpService(self.host.server.svc), metadataDataBearingStoreGroupRouter(self.host.server.svc).withBudget(.{
+            return (try api_table_router.resolveTableGroupRoute(alloc, api_table_catalog.CatalogSource.fromMetadataHttpService(self.host.server.svc), metadataDataBearingStoreGroupRouter(self.host.server.svc).withBudget(.{
                 .clock = .{ .deadline_ns = context.deadline_ns, .cancellation = context.cancellation },
-            }), group, .prefer_leader)) orelse error.NoAvailableReplica;
+            }), table, group, .prefer_leader)) orelse error.NoAvailableReplica;
         }
 
         pub fn control(self: *@This(), alloc: std.mem.Allocator, table: []const u8, request: index_execution.Request, context: api_operation.RequestContext) !std.json.Parsed(index_execution.ControlResponse) {
-            var selected = try self.route(alloc, request.group_id, context);
+            var selected = try self.route(alloc, table, request.group_id, context);
             defer selected.deinit(alloc);
             if (selected != .remote) return error.NoAvailableReplica;
             var client = self.client;
@@ -645,7 +645,7 @@ pub const MetadataServer = struct {
         }
 
         pub fn claims(self: *@This(), alloc: std.mem.Allocator, table: []const u8, request: index_execution.ClaimRequest, context: api_operation.RequestContext) !std.json.Parsed(index_execution.ClaimResponse) {
-            var selected = try self.route(alloc, request.group_id, context);
+            var selected = try self.route(alloc, table, request.group_id, context);
             defer selected.deinit(alloc);
             if (selected != .remote) return error.NoAvailableReplica;
             var client = self.client;

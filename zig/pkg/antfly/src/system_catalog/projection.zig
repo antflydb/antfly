@@ -25,8 +25,16 @@ const raft = @import("../raft/reconciler.zig");
 /// One immutable metadata read: the table schema and all applicable extension
 /// constraints. No placement, runtime, or unrelated-table inventory is copied.
 pub const WriteValidation = struct {
+    sql_persistence: ?@import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor = null,
     schema_json: []const u8,
     data_shapes: []const []const u8 = &.{},
+    pub fn requireOwner(self: @This(), owner: ?@import("antfly_local_sources").common_topology_records.RelationPersistence.Owner) !void {
+        if (self.sql_persistence) |descriptor| try descriptor.requireConnectionOwner(owner);
+    }
+    pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+        if (self.sql_persistence) |descriptor| return stream.write(.{ .schema_json = self.schema_json, .data_shapes = self.data_shapes, .sql_persistence = descriptor });
+        return stream.write(.{ .schema_json = self.schema_json, .data_shapes = self.data_shapes });
+    }
 };
 
 pub const TableEntry = struct { name: []const u8, table: metadata.TableRecord };
@@ -54,6 +62,8 @@ pub const TableListing = struct {
 pub const Export = struct {
     pub const NativeCheckpoint = @import("../storage/hot_standby/metadata_effects.zig").CheckpointArtifact;
     epoch: u64,
+    /// Local hydration also carries the append CAS sequence from the same cut.
+    standalone_durable_revision: ?u64 = null,
     /// This projection is not a definition-only restore envelope. The exact
     /// native checkpoint owns counters, stable attributes and retry history.
     native_checkpoint: ?NativeCheckpoint = null,
@@ -129,4 +139,20 @@ test "system catalog pages sort literal names and fence membership independently
     try std.testing.expectError(error.CatalogGenerationChanged, selectPage(&entries, .{ .revision = 6 }, 7));
     try std.testing.expectError(error.InvalidCatalogName, selectPage(&entries, .{ .limit = 0 }, 7));
     try std.testing.expectError(error.CatalogGenerationChanged, checkMembership(.{ .legacy_membership = legacyIdentity(1, "old") }, legacyIdentity(1, "new")));
+}
+
+test "SQL relation lifetime cached write validation requires current authenticated connection owner" {
+    const persistence = @import("antfly_local_sources").common_topology_records.RelationPersistence;
+    const owner: persistence.Owner = .{ .issuer_node_id = 1, .connection_id = @splat('a'), .wire_epoch = @splat(2), .execution_instance = @splat(3), .connection_generation = 4, .principal_digest = @splat(5) };
+    const validation: WriteValidation = .{ .schema_json = "{}", .sql_persistence = .{ .kind = .temporary, .owner_node_id = 7, .owner_store_id = 8, .generation_instance = @splat(9), .data_generation = 1, .owner = owner } };
+    try validation.requireOwner(owner);
+    try std.testing.expectError(error.SqlTemporaryRelationNotOwned, validation.requireOwner(null));
+    var recycled = owner;
+    recycled.connection_generation += 1;
+    try std.testing.expectError(error.SqlTemporaryRelationNotOwned, validation.requireOwner(recycled));
+    const ordinary: WriteValidation = .{ .schema_json = "{}" };
+    try ordinary.requireOwner(null);
+    const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, ordinary, .{});
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "sql_persistence") == null);
 }

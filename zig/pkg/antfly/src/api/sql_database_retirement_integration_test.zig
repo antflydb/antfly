@@ -65,6 +65,7 @@ const Campaign = struct {
         if (response.status == 200 or response.status == 202) return error.ExpectedSqlRejection;
         var diagnostic = try std.json.parseFromSlice(struct { code: []const u8 }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
         defer diagnostic.deinit();
+        if (!std.mem.eql(u8, code, diagnostic.value.code)) std.debug.print("SQL rejection mismatch sql={s} status={d} body={s}\n", .{ sql, response.status, response.body });
         try std.testing.expectEqualStrings(code, diagnostic.value.code);
     }
     fn open(ctx: *fixture.Context, database: []const u8) ![32]u8 {
@@ -207,4 +208,126 @@ test "mounted SQL scope retirement capture completes original database DROP and 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try fixture.runWithState(Campaign, .{ .retained = arena.allocator() });
+}
+
+const SchemaCampaign = struct {
+    pub const native_auth = true;
+    pub const native_sessions = true;
+    pub const cold_catalog = true;
+    pub const configureAuth = Campaign.configureAuth;
+    credentials: client.ApiKeyHeaders = .{},
+    retained: std.mem.Allocator,
+    first_token: ?[]const u8 = null,
+    pending_token: ?[]const u8 = null,
+
+    fn command(ctx: *fixture.Context, sql: []const u8) !void {
+        var response = try Campaign.send(ctx, "default", null, sql);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 200 and response.status != 202) std.debug.print("schema setup sql={s} status={d} body={s}\n", .{ sql, response.status, response.body });
+        try std.testing.expect(response.status == 200 or response.status == 202);
+        if (response.status == 200) return;
+        var parsed = try std.json.parseFromSlice(Wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer parsed.deinit();
+        if (parsed.value.ddl_receipt) |pending| {
+            if (pending.state == .invalid) return error.SchemaSetupRejected;
+            const serving = try fixture.waitServingSchemaInScope(ctx, pending.database, pending.namespace, pending.table, 0);
+            try std.testing.expectEqual(try std.fmt.parseInt(u64, pending.table_id, 10), serving.table_id);
+        } else if (parsed.value.catalog_receipt) |pending| {
+            try Campaign.await(ctx, pending.recovery_token);
+        } else return error.MissingSchemaSetupReceipt;
+    }
+    fn setup(ctx: *fixture.Context) !void {
+        try command(ctx, "CREATE SCHEMA tenant_ops");
+        try command(ctx, "CREATE TABLE tenant_ops.parent(id BIGINT PRIMARY KEY)");
+        try command(ctx, "INSERT INTO tenant_ops.parent VALUES(1)");
+        try command(ctx, "CREATE TABLE tenant_ops.child(id BIGINT PRIMARY KEY,parent_id BIGINT REFERENCES tenant_ops.parent(id))");
+        _ = try fixture.waitServingSchemaInScope(ctx, "default", "tenant_ops", "child", 0);
+        try command(ctx, "INSERT INTO tenant_ops.child VALUES(10,1)");
+        try command(ctx, "CREATE VIEW tenant_ops.display AS SELECT id FROM tenant_ops.parent");
+        try command(ctx, "CREATE SEQUENCE tenant_ops.counter");
+        try command(ctx, "CREATE TABLE tenant_ops.documents () WITH (antfly.storage_mode='document',antfly.default_type='doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"keyword\"}}}'");
+        try command(ctx, "INSERT INTO tenant_ops.documents(_id,title) VALUES('doc:one','ready')");
+    }
+    fn value(ctx: *fixture.Context, sql: []const u8, expected: i64) !void {
+        var response = try Campaign.send(ctx, "default", null, sql);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 200) std.debug.print("schema retirement observation sql={s} status={d} body={s}\n", .{ sql, response.status, response.body });
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var parsed = try std.json.parseFromSlice(Wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.rows[0].len);
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.columns.len);
+        try std.testing.expectEqual(Wire.SQLColumnType.integer, parsed.value.columns[0].type);
+        try std.testing.expectEqual(@as(?Wire.SQLArrayElementType, .int64), parsed.value.columns[0].element_type);
+        const cell = parsed.value.rows[0][0];
+        try std.testing.expect(cell == .string);
+        try std.testing.expectEqual(expected, try std.fmt.parseInt(i64, cell.string, 10));
+        try std.testing.expect(!parsed.value.sql_nulls.?[0][0]);
+    }
+    fn drop(self: *@This(), ctx: *fixture.Context, sql: []const u8) ![]const u8 {
+        var response = try Campaign.send(ctx, "default", null, sql);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 200 and response.status != 202) std.debug.print("schema retirement sql={s} status={d} body={s}\n", .{ sql, response.status, response.body });
+        try std.testing.expect(response.status == 200 or response.status == 202);
+        var parsed = try std.json.parseFromSlice(Wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer parsed.deinit();
+        const result = parsed.value.catalog_receipt orelse return error.MissingSchemaDropReceipt;
+        try std.testing.expect(result.kind == .namespace);
+        try std.testing.expectEqualStrings("tenant_ops", result.name);
+        try std.testing.expectEqualStrings("tenant_ops", result.namespace);
+        try std.testing.expectEqualStrings(if (result.state == .committed) "DROP SCHEMA" else "DDL PENDING", parsed.value.command_tag);
+        return self.retained.dupe(u8, result.recovery_token);
+    }
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try self.credentials.activateWithCatalog(ctx, true);
+        ctx.headers = ctx.admin_headers;
+        try command(ctx, "CREATE TABLE outside_scope(id BIGINT PRIMARY KEY)");
+        try command(ctx, "INSERT INTO outside_scope VALUES(7)");
+        try setup(ctx);
+        // RESTRICT stays an atomic empty-namespace check, while the original
+        // sql-0105 CASCADE must retire actual typed/document storage owners.
+        try Campaign.reject(ctx, "default", null, "DROP SCHEMA tenant_ops", "2BP01");
+        var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+        defer corpus.deinit();
+        const original = (try corpus.get("sql-0105")).sql;
+        ctx.headers = ctx.reader_headers;
+        try Campaign.reject(ctx, "default", null, original, "42501");
+        ctx.headers = ctx.admin_headers;
+        self.first_token = try self.drop(ctx, original);
+        try Campaign.await(ctx, self.first_token.?);
+        try value(ctx, "SELECT id FROM outside_scope", 7);
+        try Campaign.reject(ctx, "default", null, "SELECT id FROM tenant_ops.parent", "42P01");
+        // Reuse the spelling with new immutable schema/table identities. Old
+        // receipt recovery must never retire this replacement generation.
+        try setup(ctx);
+        try std.testing.expect(try Campaign.observe(ctx, self.first_token.?));
+        try value(ctx, "SELECT id FROM tenant_ops.parent", 1);
+        const driver = @import("http_server.zig").ApiHttpServer.FkGenerationPublicationTestDriver;
+        try driver.pauseBackground(ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi, ctx.io);
+        if (ctx.data.http_server) |*api| try driver.pauseBackground(api, ctx.io);
+        self.pending_token = try self.drop(ctx, original);
+        try std.testing.expect(!try Campaign.observe(ctx, self.pending_token.?));
+    }
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try self.credentials.activateWithCatalog(ctx, true);
+        ctx.headers = ctx.admin_headers;
+        try Campaign.await(ctx, self.pending_token.?);
+        try std.testing.expect(try Campaign.observe(ctx, self.first_token.?));
+        try value(ctx, "SELECT id FROM outside_scope", 7);
+        try Campaign.reject(ctx, "default", null, "SELECT id FROM tenant_ops.parent", "42P01");
+        try command(ctx, "DROP SCHEMA IF EXISTS tenant_ops CASCADE");
+        try setup(ctx);
+        try std.testing.expect(try Campaign.observe(ctx, self.pending_token.?));
+        try value(ctx, "SELECT id FROM tenant_ops.parent", 1);
+        try value(ctx, "SELECT id FROM tenant_ops.child", 10);
+    }
+};
+
+test "mounted SQL scope retirement capture completes original schema CASCADE across mixed owners and cold recovery" {
+    // Unchanged original sql-0105, with FK-related rows, a document owner,
+    // a view and sequence, exact receipts, authorization and cold publication.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try fixture.runWithState(SchemaCampaign, .{ .retained = arena.allocator() });
 }

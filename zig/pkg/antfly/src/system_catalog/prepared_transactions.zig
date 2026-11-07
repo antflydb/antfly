@@ -65,6 +65,7 @@ pub const Participant = struct {
             self.route.table_id == 0 or self.route.route.group_id == 0 or self.route.topology_epoch == 0 or self.route.metadata_group_id == 0 or
             self.route.route.identity_namespace.table_id != self.route.table_id or
             self.route.metadata_incarnation == null or !std.mem.eql(u8, &self.route.metadata_incarnation.?, &incarnation)) return error.InvalidCatalogMutation;
+        if (self.route.route.execution == .native_local and self.route.native_participant == null) return error.InvalidCatalogMutation;
         if (self.sql_locks) |admission| {
             try admission.validate();
             const expected = try (local.storage_pessimistic_lock_authority.Data.Spec{ .table_name = self.table_name, .route = self.route, .schema_version = self.schema_version }).binding(.{ .home = .metadata, .group = self.route.metadata_group_id, .incarnation = admission.binding.namespace.incarnation });
@@ -230,6 +231,7 @@ pub const CommitProgress = enum { resolving, indexing, ready, repair_required };
 pub const Phase = enum { preparing, locking, prepared, decided, active, resolved, retired };
 pub const DecisionInput = struct { version: u64, sync_level: local.storage_db_types.SyncLevel = .write };
 pub const Decision = struct { status: enum { committed, aborted }, version: u64, sync_level: local.storage_db_types.SyncLevel = .write };
+pub const NativeRetirement = struct { member: u8, digest: [32]u8 };
 pub const Record = struct {
     identity: Identity,
     revision: u64 = 1,
@@ -244,6 +246,28 @@ pub const Record = struct {
     visibility_repairs: u64 = 0,
     locks_released: bool = false,
     decision: ?Decision = null,
+    /// Irreversible image retirement is independent of the global decision.
+    /// These metadata-verified facts never assert a native row/intent ACK.
+    native_retirements: []const NativeRetirement = &.{},
+
+    pub fn nativeJsonSkipField(self: Record, comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "native_retirements") and self.native_retirements.len == 0;
+    }
+    pub fn jsonStringify(self: Record, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Record).@"struct".field_names) |field| {
+            if (!self.nativeJsonSkipField(field)) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+    pub fn nativeRetirementMask(self: Record) u64 {
+        var mask_value: u64 = 0;
+        for (self.native_retirements) |retired| mask_value |= @as(u64, 1) << @intCast(retired.member);
+        return mask_value;
+    }
 
     pub fn mask(self: Record) u64 {
         return if (self.participants.len == 64) std.math.maxInt(u64) else (@as(u64, 1) << @as(u6, @intCast(self.participants.len))) - 1;
@@ -276,6 +300,16 @@ pub const Record = struct {
         };
         if (self.revision == 0 or !std.mem.eql(u8, &try manifestDigest(a, self.participants, self.identity.metadata_incarnation), &self.identity.manifest_digest)) return error.InvalidCatalogRecord;
         const all = self.mask();
+        if (self.native_retirements.len > self.participants.len) return error.InvalidCatalogRecord;
+        var retired_members: u64 = 0;
+        for (self.native_retirements) |retired| {
+            if (retired.member >= self.participants.len or std.mem.allEqual(u8, &retired.digest, 0)) return error.InvalidCatalogRecord;
+            const part = self.participants[retired.member];
+            if (part.route.route.execution != .native_local or part.route.native_participant == null) return error.InvalidCatalogRecord;
+            const bit = @as(u64, 1) << @intCast(retired.member);
+            if (retired_members & bit != 0) return error.InvalidCatalogRecord;
+            retired_members |= bit;
+        }
         if (self.native_lock_releases & ~self.nativeLockMask() != 0 or
             (self.native_lock_releases != 0 and self.phase != .resolved and self.phase != .retired) or
             (self.phase == .retired and self.native_lock_releases != self.nativeLockMask())) return error.InvalidCatalogRecord;
@@ -316,6 +350,7 @@ pub const Action = union(enum) {
     lock_release,
     lock_released,
     native_locks_released: u64,
+    native_retired: []const NativeRetirement,
     commit: DecisionInput,
     abort: u64,
     activate: u64,
@@ -361,6 +396,23 @@ pub fn advance(a: A, record: Record, expected_revision: u64, owner: Owner, actio
             if ((record.phase != .preparing and record.phase != .locking and record.phase != .prepared) or (record.identity.kind == .session_commit and record.phase == .prepared) or version <= record.identity.begin_timestamp) return error.InvalidPreparedTransactionPhase;
             next.decision = .{ .status = .aborted, .version = version };
             next.phase = if (all == 0) .resolved else .decided;
+        },
+        .native_retired => |claims| {
+            if (claims.len == 0 or claims.len > record.participants.len or record.phase == .retired) return error.InvalidPreparedTransactionPhase;
+            var merged: std.ArrayListUnmanaged(NativeRetirement) = .empty;
+            errdefer merged.deinit(a);
+            try merged.appendSlice(a, record.native_retirements);
+            for (claims) |claim| {
+                if (claim.member >= record.participants.len or record.participants[claim.member].route.route.execution != .native_local or
+                    record.participants[claim.member].route.native_participant == null or std.mem.allEqual(u8, &claim.digest, 0)) return error.InvalidCatalogMutation;
+                const existing: ?NativeRetirement = for (merged.items) |prior| {
+                    if (prior.member == claim.member) break prior;
+                } else null;
+                if (existing) |prior| {
+                    if (!std.mem.eql(u8, &prior.digest, &claim.digest)) return error.ExternalTransactionDecisionChanged;
+                } else try merged.append(a, claim);
+            }
+            next.native_retirements = merged.items;
         },
         .activate => |members| {
             if ((record.phase != .decided and record.phase != .active) or record.decision.?.status != .committed or members == 0 or members & ~all != 0) return error.InvalidPreparedTransactionPhase;
@@ -574,10 +626,7 @@ fn countKey(a: A, group: u64, family: []const u8, id: u64) ![]u8 {
     return std.fmt.allocPrint(a, "{s}{d}", .{ try prefix(a, group, family), id });
 }
 fn optional(txn: anytype, key: []const u8) !?[]const u8 {
-    return txn.get(key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    return txn.get(key) catch |err| if (err == error.NotFound) null else return err;
 }
 fn number(txn: anytype, key: []const u8) !u64 {
     const value = (try optional(txn, key)) orelse return 0;
@@ -676,7 +725,14 @@ pub fn plan(a: A, txn: anytype, group: u64, catalog_revision: u64, request: Muta
             const receipt = (try readReceipt(a, txn, group, ack.owner.operation_id)) orelse return .{ .writes = &.{}, .deletes = &.{}, .result = .{ .revision = catalog_revision, .identity = null, .removed = 0, .no_op = true } };
             if (!receipt.owner.eql(ack.owner) or !std.mem.eql(u8, &receipt.txn_id, &ack.txn_id)) return error.ExternalTransactionDecisionChanged;
             if (receipt.status == .pending or receipt.progress == .resolving or receipt.progress == .indexing) return error.InvalidPreparedTransactionPhase;
-            if (try readOperation(a, txn, group, ack.owner.operation_id)) |pending| if (pending.native_lock_releases != pending.nativeLockMask()) return error.CatalogPublicationProofPending;
+            if (try readOperation(a, txn, group, ack.owner.operation_id)) |pending| {
+
+                // Delivery ACK is not proof that native participants released
+                // terminal retention. Only the coordinator's canonical handoff
+                // follows those actual ACKs and removes this operation in the
+                // same writer. Keep the full manifest until that has happened.
+                if (pending.identity.kind == .session_commit) return error.CatalogPublicationProofPending;
+            }
             try changeReceiptCount(a, txn, group, false, &writes, &deletes);
             try deletes.append(a, try receiptKey(a, group, ack.owner.operation_id));
             try deletes.append(a, try receiptNodeKey(a, group, receipt.session.owner_node_id, ack.owner.operation_id));
@@ -947,4 +1003,41 @@ test "SQL prepared transaction receipt work uses an explicit standalone realm wi
     try std.testing.expectError(error.InvalidCatalogMutation, (Read{ .receipt_work = .{ .owner_node_id = 0 } }).validate());
     try std.testing.expectError(error.InvalidCatalogMutation, (Read{ .receipt_work = .{ .standalone = true } }).validate());
     try std.testing.expectError(error.InvalidCatalogMutation, (Read{ .receipt_work = .{ .owner_node_id = 9, .standalone = true } }).validate());
+}
+
+test "SQL prepared native retirement preserves undecided identity and separates loss facts from global commit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const epoch: [32]u8 = @splat('1');
+    const route: local.metadata_catalog_route_contract.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = epoch, .catalog_revision = 2, .table_id = 3, .topology_epoch = 1, .route = .{ .group_id = 7, .range_id = 8, .identity_namespace = .{ .table_id = 3, .shard_id = 7, .range_id = 8 }, .execution = .{ .native_local = .{ .kind = .unlogged, .owner_node_id = 5, .owner_store_id = 6, .generation_instance = @splat(1), .data_generation = 2 } } }, .native_participant = .{ .table_id = 3, .shard_id = 7, .range_id = 8, .physical_root_incarnation = 9, .data_generation = 2 } };
+    var permanent = route;
+    permanent.table_id = 4;
+    permanent.route.group_id = 10;
+    permanent.route.range_id = 11;
+    permanent.route.identity_namespace = .{ .table_id = 4, .shard_id = 10, .range_id = 11 };
+    permanent.route.execution = .raft;
+    permanent.native_participant = null;
+    const parts = [_]Participant{ .{ .table_name = "u", .route = route }, .{ .table_name = "p", .route = permanent } };
+    const identity: Identity = .{ .gid = "survives_crash", .database_id = 1, .principal = .bootstrap, .txn_id = @splat(2), .operation_id = @splat(3), .metadata_incarnation = epoch, .begin_timestamp = 10, .expires_at_unix_ns = 1000, .plan_digest = try planDigest("[]"), .manifest_digest = try manifestDigest(a, &parts, epoch) };
+    var record: Record = .{ .identity = identity, .participants = &parts, .phase = .prepared, .was_prepared = true, .votes = 3 };
+    const owner = try identity.owner(a);
+    try record.validate(a);
+    const ordinary = try std.json.Stringify.valueAlloc(a, record, .{});
+    try std.testing.expect(std.mem.indexOf(u8, ordinary, "native_retirements") == null);
+    try std.testing.expectError(error.InvalidCatalogMutation, advance(a, record, record.revision, owner, .{ .native_retired = &.{.{ .member = 1, .digest = @splat(4) }} }));
+    record = try advance(a, record, record.revision, owner, .{ .native_retired = &.{.{ .member = 0, .digest = @splat(4) }} });
+    try std.testing.expect(record.decision == null and record.phase == .prepared and record.activations == 0 and record.resolutions == 0);
+    try std.testing.expectEqual(@as(u64, 1), record.nativeRetirementMask());
+    try std.testing.expect(recoveryDecision(record, 2000) == null); // Named PREPARED never expires into ABORT.
+    const bytes = try std.json.Stringify.valueAlloc(a, record, .{});
+    record = try std.json.parseFromSliceLeaky(Record, a, bytes, .{});
+    try record.validate(a);
+    try std.testing.expectError(error.ExternalTransactionDecisionChanged, advance(a, record, record.revision, owner, .{ .native_retired = &.{.{ .member = 0, .digest = @splat(5) }} }));
+    record = try advance(a, record, record.revision, owner, .{ .commit = .{ .version = 20 } });
+    try std.testing.expect(record.decision.?.status == .committed and record.phase == .decided);
+    record = try advance(a, record, record.revision, owner, .{ .activate = 3 });
+    record = try advance(a, record, record.revision, owner, .{ .resolve = 3 });
+    record = try advance(a, record, record.revision, owner, .handoff);
+    try std.testing.expect(record.phase == .retired and record.decision.?.status == .committed and record.nativeRetirementMask() == 1);
 }

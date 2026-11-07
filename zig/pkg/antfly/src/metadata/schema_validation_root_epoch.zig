@@ -189,7 +189,7 @@ pub const Request = struct {
             inline .audited_native, .native_bootstrap => |value, tag| blk: {
                 const proof = if (comptime tag == .audited_native) value.observation.proof else value.proof;
                 if (proof.authority != .native) return error.InvalidControlReceiptPosition;
-                break :blk .{ .view = .{ .identity = proof.identity, .reporter_incarnation = proof.reporter_incarnation, .binding_digest = proof.authority.native }, .generation = proof.root_generation };
+                break :blk .{ .view = .{ .identity = proof.identity, .reporter_incarnation = proof.reporter_incarnation, .binding_digest = proof.authority.native, .native_pin = proof.native_pin }, .generation = proof.root_generation };
             },
             else => return error.InvalidControlReceiptPosition,
         };

@@ -30,6 +30,7 @@ pub const object_annotations = @import("object_annotations.zig");
 pub const object_definitions = @import("object_definitions.zig");
 pub const object_annotation_store = @import("object_annotation_store.zig");
 pub const ServiceOwner = @import("../common/service_ownership.zig").Owner;
+pub const RelationPersistence = @import("../common/relation_persistence.zig");
 pub const Kind = enum { database, namespace, tablespace, table, query_source, view, sequence, routine, cast, named_type, role };
 
 /// One parent directory policy for admission, listing and ancestor retirement.
@@ -51,6 +52,7 @@ pub fn namespaceRelation(kind: Kind) bool {
 /// Request-owned query preparation data, excluding topology and unrelated
 /// tables. Read schema and index generations are captured together.
 pub const QueryDefinition = struct {
+    sql_persistence: ?RelationPersistence.Descriptor = null,
     full_text_read_index: ?[]const u8 = null,
     native_service: ?ServiceOwner = null,
     storage_engine: @import("../common/table_storage.zig").Engine = .local,
@@ -62,6 +64,7 @@ pub const QueryDefinition = struct {
     lake_index_catalog_json: []const u8 = "",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.sql_persistence != null) return jw.write(.{ .native_service = self.native_service, .storage_engine = self.storage_engine, .table_id = self.table_id, .object_storage_generation = self.object_storage_generation, .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json, .lake_index_catalog_json = self.lake_index_catalog_json, .full_text_read_index = self.full_text_read_index, .sql_persistence = self.sql_persistence });
         if (self.native_service != null and self.full_text_read_index != null) return jw.write(.{ .native_service = self.native_service, .storage_engine = self.storage_engine, .table_id = self.table_id, .object_storage_generation = self.object_storage_generation, .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json, .lake_index_catalog_json = self.lake_index_catalog_json, .full_text_read_index = self.full_text_read_index });
         if (self.native_service != null) return jw.write(.{ .native_service = self.native_service, .storage_engine = self.storage_engine, .table_id = self.table_id, .object_storage_generation = self.object_storage_generation, .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json, .lake_index_catalog_json = self.lake_index_catalog_json });
         if (self.full_text_read_index) |version| {
@@ -76,7 +79,7 @@ pub const QueryDefinition = struct {
     }
 
     pub fn fromTable(table: anytype) @This() {
-        return .{ .full_text_read_index = table.full_text_read_index, .storage_engine = table.storage.engine, .table_id = table.table_id, .object_storage_generation = table.object_storage_generation, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json, .lake_index_catalog_json = table.lake_index_catalog_json };
+        return .{ .sql_persistence = table.sql_persistence, .full_text_read_index = table.full_text_read_index, .storage_engine = table.storage.engine, .table_id = table.table_id, .object_storage_generation = table.object_storage_generation, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json, .lake_index_catalog_json = table.lake_index_catalog_json };
     }
     pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
         const schema = try alloc.dupe(u8, self.schema_json);
@@ -87,7 +90,11 @@ pub const QueryDefinition = struct {
         errdefer alloc.free(indexes);
         const full_text_read_index = if (self.full_text_read_index) |name| try alloc.dupe(u8, name) else null;
         errdefer if (full_text_read_index) |name| alloc.free(name);
-        return .{ .native_service = self.native_service, .full_text_read_index = full_text_read_index, .storage_engine = self.storage_engine, .table_id = self.table_id, .object_storage_generation = self.object_storage_generation, .schema_json = schema, .read_schema_json = read_schema, .indexes_json = indexes, .lake_index_catalog_json = try alloc.dupe(u8, self.lake_index_catalog_json) };
+        return .{ .sql_persistence = self.sql_persistence, .native_service = self.native_service, .full_text_read_index = full_text_read_index, .storage_engine = self.storage_engine, .table_id = self.table_id, .object_storage_generation = self.object_storage_generation, .schema_json = schema, .read_schema_json = read_schema, .indexes_json = indexes, .lake_index_catalog_json = try alloc.dupe(u8, self.lake_index_catalog_json) };
+    }
+    pub fn requireRequestAccess(self: @This(), capability: ?ServiceOwner, owner: ?RelationPersistence.Owner) !void {
+        try @import("../common/service_ownership.zig").requireAccess(self.native_service, capability);
+        if (self.sql_persistence) |descriptor| try descriptor.requireConnectionOwner(owner);
     }
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         if (self.full_text_read_index) |name| alloc.free(name);
@@ -100,21 +107,49 @@ pub const QueryDefinition = struct {
 
 /// Document operations request only identity; query admission can include a
 /// narrow definition captured in the same catalog read transaction.
+/// Query-cut evidence, never part of an immutable schema cache. Null at the
+/// containing binding means absence has not been proved.
+pub const QualifiedIncomingForeignKeys = struct {
+    coverage_revision: u64,
+    stamp: struct { revision: u64, count: u64, active_count: u64 },
+
+    pub fn validate(self: @This()) !void {
+        if (self.coverage_revision == 0 or self.stamp.active_count > self.stamp.count or
+            (self.stamp.revision == 0 and self.stamp.count != 0)) return error.InvalidCatalogRecord;
+    }
+};
+
 pub const ResolvedTable = struct {
+    logical_relation_id: ?u64 = null,
+    sql_incoming_foreign_keys: ?QualifiedIncomingForeignKeys = null,
+    sql_trigger_functions_active: bool = false,
+    sql_persistence: ?RelationPersistence.Descriptor = null,
     native_service: ?ServiceOwner = null,
     table_id: u64,
     name: []const u8,
     query_definition: ?QueryDefinition = null,
     sql_access: ?@import("privileges.zig").Access = null,
 
+    pub fn effectiveLogicalRelationId(self: @This()) u64 {
+        return self.logical_relation_id orelse self.table_id;
+    }
     pub fn fromTable(table: anytype) @This() {
-        return .{ .table_id = table.table_id, .name = table.name };
+        return .{ .sql_persistence = table.sql_persistence, .table_id = table.table_id, .name = table.name };
     }
 
     pub fn requireAccess(self: @This(), capability: ?ServiceOwner) !void {
         try @import("../common/service_ownership.zig").requireAccess(self.native_service, capability);
     }
+    pub fn requireRequestAccess(self: @This(), capability: ?ServiceOwner, owner: ?RelationPersistence.Owner) !void {
+        if (self.logical_relation_id) |id| if (id == 0 or id > std.math.maxInt(u32)) return error.InvalidSqlBackendResponse;
+        try self.requireAccess(capability);
+        if (self.query_definition) |definition| if (!std.meta.eql(self.sql_persistence, definition.sql_persistence)) return error.CatalogGenerationChanged;
+        if (self.sql_persistence) |descriptor| try descriptor.requireConnectionOwner(owner);
+    }
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.logical_relation_id != null) return jw.write(.{ .table_id = self.table_id, .name = self.name, .native_service = self.native_service, .query_definition = self.query_definition, .sql_access = self.sql_access, .sql_persistence = self.sql_persistence, .sql_incoming_foreign_keys = self.sql_incoming_foreign_keys, .sql_trigger_functions_active = self.sql_trigger_functions_active, .logical_relation_id = self.logical_relation_id });
+        if (self.sql_incoming_foreign_keys != null or self.sql_trigger_functions_active) return jw.write(.{ .table_id = self.table_id, .name = self.name, .native_service = self.native_service, .query_definition = self.query_definition, .sql_access = self.sql_access, .sql_persistence = self.sql_persistence, .sql_incoming_foreign_keys = self.sql_incoming_foreign_keys, .sql_trigger_functions_active = self.sql_trigger_functions_active });
+        if (self.sql_persistence != null) return jw.write(.{ .table_id = self.table_id, .name = self.name, .native_service = self.native_service, .query_definition = self.query_definition, .sql_access = self.sql_access, .sql_persistence = self.sql_persistence });
         if (self.sql_access != null) return jw.write(.{ .table_id = self.table_id, .name = self.name, .native_service = self.native_service, .query_definition = self.query_definition, .sql_access = self.sql_access });
         if (self.native_service != null) return jw.write(.{ .table_id = self.table_id, .name = self.name, .native_service = self.native_service, .query_definition = self.query_definition });
         if (self.query_definition) |definition| {
@@ -127,7 +162,7 @@ pub const ResolvedTable = struct {
     pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
         const name = try alloc.dupe(u8, self.name);
         errdefer alloc.free(name);
-        return .{ .sql_access = self.sql_access, .native_service = self.native_service, .table_id = self.table_id, .name = name, .query_definition = if (self.query_definition) |definition| try definition.clone(alloc) else null };
+        return .{ .logical_relation_id = self.logical_relation_id, .sql_trigger_functions_active = self.sql_trigger_functions_active, .sql_incoming_foreign_keys = self.sql_incoming_foreign_keys, .sql_persistence = self.sql_persistence, .sql_access = self.sql_access, .native_service = self.native_service, .table_id = self.table_id, .name = name, .query_definition = if (self.query_definition) |definition| try definition.clone(alloc) else null };
     }
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
@@ -151,7 +186,29 @@ pub const PlacementPolicy = struct {
     }
 };
 
+/// PostgreSQL object identifiers have an unsigned 32-bit SQL domain. The
+/// catalog's durable next_id counter reserves these independently of opaque
+/// u64 physical storage identifiers; exhaustion never wraps or hashes an OID.
+pub const max_relation_oid: u64 = std.math.maxInt(u32);
+pub fn requireRelationOid(id: u64) !void {
+    if (id == 0 or id > max_relation_oid) return error.CatalogIdExhausted;
+}
+
+/// The catalog counter owns SQL identities, independently of physical IDs.
+/// A selected SQL slot already in use proves a corrupt counter; physical
+/// storage identifiers in the same numeric range do not occupy that slot.
+pub fn nextRelationOid(reader: anytype, first: u64) !u64 {
+    try requireRelationOid(first);
+    if (try reader.tableByLogicalRelationId(first) != null) return error.InvalidCatalogRecord;
+    return first;
+}
+
 pub const Resource = struct {
+    /// Assigned bounded SQL OID, stable across same-object generation cuts.
+    /// Nil preserves a mainline table without an assigned SQL identity.
+    sql_relation_id: ?u64 = null,
+    /// Private session namespace identity; never a public ownership hint.
+    sql_temporary_owner: ?RelationPersistence.Owner = null,
     sql_owner: ?@import("privileges.zig").Principal = null,
     native_service: ?ServiceOwner = null,
     signature: ?[]const u8 = null,
@@ -169,8 +226,23 @@ pub const Resource = struct {
     source_json: []const u8 = "null",
     description: ?[]const u8 = null,
 
+    pub fn effectiveLogicalRelationId(self: @This()) u64 {
+        return self.sql_relation_id orelse self.id;
+    }
+    pub fn withPhysicalRelationId(self: @This(), physical: u64) !Resource {
+        if (self.kind != .table or physical == 0) return error.InvalidCatalogRecord;
+        var next = self;
+        next.id = physical;
+        // Absence is not an implicit claim on an opaque physical identity.
+        // Assigned OIDs survive same-object cuts, including numeric equality.
+        next.sql_relation_id = self.sql_relation_id;
+        return next;
+    }
+    pub fn validateLogicalRelationId(self: @This()) !void {
+        if (self.sql_relation_id) |id| if (self.kind != .table or self.id == 0 or id == 0 or id > max_relation_oid) return error.InvalidCatalogRecord;
+    }
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
-        return (std.mem.eql(u8, field, "sql_owner") and self.sql_owner == null) or (std.mem.eql(u8, field, "signature") and self.signature == null) or (std.mem.eql(u8, field, "native_service") and self.native_service == null) or (std.mem.eql(u8, field, "description") and self.description == null);
+        return (std.mem.eql(u8, field, "sql_relation_id") and self.sql_relation_id == null) or (std.mem.eql(u8, field, "sql_temporary_owner") and self.sql_temporary_owner == null) or (std.mem.eql(u8, field, "sql_owner") and self.sql_owner == null) or (std.mem.eql(u8, field, "signature") and self.signature == null) or (std.mem.eql(u8, field, "native_service") and self.native_service == null) or (std.mem.eql(u8, field, "description") and self.description == null);
     }
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
@@ -280,6 +352,8 @@ pub const TableScope = struct {
 
 pub const Action = enum { create, drop, rename, set_tablespace, alter, comment };
 pub const Mutation = struct {
+    /// Private session namespace identity; never a public ownership hint.
+    sql_temporary_owner: ?RelationPersistence.Owner = null,
     /// Trusted SQL ingress binds an immutable creator, never a display name.
     sql_owner: ?@import("privileges.zig").Principal = null,
     /// Only native service admission can set this immutable ownership binding.
@@ -301,7 +375,7 @@ pub const Mutation = struct {
     description: ?[]const u8 = null,
 
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
-        return (std.mem.eql(u8, field, "sql_owner") and self.sql_owner == null) or (std.mem.eql(u8, field, "native_service") and self.native_service == null) or (std.mem.eql(u8, field, "description") and self.description == null);
+        return (std.mem.eql(u8, field, "sql_temporary_owner") and self.sql_temporary_owner == null) or (std.mem.eql(u8, field, "sql_owner") and self.sql_owner == null) or (std.mem.eql(u8, field, "native_service") and self.native_service == null) or (std.mem.eql(u8, field, "description") and self.description == null);
     }
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
@@ -379,6 +453,7 @@ pub const StateIndex = struct {
     ids: std.AutoHashMapUnmanaged(Id, Resource) = .empty,
     children: std.AutoHashMapUnmanaged(Parent, std.ArrayListUnmanaged(Resource)) = .empty,
     storage_names: std.StringHashMapUnmanaged(Resource) = .empty,
+    logical_tables: std.AutoHashMapUnmanaged(u64, Resource) = .empty,
     tablespace_users: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     child_positions: std.AutoHashMapUnmanaged(Id, usize) = .empty,
 
@@ -392,6 +467,13 @@ pub const StateIndex = struct {
         var role_origins: std.AutoHashMapUnmanaged([16]u8, void) = .empty;
         defer role_origins.deinit(alloc);
         for (state.resources) |r| {
+            try r.validateLogicalRelationId();
+            if (r.sql_relation_id) |oid| {
+                if (oid >= state.next_id) return error.InvalidCatalogRecord;
+                const logical = try self.logical_tables.getOrPut(alloc, oid);
+                if (logical.found_existing) return error.InvalidCatalogRecord;
+                logical.value_ptr.* = r;
+            }
             if (r.sql_owner) |owner| {
                 try owner.validate();
                 if (r.kind != .table or owner.kind == .public) return error.InvalidCatalogRecord;
@@ -456,6 +538,12 @@ pub const StateIndex = struct {
                 count.value_ptr.* += 1;
             }
         }
+        for (state.resources) |r| if (r.sql_temporary_owner) |owner| {
+            var buffer: [72]u8 = undefined;
+            owner.validate() catch return error.InvalidCatalogRecord;
+            if (r.kind != .namespace or r.native_service != null or r.sql_owner != null or
+                !std.mem.eql(u8, r.name, try owner.namespace(&buffer))) return error.InvalidCatalogRecord;
+        };
         for (state.resources) |r| if (r.kind == .cast) {
             if (self.byId(.database, r.parent_id) == null) return error.InvalidCatalogRecord;
         };
@@ -561,6 +649,7 @@ pub const StateIndex = struct {
         try self.names.ensureUnusedCapacity(alloc, n);
         try self.ids.ensureUnusedCapacity(alloc, n);
         try self.storage_names.ensureUnusedCapacity(alloc, n);
+        try self.logical_tables.ensureUnusedCapacity(alloc, n);
         try self.tablespace_users.ensureUnusedCapacity(alloc, n);
         try self.child_positions.ensureUnusedCapacity(alloc, n);
         for (resources) |r| {
@@ -585,6 +674,7 @@ pub const StateIndex = struct {
         _ = self.names.remove(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name, .signature = r.signature orelse "" });
         _ = self.ids.remove(.{ .kind = r.kind, .id = r.id });
         if (hasPhysicalStorageBinding(r)) _ = self.storage_names.remove(r.storage_name);
+        if (r.sql_relation_id) |oid| _ = self.logical_tables.remove(oid);
         if (r.tablespace_id != 0) {
             const count = self.tablespace_users.getPtr(r.tablespace_id).?;
             count.* -= 1;
@@ -602,6 +692,7 @@ pub const StateIndex = struct {
         self.names.putAssumeCapacity(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name, .signature = r.signature orelse "" }, r);
         self.ids.putAssumeCapacity(.{ .kind = r.kind, .id = r.id }, r);
         if (hasPhysicalStorageBinding(r)) self.storage_names.putAssumeCapacity(r.storage_name, r);
+        if (r.sql_relation_id) |oid| self.logical_tables.putAssumeCapacity(oid, r);
         if (r.tablespace_id != 0) {
             const count = self.tablespace_users.getOrPutAssumeCapacity(r.tablespace_id);
             if (!count.found_existing) count.value_ptr.* = 0;
@@ -619,6 +710,7 @@ pub const StateIndex = struct {
         while (children.next()) |value| value.deinit(alloc);
         self.children.deinit(alloc);
         self.storage_names.deinit(alloc);
+        self.logical_tables.deinit(alloc);
         self.tablespace_users.deinit(alloc);
         self.child_positions.deinit(alloc);
         self.names.deinit(alloc);
@@ -630,6 +722,9 @@ pub const StateIndex = struct {
     }
     pub fn byId(self: *const StateIndex, kind: Kind, id: u64) ?Resource {
         return self.ids.get(.{ .kind = kind, .id = id }) orelse (State{}).byId(kind, id);
+    }
+    pub fn tableByLogicalRelationId(self: *const StateIndex, id: u64) ?Resource {
+        return self.logical_tables.get(id);
     }
     pub fn namespaceFor(self: *const StateIndex, database: []const u8, namespace: []const u8) !Resource {
         const db = self.find(.database, 0, database) orelse return error.DatabaseNotFound;
@@ -817,6 +912,20 @@ pub const MutableState = struct {
         }
     };
     pub fn apply(self: *MutableState, delta: Delta) !Change {
+        const LogicalReader = struct {
+            index: *const StateIndex,
+            next_id: u64,
+            pub fn nextCatalogId(r: @This()) u64 {
+                return r.next_id;
+            }
+            pub fn byId(r: @This(), kind: Kind, id: u64) !?Resource {
+                return r.index.byId(kind, id);
+            }
+            pub fn tableByLogicalRelationId(r: @This(), id: u64) !?Resource {
+                return r.index.tableByLogicalRelationId(id);
+            }
+        };
+        try requireLogicalRelationDelta(self.alloc, LogicalReader{ .index = &self.index, .next_id = self.value.next_id }, delta);
         var change = Change{ .revision = self.value.revision, .next_id = self.value.next_id };
         errdefer change.previous.deinit(self.alloc);
         errdefer {
@@ -908,6 +1017,20 @@ pub fn planWithReader(alloc: std.mem.Allocator, reader: anytype, next: u64, requ
 /// Physical table deletion is admitted only alongside an atomic topology
 /// mutation. Its identity is resolved by the authority, never the caller.
 pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation, dropping_table: bool) !Delta {
+    return planWithTopologyAndSqlOids(alloc, reader, next, request, dropping_table, false);
+}
+
+/// Only an actual metadata activation may select the new SQL identity profile.
+/// Legacy committed mutations retain their original physical-only semantics.
+pub fn planWithTopologyAndSqlOids(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation, dropping_table: bool, assign_sql_oid: bool) !Delta {
+    if (request.sql_temporary_owner) |owner| {
+        try owner.validate();
+        var buffer: [72]u8 = undefined;
+        if (request.kind != .namespace or (request.action != .create and request.action != .drop) or
+            !std.mem.eql(u8, request.name, try owner.namespace(&buffer)) or request.native_service != null or
+            request.sql_owner != null or request.new_name != null or request.tablespace != null)
+            return error.InvalidCatalogMutation;
+    }
     // View definitions require attribute/dependency admission. Generic resource
     // mutation must never publish an opaque caller-provided view payload.
     if (request.kind == .role) return error.CatalogAuthorizationAdmissionRequired;
@@ -953,6 +1076,9 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
             found = .{ .kind = .table, .id = table.id, .parent_id = default_namespace_id, .name = table.name, .storage_name = table.name };
         };
     }
+    if (found) |resource| if (resource.sql_temporary_owner) |owner| {
+        if (request.sql_temporary_owner == null or !owner.eql(request.sql_temporary_owner.?)) return error.SqlTemporaryRelationNotOwned;
+    } else if (request.sql_temporary_owner != null) return error.SqlTemporaryRelationNotOwned;
     var upserts = std.ArrayListUnmanaged(Resource).empty;
     defer upserts.deinit(alloc);
     var removes = std.ArrayListUnmanaged(Resource).empty;
@@ -972,7 +1098,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
             if (request.new_name != null) return error.InvalidCatalogMutation;
             const binding = if (request.tablespace) |name| ((try reader.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
             if (request.kind == .tablespace and binding != 0) return error.InvalidCatalogMutation;
-            var resource: Resource = .{ .sql_owner = request.sql_owner, .native_service = request.native_service, .kind = request.kind, .id = next_id, .parent_id = parent_id, .name = request.name, .tablespace_id = binding, .placement_policy = request.placement_policy, .location_json = request.location_json, .source_json = request.source_json };
+            var resource: Resource = .{ .sql_temporary_owner = request.sql_temporary_owner, .sql_owner = request.sql_owner, .native_service = request.native_service, .kind = request.kind, .id = next_id, .parent_id = parent_id, .name = request.name, .tablespace_id = binding, .placement_policy = request.placement_policy, .location_json = request.location_json, .source_json = request.source_json };
             if (request.kind == .table) {
                 if (request.table_id == 0 or request.storage_name.len == 0) return error.InvalidCatalogMutation;
                 if (try reader.byId(.table, request.table_id) != null or try reader.bindingForStorage(request.storage_name) != null or
@@ -980,6 +1106,10 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                 if (parent_id == default_namespace_id) if (try reader.physicalByName(request.name)) |table| {
                     if (try reader.byId(.table, table.id) == null) return error.CatalogAlreadyExists;
                 };
+                if (assign_sql_oid) {
+                    next_id = try nextRelationOid(reader, next_id);
+                    resource.sql_relation_id = next_id;
+                }
                 resource.id = request.table_id;
                 resource.storage_name = request.storage_name;
             }
@@ -1079,6 +1209,9 @@ pub const MemoryReader = struct {
     pub fn byId(self: @This(), kind: Kind, id: u64) !?Resource {
         return self.index.byId(kind, id);
     }
+    pub fn tableByLogicalRelationId(self: @This(), id: u64) !?Resource {
+        return self.index.tableByLogicalRelationId(id);
+    }
     pub fn namespaceFor(self: @This(), database: []const u8, namespace: []const u8) !Resource {
         return self.index.namespaceFor(database, namespace);
     }
@@ -1106,6 +1239,12 @@ pub fn plan(alloc: std.mem.Allocator, state: State, request: Mutation, tables: [
     var index = try StateIndex.init(alloc, state);
     defer index.deinit(alloc);
     return planWithReader(alloc, MemoryReader{ .index = &index, .tables = tables }, state.next_id, request);
+}
+
+fn planSqlOids(alloc: std.mem.Allocator, state: State, request: Mutation, tables: []const PhysicalTable) !Delta {
+    var index = try StateIndex.init(alloc, state);
+    defer index.deinit(alloc);
+    return planWithTopologyAndSqlOids(alloc, MemoryReader{ .index = &index, .tables = tables }, state.next_id, request, false, true);
 }
 
 pub fn hasBinding(state: State, id: u64) bool {
@@ -1466,7 +1605,7 @@ pub const ConstraintNameCheck = struct {
 
 /// SQL distinguishes stored views from physical tables; a logical view must
 /// never be represented by a fabricated table routing identity.
-pub const SqlSourceLookup = union(enum) { name: Target, table_id: u64, view_id: u64 };
+pub const SqlSourceLookup = union(enum) { name: Target, table_id: u64, view_id: u64, logical_relation_id: u64 };
 pub const SqlSource = struct {
     target: Target,
     value: union(enum) {
@@ -1503,6 +1642,8 @@ pub const ResolveMany = struct {
     /// Captured with forward bindings in the same immutable catalog read.
     storage_names: []const []const u8 = &.{},
     include_query_definitions: bool = false,
+    /// Opt-in indexed physical identities, aligned with storage_names.
+    include_storage_bindings: bool = false,
     expected_revision: ?u64 = null,
     relations: []const RelationTarget = &.{},
     /// Name allocation may use an authoritative metadata cut without a
@@ -1511,6 +1652,7 @@ pub const ResolveMany = struct {
     expected_relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.include_storage_bindings) return jw.write(.{ .sql_principal = self.sql_principal, .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch, .sql_sources = self.sql_sources, .include_storage_bindings = true });
         if (self.sql_principal != null) return jw.write(.{ .sql_principal = self.sql_principal, .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch, .sql_sources = self.sql_sources });
         if (self.sql_sources.len != 0) return jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch, .sql_sources = self.sql_sources });
         if (self.relations.len != 0 or self.expected_relation_epoch != null) {
@@ -1529,6 +1671,7 @@ pub const ResolvedMany = struct {
     revision: u64,
     tables: []const ?ResolvedTable,
     logical_names: []const ?[]const u8 = &.{},
+    storage_tables: []const ?ResolvedTable = &.{},
     /// Null means the receiver did not attest authoritative relation resolution.
     /// A missing field from an older peer must never prove name absence.
     relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
@@ -1537,6 +1680,7 @@ pub const ResolvedMany = struct {
     relation_names_only: bool = false,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.storage_tables.len != 0) return jw.write(.{ .sql_authority = self.sql_authority, .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only, .sql_sources = self.sql_sources, .sql_sources_resolved = self.sql_sources_resolved, .storage_tables = self.storage_tables });
         if (self.sql_authority != null) return jw.write(.{ .sql_authority = self.sql_authority, .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only, .sql_sources = self.sql_sources, .sql_sources_resolved = self.sql_sources_resolved });
         if (self.sql_sources_resolved) return jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only, .sql_sources = self.sql_sources, .sql_sources_resolved = true });
         if (self.relation_epoch != null or self.relations.len != 0) {
@@ -1547,12 +1691,19 @@ pub const ResolvedMany = struct {
     }
 
     pub fn validateAuthority(self: @This(), a: std.mem.Allocator, request: ResolveMany) !void {
+        if (request.include_storage_bindings) {
+            if (self.storage_tables.len != request.storage_names.len) return error.InvalidSqlBackendResponse;
+            for (self.storage_tables, request.storage_names) |entry, physical| if (entry) |value| {
+                if (value.table_id == 0 or !std.mem.eql(u8, value.name, physical)) return error.InvalidSqlBackendResponse;
+            };
+        } else if (self.storage_tables.len != 0) return error.InvalidSqlBackendResponse;
         if (request.sql_principal) |principal| {
             if (request.name_allocation or self.relation_names_only) return error.InvalidCatalogRecord;
             const authority = self.sql_authority orelse return error.InvalidSqlBackendResponse;
             try authority.validate(a, principal);
         } else if (self.sql_authority != null) return error.InvalidSqlBackendResponse;
         for (self.tables) |table| if (table) |value| try validateTableAccess(value, request.sql_principal != null);
+        for (self.storage_tables) |table| if (table) |value| try validateTableAccess(value, request.sql_principal != null);
         for (self.sql_sources) |source| if (source) |value| switch (value.value) {
             .table => |table| try validateTableAccess(table.binding, request.sql_principal != null),
             .view => {},
@@ -1590,6 +1741,8 @@ pub const ResolvedMany = struct {
         if (self.sql_authority) |authority| authority.deinit(alloc);
         for (self.sql_sources) |source| if (source) |value| value.deinit(alloc);
         alloc.free(self.sql_sources);
+        for (self.storage_tables) |table| if (table) |value| value.deinit(alloc);
+        alloc.free(self.storage_tables);
         for (self.tables) |table| if (table) |value| value.deinit(alloc);
         alloc.free(self.tables);
         for (self.logical_names) |name| if (name) |value| alloc.free(value);
@@ -2293,4 +2446,150 @@ fn relationRenameGuardOwnershipCase(a: std.mem.Allocator) !void {
 test "catalog object rename guards own explicit handoffs preserve canonical legacy wires and release failed allocations" {
     try relationRenameGuardOwnershipCase(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, relationRenameGuardOwnershipCase, .{});
+}
+
+pub fn requireLogicalRelationDelta(a: std.mem.Allocator, reader: anytype, delta: Delta) !void {
+    var removed: std.AutoHashMapUnmanaged(u64, Resource) = .empty;
+    defer removed.deinit(a);
+    for (delta.removes) |claim| if (claim.kind == .table) {
+        const actual = (try reader.byId(.table, claim.id)) orelse return error.CatalogGenerationChanged;
+        if (actual.sql_relation_id != claim.sql_relation_id) return error.CatalogGenerationChanged;
+        const oid = actual.sql_relation_id orelse continue;
+        const slot = try removed.getOrPut(a, oid);
+        if (slot.found_existing) return error.InvalidCatalogMutation;
+        slot.value_ptr.* = actual;
+    };
+    var selected: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer selected.deinit(a);
+    for (delta.upserts) |record| {
+        try record.validateLogicalRelationId();
+        if (record.kind != .table) continue;
+        const prior = try reader.byId(.table, record.id);
+        const logical = record.sql_relation_id orelse {
+            if (prior) |value| if (value.sql_relation_id != null) return error.InvalidCatalogMutation;
+            continue;
+        };
+        if ((try selected.getOrPut(a, logical)).found_existing) return error.InvalidCatalogMutation;
+        if (prior != null and prior.?.sql_relation_id != null) {
+            if (prior.?.sql_relation_id.? != logical) return error.InvalidCatalogMutation;
+        } else {
+            try requireRelationOid(logical);
+            if (removed.get(logical)) |removed_prior| {
+                if (removed_prior.id == record.id or removed_prior.parent_id != record.parent_id or !std.mem.eql(u8, removed_prior.name, record.name)) return error.InvalidCatalogMutation;
+            } else {
+                // No caller may donate an archived or canceled object's OID.
+                // A fresh allocation consumes the current counter; a staged
+                // publication must rejoin its exact retained reservation.
+                const fresh = logical >= reader.nextCatalogId() and logical < delta.next_id;
+                const reserved = if (@hasDecl(@TypeOf(reader), "reservedLogicalRelation")) try reader.reservedLogicalRelation(record) else false;
+                if (!fresh and !reserved) return error.InvalidCatalogMutation;
+            }
+        }
+        if (try reader.tableByLogicalRelationId(logical)) |logical_owner| if (logical_owner.id != record.id) {
+            if (record.sql_relation_id == null or !removed.contains(logical)) return error.InvalidCatalogMutation;
+        };
+    }
+}
+
+test "SQL logical relation identity is canonical unique and survives physical swaps and rollback" {
+    const a = std.testing.allocator;
+    const original: Resource = .{ .kind = .table, .id = 7, .sql_relation_id = 7, .parent_id = 2, .name = "items", .storage_name = "physical:7" };
+    const bytes = try std.json.Stringify.valueAlloc(a, original, .{});
+    defer a.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "sql_relation_id") != null);
+    var next = try original.withPhysicalRelationId(11);
+    next.storage_name = "physical:11";
+    try std.testing.expectEqual(@as(u64, 7), next.effectiveLogicalRelationId());
+    var mutable = try MutableState.clone(a, .{ .next_id = 12, .resources = &.{original} });
+    defer mutable.deinit();
+    var removed = [_]Resource{original};
+    var replacement = [_]Resource{next};
+    var changed = try mutable.apply(.{ .removes = &removed, .upserts = &replacement, .next_id = 12 });
+    try std.testing.expectEqual(@as(u64, 11), mutable.index.tableByLogicalRelationId(7).?.id);
+    try std.testing.expect(mutable.index.byId(.table, 7) == null);
+    changed.finish(&mutable, false);
+    try std.testing.expectEqual(@as(u64, 7), mutable.index.tableByLogicalRelationId(7).?.id);
+    changed = try mutable.apply(.{ .removes = &removed, .upserts = &replacement, .next_id = 12 });
+    changed.finish(&mutable, true);
+    var duplicate = next;
+    duplicate.id = 13;
+    duplicate.name = "copy";
+    duplicate.storage_name = "physical:13";
+    var duplicate_records = [_]Resource{duplicate};
+    try std.testing.expectError(error.InvalidCatalogMutation, mutable.apply(.{ .removes = &.{}, .upserts = &duplicate_records, .next_id = 14 }));
+    var cold = try StateIndex.init(a, mutable.value);
+    defer cold.deinit(a);
+    try std.testing.expectEqual(@as(u64, 11), cold.tableByLogicalRelationId(7).?.id);
+    try std.testing.expectEqual(@as(?u64, 7), (try next.withPhysicalRelationId(7)).sql_relation_id);
+    var changed_id = next;
+    changed_id.sql_relation_id = 8;
+    var changed_id_records = [_]Resource{changed_id};
+    try std.testing.expectError(error.InvalidCatalogMutation, mutable.apply(.{ .removes = &.{}, .upserts = &changed_id_records, .next_id = 14 }));
+    var bad_kind = next;
+    bad_kind.kind = .database;
+    try std.testing.expectError(error.InvalidCatalogRecord, bad_kind.validateLogicalRelationId());
+    var shadow = original;
+    shadow.name = "shadow";
+    shadow.storage_name = "physical:shadow";
+    try std.testing.expectError(error.InvalidCatalogRecord, StateIndex.init(a, .{ .next_id = 14, .resources = &.{ next, shadow } }));
+}
+
+test "SQL relation OIDs consume catalog slots independently of unsigned physical identities" {
+    const a = std.testing.allocator;
+    const physical = std.math.maxInt(u64) - 1;
+    const request: Mutation = .{ .action = .create, .kind = .table, .name = "items", .table_id = physical, .storage_name = "opaque:first" };
+    var legacy = try plan(a, .{}, request, &.{});
+    defer legacy.deinit(a);
+    try std.testing.expect(legacy.upserts[0].sql_relation_id == null);
+    try std.testing.expectEqual(@as(u64, 4), legacy.next_id);
+    var state = try MutableState.clone(a, .{});
+    defer state.deinit();
+    var created = try planSqlOids(a, state.value, request, &.{});
+    defer created.deinit(a);
+    try std.testing.expectEqual(@as(u64, 3), created.upserts[0].effectiveLogicalRelationId());
+    try std.testing.expectEqual(@as(u64, physical), created.upserts[0].id);
+    var applied = try state.apply(created);
+    applied.finish(&state, true);
+    const prior = state.index.byId(.table, physical).?;
+    var successor = try prior.withPhysicalRelationId(physical - 1);
+    successor.storage_name = "opaque:next";
+    var removed = [_]Resource{prior};
+    var upserts = [_]Resource{successor};
+    applied = try state.apply(.{ .upserts = &upserts, .removes = &removed, .next_id = state.value.next_id });
+    applied.finish(&state, false);
+    try std.testing.expectEqual(@as(u64, physical), state.index.tableByLogicalRelationId(3).?.id);
+    applied = try state.apply(.{ .upserts = &upserts, .removes = &removed, .next_id = state.value.next_id });
+    applied.finish(&state, true);
+    try std.testing.expectEqual(@as(u64, physical - 1), state.index.tableByLogicalRelationId(3).?.id);
+    try std.testing.expectError(error.CatalogGenerationChanged, planWithTopology(a, MemoryReader{ .index = &state.index, .tables = &.{} }, state.value.next_id, .{ .action = .drop, .kind = .table, .name = "items", .table_id = prior.id, .storage_name = prior.storage_name }, true));
+    var dropped = try planWithTopology(a, MemoryReader{ .index = &state.index, .tables = &.{} }, state.value.next_id, .{ .action = .drop, .kind = .table, .name = "items", .table_id = successor.id, .storage_name = successor.storage_name }, true);
+    defer dropped.deinit(a);
+    applied = try state.apply(dropped);
+    applied.finish(&state, true);
+    var recreated = try planSqlOids(a, state.value, request, &.{});
+    defer recreated.deinit(a);
+    try std.testing.expectEqual(@as(u64, 4), recreated.upserts[0].effectiveLogicalRelationId());
+    // Neither canceled nor archived identities can be donated by a caller.
+    recreated.upserts[0].sql_relation_id = 3;
+    try std.testing.expectError(error.InvalidCatalogMutation, state.apply(recreated));
+    try std.testing.expectError(error.CatalogIdExhausted, planSqlOids(a, .{ .next_id = max_relation_oid + 1 }, request, &.{}));
+    try std.testing.expectError(error.InvalidCatalogRecord, StateIndex.init(a, .{ .next_id = 3, .resources = &.{prior} }));
+}
+
+test "SQL relation OID allocation separates physical identity and detects occupied logical counters" {
+    const Reader = struct {
+        pub fn tableByLogicalRelationId(_: @This(), id: u64) !?Resource {
+            return if (id == 6) .{ .kind = .table, .id = 17, .sql_relation_id = 6, .parent_id = 2, .name = "occupied", .storage_name = "occupied" } else null;
+        }
+    };
+    try std.testing.expectEqual(@as(u64, 3), try nextRelationOid(Reader{}, 3));
+    try std.testing.expectError(error.InvalidCatalogRecord, nextRelationOid(Reader{}, 6));
+    try std.testing.expectEqual(max_relation_oid, try nextRelationOid(Reader{}, max_relation_oid));
+    try std.testing.expectError(error.CatalogIdExhausted, nextRelationOid(Reader{}, max_relation_oid + 1));
+    const first: Resource = .{ .kind = .table, .id = 3, .sql_relation_id = 7, .parent_id = 2, .name = "first", .storage_name = "physical:3" };
+    const second: Resource = .{ .kind = .table, .id = 7, .sql_relation_id = 8, .parent_id = 2, .name = "second", .storage_name = "physical:7" };
+    var index = try StateIndex.init(std.testing.allocator, .{ .next_id = 9, .resources = &.{ first, second } });
+    defer index.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 3), index.tableByLogicalRelationId(7).?.id);
+    try std.testing.expectEqual(@as(u64, 7), index.byId(.table, 7).?.id);
 }

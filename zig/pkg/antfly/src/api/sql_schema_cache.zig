@@ -23,6 +23,7 @@ const native_schema = @import("antfly_local_sources").storage_schema;
 const Budget = @import("antfly_local_sources").sql_memory_budget;
 
 const Layout = struct {
+    has_triggers: bool = false,
     version: u32 = 0,
     storage_mode: @FieldType(catalog.Table, "storage_mode") = .relational,
     version_field: ?[]const u8 = null,
@@ -32,7 +33,7 @@ const Layout = struct {
     index_definitions: []const catalog.IndexDefinition = &.{},
     constraints: []const catalog.Constraint = &.{},
     fn table(self: Layout, id: u64, physical_name: []const u8) catalog.Table {
-        return .{ .id = id, .physical_name = physical_name, .schema_version = self.version, .storage_mode = self.storage_mode, .version_field = self.version_field, .external_base_source = self.external_base_source, .columns = self.columns, .indexes = self.indexes, .index_definitions = self.index_definitions, .constraints = self.constraints };
+        return .{ .has_triggers = self.has_triggers, .id = id, .physical_name = physical_name, .schema_version = self.version, .storage_mode = self.storage_mode, .version_field = self.version_field, .external_base_source = self.external_base_source, .columns = self.columns, .indexes = self.indexes, .index_definitions = self.index_definitions, .constraints = self.constraints };
     }
 };
 const Kind = enum { layout, validator };
@@ -123,7 +124,7 @@ pub const Cache = struct {
             out.* = constraint;
             out.name = try alloc.dupe(u8, constraint.name);
         }
-        return .{ .external_base_source = if (entry.layout.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.layout.version, .storage_mode = entry.layout.storage_mode, .version_field = if (entry.layout.version_field) |field| try alloc.dupe(u8, field) else null, .columns = columns, .indexes = indexes, .index_definitions = definitions, .constraints = constraints };
+        return .{ .has_triggers = entry.layout.has_triggers, .external_base_source = if (entry.layout.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.layout.version, .storage_mode = entry.layout.storage_mode, .version_field = if (entry.layout.version_field) |field| try alloc.dupe(u8, field) else null, .columns = columns, .indexes = indexes, .index_definitions = definitions, .constraints = constraints };
     }
     pub const ValidatorLease = struct {
         cache: *Cache,
@@ -269,6 +270,7 @@ fn derive(layout: *Layout, json: []const u8, temporary: std.mem.Allocator, owned
     defer scratch.deinit();
     const alloc = scratch.allocator();
     const parsed = try schema.parseValidatedTableSchema(alloc, json);
+    layout.has_triggers = if (parsed.sql_triggers) |state| state.value.entries.len != 0 else false;
     layout.version_field = if (parsed.ttl_duration_ns != 0) try owned.dupe(u8, parsed.ttl_field) else null;
     layout.constraints = try catalog.Constraint.derive(owned, parsed);
     if (parsed.storage_mode == .document) {

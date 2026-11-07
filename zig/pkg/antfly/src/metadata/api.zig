@@ -1636,3 +1636,16 @@ test "metadata admin snapshot derives replication source action hints for reseed
     try std.testing.expectEqualStrings("docs", snapshot.replication_source_action_hints[0].table_name);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.replication_source_action_hints[0].reseed_exact_cutover_path, "/internal/v1/tables/docs/replication-sources/0/reseed-exact-cutover") != null);
 }
+
+/// Delivery hint for admitted native control. Exact physical store and node;
+/// health/drain do not revoke an already-admitted cleanup authority.
+pub fn nativeOwnerDataUri(alloc: std.mem.Allocator, stores: []const table_manager.StoreRecord, node_id: u64, store_id: u64) !?[]u8 {
+    if (node_id == 0 or store_id == 0) return error.InvalidCatalogRecord;
+    var selected: ?[]const u8 = null;
+    for (stores) |store| {
+        if (store.store_id != store_id) continue;
+        if (selected != null or store.node_id != node_id or !table_manager.storeServesTableData(store.role) or store.api_url.len == 0) return null;
+        selected = store.api_url;
+    }
+    return try alloc.dupe(u8, selected orelse return null);
+}

@@ -342,6 +342,23 @@ fn originKey(buffer: []u8, admission: Admission) ![]const u8 {
     const backend = (try admission.registration()).lease.backend;
     return std.fmt.bufPrint(buffer, "\x00\x00__lock_origin__:{x:0>16}:{s}:{s}:{x:0>16}", .{ ns.group, std.fmt.bytesToHex(ns.incarnation, .lower), std.fmt.bytesToHex(backend.id, .lower), backend.fence });
 }
+/// A missing source may be retired only if its BEGIN marker is absent too.
+/// Existing marker bytes without their source/ledger owner are corruption.
+pub fn requireUnadmitted(txn: anytype, admission: Admission) !void {
+    var buffer: [160]u8 = undefined;
+    _ = txn.get(try originKey(&buffer, admission)) catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    return error.InvalidLockRecord;
+}
+
+pub const Testing = if (@import("builtin").is_test) struct {
+    pub fn originAddress(buffer: []u8, admission: Admission) ![]const u8 {
+        return originKey(buffer, admission);
+    }
+} else struct {};
+
 fn requireOrigin(backing: std.mem.Allocator, txn: anytype, admission: Admission) !void {
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();

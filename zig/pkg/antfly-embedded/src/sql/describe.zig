@@ -294,6 +294,21 @@ fn typedValuesSource(allocator: std.mem.Allocator, source: *const ast.Select, in
 /// request/description arena and discard that arena on binding failure.
 /// The backend's definition lookup occurs once;
 /// execution reuses binding.table instead of resolving another schema epoch.
+/// Read only the authenticated target binding before choosing the existing
+/// SQL session/read-set owner. No scalar, default or trigger executes here.
+pub fn requiresMutationCoordination(a: std.mem.Allocator, backend: catalog.Backend, statement: ast.Statement) !bool {
+    const target: ast.Name = switch (statement) {
+        .insert => |v| v.table,
+        .update => |v| v.table,
+        .delete => |v| v.table,
+        .merge => |v| v.table,
+        else => return false,
+    };
+    const action: catalog.Action = if (statement == .merge or @import("mutation_policy.zig").selectRequired(statement)) .read_write else .write;
+    const table = try backend.vtable.resolve(backend.ptr, a, target, action);
+    return @import("statement_effects.zig").requiresCoordination(table);
+}
+
 pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
     const result = try bindInternal(allocator, backend, compiled, explicit_parameter_types);
     for (result.columns) |column| if (column.type == .array and column.element_type == null) return error.SqlTypeMismatch;
@@ -319,7 +334,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         filter.parameter_descriptors = invocation.descriptors;
         bound.copy_filter = filter;
     }
-    return bound;
+    return @import("statement_effects.zig").coordinateMutation(allocator, backend, compiled.statement, bound);
 }
 
 fn validateCopyExpression(expression: *const ast.Scalar, depth: usize) !void {
@@ -2232,4 +2247,38 @@ test "SQL binding retains provider allocators across ownership moves and every a
     defer compiled.deinit();
     try Fixture.exercise(std.testing.allocator, &compiled);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.exercise, .{&compiled});
+}
+
+test "SQL protected mutation admission resolves actual source before session selection" {
+    const Probe = struct {
+        table: catalog.Table,
+        calls: usize = 0,
+        deny: bool = false,
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.deny) return error.Forbidden;
+            return self.table;
+        }
+        fn checkpoint(_: *anyopaque) !void {
+            return error.TestUnexpectedEffect;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "INSERT INTO things(id) VALUES(1)",
+        "UPDATE things SET id=id+1",
+        "DELETE FROM things",
+    }) |sql| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        for (0..5) |mode| {
+            var probe: Probe = .{ .table = .{ .id = 19, .physical_name = "things", .schema_version = 7, .columns = &.{}, .has_triggers = mode == 1, .has_incoming_foreign_keys = mode == 2, .trigger_functions_active = mode >= 3, .incoming_foreign_keys = if (mode == 4) .{ .coverage_revision = 1, .stamp = .{ .revision = 1, .count = 0, .active_count = 0 } } else null } };
+            const backend: catalog.Backend = .{ .ptr = &probe, .vtable = &.{ .resolve = Probe.resolve, .scan = undefined, .mutate = undefined, .checkpoint = Probe.checkpoint } };
+            try std.testing.expectEqual(mode != 0 and mode != 4, try requiresMutationCoordination(a, backend, compiled.statement));
+            try std.testing.expectEqual(@as(usize, 1), probe.calls);
+            probe.deny = true;
+            try std.testing.expectError(error.Forbidden, requiresMutationCoordination(a, backend, compiled.statement));
+        }
+    }
 }

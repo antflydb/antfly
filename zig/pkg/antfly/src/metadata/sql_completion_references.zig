@@ -24,7 +24,19 @@ pub const Owner = struct {
     publication_id: ?Id = null,
 };
 pub const Command = struct { managed: bool = false, retired_through: u64 = 0, reference_id: Id, owner: Owner, action: enum { pin, prepare, abandon, complete, acknowledge, forget } };
-pub const Record = struct { reference_id: Id, owner: Owner, complete: bool = false };
+pub const Record = struct {
+    reference_id: Id,
+    owner: Owner,
+    complete: bool = false,
+    // Custody only: the exact catalog nonce/digest remains in its operation
+    // receipt. A paired schema owner must settle in its all-owner ACTIVE writer.
+    policy_pair: bool = false,
+
+    pub fn jsonStringify(self: Record, writer: anytype) !void {
+        if (self.policy_pair) return writer.write(.{ .reference_id = self.reference_id, .owner = self.owner, .complete = self.complete, .policy_pair = true });
+        return writer.write(.{ .reference_id = self.reference_id, .owner = self.owner, .complete = self.complete });
+    }
+};
 pub const Status = struct { record: ?Record = null, physical_name: ?[]const u8 = null };
 /// Validate the applied command's observable state before confirming its RPC.
 pub fn validateApplied(command: Command, status: Status) !void {
@@ -53,4 +65,19 @@ pub fn sameOwner(a: Owner, b: Owner) bool {
 
 pub fn prefixForGroup(buf: []u8, group: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:sql_completion:{d}:", .{group});
+}
+
+/// Immutable locator into the existing policy install history. It carries no
+/// completion decision: only the exact ACTIVE snapshot proves owner readiness.
+pub const max_policy_pair_bytes = 4096;
+pub const PolicyPair = struct {
+    generation: u64,
+    catalog_epoch: u64,
+    digest: [32]u8,
+    pub fn jsonStringify(self: PolicyPair, writer: anytype) @TypeOf(writer.*).Error!void {
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, writer);
+    }
+};
+pub fn policyPairKey(buf: []u8, group: u64, table: u64, schema_version: u32) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:system_catalog:{d}:policy-schema-pair:{d}:{d}", .{ group, table, schema_version });
 }

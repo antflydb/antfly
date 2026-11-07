@@ -28,8 +28,14 @@ pub const Destination = struct {
     port: owners.Port,
     table: []const u8,
     group: u64,
+    native_execution: ?local.common_topology_records.RelationPersistence.Descriptor = null,
     scope: staging.Scope,
     range: local.storage_byte_range.ByteRange = .{ .start = "", .end = "" },
+    fn execute(self: @This(), a: std.mem.Allocator, request: owners.Request, context: operation.RequestContext) !owners.Response {
+        var captured = request;
+        captured.native_execution = self.native_execution;
+        return self.port.execute(a, self.table, self.group, captured, context);
+    }
 };
 pub const Stats = struct { source_rows: u64 = 0, page_requests: u64 = 0, buffer_peak_bytes: usize = 0, seals_started: bool = false };
 pub const Options = struct { buffer_bytes: usize = 8 * 1024 * 1024, stats: ?*Stats = null };
@@ -113,7 +119,7 @@ pub fn deliverCohort(a: std.mem.Allocator, destinations: []const Destination, so
     var fresh: usize = 0;
     // Inspect the whole cohort before consuming any fresh producer lane.
     for (destinations, cursors) |destination, *cursor| {
-        const status = try destination.port.execute(a, destination.table, destination.group, .{ .scope = destination.scope, .action = .status }, context);
+        const status = try destination.execute(a, .{ .scope = destination.scope, .action = .status }, context);
         cursor.* = try contract.Cursor.init(destination.scope.population.?);
         if (status.population) |observed| {
             try observed.validate();
@@ -231,11 +237,11 @@ fn send(a: std.mem.Allocator, destination: Destination, cursor: *contract.Cursor
 }
 
 fn acknowledge(a: std.mem.Allocator, destination: Destination, request: owners.Request, expected: contract.Cursor, context: operation.RequestContext) !owners.Response {
-    const response = destination.port.execute(a, destination.table, destination.group, request, context) catch |send_error| blk: {
+    const response = destination.execute(a, request, context) catch |send_error| blk: {
         // Never ask the source for another page after an uncertain response.
         // A read-indexed exact receipt can resolve a lost ACK without redoing
         // expression evaluation or mutating the receiver again.
-        const observed = destination.port.execute(a, destination.table, destination.group, request.statusRead(), context) catch return send_error;
+        const observed = destination.execute(a, request.statusRead(), context) catch return send_error;
         if (!std.meta.eql(observed.population orelse return send_error, expected)) return send_error;
         break :blk observed;
     };

@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 87;
+pub const abi_version: u32 = 91;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -919,6 +919,27 @@ pub const Status = enum(u32) {
     sequence_admission_conflict = 960,
     invalid_table_retirement_manifest = 961,
     extension_owned_object = 962,
+    invalid_sql_trigger_definition = 963,
+    invalid_sql_trigger_manifest = 964,
+    sql_trigger_context_required = 965,
+    sql_trigger_returned_no_value = 966,
+    sql_trigger_return_value_required = 967,
+    sql_trigger_declared_arguments = 968,
+    sql_trigger_sql_language = 969,
+    invalid_sql_relation_persistence = 970,
+    sql_relation_owner_changed = 971,
+    sql_temporary_relation_not_owned = 972,
+    invalid_sql_temporary_namespace = 973,
+    sql_relation_persistence_foreign_key_mismatch = 974,
+    sql_relation_recovery_incomplete = 975,
+    sql_relation_owner_unavailable = 976,
+    sql_trigger_coordination_required = 977,
+    sql_prepared_durability_unavailable = 978,
+    invalid_prepared_graph_effects = 979,
+    // 980-982 remain reserved for the separate generation transaction profile.
+    commit_decision_unknown = 983,
+    // 984 is reserved for the merged main catalog-occupancy identity.
+    invalid_participant = 985,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

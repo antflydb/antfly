@@ -191,6 +191,10 @@ pub const Rejection = enum {
     SqlUndefinedFunction,
     SqlUndefinedProcedure,
     SqlInvalidFunctionDefinition,
+    InvalidSqlTriggerDefinition,
+    SqlTriggerDeclaredArguments,
+    SqlTriggerSqlLanguage,
+    SqlTriggerReturnValueRequired,
     SqlInvalidCastDefinition,
     SqlDuplicateCast,
     SqlCastNotFound,
@@ -228,6 +232,13 @@ pub const Rejection = enum {
     SqlAssignmentTypeMismatch,
     SqlIndexOperatorClassTypeMismatch,
     CatalogRevisionExhausted,
+    TableTopologyProtocolUpgradeRequired,
+    // Paired schema/policy admission requires metadata175. These refusals are
+    // retained authored outcomes before effects, not an ordered-apply failure.
+    RowPolicyCatalogChanged,
+    RowPolicyUnsupported,
+    RowPolicyLimitExceeded,
+    RelationalTopologyProtocolUpgradeRequired,
 };
 /// Compact reference to the existing all-owner schema job. The catalog
 /// journal never duplicates table schemas or owner arrays into retained slots.
@@ -242,6 +253,18 @@ pub const RestoreWork = struct {
         if (self.group == 0 or std.mem.allEqual(u8, &self.id, 0) or std.mem.allEqual(u8, &self.intent_digest, 0) or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidSequenceOutcome;
     }
 };
+/// Compact exact completion reference retained in the existing catalog outcome
+/// ring. The historical ACTIVE bundle is immutable across later publications.
+pub const PolicyPairWork = struct {
+    group: u64,
+    incarnation: [16]u8,
+    table_id: u64,
+    logical_relation_id: u64,
+    schema_version: u32,
+    policy_generation: u64,
+    catalog_epoch: u64,
+    pair_digest: [32]u8,
+};
 pub const Pending = struct {
     revision: u64,
     identity: Identity,
@@ -249,10 +272,16 @@ pub const Pending = struct {
         schema: @import("../metadata/schema_validation_read.zig").Lookup,
         sequence_schema: @import("../metadata/schema_validation_read.zig").Lookup,
         restore: RestoreWork,
+        policy_pair: PolicyPairWork,
     },
     pub fn validate(self: @This()) !void {
         try self.identity.validate();
         switch (self.work) {
+            .policy_pair => |pair| {
+                if (pair.group == 0 or pair.table_id == 0 or pair.logical_relation_id != self.identity.id or
+                    pair.logical_relation_id > std.math.maxInt(u32) or pair.schema_version == 0 or self.identity.generation != pair.schema_version or
+                    pair.policy_generation == 0 or pair.catalog_epoch == 0 or std.mem.allEqual(u8, &pair.incarnation, 0) or std.mem.allEqual(u8, &pair.pair_digest, 0)) return error.InvalidSequenceOutcome;
+            },
             .schema, .sequence_schema => |lookup| try (@import("../metadata/schema_validation_read.zig").OwnerReadRequest{ .lookup = lookup, .ordinal = 0 }).validate(),
             .restore => |lookup| {
                 try lookup.validate();
@@ -264,6 +293,7 @@ pub const Pending = struct {
         return switch (self.work) {
             .schema, .sequence_schema => |lookup| std.mem.eql(u8, &lookup.metadata_incarnation, &std.fmt.bytesToHex(incarnation, .lower)),
             .restore => |lookup| std.mem.eql(u8, &lookup.incarnation, &incarnation),
+            .policy_pair => |pair| std.mem.eql(u8, &pair.incarnation, &incarnation),
         };
     }
 };
@@ -388,6 +418,24 @@ pub fn Store(comptime Txn: type) type {
             if (parsed.value.outcome == .pending) {
                 const pending = parsed.value.outcome.pending;
                 if (!pending.matchesIncarnation(self.incarnation)) return error.InvalidSequenceOutcome;
+                if (pending.work == .policy_pair) {
+                    const work = pending.work.policy_pair;
+                    if (work.group != self.group) return error.InvalidSequenceOutcome;
+                    const storage = @import("storage.zig");
+                    const retained_key = try storage.policyInstallSnapshotKeyAlloc(a, self.group, work.table_id, work.policy_generation, .active);
+                    defer a.free(retained_key);
+                    if (try self.optional(retained_key)) |active| {
+                        const policies = @import("antfly_local_sources").system_catalog_policies;
+                        if (active.len > policies.max_install_snapshot_bytes) return error.InvalidSequenceOutcome;
+                        var snapshot = try std.json.parseFromSlice(policies.InstallSnapshot, a, active, .{});
+                        defer snapshot.deinit();
+                        try snapshot.value.validateShape();
+                        const pair = snapshot.value.schema_pair orelse return error.InvalidSequenceOutcome;
+                        if (snapshot.value.table_id != work.table_id or snapshot.value.policy_generation != work.policy_generation or snapshot.value.schema_version != work.schema_version or snapshot.value.catalog_epoch != work.catalog_epoch or snapshot.value.phase != .active or !std.mem.eql(u8, &try pair.digest(a), &work.pair_digest)) return error.InvalidSequenceOutcome;
+                        parsed.value.outcome = .{ .success = .{ .revision = pending.revision, .identity = null, .removed = 0 } };
+                    }
+                    return parsed.value;
+                }
                 if (pending.work == .restore) {
                     parsed.value.outcome = (try self.restoreOutcomeAtCatalog(a, pending.work.restore, parsed.value.digest, catalog)) orelse return error.InvalidSequenceOutcome;
                     try parsed.value.outcome.validateCatalog(catalog);
@@ -737,5 +785,13 @@ test "SQL routine catalog type retirement projects exact cold restore progress a
         defer a.free(canceled);
         try txn.put(try staging.progressKey(&buffer, work.group, work.id), canceled);
         try std.testing.expectEqualDeep(Outcome{ .rejected = .CatalogGenerationChanged }, (try journal.lookup(a, admission, digest)).?);
+    }
+}
+
+test "row-policy coupled schema authored refusal retains exact identity before committed effects" {
+    inline for (.{ error.RowPolicyCatalogChanged, error.RowPolicyUnsupported, error.RowPolicyLimitExceeded, error.RelationalTopologyProtocolUpgradeRequired }) |err| {
+        const rejected = Outcome.fromError(err) orelse return error.MissingCoupledPolicyRejection;
+        try @import("std").testing.expect(rejected == .rejected);
+        try @import("std").testing.expectError(err, rejected.result());
     }
 }

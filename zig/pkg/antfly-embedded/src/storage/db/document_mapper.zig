@@ -537,7 +537,7 @@ pub const PreparedRelationalWrite = struct {
         json_null_fields: []const []const u8,
     ) !PreparedRelationalWrite {
         var intent_digest: ?document_content_hash.Digest = null;
-        var parsed = if (durable_row) |bytes| blk: {
+        const parsed = if (durable_row) |bytes| blk: {
             if (try relationalRowSchemaVersion(bytes) != table_schema.version) return error.InvalidTxnRecord;
             intent_digest = try relational_row_codec.rowSemanticHash(bytes);
             _ = try relational_row_codec.ordinalRowViewTrusted(bytes, table_schema, physical_layout);
@@ -553,6 +553,19 @@ pub const PreparedRelationalWrite = struct {
             error.OutOfMemory => return err,
             else => return error.InvalidBatchRequest,
         };
+        return finishParsed(alloc, scratch, retain_text_root, key, document_json, validator, table_schema, physical_layout, durable_row, preserve_logical_values, json_null_fields, parsed, intent_digest, false);
+    }
+
+    /// Consume a request-owned parsed candidate without serializing or parsing
+    /// it again after BEFORE triggers. The same root drives validation, index
+    /// extraction, semantic hashing and the physical row. Ownership transfers
+    /// on both success and failure.
+    pub fn initParsedTyped(alloc: Allocator, scratch: Allocator, retain_text_root: bool, key: []const u8, original_json: []const u8, validator: ?schema_api.CompiledTableValidator, table_schema: runtime_schema.TableSchema, physical_layout: *const relational_row_codec.PhysicalLayout, json_null_fields: []const []const u8, preserve: bool, owned: std.json.Parsed(std.json.Value)) !PreparedRelationalWrite {
+        return finishParsed(alloc, scratch, retain_text_root, key, original_json, validator, table_schema, physical_layout, null, preserve, json_null_fields, owned, null, true);
+    }
+
+    fn finishParsed(alloc: Allocator, scratch: Allocator, retain_text_root: bool, key: []const u8, document_json: []const u8, validator: ?schema_api.CompiledTableValidator, table_schema: runtime_schema.TableSchema, physical_layout: *const relational_row_codec.PhysicalLayout, durable_row: ?[]const u8, preserve_logical_values: bool, json_null_fields: []const []const u8, owned: std.json.Parsed(std.json.Value), intent_digest: ?document_content_hash.Digest, force_logical_source: bool) !PreparedRelationalWrite {
+        var parsed = owned;
         errdefer parsed.deinit();
         var effective_json_null_fields = std.ArrayListUnmanaged([]const u8).empty;
         defer effective_json_null_fields.deinit(scratch);
@@ -642,7 +655,8 @@ pub const PreparedRelationalWrite = struct {
             effective_json_null_fields.items,
         );
         errdefer alloc.free(prepared_row.bytes);
-        if (validator) |compiled| if (compiled.execution.expressions) |expressions| if (expressions.bindings.len != 0) {
+        const generated = if (validator) |compiled| if (compiled.execution.expressions) |expressions| expressions.bindings.len != 0 else false else false;
+        if (force_logical_source or generated) {
             // Original API JSON predates defaults/generated evaluation. Lazy
             // JSON consumers (including deferred text publication) must render
             // the typed authority, never index that obsolete input snapshot.
@@ -653,7 +667,7 @@ pub const PreparedRelationalWrite = struct {
             extracted.cleaned_value = null;
             extracted.cleaned_value_owned = false;
             extracted.logical_source = source;
-        };
+        }
         return .{
             .parsed = parsed,
             .extracted = extracted,
@@ -7535,4 +7549,31 @@ test "external lake bounded window profiles native source column inputs keep typ
     try std.testing.expect(doc.stored_source_bytes > payload.len and bytes >= payload.len);
     try std.testing.expect(introducer_mod.estimateTextDocumentSegmentBytes(doc) >= payload.len);
     try std.testing.expect((try introducer_mod.estimateTextDocumentBuildMemoryBytes(a, doc)) >= payload.len);
+}
+
+test "trigger prepared DOM owns one row authority for encoding hashing and deferred text" {
+    const Fault = struct {
+        fn run(a: Allocator) !void {
+            const table: runtime_schema.TableSchema = .{ .version = 7, .storage_mode = .relational, .relational_columns = &.{.{ .name = "amount", .path = "amount", .column_type = .integer, .required = true }} };
+            var layout = try relational_row_codec.PhysicalLayout.init(a, table);
+            defer layout.deinit();
+            var candidate = try std.json.parseFromSlice(std.json.Value, a, "{\"amount\":1}", .{ .parse_numbers = false });
+            candidate.value.object.getPtr("amount").?.* = .{ .integer = 42 };
+            // initParsedTyped consumes candidate on errors as well as success.
+            var prepared = try PreparedRelationalWrite.initParsedTyped(a, a, false, "row", "{\"amount\":1}", null, table, &layout, &.{}, true, candidate);
+            defer prepared.deinit(a);
+            var expected = try PreparedRelationalWrite.init(a, "row", "{\"amount\":42}", null, table, &layout);
+            defer expected.deinit(a);
+            try prepared.finalizeMetadata(0);
+            try expected.finalizeMetadata(0);
+            try std.testing.expectEqualSlices(u8, expected.packed_row, prepared.packed_row);
+            try std.testing.expectEqualSlices(u8, &expected.semantic_hash, &prepared.semantic_hash);
+            const logical = (try prepared.extracted.logicalJson()).?;
+            var observed = try std.json.parseFromSlice(std.json.Value, a, logical, .{});
+            defer observed.deinit();
+            try std.testing.expectEqual(@as(i64, 42), observed.value.object.get("amount").?.integer);
+        }
+    };
+    try Fault.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fault.run, .{});
 }

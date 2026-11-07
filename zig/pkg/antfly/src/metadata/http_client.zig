@@ -1572,8 +1572,8 @@ pub const MetadataHttpClient = struct {
         const command = try request.encodeAlloc(self.alloc);
         defer self.alloc.free(command);
         const group = switch (request.operation) {
-            .reserve => |manifest| manifest.metadata_group_id,
-            inline .cancel, .drain, .child_ready, .publish => |progress| progress.lookup.group,
+            inline .reserve, .reserve_lost_temporary => |manifest| manifest.metadata_group_id,
+            inline .cancel, .drain, .child_ready, .source_lost, .publish => |progress| progress.lookup.group,
         };
         var input = try wire.Input.parse(self.alloc, group, command);
         defer input.deinit();
@@ -1674,6 +1674,15 @@ pub const MetadataHttpClient = struct {
         if (response.status >= 200 and response.status < 300 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed)) return self.alloc.dupe(u8, response.body);
         if (!std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) return error.MetadataMutationOutcomeUnknown;
         possible_submission = false; // Authenticated owner proved non-admission.
+        if (input == .policy_definition_mutate or input == .policy_publication_begin or input == .policy_publication_mutate) {
+            // These diagnostics are definite only with the authenticated
+            // not-proposed acknowledgement above. A matching error body on
+            // an ambiguous response must never authorize resubmission.
+            if (response.status == 426 and std.mem.eql(u8, response.body, "RowPolicyUnsupported")) return error.RowPolicyUnsupported;
+            if (response.status == 409 and std.mem.eql(u8, response.body, "RowPolicyCatalogChanged")) return error.RowPolicyCatalogChanged;
+            if (response.status == 400 and std.mem.eql(u8, response.body, "InvalidRowPolicyPublication")) return error.InvalidRowPolicyPublication;
+            if (response.status == 400 and std.mem.eql(u8, response.body, "InvalidRowPolicyRecord")) return error.InvalidRowPolicyRecord;
+        }
         if (input.isRelationalIndexOwnerCall()) if (@import("relational_index_publication.zig").ownerAckHttpFailure(response.status, response.body)) |err| return err;
         if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
         return switch (response.status) {
@@ -5534,6 +5543,11 @@ fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call
         .schema_validation_work => @import("schema_validation_work.zig").max_wire_bytes,
         .schema_validation_prepare => @import("schema_validation_admission.zig").max_wire_bytes,
         .scope_retirement_work => 8192,
+        .sql_relation_boot_read => |query| if (query.recovery_capture != null) @import("../system_catalog/trigger_snapshot.zig").max_snapshot_bytes else 64 * 1024,
+        .sql_relation_boot_submit => 64 * 1024,
+        .sql_graph_preparation_read => @import("../system_catalog/trigger_snapshot.zig").max_snapshot_bytes + 512,
+        .sql_graph_preparation_admit, .sql_graph_preparation_outcome => @import("../system_catalog/sequence_outcomes.zig").max_record_bytes,
+        .sql_relation_lifetime_page => 128 * @import("sql_relation_lifetimes.zig").max_record_bytes,
         .scope_retirement_prepare, .scope_retirement_manifest => @import("antfly_local_sources").system_catalog_domain.scope_retirement.max_manifest_bytes,
         .scope_retirement_observation => 16384,
         .table_retirement_prepare, .table_retirement_effects => @import("table_retirement_manifest.zig").max_bytes,
@@ -6068,6 +6082,42 @@ test "SQL command fence remains bound to the authenticated internal HTTP body" {
     defer a.free(response);
     try std.testing.expectEqualStrings("{}", response);
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
+}
+
+test "SQL policy publication HTTP preserves definite native refusal only with nonadmission evidence" {
+    const a = std.testing.allocator;
+    const Executor = struct {
+        outcome: ?[]const u8 = routes.Routes.raft_mutation_outcome_not_proposed,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const headers = try alloc.alloc(http_common.Header, if (self.outcome != null) 1 else 0);
+            errdefer alloc.free(headers);
+            if (self.outcome) |outcome| headers[0] = .{ .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header), .value = try alloc.dupe(u8, outcome) };
+            return .{ .status = 426, .headers = headers, .body = try alloc.dupe(u8, "RowPolicyUnsupported") };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("policy-test-secret", "policy-test");
+    const input: @import("../system_catalog/server_call.zig").Call = .{ .policy_publication_begin = .{ .table_id = 7, .enable = true, .expected_revision = 3 } };
+    const forwarding: raft_mutation_forwarding.Context = .{ .remaining_ms = 1000, .forwards_remaining = 0, .campaign_allowed = false };
+    var submitted = false;
+    try std.testing.expectError(error.RowPolicyUnsupported, client.forwardSystemCatalogWithControl("http://owner", input, forwarding, true, .{ .submitted = &submitted }));
+    try std.testing.expect(!submitted);
+    executor.outcome = routes.Routes.raft_mutation_outcome_unknown;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.forwardSystemCatalogWithControl("http://owner", input, forwarding, true, .{ .submitted = &submitted }));
+    try std.testing.expect(submitted);
+    submitted = false;
+    executor.outcome = routes.Routes.raft_mutation_outcome_committed;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.forwardSystemCatalogWithControl("http://owner", input, forwarding, true, .{ .submitted = &submitted }));
+    try std.testing.expect(submitted);
+    submitted = false;
+    executor.outcome = null;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, client.forwardSystemCatalogWithControl("http://owner", input, forwarding, true, .{ .submitted = &submitted }));
+    try std.testing.expect(submitted);
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
 }
 
 test "SQL pgwire native metadata RPC preserves explicit submission evidence" {

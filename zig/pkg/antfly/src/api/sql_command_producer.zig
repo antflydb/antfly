@@ -40,7 +40,22 @@ pub const Ticket = struct {
         if (zero(self.instance) or zero(self.body)) return error.InvalidSqlConnection;
     }
 };
+pub const TemporaryOwner = @import("sql_relation_lifetimes.zig").Owner;
+pub const TemporaryJob = struct {
+    nonce: [16]u8,
+    database_id: u64,
+    namespace_id: u64,
+};
+pub const TemporaryRetirement = struct {
+    owner: TemporaryOwner,
+    after: ?u64 = null,
+    job: ?TemporaryJob = null,
+};
+pub const TemporaryProgress = union(enum) { pending, advanced: TemporaryRetirement, complete };
+
 pub const Record = struct {
+    temporary_owner: ?TemporaryOwner = null,
+    temporary_retirement: ?TemporaryRetirement = null,
     notification_generation: ?u64 = null,
     revision: u64 = 1,
     registration: authority.scopes.Registration,
@@ -60,7 +75,36 @@ pub const Record = struct {
     recovery: bool = false,
     failure: ?authority.outcomes.Rejection = null,
 
+    pub fn requiresWork(self: Record) bool {
+        return self.phase != .retired or self.temporary_owner != null or self.temporary_retirement != null;
+    }
+    pub fn temporaryRetirementComplete(self: Record) bool {
+        return self.temporary_owner == null and self.temporary_retirement == null;
+    }
+    fn requireTemporaryOwner(self: Record, owner: TemporaryOwner) !void {
+        try owner.validate();
+        var principal: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(self.principal, &principal, .{});
+        if (owner.issuer_node_id != self.registration.lease.node or
+            !std.mem.eql(u8, &owner.connection_id, &self.registration.connection) or
+            !std.mem.eql(u8, &owner.execution_instance, &self.instance) or
+            !std.mem.eql(u8, &owner.principal_digest, &principal)) return error.InvalidSqlConnection;
+    }
+    fn retireTemporaryOwner(self: *Record) !void {
+        const owner = self.temporary_owner orelse return;
+        if (self.temporary_retirement != null) return error.SqlConnectionBusy;
+        self.temporary_retirement = .{ .owner = owner };
+        self.temporary_owner = null;
+    }
     pub fn validate(self: Record, a: A) !void {
+        if (self.temporary_owner) |owner| try self.requireTemporaryOwner(owner);
+        if (self.temporary_retirement) |pending| {
+            try self.requireTemporaryOwner(pending.owner);
+            if (self.temporary_owner != null or pending.after == @as(?u64, 0)) return error.InvalidSqlConnection;
+            if (pending.job) |job| {
+                if (std.mem.allEqual(u8, &job.nonce, 0) or job.namespace_id == 0 or job.database_id != self.registration.lease.database) return error.InvalidSqlConnection;
+            }
+        }
         try self.registration.validate(.{ .home = .metadata, .group = self.registration.group, .incarnation = self.registration.lease.backend.incarnation });
         try self.actor.validate();
         if (self.revision == 0 or self.next_command == 0 or zero(self.instance) or self.principal.len > 4096 or !std.unicode.utf8ValidateSlice(self.principal) or
@@ -127,7 +171,12 @@ pub const Record = struct {
     pub fn jsonStringify(self: Record, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Record).@"struct".field_names) |field| {
-            if (!(comptime std.mem.eql(u8, field, "notification_generation")) or self.notification_generation != null) {
+            if (comptime std.mem.eql(u8, field, "notification_generation") or std.mem.eql(u8, field, "temporary_owner") or std.mem.eql(u8, field, "temporary_retirement")) {
+                if (@field(self, field) != null) {
+                    try writer.objectField(field);
+                    try writer.write(@field(self, field));
+                }
+            } else {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
             }
@@ -137,7 +186,7 @@ pub const Record = struct {
     fn controlRequest(self: Record, head: u64, nonce: Id, operation: @FieldType(authority.Request, "operation")) authority.Request {
         return .{ .notification_generation = if (operation == .finish) self.notification_generation else null, .admission = .{ .head = head, .nonce = nonce }, .incarnation = self.registration.lease.backend.incarnation, .standalone = self.registration.standalone, .database = self.registration.lease.database, .actor = self.actor, .backend = self.registration.lease.backend, .operation = operation };
     }
-    fn fence(self: Record) authority.scopes.CommandFence {
+    pub fn fence(self: Record) authority.scopes.CommandFence {
         return .{ .group = self.registration.group, .backend = self.registration.lease.backend, .command = self.ticket.?.command, .database = self.registration.lease.database, .principal = self.registration.lease.principal, .standalone = self.registration.standalone };
     }
 };
@@ -222,6 +271,7 @@ fn stageControlTxn(a: A, txn: anytype, plan: ControlPlan, connection: [32]u8, sc
         const effect: authority.scopes.ledger.Effect = .{ .backend = prior.registration.lease.backend, .sequence = plan.next_effect, .nonce = plan.nonce, .action = .{ .control = action } };
         try effect.validate();
         var next = prior;
+        if (scope == .idle and action == .unlock_all) try next.retireTemporaryOwner();
         if (scope == .idle and attached.value.notification_pid != null) next.notification_generation = std.math.add(u64, attached.value.generation, 1) catch return error.SqlProgramLimitExceeded;
         next.control_effect = effect;
         next.failure_control = if (plan.failure) scope.transaction else null;
@@ -248,7 +298,7 @@ pub fn readTxn(a: A, txn: anytype, id: [32]u8) !?std.json.Parsed(Record) {
 pub fn retirementReadyTxn(a: A, txn: anytype, id: [32]u8) !bool {
     var found = (try readTxn(a, txn, id)) orelse return true;
     defer found.deinit();
-    return found.value.phase == .retired;
+    return found.value.phase == .retired and found.value.temporaryRetirementComplete();
 }
 /// Connection reconciliation has independent begin/terminal proof. It may
 /// publish only while this source has no executing SQL body. Finishing owns
@@ -270,7 +320,7 @@ pub fn requireUnusedTxn(a: A, txn: anytype, id: [32]u8) !void {
 pub fn forgetRetiredTxn(a: A, txn: anytype, id: [32]u8) !void {
     var found = (try readTxn(a, txn, id)) orelse return;
     defer found.deinit();
-    if (found.value.phase != .retired) return error.SqlConnectionBusy;
+    if (found.value.phase != .retired or !found.value.temporaryRetirementComplete()) return error.SqlConnectionBusy;
     try eraseTxn(txn, id);
 }
 fn eraseTxn(txn: anytype, id: [32]u8) !void {
@@ -300,7 +350,7 @@ fn putTxn(a: A, txn: anytype, value: Record) !void {
     if (bytes.len > max_bytes) return error.SqlProgramLimitExceeded;
     const id = value.registration.connection;
     try txn.put(&key(prefix, id), bytes);
-    if (value.phase == .retired) {
+    if (!value.requiresWork()) {
         txn.delete(&key(work_prefix, id)) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
@@ -320,7 +370,7 @@ fn readIndexedTxn(a: A, txn: anytype, id: [32]u8) !?std.json.Parsed(Record) {
         error.NotFound => false,
         else => return err,
     };
-    if (indexed != (found != null and found.?.value.phase != .retired)) return error.InvalidSqlConnection;
+    if (indexed != (found != null and found.?.value.requiresWork())) return error.InvalidSqlConnection;
     return found;
 }
 fn uncertainConnectionTxn(store: *transactions.DurableSessionStore, a: A, txn: anytype, id: [32]u8) !bool {
@@ -372,6 +422,8 @@ const Change = union(enum) {
     replace: struct { revision: u64, prior_digest: [32]u8, next: Record },
     begin_observed: struct { revision: u64, prior_digest: [32]u8, next: Record },
     take: struct { revision: u64, prior_digest: [32]u8, ticket: Ticket },
+    temporary_owner: struct { owner: TemporaryOwner, fence: authority.scopes.CommandFence, database: []const u8, now_ms: u64 },
+    temporary_progress: struct { revision: u64, prior_digest: [32]u8, retirement: ?TemporaryRetirement },
 };
 fn change(store: *transactions.DurableSessionStore, id: [32]u8, principal: []const u8, node: u64, action: Change) !void {
     if (!store.supportsSharedMutations()) return error.SqlConnectionUnavailable;
@@ -418,6 +470,12 @@ fn changeTxn(a: A, txn: anytype, id: [32]u8, principal: []const u8, node: u64, a
         },
         .replace => |update| blk: {
             const old = if (previous) |value| value.value else return error.SqlConnectionNotFound;
+            if (old.temporary_retirement != null and !std.meta.eql(old.temporary_retirement, update.next.temporary_retirement)) return error.InvalidSqlConnection;
+            if (old.temporary_owner) |owner| {
+                const preserved = if (update.next.temporary_owner) |next_owner| owner.eql(next_owner) else false;
+                const retiring = if (update.next.temporary_retirement) |pending| owner.eql(pending.owner) else false;
+                if (!preserved and !retiring) return error.InvalidSqlConnection;
+            }
             if (old.revision != update.revision or !std.mem.eql(u8, &try digest(a, old), &update.prior_digest)) return error.SqlConnectionChanged;
             if (connection == null and !update.next.recovery) return error.SqlConnectionNotFound;
             if (update.next.phase == .beginning) {
@@ -432,11 +490,39 @@ fn changeTxn(a: A, txn: anytype, id: [32]u8, principal: []const u8, node: u64, a
         .begin_observed => |update| blk: {
             const live = (connection orelse return error.SqlConnectionNotFound).value;
             const old = if (previous) |value| value.value else return error.SqlConnectionNotFound;
+            if (!std.meta.eql(old.temporary_owner, update.next.temporary_owner) or !std.meta.eql(old.temporary_retirement, update.next.temporary_retirement)) return error.InvalidSqlConnection;
             if (old.revision != update.revision or !std.mem.eql(u8, &try digest(a, old), &update.prior_digest)) return error.SqlConnectionChanged;
-            if (old.phase != .idle or old.pending != null or old.recovery or live.state == .beginning or live.state == .uncertain) return error.SqlConnectionBusy;
+            if (old.phase != .idle or old.pending != null or old.temporary_retirement != null or old.recovery or live.state == .beginning or live.state == .uncertain) return error.SqlConnectionBusy;
             if (update.next.phase != .beginning or !std.meta.eql(old.registration, update.next.registration) or
                 old.next_command != update.next.next_command or update.next.revision != old.revision + 1) return error.InvalidSqlConnection;
             break :blk update.next;
+        },
+        .temporary_progress => |update| blk: {
+            var old = if (previous) |value| value.value else return error.SqlConnectionNotFound;
+            if (old.revision != update.revision or !std.mem.eql(u8, &try digest(a, old), &update.prior_digest)) return error.SqlConnectionChanged;
+            const pending = old.temporary_retirement orelse return error.InvalidSqlConnection;
+            if (update.retirement) |next| {
+                if (!next.owner.eql(pending.owner) or (pending.after != null and (next.after == null or next.after.? < pending.after.?))) return error.InvalidSqlConnection;
+            }
+            old.temporary_retirement = update.retirement;
+            old.revision = std.math.add(u64, old.revision, 1) catch return error.SqlProgramLimitExceeded;
+            break :blk old;
+        },
+        .temporary_owner => |input| blk: {
+            const live = (connection orelse return error.SqlConnectionNotFound).value;
+            var old = if (previous) |value| value.value else return error.SqlConnectionNotFound;
+            try requireCommandTxn(a, txn, id, &input.fence, input.now_ms);
+            if (!std.mem.eql(u8, live.database, input.database)) return error.UnsupportedSqlShape;
+            const captured = try @import("sql_relation_lifetimes.zig").ownerFromConnection(live, old.instance, node);
+            if (!captured.eql(input.owner)) return error.SqlTemporaryRelationNotOwned;
+            if (old.temporary_retirement != null) return error.SqlConnectionBusy;
+            if (old.temporary_owner) |owner| {
+                if (!owner.eql(captured)) return error.SqlTemporaryRelationNotOwned;
+                return;
+            }
+            old.temporary_owner = captured;
+            old.revision = std.math.add(u64, old.revision, 1) catch return error.SqlProgramLimitExceeded;
+            break :blk old;
         },
         .take => |claim| blk: {
             if (connection == null) return error.SqlConnectionNotFound;
@@ -448,7 +534,7 @@ fn changeTxn(a: A, txn: anytype, id: [32]u8, principal: []const u8, node: u64, a
         },
     };
     if (!std.mem.eql(u8, next.principal, principal) or next.registration.lease.node != node) return error.InvalidSqlConnection;
-    if (connection == null and next.phase == .retired) try eraseTxn(txn, id) else try putTxn(a, txn, next);
+    if (connection == null and !next.requiresWork()) try eraseTxn(txn, id) else try putTxn(a, txn, next);
 }
 fn digest(a: A, record: Record) ![32]u8 {
     const bytes = try std.json.Stringify.valueAlloc(a, record, .{});
@@ -459,9 +545,21 @@ fn digest(a: A, record: Record) ![32]u8 {
 }
 fn replace(store: *transactions.DurableSessionStore, principal: []const u8, prior: Record, next_value: Record) !void {
     var next = next_value;
+    if (next.recovery) try next.retireTemporaryOwner();
     next.revision = std.math.add(u64, prior.revision, 1) catch return error.SqlProgramLimitExceeded;
     try change(store, prior.registration.connection, principal, prior.registration.lease.node, .{ .replace = .{ .revision = prior.revision, .prior_digest = try digest(store.alloc, prior), .next = next } });
 }
+/// Persist the exact session owner before publishing even an empty namespace.
+/// The native source writer checks the logical connection and taken command
+/// together, so generation change or a failed source write has no metadata effect.
+pub fn markTemporaryOwner(store: *transactions.DurableSessionStore, owner: TemporaryOwner, fence: authority.scopes.CommandFence, database: []const u8, now_ms: u64) !void {
+    try owner.validate();
+    try fence.validate();
+    var prior = (try load(store, store.alloc, owner.connection_id)) orelse return error.SqlConnectionNotFound;
+    defer prior.deinit();
+    try change(store, owner.connection_id, prior.value.principal, owner.issuer_node_id, .{ .temporary_owner = .{ .owner = owner, .fence = fence, .database = database, .now_ms = now_ms } });
+}
+
 pub fn create(store: *transactions.DurableSessionStore, principal: []const u8, registration: authority.scopes.Registration, actor: authority.prepared.Actor, instance: Id, head: u64, nonce: Id, now_ms: u64) !void {
     var value: Record = .{ .registration = registration, .actor = actor, .principal = principal, .instance = instance };
     value.pending = value.controlRequest(head, nonce, .{ .register = registration });
@@ -469,7 +567,7 @@ pub fn create(store: *transactions.DurableSessionStore, principal: []const u8, r
 }
 pub fn begin(store: *transactions.DurableSessionStore, principal: []const u8, prior: Record, instance: Id, command: authority.scopes.Command, body: [32]u8, head: u64, nonce: Id, now_ms: u64) !Ticket {
     try prior.validate(store.alloc);
-    if (prior.pending != null or prior.phase != .idle or prior.recovery or prior.registration.lease.expires_at_ms <= now_ms or command.sequence != prior.next_command) return error.SqlConnectionBusy;
+    if (prior.pending != null or prior.temporary_retirement != null or prior.phase != .idle or prior.recovery or prior.registration.lease.expires_at_ms <= now_ms or command.sequence != prior.next_command) return error.SqlConnectionBusy;
     const ticket: Ticket = .{ .instance = instance, .command = command, .body = body };
     try ticket.validate();
     var next = prior;
@@ -634,12 +732,14 @@ pub fn requestRecovery(store: *transactions.DurableSessionStore, principal: []co
     if (prior.recovery or prior.phase == .retired) return;
     var next = prior;
     next.recovery = true;
+    try next.retireTemporaryOwner();
     try replace(store, principal, prior, next);
 }
 
 pub const Port = struct {
     ptr: *anyopaque,
     call: *const fn (*anyopaque, A, Call) anyerror![]u8,
+    retire_temporary: ?*const fn (*anyopaque, A, Record) anyerror!TemporaryProgress = null,
     pub fn snapshot(self: Port, a: A, value: Record) !std.json.Parsed(authority.Snapshot) {
         const bytes = try self.call(self.ptr, a, .{ .sql_lock_read = .{ .incarnation = value.registration.lease.backend.incarnation, .standalone = value.registration.standalone, .actor = value.actor, .database = value.registration.lease.database, .backend = value.registration.lease.backend, .effect = value.control_effect } });
         defer a.free(bytes);
@@ -704,17 +804,44 @@ pub const Port = struct {
 /// instance may deliver immutable control but cannot take an execution permit.
 /// Only expiry or explicit recovery requests fence before decision-gated
 /// cleanup; a different local facade is not proof that its owner is dead.
+fn advanceTemporary(store: *transactions.DurableSessionStore, a: A, principal: []const u8, prior: Record, port: Port) !void {
+    const pending = prior.temporary_retirement orelse return error.InvalidSqlConnection;
+    const retire = port.retire_temporary orelse return error.CatalogPublicationProofPending;
+    var next = prior;
+    switch (try retire(port.ptr, a, prior)) {
+        .pending => return,
+        .advanced => |progress| {
+            if (!progress.owner.eql(pending.owner) or (pending.after != null and (progress.after == null or progress.after.? < pending.after.?))) return error.InvalidSqlConnection;
+            if (std.meta.eql(progress, pending)) return;
+            next.temporary_retirement = progress;
+        },
+        .complete => next.temporary_retirement = null,
+    }
+    try change(store, prior.registration.connection, principal, prior.registration.lease.node, .{ .temporary_progress = .{ .revision = prior.revision, .prior_digest = try digest(a, prior), .retirement = next.temporary_retirement } });
+}
+
 pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []const u8, prior: Record, instance: Id, now_ms: u64, nonce: Id, port: Port) !void {
     try prior.validate(a);
-    if (prior.phase == .retired) return;
+    if (prior.phase == .retired) {
+        if (prior.temporary_retirement != null) try advanceTemporary(store, a, principal, prior, port);
+        return;
+    }
     if (zero(instance) or zero(nonce)) return error.InvalidSqlConnection;
     var next = prior;
     next.recovery = prior.recovery or prior.registration.lease.expires_at_ms <= now_ms;
+    if (next.recovery) try next.retireTemporaryOwner();
     // Live idle/executing commands need no metadata round trip per worker tick.
     if (!next.recovery and prior.pending == null and (prior.phase == .idle or prior.phase == .ready or prior.phase == .executing)) return;
     var observed = try port.snapshot(a, prior);
     defer observed.deinit();
     const cut = observed.value;
+    if (prior.temporary_retirement != null) {
+        const ready = if (cut.scope) |scope|
+            !next.recovery and scope.state == .active and scope.transaction == null and prior.phase == .finishing and prior.control_effect == null and prior.pending != null and prior.pending.?.operation == .finish
+        else
+            prior.phase == .retired;
+        if (ready) return advanceTemporary(store, a, principal, prior, port);
+    }
     if (cut.scope) |scope| {
         next.registration = scope.registration;
         next.recovery = prior.recovery or scope.registration.lease.expires_at_ms <= now_ms;
@@ -974,7 +1101,11 @@ pub const NativePort = struct {
     server: *@import("http_server.zig").ApiHttpServer,
     context: @import("antfly_local_sources").api_operation.RequestContext,
     pub fn port(self: *NativePort) Port {
-        return .{ .ptr = self, .call = call };
+        return .{ .ptr = self, .call = call, .retire_temporary = retireTemporary };
+    }
+    fn retireTemporary(raw: *anyopaque, a: A, prior: Record) anyerror!TemporaryProgress {
+        const self: *NativePort = @ptrCast(@alignCast(raw));
+        return @import("sql_temporary_lifecycle.zig").advance(self.server, self.context, a, prior);
     }
     fn call(raw: *anyopaque, a: A, input: Call) anyerror![]u8 {
         const self: *NativePort = @ptrCast(@alignCast(raw));
@@ -1002,6 +1133,82 @@ pub fn advanceWork(server: *@import("http_server.zig").ApiHttpServer, after: *?[
     if (page.ids.len == 0) return false;
     try advanceConnection(server, a, page.ids[0], .none);
     return true;
+}
+
+/// Shutdown owns ingress and has joined requests before calling this drain.
+/// Close only this live issuer's durable sources through the ordinary recovery
+/// state machine; retained prepared decisions and unknown outcomes keep their
+/// custody. No request body or connection owner is reconstructed here.
+pub fn drainCurrentProcess(server: *@import("http_server.zig").ApiHttpServer, deadline: @import("../common/runtime_lifecycle.zig").ShutdownDeadline) !void {
+    const store = server.txn_sessions.durable orelse return;
+    const io = server.embedding_provider_runtime.io;
+    const instance = try server.sql_connection_admission.executionInstance(io);
+    const node = server.localSessionNodeId();
+    const Cancel = struct {
+        fn expired(raw: *const anyopaque) bool {
+            const bound: *const @import("../common/runtime_lifecycle.zig").ShutdownDeadline = @ptrCast(@alignCast(raw));
+            return bound.expired();
+        }
+    };
+    const cancellation: @import("antfly_local_sources").api_operation.CancellationToken = .{ .ptr = &deadline, .is_cancelled_fn = Cancel.expired };
+    var reported_failure = false;
+    while (!deadline.expired()) {
+        var pending = false;
+        var after: ?[32]u8 = null;
+        while (!deadline.expired()) {
+            var arena = std.heap.ArenaAllocator.init(server.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const page = try scanWork(store, a, after, 128);
+            for (page.ids) |id| {
+                if (deadline.expired()) return error.SqlRelationRecoveryIncomplete;
+                var retained = (try loadMode(store, a, id, true)) orelse continue;
+                defer retained.deinit();
+                const prior = retained.value;
+                if (prior.registration.lease.node != node or !std.mem.eql(u8, &prior.instance, &instance)) continue;
+                if (prior.phase == .retired and prior.temporaryRetirementComplete()) continue;
+                pending = true;
+                requestRecovery(store, prior.principal, prior) catch |err| switch (err) {
+                    error.SqlConnectionChanged => continue,
+                    else => return err,
+                };
+                // A failed or ambiguous quantum never proves retirement. The
+                // next pass reads its durable result before making progress.
+                advanceConnection(server, a, id, cancellation) catch |err| {
+                    if (comptime @import("builtin").mode == .debug) if (!reported_failure) {
+                        reported_failure = true;
+                        std.debug.print("native SQL shutdown scope cleanup deferred reason={s}\n", .{@errorName(err)});
+                    };
+                };
+            }
+            after = page.next_after;
+            if (after == null) break;
+        }
+        if (!pending) return;
+        io.sleep(.fromMilliseconds(1), .awake) catch return error.SqlRelationRecoveryIncomplete;
+    }
+    return error.SqlRelationRecoveryIncomplete;
+}
+
+/// Only a still-live local connection can lend its existing TEMP capsule to
+/// pending command control. Restart/retirement recovery deliberately stays on
+/// its independent sealed/retirement authority and never recreates that Owner.
+fn backgroundControlOwner(store: *transactions.DurableSessionStore, a: A, prior: Record, instance: Id, node: u64, now_ms: u64) !?TemporaryOwner {
+    const retained = prior.temporary_owner orelse return null;
+    if (prior.recovery or prior.registration.lease.expires_at_ms <= now_ms or
+        prior.registration.lease.node != node or !std.mem.eql(u8, &prior.instance, &instance) or
+        prior.pending == null or (prior.phase != .executing and prior.phase != .finishing) or
+        (prior.phase == .executing and prior.control_effect == null)) return null;
+    var current = @import("sql_connections.zig").load(store, a, prior.registration.connection, prior.principal, node, now_ms) catch |err| switch (err) {
+        error.SqlConnectionNotFound, error.SqlConnectionWrongOwner => return null,
+        else => return err,
+    };
+    defer current.deinit();
+    if (current.value.expires_at_ms <= now_ms or current.value.state == .beginning or current.value.state == .uncertain or current.value.wire_epoch == null or
+        !std.mem.eql(u8, &current.value.wire_epoch.?, &instance)) return null;
+    const actual = try @import("sql_relation_lifetimes.zig").ownerFromConnection(current.value, instance, node);
+    if (!actual.eql(retained)) return null;
+    return actual;
 }
 
 /// The shared upkeep lane claims keys independently, then executes each owner
@@ -1054,6 +1261,7 @@ pub fn advanceConnection(server: *@import("http_server.zig").ApiHttpServer, a: A
     try io.randomSecure(&nonce);
     var native: NativePort = .{ .server = server, .context = .{ .deadline_ns = time.monotonicNs() +| std.time.ns_per_s, .cancellation = cancellation } };
     const now_ms = time.realtimeNs() / std.time.ns_per_ms;
+    native.context.sql_relation_owner = try backgroundControlOwner(store, a, prior, instance, server.localSessionNodeId(), now_ms);
     const due = prior.registration.lease.expires_at_ms > now_ms and prior.registration.lease.expires_at_ms - now_ms <= renew_before_ms;
     if (!prior.recovery and (due or !std.mem.eql(u8, &prior.instance, &instance))) {
         var connection = @import("sql_connections.zig").load(store, a, connection_id, prior.principal, prior.registration.lease.node, 0) catch |err| switch (err) {
@@ -1170,4 +1378,111 @@ test "SQL command producer native outbox aborts every staged write before WAL pu
         try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(found.arena.allocator(), baseline, .{}), try std.json.Stringify.valueAlloc(found.arena.allocator(), found.value, .{}));
         try std.testing.expectEqualStrings("", try txn.get(&key(work_prefix, connection)));
     };
+}
+
+test "SQL command producer native begin observation cannot erase TEMP namespace cleanup ownership" {
+    const native = @import("../metadata/storage/raft_apply_store.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-owned-begin", .{tmp.sub_path});
+    defer a.free(path);
+    var metadata = try native.RaftApplyStore.init(a, .{ .root_dir = path });
+    defer metadata.deinit();
+    const connection: connections.Record = .{ .id = @splat('a'), .wire_epoch = @splat(1), .principal = "alice", .owner_node_id = 0, .expires_at_ms = 1000, .database = "main", .namespace = "public" };
+    const owner = try @import("sql_relation_lifetimes.zig").ownerFromConnection(connection, @splat(1), 0);
+    const baseline: Record = .{
+        .principal = "alice",
+        .instance = @splat(1),
+        .actor = .{ .session_user = .bootstrap, .credential = "" },
+        .registration = .{ .connection = connection.id, .nonce = @splat(2), .standalone = true, .lease = .{ .backend = .{ .incarnation = @splat(3), .id = @splat(4), .fence = 1 }, .node = 0, .database = 1, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = 1000 } },
+        .phase = .idle,
+        .temporary_owner = owner,
+    };
+    var write = try metadata.store.beginWriteTxn();
+    defer write.abort();
+    try connections.putTxn(&write, a, connection);
+    try putTxn(a, &write, baseline);
+    var next = baseline;
+    next.phase = .beginning;
+    next.revision += 1;
+    next.ticket = .{ .instance = baseline.instance, .command = .{ .sequence = 1, .nonce = @splat(5), .executor = @splat(6) }, .body = @splat(7) };
+    next.pending = next.controlRequest(0, @splat(8), .{ .begin = next.ticket.?.command });
+    next.temporary_owner = null;
+    try std.testing.expectError(error.InvalidSqlConnection, changeTxn(a, &write, connection.id, "alice", 0, .{ .begin_observed = .{ .revision = baseline.revision, .prior_digest = try digest(a, baseline), .next = next } }));
+    next.temporary_owner = owner;
+    try changeTxn(a, &write, connection.id, "alice", 0, .{ .begin_observed = .{ .revision = baseline.revision, .prior_digest = try digest(a, baseline), .next = next } });
+    var retained = (try readTxn(a, &write, connection.id)).?;
+    defer retained.deinit();
+    try std.testing.expect(retained.value.temporary_owner.?.eql(owner));
+    try std.testing.expectEqual(Phase.beginning, retained.value.phase);
+}
+
+test "SQL relation lifetime background pending controls rejoin only the current live TEMP owner" {
+    const storage = @import("../metadata/storage/raft_apply_store.zig");
+    const lifetimes = @import("sql_relation_lifetimes.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/background-control-owner", .{tmp.sub_path});
+    defer a.free(path);
+    var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+    defer metadata.deinit();
+    var store = transactions.DurableSessionStore.init(a, &metadata.store);
+    const connection: connections.Record = .{ .id = @splat('a'), .wire_epoch = @splat(1), .principal = "alice", .owner_node_id = 0, .expires_at_ms = 1000, .database = "main", .namespace = "public" };
+    const owner = try lifetimes.ownerFromConnection(connection, @splat(1), 0);
+    var prior: Record = .{
+        .principal = "alice",
+        .instance = @splat(1),
+        .actor = .{ .session_user = .bootstrap, .credential = "" },
+        .registration = .{ .connection = connection.id, .nonce = @splat(2), .standalone = true, .lease = .{ .backend = .{ .incarnation = @splat(3), .id = @splat(4), .fence = 1 }, .node = 0, .database = 1, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = 1000 } },
+        .phase = .executing,
+        .temporary_owner = owner,
+        .ticket = .{ .instance = @splat(1), .command = .{ .sequence = 1, .nonce = @splat(5), .executor = @splat(1) }, .body = @splat(6) },
+    };
+    const effect: authority.scopes.ledger.Effect = .{ .backend = prior.registration.lease.backend, .sequence = 1, .nonce = @splat(7), .action = .{ .control = .{ .rollback = .{ .transaction = @splat(8), .first_aborted = 1 } } } };
+    prior.control_effect = effect;
+    prior.pending = prior.controlRequest(0, @splat(9), .{ .effect = .{ .command = prior.ticket.?.command, .effect = effect } });
+    {
+        var writer = try metadata.store.beginWriteTxn();
+        errdefer writer.abort();
+        try connections.putTxn(&writer, a, connection);
+        try putTxn(a, &writer, prior);
+        try writer.commit();
+    }
+    try std.testing.expect(prior.requiresWork());
+    var stored = (try loadMode(&store, a, connection.id, true)).?;
+    defer stored.deinit();
+    try std.testing.expect((try backgroundControlOwner(&store, a, stored.value, @splat(1), 0, 2)).?.eql(owner));
+    try std.testing.expect(try backgroundControlOwner(&store, a, stored.value, @splat(2), 0, 2) == null);
+    try std.testing.expect(try backgroundControlOwner(&store, a, stored.value, @splat(1), 9, 2) == null);
+    try std.testing.expect(try backgroundControlOwner(&store, a, stored.value, @splat(1), 0, 1000) == null);
+    var refused = stored.value;
+    refused.principal = "mallory";
+    try std.testing.expect(try backgroundControlOwner(&store, a, refused, @splat(1), 0, 2) == null);
+    refused = stored.value;
+    refused.recovery = true;
+    try std.testing.expect(try backgroundControlOwner(&store, a, refused, @splat(1), 0, 2) == null);
+    refused = stored.value;
+    refused.control_effect = null;
+    try std.testing.expect(try backgroundControlOwner(&store, a, refused, @splat(1), 0, 2) == null);
+    // A valid logical successor cannot donate its new generation to old work.
+    var next = connection;
+    next.generation += 1;
+    {
+        var writer = try metadata.store.beginWriteTxn();
+        errdefer writer.abort();
+        try connections.putTxn(&writer, a, next);
+        try writer.commit();
+    }
+    try std.testing.expect(try backgroundControlOwner(&store, a, stored.value, @splat(1), 0, 2) == null);
+    next = connection;
+    next.wire_epoch = @splat(2);
+    {
+        var writer = try metadata.store.beginWriteTxn();
+        errdefer writer.abort();
+        try connections.putTxn(&writer, a, next);
+        try writer.commit();
+    }
+    try std.testing.expect(try backgroundControlOwner(&store, a, stored.value, @splat(1), 0, 2) == null);
 }

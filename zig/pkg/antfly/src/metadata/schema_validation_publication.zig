@@ -68,6 +68,19 @@ pub const OwnerCut = struct {
     metadata_incarnation: [32]u8,
     authority: local.storage_source_authority.Kind,
     ranges: []const local.common_topology_records.RangeRecord,
+    native_tables: []const u64 = &.{},
+
+    pub fn authorityFor(self: OwnerCut, table: u64) local.storage_source_authority.Kind {
+        for (self.native_tables) |native| if (native == table) return .native;
+        return self.authority;
+    }
+    pub fn nativeJsonSkipField(self: OwnerCut, comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "native_tables") and self.native_tables.len == 0;
+    }
+    pub fn jsonStringify(self: OwnerCut, writer: anytype) !void {
+        if (self.native_tables.len == 0) return writer.write(.{ .metadata_group_id = self.metadata_group_id, .metadata_incarnation = self.metadata_incarnation, .authority = self.authority, .ranges = self.ranges });
+        return writer.write(.{ .metadata_group_id = self.metadata_group_id, .metadata_incarnation = self.metadata_incarnation, .authority = self.authority, .ranges = self.ranges, .native_tables = self.native_tables });
+    }
 };
 
 pub const SequenceRetirement = struct {

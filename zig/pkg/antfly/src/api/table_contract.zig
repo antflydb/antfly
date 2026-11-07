@@ -115,6 +115,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         .object => |object| object,
         else => return error.InvalidCreateTableRequest,
     };
+    if (raw_root.get("sql_persistence") != null) return error.InvalidCreateTableRequest;
     if (raw_root.get("enrichments") != null or raw_root.get("artifact_enrichments") != null) {
         return error.TableEnrichmentsRequireArtifactEndpoint;
     }
@@ -317,6 +318,7 @@ pub fn normalizeTableDefinitionIndexesValueAlloc(alloc: std.mem.Allocator, value
 }
 
 pub fn encodeCreateTableRequest(alloc: std.mem.Allocator, req: tables_api.CreateTableRequest) ![]u8 {
+    if (req.sql_persistence != null) return error.InvalidCreateTableRequest;
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
 

@@ -92,21 +92,56 @@ pub const ReadSafetyBarrier = struct {
     };
 
     pub const FrozenProof = struct {
-        incarnation: u128,
-        term: u64,
-        applied_index: u64,
+        incarnation: u128 = 0,
+        term: u64 = 0,
+        applied_index: u64 = 0,
+        native: ?NativeCut = null,
+
+        pub const NativeCut = struct {
+            descriptor_fingerprint: [32]u8,
+            native_instance: [16]u8,
+            primary_sequence: u64,
+        };
+        pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+            return (comptime std.mem.eql(u8, field, "native")) and self.native == null;
+        }
+        pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+            if (self.native) |native| return stream.write(.{ .incarnation = self.incarnation, .term = self.term, .applied_index = self.applied_index, .native = native });
+            return stream.write(.{ .incarnation = self.incarnation, .term = self.term, .applied_index = self.applied_index });
+        }
+        pub fn fromNative(descriptor: @import("../common/topology_records.zig").RelationPersistence.Descriptor, native_instance: [16]u8, sequence: u64) !FrozenProof {
+            if (std.mem.allEqual(u8, &native_instance, 0)) return error.SqlRelationOwnerChanged;
+            return .{ .native = .{ .descriptor_fingerprint = try descriptor.fingerprint(), .native_instance = native_instance, .primary_sequence = sequence } };
+        }
+        pub fn requireNative(self: FrozenProof, descriptor: @import("../common/topology_records.zig").RelationPersistence.Descriptor, native_instance: [16]u8) !void {
+            const native = self.native orelse return error.SqlStatementSnapshotRequired;
+            if (self.incarnation != 0 or self.term != 0 or self.applied_index != 0 or
+                std.mem.allEqual(u8, &native_instance, 0) or !std.mem.eql(u8, &native.native_instance, &native_instance) or
+                !std.mem.eql(u8, &native.descriptor_fingerprint, &try descriptor.fingerprint())) return error.SqlRelationOwnerChanged;
+        }
 
         /// A retained immutable root was certified while capture was frozen.
         /// Later opens require a newly quorum-completed prefix on the same
         /// owner/term, which may include subsequent writes. Never use this to
         /// validate a live capture fence or fabricate completion from Raft tips.
         pub fn validateRetained(self: @This(), completed: FrozenProof) !void {
+            if (self.native) |captured| {
+                const current = completed.native orelse return error.SqlRelationOwnerChanged;
+                if (self.incarnation != 0 or self.term != 0 or self.applied_index != 0 or
+                    completed.incarnation != 0 or completed.term != 0 or completed.applied_index != 0 or
+                    std.mem.allEqual(u8, &captured.native_instance, 0) or !std.mem.eql(u8, &captured.native_instance, &current.native_instance) or
+                    !std.mem.eql(u8, &captured.descriptor_fingerprint, &current.descriptor_fingerprint)) return error.SqlRelationOwnerChanged;
+                if (current.primary_sequence < captured.primary_sequence) return error.ReadUnavailable;
+                return;
+            }
+            if (completed.native != null) return error.SqlRelationOwnerChanged;
             if (self.incarnation == 0 or self.term == 0 or self.applied_index == 0) return error.InvalidControlReceiptPosition;
             if (completed.incarnation != self.incarnation or completed.term != self.term) return error.NotLeader;
             if (completed.applied_index < self.applied_index) return error.ReadUnavailable;
         }
 
         pub fn validate(self: @This(), incarnation: u128, term: u64, is_leader: bool, quorum_index: u64) !void {
+            if (self.native != null) return error.SqlRelationOwnerChanged;
             if (!is_leader or incarnation != self.incarnation or term != self.term) return error.NotLeader;
             if (quorum_index > self.applied_index) return error.ReadUnavailable;
         }
@@ -345,3 +380,43 @@ pub const FeatureReads = struct {
         try self.prepareScanWithConsistency(group_id, from_key, to_key, opts, .read_index);
     }
 };
+
+test "native local frozen cut proves actual sequence and owner without inventing raft positions" {
+    const descriptor: @import("../common/topology_records.zig").RelationPersistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 1, .owner_store_id = 2, .generation_instance = @splat(3), .data_generation = 4 };
+    const empty = try ReadSafetyBarrier.FrozenProof.fromNative(descriptor, @splat(3), 0);
+    try empty.requireNative(descriptor, @splat(3));
+    try std.testing.expectEqual(@as(u128, 0), empty.incarnation);
+    try std.testing.expectEqual(@as(u64, 0), empty.term);
+    try std.testing.expectEqual(@as(u64, 0), empty.applied_index);
+    const newer = try ReadSafetyBarrier.FrozenProof.fromNative(descriptor, @splat(3), 7);
+    try empty.validateRetained(newer);
+    try std.testing.expectError(error.ReadUnavailable, newer.validateRetained(empty));
+    // Clean adoption keeps the image/descriptor but invalidates every old live read cut.
+    try std.testing.expectError(error.SqlRelationOwnerChanged, empty.requireNative(descriptor, @splat(4)));
+    try std.testing.expectError(error.SqlRelationOwnerChanged, empty.validateRetained(try ReadSafetyBarrier.FrozenProof.fromNative(descriptor, @splat(4), 7)));
+    var reset = descriptor;
+    reset.data_generation += 1;
+    try std.testing.expectError(error.SqlRelationOwnerChanged, empty.requireNative(reset, @splat(3)));
+    try std.testing.expectError(error.SqlRelationOwnerChanged, empty.validateRetained(try ReadSafetyBarrier.FrozenProof.fromNative(reset, @splat(3), 7)));
+    const raft: ReadSafetyBarrier.FrozenProof = .{ .incarnation = 1, .term = 2, .applied_index = 3 };
+    try std.testing.expectError(error.SqlRelationOwnerChanged, empty.validateRetained(raft));
+    try std.testing.expectError(error.SqlRelationOwnerChanged, raft.validateRetained(newer));
+    try std.testing.expectError(error.SqlRelationOwnerChanged, empty.validate(1, 2, true, 3));
+}
+
+test "SQL relation lifetime ordinary frozen proof preserves HTTP and durable wire" {
+    const a = std.testing.allocator;
+    const proof: ReadSafetyBarrier.FrozenProof = .{ .incarnation = 1, .term = 2, .applied_index = 3 };
+    const http = try std.json.Stringify.valueAlloc(a, proof, .{});
+    defer a.free(http);
+    try std.testing.expectEqualStrings("{\"incarnation\":1,\"term\":2,\"applied_index\":3}", http);
+    const Wire = struct {
+        value: ReadSafetyBarrier.FrozenProof,
+        pub fn jsonStringify(self: @This(), stream: anytype) !void {
+            return @import("db/relational_integrity_json.zig").write(self.value, stream);
+        }
+    };
+    const durable = try std.json.Stringify.valueAlloc(a, Wire{ .value = proof }, .{});
+    defer a.free(durable);
+    try std.testing.expectEqualStrings(http, durable);
+}

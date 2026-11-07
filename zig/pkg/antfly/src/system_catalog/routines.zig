@@ -30,13 +30,19 @@ pub const SnapshotRequest = struct {
     include_description: bool = false,
     kind: ?records.Kind = null,
     reference: ?records.RoutineReference = null,
+    /// Attachment references follow immutable routine identity across SET SCHEMA.
+    /// The catalog incarnation prevents cross-restore identifier adoption.
+    immutable_id: ?struct { id: u64, incarnation: [16]u8 } = null,
     signature: ?[]const u8 = null,
     arguments: ?[]const records.Input = null,
     pub fn validate(self: @This()) !void {
-        if ((self.targets.len == 0 and self.reference == null) or self.targets.len > 64 or (self.signature != null and self.arguments != null)) return error.InvalidCatalogMutation;
+        if ((self.targets.len == 0 and self.reference == null and self.immutable_id == null) or self.targets.len > 64 or (self.signature != null and self.arguments != null)) return error.InvalidCatalogMutation;
         if (self.reference) |reference| {
             try reference.validate();
             if (self.targets.len != 0 or self.signature != null or self.arguments != null) return error.InvalidCatalogMutation;
+        }
+        if (self.immutable_id) |identity| {
+            if (identity.id == 0 or std.mem.allEqual(u8, &identity.incarnation, 0) or self.reference != null or self.targets.len != 0 or self.signature != null or self.arguments != null) return error.InvalidCatalogMutation;
         }
         for (self.targets) |target| try target.validate();
         if (self.signature) |signature| if (signature.len > 4096 or std.mem.indexOfScalar(u8, signature, 0) != null) return error.InvalidCatalogMutation;
@@ -57,7 +63,7 @@ pub const Snapshot = struct {
     found: ?Found,
     pub fn validate(self: @This(), request: SnapshotRequest) !void {
         try request.validate();
-        if (self.next_id < 3 or self.scopes.len != (if (request.reference != null) @as(usize, 1) else request.targets.len) or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidSqlBackendResponse;
+        if (self.next_id < 3 or self.scopes.len != (if (request.reference != null or request.immutable_id != null) @as(usize, 1) else request.targets.len) or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidSqlBackendResponse;
         if (request.expected_revision) |revision| if (revision != self.revision) return error.CatalogGenerationChanged;
         for (self.scopes[0..request.targets.len], request.targets) |scope, target| {
             if (!std.mem.eql(u8, scope.target.database, target.database) or !std.mem.eql(u8, scope.target.namespace, target.namespace) or !std.mem.eql(u8, scope.target.table, target.table) or
@@ -67,6 +73,7 @@ pub const Snapshot = struct {
             if (found.scope >= self.scopes.len or self.scopes[found.scope].namespace_id == null or found.record.id >= self.next_id) return error.InvalidSqlBackendResponse;
             try found.record.validate();
             if (request.reference) |reference| if (found.record.id != reference.id or found.record.kind != (request.kind orelse .function) or self.scopes[found.scope].namespace_id != reference.namespace_id) return error.InvalidSqlBackendResponse;
+            if (request.immutable_id) |identity| if (found.record.id != identity.id or found.record.kind != (request.kind orelse .function) or !std.mem.eql(u8, &self.incarnation, &identity.incarnation)) return error.InvalidSqlBackendResponse;
         }
     }
 };

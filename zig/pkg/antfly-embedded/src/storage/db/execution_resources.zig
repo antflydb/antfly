@@ -1018,7 +1018,23 @@ pub const BatchVisibilityCompletion = struct {
     }
 };
 
+pub const NativeAtomicEffects = struct {
+    writes: []const docstore_mod.KVPair = &.{},
+    deletes: []const []const u8 = &.{},
+};
+
+pub const CheckedNativeAtomic = struct {
+    snapshot_owner: *snapshot_admission_mod.SnapshotAdmission.MutationLease,
+    replication_owner: *?MutationBarrier.SharedLease,
+    schema_namespace_generation: u64,
+    // DB-owned attempt/finalizer; process-local and never supplied by JSON.
+    ptr: *anyopaque,
+    finalize_fn: *const fn (*anyopaque) anyerror!NativeAtomicEffects,
+};
+
 pub const BatchExecutionOptions = struct {
+    // Process-local checked plan, never serialized or derived from JSON.
+    checked_native_atomic: ?*const CheckedNativeAtomic = null,
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
     /// Native-only completion observation; never encoded in a replicated command.
@@ -1053,6 +1069,7 @@ pub const BatchExecutionOptions = struct {
     /// writes the data-Raft watermark into a native source-authority root.
     native_initial_child_entry: ?OrderedApplyReceipt = null,
     native_fk_generation_entry: ?OrderedApplyReceipt = null,
+    native_fk_generation_control: bool = false,
     native_topology_position: ?@import("receipt_position.zig").Native = null,
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
@@ -1062,6 +1079,7 @@ pub const BatchExecutionOptions = struct {
     extra_store_deletes: []const []const u8 = &.{},
     merge_chunk_expected_progress: ?[32]u8 = null,
     transaction_resolution: ?TransactionResolution = null,
+    prepared_graph_indexes: []const @import("prepared_graph_effects.zig").Index = &.{},
     durable_rows: ?*const std.StringHashMapUnmanaged([]const u8) = null,
     /// Borrowed by this synchronous call and consumed only after primary
     /// durability, while waiting for requested derived visibility.
@@ -1071,6 +1089,7 @@ pub const BatchExecutionOptions = struct {
 pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
 
 pub const TransactionResolution = struct {
+    prepared_graph_effects_checked: bool = false,
     external_decision_owner: ?transactions_mod.ExternalDecisionOwner = null,
     txn_id: transactions_mod.TxnId,
     status: transactions_mod.TxnStatus,
@@ -1131,6 +1150,8 @@ pub const LocalExecutionState = struct {
     row_policy_bundle: ?row_policy_bundle_mod.Installed = null,
     /// Borrowed from the opaque owner handle; Lite leaves these unset and
     /// therefore cannot turn a raw local read into an authenticated one.
+    sql_preparation_secret: ?[]const u8 = null,
+    sql_preparation_issuer: ?[]const u8 = null,
     row_policy_authority_secret: ?[]const u8 = null,
     row_policy_authority_issuer: ?[]const u8 = null,
     row_policy_table_name: ?[]const u8 = null,
