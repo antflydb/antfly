@@ -710,12 +710,73 @@ pub const MarkerSweep = struct {
     }
 };
 
+const publication_guard_name = ".aflite-lease-publication.lock";
+
 // This persistent inode is deliberately outside the UUID marker namespace.
 // Never unlink it: replacing its inode could split cross-process coordination.
+//
+// Resolve `root`'s parent directory *once*, as an already-open handle, and
+// create the guard file relative to that handle -- rather than joining a
+// string (`dirname(root) orelse "."`) and asking `std.Io.Dir.cwd()` to
+// resolve it a second time. The second resolution is also against cwd, so a
+// bare, directory-component-free `root` (`dirname` returning `null`, hence
+// `"."`) depends on whichever directory happens to be the process's current
+// one at that exact call -- the same class of bug `reader_epochs.zig`'s
+// `Namespace.open` documents fixing for its own "identity" marker (observed
+// there as a bare file landing in the process's cwd instead of next to its
+// `.aflite` file). `openPublicationGuard` is called more than once over a
+// store's lifetime (`Registry.create` and `MarkerSweep.run`, potentially far
+// apart in time), so pinning this call to the parent directory's own open
+// handle removes any dependency on cwd being unchanged between those calls.
 fn openPublicationGuard(allocator: Allocator, io: std.Io, root: []const u8) !std.Io.File {
-    const path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(root) orelse ".", ".aflite-lease-publication.lock" });
-    defer allocator.free(path);
-    return std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false, .permissions = .fromMode(0o600) });
+    _ = allocator;
+    var parent = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(root) orelse ".", .{});
+    defer parent.close(io);
+    return parent.createFile(io, publication_guard_name, .{ .read = true, .truncate = false, .permissions = .fromMode(0o600) });
+}
+
+// Bug repro/regression: a bare, directory-component-free root (the shape
+// `std.fs.path.dirname` returns `null` for) must resolve the publication
+// guard next to the database file -- i.e. inside whatever directory is the
+// process's cwd *at open time* -- and never leave anything behind in a
+// *different* directory that later becomes cwd. Mirrors native.zig's "bug2"
+// regression for `reader_epochs.zig`'s `Namespace.open`.
+test "lite artifact lease publication guard at a relative path creates no files outside its own directory" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    const original_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+    defer a.free(original_cwd);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_dir_len = try tmp.dir.realPath(io, &buf);
+    const tmp_dir_path = try a.dupe(u8, buf[0..tmp_dir_len]);
+    defer a.free(tmp_dir_path);
+
+    try std.process.setCurrentPath(io, tmp_dir_path);
+    var restored = false;
+    defer if (!restored) std.process.setCurrentPath(io, original_cwd) catch {};
+
+    const bare_name = "bug3-repro.aflite";
+    {
+        var file = try native.NativeFile.createWithIo(a, io, bare_name, .{ .no_sync = true, .exclusive = true });
+        defer file.close();
+        const guard = try openPublicationGuard(a, io, bare_name);
+        defer guard.close(io);
+        // Must have landed inside the temp directory (next to the bare
+        // `.aflite` file), not wherever cwd happens to be by the time some
+        // *other* call into this function runs.
+        try std.Io.Dir.cwd().access(io, publication_guard_name, .{});
+    }
+
+    try std.process.setCurrentPath(io, original_cwd);
+    restored = true;
+
+    // Nothing leaked into the original cwd: no bare guard file sitting
+    // directly in it.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, publication_guard_name, .{}));
 }
 
 test "lite persistent mapped lease publication excludes cross-root marker sweeping" {

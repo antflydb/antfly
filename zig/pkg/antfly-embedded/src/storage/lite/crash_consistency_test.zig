@@ -661,6 +661,18 @@ fn checkInFlightResolutionDb(in_flight: Checkpoint, handle: *DbHandle, allocator
 /// draining background work between attempts, and only treats it as a
 /// finding if the index never finishes catching up within a generous bound.
 fn assertSearchable(handle: *DbHandle, allocator: Allocator, search_index: []const u8, search_field: []const u8, key: []const u8, text: []const u8) !void {
+    const platform_time = @import("antfly_platform").time;
+    // A fixed retry count conflates "stuck" with "a real host under enough
+    // concurrent load that each recovery pass's own I/O keeps hitting fresh
+    // transient errors" -- recovery can legitimately still be making
+    // progress (a different injected-free error each attempt, not the same
+    // one repeating) well past any small fixed count on a busy shared
+    // machine. Bound by wall-clock time instead so a crash sweep run under
+    // sustained load does not fail just because it needed more than N
+    // iterations; `attempt` is kept only for diagnostics. A real stuck
+    // recovery (the same unresolved condition forever) still eventually
+    // exhausts this deadline and fails exactly as before.
+    const deadline_ns = platform_time.monotonicNs() +| (30 * std.time.ns_per_s);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         var result = handle.db.search(allocator, .{
@@ -668,7 +680,7 @@ fn assertSearchable(handle: *DbHandle, allocator: Allocator, search_index: []con
             .full_text = .{ .match = .{ .field = search_field, .text = text } },
             .limit = 10,
         }) catch |err| {
-            if (err == error.IndexRebuilding and attempt < 50) {
+            if (err == error.IndexRebuilding and platform_time.monotonicNs() < deadline_ns) {
                 // `runUntilIdle` alone is what a sweep barrier count needs
                 // to stay deterministic (see `openDbWithIo`), but settling
                 // a text index after reopen may need the fuller recipe
@@ -1227,6 +1239,72 @@ test "crash sweep: full text recovers from one transient io fault with no crash"
             };
         }
     }
+}
+
+// Bug repro: a commit that fails *after staging* (an injected, persistent
+// `error.InputOutput` on the write op below -- `IoFaultPlan.repeat = true`
+// never clears it) must not leak the retained/artifact_inputs/
+// document_revisions captures `storage/docstore.zig`'s `DocStore.Txn.commit`
+// / `Batch.commitStaged` / `StagedBatch.wait` stage into the batch before
+// the native write itself runs. The real bug: `DocStore.StagedDocBatch.wait`
+// (the wrapper `mutation_commit.zig`'s `batchInternalPreparedOwned` actually
+// calls) unconditionally `defer`-destroyed its heap-boxed `*Batch` without
+// ever calling `abort()` on it first when `inner.wait()` failed, so those
+// captures' backing allocations (document_mutation_revision.zig's `touch`,
+// in particular) became unreachable the moment that memory was freed --
+// a leak the crash sweep's `SafeAllocator` catches directly. Separately,
+// also bound `close()` on its own thread with a deadline: a short
+// `test_visibility_wait_timeout_ms` combined with a persistent fault drives
+// the same derived-worker recoverable-retry path `ee89ce70b5` added, and a
+// regression there must fail loudly instead of hanging the whole suite.
+test "crash sweep: commit failing after staging under a persistent io fault does not leak or hang close" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    const sim = try sim_io.SimIo.init(allocator, std.testing.io);
+    defer sim.deinit();
+
+    var handle = try openDbWithIo(allocator, path, sim.io(), true);
+    var handle_open = true;
+    defer if (handle_open) handle.close();
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+
+    // Never clears: every subsequent write-kind op faults, including this
+    // next write's own primary commit (not only the derived worker's
+    // catch-up) -- exactly "a commit fails after staging" as described.
+    sim.setIoFaultPlan(.{ .at_op = 0, .kind = .write, .err = error.InputOutput, .repeat = true });
+    db_mod.test_visibility_wait_timeout_ms = 1;
+    defer db_mod.test_visibility_wait_timeout_ms = null;
+
+    handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text }) catch |err| switch (err) {
+        error.CommitVisibilityNotSatisfied, error.InputOutput => {},
+        else => return err,
+    };
+
+    const Closer = struct {
+        handle: *DbHandle,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.handle.close();
+            self.done.store(true, .release);
+        }
+    };
+    var closer: Closer = .{ .handle = &handle };
+    const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    const platform_time = @import("antfly_platform").time;
+    const deadline_ns = platform_time.monotonicNs() +| (20 * std.time.ns_per_s);
+    while (!closer.done.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline_ns) {
+            thread.detach();
+            return error.ShutdownHangDetected;
+        }
+        std.Thread.yield() catch {};
+    }
+    thread.join();
+    handle_open = false;
 }
 
 fn reportFailures(report: *const SweepReport) !void {
