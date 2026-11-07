@@ -46,6 +46,11 @@ import SwiftUI
   private var generation = UUID()
   private var registered: DictationCore.KeyboardShortcut?
   @Published var capturingShortcut = false
+  @Published private(set) var fnSetupPending = false
+  @Published private(set) var fnSetupStatus = ""
+  private let keyboardAccess: @MainActor () -> Bool
+  private let keyboardAccessRequest: @MainActor () -> Void
+  private let settingsOpener: @MainActor (String) -> Void
   private var retryAudio: Data?
   private var retryPreset: Preset?
   private let clientFactory: (@Sendable (Configuration) throws -> AntflyClient)?
@@ -55,8 +60,18 @@ import SwiftUI
   init(
     directory storageDirectory: URL? = nil, registerHotkey: Bool = true,
     historyUpload: HistoryOutbox.Upload? = nil,
-    clientFactory: (@Sendable (Configuration) throws -> AntflyClient)? = nil
+    clientFactory: (@Sendable (Configuration) throws -> AntflyClient)? = nil,
+    keyboardAccess: @escaping @MainActor () -> Bool = { AXIsProcessTrusted() },
+    keyboardAccessRequest: @escaping @MainActor () -> Void = {
+      let options =
+        [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+      _ = AXIsProcessTrustedWithOptions(options)
+    },
+    settingsOpener: @escaping @MainActor (String) -> Void = { DesktopSettings.open($0) }
   ) {
+    self.keyboardAccess = keyboardAccess
+    self.keyboardAccessRequest = keyboardAccessRequest
+    self.settingsOpener = settingsOpener
     self.clientFactory = clientFactory
     self.directory =
       storageDirectory
@@ -118,6 +133,11 @@ import SwiftUI
     registered = shortcut
   }
   func refreshShortcutAccess() {
+    guard state == .idle, !capturingShortcut else { return }
+    if fnSetupPending {
+      if keyboardAccess() { completeFnSetup() }
+      return
+    }
     guard registered == nil || hotkey?.isAvailable == false, state == .idle, !capturingShortcut
     else { return }
     do {
@@ -126,8 +146,68 @@ import SwiftUI
     } catch { message = error.localizedDescription }
   }
   func captureShortcut(_ capturing: Bool) {
+    if capturing { cancelFnSetup() }
     capturingShortcut = capturing
     hotkey?.setSuspended(capturing)
+  }
+
+  func setUpFnShortcut() {
+    guard state == .idle, !working, !capturingShortcut else { return }
+    fnSetupPending = true
+    if keyboardAccess() {
+      completeFnSetup()
+      return
+    }
+    fnSetupStatus =
+      "Enable Antfly Dictation in Accessibility, then return here. Fn will be applied automatically."
+    message = fnSetupStatus
+    keyboardAccessRequest()
+    settingsOpener("com.apple.preference.security?Privacy_Accessibility")
+  }
+  func cancelFnSetup() {
+    guard fnSetupPending else { return }
+    fnSetupPending = false
+    fnSetupStatus = "Fn setup canceled. The previous shortcut is unchanged."
+  }
+  func openKeyboardSettings() {
+    settingsOpener("com.apple.Keyboard-Settings.extension")
+  }
+  private func completeFnSetup() {
+    guard fnSetupPending, keyboardAccess() else { return }
+    let previous = registered
+    do {
+      // Apply only the shortcut, preserving saved preferences and credentials.
+      let previousData =
+        FileManager.default.fileExists(atPath: settingsFile.path)
+        ? try Data(contentsOf: settingsFile) : nil
+      var saved = try previousData.map { try Configuration.decode($0) } ?? Configuration()
+      saved.effectiveShortcut = .fn
+      let bytes = try JSONEncoder().encode(saved.validated())
+      try hotkey?.register(.fn)
+      do { try write(bytes, to: settingsFile) } catch {
+        do {
+          if let previous { try hotkey?.register(previous) } else { hotkey?.unregister() }
+        } catch {
+          hotkey?.unregister()
+          registered = nil
+        }
+        if let previousData {
+          try? previousData.write(to: settingsFile, options: .atomic)
+        } else {
+          try? FileManager.default.removeItem(at: settingsFile)
+        }
+        throw error
+      }
+      config.effectiveShortcut = .fn
+      registered = .fn
+      fnSetupPending = false
+      fnSetupStatus = "Fn is enabled and saved. \(config.toggle ? "Press" : "Hold") Fn to dictate."
+      message = fnSetupStatus
+    } catch {
+      fnSetupPending = false
+      fnSetupStatus = "Could not set up Fn: " + error.localizedDescription
+      message = fnSetupStatus
+    }
   }
 
   private func write(_ data: Data, to url: URL) throws {
@@ -176,9 +256,7 @@ import SwiftUI
     }
   }
   func requestAccessibility() {
-    let options =
-      [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-    _ = AXIsProcessTrustedWithOptions(options)
+    keyboardAccessRequest()
   }
   func shortcut(down: Bool) {
     guard !working, !capturingShortcut else { return }

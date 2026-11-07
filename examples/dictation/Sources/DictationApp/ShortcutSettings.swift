@@ -131,6 +131,17 @@ struct ShortcutSettings: View {
         .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
       }
       HStack {
+        Button(store.fnSetupPending ? "Open Accessibility settings…" : "Set up Fn shortcut") {
+          store.setUpFnShortcut()
+        }.buttonStyle(.borderedProminent).disabled(recorder.recording)
+        if store.fnSetupPending { Button("Cancel setup") { store.cancelFnSetup() } }
+        Button("Keyboard settings…") { store.openKeyboardSettings() }
+      }
+      if !store.fnSetupStatus.isEmpty { Text(store.fnSetupStatus).font(.caption) }
+      Text("Set up Fn saves only your shortcut. Other edits still use Save settings.").font(
+        .caption
+      ).foregroundStyle(.secondary)
+      HStack {
         ForEach(modifiers, id: \.1) { item in
           Toggle(
             item.0,
@@ -192,6 +203,9 @@ struct ShortcutSettings: View {
       recorder.completed = { store.config.effectiveShortcut = $0 }
       recorder.captureChanged = { store.captureShortcut($0) }
       store.refreshShortcutAccess()
+    }
+    .onChange(of: store.config.effectiveShortcut) { _, _ in
+      if store.fnSetupPending { store.cancelFnSetup() }
     }
     .onDisappear { recorder.stop() }
     .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification))

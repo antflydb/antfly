@@ -23,7 +23,10 @@ app="$PWD/dist/Antfly Dictation.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 # SwiftPM's native and Xcode build engines have different product layouts.
 bin_dir="$(swift build -c release --show-bin-path --cache-path "$PWD/.build/cache")"
-cp "$bin_dir/AntflyDictation" "$app/Contents/MacOS/AntflyDictation"
+# Replace the executable inode, so rebuilding cannot invalidate pages mapped by
+# an older running app while the user is still using it.
+cp "$bin_dir/AntflyDictation" "$app/Contents/MacOS/.AntflyDictation.next"
+mv -f "$app/Contents/MacOS/.AntflyDictation.next" "$app/Contents/MacOS/AntflyDictation"
 cp Info.plist "$app/Contents/Info.plist"
 cp Assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
 codesign --force --sign "${SIGNING_IDENTITY:--}" "$app"

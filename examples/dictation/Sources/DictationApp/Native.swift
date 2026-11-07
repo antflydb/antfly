@@ -74,6 +74,16 @@ import Security
         return noErr
       }, events.count, &events, Unmanaged.passUnretained(self).toOpaque(), &resources.handler)
   }
+  func unregister() {
+    bindingVersion = UUID()
+    pressed = false
+    if let reference = resources.reference {
+      UnregisterEventHotKey(reference)
+      resources.reference = nil
+    }
+    resources.tap?.stop()
+    resources.tap = nil
+  }
   var isAvailable: Bool {
     resources.tap?.isAvailable ?? (resources.reference != nil)
   }
@@ -421,5 +431,14 @@ final class CaptureConverter: @unchecked Sendable {
       }
       clipboard.writeObjects(items)
     }
+  }
+}
+
+@MainActor enum DesktopSettings {
+  static func open(_ pane: String) {
+    if let url = URL(string: "x-apple.systempreferences:" + pane), NSWorkspace.shared.open(url) {
+      return
+    }
+    _ = NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/System Settings.app"))
   }
 }

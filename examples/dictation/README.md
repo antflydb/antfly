@@ -94,7 +94,13 @@ Choose **Control + Option** in the shortcut presets for keyboards without Fn.
 The default behavior is hold-to-talk; toggle mode starts/stops on successive presses.
 The menu bar also provides record, finish, cancel, copy, and settings controls.
 
-Settings provide clickable Fn/Control/Option/Shift/Command buttons, a live shortcut
+**Set up Fn shortcut** selects, registers, and saves Fn in one action. If permission
+is missing, it opens Accessibility settings and finishes automatically when you
+return after granting access. Cancel setup keeps the previous shortcut. This action
+saves only the shortcut; other unsaved settings and credentials are not changed.
+**Keyboard settings** opens the Globe-key preferences without changing them.
+
+Settings also provide clickable Fn/Control/Option/Shift/Command buttons, a live shortcut
 label, **Record shortcut**, **Modifiers only**, and **Reset to Fn**. During selection,
 dictation is paused and captured keystrokes are consumed locally. Release your
 keys to accept the selection, or press Escape to cancel. Save settings to apply;
