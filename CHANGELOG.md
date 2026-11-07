@@ -24,7 +24,9 @@ All notable changes to Antfly will be documented in this file.
   trace. Definitions compile once; optional native stages discover models under
   the cascade deadline and failure policy. Shared generated-batch usage is
   apportioned across inputs and marked as estimated; retained typed failures
-  preserve measured usage. SDK-emitted first-stage `on_failure: fail` defaults
+  preserve measured usage, including costs from all completed siblings after a
+  token-limit overrun; later windows stop and generated costs remain apportioned.
+  SDK-emitted first-stage `on_failure: fail` defaults
   are accepted, public image-capability denials constrain the whole cascade,
   and committed failure receipts remain stable on replay. Resolver batches reuse
   one compiled classification plan. Resolver catalogs and decision enrichment producers that use a cascade

@@ -238,8 +238,12 @@ resolver `adjudicate` policy or decision enrichment.
   `choice` measures that value's probability instead of the selected value's.
 - The final answer is the last answering stage's. Usage is summed over the
   stages that ran for the input. Shared generated-batch usage is apportioned
-  evenly across the batch inputs, with integer remainders assigned in input
+  evenly across each call's inputs, with integer remainders assigned in input
   order, and marked `usage.estimated: true`. Request totals remain measured.
+  If reported usage exceeds a stage's token limit, every completed call is
+  charged before the stage fails and future windows stop. `keep_previous`
+  retains those paid costs in the failed-stage trace and final usage; inputs
+  that were not submitted incur no model usage.
 - Only choice and predicate questions are accepted, because bands read
   probabilities. Embedding-similarity deciders and nested cascades cannot be
   stages, and a band cannot follow a `verdict_only` generated stage.

@@ -129,3 +129,15 @@ an accuracy evaluation.
 These checks qualify the API revision. Production quality and throughput claims
 need current workload evidence; earlier performance artifacts retain their
 original source provenance.
+
+Post-call limits use metered failed outcomes in partial execution. Typed
+windows drain and account all completed siblings before validating results or
+enforcing actual token usage. An overrun clears the stage invocation's answers,
+preserves per-item costs (zero for unsubmitted inputs), and prevents later
+windows from being sent. Reaching the allowance exactly preserves completed
+answers and rejects only unsubmitted inputs. Generated windows and repairs use
+the same allowance; each physical call's usage is apportioned only among its
+actual inputs, with estimates explicitly labelled. Strict callers
+still receive an error; cancellation, deadlines and allocation failures remain
+fatal. Direct generated enrichments also retain their physical execution report
+on a post-call limit failure, and an exhausted allowance prevents another call.
