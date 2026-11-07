@@ -1,0 +1,67 @@
+{
+  "scope": "Owned document transform preparation and exact precommit validation",
+  "base_commit": "e374726826e9e76de6e88aa04a235e5e1bfa8ea2",
+  "compiled_source_patch_sha256": "06493fbe8175c55af779b290dfd99d60bb392a0402b60133022a929092ff859d",
+  "changes": [
+    "Runtime-free request-effect coalescing and graph projection helpers shared by ordinary execution and owned preparation.",
+    "Owned request operands and order-sensitive fingerprints independent of caller buffers.",
+    "Bounded transform base copies retain no read transaction; parsing, resolution, hashing, mapping and text preparation occur after capture admission releases.",
+    "Current revision/timestamp/content witnesses reject changed primary bytes with equal timestamps; unchanged primary content survives artifact-only revision changes.",
+    "Final commit borrows owned postimages and validates their source witnesses before primary mutation.",
+    "Known precommit stale inputs release admission and reprepare within the request busy budget; committed results never enter that retry path.",
+    "Owned increments and cheap text publication share one native checkpoint and, in the durable fixture, one sync."
+  ],
+  "validation": {
+    "pure_effect_extraction": {
+      "passed": 8,
+      "failed": 0,
+      "leaked": 0
+    },
+    "owned_request_and_input_witnesses": {
+      "passed": 7,
+      "failed": 0,
+      "leaked": 0
+    },
+    "integrated_storage": {
+      "passed": 12,
+      "failed": 0,
+      "leaked": 0,
+      "includes": [
+        "durable primary/text transform publication",
+        "dynamic multi-index publication",
+        "reserved source-sequence holes",
+        "same-timestamp primary conflict",
+        "artifact-only acceptance",
+        "legacy content-cache fallback",
+        "partial snapshot and operand allocation failure cleanup",
+        "stale owned commit refusal"
+      ]
+    },
+    "physical_capi_owner": {
+      "passed": 2,
+      "failed": 0,
+      "leaked": 0,
+      "includes": [
+        "one stale refusal followed by a single increment against the refreshed base",
+        "root/table registry pins released on preparation failure"
+      ]
+    },
+    "configuration": {
+      "optimize": "Debug",
+      "strip": true,
+      "jobs_per_build": 1,
+      "rss_cap_bytes": 32212254720
+    },
+    "source_isolation": "One reusable source-only mirror; original worktree cache and zig-out prefix reused."
+  },
+  "limits": [
+    "SQL relational preparation remains on its existing compatibility path.",
+    "Before-gate primary/index cohorts and durable posting-delta buffering are not integrated.",
+    "A follow-up in this task must make nested preparation/staging waits debit the same request admission budget; active preparation/proof time remains excluded.",
+    "Current full C API/crash/SDK/ABI, unchanged importer and optimized wolfspider qualification remain outstanding.",
+    "The earlier intermittent issue1015 invalid_argument has not been established resolved by these focused checks."
+  ],
+  "baseline_rebuilt_or_rerun": false,
+  "qualification_databases_archived": false,
+  "performance_claim": "Operation-count contracts only; no new end-to-end throughput or optimized claim."
+}

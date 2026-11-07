@@ -173,6 +173,7 @@ const json_helpers = @import("../../api/json_helpers.zig");
 
 test {
     _ = @import("mutation_effects.zig");
+    _ = @import("owned_transform_inputs.zig");
     _ = durable_outbox;
     _ = durable_outbox_store;
     _ = apply_receipts;
@@ -78210,6 +78211,30 @@ fn testNativeForegroundTextPrimary(dynamic: bool, durable: bool, holes: bool) !v
             try std.testing.expectEqual(@as(usize, 0), matches.hits.len);
         }
     }
+    // Transform resolution, mapping and tokenization use owned bases before
+    // admission. Its postimage and index activation share the same native cut.
+    const increment: types.BatchRequest = .{ .transforms = &.{.{ .key = "one", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }}, .sync_level = .write };
+    var transforming = (try Prepared.capture(a, &database)).?;
+    defer transforming.deinit();
+    try transforming.prepare(increment);
+    try transforming.captureTransformInputs(&database);
+    try transforming.finishOwnedTransforms(increment);
+    try std.testing.expect(transforming.resolvedFor(increment) != null);
+    try transforming.stageIndependentForegroundText();
+    try transforming.stageForegroundText(&database);
+    for (transforming.text.items) |item| if (item.publication == null) return error.ForegroundTransformNotPrepared;
+    const before_transform = backend.native_docstore.?.file.activeCheckpoint().commit_sequence;
+    const transform_barriers = backend.native_docstore.?.file.test_durability_syncs.load(.monotonic);
+    var transform_committed = false;
+    try database.batchTrackedWithPreparedDocuments(increment, &transform_committed, null, &transforming);
+    try std.testing.expect(transform_committed);
+    try std.testing.expectEqual(before_transform + 1, backend.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    if (durable) try std.testing.expectEqual(@as(u64, 1), backend.native_docstore.?.file.test_durability_syncs.load(.monotonic) - transform_barriers);
+    const transformed = (try database.get(a, "one")).?;
+    defer a.free(transformed);
+    var parsed_transform = try std.json.parseFromSlice(std.json.Value, a, transformed, .{});
+    defer parsed_transform.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_transform.value.object.get("count").?.integer);
     // A failed predicate must leave both the primary and prepared indexes
     // untouched, including their generation/progress records.
     const refused: types.BatchRequest = .{ .writes = &.{.{ .key = "one", .value = "{\"body\":\"mustnotpublish\"}" }}, .predicates = &.{.{ .key = "one", .expected_version = 0 }}, .sync_level = .write };
@@ -128106,6 +128131,93 @@ test "db batch resolves transforms against pending same-batch writes" {
         else => return error.TestExpectedEqual,
     }
     try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("tags").?.array.items.len);
+}
+
+test "owned transform inputs reject changed primary bodies with equal timestamps and accept unrelated artifacts" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("owned-transform-inputs");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const effects = @import("mutation_effects.zig");
+    const owned = @import("owned_transform_inputs.zig");
+    var request = try effects.OwnedRequest.init(a, &.{}, &.{}, &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "n", .value_json = "1" }} }});
+    defer request.deinit();
+    const bases = try owned.requiredBaseKeys(a, &request);
+    defer a.free(bases);
+    try db.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"n\":2}" }}, .timestamp_ns = 42 });
+    var inputs = try owned.Inputs.capture(a, db.core.store, bases, 8 * 1024 * 1024);
+    defer inputs.deinit();
+    try std.testing.expectError(error.InvalidDerivedApplyState, inputs.validate(db.core.store));
+    inputs.seal();
+    var resolved = try effects.coalesceCapturedKeyValueRequest(a, types.BatchWrite, request.writes, request.deletes, request.transforms, &inputs.snapshot);
+    defer resolved.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), resolved.writes.len);
+    try db.batch(.{ .writes = &.{.{ .key = "other", .value = "{}" }}, .timestamp_ns = 42 });
+    try inputs.validate(db.core.store);
+    const artifact = try internal_keys.chunkArtifactKeyAlloc(a, "counter", "chunks", 0);
+    defer a.free(artifact);
+    try db.core.store.put(artifact, "{\"text\":\"new derived data\"}");
+    try inputs.validate(db.core.store);
+    // Clear only the disposable cache. Legacy/adopted rows must compare the
+    // current primary correctly when their all-effects revision has advanced.
+    const revision = try @import("../document_mutation_revision.zig").keyForDocumentAlloc(a, "counter");
+    try db.core.store.delete(&@import("../document_mutation_revision.zig").contentKey(revision));
+    try inputs.validate(db.core.store);
+    try db.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"n\":10}" }}, .timestamp_ns = 42 });
+    try std.testing.expectError(error.OwnedPreparationStale, inputs.validate(db.core.store));
+}
+
+fn testOwnedTransformCaptureAllocation(a: Allocator, store: *docstore_mod.DocStore) !void {
+    const effects = @import("mutation_effects.zig");
+    const owned = @import("owned_transform_inputs.zig");
+    var request = try effects.OwnedRequest.init(a, &.{}, &.{}, &.{
+        .{ .key = "one", .operations = &.{.{ .op = .inc, .path = "n", .value_json = "1" }} },
+        .{ .key = "two", .operations = &.{.{ .op = .inc, .path = "n", .value_json = "1" }} },
+    });
+    defer request.deinit();
+    const bases = try owned.requiredBaseKeys(a, &request);
+    defer a.free(bases);
+    var inputs = try owned.Inputs.capture(a, store, bases, 8 * 1024 * 1024);
+    defer inputs.deinit();
+    inputs.seal();
+    var resolved = try effects.coalesceCapturedKeyValueRequest(a, types.BatchWrite, request.writes, request.deletes, request.transforms, &inputs.snapshot);
+    defer resolved.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), resolved.writes.len);
+}
+
+test "db owned transform preparation refuses stale bases before commit" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("owned-transform-commit-fence");
+    defer directory.cleanup();
+    var database = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer database.close();
+    try database.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"n\":2}" }}, .timestamp_ns = 42 });
+    const request: types.BatchRequest = .{ .transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "n", .value_json = "1" }} }} };
+    const Prepared = @import("prepared_document_batch.zig").Plan;
+    var prepared = (try Prepared.capture(a, &database)).?;
+    defer prepared.deinit();
+    try prepared.prepare(request);
+    try prepared.captureTransformInputs(&database);
+    try prepared.finishOwnedTransforms(request);
+    try std.testing.expect(prepared.resolvedFor(request) != null);
+    try database.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"n\":10}" }}, .timestamp_ns = 42 });
+    var committed = false;
+    try std.testing.expectError(error.OwnedPreparationStale, database.batchTrackedWithPreparedDocuments(request, &committed, null, &prepared));
+    try std.testing.expect(!committed);
+    try std.testing.expect(prepared.needs_reprepare);
+    const body = (try database.get(a, "counter")).?;
+    defer a.free(body);
+    try std.testing.expectEqualStrings("{\"n\":10}", body);
+}
+
+test "owned transform inputs release partial snapshots across every allocation failure" {
+    var directory = try TestDirectory.init("owned-transform-inputs-allocation");
+    defer directory.cleanup();
+    var db = try DB.open(std.testing.allocator, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{ .{ .key = "one", .value = "{\"n\":1}" }, .{ .key = "two", .value = "{\"n\":2}" } }, .timestamp_ns = 42 });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testOwnedTransformCaptureAllocation, .{db.core.store});
 }
 
 test "transform preparation fences durable bases before commit" {

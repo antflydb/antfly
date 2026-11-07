@@ -27,6 +27,8 @@ const Allocator = std.mem.Allocator;
 const persistent = @import("../persistent.zig");
 const native_publication = @import("../native_publication.zig");
 const docstore = @import("../docstore.zig");
+const mutation_effects = @import("mutation_effects.zig");
+const owned_transform_inputs = @import("owned_transform_inputs.zig");
 
 pub const Plan = struct {
     alloc: Allocator,
@@ -44,6 +46,12 @@ pub const Plan = struct {
     explicit_deletes: std.StringHashMapUnmanaged(void) = .empty,
     effects_seen: std.StringHashMapUnmanaged(void) = .empty,
     ordinal_postimages: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    effect_request: ?mutation_effects.OwnedRequest = null,
+    transform_base_keys: [][]const u8 = &.{},
+    transform_inputs: ?owned_transform_inputs.Inputs = null,
+    resolved_effects: ?mutation_effects.CoalescedKeyValueRequest(types.BatchWrite) = null,
+    transform_capture_declined: bool = false,
+    needs_reprepare: bool = false,
     const Text = struct { config: manager_mod.ForegroundTextProjection, built: manager_mod.PreparedTextMapperPublication, publication: ?*manager_mod.OwnedForegroundTextPublication = null };
     const Entry = struct { value: []const u8, ordinal_key: []const u8 = &.{}, template: mapper.ExtractedWrite, extracted: ?mapper.ExtractedWrite = null };
 
@@ -83,6 +91,10 @@ pub const Plan = struct {
         self.effects_seen.deinit(self.alloc);
         self.ordinal_postimages.deinit(self.alloc);
         self.rows.deinit(self.alloc);
+        if (self.resolved_effects) |*effects| effects.deinit(self.alloc);
+        if (self.transform_inputs) |*inputs| inputs.deinit();
+        self.alloc.free(self.transform_base_keys);
+        if (self.effect_request) |*request| request.deinit();
         self.catalog.release();
         if (self.schema) |*schema| schema.release();
         self.inputs.deinit();
@@ -90,6 +102,35 @@ pub const Plan = struct {
     }
 
     pub fn prepare(self: *Plan, request: types.BatchRequest) !void {
+        if (request.transforms.len != 0 and !self.transform_capture_declined) {
+            if (self.effect_request != null) return;
+            if (request.writes.len > 8192 or request.deletes.len > 8192 or request.transforms.len > 8192) return;
+            var bytes: usize = 0;
+            var operations: usize = 0;
+            for (request.writes) |write| {
+                if (write.json_null_fields.len != 0) return;
+                bytes +|= write.key.len +| write.value.len;
+            }
+            for (request.deletes) |key| bytes +|= key.len;
+            for (request.transforms) |transform| {
+                if (transform.key.len != 0 and transform.key[0] == 0) return;
+                bytes +|= transform.key.len;
+                operations +|= transform.operations.len;
+                for (transform.operations) |operation| bytes +|= operation.path.len +| if (operation.value_json) |value| value.len else 0;
+            }
+            if (bytes > 8 * 1024 * 1024 or operations > 8192) return;
+            self.effect_request = try mutation_effects.OwnedRequest.init(self.alloc, request.writes, request.deletes, request.transforms);
+            self.transform_base_keys = try owned_transform_inputs.requiredBaseKeys(self.alloc, &self.effect_request.?);
+            if (self.transform_base_keys.len == 0) {
+                self.transform_inputs = owned_transform_inputs.Inputs.empty(self.alloc);
+                try self.finishOwnedTransforms(request);
+            }
+            return;
+        }
+        try self.preparePostimages(request);
+    }
+
+    fn preparePostimages(self: *Plan, request: types.BatchRequest) !void {
         // Preparation is optional acceleration, with explicit request-local
         // limits. Larger atomic batches retain the ordinary authoritative path.
         if (request.writes.len > 8192 or request.deletes.len > 8192) return;
@@ -134,6 +175,59 @@ pub const Plan = struct {
         }
         try self.prepareForegroundText(request);
         try self.prepareAttempt();
+    }
+
+    pub fn needsTransformCapture(self: *const Plan) bool {
+        return self.effect_request != null and self.transform_inputs == null and !self.transform_capture_declined;
+    }
+
+    /// The caller holds only the short current namespace/lifetime fence. No
+    /// read transaction, runtime or borrowed body escapes this bounded copy.
+    pub fn captureTransformInputs(self: *Plan, database: anytype) !void {
+        if (!self.needsTransformCapture()) return;
+        if (!try self.matches(database)) {
+            self.transform_capture_declined = true;
+            return;
+        }
+        self.transform_inputs = owned_transform_inputs.Inputs.capture(self.alloc, database.core.store, self.transform_base_keys, 8 * 1024 * 1024) catch |err| switch (err) {
+            error.Unsupported, error.OwnedPreparationTooLarge, error.ResourceBudgetExceeded, error.OutOfMemory => blk: {
+                self.transform_capture_declined = true;
+                break :blk null;
+            },
+            else => return err,
+        };
+    }
+
+    /// Resolve, parse, map and tokenize the owned postimages after capture has
+    /// released admission. The authoritative commit later validates their bases.
+    pub fn finishOwnedTransforms(self: *Plan, request: types.BatchRequest) !void {
+        if (self.effect_request == null or self.resolved_effects != null) return;
+        const inputs = if (self.transform_inputs) |*value| value else {
+            if (self.transform_capture_declined) try self.preparePostimages(request);
+            return;
+        };
+        inputs.seal();
+        const owned = &self.effect_request.?;
+        self.resolved_effects = try mutation_effects.coalesceCapturedKeyValueRequest(self.alloc, types.BatchWrite, owned.writes, owned.deletes, owned.transforms, &inputs.snapshot);
+        var resolved = request;
+        resolved.writes = self.resolved_effects.?.writes;
+        resolved.deletes = self.resolved_effects.?.deletes;
+        resolved.transforms = &.{};
+        try self.preparePostimages(resolved);
+    }
+
+    pub fn resolvedFor(self: *Plan, request: types.BatchRequest) ?*const mutation_effects.CoalescedKeyValueRequest(types.BatchWrite) {
+        const owned = if (self.effect_request) |*value| value else return null;
+        if (!owned.matches(request.writes, request.deletes, request.transforms)) return null;
+        return if (self.resolved_effects) |*effects| effects else null;
+    }
+
+    pub fn validateOwnedTransforms(self: *Plan, store: *docstore.DocStore) !void {
+        const inputs = if (self.transform_inputs) |*value| value else return error.InvalidDerivedApplyState;
+        inputs.validate(store) catch |err| {
+            if (err == error.OwnedPreparationStale) self.needs_reprepare = true;
+            return err;
+        };
     }
 
     fn prepareForegroundText(self: *Plan, request: types.BatchRequest) !void {

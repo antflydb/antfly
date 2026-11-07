@@ -428,15 +428,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // predicate into the commit fence; retries rebuild both the effective
             // JSON and every derived artifact from a fresh base.
             const resolve_transforms_start_ns = monotonicTimeNs();
-            var transform_snapshot = try self.captureTransformReadSnapshot(
-                preparation_alloc,
-                types.BatchWrite,
-                req.writes,
-                req.deletes,
-                req.transforms,
-            );
-            defer transform_snapshot.deinit(preparation_alloc);
-            var effective_ops = try coalesceKeyValueRequest(
+            const owned_resolution = if (opts.prepared_documents) |plan| blk: {
+                const resolved = plan.resolvedFor(req) orelse break :blk null;
+                if (!try plan.matches(struct { core: @TypeOf(S.ownerField(self, "core").*), root_incarnation: u128 }{ .core = S.ownerField(self, "core").*, .root_incarnation = S.ownerField(self, "root_incarnation").* })) {
+                    plan.needs_reprepare = true;
+                    return error.OwnedPreparationStale;
+                }
+                break :blk resolved;
+            } else null;
+            var transform_snapshot = if (owned_resolution != null)
+                opts.prepared_documents.?.transform_inputs.?.snapshot
+            else
+                try self.captureTransformReadSnapshot(
+                    preparation_alloc,
+                    types.BatchWrite,
+                    req.writes,
+                    req.deletes,
+                    req.transforms,
+                );
+            defer if (owned_resolution == null) transform_snapshot.deinit(preparation_alloc);
+            var effective_ops = if (owned_resolution) |resolved| resolved.* else try coalesceKeyValueRequest(
                 self,
                 preparation_alloc,
                 types.BatchWrite,
@@ -445,7 +456,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 req.transforms,
                 &transform_snapshot,
             );
-            defer effective_ops.deinit(preparation_alloc);
+            defer if (owned_resolution == null) effective_ops.deinit(preparation_alloc);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.resolve_transforms_ns, resolve_transforms_start_ns);
 
             if (req.reject_graph_transform_projections and
@@ -1316,7 +1327,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.transaction_resolution == null) {
                 try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
             }
-            try self.validateTransformReadSnapshot(transform_snapshot);
+            if (owned_resolution != null)
+                try opts.prepared_documents.?.validateOwnedTransforms(S.ownerField(self, "core").*.store)
+            else
+                try self.validateTransformReadSnapshot(transform_snapshot);
             // Catches a concurrent commit to one of this batch's own write keys
             // between the pre-lock precompute read and this lock acquisition --
             // the race the catalog-generation check above cannot see, since it

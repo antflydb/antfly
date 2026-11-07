@@ -5044,6 +5044,38 @@ pub fn executeBatchWithReplayAdmissionRetry(ptr: ?*anyopaque, request: *anyopaqu
     return executeBatchWithReplayPreparation(ptr, request, null, apply);
 }
 
+fn prepareOwnedBatchAttempt(handle_ptr: ?*anyopaque, prepared: *?@import("../storage/db/prepared_document_batch.zig").Plan, request: db_mod.types.BatchRequest) !void {
+    const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
+    var refreshed = false;
+    if (prepared.*) |*plan| if (plan.needs_reprepare) {
+        const guard = enterHandle(handle_ptr, .read) orelse return error.InvalidArgument;
+        defer guard.leave();
+        if (guard.entry_error != null) return;
+        const replacement = try Prepared.capture(guard.handle.database().alloc, guard.handle.database());
+        plan.deinit();
+        prepared.* = replacement;
+        refreshed = true;
+    };
+    const plan = if (prepared.*) |*value| value else return;
+    if (refreshed) try plan.prepare(request);
+    try plan.prepareAttempt();
+    if (plan.needsTransformCapture()) {
+        const guard = enterHandle(handle_ptr, .read) orelse return error.InvalidArgument;
+        defer guard.leave();
+        if (guard.entry_error != null) return;
+        try plan.captureTransformInputs(guard.handle.database());
+    }
+    try plan.finishOwnedTransforms(request);
+    try plan.stageIndependentForegroundText();
+    {
+        const guard = enterHandle(handle_ptr, .read) orelse return error.InvalidArgument;
+        defer guard.leave();
+        if (guard.entry_error != null) return;
+        try plan.captureForegroundText(guard.handle.database());
+    }
+    try plan.finishForegroundText();
+}
+
 fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prepare_attempt: ?*const fn (*anyopaque) anyerror!void, apply: *const fn (*anyopaque, *Handle, *bool) anyerror!void) capi.ErrorCode {
     const alloc = std.heap.c_allocator;
     var entry = HandleEntry.capture(ptr) orelse return capi.mapError(error.InvalidArgument);
@@ -5072,39 +5104,44 @@ fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prep
         defer if (held) guard.leave();
         if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
         const receipt_scope = beginOutcomeReceipts(guard.lock_handle);
-        defer receipt_scope.end();
+        var receipt_scope_active = true;
+        defer if (receipt_scope_active) receipt_scope.end();
         const body_started = std.Io.Clock.awake.now(io).nanoseconds;
         var primary_committed = false;
         apply(request, guard.handle, &primary_committed) catch |err| {
             if (primary_committed) return batchFailureCode(err, true);
             if (err == error.CommitVisibilityNotSatisfied)
                 return capi.mapErrorContext(err, "batch primary write committed; derived visibility is pending; do not retry the batch");
-            if (err != error.LiteReplayBacklogExceeded or timeout_ms == 0) return capi.mapError(err);
+            const owned_stale = err == error.OwnedPreparationStale and prepare_attempt != null;
+            if (err != error.LiteReplayBacklogExceeded and !owned_stale) return capi.mapError(err);
+            if (timeout_ms == 0) return capi.mapError(if (owned_stale) error.FileBusy else err);
             // Busy timeout bounds admission/capacity waits, not active batch
             // preparation. A late, pre-commit quota refusal must still give
             // consumers their remaining wait budget after releasing the gate.
             // Committed visibility failures above never retry the mutation.
             const body_ns = @max(0, std.Io.Clock.awake.now(io).nanoseconds - body_started);
             deadline = std.Io.Clock.awake.now(io).nanoseconds + (guard.admission_budget_ns orelse 0);
-            if (guard.connection) |connection| {
+            if (!owned_stale) if (guard.connection) |connection| {
                 const stats = &connection.owner.publication_stats;
                 stats.replay_refused_preparation_ns +|= @intCast(body_ns);
-            }
+            };
             const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
-            if (remaining <= 0) return capi.mapError(err);
+            if (remaining <= 0) return capi.mapError(if (owned_stale) error.FileBusy else err);
             var hint: ?lite_backend.native.replay_admission.WaitHint = null;
-            if (guard.connection) |connection| {
+            if (!owned_stale) if (guard.connection) |connection| {
                 connection.owner.publication_stats.replay_backpressure_waits +|= 1;
                 hint = connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file.replay_wait_hint;
                 if (hint != null and wait_path == null) wait_path = alloc.dupe(u8, connection.path) catch |copy_err| return capi.mapError(copy_err);
-            }
+            };
+            receipt_scope.end();
+            receipt_scope_active = false;
             guard.leave();
             held = false;
             if (hint) |refusal| {
                 waitForReplayCapacity(ptr, wait_path.?, refusal, deadline, &backoff) catch |wait_err| return capi.mapError(wait_err);
             } else io.sleep(.fromNanoseconds(@min(backoff, remaining)), .awake) catch |sleep_err| return capi.mapError(sleep_err);
             // Do not reacquire an expired or canceled operation's admission.
-            if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return capi.mapError(error.LiteReplayBacklogExceeded);
+            if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return capi.mapError(if (owned_stale) error.FileBusy else error.LiteReplayBacklogExceeded);
             entry = HandleEntry.capture(ptr) orelse return capi.mapError(error.InvalidArgument);
             entry_owned = true;
             capi.clearLastError();
@@ -5134,7 +5171,7 @@ pub fn antfly_db_batch(
     const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
     var prepared: ?Prepared = null;
     defer if (prepared) |*plan| plan.deinit();
-    if (owned.req.writes.len != 0 or owned.req.deletes.len != 0) {
+    if (owned.req.writes.len != 0 or owned.req.deletes.len != 0 or owned.req.transforms.len != 0) {
         const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
         defer guard.leave();
         if (guard.entry_error) |code| {
@@ -5146,29 +5183,18 @@ pub fn antfly_db_batch(
     if (prepared) |*plan| plan.prepare(owned.req) catch |err| return capi.mapError(err);
     const Request = struct {
         owned: *StructBatchRequest,
-        prepared: ?*Prepared,
+        prepared: *?Prepared,
         handle_ptr: ?*anyopaque,
         fn prepare(raw: *anyopaque) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
-            const plan = request.prepared orelse return;
-            try plan.prepareAttempt();
-            try plan.stageIndependentForegroundText();
-            {
-                const guard = enterHandle(request.handle_ptr, .read) orelse return error.InvalidArgument;
-                defer guard.leave();
-                // Preparation is optional. Mutation admission below preserves
-                // the actual entry error and its outcome classification.
-                if (guard.entry_error != null) return;
-                try plan.captureForegroundText(guard.handle.database());
-            }
-            try plan.finishForegroundText();
+            try prepareOwnedBatchAttempt(request.handle_ptr, request.prepared, request.owned.req);
         }
         fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
-            try trackedBatchWithPreparedDocuments(handle.database(), request.owned.req, primary_committed, handle.selected_table_name, request.prepared);
+            try trackedBatchWithPreparedDocuments(handle.database(), request.owned.req, primary_committed, handle.selected_table_name, if (request.prepared.*) |*plan| plan else null);
         }
     };
-    var request: Request = .{ .owned = &owned, .prepared = if (prepared) |*plan| plan else null, .handle_ptr = handle_ptr };
+    var request: Request = .{ .owned = &owned, .prepared = &prepared, .handle_ptr = handle_ptr };
     return executeBatchWithReplayPreparation(handle_ptr, &request, Request.prepare, Request.apply);
 }
 
@@ -5216,7 +5242,7 @@ pub fn antfly_db_batch_json(
     const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
     var prepared: ?Prepared = null;
     defer if (prepared) |*plan| plan.deinit();
-    if (owned.req.writes.len != 0 or owned.req.deletes.len != 0) {
+    if (owned.req.writes.len != 0 or owned.req.deletes.len != 0 or owned.req.transforms.len != 0) {
         // Capture only immutable catalog inputs under ordinary handle lifetime
         // admission. Parsing/mapping and graph-field extraction then proceed
         // without either process gate or native writer lease.
@@ -5229,29 +5255,18 @@ pub fn antfly_db_batch_json(
     if (prepared) |*plan| plan.prepare(owned.req) catch |err| return capi.mapError(err);
     const Request = struct {
         owned: *@TypeOf(owned),
-        prepared: ?*Prepared,
+        prepared: *?Prepared,
         handle_ptr: ?*anyopaque,
         fn prepare(raw: *anyopaque) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
-            const plan = request.prepared orelse return;
-            try plan.prepareAttempt();
-            try plan.stageIndependentForegroundText();
-            {
-                const guard = enterHandle(request.handle_ptr, .read) orelse return error.InvalidArgument;
-                defer guard.leave();
-                // Preparation is optional. Mutation admission below preserves
-                // the actual entry error and its outcome classification.
-                if (guard.entry_error != null) return;
-                try plan.captureForegroundText(guard.handle.database());
-            }
-            try plan.finishForegroundText();
+            try prepareOwnedBatchAttempt(request.handle_ptr, request.prepared, request.owned.req);
         }
         fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
-            try trackedBatchWithPreparedDocuments(handle.database(), request.owned.req, primary_committed, handle.selected_table_name, request.prepared);
+            try trackedBatchWithPreparedDocuments(handle.database(), request.owned.req, primary_committed, handle.selected_table_name, if (request.prepared.*) |*plan| plan else null);
         }
     };
-    var request: Request = .{ .owned = &owned, .prepared = if (prepared) |*plan| plan else null, .handle_ptr = handle_ptr };
+    var request: Request = .{ .owned = &owned, .prepared = &prepared, .handle_ptr = handle_ptr };
     const code = executeBatchWithReplayPreparation(handle_ptr, &request, Request.prepare, Request.apply);
     if (code != .ok) return code;
     out_buf.* = .{ .ptr = response.?.ptr, .len = response.?.len };
@@ -12077,6 +12092,67 @@ test "capi native memory supersession uses filtered lexical indexes and durable 
     try std.testing.expectEqual(t.Lifecycle.superseded, record.lifecycle);
     const detail = try std.json.parseFromSliceLeaky(t.SupersessionProposalDetail, a, try nativeMemoryTestCall(handle, a, "alice", .supersession_proposal, .{}, "", "pair"), .{});
     try std.testing.expectEqual(t.SupersessionRelation.supersedes, detail.proposal.verdict.?);
+}
+
+test "capi owned transforms reprepare changed bases without applying an increment twice" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("owned-transform-reprepare");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{directory.path()});
+    defer a.free(path);
+    const wrapper = try @import("lite_connection.zig").open(path, .{ .no_sync = true, .profile = .native, .busy_timeout_ms = 5000 }, true);
+    const id = try publishHandle(wrapper);
+    defer antfly_db_close(id);
+    var output: capi.Buffer = .{};
+    defer antfly_buffer_free(&output);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(id, .fromSlice("{\"inserts\":{\"counter\":{\"n\":2}},\"sync_level\":\"write\"}"), &output));
+    antfly_buffer_free(&output);
+    const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
+    const increment: db_mod.types.BatchRequest = .{ .transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "n", .value_json = "1" }} }}, .sync_level = .write };
+    var prepared: ?Prepared = null;
+    defer if (prepared) |*plan| plan.deinit();
+    {
+        const guard = enterHandle(id, .read).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        prepared = try Prepared.capture(a, guard.handle.database());
+    }
+    try prepared.?.prepare(increment);
+    const Request = struct {
+        id: *anyopaque,
+        plan: *?Prepared,
+        request: db_mod.types.BatchRequest,
+        injected: bool = false,
+        refusals: usize = 0,
+        fn prepare(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try prepareOwnedBatchAttempt(self.id, self.plan, self.request);
+            if (!self.injected) {
+                self.injected = true;
+                var out: capi.Buffer = .{};
+                defer antfly_buffer_free(&out);
+                try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(self.id, .fromSlice("{\"inserts\":{\"counter\":{\"n\":10}},\"sync_level\":\"write\"}"), &out));
+            }
+        }
+        fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            trackedBatchWithPreparedDocuments(handle.database(), self.request, primary_committed, handle.selected_table_name, if (self.plan.*) |*plan| plan else null) catch |err| {
+                if (err == error.OwnedPreparationStale) {
+                    try std.testing.expect(!primary_committed.*);
+                    self.refusals += 1;
+                }
+                return err;
+            };
+        }
+    };
+    var request: Request = .{ .id = id, .plan = &prepared, .request = increment };
+    try std.testing.expectEqual(capi.ErrorCode.ok, executeBatchWithReplayPreparation(id, &request, Request.prepare, Request.apply));
+    try std.testing.expectEqual(@as(usize, 1), request.refusals);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(id, .fromSlice("counter"), &output));
+    var row = try std.json.parseFromSlice(std.json.Value, a, output.ptr.?[0..output.len], .{});
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 11), row.value.object.get("n").?.integer);
 }
 
 test "capi native batch preparation failure releases table and parent pins" {
