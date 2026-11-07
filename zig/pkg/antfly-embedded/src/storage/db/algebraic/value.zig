@@ -79,6 +79,13 @@ pub fn scalarFromJsonAlloc(alloc: Allocator, field_type: []const u8, json_value:
         },
         .datetime => switch (json_value) {
             .string => |v| try canonicalAlloc(alloc, .datetime, v),
+            .integer, .number_string => blk: {
+                const ns = @import("../../../datetime.zig").rangeNanoseconds(json_value) orelse break :blk null;
+                const unsigned = std.math.cast(u64, ns) orelse break :blk null;
+                const timestamp = try @import("../../../datetime.zig").formatDateTimeNsAlloc(alloc, unsigned);
+                defer alloc.free(timestamp);
+                break :blk try canonicalAlloc(alloc, .datetime, timestamp);
+            },
             else => null,
         },
         .bytes, .string => switch (json_value) {
@@ -200,4 +207,14 @@ test "value parses canonical scalar tag and payload" {
     defer deinitScalar(alloc, scalar);
     try std.testing.expectEqual(Kind.boolean, scalar.kind);
     try std.testing.expectEqualStrings("true", scalar.canonical);
+}
+
+test "time series integer timestamps retain exact temporal facts" {
+    const a = std.testing.allocator;
+    const encoded = (try scalarFromJsonAlloc(a, "datetime", .{ .number_string = "1793966400000000001" })).?;
+    defer a.free(encoded);
+    const parsed = try parseScalarAlloc(a, encoded);
+    defer deinitScalar(a, parsed);
+    try std.testing.expectEqual(Kind.datetime, parsed.kind);
+    try std.testing.expectEqualStrings("2026-11-06T12:00:00.000000001Z", parsed.canonical);
 }

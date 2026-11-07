@@ -3464,6 +3464,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
+    const time_series_tests = b.addTest(.{
+        .name = "time-series-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{"time series"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    time_series_tests.step.max_rss = 5 * 1024 * 1024 * 1024;
+    b.step("time-series-test", "Verify fixed temporal buckets, bounds and empty measurements").dependOn(&b.addRunArtifact(time_series_tests).step);
     const lib_storage_test_step = b.step("antfly-storage-test", "Run local and server storage tests");
     const graph_ttl_migration_tests = b.addTest(.{
         .name = "graph-ttl-migration-tests",

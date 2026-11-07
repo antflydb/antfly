@@ -528,6 +528,12 @@ pub const AggregationRequest = struct {
     date_ranges: ?[]const AggregationDateRange = null,
     /// Fixed interval for histogram aggregations
     interval: ?f32 = null,
+    /// Explicit half-open RFC3339 extent for date_histogram empty buckets. Does not filter documents; use a matching date range filter. Limited to 10000 buckets.
+    date_bounds: ?std.json.Value = null,
+    /// Positive elapsed duration for date_histogram (for example 30s, 5m, 1h30m). Mutually exclusive with calendar_interval. Nanosecond precision; UTC epoch alignment by default.
+    fixed_interval: ?[]const u8 = null,
+    /// RFC3339 alignment origin for fixed_interval. Calendar buckets use calendar boundaries and reject this field.
+    bucket_origin: ?[]const u8 = null,
     /// Calendar-aware interval for date_histogram aggregations
     calendar_interval: ?std.json.Value = null,
     /// Origin for geohash_grid aggregation (format: "lat,lon") Example: "37.7749,-122.4194"
@@ -559,6 +565,9 @@ pub const AggregationRequest = struct {
         .{ "ranges", "ranges", true },
         .{ "date_ranges", "date_ranges", true },
         .{ "interval", "interval", true },
+        .{ "date_bounds", "date_bounds", true },
+        .{ "fixed_interval", "fixed_interval", true },
+        .{ "bucket_origin", "bucket_origin", true },
         .{ "calendar_interval", "calendar_interval", true },
         .{ "origin", "origin", true },
         .{ "precision", "precision", true },
@@ -609,6 +618,18 @@ pub const AggregationRequest = struct {
         }
         if (self.interval) |value| {
             try jw.objectField("interval");
+            try jw.write(value);
+        }
+        if (self.date_bounds) |value| {
+            try jw.objectField("date_bounds");
+            try jw.write(value);
+        }
+        if (self.fixed_interval) |value| {
+            try jw.objectField("fixed_interval");
+            try jw.write(value);
+        }
+        if (self.bucket_origin) |value| {
+            try jw.objectField("bucket_origin");
             try jw.write(value);
         }
         if (self.calendar_interval) |value| {
@@ -831,6 +852,10 @@ pub const AlgebraicAggregateConfig = struct {
     name: []const u8,
     op: []const u8,
     group_by: ?[]const []const u8 = null,
+    /// Schema datetime column used for temporal grouping. Requires bucket.
+    time: ?[]const u8 = null,
+    /// UTC calendar unit (minute, hour, day, week, month, quarter, year) or positive fixed elapsed duration such as 5m. Requires time. Fixed buckets align to the Unix epoch.
+    bucket: ?[]const u8 = null,
     /// Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values.
     measure: ?[]const u8 = null,
 
@@ -839,6 +864,8 @@ pub const AlgebraicAggregateConfig = struct {
         .{ "name", "name", false },
         .{ "op", "op", false },
         .{ "group_by", "group_by", true },
+        .{ "time", "time", true },
+        .{ "bucket", "bucket", true },
         .{ "measure", "measure", true },
     };
 
@@ -858,6 +885,14 @@ pub const AlgebraicAggregateConfig = struct {
         try jw.write(self.op);
         if (self.group_by) |value| {
             try jw.objectField("group_by");
+            try jw.write(value);
+        }
+        if (self.time) |value| {
+            try jw.objectField("time");
+            try jw.write(value);
+        }
+        if (self.bucket) |value| {
+            try jw.objectField("bucket");
             try jw.write(value);
         }
         if (self.measure) |value| {
@@ -56978,6 +57013,8 @@ pub const TableRestoreStatus = struct {
 pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?u32 = null,
+    /// Physical document index order. Fields must have sortable scalar mappings. Changing the order requires rebuilding physical coverage. Relational tables use relational_indexes instead.
+    index_sort: ?[]const std.json.Value = null,
     storage_mode: ?TableStorageMode = null,
     /// External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables.
     base_source: ?ExternalLakeTableSource = null,
@@ -57011,6 +57048,7 @@ pub const TableSchema = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "version", "version", true },
+        .{ "index_sort", "index_sort", true },
         .{ "storage_mode", "storage_mode", true },
         .{ "base_source", "base_source", true },
         .{ "column_defaults", "column_defaults", true },
@@ -57040,6 +57078,10 @@ pub const TableSchema = struct {
         try jw.beginObject();
         if (self.version) |value| {
             try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.index_sort) |value| {
+            try jw.objectField("index_sort");
             try jw.write(value);
         }
         if (self.storage_mode) |value| {

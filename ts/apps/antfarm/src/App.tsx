@@ -49,6 +49,7 @@ const tableSections = new Set([
   "semantic",
   "graph",
   "faceted",
+  "time-series",
   "bulk",
   "document-builder",
   "artifacts",

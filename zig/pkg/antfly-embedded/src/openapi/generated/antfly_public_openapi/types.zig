@@ -508,6 +508,12 @@ pub const AggregationRequest = struct {
     date_ranges: ?[]const AggregationDateRange = null,
     /// Fixed interval for histogram aggregations
     interval: ?f32 = null,
+    /// Explicit half-open RFC3339 extent for date_histogram empty buckets. Does not filter documents; use a matching date range filter. Limited to 10000 buckets.
+    date_bounds: ?std.json.Value = null,
+    /// Positive elapsed duration for date_histogram (for example 30s, 5m, 1h30m). Mutually exclusive with calendar_interval. Nanosecond precision; UTC epoch alignment by default.
+    fixed_interval: ?[]const u8 = null,
+    /// RFC3339 alignment origin for fixed_interval. Calendar buckets use calendar boundaries and reject this field.
+    bucket_origin: ?[]const u8 = null,
     /// Calendar-aware interval for date_histogram aggregations
     calendar_interval: ?std.json.Value = null,
     /// Origin for geohash_grid aggregation (format: "lat,lon") Example: "37.7749,-122.4194"
@@ -539,6 +545,9 @@ pub const AggregationRequest = struct {
         .{ "ranges", "ranges", true },
         .{ "date_ranges", "date_ranges", true },
         .{ "interval", "interval", true },
+        .{ "date_bounds", "date_bounds", true },
+        .{ "fixed_interval", "fixed_interval", true },
+        .{ "bucket_origin", "bucket_origin", true },
         .{ "calendar_interval", "calendar_interval", true },
         .{ "origin", "origin", true },
         .{ "precision", "precision", true },
@@ -589,6 +598,18 @@ pub const AggregationRequest = struct {
         }
         if (self.interval) |value| {
             try jw.objectField("interval");
+            try jw.write(value);
+        }
+        if (self.date_bounds) |value| {
+            try jw.objectField("date_bounds");
+            try jw.write(value);
+        }
+        if (self.fixed_interval) |value| {
+            try jw.objectField("fixed_interval");
+            try jw.write(value);
+        }
+        if (self.bucket_origin) |value| {
+            try jw.objectField("bucket_origin");
             try jw.write(value);
         }
         if (self.calendar_interval) |value| {

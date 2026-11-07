@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from dateutil.parser import isoparse
 
 from ..models.aggregation_type import AggregationType
 from ..models.calendar_interval import CalendarInterval
@@ -16,6 +18,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.aggregation_date_range import AggregationDateRange
     from ..models.aggregation_range import AggregationRange
+    from ..models.aggregation_request_date_bounds import AggregationRequestDateBounds
     from ..models.aggregation_request_sub_aggregations import AggregationRequestSubAggregations
     from ..models.algebraic_aggregation_join import AlgebraicAggregationJoin
     from ..models.autocomplete_query import AutocompleteQuery
@@ -77,6 +80,12 @@ class AggregationRequest:
         ranges (list[AggregationRange] | Unset): Ranges for range aggregations
         date_ranges (list[AggregationDateRange] | Unset): Date ranges for date_range aggregations
         interval (float | Unset): Fixed interval for histogram aggregations
+        date_bounds (AggregationRequestDateBounds | Unset): Explicit half-open RFC3339 extent for date_histogram empty
+            buckets. Does not filter documents; use a matching date range filter. Limited to 10000 buckets.
+        fixed_interval (str | Unset): Positive elapsed duration for date_histogram (for example 30s, 5m, 1h30m).
+            Mutually exclusive with calendar_interval. Nanosecond precision; UTC epoch alignment by default.
+        bucket_origin (datetime.datetime | Unset): RFC3339 alignment origin for fixed_interval. Calendar buckets use
+            calendar boundaries and reject this field.
         calendar_interval (CalendarInterval | Unset): Calendar-aware interval for date_histogram aggregations
         origin (str | Unset): Origin for geohash_grid aggregation (format: "lat,lon")
             Example: "37.7749,-122.4194"
@@ -112,6 +121,9 @@ class AggregationRequest:
     ranges: list[AggregationRange] | Unset = UNSET
     date_ranges: list[AggregationDateRange] | Unset = UNSET
     interval: float | Unset = UNSET
+    date_bounds: AggregationRequestDateBounds | Unset = UNSET
+    fixed_interval: str | Unset = UNSET
+    bucket_origin: datetime.datetime | Unset = UNSET
     calendar_interval: CalendarInterval | Unset = UNSET
     origin: str | Unset = UNSET
     precision: int | Unset = UNSET
@@ -218,6 +230,16 @@ class AggregationRequest:
                 date_ranges.append(date_ranges_item)
 
         interval = self.interval
+
+        date_bounds: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.date_bounds, Unset):
+            date_bounds = self.date_bounds.to_dict()
+
+        fixed_interval = self.fixed_interval
+
+        bucket_origin: str | Unset = UNSET
+        if not isinstance(self.bucket_origin, Unset):
+            bucket_origin = self.bucket_origin.isoformat()
 
         calendar_interval: str | Unset = UNSET
         if not isinstance(self.calendar_interval, Unset):
@@ -339,6 +361,12 @@ class AggregationRequest:
             field_dict["date_ranges"] = date_ranges
         if interval is not UNSET:
             field_dict["interval"] = interval
+        if date_bounds is not UNSET:
+            field_dict["date_bounds"] = date_bounds
+        if fixed_interval is not UNSET:
+            field_dict["fixed_interval"] = fixed_interval
+        if bucket_origin is not UNSET:
+            field_dict["bucket_origin"] = bucket_origin
         if calendar_interval is not UNSET:
             field_dict["calendar_interval"] = calendar_interval
         if origin is not UNSET:
@@ -366,6 +394,7 @@ class AggregationRequest:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.aggregation_date_range import AggregationDateRange
         from ..models.aggregation_range import AggregationRange
+        from ..models.aggregation_request_date_bounds import AggregationRequestDateBounds
         from ..models.aggregation_request_sub_aggregations import AggregationRequestSubAggregations
         from ..models.algebraic_aggregation_join import AlgebraicAggregationJoin
         from ..models.autocomplete_query import AutocompleteQuery
@@ -436,6 +465,22 @@ class AggregationRequest:
                 date_ranges.append(date_ranges_item)
 
         interval = d.pop("interval", UNSET)
+
+        _date_bounds = d.pop("date_bounds", UNSET)
+        date_bounds: AggregationRequestDateBounds | Unset
+        if isinstance(_date_bounds, Unset):
+            date_bounds = UNSET
+        else:
+            date_bounds = AggregationRequestDateBounds.from_dict(_date_bounds)
+
+        fixed_interval = d.pop("fixed_interval", UNSET)
+
+        _bucket_origin = d.pop("bucket_origin", UNSET)
+        bucket_origin: datetime.datetime | Unset
+        if isinstance(_bucket_origin, Unset):
+            bucket_origin = UNSET
+        else:
+            bucket_origin = isoparse(_bucket_origin)
 
         _calendar_interval = d.pop("calendar_interval", UNSET)
         calendar_interval: CalendarInterval | Unset
@@ -782,6 +827,9 @@ class AggregationRequest:
             ranges=ranges,
             date_ranges=date_ranges,
             interval=interval,
+            date_bounds=date_bounds,
+            fixed_interval=fixed_interval,
+            bucket_origin=bucket_origin,
             calendar_interval=calendar_interval,
             origin=origin,
             precision=precision,

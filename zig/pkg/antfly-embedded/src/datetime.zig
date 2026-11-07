@@ -285,3 +285,45 @@ test "signed civil calendar roundtrips the RFC3339 lower year boundary" {
         }
     }
 }
+
+/// Positive fixed elapsed durations. Calendar months/years are intentionally not
+/// accepted: their length depends on calendar boundaries. Integer components
+/// preserve nanoseconds without passing through floating point.
+pub fn durationNs(text: []const u8) ?u64 {
+    var pos: usize = 0;
+    var total: u64 = 0;
+    while (pos < text.len) {
+        const start = pos;
+        while (pos < text.len and std.ascii.isDigit(text[pos])) : (pos += 1) {}
+        if (start == pos) return null;
+        const amount = std.fmt.parseInt(u64, text[start..pos], 10) catch return null;
+        const units = .{ "ns", "us", "ms", "s", "m", "h", "d", "w" };
+        const sizes = .{ 1, std.time.ns_per_us, std.time.ns_per_ms, std.time.ns_per_s, std.time.ns_per_min, std.time.ns_per_hour, std.time.ns_per_day, 7 * std.time.ns_per_day };
+        var found = false;
+        inline for (units, sizes) |suffix, size| {
+            if (!found and std.mem.startsWith(u8, text[pos..], suffix)) {
+                total = std.math.add(u64, total, std.math.mul(u64, amount, size) catch return null) catch return null;
+                pos += suffix.len;
+                found = true;
+            }
+        }
+        if (!found) return null;
+    }
+    return if (total == 0) null else total;
+}
+
+pub fn binSigned(ns: i128, every_ns: u64, origin_ns: i128) ?i128 {
+    if (every_ns == 0) return null;
+    const delta = std.math.sub(i128, ns, origin_ns) catch return null;
+    const offset = std.math.mul(i128, @divFloor(delta, every_ns), every_ns) catch return null;
+    return std.math.add(i128, origin_ns, offset) catch null;
+}
+
+test "fixed temporal bins preserve offsets precision and floor before origin" {
+    const a = parseRfc3339ToSignedNs("2026-11-06T12:07:00.000000001+01:00").?;
+    const origin = parseRfc3339ToSignedNs("2026-11-06T11:02:00Z").?;
+    try std.testing.expectEqual(origin + 5 * std.time.ns_per_min, binSigned(a, durationNs("5m").?, origin).?);
+    try std.testing.expectEqual(@as(i128, -10), binSigned(-1, 10, 0).?);
+    try std.testing.expectEqual(@as(u64, 90 * std.time.ns_per_min), durationNs("1h30m").?);
+    for ([_][]const u8{ "", "0s", "-1m", "1M", "1.5s", "18446744073709551615w" }) |text| try std.testing.expect(durationNs(text) == null);
+}

@@ -10048,6 +10048,20 @@ export interface components {
              * @description Fixed interval for histogram aggregations
              */
             interval?: number;
+            /** @description Explicit half-open RFC3339 extent for date_histogram empty buckets. Does not filter documents; use a matching date range filter. Limited to 10000 buckets. */
+            date_bounds?: {
+                /** Format: date-time */
+                start: string;
+                /** Format: date-time */
+                end: string;
+            };
+            /** @description Positive elapsed duration for date_histogram (for example 30s, 5m, 1h30m). Mutually exclusive with calendar_interval. Nanosecond precision; UTC epoch alignment by default. */
+            fixed_interval?: string;
+            /**
+             * Format: date-time
+             * @description RFC3339 alignment origin for fixed_interval. Calendar buckets use calendar boundaries and reject this field.
+             */
+            bucket_origin?: string;
             /** @description Calendar-aware interval for date_histogram aggregations */
             calendar_interval?: components["schemas"]["CalendarInterval"];
             /**
@@ -18547,6 +18561,10 @@ export interface components {
             /** @enum {string} */
             op: "count" | "sum" | "avg" | "min" | "max";
             group_by?: string[];
+            /** @description Schema datetime column used for temporal grouping. Requires bucket. */
+            time?: string;
+            /** @description UTC calendar unit (minute, hour, day, week, month, quarter, year) or positive fixed elapsed duration such as 5m. Requires time. Fixed buckets align to the Unix epoch. */
+            bucket?: string;
             /** @description Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values. */
             measure?: string;
         };
@@ -19242,6 +19260,15 @@ export interface components {
              * @description Backend-managed schema generation used for migrations. Omit it from create and update requests.
              */
             readonly version?: number;
+            /** @description Physical document index order. Fields must have sortable scalar mappings. Changing the order requires rebuilding physical coverage. Relational tables use relational_indexes instead. */
+            index_sort?: {
+                field: string;
+                /**
+                 * @default asc
+                 * @enum {string}
+                 */
+                order?: "asc" | "desc";
+            }[];
             storage_mode?: components["schemas"]["TableStorageMode"];
             /** @description External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables. */
             base_source?: components["schemas"]["ExternalLakeTableSource"];

@@ -63,6 +63,9 @@ pub const SearchAggregationRequest = struct {
     interval: f64 = 0,
     calendar_interval: []const u8 = "",
     fixed_interval: []const u8 = "",
+    bucket_origin: []const u8 = "",
+    date_bounds_start: []const u8 = "",
+    date_bounds_end: []const u8 = "",
     min_doc_count: i64 = 0,
     significance_algorithm: []const u8 = "",
     background_query: ?BackgroundQuery = null,
@@ -196,16 +199,18 @@ pub fn isPipelineAggregation(agg_type: []const u8) bool {
 }
 
 pub fn algebraicBucketName(request: SearchAggregationRequest) ?[]const u8 {
-    const interval = if (request.calendar_interval.len > 0)
-        request.calendar_interval
-    else if (request.fixed_interval.len > 0)
-        request.fixed_interval
-    else
-        return null;
-    if (std.mem.eql(u8, interval, "hour") or std.mem.eql(u8, interval, "1h") or std.mem.eql(u8, interval, "60m")) return "hour";
-    if (std.mem.eql(u8, interval, "day") or std.mem.eql(u8, interval, "1d") or std.mem.eql(u8, interval, "24h")) return "day";
-    if (std.mem.eql(u8, interval, "month") or std.mem.eql(u8, interval, "1M")) return "month";
-    return null;
+    if (request.bucket_origin.len > 0 or (request.calendar_interval.len > 0 and request.fixed_interval.len > 0)) return null;
+    const cylinder = @import("algebraic/cylinder.zig");
+    if (request.fixed_interval.len > 0) return cylinder.canonicalBucketName(request.fixed_interval);
+    const interval = request.calendar_interval;
+    if (std.mem.eql(u8, interval, "1m")) return "minute";
+    if (std.mem.eql(u8, interval, "1h") or std.mem.eql(u8, interval, "60m")) return "hour";
+    if (std.mem.eql(u8, interval, "1d") or std.mem.eql(u8, interval, "24h")) return "day";
+    if (std.mem.eql(u8, interval, "1w")) return "week";
+    if (std.mem.eql(u8, interval, "1M")) return "month";
+    if (std.mem.eql(u8, interval, "1q")) return "quarter";
+    if (std.mem.eql(u8, interval, "1y")) return "year";
+    return cylinder.canonicalBucketName(interval);
 }
 
 pub fn significantTermsCandidateLimit(size: usize) !usize {

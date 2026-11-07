@@ -18,6 +18,7 @@ from .aggregation_bucket_sub_aggregations import AggregationBucketSubAggregation
 from .aggregation_date_range import AggregationDateRange
 from .aggregation_range import AggregationRange
 from .aggregation_request import AggregationRequest
+from .aggregation_request_date_bounds import AggregationRequestDateBounds
 from .aggregation_request_sub_aggregations import AggregationRequestSubAggregations
 from .aggregation_result import AggregationResult
 from .aggregation_type import AggregationType
@@ -2489,6 +2490,8 @@ from .table_restore_status import TableRestoreStatus
 from .table_restore_status_status import TableRestoreStatusStatus
 from .table_schema import TableSchema
 from .table_schema_document_schemas import TableSchemaDocumentSchemas
+from .table_schema_index_sort_item import TableSchemaIndexSortItem
+from .table_schema_index_sort_item_order import TableSchemaIndexSortItemOrder
 from .table_schema_patch import TableSchemaPatch
 from .table_shards import TableShards
 from .table_statistics import TableStatistics
@@ -2650,6 +2653,7 @@ __all__ = (
     "AggregationDateRange",
     "AggregationRange",
     "AggregationRequest",
+    "AggregationRequestDateBounds",
     "AggregationRequestSubAggregations",
     "AggregationResult",
     "AggregationType",
@@ -4897,6 +4901,8 @@ __all__ = (
     "TableRestoreStatusStatus",
     "TableSchema",
     "TableSchemaDocumentSchemas",
+    "TableSchemaIndexSortItem",
+    "TableSchemaIndexSortItemOrder",
     "TableSchemaPatch",
     "TableShards",
     "TablespaceCatalogRecord",

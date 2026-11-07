@@ -1434,6 +1434,7 @@ pub fn fillDateHistogramBucketKeys(
 
     var current = first_key;
     while (current <= last_key) {
+        if (keys.items.len >= 10000) return error.QueryCandidateBudgetExceeded;
         try keys.append(alloc, current);
         const next = try nextDateHistogramBucketKey(current, interval);
         if (next <= current) break;
@@ -1450,6 +1451,8 @@ pub fn nextDateHistogramBucketKey(current: u64, interval: search_agg_mod.DateInt
         .week => current + 7 * std.time.ns_per_day,
         .month => try addCalendarMonths(current, 1),
         .year => try addCalendarYears(current, 1),
+        .quarter => try addCalendarMonths(current, 3),
+        .fixed => |spec| std.math.add(u64, current, spec.every_ns) catch return error.InvalidAggregation,
     };
 }
 
@@ -1508,47 +1511,11 @@ pub fn extractTimestampFieldFromStoredJson(alloc: Allocator, raw_json: []const u
 }
 
 pub fn parseDateInterval(request: JsonSearchAggregationRequest) !search_agg_mod.DateInterval {
-    const value = if (request.calendar_interval.len > 0) request.calendar_interval else request.fixed_interval;
-    if (std.mem.eql(u8, value, "minute") or std.mem.eql(u8, value, "1m")) return .minute;
-    if (std.mem.eql(u8, value, "hour") or std.mem.eql(u8, value, "1h")) return .hour;
-    if (std.mem.eql(u8, value, "day") or std.mem.eql(u8, value, "1d")) return .day;
-    if (std.mem.eql(u8, value, "week") or std.mem.eql(u8, value, "1w")) return .week;
-    if (std.mem.eql(u8, value, "month")) return .month;
-    if (std.mem.eql(u8, value, "year")) return .year;
-    return error.UnsupportedAggregation;
+    return search_agg_mod.parseDateInterval(request.calendar_interval, request.fixed_interval, "");
 }
 
 pub fn parseRfc3339ToNs(text: []const u8) !?u64 {
-    if (text.len < 20) return null;
-    if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
-
-    const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(i64, text[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(i64, text[8..10], 10) catch return null;
-    const hour = std.fmt.parseInt(i64, text[11..13], 10) catch return null;
-    const minute = std.fmt.parseInt(i64, text[14..16], 10) catch return null;
-    const second = std.fmt.parseInt(i64, text[17..19], 10) catch return null;
-
-    var idx: usize = 19;
-    var nanos: u64 = 0;
-    if (idx < text.len and text[idx] == '.') {
-        idx += 1;
-        const frac_start = idx;
-        while (idx < text.len and text[idx] >= '0' and text[idx] <= '9') : (idx += 1) {}
-        const frac = text[frac_start..idx];
-        if (frac.len == 0 or frac.len > 9) return null;
-        var frac_ns = std.fmt.parseInt(u64, frac, 10) catch return null;
-        var scale: usize = frac.len;
-        while (scale < 9) : (scale += 1) frac_ns *= 10;
-        nanos = frac_ns;
-    }
-    if (idx >= text.len or text[idx] != 'Z' or idx + 1 != text.len) return null;
-
-    const days = daysFromCivil(year, month, day);
-    if (days < 0) return null;
-    const secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    if (secs < 0) return null;
-    return @as(u64, @intCast(secs)) * std.time.ns_per_s + nanos;
+    return @import("../datetime.zig").parseRfc3339ToNs(text);
 }
 
 pub fn daysFromCivil(year: i64, month: i64, day: i64) i64 {

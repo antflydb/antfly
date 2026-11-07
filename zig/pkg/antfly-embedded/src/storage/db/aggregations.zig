@@ -217,6 +217,86 @@ fn computeSingleAggregation(
     ctx: Context,
     allow_algebraic: bool,
 ) anyerror!SearchAggregationResult {
+    if (!std.mem.eql(u8, request.type, "date_histogram")) return computeSingleAggregationImpl(alloc, request, hits, ctx, allow_algebraic);
+    _ = try parseDateInterval(request);
+    var result = try computeSingleAggregationImpl(alloc, request, hits, ctx, allow_algebraic);
+    errdefer result.deinit(alloc);
+    try completeDateHistogram(alloc, request, &result, ctx);
+    return result;
+}
+
+/// Shared presentation fold for scanning and distributed algebraic execution.
+pub fn completeDateHistogram(alloc: Allocator, request: SearchAggregationRequest, result: *SearchAggregationResult, ctx: Context) anyerror!void {
+    const interval = try parseDateInterval(request);
+    if (request.date_bounds_start.len == 0 and request.date_bounds_end.len == 0) return;
+    const dt = @import("../../datetime.zig");
+    const start = dt.parseRfc3339ToNs(request.date_bounds_start) orelse return error.InvalidAggregation;
+    const end = dt.parseRfc3339ToNs(request.date_bounds_end) orelse return error.InvalidAggregation;
+    if (start >= end or request.min_doc_count != 0) return error.InvalidAggregation;
+    // Pipelines must run after gap generation; bounded series currently accepts
+    // primary metrics only, rather than producing incorrect pipeline values.
+    for (request.aggregations) |child| if (contract.isPipelineAggregation(child.type)) return error.InvalidAggregation;
+    const first_key = std.math.cast(u64, try search_agg_mod.truncateSignedToInterval(start, interval)) orelse return error.InvalidAggregation;
+    const last_key = std.math.cast(u64, try search_agg_mod.truncateSignedToInterval(end - 1, interval)) orelse return error.InvalidAggregation;
+    const keys = try fillDateHistogramBucketKeys(alloc, first_key, last_key, interval);
+    defer alloc.free(keys);
+    var buckets: std.ArrayList(SearchAggregationBucket) = .empty;
+    errdefer {
+        for (buckets.items) |*bucket| bucket.deinit(alloc);
+        buckets.deinit(alloc);
+    }
+    var existing = std.AutoHashMap(u64, usize).init(alloc);
+    defer existing.deinit();
+    for (result.buckets, 0..) |bucket, i| {
+        const key = std.mem.trim(u8, bucket.key_json, "\"");
+        if (dt.parseRfc3339ToNs(key)) |ns| try existing.put(ns, i);
+    }
+    for (keys) |key| {
+        const formatted = try formatRfc3339Bucket(alloc, key);
+        defer alloc.free(formatted);
+        const key_json = try std.json.Stringify.valueAlloc(alloc, formatted, .{});
+        const found = existing.get(key);
+        if (found) |i| {
+            alloc.free(key_json);
+            if (result.buckets[i].count == 0 and result.buckets[i].aggregations.len == 0 and request.aggregations.len > 0) {
+                result.buckets[i].aggregations = try computeSearchAggregationsAtDepth(alloc, request.aggregations, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, ctx, false);
+            }
+            try buckets.append(alloc, result.buckets[i]);
+            result.buckets[i] = .{ .key_json = "", .count = 0 };
+        } else {
+            errdefer alloc.free(key_json);
+            const nested = try computeSearchAggregationsAtDepth(alloc, request.aggregations, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, ctx, false);
+            errdefer {
+                for (nested) |*child| child.deinit(alloc);
+                alloc.free(nested);
+            }
+            try buckets.append(alloc, .{ .key_json = key_json, .count = 0, .aggregations = nested });
+        }
+    }
+    for (result.buckets) |*bucket| if (bucket.key_json.len > 0) {
+        try buckets.append(alloc, bucket.*);
+        bucket.* = .{ .key_json = "", .count = 0 };
+    };
+    if (buckets.items.len > 10000) return error.QueryCandidateBudgetExceeded;
+    std.mem.sort(SearchAggregationBucket, buckets.items, {}, struct {
+        fn lessThan(_: void, left: SearchAggregationBucket, right: SearchAggregationBucket) bool {
+            const left_ns = @import("../../datetime.zig").parseRfc3339ToNs(std.mem.trim(u8, left.key_json, "\"")).?;
+            const right_ns = @import("../../datetime.zig").parseRfc3339ToNs(std.mem.trim(u8, right.key_json, "\"")).?;
+            return left_ns < right_ns;
+        }
+    }.lessThan);
+    if (result.buckets.len > 0) alloc.free(result.buckets);
+    result.buckets = &.{};
+    result.buckets = try buckets.toOwnedSlice(alloc);
+}
+
+fn computeSingleAggregationImpl(
+    alloc: Allocator,
+    request: SearchAggregationRequest,
+    hits: []const types.SearchHit,
+    ctx: Context,
+    allow_algebraic: bool,
+) anyerror!SearchAggregationResult {
     if (allow_algebraic) {
         // Source-value aggregation semantics stay logical. Resolve a compatible
         // typed/keyword representation only for the indexed execution attempt;
@@ -3697,6 +3777,19 @@ pub fn algebraicDateHistogramAggregationFromDistributedPartialsAlloc(
     constraints: []const FixedConstraint,
     merged: algebraic_mod.distributed.MergeSet,
 ) !?SearchAggregationResult {
+    var result = (try algebraicDateHistogramAggregationFromDistributedPartialsImpl(alloc, index, request, constraints, merged)) orelse return null;
+    errdefer result.deinit(alloc);
+    try completeDateHistogram(alloc, request, &result, .{});
+    return result;
+}
+
+fn algebraicDateHistogramAggregationFromDistributedPartialsImpl(
+    alloc: Allocator,
+    index: *algebraic_mod.index.Index,
+    request: SearchAggregationRequest,
+    constraints: []const FixedConstraint,
+    merged: algebraic_mod.distributed.MergeSet,
+) !?SearchAggregationResult {
     if (request.field.len == 0) return null;
     const bucket_name = algebraicBucketName(request) orelse return null;
     const interval = parseDateInterval(request) catch return null;
@@ -4001,13 +4094,8 @@ fn algebraicDistributedDateRangePlanAlloc(
 }
 
 fn dateIntervalFromBucketName(bucket: []const u8) ?search_agg_mod.DateInterval {
-    if (std.mem.eql(u8, bucket, "minute") or std.mem.eql(u8, bucket, "1m")) return .minute;
-    if (std.mem.eql(u8, bucket, "hour") or std.mem.eql(u8, bucket, "1h") or std.mem.eql(u8, bucket, "60m")) return .hour;
-    if (std.mem.eql(u8, bucket, "day") or std.mem.eql(u8, bucket, "1d") or std.mem.eql(u8, bucket, "24h")) return .day;
-    if (std.mem.eql(u8, bucket, "week") or std.mem.eql(u8, bucket, "1w")) return .week;
-    if (std.mem.eql(u8, bucket, "month") or std.mem.eql(u8, bucket, "1M")) return .month;
-    if (std.mem.eql(u8, bucket, "year") or std.mem.eql(u8, bucket, "1y")) return .year;
-    return null;
+    return search_agg_mod.parseDateInterval("", bucket, "") catch
+        (search_agg_mod.parseDateInterval(bucket, "", "") catch null);
 }
 
 fn dateRangesAlignToInterval(ranges: []const DateRangeRequest, interval: search_agg_mod.DateInterval) bool {
@@ -6709,16 +6797,7 @@ fn computeAdaptiveDateHistogramAggregation(
 }
 
 pub fn algebraicBucketName(request: SearchAggregationRequest) ?[]const u8 {
-    const interval = if (request.calendar_interval.len > 0)
-        request.calendar_interval
-    else if (request.fixed_interval.len > 0)
-        request.fixed_interval
-    else
-        return null;
-    if (std.mem.eql(u8, interval, "hour") or std.mem.eql(u8, interval, "1h") or std.mem.eql(u8, interval, "60m")) return "hour";
-    if (std.mem.eql(u8, interval, "day") or std.mem.eql(u8, interval, "1d") or std.mem.eql(u8, interval, "24h")) return "day";
-    if (std.mem.eql(u8, interval, "month") or std.mem.eql(u8, interval, "1M")) return "month";
-    return null;
+    return contract.algebraicBucketName(request);
 }
 
 fn algebraicNestedMetricResults(
@@ -15708,11 +15787,11 @@ test "algebraic aggregation planner reads ready adaptive tensor materializations
 }
 
 test "date interval aliases align with algebraic buckets" {
-    try std.testing.expectEqual(search_agg_mod.DateInterval.hour, try parseDateInterval(.{ .name = "by_time", .type = "date_histogram", .field = "created_at", .calendar_interval = "60m" }));
+    try std.testing.expectEqual(@as(search_agg_mod.DateInterval, .hour), try parseDateInterval(.{ .name = "by_time", .type = "date_histogram", .field = "created_at", .calendar_interval = "60m" }));
     try std.testing.expectEqualStrings("hour", algebraicBucketName(.{ .name = "by_time", .type = "date_histogram", .field = "created_at", .calendar_interval = "60m" }).?);
-    try std.testing.expectEqual(search_agg_mod.DateInterval.day, try parseDateInterval(.{ .name = "by_time", .type = "date_histogram", .field = "created_at", .calendar_interval = "24h" }));
+    try std.testing.expectEqual(@as(search_agg_mod.DateInterval, .day), try parseDateInterval(.{ .name = "by_time", .type = "date_histogram", .field = "created_at", .calendar_interval = "24h" }));
     try std.testing.expectEqualStrings("day", algebraicBucketName(.{ .name = "by_time", .type = "date_histogram", .field = "created_at", .calendar_interval = "24h" }).?);
-    try std.testing.expectEqual(search_agg_mod.DateInterval.month, try parseDateInterval(.{ .name = "by_time", .type = "date_histogram", .field = "created_at", .calendar_interval = "1M" }));
+    try std.testing.expectEqual(@as(search_agg_mod.DateInterval, .month), try parseDateInterval(.{ .name = "by_time", .type = "date_histogram", .field = "created_at", .calendar_interval = "1M" }));
     try std.testing.expectEqualStrings("month", algebraicBucketName(.{ .name = "by_time", .type = "date_histogram", .field = "created_at", .calendar_interval = "1M" }).?);
 }
 
@@ -15939,7 +16018,9 @@ fn fillDateHistogramBucketKeys(
 
     var current = first_key;
     while (current <= last_key) {
+        if (keys.items.len >= 10000) return error.QueryCandidateBudgetExceeded;
         try keys.append(alloc, current);
+        if (current == last_key or (interval == .fixed and last_key - current < interval.fixed.every_ns)) break;
         const next = try nextDateHistogramBucketKey(current, interval);
         if (next <= current) break;
         current = next;
@@ -15955,6 +16036,8 @@ fn nextDateHistogramBucketKey(current: u64, interval: search_agg_mod.DateInterva
         .week => current + 7 * std.time.ns_per_day,
         .month => try addCalendarMonths(current, 1),
         .year => try addCalendarYears(current, 1),
+        .quarter => try addCalendarMonths(current, 3),
+        .fixed => |spec| std.math.add(u64, current, spec.every_ns) catch return error.InvalidAggregation,
     };
 }
 
@@ -15997,8 +16080,8 @@ fn extractTimestampFieldFromStoredJson(alloc: Allocator, raw_json: []const u8, f
     defer parsed.deinit();
     const value = extractValueAtPath(parsed.value, field_path) orelse return null;
     return switch (value) {
-        .integer => @intCast(value.integer),
-        .float => @intFromFloat(value.float),
+        .integer => std.math.cast(u64, value.integer),
+        .float => null,
         .number_string => std.fmt.parseInt(u64, value.number_string, 10) catch null,
         .string => try parseRfc3339ToNs(value.string),
         else => null,
@@ -16006,47 +16089,11 @@ fn extractTimestampFieldFromStoredJson(alloc: Allocator, raw_json: []const u8, f
 }
 
 fn parseDateInterval(request: SearchAggregationRequest) !search_agg_mod.DateInterval {
-    const value = if (request.calendar_interval.len > 0) request.calendar_interval else request.fixed_interval;
-    if (std.mem.eql(u8, value, "minute") or std.mem.eql(u8, value, "1m")) return .minute;
-    if (std.mem.eql(u8, value, "hour") or std.mem.eql(u8, value, "1h") or std.mem.eql(u8, value, "60m")) return .hour;
-    if (std.mem.eql(u8, value, "day") or std.mem.eql(u8, value, "1d") or std.mem.eql(u8, value, "24h")) return .day;
-    if (std.mem.eql(u8, value, "week") or std.mem.eql(u8, value, "1w")) return .week;
-    if (std.mem.eql(u8, value, "month") or std.mem.eql(u8, value, "1M")) return .month;
-    if (std.mem.eql(u8, value, "year") or std.mem.eql(u8, value, "1y")) return .year;
-    return error.UnsupportedAggregation;
+    return search_agg_mod.parseDateInterval(request.calendar_interval, request.fixed_interval, request.bucket_origin);
 }
 
 fn parseRfc3339ToNs(text: []const u8) !?u64 {
-    if (text.len < 20) return null;
-    if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
-
-    const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(i64, text[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(i64, text[8..10], 10) catch return null;
-    const hour = std.fmt.parseInt(i64, text[11..13], 10) catch return null;
-    const minute = std.fmt.parseInt(i64, text[14..16], 10) catch return null;
-    const second = std.fmt.parseInt(i64, text[17..19], 10) catch return null;
-
-    var idx: usize = 19;
-    var nanos: u64 = 0;
-    if (idx < text.len and text[idx] == '.') {
-        idx += 1;
-        const frac_start = idx;
-        while (idx < text.len and text[idx] >= '0' and text[idx] <= '9') : (idx += 1) {}
-        const frac = text[frac_start..idx];
-        if (frac.len == 0 or frac.len > 9) return null;
-        var frac_ns = std.fmt.parseInt(u64, frac, 10) catch return null;
-        var scale: usize = frac.len;
-        while (scale < 9) : (scale += 1) frac_ns *= 10;
-        nanos = frac_ns;
-    }
-    if (idx >= text.len or text[idx] != 'Z' or idx + 1 != text.len) return null;
-
-    const days = daysFromCivil(year, month, day);
-    if (days < 0) return null;
-    const secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    if (secs < 0) return null;
-    return @as(u64, @intCast(secs)) * std.time.ns_per_s + nanos;
+    return @import("../../datetime.zig").parseRfc3339ToNs(text);
 }
 
 fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
@@ -16061,6 +16108,7 @@ fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
 }
 
 fn formatRfc3339Bucket(alloc: Allocator, ns: u64) ![]const u8 {
+    if (ns % std.time.ns_per_s != 0) return @import("../../datetime.zig").formatDateTimeNsAlloc(alloc, ns);
     const total_seconds: u64 = @intCast(@divFloor(ns, std.time.ns_per_s));
     const days: i64 = @intCast(@divFloor(total_seconds, 86_400));
     const secs_of_day: u64 = total_seconds % 86_400;
@@ -16109,4 +16157,37 @@ fn extractValueAtPath(root: std.json.Value, field_path: []const u8) ?std.json.Va
         }
     }
     return current;
+}
+
+test "time series fixed buckets preserve offsets origin empty metrics and bounds" {
+    const alloc = std.testing.allocator;
+    const hits = [_]types.SearchHit{
+        .{ .id = @constCast("a"), .score = 1, .stored_data = @constCast("{\"ts\":\"2026-11-06T13:01:00+01:00\",\"value\":10}") },
+        .{ .id = @constCast("b"), .score = 1, .stored_data = @constCast("{\"ts\":\"2026-11-06T12:04:59.999999999Z\",\"value\":20}") },
+        .{ .id = @constCast("c"), .score = 1, .stored_data = @constCast("{\"ts\":\"2026-11-06T12:10:00Z\",\"value\":30}") },
+    };
+    const request = SearchAggregationRequest{ .name = "points", .type = "date_histogram", .field = "ts", .fixed_interval = "5m", .date_bounds_start = "2026-11-06T12:00:00Z", .date_bounds_end = "2026-11-06T12:20:00Z", .aggregations = &.{.{ .name = "average", .type = "avg", .field = "value" }} };
+    var result = try computeSingleAggregation(alloc, request, &hits, .{}, false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4), result.buckets.len);
+    try std.testing.expectEqual(@as(i64, 2), result.buckets[0].count);
+    try std.testing.expectEqualStrings("{\"count\":2,\"sum\":30,\"avg\":15}", result.buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqual(@as(i64, 0), result.buckets[1].count);
+    try std.testing.expectEqualStrings("{\"count\":0,\"sum\":0,\"avg\":0}", result.buckets[1].aggregations[0].value_json.?);
+    var empty = try computeSingleAggregation(alloc, request, &.{}, .{}, false);
+    defer empty.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4), empty.buckets.len);
+    var origin_request = request;
+    origin_request.bucket_origin = "1970-01-01T00:02:00Z";
+    origin_request.date_bounds_start = "";
+    origin_request.date_bounds_end = "";
+    var shifted = try computeSingleAggregation(alloc, origin_request, &hits, .{}, false);
+    defer shifted.deinit(alloc);
+    try std.testing.expectEqualStrings("\"2026-11-06T11:57:00Z\"", shifted.buckets[0].key_json);
+    var invalid = request;
+    invalid.calendar_interval = "day";
+    try std.testing.expectError(error.InvalidAggregation, computeSingleAggregation(alloc, invalid, &hits, .{}, false));
+    invalid = request;
+    invalid.fixed_interval = "1ns";
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, computeSingleAggregation(alloc, invalid, &.{}, .{}, false));
 }

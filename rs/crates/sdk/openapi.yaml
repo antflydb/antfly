@@ -28682,6 +28682,30 @@ components:
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Fixed interval for histogram aggregations
+        date_bounds:
+          type: object
+          additionalProperties: false
+          required:
+            - start
+            - end
+          description: Explicit half-open RFC3339 extent for date_histogram empty buckets. Does not filter
+            documents; use a matching date range filter. Limited to 10000 buckets.
+          properties:
+            start:
+              type: string
+              format: date-time
+            end:
+              type: string
+              format: date-time
+        fixed_interval:
+          type: string
+          description: Positive elapsed duration for date_histogram (for example 30s, 5m, 1h30m). Mutually
+            exclusive with calendar_interval. Nanosecond precision; UTC epoch alignment by default.
+        bucket_origin:
+          type: string
+          format: date-time
+          description: RFC3339 alignment origin for fixed_interval. Calendar buckets use calendar boundaries
+            and reject this field.
         calendar_interval:
           x-go-type-skip-optional-pointer: false
           allOf:
@@ -43146,6 +43170,13 @@ components:
           items:
             type: string
             minLength: 1
+        time:
+          type: string
+          description: Schema datetime column used for temporal grouping. Requires bucket.
+        bucket:
+          type: string
+          description: UTC calendar unit (minute, hour, day, week, month, quarter, year) or positive fixed
+            elapsed duration such as 5m. Requires time. Fixed buckets align to the Unix epoch.
         measure:
           type: string
           minLength: 1
@@ -44485,6 +44516,27 @@ components:
           readOnly: true
           description: Backend-managed schema generation used for migrations. Omit it from create and
             update requests.
+        index_sort:
+          type: array
+          maxItems: 32
+          description: Physical document index order. Fields must have sortable scalar mappings. Changing
+            the order requires rebuilding physical coverage. Relational tables use relational_indexes
+            instead.
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - field
+            properties:
+              field:
+                type: string
+                minLength: 1
+              order:
+                type: string
+                enum:
+                  - asc
+                  - desc
+                default: asc
         storage_mode:
           $ref: '#/components/schemas/TableStorageMode'
         base_source:

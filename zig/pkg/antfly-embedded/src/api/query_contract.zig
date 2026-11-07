@@ -5460,6 +5460,9 @@ pub fn freeAggregationRequests(
         if (request.fields.len > 0) alloc.free(@constCast(request.fields));
         if (request.calendar_interval.len > 0) alloc.free(request.calendar_interval);
         if (request.fixed_interval.len > 0) alloc.free(request.fixed_interval);
+        if (request.bucket_origin.len > 0) alloc.free(request.bucket_origin);
+        if (request.date_bounds_start.len > 0) alloc.free(request.date_bounds_start);
+        if (request.date_bounds_end.len > 0) alloc.free(request.date_bounds_end);
         if (request.significance_algorithm.len > 0) alloc.free(request.significance_algorithm);
         if (request.bucket_path.len > 0) alloc.free(request.bucket_path);
         if (request.sort_order.len > 0) alloc.free(request.sort_order);
@@ -5517,6 +5520,9 @@ fn parseAggregationRequestsAlloc(
             if (request.fields.len > 0) alloc.free(@constCast(request.fields));
             if (request.calendar_interval.len > 0) alloc.free(request.calendar_interval);
             if (request.fixed_interval.len > 0) alloc.free(request.fixed_interval);
+            if (request.bucket_origin.len > 0) alloc.free(request.bucket_origin);
+            if (request.date_bounds_start.len > 0) alloc.free(request.date_bounds_start);
+            if (request.date_bounds_end.len > 0) alloc.free(request.date_bounds_end);
             if (request.significance_algorithm.len > 0) alloc.free(request.significance_algorithm);
             if (request.bucket_path.len > 0) alloc.free(request.bucket_path);
             if (request.sort_order.len > 0) alloc.free(request.sort_order);
@@ -5670,6 +5676,23 @@ fn parseSingleAggregationRequestAlloc(
         center_lon = std.fmt.parseFloat(f64, std.mem.trim(u8, lon_text, &std.ascii.whitespace)) catch return error.InvalidQueryRequest;
     }
 
+    if (aggregation.type == .date_histogram) {
+        const calendar = if (aggregation.calendar_interval) |value| blk: {
+            if (value != .string) return error.InvalidQueryRequest;
+            break :blk value.string;
+        } else "";
+        _ = @import("../search/aggregation.zig").parseDateInterval(calendar, aggregation.fixed_interval orelse "", aggregation.bucket_origin orelse "") catch return error.InvalidQueryRequest;
+    } else if (aggregation.fixed_interval != null or aggregation.bucket_origin != null or aggregation.date_bounds != null) return error.InvalidQueryRequest;
+    if (aggregation.date_bounds) |bounds| {
+        if (bounds != .object or bounds.object.count() != 2 or (aggregation.min_doc_count orelse 0) != 0) return error.InvalidQueryRequest;
+        const start = bounds.object.get("start") orelse return error.InvalidQueryRequest;
+        const end = bounds.object.get("end") orelse return error.InvalidQueryRequest;
+        if (start != .string or end != .string) return error.InvalidQueryRequest;
+        const first = @import("../datetime.zig").parseRfc3339ToNs(start.string) orelse return error.InvalidQueryRequest;
+        const last = @import("../datetime.zig").parseRfc3339ToNs(end.string) orelse return error.InvalidQueryRequest;
+        if (first >= last) return error.InvalidQueryRequest;
+    }
+
     const cardinality_mode = try parseCardinalityModeJson(alloc, aggregation.mode);
 
     return .{
@@ -5684,6 +5707,10 @@ fn parseSingleAggregationRequestAlloc(
             try jsonValueToFlatStringAlloc(alloc, value)
         else
             "",
+        .date_bounds_start = if (aggregation.date_bounds) |bounds| try aggregationDateBoundAlloc(alloc, bounds, "start") else "",
+        .date_bounds_end = if (aggregation.date_bounds) |bounds| try aggregationDateBoundAlloc(alloc, bounds, "end") else "",
+        .fixed_interval = if (aggregation.fixed_interval) |value| try alloc.dupe(u8, value) else "",
+        .bucket_origin = if (aggregation.bucket_origin) |value| try alloc.dupe(u8, value) else "",
         .min_doc_count = aggregation.min_doc_count orelse 0,
         .significance_algorithm = if (aggregation.algorithm) |value|
             try jsonValueToFlatStringAlloc(alloc, value)
@@ -5709,6 +5736,13 @@ fn parseSingleAggregationRequestAlloc(
         .algebraic_join = algebraic_join,
         .aggregations = nested,
     };
+}
+
+fn aggregationDateBoundAlloc(alloc: std.mem.Allocator, value: std.json.Value, field: []const u8) ![]u8 {
+    if (value != .object) return error.InvalidQueryRequest;
+    const bound = value.object.get(field) orelse return error.InvalidQueryRequest;
+    if (bound != .string or @import("../datetime.zig").parseRfc3339ToNs(bound.string) == null) return error.InvalidQueryRequest;
+    return alloc.dupe(u8, bound.string);
 }
 
 fn parseAlgebraicAggregationJoinAlloc(
@@ -20907,4 +20941,16 @@ test "native member traversal requires producer and private parent admission" {
     defer json.deinit();
     try json.value.object.put(json.arena.allocator(), "_hierarchy_parent_admitted", .{ .bool = true });
     try std.testing.expect(objectHasInternalShardField(json.value.object));
+}
+
+test "time series public query preserves duration origin and bounded extent" {
+    const a = std.testing.allocator;
+    const requests = try parseAggregationRequestsJson(a,
+        \\{"points":{"type":"date_histogram","field":"ts","fixed_interval":"5m","bucket_origin":"1970-01-01T00:02:00Z","date_bounds":{"start":"2026-11-06T12:00:00Z","end":"2026-11-06T13:00:00Z"},"sub_aggregations":{"average":{"type":"avg","field":"value"}}}}
+    );
+    defer freeAggregationRequests(a, requests);
+    try std.testing.expectEqualStrings("5m", requests[0].fixed_interval);
+    try std.testing.expectEqualStrings("1970-01-01T00:02:00Z", requests[0].bucket_origin);
+    try std.testing.expectEqualStrings("2026-11-06T12:00:00Z", requests[0].date_bounds_start);
+    try std.testing.expectEqual(@as(usize, 1), requests[0].aggregations.len);
 }
