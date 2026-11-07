@@ -304,7 +304,7 @@ def conditions(backend=None):
     return result
 
 
-def prepare(model, artifacts, output):
+def prepare(model, artifacts, output, text_only=False):
     from tokenizers import Tokenizer
 
     tokenizer = Tokenizer.from_file(str(model / "tokenizer.json"))
@@ -338,16 +338,17 @@ def prepare(model, artifacts, output):
     for name, text, task, prefix in texts:
         ids = tokenizer.encode(prefix + text).ids
         cases.append({"name": name, "task": task, "text": text, "token_ids": ids})
-    media = json.loads((artifacts / "media-oracle.json").read_text())
-    for case in media["cases"]:
-        if case["name"] in ("image", "audio", "mixed"):
-            cases.append(
-                {
-                    "name": case["name"],
-                    "token_ids": case["token_ids"],
-                    "oracle": case["embedding"],
-                }
-            )
+    if not text_only:
+        media = json.loads((artifacts / "media-oracle.json").read_text())
+        for case in media["cases"]:
+            if case["name"] in ("image", "audio", "mixed"):
+                cases.append(
+                    {
+                        "name": case["name"],
+                        "token_ids": case["token_ids"],
+                        "oracle": case["embedding"],
+                    }
+                )
     documents = [
         ("access", "Reset your password to recover access to your account."),
         ("billing", "View invoices and request a refund for an unexpected charge."),
@@ -402,6 +403,8 @@ def prepare(model, artifacts, output):
         "model": reference.MODEL,
         "revision": reference.REVISION,
         "recipe": "embeddinggemma2-f32-mean-v3-display-hdr",
+        "evaluation_scope": "text-only" if text_only else "text-and-media",
+        "case_selection": [case["name"] for case in cases],
         "cases": cases,
         "decision": decision,
         "retrieval": {
@@ -414,7 +417,7 @@ def prepare(model, artifacts, output):
                 "path": str((artifacts / name).resolve()),
                 "sha256": reference.sha256(artifacts / name),
             }
-            for name in ("image.png", "audio.wav")
+            for name in (() if text_only else ("image.png", "audio.wav"))
         },
     }
     publish(output, result)
@@ -466,11 +469,15 @@ def iterations(case, count, long_count=1):
     )
 
 
-def select_cases(suite, names, encoder=False):
+def select_cases(suite, names, encoder=False, text_only=False):
     known = {case["name"] for case in suite["cases"]}
     if names and (len(set(names)) != len(names) or not set(names).issubset(known)):
         raise ValueError("duplicate or unknown case selection")
     selected = [case for case in suite["cases"] if not names or case["name"] in names]
+    if text_only:
+        if names and any("text" not in case for case in selected):
+            raise ValueError("text-only scope cannot select media")
+        selected = [case for case in selected if "text" in case]
     if encoder:
         if names and any("text" not in case for case in selected):
             raise ValueError("encoder benchmark requires prepared text")
@@ -762,12 +769,39 @@ def execution_precision(backend, requested=None):
     return precision
 
 
+def load_torch_media(model_dir, suite):
+    """Load only the media dependencies actually required by selected cases."""
+    names = {case["name"] for case in suite["cases"] if "text" not in case}
+    if not names.issubset({"image", "audio", "mixed"}):
+        raise ValueError("unknown media case")
+    if not names:
+        return None, None, None
+    from transformers import AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(model_dir, local_files_only=True)
+    image = None
+    waveform = None
+    if names.intersection({"image", "mixed"}):
+        from PIL import Image
+
+        image = Image.open(suite["assets"]["image.png"]["path"]).convert("RGB")
+    if names.intersection({"audio", "mixed"}):
+        import numpy as np
+        import wave
+
+        with wave.open(suite["assets"]["audio.wav"]["path"]) as audio:
+            waveform = (
+                np.frombuffer(audio.readframes(audio.getnframes()), dtype="<i2").astype(
+                    np.float32
+                )
+                / 32768
+            )
+    return processor, image, waveform
+
+
 def torch_run(args, suite, result):
-    import numpy as np
     import torch
-    import wave
-    from PIL import Image
-    from transformers import AutoModel, AutoProcessor, AutoTokenizer
+    from transformers import AutoModel, AutoTokenizer
 
     reference.verify_reference(args.model_dir)
     torch.set_num_threads(4)
@@ -817,15 +851,7 @@ def torch_run(args, suite, result):
     sync()
     result["model_load_seconds"] = time.perf_counter() - started
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
-    processor = AutoProcessor.from_pretrained(args.model_dir, local_files_only=True)
-    image = Image.open(suite["assets"]["image.png"]["path"]).convert("RGB")
-    with wave.open(suite["assets"]["audio.wav"]["path"]) as audio:
-        waveform = (
-            np.frombuffer(audio.readframes(audio.getnframes()), dtype="<i2").astype(
-                np.float32
-            )
-            / 32768
-        )
+    processor, image, waveform = load_torch_media(args.model_dir, suite)
 
     def inputs(case):
         if args.timing_mode == "encoder":
@@ -991,6 +1017,10 @@ def main():
     )
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--artifacts-dir", type=Path)
+    parser.add_argument(
+        "--text-only", action="store_true",
+        help="Prepare or select text cases without media assets or processors",
+    )
     parser.add_argument("--suite", type=Path)
     parser.add_argument("--binary", type=Path)
     parser.add_argument(
@@ -1028,9 +1058,9 @@ def main():
     ):
         parser.error("iterations must be 1..100")
     if args.backend == "prepare":
-        if not args.artifacts_dir:
-            parser.error("prepare requires --artifacts-dir")
-        prepare(args.model_dir, args.artifacts_dir, args.output)
+        if not args.artifacts_dir and not args.text_only:
+            parser.error("full prepare requires --artifacts-dir")
+        prepare(args.model_dir, args.artifacts_dir, args.output, args.text_only)
         return
     try:
         args.precision = execution_precision(args.backend, args.precision)
@@ -1049,7 +1079,7 @@ def main():
     suite = json.loads(args.suite.read_text())
     if suite["revision"] != reference.REVISION:
         raise ValueError("suite checkpoint revision differs")
-    suite = select_cases(suite, args.case, args.timing_mode == "encoder")
+    suite = select_cases(suite, args.case, args.timing_mode == "encoder", args.text_only)
     if args.timing_mode == "encoder" and args.warmups is None:
         args.warmups = 2
     result = {
@@ -1057,6 +1087,8 @@ def main():
         "status": "running",
         "measurement_mode": args.timing_mode,
         "case_selection": [case["name"] for case in suite["cases"]],
+        "evaluation_scope": "text-only" if all("text" in case for case in suite["cases"]) else "text-and-media",
+        "requested_text_only": args.text_only,
         "warmups": args.warmups,
         "long_iterations": args.long_iterations,
         "max_vector_error": args.max_vector_error,

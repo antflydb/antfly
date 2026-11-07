@@ -21,6 +21,9 @@ from pathlib import Path
 from unittest import mock
 import copy
 import unittest
+import json
+import tempfile
+import types
 
 if __package__:
     from . import compare
@@ -29,6 +32,89 @@ else:
 
 
 class ComparisonContracts(unittest.TestCase):
+    def test_text_prepare_never_reads_or_hashes_media(self):
+        tokenizer = mock.Mock()
+        tokenizer.encode.side_effect = lambda text: types.SimpleNamespace(ids=list(range(len(text.split()))))
+        package = types.SimpleNamespace(Tokenizer=mock.Mock())
+        package.Tokenizer.from_file.return_value = tokenizer
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "text-suite.json"
+            # No artifacts directory, media oracle, image or audio exists.
+            with mock.patch.dict(sys.modules, {"tokenizers": package}), mock.patch.object(compare.reference, "sha256", side_effect=AssertionError("media hash attempted")):
+                compare.prepare(root, None, output, text_only=True)
+            suite = json.loads(output.read_text())
+        self.assertEqual(suite["evaluation_scope"], "text-only")
+        self.assertEqual(suite["assets"], {})
+        self.assertEqual(suite["case_selection"], [case["name"] for case in suite["cases"]])
+        self.assertTrue(all("text" in case and "oracle" not in case for case in suite["cases"]))
+        self.assertEqual([len(case["token_ids"]) for case in suite["cases"][2:5]], [128, 512, 8192])
+        self.assertIn("decision", suite)
+        self.assertIn("retrieval", suite)
+
+    def test_prepare_cli_allows_absent_artifacts_only_with_explicit_text_scope(self):
+        argv = ["compare.py", "--backend", "prepare", "--model-dir", "model", "--output", "suite.json"]
+        with mock.patch.object(sys, "argv", argv + ["--text-only"]), mock.patch.object(compare, "prepare") as prepared:
+            compare.main()
+            prepared.assert_called_once_with(Path("model"), None, Path("suite.json"), True)
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(compare, "prepare") as prepared:
+            with self.assertRaises(SystemExit):
+                compare.main()
+            prepared.assert_not_called()
+
+    def test_full_prepare_still_requires_real_media_oracle(self):
+        tokenizer = mock.Mock()
+        tokenizer.encode.side_effect = lambda text: types.SimpleNamespace(ids=list(range(len(text.split()))))
+        package = types.SimpleNamespace(Tokenizer=mock.Mock())
+        package.Tokenizer.from_file.return_value = tokenizer
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(sys.modules, {"tokenizers": package}):
+            root = Path(directory)
+            with self.assertRaises(FileNotFoundError):
+                compare.prepare(root, root / "missing-media", root / "suite.json")
+            self.assertFalse((root / "suite.json").exists())
+
+    def test_text_scope_retains_unknown_duplicate_and_media_selection_errors(self):
+        text = {"name": "query", "text": "x", "token_ids": [1]}
+        media = {"name": "image", "token_ids": [2]}
+        suite = {"cases": [text, media]}
+        self.assertEqual(compare.select_cases(suite, None, text_only=True)["cases"], [text])
+        self.assertEqual(compare.select_cases(suite, ["query"], text_only=True)["cases"], [text])
+        for names in (["missing"], ["query", "query"], ["image"], ["image", "query"]):
+            with self.subTest(names=names), self.assertRaises(ValueError):
+                compare.select_cases(suite, names, text_only=True)
+        with self.assertRaises(ValueError):
+            compare.select_cases({"cases": [media]}, None, text_only=True)
+        # Default full mode still selects actual media.
+        self.assertEqual(compare.select_cases(suite, ["image"])["cases"], [media])
+
+    def test_text_torch_media_boundary_imports_nothing_optional(self):
+        with mock.patch("builtins.__import__", side_effect=AssertionError("optional media import")):
+            self.assertEqual(compare.load_torch_media(Path("model"), {"cases": [{"name": "text", "text": "x"}]}), (None, None, None))
+            with self.assertRaises(ValueError):
+                compare.load_torch_media(Path("model"), {"cases": [{"name": "unknown"}]})
+
+    def test_image_only_media_boundary_does_not_import_or_open_audio(self):
+        image = mock.Mock()
+        image.open.return_value.convert.return_value = "actual-image"
+        processor = mock.Mock()
+        processor.from_pretrained.return_value = "actual-processor"
+        original_import = __import__
+        def import_guard(name, *args, **kwargs):
+            if name in ("wave", "numpy"):
+                raise AssertionError("unselected audio dependency")
+            return original_import(name, *args, **kwargs)
+        suite = {"cases": [{"name": "image"}], "assets": {"image.png": {"path": "image-path"}}}
+        with mock.patch.dict(sys.modules, {"PIL": types.SimpleNamespace(Image=image), "transformers": types.SimpleNamespace(AutoProcessor=processor)}), mock.patch("builtins.__import__", side_effect=import_guard):
+            self.assertEqual(compare.load_torch_media(Path("model"), suite), ("actual-processor", "actual-image", None))
+        image.open.assert_called_once_with("image-path")
+        processor.from_pretrained.assert_called_once_with(Path("model"), local_files_only=True)
+
+    def test_selected_media_still_fails_without_requested_asset(self):
+        processor = mock.Mock()
+        with mock.patch.dict(sys.modules, {"PIL": types.SimpleNamespace(Image=mock.Mock()), "transformers": types.SimpleNamespace(AutoProcessor=processor)}):
+            with self.assertRaises(KeyError):
+                compare.load_torch_media(Path("model"), {"cases": [{"name": "image"}], "assets": {}})
+
     def test_post_declares_bounded_inference_budget_and_transport_timeout(self):
         with mock.patch.object(
             compare.urllib.request, "urlopen", return_value=io.BytesIO(b'{"ok":true}')
