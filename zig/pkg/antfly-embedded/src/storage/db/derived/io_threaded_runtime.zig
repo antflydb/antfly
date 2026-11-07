@@ -171,6 +171,13 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return null;
     }
 
+    pub fn advanceAppliedSequenceIfContiguous(self: *@This(), name: []const u8, sequence: u64) bool {
+        _ = self;
+        _ = name;
+        _ = sequence;
+        return false;
+    }
+
     pub fn snapshotStats(_: *@This()) types.DerivedWorkerStats {
         return .{};
     }
@@ -575,6 +582,45 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             if (std.mem.eql(u8, worker.name, name)) return worker.applied_sequence;
         }
         return null;
+    }
+
+    /// WS4 phase 2 (inline publication with workers running): a publication
+    /// that just durably installed its own effects for `name` at `sequence`
+    /// in the primary write's own native transaction may fast-forward this
+    /// worker's in-memory bookkeeping instead of letting it redundantly
+    /// re-tokenize/re-apply a batch it would otherwise find in the journal.
+    ///
+    /// Safe only when the worker's own applied sequence is EXACTLY
+    /// `sequence - 1`: this proves (monotonically -- `applied_sequence`
+    /// only ever advances) that every earlier sequence affecting `name` has
+    /// already been applied, so jumping straight to `sequence` cannot skip
+    /// real work. If there is a gap (the worker is behind on some earlier
+    /// sequence that was never inline-published), this call is a no-op and
+    /// the worker's normal catch-up remains the only path -- it must still
+    /// walk the gap for itself.
+    ///
+    /// Deliberately leaves `persisted_sequence` untouched: that field
+    /// bounds journal retirement (`computeMinPersistedLocked`), and this
+    /// publication's progress record becomes durable through its own
+    /// native-transaction write (`apply_state.contributeProgressTxn`), not
+    /// through this worker's `persist_fn`. Advancing `persisted_sequence`
+    /// here without that flush actually having happened could let
+    /// retirement race ahead of what this worker could recover after a
+    /// crash. The ordinary idle-persist path (`workerMain`) still notices
+    /// `applied_sequence > persisted_sequence` and flushes it later via
+    /// `.advance` (max) semantics, which never regresses.
+    pub fn advanceAppliedSequenceIfContiguous(self: *DerivedRuntime, name: []const u8, sequence: u64) bool {
+        const io = self.ioContext();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (self.workers.items) |worker| {
+            if (!std.mem.eql(u8, worker.name, name)) continue;
+            if (worker.applied_sequence + 1 != sequence) return false;
+            worker.applied_sequence = sequence;
+            worker.target_sequence = @max(worker.target_sequence, sequence);
+            return true;
+        }
+        return false;
     }
 
     pub fn snapshotStats(self: *DerivedRuntime) types.DerivedWorkerStats {

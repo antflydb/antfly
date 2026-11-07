@@ -296,15 +296,30 @@ fn readProgressInt(raw: []const u8, pos: *usize, comptime T: type) T {
 pub fn contributeProgressTxn(txn: anytype, progress: Progress) !void {
     var key_buf: [256]u8 = undefined;
     const key = try progressKeyV2(&key_buf, progress.consumer);
+    var mutable_txn = txn;
+    // Never regress the durable applied-sequence watermark. A background
+    // worker's own bookkeeping (`worker.applied_sequence`) can lag behind a
+    // sequence another path (WS4 phase 2's inline text publication, in the
+    // SAME native transaction as a write's primary rows) already advanced
+    // this consumer's progress to; a worker's later, unrelated flush of its
+    // own -- lower -- watermark must not overwrite that. `txn.get` here
+    // reads the SAME in-flight transaction this call is about to write
+    // into, so this sees any earlier write this same commit already made
+    // (there is at most one `contributeProgressTxn` call per consumer per
+    // commit) and every prior commit's durable value otherwise.
+    const existing = loadProgressTxn(mutable_txn, progress.consumer) catch |err| switch (err) {
+        error.InvalidDerivedApplyState => null,
+        else => return err,
+    };
+    const effective_sequence = if (existing) |record| @max(record.applied_sequence, progress.sequence) else progress.sequence;
     const encoded = encodeProgressRecord(.{
-        .applied_sequence = progress.sequence,
+        .applied_sequence = effective_sequence,
         .status = progress.status,
         .generation = progress.generation,
         .config_hash = progress.config_hash,
         .published_count = progress.published_count,
         .lsm_wal_checkpointed_through = progress.lsm_wal_checkpointed_through,
     });
-    var mutable_txn = txn;
     try mutable_txn.put(key, &encoded);
 }
 

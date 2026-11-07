@@ -64,6 +64,7 @@ pub const Executor = struct {
         resume_worker: *const fn (ptr: *anyopaque, name: []const u8) void,
         remove_worker: *const fn (ptr: *anyopaque, name: []const u8) void,
         applied_sequence: *const fn (ptr: *anyopaque, name: []const u8) ?u64,
+        advance_applied_sequence_if_contiguous: *const fn (ptr: *anyopaque, name: []const u8, sequence: u64) bool,
         snapshot_stats: *const fn (ptr: *anyopaque) types.DerivedWorkerStats,
         notify_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
         notify_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) void,
@@ -129,6 +130,17 @@ pub const Executor = struct {
 
     pub fn appliedSequence(self: *Executor, name: []const u8) ?u64 {
         return self.vtable.applied_sequence(self.ptr, name);
+    }
+
+    /// WS4 phase 2: fast-forward a worker's in-memory applied sequence to
+    /// `sequence` without a journal scan, when an inline publication has
+    /// just durably installed `name`'s effects for `sequence` in the
+    /// primary write's own native transaction. Returns `false` (safe
+    /// no-op) whenever there is no worker for `name`, or the worker is
+    /// not exactly caught up to `sequence - 1`, in which case its own
+    /// catch-up path remains the only way forward for the gap.
+    pub fn advanceAppliedSequenceIfContiguous(self: *Executor, name: []const u8, sequence: u64) bool {
+        return self.vtable.advance_applied_sequence_if_contiguous(self.ptr, name, sequence);
     }
 
     pub fn snapshotStats(self: *Executor) types.DerivedWorkerStats {
@@ -290,6 +302,19 @@ const ManualRuntime = struct {
             if (std.mem.eql(u8, worker.name, name)) return worker.applied_sequence;
         }
         return null;
+    }
+
+    /// See `DerivedRuntime.advanceAppliedSequenceIfContiguous` (io_threaded_runtime.zig)
+    /// for the safety argument; this manual backend mirrors it exactly.
+    fn advanceAppliedSequenceIfContiguous(self: *ManualRuntime, name: []const u8, sequence: u64) bool {
+        for (self.workers.items) |*worker| {
+            if (!std.mem.eql(u8, worker.name, name)) continue;
+            if (worker.applied_sequence + 1 != sequence) return false;
+            worker.applied_sequence = sequence;
+            worker.target_sequence = @max(worker.target_sequence, sequence);
+            return true;
+        }
+        return false;
     }
 
     fn snapshotStats(self: *ManualRuntime) types.DerivedWorkerStats {
@@ -556,6 +581,7 @@ const manual_vtable = Executor.VTable{
     .resume_worker = manualResumeWorker,
     .remove_worker = manualRemoveWorker,
     .applied_sequence = manualAppliedSequence,
+    .advance_applied_sequence_if_contiguous = manualAdvanceAppliedSequenceIfContiguous,
     .snapshot_stats = manualSnapshotStats,
     .notify_sequence = manualNotifySequence,
     .notify_indexes = manualNotifyIndexes,
@@ -611,6 +637,11 @@ fn manualRemoveWorker(ptr: *anyopaque, name: []const u8) void {
 fn manualAppliedSequence(ptr: *anyopaque, name: []const u8) ?u64 {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
     return runtime.appliedSequence(name);
+}
+
+fn manualAdvanceAppliedSequenceIfContiguous(ptr: *anyopaque, name: []const u8, sequence: u64) bool {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    return runtime.advanceAppliedSequenceIfContiguous(name, sequence);
 }
 
 fn manualSnapshotStats(ptr: *anyopaque) types.DerivedWorkerStats {
@@ -714,6 +745,7 @@ const io_threaded_vtable = Executor.VTable{
     .resume_worker = ioThreadedResumeWorker,
     .remove_worker = ioThreadedRemoveWorker,
     .applied_sequence = ioThreadedAppliedSequence,
+    .advance_applied_sequence_if_contiguous = ioThreadedAdvanceAppliedSequenceIfContiguous,
     .snapshot_stats = ioThreadedSnapshotStats,
     .notify_sequence = ioThreadedNotifySequence,
     .notify_indexes = ioThreadedNotifyIndexes,
@@ -772,6 +804,11 @@ fn ioThreadedRemoveWorker(ptr: *anyopaque, name: []const u8) void {
 fn ioThreadedAppliedSequence(ptr: *anyopaque, name: []const u8) ?u64 {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     return runtime.appliedSequence(name);
+}
+
+fn ioThreadedAdvanceAppliedSequenceIfContiguous(ptr: *anyopaque, name: []const u8, sequence: u64) bool {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    return runtime.advanceAppliedSequenceIfContiguous(name, sequence);
 }
 
 fn ioThreadedSnapshotStats(ptr: *anyopaque) types.DerivedWorkerStats {

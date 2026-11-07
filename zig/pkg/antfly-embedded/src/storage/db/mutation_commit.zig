@@ -3073,6 +3073,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // `defer` knows what still needs `abort`, but the filter at
             // `applyDerivedBatchTargetsProfiled` (further down) must still
             // know which index names were handled inline regardless.
+            // Each entry is this function's OWN duplicate of the index name
+            // (see the capture site below), never an alias into
+            // `sync_targets.full_text_indexes`: the "filter
+            // `sync_targets.full_text_indexes` once" block further down
+            // frees every handled original entry as soon as it builds the
+            // filtered array, which runs well before the `install` loop
+            // at the bottom of this function reads `inline_text_handled_names`
+            // to call `advanceAppliedSequenceIfContiguous`. Storing the
+            // alias directly here used to make that call a guaranteed
+            // use-after-free: the name compared against every registered
+            // worker's name was already-freed memory, so the comparison
+            // never matched and the fast-forward silently (and always)
+            // failed, forcing every other write back onto the slow,
+            // worker-driven catch-up path (see the regression test this
+            // fix adds for the resulting alternation).
             var inline_text_handled_names: [@import("../commit_participant.zig").List.max_participants][]const u8 = undefined;
             var inline_text_publication_count: usize = 0;
             defer for (inline_text_publications[0..inline_text_publication_count]) |maybe_prepared| {
@@ -3082,11 +3097,78 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // its slot out once it has taken over the cleanup.
                 if (maybe_prepared) |prepared| prepared.abort();
             };
+            defer for (inline_text_handled_names[0..inline_text_publication_count]) |name| {
+                S.ownerField(self, "alloc").*.free(name);
+            };
+            // Phase 2 round 2: attempt the inline fast path regardless of
+            // `executor.hasWorkers()` -- the default Lite configuration runs
+            // with background index workers, and the fast path's own
+            // concurrency story (the per-index `lockManagedIndexApply` guard
+            // held from `prepareInlineTextPublication` through
+            // `install`/`abort`, below) already serializes it against a
+            // worker's own `applyPreparedTextMapperPublicationByNameWithOptions`
+            // call, which takes the same per-index guard
+            // (mutation_materialization.zig's `applyDerivedBatchToIndexContextProfiled`).
+            const inline_executor_has_workers = S.ownerField(self, "executor").*.hasWorkers();
+            // `opts.transaction_resolution != null` means this commit routes
+            // through `resolveTransactionIntentsWithExtraBatch` below, whose
+            // own `commit_participant` is `authored_acceptance.participant()`
+            // alone -- never `combined_commit_participant` (built further
+            // down from this same `inline_text_publications` array). Any
+            // publication prepared here for that path would stage nothing,
+            // get `abort`-ed by this function's own top-level `defer`, and
+            // never reach `install`. Preparing it anyway would be pure waste
+            // at best; worse, the `sync_targets.full_text_indexes` filter
+            // just below only looks at whether a publication was prepared,
+            // not whether it was ever staged, so it would wrongly exclude
+            // these names from the notify/wait call further down even
+            // though their actual index effects still need that worker's
+            // ordinary (non-inline) catch-up. Skip the whole attempt for
+            // this path instead.
             if (append_derived_replay and effective_req.sync_level == .full_text and
-                !S.ownerField(self, "executor").*.hasWorkers() and materialized_derived_batch != null)
+                opts.transaction_resolution == null and materialized_derived_batch != null)
             {
                 for (sync_targets.full_text_indexes) |target_name| {
                     if (inline_text_publication_count >= inline_text_publications.len) break;
+                    // A background worker may still be catching this index
+                    // up from an earlier write that never required
+                    // `.full_text` visibility (nothing else ever applies
+                    // that backlog except the worker's own catch-up).
+                    // Jumping straight to `sequence` here while that gap is
+                    // still open would silently skip it forever: once
+                    // durable progress says `sequence`, nothing ever
+                    // revisits anything below it. Only take the fast path
+                    // when the worker (if any is registered) is EXACTLY
+                    // caught up through `sequence - 1`; otherwise fall
+                    // through to the existing slow path below, which
+                    // correctly forces catch-up (including the gap) before
+                    // this write's own ack returns.
+                    if (inline_executor_has_workers) {
+                        const worker_applied = S.ownerField(self, "executor").*.appliedSequence(target_name) orelse 0;
+                        // `worker_applied == 0` together with the contiguity
+                        // check below (`worker_applied + 1 == sequence`)
+                        // means `sequence == 1`: the very first write this
+                        // worker has ever been asked to apply for this
+                        // index. A worker's own first catch-up also
+                        // finalizes that index's one-time admission
+                        // bookkeeping (clearing its durable
+                        // pending-activation marker via
+                        // `finalizeCompletedIndexAdmissionLocked`) as a
+                        // side effect of running through the ordinary
+                        // apply path at all -- `prepareInlineTextPublication`
+                        // only republishes an established index's ordinary
+                        // per-write effects and does not replicate that
+                        // one-time dance. Taking the fast path here would
+                        // leave the index durably stuck advertising pending
+                        // activation with no worker catch-up ever left to
+                        // resolve it (reproduced by the "crash sweep: full
+                        // text synchronous visibility" test: search() never
+                        // left `IndexRebuilding` after reopen, even on the
+                        // uncrashed run). Defer every index's very first
+                        // apply to the slow, worker-driven path; the fast
+                        // path only ever engages once steady state begins.
+                        if (worker_applied == 0 or worker_applied + 1 != sequence) continue;
+                    }
                     const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = target_name, .kind = .full_text };
                     const prepared = prepareInlineTextPublication(
                         S.ownerField(self, "alloc").*,
@@ -3095,9 +3177,66 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         materialized_derived_batch.?,
                         index_ref,
                     ) catch continue;
+                    // Own a copy of the name now: `target_name` aliases
+                    // `sync_targets.full_text_indexes`, whose "filter once"
+                    // block below frees exactly this entry (it is now
+                    // known handled) long before the `install` loop at the
+                    // bottom of this function reads `inline_text_handled_names`.
+                    const handled_name = S.ownerField(self, "alloc").*.dupe(u8, target_name) catch |dup_err| {
+                        prepared.abort();
+                        return dup_err;
+                    };
                     inline_text_publications[inline_text_publication_count] = prepared;
-                    inline_text_handled_names[inline_text_publication_count] = target_name;
+                    inline_text_handled_names[inline_text_publication_count] = handled_name;
                     inline_text_publication_count += 1;
+                }
+            }
+            // With a background executor running, every index this write just
+            // published inline must never also be handed to that executor for
+            // this same write: `notifyIndexes`/`waitForIndexes` would bump the
+            // worker's `target_sequence` and either make the ack wait on a
+            // worker that has nothing left to do, or -- worse -- invite it to
+            // redo the same apply the inline path already made durable.
+            // Rewrite `sync_targets.full_text_indexes` once, here, before any
+            // consumer (the notify call below, the visibility wait, and the
+            // `applyDerivedBatchTargetsProfiled` fallback for the no-worker
+            // case) sees it. `sync_targets.deinit()` (this function's own
+            // `defer`, above) frees whatever this field holds when the
+            // function returns, so the old backing array and every excluded
+            // name are freed right here instead of leaking, and the new array
+            // is a normal owned allocation deinit already knows how to free.
+            //
+            // The "which original entries are handled" decision is computed
+            // into a local `handled` flag array BEFORE any free() call: the
+            // original entries alias `inline_text_handled_names`' pointers
+            // (set to the very same `target_name` slice elements above), so
+            // comparing against them (`std.mem.eql`) after freeing even one
+            // earlier entry would read already-freed memory.
+            if (inline_text_publication_count != 0) {
+                const filter_alloc = S.ownerField(self, "alloc").*;
+                const handled = try filter_alloc.alloc(bool, sync_targets.full_text_indexes.len);
+                defer filter_alloc.free(handled);
+                var kept_count: usize = 0;
+                for (sync_targets.full_text_indexes, 0..) |name, i| {
+                    handled[i] = for (inline_text_handled_names[0..inline_text_publication_count]) |h| {
+                        if (std.mem.eql(u8, h, name)) break true;
+                    } else false;
+                    if (!handled[i]) kept_count += 1;
+                }
+                if (kept_count != sync_targets.full_text_indexes.len) {
+                    const filtered = try filter_alloc.alloc([]const u8, kept_count);
+                    errdefer filter_alloc.free(filtered);
+                    var fill: usize = 0;
+                    for (sync_targets.full_text_indexes, 0..) |name, i| {
+                        if (handled[i]) {
+                            filter_alloc.free(@constCast(name));
+                        } else {
+                            filtered[fill] = name;
+                            fill += 1;
+                        }
+                    }
+                    filter_alloc.free(@constCast(sync_targets.full_text_indexes));
+                    sync_targets.full_text_indexes = filtered;
                 }
             }
             var commit_participants: @import("../commit_participant.zig").List = .{};
@@ -3274,6 +3413,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (maybe_prepared) |prepared| {
                     prepared.install();
                     inline_text_publications[i] = null;
+                    // Mirror this index's now-durable progress into the
+                    // background worker's own bookkeeping (a safe no-op if
+                    // there is no worker for this index, or if it is not
+                    // exactly caught up through `sequence - 1`; see
+                    // `Executor.advanceAppliedSequenceIfContiguous`). This
+                    // is what lets the worker skip ever re-scanning this
+                    // exact sequence for this index, instead of only
+                    // avoiding it on the next write's own pre-check above.
+                    if (inline_executor_has_workers) {
+                        _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_text_handled_names[i], sequence);
+                    }
                 }
             }
             snapshot_mutation.release();
@@ -3370,20 +3520,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         // the primary commit, already installed above)
                         // must not also run through this post-commit
                         // path -- that would re-index it a second time.
-                        if (inline_text_publication_count == 0) {
+                        // `sync_targets.full_text_indexes` already excludes
+                        // every inline-handled name (filtered once, above,
+                        // before this no-worker fallback and the
+                        // has-workers notify/wait path both run), so no
+                        // separate "remaining targets" computation is
+                        // needed here any more.
+                        if (sync_targets.full_text_indexes.len != 0) {
                             try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.full_text_indexes, profile);
-                        } else {
-                            var remaining_targets = std.ArrayListUnmanaged([]const u8).empty;
-                            defer remaining_targets.deinit(S.ownerField(self, "alloc").*);
-                            remaining: for (sync_targets.full_text_indexes) |target_name| {
-                                for (inline_text_handled_names[0..inline_text_publication_count]) |handled_name| {
-                                    if (std.mem.eql(u8, handled_name, target_name)) continue :remaining;
-                                }
-                                try remaining_targets.append(S.ownerField(self, "alloc").*, target_name);
-                            }
-                            if (remaining_targets.items.len != 0) {
-                                try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, remaining_targets.items, profile);
-                            }
                         }
                     } else {
                         try applyDerivedBatchProfiled(self, materialized_derived_batch.?, profile);
