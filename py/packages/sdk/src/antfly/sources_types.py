@@ -30,6 +30,10 @@ class Capabilities(TypedDict):
     serialized_runs: NotRequired[bool]
 
 
+class SourceIdentity(TypedDict):
+    namespace: NotRequired[str]
+
+
 class Source(TypedDict):
     id: str
     name: str
@@ -39,6 +43,8 @@ class Source(TypedDict):
     state: str
     config: dict[str, Any]
     permissions: Permissions
+    identity: NotRequired[SourceIdentity]
+    rekeys: NotRequired[bool]
     permission_ttl_seconds: NotRequired[int]
     streams: NotRequired[list[TextStream]]
 
