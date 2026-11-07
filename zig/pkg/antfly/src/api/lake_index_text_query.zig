@@ -434,7 +434,11 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     defer if (navigation) |*resolver| resolver.deinit();
     var metadata: ?*@import("lake_index_search_metadata.zig").Entry = null;
     defer if (metadata) |entry| entry.release();
-    var owner: Execution = .{ .server = server, .table = sql_table, .source = source, .store = store, .domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.table_id, store.identity, selected.publication().namespace), .declarations = selected.publication().declarations, .context = context, .request = normalized, .schema_json = table.schema_json, .arena = ca, .result_allocator = a, .overlay = if (prepared.overlay != null) &prepared.overlay.? else null, .wal_cut = if (prepared.wal_cut != null) &prepared.wal_cut.? else null };
+    // Physical suppression may be built in this execution's scratch arena
+    // (retained cuts have no WAL-cache pin). Never retain that mutable mask in
+    // the shared reader after this leaf returns.
+    var execution_overlay = prepared.overlay;
+    var owner: Execution = .{ .server = server, .table = sql_table, .source = source, .store = store, .domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.table_id, store.identity, selected.publication().namespace), .declarations = selected.publication().declarations, .context = context, .request = normalized, .schema_json = table.schema_json, .arena = ca, .result_allocator = a, .overlay = if (execution_overlay != null) &execution_overlay.? else null, .wal_cut = if (prepared.wal_cut != null) &prepared.wal_cut.? else null };
     defer owner.deinit();
     var proof: @import("lake_index_row_source.zig").Provider = .{ .source = source, .context = context, .expected_delete_objects = selected.delete_objects };
     if (selected.publication().source_navigation) |ref| {

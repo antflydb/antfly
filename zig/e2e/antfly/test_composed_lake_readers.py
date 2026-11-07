@@ -306,6 +306,8 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 ],
             },
         )
+        _, accepted_first = call("POST", "/query", query)
+        assert accepted_first["next_source_cursor"].startswith("source2:")
         _, counted = call("POST", "/query", {**query, "count": True})
         assert counted["hits"]["total"]["value"] == 98
         assert not counted.get("next_source_cursor")
@@ -317,15 +319,19 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         assert not complete.get("next_source_cursor")
         assert "request-lake:" not in json.dumps(complete)
         server.restart()
-        seen = {h["_source"]["id"] for h in first["hits"]["hits"]}
-        cursor = first["next_source_cursor"]
-        while cursor:
-            _, page = call("POST", "/query", {**query, "source_cursor": cursor})
-            ids = [h["_source"]["id"] for h in page["hits"]["hits"]]
-            assert not (seen & set(ids))
-            seen.update(ids)
-            cursor = page.get("next_source_cursor")
-        assert seen == (set(range(100)) | {200}) - {1, 2}
+        for page_one, expected in (
+            (first, (set(range(100)) | {200}) - {1, 2}),
+            (accepted_first, (set(range(100)) | {200, 201}) - {1, 2, 3, 50}),
+        ):
+            seen = {h["_source"]["id"] for h in page_one["hits"]["hits"]}
+            cursor = page_one["next_source_cursor"]
+            while cursor:
+                _, page = call("POST", "/query", {**query, "source_cursor": cursor})
+                ids = [h["_source"]["id"] for h in page["hits"]["hits"]]
+                assert not (seen & set(ids))
+                seen.update(ids)
+                cursor = page.get("next_source_cursor")
+            assert seen == expected
         failed = False
     finally:
         server.stop(test_failed=failed)
