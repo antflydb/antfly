@@ -163,8 +163,10 @@ Twelve additional read-only searches with DNS/TCP/TLS/header/body/close traces
 completed in 2.248–2.788 seconds; the longest body read was 104 ms. None reproduced
 the 21.497-second stall. Three more real managed queries validated the new
 correlation capture: 2.399, 2.518 and 2.421 seconds, with body/decode times of
-3–4 ms. All returned 20 distinct rows and valid Colony request and Cloudflare Ray
-IDs. The updated gateway propagates only bounded validated IDs, including on
+3–4 ms. All returned 20 distinct rows and valid UUID response request and
+Cloudflare Ray IDs. The later CLI check below found that those response IDs do
+not match deployed Colony access-log IDs. The updated gateway propagates only
+bounded validated IDs, including on
 upstream errors, and qualification reports retain absolute start and header/body
 and close times. A regression test ensures a delayed connection close remains in
 the total and outside-upstream duration. Focused tests now pass 26 cases, with one
@@ -198,6 +200,40 @@ The gateway timing code from merged Antfly #1547 and the correlation additions
 in its follow-up are not yet deployed. This probe-only rollout did not deploy
 that code, change the database image, or optimize existing table schemas. Keep
 those boundaries separate from the verified probe correction.
+
+## Additional CLI transport checks
+
+Twenty further serial `curl` searches compared HTTP/1.1 and HTTP/2 with fresh
+and reused connections. Each returned HTTP 200 and 20 distinct rows:
+
+| Connection mode | Minimum | Median | Maximum |
+| --- | ---: | ---: | ---: |
+| Fresh HTTP/1.1 | 2.370 s | 2.492 s | 2.709 s |
+| Fresh HTTP/2 | 2.292 s | 2.391 s | 2.443 s |
+| Reused HTTP/1.1 | 2.203 s | 2.383 s | 2.613 s |
+| Reused HTTP/2 | 1.941 s | 2.272 s | 2.293 s |
+
+DNS took at most 47 ms, TCP/TLS establishment after DNS at most 76 ms, and body
+transfer at most 8 ms. A local heartbeat's longest scheduling gap was 65 ms.
+Engine cgroup counters showed zero throttled periods/time before and after the
+run; observed engine/API CPU usage was 235m/9m. No host sleep/wake event was found
+in the original outlier's ten-minute window. These checks do not exclude a past
+client scheduling pause or transient packet loss. A forced IPv6 request used
+IPv4-mapped addresses, so it does not qualify a native IPv6 path.
+
+The deployed API response IDs matched none of the 20 Colony log IDs. Origin
+requests were instead paired by the isolated time window and serial order:
+1.850–2.509 seconds at Colony, with at most 231 ms of excess client time. This
+is time/order attribution, not an exact-ID join. The canonical-ID correction is
+already merged in [Colony #947](https://github.com/antflydb/colony/pull/947), but
+the published releases checked predate that merge. A containing Colony release
+and deployment is needed before response/log-ID correlation can be relied on.
+It is an observability correction, not evidence that the transport stall is fixed.
+
+Neither protocol nor connection reuse reproduced the 21.497-second observation.
+The normal baseline in this run was mostly origin processing, while the original
+outlier's unexplained excess remains beyond Google's origin. Cloudflare edge
+telemetry or a fully traced recurrence remains necessary for the specific cause.
 
 ## Remaining scope
 

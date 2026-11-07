@@ -239,6 +239,12 @@ copy arbitrary response headers into qualification evidence. An origin completin
 quickly does not explain a later edge/client stall, and a successful rerun alone
 does not prove that stall fixed.
 
+Verify that a response request ID actually matches the deployed Colony access
+log before relying on it for a join. The observed Cloud deployment returns a
+different ID. [Colony #947](https://github.com/antflydb/colony/pull/947) adds the
+canonical response/log-ID contract; until a containing release is deployed, keep
+absolute timestamps, route and Cloudflare Ray IDs as well.
+
 For the Cloud Run hosting owner (`colony/infra/showcases/hackernews.go`), configure
 the `/health` startup probe explicitly: `initialDelaySeconds: 0`,
 `periodSeconds: 1`, `timeoutSeconds: 1`, `failureThreshold: 30`. The provider's
