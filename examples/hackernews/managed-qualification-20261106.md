@@ -105,6 +105,51 @@ Checkpoint-4 backups are archival and must not be resumed as the current writer.
 The continuous producer remains stopped and the gateway remains private. No
 additional instance, VM or serving capacity was provisioned for this run.
 
+## Follow-up latency attribution
+
+Two additional pairs of first/continuation pages were checked through both the
+managed API and private gateway, with 20 distinct rows per page. Managed request
+durations were 2.518/2.105 seconds and 21.497/2.329 seconds; gateway durations were
+12.893/2.242 seconds and 2.497/2.221 seconds. Do not discard the slow first pages.
+Cloud Run recorded a new container at 02:58:01 UTC on November 7 and startup-probe
+success at 02:58:11. Its request log recorded 12.440 seconds for the corresponding
+12.893-second client observation, followed by 2.134 seconds for continuation on
+the same container. This reproduces a gateway startup delay independently of an
+engine restart. It does not retroactively explain the earlier 10.580-second
+continuation, and the 21.497-second managed outlier still needs proxy/transport
+attribution.
+
+After this batch, the engine's retained slowest composed request was 2.454 seconds:
+2.348 seconds in leaf callbacks, 0.103 seconds in cursor work and 0.003 seconds in
+composition. Those are phases of one retained maximum, not per-request deltas;
+the health metrics cache refreshes every five seconds. No composed request in
+this process exceeded that maximum at the settled observation.
+
+The same logical sample and four original transactions were reconstructed
+locally using the released rc.10 binary and this PR's gateway. Immediately after
+an isolated local engine restart, the first All page took 41.7 ms and continuation
+31.1 ms. Four subsequent first/continuation pages took 28.5–30.9 ms. All six pages
+passed row-count/duplicate checks and supplied valid upstream timing. These use
+local filesystem data/artifacts and an unconstrained developer host, not matched
+Cloud resources or remote GCS; they establish a functional local baseline rather
+than a remote-storage or DuckDB comparison.
+
+The follow-up adds search-first qualification, an optional latency gate and
+numeric upstream timing to avoid attributing every end-to-end delay to search.
+It also declares the generated archive files immutable, matching the fresh-name
+export contract and avoiding per-file HEAD revalidation. Existing bindings still
+use their previous schemas. The hosting probe correction, deployment of the new
+gateway, and existing-binding optimization require their own rollout checks;
+these measurements do not establish that any of them has been applied live.
+
+The updated qualification command was also run against the existing private
+gateway with `--search-first --max-search-seconds 5`. Functional and latency gates
+passed for this observation: History 0.655 s, Recent 0.994 s and All 2.635 s.
+Health/readiness ran afterward. The older deployed gateway does not yet supply
+the new upstream timing header. This successful observation does not cancel the
+earlier outliers or establish a cold-start percentile. Focused gateway,
+qualification and plan tests passed (24 tests, one optional skip, nine subtests).
+
 ## Remaining scope
 
 These are bounded sample checks. Full-archive construction/performance,
