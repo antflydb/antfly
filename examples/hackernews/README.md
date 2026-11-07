@@ -1195,6 +1195,10 @@ current table uses managed Iceberg with immutable files. Accepted WAL positions,
 publication generations and retained image references live in native metadata.
 Queries issue signed `lake3:` and `source3:` capabilities to images built during
 publication/write acceptance, avoiding query-time cursor uploads for these cuts.
+If remote commitment succeeds but native acknowledgment is unconfirmed, the
+changes API returns `state: unknown` without a read receipt. The producer keeps
+its exact pending transaction and checkpoint for retry; it advances only after
+an explicit accepted response with a WAL position.
 
 A node still fetches immutable blocks on cache misses. Background warming is
 bounded and optional, uses the same verified memory/disk caches as foreground
