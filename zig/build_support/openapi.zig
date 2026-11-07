@@ -183,6 +183,7 @@ pub fn addOpenApiSourceSteps(
         .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
         .{ "indexes.yaml", "antfly_indexes_openapi" },
         .{ "resolvers.yaml", "antfly_resolvers_openapi" },
+        .{ "privacy.yaml", "antfly_privacy_openapi" },
         .{ "sort.yaml", "antfly_sort_openapi" },
         .{ "embeddings.yaml", "antfly_embeddings_openapi" },
         .{ "schema.yaml", "antfly_schema_openapi" },
@@ -196,6 +197,7 @@ pub fn addOpenApiSourceSteps(
         .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
         .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
         .{ "specs/openapi/antfly/resolvers.yaml", "antfly_resolvers_openapi" },
+        .{ "specs/openapi/antfly/privacy.yaml", "antfly_privacy_openapi" },
         .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
         .{ "specs/openapi/antfly/embeddings.yaml", "antfly_embeddings_openapi" },
         .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
@@ -214,6 +216,7 @@ pub fn addOpenApiSourceSteps(
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
             .{ "specs/openapi/antfly/resolvers.yaml", "antfly_resolvers_openapi" },
+            .{ "specs/openapi/antfly/privacy.yaml", "antfly_privacy_openapi" },
             .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
@@ -235,6 +238,10 @@ pub fn addOpenApiSourceSteps(
             .{ "chunking.yaml", "antfly_chunking_openapi" },
             .{ "query.yaml", "antfly_query_openapi" },
             .{ "generated/graph_identifier.yaml", "antfly_graph_identifier_openapi" },
+        }),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/privacy.yaml"), "antfly_privacy_openapi", antfly_generated_root ++ "/antfly_privacy_openapi", "types", &.{
+            .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
+            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
         }),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/resolvers.yaml"), "antfly_resolvers_openapi", antfly_generated_root ++ "/antfly_resolvers_openapi", "types", &.{
             .{ "indexes.yaml", "antfly_indexes_openapi" },
@@ -477,6 +484,10 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     const generating_api_openapi_mod = committedModule(b, options, "antfly_generating_api_openapi", false);
     const extraction_openapi_mod = committedModule(b, options, "antfly_extraction_openapi", false);
     extraction_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    const privacy_openapi_mod = committedModule(b, options, "antfly_privacy_openapi", false);
+    privacy_openapi_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
+    privacy_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    inline for (.{ public_openapi_mod, public_server_openapi_mod, client_openapi_mod, metadata_openapi_mod, metadata_server_openapi_mod }) |module| module.addImport("antfly_privacy_openapi", privacy_openapi_mod);
     indexes_openapi_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
     indexes_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     indexes_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);

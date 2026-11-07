@@ -74,6 +74,14 @@ pub const SplitControlObservation = struct {
     }
 };
 
+/// Key families are contiguous intervals. In particular, latest-batch metadata
+/// must not make every compaction overlap the entire append-only command log.
+fn applyRunPartition(key: []const u8) []const u8 {
+    const first = std.mem.indexOfScalar(u8, key, ':') orelse return key;
+    const second = std.mem.indexOfScalarPos(u8, key, first + 1, ':') orelse return key;
+    return key[0 .. second + 1];
+}
+
 pub const RaftApplyStoreConfig = struct {
     root_dir: []const u8,
     /// Trusted host construction only: a native document delegate must apply
@@ -139,6 +147,7 @@ pub const RaftApplyStore = struct {
             no_sync: bool,
             read_only: bool,
             resource_manager: ?*resource_manager_mod.ResourceManager,
+            runtime: ?*background_runtime.BackendRuntime,
             last_access: u64,
         ) !*GroupStore {
             var owner_reservation = if (resource_manager) |manager|
@@ -150,13 +159,36 @@ pub const RaftApplyStore = struct {
             errdefer alloc.destroy(owned);
             const owned_path = try alloc.dupe(u8, path);
             errdefer alloc.free(owned_path);
+            const executor: ?lsm_backend.BackgroundExecutor = if (runtime) |shared|
+                lsm_backend.BackgroundExecutor.init(shared, try shared.allocOwnerId())
+            else
+                null;
             var backend = try lsm_backend.BackendHandle.open(alloc, path, .{
                 .backend = .{
                     .durability = if (no_sync) .none else .full,
                     .read_only = read_only,
                     .create_if_missing = !read_only,
                 },
-                .flush_threshold = 1,
+                // Full durability syncs the WAL before acknowledgement. SST
+                // publication is byte-bounded maintenance, not one flush per
+                // Raft entry while the host progress mutex is held.
+                .flush_threshold = 1024,
+                .flush_threshold_bytes = 8 * 1024 * 1024,
+                .max_deferred_immutable_memtables = 8,
+                .max_deferred_immutable_bytes = 64 * 1024 * 1024,
+                .immutable_flush_window_bytes = 32 * 1024 * 1024,
+                .immutable_flush_window_max_memtables = 8,
+                .l0_soft_limit_runs = 16,
+                .l0_hard_limit_runs = 64,
+                .l0_soft_limit_bytes = 128 * 1024 * 1024,
+                .l0_hard_limit_bytes = 512 * 1024 * 1024,
+                .level_target_bytes_base = 64 * 1024 * 1024,
+                .max_compaction_input_bytes = 128 * 1024 * 1024,
+                .run_partition_key = applyRunPartition,
+                .wal_soft_limit_bytes = 128 * 1024 * 1024,
+                .wal_hard_limit_bytes = 512 * 1024 * 1024,
+                .foreground_soft_wal_checkpoint = true,
+                .background_executor = if (executor) |*value| value else null,
                 .resource_manager = resource_manager,
             });
             errdefer backend.close();
@@ -525,6 +557,7 @@ pub const RaftApplyStore = struct {
                 self.no_sync,
                 self.read_only,
                 self.resource_manager,
+                self.backend_runtime,
                 self.nextGroupStoreAccess(),
             ) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => {
@@ -788,6 +821,7 @@ pub const RaftApplyStore = struct {
                 self.no_sync,
                 false,
                 self.resource_manager,
+                self.backend_runtime,
                 self.nextGroupStoreAccess(),
             );
             defer candidate.close();
@@ -5635,6 +5669,9 @@ test "data raft apply placement transition retains union on abort and retires wi
     var committed = try store.beginActiveGroupTransition(&.{1 + batch_shard_count});
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
+    // Retirement itself remains allocation-free. Best-effort SST finalization
+    // can fail under the injected OOM; the acknowledged WAL must recover it.
+    @import("antfly_test_error_logs").expectErrorLogs(1);
     committed.commit();
     failing.fail_index = std.math.maxInt(usize);
     failing.resize_fail_index = std.math.maxInt(usize);
@@ -5644,6 +5681,21 @@ test "data raft apply placement transition retains union on abort and retires wi
     try std.testing.expect(shard.active_groups.contains(1 + batch_shard_count));
     try std.testing.expect(!shard.stores.contains(1));
     shard.mutex.unlock(store.runtimeIo());
+
+    var observer = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root, .read_only = true });
+    defer observer.deinit();
+    try std.testing.expectEqual(@as(u64, 0), (try observer.latestBatch(1)).?.commit_index);
+    const recovered = try observer.groupState(std.testing.allocator, 1);
+    defer {
+        for (recovered) |entry| {
+            std.testing.allocator.free(entry.key);
+            std.testing.allocator.free(entry.value);
+        }
+        std.testing.allocator.free(recovered);
+    }
+    try std.testing.expectEqual(@as(usize, 1), recovered.len);
+    try std.testing.expectEqualStrings("a", recovered[0].key);
+    try std.testing.expectEqualStrings("one", recovered[0].value);
 }
 
 test "data raft apply placement transition retires high cardinality summaries in one pass" {
@@ -5803,4 +5855,72 @@ test "data apply store replay is idempotent when applied watermark lags WAL stat
         try std.testing.expectEqual(@as(u64, 1), normal_entries[0].index);
         try std.testing.expectEqual(@as(u64, 2), normal_entries[1].index);
     }
+}
+
+test "privacy data raft apply batches WAL-durable commands without one SST per entry" {
+    const alloc = std.testing.allocator;
+    var runtime = try background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/privacy-apply-wal", .{tmp.sub_path});
+    defer alloc.free(root);
+    const payload = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+    @memcpy(payload[0..6], "put:a=");
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root, .backend_runtime = runtime.ptr() });
+        defer store.deinit();
+        for (1..41) |index| {
+            const encoded = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = payload }});
+            defer alloc.free(encoded);
+            try store.snapshotBuilder().applyBatch(.{ .group_id = 91, .commit_index = index, .entries_bytes = encoded });
+        }
+        {
+            const shard = store.batchShard(91);
+            shard.mutex.lockUncancelable(store.runtimeIo());
+            defer shard.mutex.unlock(store.runtimeIo());
+            const group = (try store.groupStoreLocked(shard, 91, false)).?;
+            try std.testing.expect(group.backend.backend.options.wal_sync_on_commit);
+            try std.testing.expect(group.backend.backend.background_executor.jobs != null);
+            try std.testing.expect(group.backend.backend.background_executor.canRunDetached());
+            try std.testing.expect(group.backend.backend.snapshotWriteStats().flushes < 10);
+        }
+        // A separate read-only owner must see WAL-backed state before the
+        // writer closes or checkpoints its partial immutable generation.
+        var observer = try RaftApplyStore.init(alloc, .{ .root_dir = root, .read_only = true });
+        defer observer.deinit();
+        try std.testing.expectEqual(@as(u64, 40), (try observer.latestBatch(91)).?.commit_index);
+        const entries = try observer.appliedNormalEntries(alloc, 91);
+        defer {
+            for (entries) |entry| alloc.free(entry.data);
+            alloc.free(entries);
+        }
+        try std.testing.expectEqual(@as(usize, 40), entries.len);
+        try std.testing.expectEqualStrings(payload, entries[0].data);
+        try std.testing.expectEqualStrings(payload, entries[39].data);
+    }
+    var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = root, .backend_runtime = runtime.ptr() });
+    defer reopened.deinit();
+    const replay = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = payload }});
+    defer alloc.free(replay);
+    try reopened.snapshotBuilder().applyBatch(.{ .group_id = 91, .commit_index = 1, .entries_bytes = replay });
+    payload[payload.len - 1] = 'y';
+    const conflict = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = payload }});
+    defer alloc.free(conflict);
+    try std.testing.expectError(error.ConflictingDataApplyBatch, reopened.snapshotBuilder().applyBatch(.{ .group_id = 91, .commit_index = 1, .entries_bytes = conflict }));
+}
+
+test "privacy data raft apply compaction families are contiguous and separate hot metadata from history" {
+    const keys = [_][]const u8{ "", "a", "a:b", "a:b:", "a:b:1", "a:b:2", "a:c:1", "g:1:a", "g:1:b", "g:2:a", "\x00\x00__metadata__:data_raft_apply:1", "\x00\x00__metadata__:data_raft_normal:1:1", "\x00\x00__metadata__:data_raft_normal:1:2" };
+    for (keys) |left| for (keys) |right| {
+        if (std.mem.eql(u8, applyRunPartition(left), applyRunPartition(right))) {
+            for (keys) |middle| if (std.mem.order(u8, left, middle) == .lt and std.mem.order(u8, middle, right) == .lt) {
+                try std.testing.expectEqualStrings(applyRunPartition(left), applyRunPartition(middle));
+            };
+        }
+    };
+    try std.testing.expect(!std.mem.eql(u8, applyRunPartition(keys[10]), applyRunPartition(keys[11])));
+    try std.testing.expectEqualStrings(applyRunPartition(keys[11]), applyRunPartition(keys[12]));
 }

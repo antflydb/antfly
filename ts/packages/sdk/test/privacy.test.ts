@@ -1,0 +1,204 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { AntflyClient } from "../src/client.js";
+
+afterEach(() => vi.unstubAllGlobals());
+
+describe("table privacy", () => {
+  it("preserves policy CAS, authentication, escaped names and cancellation", async () => {
+    const calls: Request[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string, init: RequestInit) => {
+        const request = new Request(input, init);
+        calls.push(request);
+        expect(await request.json()).toEqual({ mode: "monitor", fields: ["body"] });
+        return Response.json(
+          { configured: true },
+          { status: 202, headers: { ETag: '"privacy-2-version"' } }
+        );
+      })
+    );
+    const controller = new AbortController();
+    const client = new AntflyClient({
+      baseUrl: "https://antfly.test/db/v1",
+      auth: { username: "alice", password: "secret" },
+    });
+    const result = await client.privacy.put(
+      "db/ns/private notes",
+      { mode: "monitor", fields: ["body"] },
+      { ifMatch: '"privacy-1-version"', signal: controller.signal }
+    );
+    expect(calls[0].url).toBe("https://antfly.test/db/v1/tables/db%2Fns%2Fprivate%20notes/privacy");
+    expect(calls[0].headers.get("If-Match")).toBe('"privacy-1-version"');
+    expect(calls[0].headers.get("Authorization")).toBe(`Basic ${btoa("alice:secret")}`);
+    expect(result.etag).toBe('"privacy-2-version"');
+    controller.abort();
+    expect(calls[0].signal.aborted).toBe(true);
+  });
+
+  it("addresses scoped tables for every privacy operation without changing literal names", async () => {
+    const calls: Request[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string, init: RequestInit) => {
+        calls.push(new Request(input, init));
+        return Response.json({}, { headers: { ETag: '"scoped"' } });
+      })
+    );
+    const client = new AntflyClient({ baseUrl: "https://antfly.test" });
+    const target = { database: "tenant one", namespace: "serving", table: "notes/a" };
+    const policy = { mode: "monitor" as const, fields: ["body"] };
+    await client.privacy.get(target);
+    await client.privacy.put(target, policy, { ifMatch: '"old"' });
+    await client.privacy.preview(target, { policy, sample: { keys: ["doc"] } });
+    await client.privacy.startScan(target);
+    await client.privacy.getScan(target, "scan/a");
+    await client.privacy.findings(target, { cursor: "opaque+/=", limit: 1 });
+    const base =
+      "https://antfly.test/db/v1/databases/tenant%20one/namespaces/serving/tables/notes%2Fa/privacy";
+    expect(calls.map((call) => [call.method, call.url])).toEqual([
+      ["GET", base],
+      ["PUT", base],
+      ["POST", base + "/preview"],
+      ["POST", base + "/scans"],
+      ["GET", base + "/scans/scan%2Fa"],
+      ["POST", base + "/findings"],
+    ]);
+    expect(calls[1].headers.get("If-Match")).toBe('"old"');
+    expect(await calls[5].json()).toEqual({ cursor: "opaque+/=", limit: 1 });
+    await client.privacy.get("tenant.serving.notes/a");
+    expect(calls[6].url).toBe("https://antfly.test/db/v1/tables/tenant.serving.notes%2Fa/privacy");
+    await client.privacy.get({ table: "notes/a" });
+    expect(calls[7].url).toBe(
+      "https://antfly.test/db/v1/databases/default/namespaces/public/tables/notes%2Fa/privacy"
+    );
+  });
+
+  it("carries large opaque findings cursors and filters in the body", async () => {
+    const fetch = vi.fn(async (_input: string, _init?: RequestInit) =>
+      Response.json({ findings: [], policy_version: "v" })
+    );
+    vi.stubGlobal("fetch", fetch);
+    const client = new AntflyClient({ baseUrl: "https://antfly.test" });
+    await client.privacy.findings("private", {
+      cursor: "a+/=?&".repeat(10000),
+      document: "A&B/É",
+      category: "email",
+      policy_version: "v",
+      limit: 5,
+    });
+    const [url, init] = fetch.mock.calls[0];
+    expect(new URL(url).search).toBe("");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(init?.body as string)).toEqual({
+      cursor: "a+/=?&".repeat(10000),
+      document: "A&B/É",
+      category: "email",
+      policy_version: "v",
+      limit: 5,
+    });
+  });
+
+  it("carries a server-issued cursor above both former client caps", async () => {
+    // A 49 MiB raw key produces a valid binary cursor above 65 MiB. Reuse that
+    // one token as the response and continuation to test the complete SDK path.
+    const header = Buffer.alloc(137);
+    header.fill("a", 0, 128);
+    const cursor =
+      "p1." + Buffer.concat([header, Buffer.alloc(49 * 1024 * 1024, "x")]).toString("base64url");
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      const input = JSON.parse(init?.body as string);
+      if (input.cursor) {
+        expect(input.cursor).toBe(cursor);
+        return Response.json({ findings: [], policy_version: "v", next_cursor: null });
+      }
+      return Response.json({ findings: [], policy_version: "v", next_cursor: cursor });
+    });
+    vi.stubGlobal("fetch", fetch);
+    const client = new AntflyClient({ baseUrl: "https://antfly.test" });
+    const first = await client.privacy.findings("private");
+    expect(first.data.next_cursor).toBe(cursor);
+    const second = await client.privacy.findings("private", { cursor: first.data.next_cursor! });
+    expect(second.data.next_cursor).toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    // Other privacy operations retain their ordinary write budget.
+    await expect(
+      client.privacy.preview("private", {
+        policy: { mode: "monitor", fields: ["body"] },
+        sample: { keys: [cursor] },
+      })
+    ).rejects.toThrow();
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces precondition errors instead of silently overwriting a policy", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json(
+          { code: "privacy_precondition_failed", message: "The policy changed" },
+          { status: 412 }
+        )
+      )
+    );
+    const client = new AntflyClient({ baseUrl: "https://antfly.test" });
+    await expect(
+      client.privacy.put("private", { mode: "monitor", fields: ["body"] }, { ifMatch: '"old"' })
+    ).rejects.toMatchObject({ status: 412, message: "The policy changed" });
+  });
+  it.each([
+    409, 503,
+  ])("preserves mutation outcomes and retry delay on HTTP %i without replay", async (status) => {
+    for (const json of [true, false]) {
+      const fetch = vi.fn(
+        async () =>
+          new Response(
+            json ? JSON.stringify({ code: "upstream", retryable: true }) : "upstream unavailable",
+            {
+              status,
+              headers: { "Retry-After": "7", "x-antfly-raft-mutation-outcome": " unknown-v1 " },
+            }
+          )
+      );
+      vi.stubGlobal("fetch", fetch);
+      const client = new AntflyClient({ baseUrl: "https://antfly.test" });
+      await expect(
+        client.privacy.put("docs", { mode: "monitor", fields: ["body"] })
+      ).rejects.toMatchObject({ status, mutationOutcome: "unknown", retryAfterSeconds: 7 });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      await expect(client.privacy.startScan("docs")).rejects.toMatchObject({
+        status,
+        mutationOutcome: "unknown",
+        retryAfterSeconds: 7,
+      });
+      expect(fetch).toHaveBeenCalledTimes(2);
+    }
+  });
+
+  it.each([
+    "0",
+    "1",
+    "9007199254740992",
+    "1junk",
+    "-1",
+    "Wed, 21 Oct 2015 07:28:00 GMT",
+  ])("parses Retry-After conservatively (%s)", async (delay) => {
+    const fetch = vi.fn(async () =>
+      Response.json(
+        { code: "privacy_storage_unavailable" },
+        {
+          status: 503,
+          headers: { "Retry-After": delay, "X-Antfly-Raft-Mutation-Outcome": "unknown-v2" },
+        }
+      )
+    );
+    vi.stubGlobal("fetch", fetch);
+    const client = new AntflyClient({ baseUrl: "https://antfly.test" });
+    await expect(client.privacy.get("docs")).rejects.toMatchObject({
+      status: 503,
+      retryAfterSeconds: delay === "0" || delay === "1" ? Number(delay) : undefined,
+      mutationOutcome: undefined,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});

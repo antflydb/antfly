@@ -1,0 +1,333 @@
+import { createHash } from "node:crypto";
+import type {
+  FilesV4,
+  LanguageModelV4,
+  LanguageModelV4FilePart,
+  LanguageModelV4Message,
+  ProviderV4,
+} from "@ai-sdk/provider";
+import type { AntflyClient } from "@antfly/sdk";
+import { type LanguageModelMiddleware, uploadFile, wrapLanguageModel } from "ai";
+import { abortable, combinedSignal } from "../abort.js";
+import { type CatalogResource, resolveAuthorizedAsset } from "./catalog.js";
+import { type AuthorizeAsset, antflyAssetReferenceFrom } from "./reference.js";
+import {
+  AssetByteLimitError,
+  AssetFetchError,
+  discardSourceBody,
+  fetchSourceResponse,
+  readSourceBytes,
+} from "./transport.js";
+
+export { AssetByteLimitError, AssetFetchError } from "./transport.js";
+
+export interface AssetUploadCacheEntry {
+  reference: Record<string, string>;
+  expiresAt?: Date;
+}
+
+/** Caches a vendor file by opaque representation identity and target provider. */
+export interface AssetUploadCache {
+  get(
+    digest: string,
+    provider: string
+  ): AssetUploadCacheEntry | undefined | Promise<AssetUploadCacheEntry | undefined>;
+  set(digest: string, provider: string, entry: AssetUploadCacheEntry): void | Promise<void>;
+}
+
+/** A bounded LRU cache. Scope a shared cache to one vendor account. */
+export function createInMemoryAssetUploadCache(maxEntries = 1024): AssetUploadCache {
+  if (!Number.isSafeInteger(maxEntries) || maxEntries < 1)
+    throw new RangeError("maxEntries must be a positive integer");
+  const entries = new Map<string, AssetUploadCacheEntry>();
+  const cacheKey = (digest: string, provider: string) => `${provider}\u0000${digest}`;
+  return {
+    get: (digest, provider) => {
+      const key = cacheKey(digest, provider);
+      const entry = entries.get(key);
+      if (!entry) return undefined;
+      entries.delete(key);
+      if (entry.expiresAt && entry.expiresAt.getTime() <= Date.now()) return undefined;
+      entries.set(key, entry);
+      return entry;
+    },
+    set: (digest, provider, entry) => {
+      const key = cacheKey(digest, provider);
+      entries.delete(key);
+      entries.set(key, entry);
+      while (entries.size > maxEntries) {
+        const oldest = entries.keys().next();
+        if (oldest.done) break;
+        entries.delete(oldest.value);
+      }
+    },
+  };
+}
+
+type UploadFlight = {
+  controller: AbortController;
+  promise: Promise<AssetUploadCacheEntry>;
+  waiters: number;
+  settled: boolean;
+};
+// Sharing a cache also shares in-flight work, even across middleware instances.
+// Each reference is authorized before joining; each waiter keeps its own signal.
+const uploadFlights = new WeakMap<AssetUploadCache, Map<string, UploadFlight>>();
+
+async function uploadedOnce(
+  cache: AssetUploadCache,
+  key: string,
+  signal: AbortSignal | undefined,
+  upload: (signal: AbortSignal) => Promise<AssetUploadCacheEntry>
+): Promise<AssetUploadCacheEntry> {
+  signal?.throwIfAborted();
+  const flights = uploadFlights.get(cache) ?? new Map<string, UploadFlight>();
+  uploadFlights.set(cache, flights);
+  let flight = flights.get(key);
+  if (!flight) {
+    const controller = new AbortController();
+    const promise = Promise.resolve().then(() => upload(controller.signal));
+    const created: UploadFlight = { controller, waiters: 0, settled: false, promise };
+    created.promise = promise.finally(() => {
+      created.settled = true;
+      if (flights.get(key) === created) flights.delete(key);
+    });
+    flights.set(key, created);
+    flight = created;
+  }
+  flight.waiters++;
+  try {
+    return await abortable(flight.promise, signal);
+  } finally {
+    flight.waiters--;
+    if (flight.waiters === 0 && !flight.settled) {
+      flight.controller.abort();
+      if (flights.get(key) === flight) flights.delete(key);
+    }
+  }
+}
+
+export interface AssetMiddlewareOptions {
+  client: AntflyClient;
+  /** The app's decision on each referenced asset, bound to the current user. Required. */
+  authorize: AuthorizeAsset;
+  /**
+   * Upload the asset to the external provider's own files API, once per
+   * provider and content digest. Default `false`: vendor uploads are
+   * opt-in, because revoking access in Antfly does not remove a vendor's
+   * copy (antfly#1505). When `false` (or the provider has no files API),
+   * the asset is always fetched and sent inline instead.
+   */
+  allowVendorUpload?: boolean;
+  /** Optional files API or provider; providers without `files()` use inline bytes. */
+  files?: FilesV4 | ProviderV4;
+  /** Shared across calls for one vendor account. Defaults to a bounded in-memory cache. */
+  cache?: AssetUploadCache;
+  /** Defaults to `globalThis.fetch`. */
+  fetch?: typeof fetch;
+  /** Abort signal for the server-side fetch of the asset's bytes. */
+  abortSignal?: AbortSignal;
+  /** Largest pinned asset accepted for byte transfer. Default 256 MiB. */
+  maxAssetBytes?: number;
+  /** Sum of declared sizes across resolved file parts, including repeated parts. Default 256 MiB. */
+  maxTotalAssetBytes?: number;
+  /** Concurrent file rewrites (authorization, lookup, transfer/upload). Default 4. */
+  maxConcurrentAssetFetches?: number;
+}
+
+async function fetchResourceBytes(
+  resource: CatalogResource,
+  fetchFn: typeof fetch,
+  signal: AbortSignal | undefined
+): Promise<Uint8Array> {
+  // `resource.uri` is a bearer capability URL (antfly#1505: "treat source
+  // media URLs as secrets in logs and errors too"); it is used exactly
+  // once, here, server-side, and must never appear in a thrown message,
+  // a prompt, or a tool result.
+  const response = await fetchSourceResponse(fetchFn, resource.uri, {
+    headers: { "If-Match": resource.version },
+    signal,
+  });
+  if (response.status === 412 || response.status === 409) {
+    await discardSourceBody(response.body, signal);
+    throw new AssetFetchError(response.status, "version-mismatch");
+  }
+  if (!response.ok) {
+    await discardSourceBody(response.body, signal);
+    throw new AssetFetchError(response.status, "fetch-failed");
+  }
+  return readSourceBytes(response, resource.length, signal);
+}
+
+/**
+ * Rewrites `providerReference: { antfly: <id> }` file parts before an
+ * external (non-Antfly) model call, per antfly#1505's proposed asset flow:
+ * upload once per provider and cache it by digest (opt-in, respecting
+ * `expiresAt`), or fetch the pinned bytes with `If-Match` and send them
+ * inline. Calls to Antfly's own provider need no rewrite: `AntflyChatLanguageModel`
+ * resolves the same reference natively into the typed `source` content part.
+ *
+ * `resolveProviderReference` (`@ai-sdk/provider-utils`) throws
+ * `NoSuchProviderReferenceError` when a provider looks up its own name in a
+ * reference map and finds nothing there. This middleware always leaves the
+ * wrapped provider's own entry present (by uploading and adding it, or by
+ * removing `type: 'reference'` entirely in favor of inline bytes), so that
+ * lookup never fails for a part this middleware has touched.
+ */
+export function createAssetMiddleware(options: AssetMiddlewareOptions): LanguageModelMiddleware {
+  const fetchFn = options.fetch ?? globalThis.fetch;
+  const cache = options.cache ?? createInMemoryAssetUploadCache();
+  const files = options.allowVendorUpload ? options.files : undefined;
+  // Inspect capability without calling provider factories before authorization.
+  const getFilesAPI = files && ("uploadFile" in files ? () => files : files.files?.bind(files));
+
+  const positiveInteger = (value: number | undefined, fallback: number, name: string) => {
+    const limit = value ?? fallback;
+    if (!Number.isSafeInteger(limit) || limit < 1)
+      throw new RangeError(`${name} must be a positive safe integer`);
+    return limit;
+  };
+  const maxAssetBytes = positiveInteger(options.maxAssetBytes, 256 * 1024 * 1024, "maxAssetBytes");
+  const maxTotalAssetBytes = positiveInteger(
+    options.maxTotalAssetBytes,
+    256 * 1024 * 1024,
+    "maxTotalAssetBytes"
+  );
+  const concurrency = positiveInteger(
+    options.maxConcurrentAssetFetches,
+    4,
+    "maxConcurrentAssetFetches"
+  );
+  type RequestAssets = { total: number; bytes: Map<string, Promise<Uint8Array>> };
+  function admit(resource: CatalogResource, assets: RequestAssets): void {
+    if (!Number.isSafeInteger(resource.length) || resource.length < 0)
+      throw new AssetFetchError(0, "invalid-length");
+    if (resource.length > maxAssetBytes) throw new AssetByteLimitError("asset", maxAssetBytes);
+    // Subtraction avoids overflow, and repeated inline parts still expand the provider's request.
+    if (resource.length > maxTotalAssetBytes - assets.total)
+      throw new AssetByteLimitError("request", maxTotalAssetBytes);
+    assets.total += resource.length;
+  }
+
+  async function rewriteFilePart(
+    part: LanguageModelV4FilePart,
+    provider: string,
+    signal: AbortSignal | undefined,
+    assets: RequestAssets
+  ): Promise<LanguageModelV4FilePart> {
+    if (part.data.type !== "reference") return part;
+    const reference = antflyAssetReferenceFrom(part.data.reference);
+    if (!reference) return part;
+    const resource = await resolveAuthorizedAsset(
+      options.client,
+      options.authorize,
+      reference,
+      signal
+    );
+
+    admit(resource, assets);
+    if (getFilesAPI) {
+      // A representation ETag is scoped to one asset, not globally to bytes.
+      // Only source metadata supplies the separately verified content digest.
+      // MIME is part of a vendor file's representation as well.
+      const identity = resource.content_sha256
+        ? ["sha256", resource.content_sha256, resource.mime_type]
+        : [
+            "asset",
+            reference.table,
+            reference.key,
+            resource.uri,
+            resource.version,
+            resource.mime_type,
+          ];
+      // Keep capability URLs out of externally implemented cache keys.
+      const cacheIdentity = createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+      const entry = await uploadedOnce(
+        cache,
+        `${provider}\u0000${cacheIdentity}`,
+        signal,
+        async (sharedSignal) => {
+          const cached = await cache.get(cacheIdentity, provider);
+          sharedSignal.throwIfAborted();
+          if (cached && (!cached.expiresAt || cached.expiresAt.getTime() > Date.now()))
+            return cached;
+          const api = getFilesAPI();
+          const bytes = await fetchResourceBytes(resource, fetchFn, sharedSignal);
+          const uploaded = await uploadFile({
+            api,
+            data: bytes,
+            mediaType: resource.mime_type,
+            abortSignal: sharedSignal,
+          });
+          sharedSignal.throwIfAborted();
+          const result = { reference: uploaded.providerReference, expiresAt: uploaded.expiresAt };
+          await cache.set(cacheIdentity, provider, result);
+          return result;
+        }
+      );
+      return {
+        ...part,
+        mediaType: resource.mime_type,
+        data: { type: "reference", reference: { ...part.data.reference, ...entry.reference } },
+      };
+    }
+
+    // Authorization still runs for every occurrence. Only immutable, pinned bytes
+    // are shared, and only within this request (never across users or requests).
+    const key = JSON.stringify([resource.uri, resource.version, resource.length]);
+    let pending = assets.bytes.get(key);
+    if (!pending) {
+      pending = fetchResourceBytes(resource, fetchFn, signal);
+      assets.bytes.set(key, pending);
+    }
+    const bytes = await pending;
+    return { ...part, mediaType: resource.mime_type, data: { type: "data", data: bytes } };
+  }
+
+  return {
+    specificationVersion: "v4",
+    transformParams: async ({ params, model }) => {
+      if (model.provider === "antfly") return params;
+      const cancellation = new AbortController();
+      const signal = combinedSignal(options.abortSignal, params.abortSignal, cancellation.signal);
+      const assets: RequestAssets = { total: 0, bytes: new Map() };
+      const jobs: (() => Promise<void>)[] = [];
+      const prompt = params.prompt.map((message) => {
+        if (message.role !== "user" && message.role !== "assistant") return message;
+        const content = [...message.content];
+        for (const [index, part] of content.entries()) {
+          if (part.type === "file")
+            jobs.push(async () => {
+              content[index] = await rewriteFilePart(part, model.provider, signal, assets);
+            });
+        }
+        return { ...message, content } as LanguageModelV4Message;
+      });
+      let next = 0;
+      const worker = async () => {
+        while (next < jobs.length) {
+          signal?.throwIfAborted();
+          await jobs[next++]();
+        }
+      };
+      try {
+        await abortable(
+          Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker)),
+          signal
+        );
+        return { ...params, prompt };
+      } catch (error) {
+        cancellation.abort(error);
+        throw error;
+      }
+    },
+  };
+}
+
+/** `wrapLanguageModel({ model, middleware: createAssetMiddleware(options) })`. */
+export function withAssetMiddleware(
+  model: LanguageModelV4,
+  options: AssetMiddlewareOptions
+): LanguageModelV4 {
+  return wrapLanguageModel({ model, middleware: createAssetMiddleware(options) });
+}

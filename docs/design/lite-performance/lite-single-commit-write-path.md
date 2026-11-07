@@ -236,6 +236,33 @@ Algebraic indexes (`storage/db/algebraic/`) are built differently. They write fa
 - **Synchronous apply.** An algebraic apply for a synchronous write becomes a `commit_participant` contributor. Its facts and progress land in the primary write's own native transaction.
 - **Background work.** HLL maintenance, adaptive backfill and dematerialization, and join-fact upkeep become demand-driven ride-along commits.
 
+### 3.3c Relational, transactional and auxiliary write surfaces
+
+The rule applies to every durable effect of a write, not only to search indexes. Each of the following lands in the primary write's transaction, either folded into its batch or added as a `commit_participant` contributor:
+
+- relational secondary-index entries;
+- unique-constraint and foreign-key records;
+- relational columns;
+- SQL DML;
+- multi-document transaction resolution;
+- TTL schedules;
+- durable outbox, replication and CDC rows;
+- child-range records;
+- recovery-agenda obligations.
+
+Validation runs under the apply lock, so there is never a window in which a child row is durable while its parent check doesn't hold.
+
+The following background work rides along and is demand-driven and owner-only:
+
+- relational index maintenance, sweeps and GC;
+- constraint jobs;
+- integrity activation backfill and generation retirement;
+- TTL expiry;
+- outbox publication and trimming;
+- enrichment bookkeeping;
+- promotions;
+- split progress.
+
 ### 3.4 Progress separated from status
 
 **Progress:**

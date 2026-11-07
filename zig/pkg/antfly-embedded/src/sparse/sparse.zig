@@ -4894,19 +4894,39 @@ pub const SparseIndex = struct {
         max_doc_id: []const u8,
         profile: ?*WriteProfile,
     ) !void {
+        // `min_doc_id`/`max_doc_id` are frequently borrowed straight out of
+        // this same `txn`'s own backing store rather than caller-owned
+        // copies -- see `addToPostings`'s "append to existing chunk" branch,
+        // which forwards `readChunkRangeMeta`'s return value (a slice into
+        // the previous chunk-meta record) without copying it. On
+        // `.native_catalog` (`storage/native_catalog_backend.zig`'s
+        // persistent-tree `State`), every `txn.put` is an immediate
+        // copy-on-write replace that releases the superseded tree nodes --
+        // including the one backing that borrowed slice, if the put's
+        // insertion path rebuilds it. Encoding (and therefore copying) both
+        // payloads before issuing *either* write means nothing below ever
+        // reads through a pointer this same call may have just invalidated.
+        // Previously the chunk-key put ran first, so a `min_doc_id`/
+        // `max_doc_id` aliasing that key's own prior chunk-meta node could
+        // be freed out from under `encodeChunkOrdinalRange`'s memcpy --
+        // reproduced as a segfault in `addToPostings` under concurrent
+        // `sparse_vector_8_writers` load (see
+        // `write_amplification_bench_test.zig`).
         var phase_start_ns = nowNs();
         const encoded = try encodeChunk(alloc, doc_nums, weights);
         if (profile) |active_profile| active_profile.chunk_encode_ns += elapsedSince(phase_start_ns);
         defer alloc.free(encoded);
-        var ck_buf: [256]u8 = undefined;
-        phase_start_ns = nowNs();
-        try txnAppendPut(txn, self.dbi, invChunkKey(&ck_buf, term_id, chunk_idx), encoded);
-        if (profile) |active_profile| active_profile.chunk_put_ns += elapsedSince(phase_start_ns);
 
         phase_start_ns = nowNs();
         const meta = try encodeChunkOrdinalRange(alloc, min_doc_id, max_doc_id, doc_nums, false);
         if (profile) |active_profile| active_profile.range_meta_encode_ns += elapsedSince(phase_start_ns);
         defer alloc.free(meta);
+
+        var ck_buf: [256]u8 = undefined;
+        phase_start_ns = nowNs();
+        try txnAppendPut(txn, self.dbi, invChunkKey(&ck_buf, term_id, chunk_idx), encoded);
+        if (profile) |active_profile| active_profile.chunk_put_ns += elapsedSince(phase_start_ns);
+
         var meta_ck_buf: [256]u8 = undefined;
         phase_start_ns = nowNs();
         try txnAppendPut(txn, self.dbi, invChunkMetaKey(&meta_ck_buf, term_id, chunk_idx), meta);
@@ -6971,13 +6991,17 @@ fn writeChunkWithRangeMetaToTxn(
 ) !void {
     _ = src_txn;
     _ = src_dbi;
+    // Same ordering hazard as `writeChunkWithRangeMetaProfiled`: encode (and
+    // thereby copy) both payloads before issuing either `dest_txn` write, in
+    // case `min_doc_id`/`max_doc_id` borrow memory that a `dest_txn` put can
+    // invalidate.
     const encoded = try encodeChunk(alloc, doc_nums, weights);
     defer alloc.free(encoded);
-    var ck_buf: [256]u8 = undefined;
-    try txnPut(dest_txn, dest_dbi, invChunkKey(&ck_buf, term_id, chunk_idx), encoded);
-
     const meta = try encodeChunkOrdinalRange(alloc, min_doc_id, max_doc_id, doc_nums, false);
     defer alloc.free(meta);
+
+    var ck_buf: [256]u8 = undefined;
+    try txnPut(dest_txn, dest_dbi, invChunkKey(&ck_buf, term_id, chunk_idx), encoded);
     var meta_ck_buf: [256]u8 = undefined;
     try txnPut(dest_txn, dest_dbi, invChunkMetaKey(&meta_ck_buf, term_id, chunk_idx), meta);
 }
@@ -7188,6 +7212,164 @@ test "sparse inline publication rejects every backend but native_catalog" {
     defer index.close();
     const write: SparseWrite = .{ .doc_id = "doc-3", .vec = .{ .indices = &.{1}, .values = &.{1.0} } };
     try std.testing.expectError(error.InlineSparsePublicationUnsupported, index.prepareInlineSparsePublication(&.{write}, &.{}));
+}
+
+// Regression for a use-after-free in `writeChunkWithRangeMetaProfiled`: the
+// chunk-key `txnAppendPut` used to run *before* `encodeChunkOrdinalRange`
+// read `min_doc_id`/`max_doc_id` -- which `addToPostings`'s "append to
+// existing chunk" branch borrows straight out of this same `.native_catalog`
+// transaction's previous chunk-meta record (`readChunkRangeMeta`), never
+// copied. On `.native_catalog` (`storage/native_catalog_backend.zig`'s
+// persistent-tree `State`), every `txn.put` is an immediate copy-on-write
+// replace that releases the superseded tree node once nothing else
+// references it -- including, when that node's key happened to sit on the
+// chunk key's insertion path, the exact node backing the borrowed slice.
+// `encodeChunkOrdinalRange`'s later memcpy then read freed memory.
+// Reproduced as a segfault in `addToPostings`, reached from real concurrent
+// writers in `storage/lite/write_amplification_bench_test.zig`'s
+// `sparse_vector_8_writers` mode (inline publication and the worker
+// catch-up path both funnel through the same `stageIncrementalMutations` ->
+// `processInsert` -> `addToPostings` -> `writeChunkWithRangeMeta` call
+// chain). This test drives both of those call paths --
+// `prepareInlineSparsePublication`/`installInlineSparsePublication` for
+// "foreground inline" workers and plain `batch()` for "catch-up-style"
+// workers -- from real OS threads serialized by an explicit mutex standing
+// in for production's per-index `IndexManager.lockManagedIndexApply` guard
+// (this index's own contract: every writer serializes through one such
+// lock), with a small `chunk_size` and a narrow term universe to force many
+// existing-chunk appends. Bounded by a wall-clock deadline so a real
+// regression here fails fast instead of hanging.
+test "concurrent sparse writers across inline publication and direct batch paths do not corrupt postings" {
+    const alloc = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = tmpPath(&buf, "concurrent-inline-stress");
+    defer cleanupTmp(path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+
+    var index = try SparseIndex.open(alloc, path, .{
+        .backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.sink(),
+        .chunk_size = 3,
+    });
+    defer index.close();
+
+    const writer_count = 8;
+    const writes_per_writer = 40;
+    const term_universe = 6;
+    // Generous on purpose: this guards against a genuine hang (e.g. a
+    // reintroduced crash taking a worker thread down mid-write), not
+    // against ordinary scheduling noise. 320 total serialized writes
+    // normally finish in well under a second; a loaded machine running
+    // other work concurrently (shared CI runners, other builds) can still
+    // take meaningfully longer without anything being wrong.
+    const deadline_ns = nowNs() + 10 * 60 * std.time.ns_per_s;
+
+    const Worker = struct {
+        index: *SparseIndex,
+        sink: *NativeCatalogTestSink,
+        guard: *std.atomic.Mutex,
+        worker_id: usize,
+        count: usize,
+        deadline_ns: u64,
+        use_inline_publication: bool,
+        err: ?anyerror = null,
+        completed: usize = 0,
+
+        fn lockGuard(guard: *std.atomic.Mutex) void {
+            while (!guard.tryLock()) std.atomic.spinLoopHint();
+        }
+
+        fn run(self: *@This()) void {
+            var id_buf: [32]u8 = undefined;
+            var i: usize = 0;
+            while (i < self.count) : (i += 1) {
+                // Bounded rather than infinite: a real regression crashes or
+                // hangs long before this fires, so the test fails fast
+                // instead of hanging the suite.
+                if (nowNs() >= self.deadline_ns) return;
+                const doc_id = std.fmt.bufPrint(&id_buf, "w{d}-doc-{d}", .{ self.worker_id, i }) catch |err| {
+                    self.err = err;
+                    return;
+                };
+                // Two overlapping terms per doc out of a small shared
+                // universe: every term quickly accumulates postings from
+                // many different workers and repeatedly crosses the
+                // "append to existing chunk" branch that borrows range
+                // metadata out of the transaction being written to.
+                const t0: u32 = @intCast((self.worker_id + i) % term_universe);
+                const t1: u32 = @intCast((self.worker_id + i + 1) % term_universe);
+                const write: SparseWrite = .{
+                    .doc_id = doc_id,
+                    .vec = .{
+                        .indices = &.{ t0, t1 },
+                        .values = &.{ 1.0 + @as(f32, @floatFromInt(i % 5)), 2.0 },
+                    },
+                };
+
+                lockGuard(self.guard);
+                defer self.guard.unlock();
+
+                if (self.use_inline_publication) {
+                    var publication = self.index.prepareInlineSparsePublication(&.{write}, &.{}) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                    const scope = self.index.nativeCatalogScope().?;
+                    NativeCatalogTestSink.submit(self.sink, scope, publication.pendingMutations(), true) catch |err| {
+                        publication.abort();
+                        self.err = err;
+                        return;
+                    };
+                    self.index.installInlineSparsePublication(&publication) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                } else {
+                    self.index.batch(&.{write}, &.{}) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                }
+                self.completed += 1;
+            }
+        }
+    };
+
+    var apply_guard: std.atomic.Mutex = .unlocked;
+    var workers: [writer_count]Worker = undefined;
+    for (0..writer_count) |w| workers[w] = .{
+        .index = &index,
+        .sink = &test_sink,
+        .guard = &apply_guard,
+        .worker_id = w,
+        .count = writes_per_writer,
+        .deadline_ns = deadline_ns,
+        .use_inline_publication = w % 2 == 0,
+    };
+
+    var threads: [writer_count]std.Thread = undefined;
+    for (0..writer_count) |w| threads[w] = try std.Thread.spawn(.{}, Worker.run, .{&workers[w]});
+    for (threads) |thread| thread.join();
+
+    var total_completed: usize = 0;
+    for (workers) |worker| {
+        if (worker.err) |err| return err;
+        total_completed += worker.completed;
+    }
+    try std.testing.expectEqual(writer_count * writes_per_writer, total_completed);
+    try std.testing.expectEqual(@as(u64, writer_count * writes_per_writer), index.doc_count);
+
+    // Every term in the shared universe now has postings from many workers
+    // across many chunks; a corrupted chunk/range record would show up here
+    // as a wrong hit count (before this fix, we would not even get this far
+    // without crashing).
+    for (0..term_universe) |t| {
+        const hits = try index.search(alloc, &.{ .indices = &.{@as(u32, @intCast(t))}, .values = &.{1} }, writer_count * writes_per_writer);
+        defer SparseIndex.freeResults(alloc, hits);
+        try std.testing.expect(hits.len > 0);
+    }
 }
 
 fn expectIncarnationSearch(index: *SparseIndex, term: u32, expected: []const struct { id: []const u8, score: f32 }, filtered: bool) !void {

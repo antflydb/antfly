@@ -1267,6 +1267,7 @@ fn discoverOnce(
     const url = try scopedModelsUrlAlloc(alloc, inference_url, model, operation);
     defer alloc.free(url);
     var response = http.get(url, .{
+        .follow_redirects = false,
         .headers = headers,
         .max_response_size = capability_catalog_response_bytes,
     }) catch |err| {
@@ -1386,6 +1387,7 @@ fn discoverWithContextOnce(
     const url = try scopedModelsUrlAlloc(alloc, inference_url, model, operation);
     defer alloc.free(url);
     var response = http.get(url, .{
+        .follow_redirects = false,
         .headers = headers,
         .timeout_ms = timeout_ms,
         .cancellation = httpx.CancellationToken.fromCallback(

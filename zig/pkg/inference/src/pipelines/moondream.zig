@@ -47,10 +47,16 @@ pub const stop_text = "<END>";
 /// single-file safetensors checkpoint. Loads no weights.
 pub fn probeModelDir(allocator: std.mem.Allocator, model_dir: []const u8) !bool {
     if (!build_options.enable_native) return false;
-    if (!try c_file.fileExistsInDirChecked(allocator, model_dir, "config.json")) return false;
-    if (!try c_file.fileExistsInDirChecked(allocator, model_dir, "tokenizer.json")) return false;
-    if (!try c_file.fileExistsInDirChecked(allocator, model_dir, weights_file)) return false;
-    const cfg_bytes = c_file.readFileFromDir(allocator, model_dir, "config.json") catch return false;
+    var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, std.Options.debug_io, model_dir, null);
+    defer artifacts.deinit();
+    for ([_][]const u8{ "tokenizer.json", weights_file }) |name| {
+        const path = (try artifacts.resolve(name)) orelse return false;
+        allocator.free(path);
+    }
+    const cfg_bytes = artifacts.read("config.json", 16 * 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound, error.FileTooLarge, error.ChecksumMismatch => return false,
+        else => return err,
+    };
     defer allocator.free(cfg_bytes);
     return arch.isMoondreamConfig(allocator, cfg_bytes);
 }
@@ -127,11 +133,17 @@ pub const Pipeline = struct {
         if (!build_options.enable_native) return error.NativeNotEnabled;
         if (control) |active| try active.check();
 
-        const cfg_bytes = try c_file.readFileFromDir(allocator, model_dir, "config.json");
+        const runtime_io = io orelse std.Options.debug_io;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, runtime_io, model_dir);
+        defer publication_lease.deinit(runtime_io);
+        if (control) |active| try active.verifyModelSelection(allocator, runtime_io, model_dir);
+        var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, runtime_io, model_dir, if (control) |active| if (active.model_selection) |selected| .{ .publication = selected.publication } else null else null);
+        defer artifacts.deinit();
+        const cfg_bytes = try artifacts.read("config.json", 16 * 1024 * 1024);
         defer allocator.free(cfg_bytes);
         const config = try arch.parseConfig(allocator, cfg_bytes);
 
-        const tok_bytes = try c_file.readFileFromDir(allocator, model_dir, "tokenizer.json");
+        const tok_bytes = try artifacts.read("tokenizer.json", 256 * 1024 * 1024);
         defer allocator.free(tok_bytes);
         const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tok_bytes);
         errdefer tok.deinitSelf();
@@ -139,12 +151,14 @@ pub const Pipeline = struct {
         const stop_token_ids = try loadStopTokens(allocator, tok, config);
         errdefer allocator.free(stop_token_ids);
 
-        const weights_path = try std.fs.path.join(allocator, &.{ model_dir, weights_file });
+        const weights_path = (try artifacts.resolve(weights_file)) orelse return error.NoDenseWeightSource;
         defer allocator.free(weights_path);
         const st = try tensor_store_mod.SafetensorsStore.initAbsolute(allocator, weights_path);
         const store = st.tensorStore();
         var store_owned = true;
         errdefer if (store_owned) store.deinit();
+        try artifacts.verifyBytes(weights_file, st.source.reader.file_bytes);
+        try artifacts.verify();
         if (control) |active| try active.check();
 
         try validateCheckpoint(allocator, store, config);

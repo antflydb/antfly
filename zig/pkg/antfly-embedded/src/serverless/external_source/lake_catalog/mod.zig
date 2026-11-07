@@ -22,6 +22,7 @@ pub const parquet_writer = @import("parquet_writer.zig");
 pub const avro_writer = @import("avro_writer.zig");
 pub const manifest_inventory = @import("manifest_inventory.zig");
 pub const retirement_index = @import("retirement_index.zig");
+pub const bucket = @import("bucket.zig");
 pub const row_commit = @import("row_commit.zig");
 const std = @import("std");
 pub const Catalog = union(enum) {

@@ -244,6 +244,9 @@ SOURCE_MODULES = {
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_logging_openapi/root.zig",
     ),
     "antfly_matcher": ("zig/pkg/antfly-embedded/matcher/src/mod.zig",),
+    "antfly_privacy_openapi": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_privacy_openapi/root.zig",
+    ),
     "antfly_metadata_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_metadata_openapi/root.zig",
     ),

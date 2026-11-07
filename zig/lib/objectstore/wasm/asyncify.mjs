@@ -195,7 +195,7 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
           if (!ptr) throw new Error("WASM response allocation failed");
           try {
             const response = JSON.parse(decoder.decode(bytes(ptr, len)));
-            if (response.err) { protocolError = true; throw new Error(response.err); }
+            if (response?.err) { protocolError = true; throw new Error(response.err); }
             outcome = "ok";
             return response;
           } finally { wasm.antfly_host_free(ptr, len); }

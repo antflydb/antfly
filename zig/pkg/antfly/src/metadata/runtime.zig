@@ -1198,6 +1198,7 @@ pub fn runFromIterator(
         storage_kernel_context = context;
         try storage_kernel_context.?.configureRemoteContent(remote_content);
         try storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
+        if (loaded_config) |*cfg| try storage_kernel_context.?.configureInferenceDefaults(cfg.inference.api_url, cfg.inference.api_key);
     }
 
     var auth_backend: ?LegacyAuthBackend = null;
@@ -1269,6 +1270,9 @@ pub fn runFromIterator(
         }
     }
 
+    var sql_configuration = std.heap.ArenaAllocator.init(alloc);
+    defer sql_configuration.deinit();
+    const sql_config = try @import("../serverless/sql/deployment.zig").Config.fromEnv(sql_configuration.allocator(), init.environ_map, if (secret_store_initialized) &secret_store else null);
     var server = try Server.init(alloc, .{
         .online_merge_enabled = cli.online_merge_enabled,
         .local_node_id = local_node_id,
@@ -1284,6 +1288,7 @@ pub fn runFromIterator(
         .reconciler_config = shardAllocationReconcilerConfig(if (loaded_config) |*cfg| cfg else null),
         .secret_store = if (secret_store_initialized) &secret_store else null,
         .api_server_cfg = .{
+            .sql_deployment = sql_config,
             .auth_enabled = effective_auth_enabled,
             .experimental = cli.experimental,
             .trusted_principal_secret = trusted_principal_secret,

@@ -345,6 +345,7 @@ test "decode bmp fixture returns rgb image" {
 
 test "decode rejects oversized image dimensions before full decode" {
     var png = red_png_2x2;
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 100_000, .big);
     std.mem.writeInt(u32, png[20..24], 100_000, .big);
     try std.testing.expectError(error.ImageDecodeFailed, decode(std.testing.allocator, &png));
@@ -360,11 +361,14 @@ test "encoded image inspection distinguishes malformed and configured limits" {
     try std.testing.expectError(error.ImageDecodeFailed, inspectEncodedForInference(red_png_2x2[0..20], null));
 
     var png = red_png_2x2;
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 2049, .big);
     try std.testing.expectError(error.ImageTooLarge, inspectEncodedForInference(&png, 2048));
 
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 0, .big);
     try std.testing.expectError(error.ImageDecodeFailed, inspectEncodedForInference(&png, null));
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], std.math.maxInt(u32), .big);
     std.mem.writeInt(u32, png[20..24], std.math.maxInt(u32), .big);
     try std.testing.expectError(error.ImageTooLarge, inspectEncodedForInference(&png, null));

@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "antfly-sql",
+  "main": "sql-worker.mjs",
+  "compatibility_date": "2026-10-19",
+  "durable_objects": {"bindings": [{"name": "SQL_COORDINATORS", "class_name": "SQLCoordinator"}]},
+  "migrations": [{"tag": "sql-v1", "new_sqlite_classes": ["SQLCoordinator"]}],
+  "r2_buckets": [
+    {"binding": "SQL_EXECUTION", "bucket_name": "antfly-sql-execution"},
+    {"binding": "SQL_SOURCE", "bucket_name": "antfly-sql-source"}
+  ],
+  "queues": {
+    "producers": [{"binding": "SQL_TASKS", "queue": "antfly-sql-tasks"}],
+    "consumers": [{"queue": "antfly-sql-tasks", "max_batch_size": 1, "max_batch_timeout": 0, "max_retries": 10, "max_concurrency": 32, "dead_letter_queue": "antfly-sql-dead-letter"}]
+  },
+  "triggers": {"crons": ["* * * * *"]},
+  "vars": {
+    "SQL_SERVICE_ISSUER": "sql:replace-cluster-incarnation",
+    "SQL_BUCKET_BINDINGS": "{\"antfly-sql-execution\":\"SQL_EXECUTION\",\"antfly-sql-source\":\"SQL_SOURCE\"}",
+    "SQL_CONFIG": "{\"state\":{\"bucket\":\"antfly-sql-execution\",\"prefix\":\"cluster/state\"},\"exchange\":{\"bucket\":\"antfly-sql-execution\",\"prefix\":\"cluster/exchange\"},\"artifacts\":{\"version\":1,\"protocol\":\"s3\",\"connection\":\"source\",\"bucket\":\"antfly-sql-source\",\"prefix\":\"cluster/artifacts\",\"root\":\"replace-account.r2.cloudflarestorage.com\",\"tls\":true},\"source_buckets\":[\"antfly-sql-source\"],\"task_memory\":8388608}"
+  }
+}

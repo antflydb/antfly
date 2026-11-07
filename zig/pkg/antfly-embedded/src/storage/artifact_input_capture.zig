@@ -222,7 +222,7 @@ pub const Capture = struct {
                 _ = try @import("db/artifact_producer_obligations.zig").mark(self.allocator orelse return error.ArtifactCatalogCorrupt, txn, expected, document.*, input_position);
             }
         }
-        if (try @import("db/artifact_producer_obligations.zig").load(txn) != null)
+        if (try @import("db/artifact_producer_obligations.zig").loadMetadata(txn) != null)
             try @import("db/artifact_producer_validation.zig").invalidate(self.allocator orelse return error.ArtifactCatalogCorrupt, txn, expected);
         self.staged = true;
     }

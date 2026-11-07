@@ -59,6 +59,7 @@ pub const FsStore = struct {
     verified_mu: std.atomic.Mutex = .unlocked,
     journal_backfills: std.atomic.Value(usize) = .init(0),
     journal_records_read: std.atomic.Value(usize) = .init(0),
+    journal_attempt_scans: std.atomic.Value(u64) = .init(0),
     verified_files: std.StringHashMapUnmanaged(VerifiedFile) = .empty,
 
     pub fn init(alloc: Allocator, root_dir: []const u8) !FsStore {
@@ -447,7 +448,6 @@ pub const FsStore = struct {
             else => return err,
         };
         defer dir.close(io);
-        var after_name: [32]u8 = undefined;
         var after_attempt: ?[]const u8 = null;
         var after_offset: u64 = 0;
         if (visitor.continuation) |token| {
@@ -456,30 +456,46 @@ pub const FsStore = struct {
             _ = std.fmt.hexToBytes(&decoded, token[0..32]) catch return error.InvalidArtifactEnumerationContinuation;
             after_attempt = token[0..32];
             after_offset = std.fmt.parseInt(u64, token[33..49], 16) catch return error.InvalidArtifactEnumerationContinuation;
-            if (after_offset < journal_header.len or (after_offset - journal_header.len) % 64 != 0) return error.InvalidArtifactEnumerationContinuation;
+            if (after_offset != std.math.maxInt(u64) and (after_offset < journal_header.len or (after_offset - journal_header.len) % 64 != 0)) return error.InvalidArtifactEnumerationContinuation;
         }
         const maximum = visitor.max_entries orelse 256;
         if (maximum == 0 or maximum > 65536) return error.InvalidArtifactEnumerationLimit;
         var visited: usize = 0;
-        while (true) {
-            // There are bounded publication attempts per namespace. Only their
-            // 32-byte names are compared; payload directories are never scanned
-            // again once their journal exists.
-            var selected: ?[32]u8 = null;
-            var attempts = dir.iterate();
-            while (try attempts.next(io)) |entry| {
-                try cancellation.check();
-                if (entry.kind != .directory or entry.name.len != 32) continue;
-                var scope: artifact_store.UploadScope = .{ .domain = domain, .attempt = undefined };
-                _ = std.fmt.hexToBytes(&scope.attempt, entry.name) catch continue;
-                scope.validate() catch continue;
-                if (scope.fencingToken() < visitor.fencing_floor or (visitor.fencing_cutoff != null and scope.fencingToken() >= visitor.fencing_cutoff.?)) continue;
-                if (visitor.exclude_attempt) |excluded| if (std.mem.eql(u8, &excluded, &scope.attempt)) continue;
-                if (visitor.only_attempt) |only| if (!std.mem.eql(u8, &only, &scope.attempt)) continue;
-                if (after_attempt) |after| if (std.mem.order(u8, entry.name, after) == .lt or (std.mem.eql(u8, entry.name, after) and after_offset == std.math.maxInt(u64))) continue;
-                if (selected == null or std.mem.order(u8, entry.name, &selected.?) == .lt) selected = entry.name[0..32].*;
+        // Select a bounded page of attempts in one namespace scan. Selecting
+        // the next minimum separately for every attempt makes a wide namespace
+        // quadratic even though each upload journal itself is read linearly.
+        const Candidate = [32]u8;
+        const Order = struct {
+            fn compare(_: void, left: Candidate, right: Candidate) std.math.Order {
+                return std.mem.order(u8, &right, &left);
             }
-            const name = selected orelse return;
+            fn less(_: void, left: Candidate, right: Candidate) bool {
+                return std.mem.order(u8, &left, &right) == .lt;
+            }
+        };
+        var candidates = std.PriorityQueue(Candidate, void, Order.compare).initContext({});
+        defer candidates.deinit(self.alloc);
+        if (@import("builtin").is_test) _ = self.journal_attempt_scans.fetchAdd(1, .monotonic);
+        var attempts = dir.iterate();
+        while (try attempts.next(io)) |entry| {
+            try cancellation.check();
+            if (entry.kind != .directory or entry.name.len != 32) continue;
+            var scope: artifact_store.UploadScope = .{ .domain = domain, .attempt = undefined };
+            _ = std.fmt.hexToBytes(&scope.attempt, entry.name) catch continue;
+            scope.validate() catch continue;
+            if (scope.fencingToken() < visitor.fencing_floor or (visitor.fencing_cutoff != null and scope.fencingToken() >= visitor.fencing_cutoff.?)) continue;
+            if (visitor.exclude_attempt) |excluded| if (std.mem.eql(u8, &excluded, &scope.attempt)) continue;
+            if (visitor.only_attempt) |only| if (!std.mem.eql(u8, &only, &scope.attempt)) continue;
+            if (after_attempt) |after| if (std.mem.order(u8, entry.name, after) == .lt or (std.mem.eql(u8, entry.name, after) and after_offset == std.math.maxInt(u64))) continue;
+            const name: Candidate = entry.name[0..32].*;
+            if (candidates.items.len == maximum + 1) {
+                if (std.mem.order(u8, &name, &candidates.peek().?) != .lt) continue;
+                _ = candidates.pop();
+            }
+            try candidates.push(self.alloc, name);
+        }
+        std.mem.sort(Candidate, candidates.items, {}, Order.less);
+        for (candidates.items[0..@min(maximum, candidates.items.len)]) |name| {
             const attempt = try dir.openDir(io, &name, .{ .iterate = true, .follow_symlinks = false });
             defer attempt.close(io);
             var scope: artifact_store.UploadScope = .{ .domain = domain, .attempt = undefined };
@@ -522,12 +538,16 @@ pub const FsStore = struct {
                 defer self.alloc.free(token);
                 try visitor.checkpoint.?(visitor.ptr, token);
             }
-            // The last actual record remains the durable token. Reopening an
-            // exhausted attempt costs a length check, then moves to the next.
-            after_name = name;
-            after_attempt = &after_name;
-            after_offset = std.math.maxInt(u64);
+            // Closed attempts cannot gain legitimate new uploads. A durable
+            // completion marker also advances past empty/backfilled journals
+            // when the work quantum contains only one record/attempt.
+            if (visitor.fencing_cutoff != null) {
+                const token = try std.fmt.allocPrint(self.alloc, "{s}:ffffffffffffffff", .{name});
+                defer self.alloc.free(token);
+                try visitor.checkpoint.?(visitor.ptr, token);
+            }
         }
+        if (candidates.items.len > maximum) return error.ArtifactEnumerationPaused;
     }
 
     fn visitScopedUploads(self: *FsStore, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
@@ -1400,6 +1420,66 @@ test "external lake filesystem journal resumes across restart with linear record
     try std.testing.expectEqual(@as(usize, 73), total);
     try std.testing.expectEqual(total, reads);
     try std.testing.expectEqual(@as(usize, 11), passes);
+}
+
+test "external lake filesystem journal batches attempts and advances empty journals" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "journal-attempt-pages");
+    defer cleanupTmp(path);
+    var backend = try FsStore.init(a, std.mem.span(path));
+    defer backend.deinit();
+    var store = backend.artifactStore();
+    for (0..12) |i| {
+        const scope = try artifact_store.UploadScope.forPublication(@splat(17), i + 1, std.testing.io);
+        var ref = try store.putScoped(scope, "payload", .none);
+        defer ref.deinit(a);
+        if (i % 2 == 0) try store.delete(ref.artifact_id);
+    }
+    const Visitor = struct {
+        count: usize = 0,
+        token: ?[]u8 = null,
+        fn visit(raw: *anyopaque, _: artifact_store.UploadScope, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+        fn checkpoint(raw: *anyopaque, token: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const next = try std.testing.allocator.dupe(u8, token);
+            if (self.token) |old| std.testing.allocator.free(old);
+            self.token = next;
+        }
+    };
+    // One-record turns must still advance across attempts containing only
+    // tombstones; larger pages must scan the namespace only once per turn.
+    for ([_]usize{ 1, 4 }) |quantum| {
+        var visitor: Visitor = .{};
+        defer if (visitor.token) |token| a.free(token);
+        var passes: usize = 0;
+        const before = backend.journal_attempt_scans.load(.monotonic);
+        while (true) {
+            var paused = false;
+            const previous = if (visitor.token) |token| try a.dupe(u8, token) else null;
+            defer if (previous) |token| a.free(token);
+            store.visitScopedUploads(@splat(17), .{
+                .ptr = &visitor,
+                .visit = Visitor.visit,
+                .checkpoint = Visitor.checkpoint,
+                .continuation = previous,
+                .fencing_cutoff = 13,
+                .max_entries = quantum,
+            }, .none) catch |err| {
+                if (err != error.ArtifactEnumerationPaused) return err;
+                paused = true;
+            };
+            passes += 1;
+            try std.testing.expect(passes <= 13);
+            if (!paused) break;
+        }
+        try std.testing.expectEqual(@as(usize, 6), visitor.count);
+        try std.testing.expectEqual(@as(usize, 12 / quantum), passes);
+        try std.testing.expectEqual(passes, backend.journal_attempt_scans.load(.monotonic) - before);
+    }
 }
 
 test "external lake filesystem concurrent scoped uploads preserve journal and duplicate content" {

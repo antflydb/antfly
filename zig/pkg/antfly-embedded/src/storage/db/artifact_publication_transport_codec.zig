@@ -23,7 +23,7 @@ const Position = @import("receipt_position.zig").Position;
 const Allocator = std.mem.Allocator;
 const magic = "APB1";
 const domain = "antfly:artifact-publication-transport:v1:";
-pub const max_encoded_bytes: usize = 68 * 1024 * 1024;
+pub const max_encoded_bytes: usize = publication.max_payload_bytes + publication.max_identity_bytes + 4 * 1024 * 1024;
 pub const chunk_bytes: usize = 1024 * 1024;
 pub const max_chunks: usize = (max_encoded_bytes + chunk_bytes - 1) / chunk_bytes;
 pub const Digest = publication.Digest;
@@ -35,6 +35,11 @@ pub fn controlAdmissionHint(bytes: []const u8) bool {
     if (bytes.len < 36 or bytes.len > max_encoded_bytes or !std.mem.eql(u8, bytes[0..4], magic)) return false;
     const mode = std.enums.fromInt(@FieldType(publication.Command, "mode"), bytes[4]) orelse return false;
     return mode != .publish and mode != .append_chunks;
+}
+/// A pending baseline for this owner will be recomputed after apply; changing
+/// the observed Raft watermark must not enqueue another copy of its large bound.
+pub fn baselineAdmissionHint(bytes: []const u8) bool {
+    return controlAdmissionHint(bytes) and bytes[4] == @backingInt(@as(@FieldType(publication.Command, "mode"), .baseline));
 }
 comptime {
     if (@typeInfo(publication.Command).@"struct".field_names.len != 20 or

@@ -234,7 +234,7 @@ pub const PersistentObjectRangeCacheDurability = enum {
 
 pub const PersistentObjectRangeCachePolicy = struct {
     /// Includes the provenance header as well as payload bytes.
-    max_total_bytes: usize = 10 * 1024 * 1024 * 1024,
+    max_total_bytes: usize = @min(std.math.maxInt(usize), 10 * 1024 * 1024 * 1024),
     max_entries: usize = 16_384,
     /// Pending and in-flight write memory is independently bounded so a slow
     /// local disk cannot turn object-store misses into an unbounded RAM queue.
@@ -1339,7 +1339,7 @@ pub const ObjectRangeCache = struct {
             return try alloc.dupe(u8, cached.bytes);
         }
 
-        if (self.persistent) |persistent| {
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.persistent) |persistent| {
             if (try persistent.readAlloc(alloc, cache_key, read_len)) |bytes| {
                 errdefer alloc.free(bytes);
                 self.stats.hits += 1;
@@ -1347,7 +1347,7 @@ pub const ObjectRangeCache = struct {
                 try self.storeFetchedBytes(alloc, cache_key, cache_lane, bytes, false);
                 return bytes;
             }
-        }
+        };
 
         self.stats.misses += 1;
         self.stats.lanes[@backingInt(cache_lane)].misses += 1;
@@ -1365,9 +1365,11 @@ pub const ObjectRangeCache = struct {
         bytes: []const u8,
         write_persistent: bool,
     ) !void {
-        if (write_persistent) {
-            if (self.persistent) |persistent| _ = persistent.enqueueWrite(cache_key, bytes);
-        }
+        if (comptime @import("builtin").os.tag != .freestanding) if (write_persistent) {
+            if (self.persistent) |persistent| {
+                _ = persistent.enqueueWrite(cache_key, bytes);
+            }
+        };
         self.ensureLaneCapacity(alloc, cache_lane, bytes.len);
         self.ensureTotalCapacity(alloc, cache_lane, bytes.len);
         if (!self.admitsLaneBytes(cache_lane, bytes.len) or !self.admitsTotalBytes(bytes.len)) {

@@ -17,7 +17,7 @@
 //! Both merge inputs must resume: a member key alone loses empty-head and
 //! ignored-legacy progress. Empty keys denote exhausted inputs.
 const std = @import("std");
-pub const max_key_bytes = 1024 * 1024;
+pub const max_key_bytes = @import("artifact_publication.zig").max_cursor_bytes;
 pub const max_encoded_bytes = 49 + 2 * max_key_bytes;
 pub const Position = struct {
     head: []const u8,
@@ -102,4 +102,16 @@ test "ordered artifact inventory logical scan positions own binary merge progres
     try std.testing.expect(!position.advances(next));
     next.members_open = true;
     try std.testing.expectError(error.InvalidBatchRequest, next.encodeAlloc(alloc));
+}
+
+test "privacy logical chunk scan position round trips large physical keys" {
+    const a = std.testing.allocator;
+    const key = try a.alloc(u8, 1_100_000);
+    defer a.free(key);
+    @memset(key, 'x');
+    const raw = try (Position{ .head = key, .legacy = key }).encodeAlloc(a);
+    defer a.free(raw);
+    const restored = try Position.decode(raw);
+    try std.testing.expectEqualSlices(u8, key, restored.head);
+    try std.testing.expectEqualSlices(u8, key, restored.legacy);
 }
