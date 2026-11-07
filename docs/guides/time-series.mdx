@@ -156,6 +156,22 @@ presentation option. `seriesSQL(options)` produces parameterized SQL with quoted
 identifiers. SQL expressions outside the materialization planner's proven shapes
 retain normal scan execution.
 
+### PostgreSQL and TimescaleDB conventions
+
+The fixed-duration SQL primitive follows PostgreSQL's
+[`date_bin`](https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-BIN)
+shape: width, timestamp, and explicit origin. Antfly currently accepts its compact
+duration strings, such as `'5m'`, rather than PostgreSQL `INTERVAL` values.
+
+TimescaleDB's [`time_bucket_gapfill`](https://docs.tigerdata.com/api/latest/hyperfunctions/gapfilling/time_bucket_gapfill/)
+is a useful model for the separate gap-generation stage: missing buckets do not
+imply measured zeroes. Antfly's bounded JSON histograms generate missing buckets,
+while SQL currently emits populated groups. Antfly does not currently expose SQL
+`time_bucket_gapfill`, last-observation-carried-forward, or interpolation functions.
+These policies belong after aggregation, so inferred values never become facts
+in an algebraic index. TimescaleDB timezone, calendar, and default-alignment
+behavior should not be assumed for Antfly queries.
+
 ## Latest readings and pagination
 
 ```typescript
