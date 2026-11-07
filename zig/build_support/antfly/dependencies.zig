@@ -233,6 +233,23 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const build_options = makeRootBuildOptions(b, false, with_tla, link_libc, false, false);
     const standalone_runtime_build_options = makeRootBuildOptions(b, false, with_tla, link_libc, true, false);
     const production_build_options = makeRootBuildOptions(b, false, with_tla, link_libc, false, true);
+    const shared_lake_execution = b.option(bool, "shared-lake-execution", "Execute whole lake index attempts in the serverless owner") orelse false;
+    const lake_source_options = b.addOptions();
+    lake_source_options.addOption(bool, "shared_lake_execution", false);
+    lake_source_options.addOption(bool, "provide_lake_execution", false);
+    const lake_source_module = lake_source_options.createModule();
+    const lake_client_options = b.addOptions();
+    lake_client_options.addOption(bool, "shared_lake_execution", shared_lake_execution);
+    lake_client_options.addOption(bool, "provide_lake_execution", false);
+    const lake_provider_options = b.addOptions();
+    lake_provider_options.addOption(bool, "shared_lake_execution", false);
+    lake_provider_options.addOption(bool, "provide_lake_execution", shared_lake_execution);
+    const shared_pdf_templates = b.option(bool, "shared-pdf-templates", "Route production template PDF work through the shared media owner") orelse true;
+    if (shared_pdf_templates and (target.result.os.tag == .linux or target.result.os.tag == .macos) and (target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64))
+        production_build_options.addOption(bool, "shared_pdf_templates", true);
+    const shared_image_operations = (b.option(bool, "shared-image-operations", "Route complete encoded-image and retained VP8 operations through the media owner") orelse false) and (target.result.os.tag == .linux or target.result.os.tag == .macos) and (target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64);
+    const shared_pdf_sessions_requested = b.option(bool, "shared-pdf-sessions", "Route retained PDF readers, forks and batches through the media owner") orelse false;
+    const shared_pdf_sessions = (shared_pdf_sessions_requested or shared_image_operations) and (target.result.os.tag == .linux or target.result.os.tag == .macos) and (target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options, platform_mod);
     const raft_engine_mod = b.createModule(.{
         .root_source_file = b.path("lib/raft/src/root.zig"),
@@ -772,6 +789,35 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // storage/API validation. CI can qualify that mixed product without
     // optimizing the much larger database and server ownership graph.
     const inference_optimize = b.option(std.lang.Optimize, "inference-optimize", "Optimization mode for the model execution graph (defaults to the product mode)") orelse optimize;
+    const engine_error_names = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine_errors.zig"), .target = target, .optimize = optimize });
+    const pdf_native_contract = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/pdf_native_contract.zig"), .target = target, .optimize = optimize });
+    pdf_native_contract.addImport("image_work_control", image_mod.import_table.get("image_work_control").?);
+    pdf_native_contract.addImport("pdf_values", pdf_mod.import_table.get("pdf_values").?);
+    pdf_native_contract.addImport("antfly_runtime_abi", runtime_abi_mod);
+    pdf_native_contract.addImport("engine_errors", engine_error_names);
+    const pdf_facade = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/pdf_facade.zig"), .target = target, .optimize = optimize });
+    pdf_facade.addImport("pdf_native_contract", pdf_native_contract);
+    pdf_facade.addImport("antfly_font", font_mod);
+    pdf_facade.addImport("pdf_standard_fonts", pdf_standard_fonts_mod);
+    // Raw readers and native facades share these leaf modules, including
+    // source fixtures that legitimately use both paths in one compilation.
+    const facade_syntax = pdf_mod.import_table.get("pdf_syntax").?;
+    const facade_text = pdf_mod.import_table.get("pdf_text_encoding").?;
+    pdf_facade.addImport("pdf_syntax", facade_syntax);
+    pdf_facade.addImport("pdf_text_encoding", facade_text);
+    pdf_facade.addImport("pdf_text_structure", pdf_mod.import_table.get("pdf_text_structure").?);
+
+    pdf_facade.addImport("engine_errors", engine_error_names);
+    const media_native_abi = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/media_native_abi.zig"), .target = target, .optimize = optimize });
+    media_native_abi.addImport("image_work_control", image_mod.import_table.get("image_work_control").?);
+    media_native_abi.addImport("antfly_runtime_abi", runtime_abi_mod);
+    media_native_abi.addImport("engine_errors", engine_error_names);
+    const image_native_contract = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/image_native_contract.zig"), .target = target, .optimize = optimize });
+    image_native_contract.addImport("media_native_abi", media_native_abi);
+    image_native_contract.addImport("image_values", image_mod.import_table.get("image_values").?);
+    const image_facade = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/image_facade.zig"), .target = target, .optimize = optimize });
+    image_facade.addImport("image_native_contract", image_native_contract);
+    image_facade.addImport("image_processing", image_mod.import_table.get("image_processing").?);
     const inference_config: inference_runtime_build.Config = .{
         .b = b,
         .target = target,
@@ -812,7 +858,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
             .regex = regex_mod,
             .jsonschema = jsonschema_mod,
             .image = image_mod,
-            .pdf = pdf_mod,
+            .pdf = if (shared_pdf_sessions) pdf_facade else pdf_mod,
+            .pdf_source = pdf_mod,
             .hash = hash_mod,
             .prometheus = prometheus_mod,
             .structlog = structlog_mod,
@@ -1212,7 +1259,6 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     engine_options.addOption(bool, "shared_inference_core", shared_inference_core);
     const inference_engine_mod = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine.zig"), .target = target, .optimize = optimize });
     inference_engine_mod.addOptions("engine_options", engine_options);
-    const engine_error_names = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine_errors.zig"), .target = target, .optimize = optimize });
     inference_engine_mod.addImport("engine_errors", engine_error_names);
     inference_engine_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     inference_engine_mod.addImport("inference_server", inference_server_mod);
@@ -1236,7 +1282,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     }
     const antfly_imports = AntflyRootImports{
         .sql_parser = sql_parser_mod,
-        .storage_boundary = @import("../embedded/storage_boundary.zig").createWithOptions(b, target, optimize, .{ .sanitize_thread = sanitize_thread, .error_names = engine_error_names }),
+        .decisions = @import("../../lib/decisions/build.zig").create(b, b.path("lib/decisions/root.zig")),
+        .storage_boundary = @import("../embedded/storage_boundary.zig").createWithOptions(b, target, optimize, .{ .sanitize_thread = sanitize_thread, .error_names = engine_error_names, .runtime_abi = runtime_abi_mod }),
         .cancellation = cancellation_mod,
         .cache_budget = cache_budget_mod,
         .runtime_abi = runtime_abi_mod,
@@ -1275,6 +1322,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .build_info = build_info,
 
         .build_options = build_options,
+        .lake_execution_options = lake_source_module,
+        .lake_provider_options = lake_source_module,
         .lite_options = antfly_storage_build.createLiteOptions(b, lite_local_inference_runtime),
         .embedded_openapi = pkg_antfly_build_codegen.addEmbeddedSpecs(b, .{
             .root_source_file = b.path("pkg/antfly/src/openapi/embedded_specs.zig"),
@@ -1422,6 +1471,23 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     antfly_imports.storage_boundary.configureSources(storage_mod, false, false);
     var production_antfly_imports = antfly_imports;
     production_antfly_imports.build_options = production_build_options;
+    production_antfly_imports.shared_lake_execution = shared_lake_execution;
+    production_antfly_imports.lake_execution_options = if (shared_lake_execution) lake_client_options.createModule() else lake_source_module;
+    production_antfly_imports.lake_provider_options = if (shared_lake_execution) lake_provider_options.createModule() else lake_source_module;
+    if (shared_pdf_sessions and antfly_imports.storage_boundary.shared_core) {
+        production_antfly_imports.pdf = pdf_facade;
+        production_antfly_imports.pdf_implementation = pdf_mod;
+        production_antfly_imports.pdf_native_contract = pdf_native_contract;
+    }
+    if (shared_image_operations and antfly_imports.storage_boundary.shared_core) {
+        const implementation = b.allocator.create(AntflyRootImports) catch @panic("OOM");
+        implementation.* = antfly_imports;
+        production_antfly_imports.media_implementation_imports = implementation;
+        production_antfly_imports.image_implementation = image_mod;
+        production_antfly_imports.image_native_contract = image_native_contract;
+        production_antfly_imports.image_facade = image_facade;
+    }
+    production_antfly_imports.shared_pdf_templates = shared_pdf_templates and antfly_imports.storage_boundary.shared_core;
 
     return .{
         .api_bench_standalone = api_bench_standalone,
@@ -1528,4 +1594,31 @@ fn buildArguments(b: *std.Build) ?[]const []const u8 {
         .list => |values| values.items,
         else => null,
     };
+}
+
+/// Freeze source construction before forking implementation-free production
+/// clients. Entry points finish Apple/platform/shared-module configuration first.
+pub fn finalizeMediaClients(b: *std.Build, original: AntflyRootImports) AntflyRootImports {
+    if (original.image_native_contract == null) return original;
+    const graph = @import("../module_rewrite.zig");
+    const replacements = [_]graph.Replacement{
+        .{ .source = original.image_implementation.?, .target = original.image_facade.? },
+        .{ .source = original.pdf_implementation.?, .target = original.pdf },
+    };
+    var clients: graph.Rewriter = .{ .b = b, .replacements = &replacements, .on_copy = @import("../embedded/source_owner.zig").forkContext };
+    var result = original;
+    inline for (@typeInfo(AntflyRootImports).@"struct".field_names) |field| {
+        if (comptime !std.mem.eql(u8, field, "pdf_implementation") and !std.mem.eql(u8, field, "image_implementation")) {
+            const T = @FieldType(AntflyRootImports, field);
+            if (T == *std.Build.Module) @field(result, field) = clients.rewrite(@field(result, field));
+            if (T == ?*std.Build.Module) if (@field(result, field)) |module| {
+                @field(result, field) = clients.rewrite(module);
+            };
+        }
+    }
+    inline for (@typeInfo(@TypeOf(result.storage_boundary)).@"struct".field_names) |field| {
+        if (@FieldType(@TypeOf(result.storage_boundary), field) == *std.Build.Module)
+            @field(result.storage_boundary, field) = clients.rewrite(@field(result.storage_boundary, field));
+    }
+    return result;
 }

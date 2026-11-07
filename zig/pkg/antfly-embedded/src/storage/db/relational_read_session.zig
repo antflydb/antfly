@@ -16,17 +16,20 @@
 //! Retained local relational read session. DB acquires the admitted snapshot;
 //! this owner holds its reader, policy lease, cancellation and output cleanup.
 const std = @import("std");
-const storage_engine = @import("../engine_selection.zig");
+const Types = @import("read_session_types").types;
+const Source = @import("read_session_source_types").types;
 const Allocator = std.mem.Allocator;
-const types = @import("types.zig");
-const mapper = @import("document_mapper.zig");
-const row_policy_gate_mod = @import("row_policy_gate.zig");
-const RelationalRows = @import("relational_rows.zig");
-const platform_time = @import("antfly_platform").time;
+const types = Types.types;
+const mapper = Source.mapper;
+const row_policy_gate_mod = Source.row_policy_gate;
+const RelationalRows = @import("../read_session_source.zig").RelationalRows;
+const platform_time = Source.platform.time;
 
-pub const Session = struct {
+pub const Session = Implementation;
+
+pub const Implementation = struct {
     row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null,
-    range_proofs: ?[]@import("../range_protection.zig").Proof = null,
+    range_proofs: ?[]Types.range_protection.Proof = null,
     page_bytes: usize = 16 * 1024 * 1024,
     alloc: Allocator,
     reader: RelationalRows.Reader = undefined,
@@ -35,8 +38,7 @@ pub const Session = struct {
     cancellation: @FieldType(types.ScanOptions, "cancellation"),
     deadline_ns: ?u64,
 
-    pub fn deinit(session: *Session) void {
-        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionDeinit", .{session}) catch @panic("incompatible storage owner");
+    pub fn deinit(session: *Implementation) void {
         if (session.range_proofs) |proofs| session.alloc.free(proofs);
         session.reader.deinit();
         if (session.filter_context) |filter| session.destroy_filter.?(session.alloc, filter);
@@ -45,20 +47,17 @@ pub const Session = struct {
         owner.destroy(session);
     }
 
-    pub fn checkpoint(session: *const Session) !void {
-        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionCheckpoint", .{session});
+    pub fn checkpoint(session: *const Implementation) !void {
         if (session.cancellation) |cancellation| try cancellation.check();
         if (session.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         if (session.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
     }
-    pub fn rangeProofs(session: *Session, alloc: Allocator) ![]@import("../range_protection.zig").Proof {
-        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionRangeProofs", .{ session, alloc });
+    pub fn rangeProofs(session: *Implementation, alloc: Allocator) ![]Types.range_protection.Proof {
         try session.checkpoint();
-        return alloc.dupe(@import("../range_protection.zig").Proof, session.range_proofs orelse return error.SqlRangeTrackingRequired);
+        return alloc.dupe(Types.range_protection.Proof, session.range_proofs orelse return error.SqlRangeTrackingRequired);
     }
 
-    pub fn nextTypedPage(session: *Session, alloc: Allocator, io: ?std.Io, budget: RelationalRows.Budget) !RelationalRows.Page {
-        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionNextTypedPage", .{ session, alloc, io, budget });
+    pub fn nextTypedPage(session: *Implementation, alloc: Allocator, io: ?std.Io, budget: RelationalRows.Budget) !RelationalRows.Page {
         try session.checkpoint();
         var bounded = budget;
         bounded.target_bytes = @min(bounded.output_bytes, if (bounded.target_bytes == 0) session.page_bytes else @min(bounded.target_bytes, session.page_bytes));
@@ -68,12 +67,24 @@ pub const Session = struct {
         return page;
     }
 
+    /// Convert complete native page state in the physical owner. API callers
+    /// never inspect the retained reader's schema or continuation fields.
+    pub fn nextViewPage(session: *Implementation, alloc: Allocator, limit: u32) !Types.view.Page {
+        const View = Types.view;
+        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
+        errdefer page.deinit();
+        const owned = page.arena.allocator();
+        const output = try owned.alloc(View.Row, page.rows.len);
+        for (page.rows, output) |row, *out| out.* = .{ .id = row.key, .version = row.version, .schema_version = session.reader.active.version(), .value = row.typed orelse .null, .typed_cells = row.typed_cells, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest };
+        const after = if (page.more) try owned.dupe(u8, session.reader.after.items) else null;
+        return .{ .arena = page.arena, .rows = output, .after = after };
+    }
+
     /// Prepare logical rows under this reader's immutable schema epoch,
     /// without publishing primary rows, index effects or transaction state.
     /// SQL staging uses the same defaults/generated/CHECK pipeline as commit.
     /// Each returned key/value and the outer slice belong to alloc.
-    pub fn normalizeRows(session: *Session, alloc: Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
-        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionNormalizeRows", .{ session, alloc, writes });
+    pub fn normalizeRows(session: *Implementation, alloc: Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
         if (writes.len > 4096) return error.InvalidArgument;
         try session.checkpoint();
         const view = session.reader.active;

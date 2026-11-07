@@ -97,6 +97,25 @@ class LiteralSourceOwnership(unittest.TestCase):
                 ):
                     measurement.control_catalog_contents()
 
+    def test_conditional_imports_cannot_retain_a_physical_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            local = root / "pkg/antfly-embedded/src"
+            local.mkdir(parents=True)
+            (local / "source_catalog.zig").write_text(
+                "// header\n" * 16
+                + 'pub const hosted = if (enabled) @import("owner.zig") else struct {};\n'
+                + 'pub const safe = if (enabled) @import("leaf.zig") else struct {};\n'
+            )
+            (local / "owner.zig").write_text(
+                'pub const db = @import("storage/db/db.zig");\n'
+            )
+            (local / "leaf.zig").write_text("")
+            with mock.patch.object(measurement, "ZIG_ROOT", root):
+                rendered = measurement.control_catalog_contents()
+            self.assertNotIn("pub const hosted", rendered)
+            self.assertIn("pub const safe", rendered)
+
     def test_control_catalog_is_current_and_has_no_physical_imports(self):
         local = measurement.ZIG_ROOT / "pkg/antfly-embedded/src"
         catalog = local / "source_catalog_control.zig"
@@ -224,11 +243,14 @@ class BuildFailureEvidence(unittest.TestCase):
             ("warm", set()),
             (
                 "read coordination",
-                {"antfly-runtime-distributed", "antfly-storage-kernel"},
+                {"antfly-runtime-distributed", "antfly-runtime-local_query"},
             ),
             ("write coordination", {"antfly-runtime-distributed"}),
-            ("physical DB", {"antfly-storage-kernel"}),
-            ("physical local query", {"antfly-storage-kernel"}),
+            ("physical DB", {"antfly-storage-kernel", "antfly-runtime-local_query"}),
+            (
+                "physical local query",
+                {"antfly-storage-kernel", "antfly-runtime-local_query"},
+            ),
             ("owner integration test", {"storage-owner-tests"}),
             ("consumer test root", {"api-table-read-tests"}),
             *(
@@ -243,6 +265,7 @@ class BuildFailureEvidence(unittest.TestCase):
                 "storage contract",
                 {
                     "antfly-storage-kernel",
+                    "antfly-runtime-local_query",
                     "antfly-runtime-distributed",
                     "storage-owner-tests",
                 },
@@ -648,14 +671,20 @@ class ParallelAuditIsolation(unittest.TestCase):
         sources = {
             "api/table_reads.zig": (
                 "read coordination",
-                {"antfly-runtime-distributed", "antfly-storage-kernel"},
+                {"antfly-runtime-distributed", "antfly-runtime-local_query"},
             ),
             "api/table_writes.zig": (
                 "write coordination",
                 {"antfly-runtime-distributed"},
             ),
-            "storage/db/db.zig": ("physical DB", {"antfly-storage-kernel"}),
-            "storage/query.zig": ("physical local query", {"antfly-storage-kernel"}),
+            "storage/db/db.zig": (
+                "physical DB",
+                {"antfly-storage-kernel", "antfly-runtime-local_query"},
+            ),
+            "storage/query.zig": (
+                "physical local query",
+                {"antfly-storage-kernel", "antfly-runtime-local_query"},
+            ),
             "storage/kernel_owner_test.zig": (
                 "owner integration test",
                 {"storage-owner-tests"},
@@ -668,6 +697,7 @@ class ParallelAuditIsolation(unittest.TestCase):
                 "storage contract",
                 {
                     "antfly-storage-kernel",
+                    "antfly-runtime-local_query",
                     "antfly-runtime-distributed",
                     "storage-owner-tests",
                 },
@@ -868,7 +898,7 @@ pub fn create(b: *std.Build) ?void {
         }),
     });
     b.step("unrelated", "unrelated").dependOn(&unrelated.step);
-    inline for (.{ "cli", "distributed", "storage_kernel", "enrichment_compute", "serverless", "inference", "api_kernel" }) |unit| {
+    inline for (.{ "cli", "distributed", "storage_kernel", "local_query", "enrichment_compute", "serverless", "inference", "api_kernel" }) |unit| {
         _ = b.step("runtime-unit-" ++ unit, unit);
     }
     return {};

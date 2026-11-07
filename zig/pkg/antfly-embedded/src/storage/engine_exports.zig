@@ -14,6 +14,8 @@
 // limitations under the License.
 
 const engine = @import("engine.zig");
+const read_sessions = @import("read_session_provider.zig");
+const session_contract = @import("read_session_contract.zig");
 const std = @import("std");
 const native = @import("antfly_runtime_abi").native_abi;
 const Exports = @This();
@@ -84,16 +86,6 @@ fn searchWithCapturedRequestAndExecutionContext(
     var received = req;
     if (source) |*predicate| received.native_key_predicate = predicate.receiver();
     var value = self.searchWithCapturedRequestAndExecutionContext(alloc, received, exec_ctx) catch |err| return .{ .failure = .init(@errorName(err)) };
-    // Captured requests retain caller-owned hooks, never the stack proxy.
-    value.request.native_key_predicate = req.native_key_predicate;
-    return .{ .value = value };
-}
-
-fn searchLease(lease: DB.QueryReadLease, alloc: Allocator, req: types.SearchRequest) engine.Outcome(SearchWithDenseProfileResult) {
-    var source = req.native_key_predicate;
-    var received = req;
-    if (source) |*predicate| received.native_key_predicate = predicate.receiver();
-    var value = lease.search(alloc, received) catch |err| return .{ .failure = .init(@errorName(err)) };
     // Captured requests retain caller-owned hooks, never the stack proxy.
     value.request.native_key_predicate = req.native_key_predicate;
     return .{ .value = value };
@@ -621,28 +613,28 @@ fn waitForResolvedTransactionSyncTargetWithCancellation(self: *DB, sync_level: t
     return .{ .value = self.waitForResolvedTransactionSyncTargetWithCancellation(sync_level, sequence, phase, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn captureRelationalStatementSnapshot(self: *DB) engine.Outcome(DB.RelationalStatementSnapshot) {
-    return .{ .value = self.captureRelationalStatementSnapshot() catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn captureRelationalStatementSnapshot(self: *DB) engine.Outcome(session_contract.Statement) {
+    return .{ .value = read_sessions.capture(self) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn beginRelationalRows(self: *DB, alloc: std.mem.Allocator, request: @import("db/relational_rows.zig").Request) engine.Outcome(@import("db/relational_rows.zig").Reader) {
-    return .{ .value = self.beginRelationalRows(alloc, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn beginRelationalRows(self: *DB, alloc: std.mem.Allocator, request: @import("read_reader_values.zig").Request) engine.Outcome(session_contract.Handle) {
+    return .{ .value = read_sessions.beginReader(self, alloc, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn openDocumentReadSession(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) engine.Outcome(*DB.DocumentReadSession) {
-    return .{ .value = self.openDocumentReadSession(alloc, from_key, to_key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn openDocumentReadSession(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) engine.Outcome(session_contract.Handle) {
+    return .{ .value = read_sessions.openDocument(self, alloc, from_key, to_key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn openRelationalReadSessionAtSnapshot(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*DB.RelationalStatementSnapshot) engine.Outcome(*DB.RelationalReadSession) {
-    return .{ .value = self.openRelationalReadSessionAtSnapshot(alloc, from_key, to_key, opts, statement) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn openRelationalReadSessionAtSnapshot(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?session_contract.Handle) engine.Outcome(session_contract.Handle) {
+    return .{ .value = read_sessions.openRelational(self, alloc, from_key, to_key, opts, statement) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn tryStatementReadFence(self: *DB) engine.Outcome(?DB.StatementReadFence) {
-    return .{ .value = self.tryStatementReadFence() catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn tryStatementReadFence(self: *DB) engine.Outcome(?session_contract.Handle) {
+    return .{ .value = read_sessions.tryFence(self, false) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn tryEmbeddedBackupReadFence(self: *DB) engine.Outcome(?DB.StatementReadFence) {
-    return .{ .value = self.tryEmbeddedBackupReadFence() catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn tryEmbeddedBackupReadFence(self: *DB) engine.Outcome(?session_contract.Handle) {
+    return .{ .value = read_sessions.tryFence(self, true) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn catchUpPendingDerivedReplay(self: *DB) engine.Outcome(void) {
@@ -737,68 +729,6 @@ fn rollDenseAutoBulkIngestSessionWithOptions(self: *DB, options: @import("backen
     return .{ .value = self.rollDenseAutoBulkIngestSessionWithOptions(options) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn relationalReaderDeinit(self: *@import("db/relational_rows.zig").Reader) engine.Outcome(void) {
-    return .{ .value = self.deinit() };
-}
-
-fn relationalReaderNextPage(self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) engine.Outcome(@import("db/relational_rows.zig").Page) {
-    var receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = if (io) |borrow| borrow.receive() catch |err| return .{ .failure = .init(@errorName(err)) } else null;
-    const received_io: ?std.Io = if (receiver) |*value| value.io() else null;
-    return .{ .value = self.nextPage(alloc, received_io, budget) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn relationalReaderNextTypedPage(self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) engine.Outcome(@import("db/relational_rows.zig").Page) {
-    var receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = if (io) |borrow| borrow.receive() catch |err| return .{ .failure = .init(@errorName(err)) } else null;
-    const received_io: ?std.Io = if (receiver) |*value| value.io() else null;
-    return .{ .value = self.nextTypedPage(alloc, received_io, budget) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn relationalReaderLookupSqlBatch(self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, documents: []const []const u8, layout: *const @import("../sql/catalog.zig").Row.TypedLayout, max_bytes: usize) engine.Outcome(@import("db/relational_rows.zig").Reader.Hydrated) {
-    return .{ .value = self.lookupSqlBatch(alloc, documents, layout, max_bytes) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn relationalReaderLookupTypedRow(self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?*const @import("../sql/catalog.zig").Row.TypedLayout) engine.Outcome(?@import("db/relational_rows.zig").Row) {
-    return .{ .value = (if (native_cells) if (shared) |layout| self.lookupSqlRowWithLayout(alloc, document, layout) else self.lookupSqlRow(alloc, document) else self.lookupTypedRow(alloc, document)) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn relationalSessionDeinit(session: *@import("db/relational_read_session.zig").Session) engine.Outcome(void) {
-    return .{ .value = session.deinit() };
-}
-
-fn relationalSessionCheckpoint(session: *const @import("db/relational_read_session.zig").Session) engine.Outcome(void) {
-    return .{ .value = session.checkpoint() catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn relationalSessionRangeProofs(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator) engine.Outcome([]@import("range_protection.zig").Proof) {
-    return .{ .value = session.rangeProofs(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn relationalSessionNextTypedPage(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) engine.Outcome(@import("db/relational_rows.zig").Page) {
-    var receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = if (io) |borrow| borrow.receive() catch |err| return .{ .failure = .init(@errorName(err)) } else null;
-    const received_io: ?std.Io = if (receiver) |*value| value.io() else null;
-    return .{ .value = session.nextTypedPage(alloc, received_io, budget) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn relationalSessionNormalizeRows(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, writes: []const types.BatchWrite) engine.Outcome([]types.BatchWrite) {
-    return .{ .value = session.normalizeRows(alloc, writes) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn documentSessionDeinit(self: *@import("db/document_rows.zig").Session) engine.Outcome(void) {
-    return .{ .value = self.deinit() };
-}
-
-fn documentSessionRangeProofs(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator) engine.Outcome([]@import("range_protection.zig").Proof) {
-    return .{ .value = self.rangeProofs(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn documentSessionNormalizeRows(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite) engine.Outcome([]types.BatchWrite) {
-    return .{ .value = self.normalizeRows(alloc, writes) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn documentSessionNext(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, limit: u32) engine.Outcome(@import("relational_read_view.zig").View.Page) {
-    return .{ .value = self.next(alloc, limit) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
 fn catchUpPendingDerivedReplayWithProgress(self: *DB, context: *anyopaque, hook: db.ReplayProgressHook, dispatch: @import("named_callback.zig").Dispatch) engine.Outcome(void) {
     const Proxy = struct {
         context: *anyopaque,
@@ -812,33 +742,7 @@ fn catchUpPendingDerivedReplayWithProgress(self: *DB, context: *anyopaque, hook:
     var proxy: Proxy = .{ .context = context, .hook = hook, .dispatch = dispatch };
     return .{ .value = self.catchUpPendingDerivedReplayWithProgress(&proxy, Proxy.progress) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
-fn relationalSnapshotDeinit(cut: *DB.RelationalStatementSnapshot) engine.Outcome(void) {
-    return .{ .value = cut.deinit() };
-}
-fn statementFenceRelease(fence: *DB.StatementReadFence) engine.Outcome(void) {
-    return .{ .value = fence.release() };
-}
-fn documentRowsUnderLease(lease: *const DB.QueryReadLease, alloc: Allocator, version: u32) engine.Outcome(DB.DocumentRows) {
-    return .{ .value = lease.documentRows(alloc, version) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-fn documentRowsLookupProjectedBatch(reader: *DB.DocumentRows, ids: []const []const u8, fields: []const []const u8, max_bytes: usize) engine.Outcome(DB.DocumentRows.ProjectedBatch) {
-    return .{ .value = reader.lookupProjectedBatch(ids, fields, max_bytes) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-fn documentRowsLookupBatch(reader: *DB.DocumentRows, ids: []const []const u8, max_bytes: usize) engine.Outcome(DB.DocumentRows.Batch) {
-    return .{ .value = reader.lookupBatch(ids, max_bytes) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-fn documentRowsLookup(reader: *DB.DocumentRows, key: []const u8) engine.Outcome([]const u8) {
-    return .{ .value = reader.lookup(key) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-fn documentRowsReleasePage(reader: *DB.DocumentRows) engine.Outcome(void) {
-    return .{ .value = reader.releasePage() };
-}
-fn documentRowsDeinit(reader: *DB.DocumentRows) engine.Outcome(void) {
-    return .{ .value = reader.deinit() };
-}
-fn relationalRowsUnderLease(lease: *const DB.QueryReadLease, alloc: Allocator, fields: []const []const u8, version: u32) engine.Outcome(@import("db/relational_rows.zig").Reader) {
-    return .{ .value = lease.relationalRows(alloc, fields, version) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
+
 fn resolveNativeRestoreOpenPlan(target_path: []const u8, requested_options: db.OpenOptions) engine.Outcome(db.NativeRestoreOpenPlan) {
     return .{ .value = DB.resolveNativeRestoreOpenPlan(target_path, requested_options) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -995,6 +899,11 @@ fn restoreSnapshotToStagedGeneration(staged_generation: *const @import("db/gener
 
 fn restoreIdentityPreservingSnapshotToStagedGeneration(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, expected_namespace: @import("db/doc_identity.zig").Namespace) engine.Outcome(void) {
     return .{ .value = DB.restoreIdentityPreservingSnapshotToStagedGeneration(staged_generation, alloc, snapshot_root, path, opts, expected_namespace) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn materializeRestoreSourceDecoder(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: Allocator, io: native.IoBorrow, path: []const u8, opts: db.OpenOptions, plan: @import("restore_decoder_contract.zig").Plan) engine.Outcome(void) {
+    var receiver = io.receive() catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = DB.materializeRestoreSourceDecoder(staged_generation, alloc, receiver.io(), path, opts, plan) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn openVerifiedRestoreSourceWithCancellation(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, expected_namespace: @import("db/doc_identity.zig").Namespace, cancellation: types.CancellationToken) engine.Outcome(DB) {
@@ -1243,8 +1152,8 @@ fn ensureGeneratedCoverageRecoveryIntents(self: *DB, alloc: std.mem.Allocator) e
     return .{ .value = self.ensureGeneratedCoverageRecoveryIntents(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn beginQueryReadLease(self: *DB) engine.Outcome(DB.QueryReadLease) {
-    return .{ .value = self.beginQueryReadLease() catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn beginQueryReadLease(self: *DB) engine.Outcome(DB.QueryReadLease.Protocol.Handle) {
+    return .{ .value = read_sessions.beginQueryLease(self) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn searchRequestAtCurrentIdentityGeneration(self: *DB, req: types.SearchRequest) engine.Outcome(types.SearchRequest) {
@@ -1572,9 +1481,6 @@ fn runDenseArtifactRebuildMaintenanceWithProgress(self: *DB, alloc: Allocator, c
     }
     return .{ .value = self.runDenseArtifactRebuildMaintenanceWithProgress(alloc, context, null) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
-fn queryReadLeaseRelease(lease: *DB.QueryReadLease) engine.Outcome(void) {
-    return .{ .value = lease.release() };
-}
 
 fn batchReplicatedApply(self: *DB, req: types.BatchRequest) engine.Outcome(void) {
     return .{ .value = self.batchReplicatedApply(req) catch |err| return .{ .failure = .init(@errorName(err)) } };
@@ -1657,8 +1563,8 @@ fn importCohortPortableFileIntoUnpublishedEmpty(self: *DB, alloc: std.mem.Alloca
     return .{ .value = self.importCohortPortableFileIntoUnpublishedEmpty(alloc, received_io, file, file_size, proof, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn openRelationalReadSession(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) engine.Outcome(*DB.RelationalReadSession) {
-    return .{ .value = self.openRelationalReadSession(alloc, from_key, to_key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn openRelationalReadSession(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) engine.Outcome(session_contract.Handle) {
+    return .{ .value = read_sessions.openRelational(self, alloc, from_key, to_key, opts, null) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn search(self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest) engine.Outcome(types.SearchResult) {
@@ -2070,12 +1976,44 @@ const descriptor: engine.Descriptor = .{
     .resource_manager_layout = engine.resource_manager_layout,
     .prepared_owner_layout = engine.prepared_owner_layout,
     .prepared_allocator_layout = engine.prepared_allocator_layout,
+    .prepared_commit_disposition_layout = engine.prepared_commit_disposition_layout,
+    .prepared_commit_disposition_state_layout = engine.prepared_commit_disposition_state_layout,
     .embedding_memo_layout = engine.embedding_memo_layout,
     .async_context_layout = engine.async_context_layout,
     .enrichment_runtime_layout = engine.enrichment_runtime_layout,
-    .relationalReader_layout = engine.relationalReader_layout,
-    .relationalSession_layout = engine.relationalSession_layout,
-    .documentSession_layout = engine.documentSession_layout,
+    .read_session_release_layout = engine.read_session_release_layout,
+    .read_reader_typed_cells_layout = engine.read_reader_typed_cells_layout,
+    .read_reader_datum_layout = engine.read_reader_datum_layout,
+    .read_numeric_value_layout = engine.read_numeric_value_layout,
+    .read_numeric_kind_layout = engine.read_numeric_kind_layout,
+    .read_array_value_layout = engine.read_array_value_layout,
+    .read_array_dimension_layout = engine.read_array_dimension_layout,
+    .read_array_element_type_layout = engine.read_array_element_type_layout,
+    .read_array_stored_view_layout = engine.read_array_stored_view_layout,
+    .read_array_stored_validation_layout = engine.read_array_stored_validation_layout,
+    .read_session_handle_layout = engine.read_session_handle_layout,
+    .retained_query_lease_layout = engine.retained_query_lease_layout,
+    .query_read_lease_handle_layout = engine.query_read_lease_handle_layout,
+    .query_read_lease_operations_layout = engine.query_read_lease_operations_layout,
+    .read_reader_request_layout = engine.read_reader_request_layout,
+    .read_reader_filter_layout = engine.read_reader_filter_layout,
+    .read_reader_hydrated_layout = engine.read_reader_hydrated_layout,
+    .read_reader_typed_layout = engine.read_reader_typed_layout,
+    .read_reader_ordinal_view_layout = engine.read_reader_ordinal_view_layout,
+    .document_source_kind_layout = engine.document_source_kind_layout,
+    .document_source_layout = engine.document_source_layout,
+    .document_field_layout = engine.document_field_layout,
+    .document_batch_layout = engine.document_batch_layout,
+    .document_projected_batch_layout = engine.document_projected_batch_layout,
+    .read_session_kind_layout = engine.read_session_kind_layout,
+    .read_session_budget_layout = engine.read_session_budget_layout,
+    .read_session_operations_layout = engine.read_session_operations_layout,
+    .restore_decoder_plan_layout = engine.restore_decoder_plan_layout,
+    .restore_decoder_format_layout = engine.restore_decoder_format_layout,
+    .relational_page_layout = engine.relational_page_layout,
+    .relational_row_layout = engine.relational_row_layout,
+    .read_view_page_layout = engine.read_view_page_layout,
+    .read_view_row_layout = engine.read_view_row_layout,
 
     .index_manager_layout = engine.index_manager_layout,
     .index_manager_fields = engine.index_manager_fields.ptr,

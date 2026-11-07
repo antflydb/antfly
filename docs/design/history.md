@@ -31,6 +31,7 @@ recorded under Planning Rules in [`zig/ROADMAP.md`](../../zig/ROADMAP.md).
 
 | Area | Document | Design doc | Summary |
 |------|----------|------------|---------|
+| Compilation | [Production owner qualification](compilation/history/production-owners-2026-11-02.md) | [zig/COMPILATION.md](../../zig/COMPILATION.md) | Accepted ownership changes, measured limits, regression checkpoints and pinned experimental records |
 | VOPR | [vopr/status-history.md](vopr/history/status-history.md) | [zig/VOPR.md](../../zig/VOPR.md) | Scenario-version status preamble (v9–v53) and verification-audit narrative |
 | VOPR | [vopr/defects-found.md](vopr/history/defects-found.md) | [zig/VOPR.md](../../zig/VOPR.md) | Per-defect ledger of production and harness bugs VOPR found |
 | VOPR | [vopr/follow-ups-2026-09.md](vopr/history/follow-ups-2026-09.md) | [zig/VOPR.md](../../zig/VOPR.md) | Dated runtime-correctness, merge, and deadline follow-ups (2026-09-06/07) |

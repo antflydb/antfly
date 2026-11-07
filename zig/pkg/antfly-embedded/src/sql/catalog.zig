@@ -231,7 +231,8 @@ pub const Row = struct {
         values: []const Cell = &.{},
         presence: ?[]const bool = null,
         /// Shared immutable column blocks, owned by the enclosing page lease.
-        columnar: ?struct { blocks: []const @import("spill.zig").ColumnarBlock, row: usize } = null,
+        columnar: ?Columnar = null,
+        pub const Columnar = struct { blocks: []const @import("spill.zig").ColumnarBlock, row: usize };
         pub fn count(self: TypedCells) usize {
             if (self.columnar != null) return self.layout.names.len;
             return self.values.len;

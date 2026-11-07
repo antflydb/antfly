@@ -89,6 +89,7 @@ const Job = struct {
     fn executeAdmitted(self: *Job) !void {
         self.execution.checkpoint = .{ .ptr = self, .check = check };
         try self.execution.enter(self.pipeline.io);
+        if (comptime @hasDecl(@import("root"), "lakeExecutionProbeParallelJob")) @import("root").lakeExecutionProbeParallelJob();
         self.publication_io = .{ .execution = &self.execution, .io = self.pipeline.io };
         self.store.io_phase = self.publication_io.capability();
         self.provider.io_phase = self.store.io_phase;
@@ -100,6 +101,10 @@ const Job = struct {
     }
 };
 fn executeFamily(args: Args, kind: Kind, provider: *Provider, store: *stores.ArtifactStore) !Result {
+    const started_probe = @import("lake_execution_probe_hooks.zig").start();
+    defer switch (kind) {
+        inline else => |tag| @import("lake_execution_probe_hooks.zig").finish(@tagName(tag), started_probe),
+    };
     var result: Result = .{};
     const source = provider.source;
     switch (kind) {

@@ -721,7 +721,7 @@ pub fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_
         var cancellation = req.cancellation;
         const response = try local_query_client.executeJsonAlloc(
             handle.alloc,
-            @ptrCast(handle.database()),
+            handle.database(),
             "docs",
             request_json,
             .internal,
@@ -4971,7 +4971,7 @@ pub fn antfly_db_batch_json(
     defer receipt_scope.end();
     var primary_committed = false;
     // A table handle commits to its table's database, which holds the marker.
-    trackedBatch(handle.database(), owned.req, &primary_committed, handle.selected_table_name) catch |err| return batchFailureCode(err, primary_committed);
+    trackedBatch(handle.database(), db_mod.types.fromPublicMutation(owned.req), &primary_committed, handle.selected_table_name) catch |err| return batchFailureCode(err, primary_committed);
     // Committed: a response failure must not read as a failed batch.
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch
         return capi.recordError(.stalled, "batch committed; its response could not be encoded; do not retry the batch");
@@ -6131,7 +6131,7 @@ pub fn searchPublicQueryJson(
             var failure: kernel_owner_abi.FailureIdentity = .{};
             const response = local_query_client.executeJsonAlloc(
                 std.heap.c_allocator,
-                @ptrCast(handle.database()),
+                handle.database(),
                 table_name,
                 request_json.bytes(),
                 .public,

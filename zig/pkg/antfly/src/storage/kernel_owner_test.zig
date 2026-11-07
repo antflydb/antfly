@@ -24,6 +24,47 @@ const wal_client = @import("kernel_wal_client.zig");
 const data_apply_client = @import("data_raft_apply_client.zig");
 const metadata_apply_client = @import("metadata_raft_apply_client.zig");
 
+test "borrowed document batches cross compiled owner without payload ownership transfer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var owner = try client.Owner.open(.{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 1 });
+    defer owner.deinit();
+    const document = try alloc.dupe(u8, "{\"id\":9007199254740993,\"text\":\"borrowed\"}");
+    defer alloc.free(document);
+    const writes = [_]abi.BorrowedDocumentWrite{.{ .key = .fromSlice("a"), .document_json = .fromSlice(document) }};
+    var inserted = try owner.batchBorrowedDocuments(.{ .table_name = .fromSlice("docs"), .writes = &writes, .write_count = writes.len });
+    inserted.deinit();
+    @memset(document, 'x');
+    var persisted = try owner.lookupJson("docs", "{\"key\":\"a\"}");
+    defer persisted.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, persisted.bytes(), "9007199254740993") != null);
+
+    const invalid = [_]abi.BorrowedDocumentWrite{
+        .{ .key = .fromSlice("not-committed"), .document_json = .fromSlice("{}") },
+        .{ .key = .fromSlice("bad"), .document_json = .fromSlice("[]") },
+    };
+    try std.testing.expectError(error.InvalidBatchRequest, owner.batchBorrowedDocuments(.{ .table_name = .fromSlice("docs"), .writes = &invalid, .write_count = invalid.len }));
+    try std.testing.expectError(error.NotFound, owner.lookupJson("docs", "{\"key\":\"not-committed\"}"));
+    var output: abi.OwnedBytes = .{};
+    var failure: abi.FailureIdentity = .{};
+    const invalid_status = abi.antfly_storage_owner_batch_borrowed_documents(owner.handle, &.{ .table_name = .fromSlice("docs"), .write_count = 1 }, &output, &failure);
+    try error_identity.validateFailureEnvelope(invalid_status, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings("InvalidArgument", failure.errorName());
+    try std.testing.expectEqual(@backingInt(abi.BorrowedBatchOperation.validate), failure.operation);
+    try std.testing.expect(output.ptr == null);
+    const old_status = abi.antfly_storage_owner_batch_borrowed_documents(owner.handle, &.{ .version = abi.abi_version - 1 }, &output, &failure);
+    try error_identity.validateFailureEnvelope(old_status, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings("InvalidAbiVersion", failure.errorName());
+
+    const deletes = [_]abi.BorrowedBytes{.fromSlice("a")};
+    var deleted = try owner.batchBorrowedDocuments(.{ .table_name = .fromSlice("docs"), .deletes = &deletes, .delete_count = deletes.len });
+    defer deleted.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, deleted.bytes(), "\"deleted\":1") != null);
+}
+
 test "opaque owner retained relational read crosses checked archive boundary" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -92,7 +133,7 @@ test "opaque owner retained relational read crosses checked archive boundary" {
 
 test "opaque owner conditional writes retain version and digest fences" {
     const alloc = std.testing.allocator;
-    const batch = @import("antfly_local_sources").api_batch;
+    const batch = @import("antfly_local_sources").api_internal_batch;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
@@ -394,7 +435,7 @@ test "opaque owner source artifact transfer resumes across replicas without dono
     const alloc = std.testing.allocator;
     const transfer = @import("antfly_local_sources").storage_db_source_artifact_transfer;
     const contract = @import("antfly_local_sources").api_local_query_contract;
-    const batch = @import("antfly_local_sources").api_batch;
+    const batch = @import("antfly_local_sources").api_internal_batch;
     const source = @import("antfly_local_sources").storage_db_online_source_contract;
     const Call = struct {
         fn transport(ptr: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, request: transfer.Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
@@ -594,7 +635,7 @@ test "opaque owner source artifact transfer resumes across replicas without dono
 test "opaque owner online source controls and status survive compiled boundary restart" {
     const alloc = std.testing.allocator;
     const contract = @import("antfly_local_sources").api_local_query_contract;
-    const batch = @import("antfly_local_sources").api_batch;
+    const batch = @import("antfly_local_sources").api_internal_batch;
     const source = @import("antfly_local_sources").storage_db_online_source_contract;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -980,7 +1021,7 @@ test "opaque portable and native restore preserve bounded range through captured
     const handoff = @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract;
     const transition = @import("antfly_local_sources").storage_db_relational_transition_contract;
     const seal = @import("antfly_local_sources").storage_db_native_backup_seal_contract;
-    const batch_wire = @import("antfly_local_sources").api_batch;
+    const batch_wire = @import("antfly_local_sources").api_internal_batch;
     const Driver = struct {
         owner: *client.Owner,
         index: u64 = 0,
@@ -2057,6 +2098,14 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         invalid_abi_failure.operation,
     );
     try std.testing.expectEqualStrings("InvalidAbiVersion", invalid_abi_failure.errorName());
+
+    // Reject an incompatible owner-issued capability before invoking it.
+    // A poisoned context must never reach an owner callback.
+    invalid_abi_request = .{ .execution = .{ .version = 0, .context = @ptrFromInt(1) }, .table_name = .fromSlice("docs"), .request_json = .fromSlice("{}") };
+    const incompatible_db_status = abi.antfly_local_query_execute(&invalid_abi_request, &invalid_abi_response, &invalid_abi_failure);
+    try std.testing.expectEqual(abi.Status.invalid_abi, incompatible_db_status);
+    try std.testing.expectEqualStrings("InvalidAbiVersion", invalid_abi_failure.errorName());
+    try std.testing.expectEqual(@as(u64, 0), invalid_abi_response.buffer.len);
 
     // Every operation family crossing the storage-owner boundary carries the
     // same complete envelope even when it remains in the storage unit.
