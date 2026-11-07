@@ -54,19 +54,32 @@ fn moovMentionsAv1(bytes: []const u8) bool {
 
 pub const limits: media.mp4.Limits = .{ .codecs = std.EnumSet(media.mp4.Codec).initMany(&.{ .avc, .mjpeg, .hevc, .av1 }) };
 
-/// The returned reader takes over the MP4 reader's metadata and index admission.
+/// The returned reader owns MP4 metadata and exact WebM-index admission.
+/// Conversion admits the overlap while both packet indexes are live.
 pub fn openWebm(a: std.mem.Allocator, source: *media.source.Source) !media.webm.Reader {
     var reader = try media.mp4.Reader.init(a, source, limits);
-    var moved = false;
-    defer if (!moved) reader.deinit();
+    errdefer reader.deinit();
+    return intoWebm(a, &reader);
+}
+
+/// Consumes the MP4 owner on success; errors preserve it for caller cleanup.
+fn intoWebm(a: std.mem.Allocator, reader: *media.mp4.Reader) !media.webm.Reader {
+    try reader.input.control.check();
     if (reader.track.codec != .av1) return error.UnsupportedVideoCodec;
     if (reader.track.timescale == 0) return error.InvalidTimebase;
     const track = try webmTrack(reader.track);
+    if (reader.packets.len > limits.max_index_bytes / @sizeOf(media.webm.Packet)) return error.ResourceLimitExceeded;
+    const index_bytes = reader.packets.len * @sizeOf(media.webm.Packet);
+    // The old index remains live throughout translation. Admit this moving
+    // overlap before allocation, and retain the replacement's exact charge.
+    var replacement = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = index_bytes }) else media.admission.Token{};
+    errdefer replacement.deinit();
     const packets = try a.alloc(media.webm.Packet, reader.packets.len);
     errdefer a.free(packets);
     var start: i128 = std.math.maxInt(i64);
     var end: i128 = std.math.minInt(i64);
-    for (reader.packets, packets) |packet, *out| {
+    for (reader.packets, packets, 0..) |packet, *out, index| {
+        if (index % 256 == 0) try reader.input.control.check();
         start = @min(start, packet.pts);
         end = @max(end, @as(i128, packet.pts) + packet.duration);
         out.* = .{
@@ -80,13 +93,14 @@ pub fn openWebm(a: std.mem.Allocator, source: *media.source.Source) !media.webm.
             .discardable = false,
         };
     }
+    try reader.input.control.check();
     const cues = try a.alloc(media.webm.Cue, 0);
     const span = if (end > start) @as(f64, @floatFromInt(end - start)) / @as(f64, @floatFromInt(reader.track.timescale)) else null;
     const result = media.webm.Reader{
         .allocator = a,
-        .input = source,
+        .input = reader.input,
         .metadata = reader.metadata,
-        .index_reservation = reader.index_reservation,
+        .index_reservation = replacement,
         .track = track,
         .packets = packets,
         .cues = cues,
@@ -94,7 +108,8 @@ pub fn openWebm(a: std.mem.Allocator, source: *media.source.Source) !media.webm.
         .duration_seconds = span,
     };
     reader.allocator.free(reader.packets);
-    moved = true;
+    reader.index_reservation.deinit();
+    reader.* = undefined;
     return result;
 }
 
@@ -207,4 +222,121 @@ test "MP4 color declarations map to WebM colour" {
     try std.testing.expectEqual(@as(u16, 18), hlg.transfer);
     try std.testing.expectEqual(@as(u8, 1), hlg.range);
     try std.testing.expectEqual(@as(u16, 2), (try colour("prof-icc-profile")).matrix);
+}
+
+// Synthetic prevalidated metadata keeps migration tests independent of encoding
+// cost and fixture length; real packet preservation is covered above.
+fn indexedTestReader(a: std.mem.Allocator, source: *media.source.Source, count: usize) !media.mp4.Reader {
+    var metadata = try source.read(0, @intCast(source.length()));
+    errdefer metadata.deinit();
+    var reservation = try source.admission_pool.?.acquire(.{ .host_bytes = count * @sizeOf(media.mp4.Packet) });
+    errdefer reservation.deinit();
+    const packets = try a.alloc(media.mp4.Packet, count);
+    for (packets, 0..) |*packet, index| packet.* = .{ .offset = 0, .size = 1, .dts = @intCast(index), .media_pts = @intCast(index), .pts = @intCast(index), .duration = 1, .sync = true };
+    return .{
+        .allocator = a,
+        .input = source,
+        .metadata = metadata,
+        .index_reservation = reservation,
+        .track = .{ .codec = .av1, .id = 1, .timescale = 1000, .width = 192, .height = 192, .avcc = &.{}, .codec_config = &.{ 0x81, 0, 0x0c, 0 }, .nal_length_bytes = 0, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } },
+        .packets = packets,
+        .limits = limits,
+    };
+}
+
+test "AV1 MP4 bridge admits index overlap before allocation and transfers exact ownership" {
+    const a = std.testing.allocator;
+    const count = 400;
+    const old_bytes = count * @sizeOf(media.mp4.Packet);
+    const new_bytes = count * @sizeOf(media.webm.Packet);
+    const peak = "metadata".len + old_bytes + new_bytes;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = peak - 1 } };
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = "metadata" }, .identity = "index-overlap", .admission_pool = &pool };
+    var reader = try indexedTestReader(a, &source, count);
+    var owns_reader = true;
+    defer if (owns_reader) reader.deinit();
+    const original = reader.packets.ptr;
+    var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.SharedAdmissionExceeded, intoWebm(denied.allocator(), &reader));
+    try std.testing.expectEqual(@as(usize, 0), denied.allocated_bytes);
+    try std.testing.expectEqual(original, reader.packets.ptr);
+    try std.testing.expectEqual(@as(u64, "metadata".len + old_bytes), pool.snapshot().host_bytes);
+    pool.limits.host_bytes = peak;
+    var translated = try intoWebm(a, &reader);
+    owns_reader = false;
+    var owns_translated = true;
+    defer if (owns_translated) translated.deinit();
+    try std.testing.expectEqual(@as(u64, peak), pool.high_water.host_bytes);
+    try std.testing.expectEqual(@as(u64, new_bytes), translated.index_reservation.resources.host_bytes);
+    try std.testing.expectEqual(@as(u64, "metadata".len + new_bytes), pool.snapshot().host_bytes);
+    try std.testing.expectEqual(@as(i64, 399_000_000), translated.packets[399].pts);
+    try std.testing.expectEqual(@as(?u64, 1_000_000), translated.packets[0].duration_ns);
+    translated.deinit();
+    owns_translated = false;
+    try std.testing.expectEqualDeep(media.admission.Resources{}, pool.snapshot());
+    try std.testing.expectEqual(@as(usize, 0), source.retained_bytes);
+}
+
+test "AV1 MP4 bridge allocation failures release both index and metadata ownership" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var pool = media.admission.Pool{ .limits = .{ .host_bytes = 1024 * 1024 } };
+            var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = "metadata" }, .identity = "bridge-allocation", .admission_pool = &pool };
+            defer {
+                std.debug.assert(pool.snapshot().host_bytes == 0);
+                std.debug.assert(source.retained_bytes == 0);
+            }
+            var reader = try indexedTestReader(a, &source, 400);
+            var owns_reader = true;
+            defer if (owns_reader) reader.deinit();
+            var translated = try intoWebm(a, &reader);
+            owns_reader = false;
+            defer translated.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "AV1 MP4 bridge conversion errors and cancellation preserve the source owner" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |cancel| {
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 1024 * 1024 } };
+        var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = "metadata" }, .identity = "bridge-errors", .admission_pool = &pool };
+        defer std.debug.assert(pool.snapshot().host_bytes == 0);
+        var reader = try indexedTestReader(a, &source, 400);
+        defer reader.deinit();
+        const Cancel = struct {
+            calls: usize = 0,
+            fn check(raw: ?*const anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+                self.calls += 1;
+                if (self.calls == 2) return error.Cancelled;
+            }
+        };
+        var cancellation: Cancel = .{};
+        if (cancel) source.control = .{ .context = &cancellation, .check_fn = Cancel.check } else reader.packets[0].pts = std.math.maxInt(i64);
+        const before = pool.snapshot();
+        const original = reader.packets.ptr;
+        try std.testing.expectError(if (cancel) error.Cancelled else error.TimestampOverflow, intoWebm(a, &reader));
+        try std.testing.expectEqualDeep(before, pool.snapshot());
+        try std.testing.expectEqual(original, reader.packets.ptr);
+        try std.testing.expectEqual(@as(usize, "metadata".len), source.retained_bytes);
+    }
+}
+
+test "AV1 MP4 bridge retains only translated index admission on real input" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 1024 * 1024 } };
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../testdata/av1-mp4.mp4") }, .identity = "bridge-integration", .admission_pool = &pool };
+    {
+        var reader = try openWebm(a, &source);
+        defer reader.deinit();
+        const new_bytes = reader.packets.len * @sizeOf(media.webm.Packet);
+        const old_bytes = reader.packets.len * @sizeOf(media.mp4.Packet);
+        try std.testing.expectEqual(@as(u64, new_bytes), reader.index_reservation.resources.host_bytes);
+        try std.testing.expectEqual(@as(u64, reader.metadata.bytes.len + new_bytes), pool.snapshot().host_bytes);
+        try std.testing.expect(pool.high_water.host_bytes >= reader.metadata.bytes.len + old_bytes + new_bytes);
+    }
+    try std.testing.expectEqualDeep(media.admission.Resources{}, pool.snapshot());
+    try std.testing.expectEqual(@as(usize, 0), source.retained_bytes);
 }
