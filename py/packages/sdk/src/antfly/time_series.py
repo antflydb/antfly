@@ -58,7 +58,7 @@ def series_query(
     start_ns, end_ns = nanos(start, first), nanos(end, last)
     if first.tzinfo is None or last.tzinfo is None or start_ns >= end_ns:
         raise ValueError("Expected an increasing timezone-aware [start, end) range")
-    if (end_ns - start_ns) // duration + 2 > 10000:
+    if (end_ns - 1) // duration - start_ns // duration + 1 > 10000:
         raise ValueError("Select a coarser interval: at most 10000 buckets")
     if not 1 <= max_series <= 1000:
         raise ValueError("max_series must be between 1 and 1000")

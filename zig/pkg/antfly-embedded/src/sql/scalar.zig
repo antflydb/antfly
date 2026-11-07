@@ -4918,7 +4918,7 @@ const Evaluator = struct {
             .date_bin => {
                 if (first != .string or values[1] != .string or values[2] != .string) return error.SqlTypeMismatch;
                 const every = datetime.durationNs(first.string) orelse return error.InvalidSqlParameters;
-                const ns = datetime.parseDateTimeToNs(values[1].string) orelse return error.InvalidSqlDateTime;
+                const ns = datetime.parseDateTimeToSignedNs(values[1].string) orelse return error.InvalidSqlDateTime;
                 const origin = datetime.parseDateTimeToSignedNs(values[2].string) orelse return error.InvalidSqlDateTime;
                 const start = datetime.binSigned(ns, every, origin) orelse return error.InvalidSqlDateTime;
                 try self.charge(30);

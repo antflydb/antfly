@@ -10,7 +10,13 @@ import {
   Label,
   Textarea,
 } from "@antfly/design-system";
-import { type SeriesQueryOptions, seriesQuery, seriesSQL, type TimeSeries } from "@antfly/sdk";
+import {
+  type SeriesQueryOptions,
+  seriesQuery,
+  seriesSQL,
+  seriesTimestampNanoseconds,
+  type TimeSeries,
+} from "@antfly/sdk";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useApi } from "../../hooks/use-api-config";
 import JsonViewer from "../JsonViewer";
@@ -24,8 +30,12 @@ export function TimeSeriesPanel({ tableName }: { tableName: string }) {
   const [calendar, setCalendar] = useState(false);
   const [origin, setOrigin] = useState("");
   const [zeroFill, setZeroFill] = useState(false);
-  const [start, setStart] = useState(() => new Date(Date.now() - 3600000).toISOString());
-  const [end, setEnd] = useState(() => new Date().toISOString());
+  const [start, setStart] = useState(() =>
+    new Date(Math.floor(Date.now() / 300000) * 300000 - 3600000).toISOString()
+  );
+  const [end, setEnd] = useState(() =>
+    new Date(Math.floor(Date.now() / 300000) * 300000).toISOString()
+  );
   const [filters, setFilters] = useState("{}");
   const [poll, setPoll] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -238,81 +248,138 @@ export function TimeSeriesPanel({ tableName }: { tableName: string }) {
   );
 }
 
-function SeriesChart({ series }: { series: TimeSeries }) {
-  const values = series.points.flatMap((point) =>
-    point.measures.average == null ? [] : [point.measures.average]
-  );
-  const min = Math.min(...values),
-    max = Math.max(...values);
-  const x = (at: string) => {
-    const first = Date.parse(series.points[0]?.at ?? at),
-      last = Date.parse(series.points.at(-1)?.at ?? at);
-    return 20 + (760 * (Date.parse(at) - first)) / Math.max(1, last - first);
-  };
-  const y = (value: number) => 170 - (150 * (value - min)) / Math.max(1e-12, max - min);
-  let drawing = false;
-  const path = series.points
-    .map((point) => {
+export function SeriesChart({ series }: { series: TimeSeries }) {
+  const [dataOpen, setDataOpen] = useState(false);
+  const [page, setPage] = useState(0);
+  const pageSize = 100;
+  useEffect(() => setPage(0), [series]);
+  const chart = useMemo(() => {
+    const first = series.points[0];
+    const last = series.points.at(-1);
+    if (!first || !last)
+      return { path: "", dots: [] as { x: number; y: number }[], min: 0, max: 0, count: 0 };
+    const start = seriesTimestampNanoseconds(first.at);
+    const span = seriesTimestampNanoseconds(last.at) - start;
+    const x = (index: number) =>
+      20 +
+      (span === 0n
+        ? 0
+        : (760 * Number(seriesTimestampNanoseconds(series.points[index].at) - start)) /
+          Number(span));
+    const gaps = new Uint32Array(series.points.length + 1);
+    const bins = new Map<number, { first: number; last: number; min: number; max: number }>();
+    let min = Infinity,
+      max = -Infinity,
+      count = 0;
+    series.points.forEach((point, index) => {
       const value = point.measures.average;
-      if (value == null) {
-        drawing = false;
-        return "";
+      gaps[index + 1] = gaps[index] + (value == null ? 1 : 0);
+      if (value == null) return;
+      min = Math.min(min, value);
+      max = Math.max(max, value);
+      count++;
+      const bin = Math.floor(x(index));
+      const prior = bins.get(bin);
+      if (!prior) bins.set(bin, { first: index, last: index, min: index, max: index });
+      else {
+        prior.last = index;
+        if (value < (series.points[prior.min].measures.average ?? Infinity)) prior.min = index;
+        if (value > (series.points[prior.max].measures.average ?? -Infinity)) prior.max = index;
       }
-      const command = drawing ? "L" : "M";
-      drawing = true;
-      return `${command}${x(point.at)},${y(value)}`;
-    })
-    .join(" ");
+    });
+    // At most four samples per horizontal pixel. Preserve extrema and never
+    // connect selected samples across a missing measurement, even within a bin.
+    const selected = [
+      ...new Set([...bins.values()].flatMap((bin) => [bin.first, bin.min, bin.max, bin.last])),
+    ].sort((a, b) => a - b);
+    const y = (value: number) => 170 - (150 * (value - min)) / Math.max(1e-12, max - min);
+    const samples = selected.map((index, i) => ({
+      x: x(index),
+      y: y(series.points[index].measures.average ?? 0),
+      begins: i === 0 || gaps[index] > gaps[selected[i - 1] + 1],
+    }));
+    return {
+      min,
+      max,
+      count,
+      path: samples.map((point) => `${point.begins ? "M" : "L"}${point.x},${point.y}`).join(" "),
+      dots: samples.filter(
+        (point, i) => point.begins && (i === samples.length - 1 || samples[i + 1].begins)
+      ),
+    };
+  }, [series]);
+  const pageCount = Math.max(1, Math.ceil(series.points.length / pageSize));
+  const currentPage = Math.min(page, pageCount - 1);
   return (
     <section className="space-y-2">
       <h3 className="font-medium">{series.key}</h3>
-      {values.length ? (
+      {chart.count ? (
         <svg
           role="img"
           aria-label={`Average measurement over time for ${series.key}`}
           viewBox="0 0 800 200"
           className="w-full text-primary"
         >
-          <path d={path} stroke="currentColor" fill="none" strokeWidth="2" />
-          {series.points.length === 1 && values.length === 1 && (
-            <circle cx={20} cy={y(values[0])} r={3} fill="currentColor" />
-          )}
+          <path d={chart.path} stroke="currentColor" fill="none" strokeWidth="2" />
+          {chart.dots.map((point, i) => (
+            <circle key={i} cx={point.x} cy={point.y} r={3} fill="currentColor" />
+          ))}
         </svg>
       ) : (
         <p>No measurements in this range.</p>
       )}
-      {values.length > 0 && (
+      {chart.count > 0 && (
         <p className="text-xs text-muted-foreground">
-          Average range: {min} to {max} · {series.points[0]?.at} to{" "}
-          {series.points[series.points.length - 1]?.at}
+          Average range: {chart.min} to {chart.max} · {series.points[0]?.at} to{" "}
+          {series.points.at(-1)?.at}
         </p>
       )}
-      <details>
+      <details onToggle={(event) => setDataOpen(event.currentTarget.open)}>
         <summary>{series.points.length} buckets · view data</summary>
-        <div className="max-h-80 overflow-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr>
-                <th>UTC bucket</th>
-                <th>Count</th>
-                <th>Average</th>
-                <th>Min</th>
-                <th>Max</th>
-              </tr>
-            </thead>
-            <tbody>
-              {series.points.map((point) => (
-                <tr key={point.at}>
-                  <td>{point.at}</td>
-                  <td>{point.count}</td>
-                  <td>{point.measures.average ?? "—"}</td>
-                  <td>{point.measures.minimum ?? "—"}</td>
-                  <td>{point.measures.maximum ?? "—"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        {dataOpen && (
+          <div className="space-y-2">
+            <div className="flex gap-2 items-center">
+              <Button disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>
+                Previous buckets
+              </Button>
+              <span>
+                Page {currentPage + 1} of {pageCount}
+              </span>
+              <Button
+                disabled={currentPage + 1 === pageCount}
+                onClick={() => setPage(currentPage + 1)}
+              >
+                Next buckets
+              </Button>
+            </div>
+            <div className="max-h-80 overflow-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr>
+                    <th>UTC bucket</th>
+                    <th>Count</th>
+                    <th>Average</th>
+                    <th>Min</th>
+                    <th>Max</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {series.points
+                    .slice(currentPage * pageSize, (currentPage + 1) * pageSize)
+                    .map((point) => (
+                      <tr key={point.at}>
+                        <td>{point.at}</td>
+                        <td>{point.count}</td>
+                        <td>{point.measures.average ?? "—"}</td>
+                        <td>{point.measures.minimum ?? "—"}</td>
+                        <td>{point.measures.maximum ?? "—"}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
       </details>
     </section>
   );

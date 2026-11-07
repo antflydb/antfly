@@ -18,6 +18,7 @@ package sdk
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"time"
 )
 
@@ -38,7 +39,14 @@ func NewSeriesQuery(options SeriesQueryOptions) (*QueryRequest, error) {
 	if options.Timestamp == "" || options.Measurement == "" || !options.Start.Before(options.End) || options.Every <= 0 {
 		return nil, fmt.Errorf("antfly: timestamp, measurement, increasing range and positive interval required")
 	}
-	if options.End.Sub(options.Start)/options.Every+2 > 10000 {
+	ns := func(value time.Time) *big.Int {
+		return new(big.Int).Add(new(big.Int).Mul(big.NewInt(value.Unix()), big.NewInt(1_000_000_000)), big.NewInt(int64(value.Nanosecond())))
+	}
+	width := big.NewInt(int64(options.Every))
+	first := new(big.Int).Div(ns(options.Start), width)
+	last := new(big.Int).Div(new(big.Int).Sub(ns(options.End), big.NewInt(1)), width)
+	buckets := new(big.Int).Add(new(big.Int).Sub(last, first), big.NewInt(1))
+	if buckets.Cmp(big.NewInt(10000)) > 0 {
 		return nil, fmt.Errorf("antfly: select a coarser interval (10000 bucket limit)")
 	}
 	maxSeries := options.MaxSeries

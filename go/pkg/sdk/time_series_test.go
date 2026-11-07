@@ -32,9 +32,21 @@ func TestSeriesQueryPreservesTemporalContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, part := range []string{"300000000000ns", "2026-11-06T12:00:00.000000001Z", "date_bounds", "inclusive_end", "sub_aggregations", `"equals":"sensor"`} {
+	for _, part := range []string{"300000000000ns", "2026-11-06T12:00:00.000000001Z", "date_bounds", "inclusive_end", `"limit":0`, "sub_aggregations", `"equals":"sensor"`} {
 		if !strings.Contains(string(data), part) {
 			t.Fatalf("missing %q: %s", part, data)
 		}
+	}
+}
+
+func TestSeriesQueryExactBucketLimit(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	opts := SeriesQueryOptions{Table: "r", Timestamp: "ts", Measurement: "v", Start: start, End: start.Add(10000 * time.Second), Every: time.Second}
+	if _, err := NewSeriesQuery(opts); err != nil {
+		t.Fatal(err)
+	}
+	opts.End = opts.End.Add(time.Nanosecond)
+	if _, err := NewSeriesQuery(opts); err == nil {
+		t.Fatal("expected 10001 bucket rejection")
 	}
 }

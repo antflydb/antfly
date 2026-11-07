@@ -139,3 +139,9 @@ test "time series algebraic buckets share fixed duration and normalized instants
     try std.testing.expectEqualStrings("2026-11-06T12:00:00.000000010Z", precise);
     try std.testing.expect(Bucket.parse("0s") == null);
 }
+
+pub fn equivalentBucketNames(left: []const u8, right: []const u8) bool {
+    const a = Bucket.parse(canonicalBucketName(left) orelse return false) orelse return false;
+    const b = Bucket.parse(canonicalBucketName(right) orelse return false) orelse return false;
+    return std.meta.eql(a, b);
+}

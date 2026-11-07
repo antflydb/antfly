@@ -81,7 +81,9 @@ class AggregationRequest:
         date_ranges (list[AggregationDateRange] | Unset): Date ranges for date_range aggregations
         interval (float | Unset): Fixed interval for histogram aggregations
         date_bounds (AggregationRequestDateBounds | Unset): Explicit half-open RFC3339 extent for date_histogram empty
-            buckets. Does not filter documents; use a matching date range filter. Limited to 10000 buckets.
+            buckets. Does not filter documents; use a matching date range filter. Limited to 10000 buckets per histogram and
+            100000 generated cells (buckets plus metrics) per request. Only scalar metric sub-aggregations are supported
+            with these bounds.
         fixed_interval (str | Unset): Positive elapsed duration for date_histogram (for example 30s, 5m, 1h30m).
             Mutually exclusive with calendar_interval. Nanosecond precision; UTC epoch alignment by default.
         bucket_origin (datetime.datetime | Unset): RFC3339 alignment origin for fixed_interval. Calendar buckets use

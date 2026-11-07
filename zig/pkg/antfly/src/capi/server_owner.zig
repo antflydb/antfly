@@ -5657,6 +5657,18 @@ pub fn storageAggregateJson(
         requests,
         result,
         .{
+            .control = .{
+                .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else null,
+                .cancellation = if (request.cancellation_fn != null) .{
+                    .ptr = request,
+                    .is_cancelled_fn = struct {
+                        fn cancelled(ptr: *const anyopaque) bool {
+                            const call: *const kernel_owner_abi.AggregationRequest = @ptrCast(@alignCast(ptr));
+                            return call.cancellation_fn.?(call.cancellation_ctx) != 0;
+                        }
+                    }.cancelled,
+                } else null,
+            },
             .text_analysis = if (wire.text_analysis) |*value| value else null,
             .distributed_text_stats = wire.distributed_text_stats,
             .distributed_background_text_stats = wire.distributed_background_text_stats,

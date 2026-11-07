@@ -37,7 +37,7 @@ export interface SeriesQueryOptions extends SeriesRange {
   profile?: boolean;
 }
 
-function instant(text: string): bigint {
+export function seriesTimestampNanoseconds(text: string): bigint {
   // Date is used only to validate the civil date and timezone, never to round
   // the returned timestamp or compare its submillisecond component.
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(text))
@@ -57,6 +57,8 @@ function instant(text: string): bigint {
   const fraction = /\.(\d+)/.exec(text)?.[1] ?? "";
   return BigInt(ms) * 1_000_000n + BigInt(fraction.padEnd(9, "0").slice(3));
 }
+
+const instant = seriesTimestampNanoseconds;
 
 export function fixedDurationNanoseconds(text: string): bigint {
   const units: Record<string, bigint> = {
@@ -115,7 +117,12 @@ export function seriesQuery(options: SeriesQueryOptions): GlobalQueryRequest {
   )
     throw new TypeError("Invalid calendar interval");
   for (const [name, metric] of Object.entries(options.measures)) {
-    if (!name || !metric.field || !["count", "sum", "avg", "min", "max"].includes(metric.op))
+    if (
+      !name ||
+      name.startsWith("__antfly_series_") ||
+      !metric.field ||
+      !["count", "sum", "avg", "min", "max"].includes(metric.op)
+    )
       throw new TypeError("Invalid named measurement");
   }
 
@@ -124,7 +131,11 @@ export function seriesQuery(options: SeriesQueryOptions): GlobalQueryRequest {
     throw new TypeError("maxSeries must be between 1 and 1000");
   if (options.bucket.every) {
     const every = fixedDurationNanoseconds(options.bucket.every);
-    if ((instant(options.end) - instant(options.start)) / every + 2n > 10000n)
+    const origin = options.bucket.origin ? instant(options.bucket.origin) : 0n;
+    const floor = (value: bigint) => value / every - (value % every < 0n ? 1n : 0n);
+    const buckets =
+      floor(instant(options.end) - 1n - origin) - floor(instant(options.start) - origin) + 1n;
+    if (options.emptyBuckets !== false && buckets > 10000n)
       throw new RangeError("Select a coarser interval: at most 10000 buckets are supported");
     if (options.bucket.origin) instant(options.bucket.origin);
   }
@@ -136,6 +147,10 @@ export function seriesQuery(options: SeriesQueryOptions): GlobalQueryRequest {
       { type: value.op, field: value.field },
     ])
   );
+  for (const [name, metric] of Object.entries(options.measures)) {
+    if (metric.op === "sum")
+      measures[`__antfly_series_count_${name}`] = { type: "avg", field: metric.field };
+  }
   const histogram: AggregationRequest = {
     type: "date_histogram",
     field: options.timestamp,
@@ -151,6 +166,7 @@ export function seriesQuery(options: SeriesQueryOptions): GlobalQueryRequest {
   const groupBy = options.groupBy ?? [];
   return {
     table: options.table,
+    timeout_ms: 30000,
     profile: options.profile,
     filter_query,
     limit: 0,
@@ -206,14 +222,18 @@ export function seriesResults(result: QueryResult, fill: null | 0 = null): TimeS
       at: bucket.key,
       count: bucket.doc_count,
       measures: Object.fromEntries(
-        Object.entries(bucket.sub_aggregations ?? {}).map(([name, metric]) => [
-          name,
-          typeof metric.value === "number"
-            ? metric.value
-            : metric.count === 0
+        Object.entries(bucket.sub_aggregations ?? {})
+          .filter(([name]) => !name.startsWith("__antfly_series_"))
+          .map(([name, metric]) => [
+            name,
+            bucket.sub_aggregations?.[`__antfly_series_count_${name}`]?.count === 0
               ? fill
-              : (metric.avg ?? fill),
-        ])
+              : typeof metric.value === "number"
+                ? metric.value
+                : metric.count === 0
+                  ? fill
+                  : (metric.avg ?? fill),
+          ])
       ),
     }));
   const groups = result.aggregations?.series?.buckets;
@@ -286,7 +306,7 @@ export function timeSeriesTable(options: {
             bucket: options.bucket ?? "5m",
           },
           ...options.measurements.flatMap((measure, i) =>
-            (["count", "sum", "avg", "min", "max"] as const).map((op) => ({
+            (["sum", "avg", "min", "max"] as const).map((op) => ({
               name: `m${i}_${op}`,
               op,
               measure,
@@ -312,10 +332,17 @@ export function seriesBatch(
   if (readings.length === 0 || readings.length > 1000)
     throw new RangeError("Batch must contain 1–1000 readings");
   const inserts: Record<string, Record<string, unknown>> = Object.create(null);
-  for (const { id, document } of readings) {
-    if (!id || id in inserts)
+  for (const reading of readings) {
+    if (!reading || typeof reading !== "object") throw new TypeError("Readings must be objects");
+    const { id, document } = reading;
+    if (typeof id !== "string" || !id || id in inserts)
       throw new TypeError("Reading IDs must be nonempty and unique within the batch");
-    if (typeof document[timestamp] !== "string")
+    if (
+      !document ||
+      typeof document !== "object" ||
+      Array.isArray(document) ||
+      typeof document[timestamp] !== "string"
+    )
       throw new TypeError("Readings require an RFC3339 timestamp");
     instant(document[timestamp]);
     inserts[id] = document;
@@ -343,7 +370,8 @@ export function seriesSQL(options: SeriesQueryOptions): SQLRequest {
     ...dimensions,
     `${bucket} AS "bucket"`,
     ...Object.entries(options.measures).map(
-      ([name, metric]) => `${metric.op.toUpperCase()}(${quote(metric.field)}) AS ${quote(name)}`
+      ([name, metric]) =>
+        `${metric.op.toUpperCase()}(${metric.op === "count" ? "*" : quote(metric.field)}) AS ${quote(name)}`
     ),
   ];
   const predicates = [
@@ -367,10 +395,24 @@ export class SeriesImportError extends Error {
   constructor(
     readonly committedReadings: number,
     readonly pendingIds: string[],
-    cause: unknown
+    cause: unknown,
+    readonly details: {
+      phase: "source" | "validation" | "submission" | "callback" | "aborted";
+      bufferedIds: string[];
+      mayHaveCommitted: boolean;
+      committedPendingBatches: number;
+      repairRequiredBatches: number;
+      lastOutcome?: unknown;
+    } = {
+      phase: "submission",
+      bufferedIds: [],
+      mayHaveCommitted: true,
+      committedPendingBatches: 0,
+      repairRequiredBatches: 0,
+    }
   ) {
     super(
-      `Series import stopped after ${committedReadings} acknowledged readings; reconcile the pending batch before retrying`
+      `Series import stopped during ${details.phase} after ${committedReadings} acknowledged readings${details.mayHaveCommitted ? "; reconcile the pending batch before retrying" : ""}`
     );
     this.name = "SeriesImportError";
     this.cause = cause;

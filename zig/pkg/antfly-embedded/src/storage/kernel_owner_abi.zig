@@ -21,7 +21,7 @@ const failure_abi = @import("runtime_failure_abi");
 // Storage layouts evolve independently of the shared failure envelope.
 // Version 85 adds privacy policy fences to lookup, scan and query requests.
 // Older owners must reject their operation identifiers before dispatch.
-pub const abi_version: u32 = 85;
+pub const abi_version: u32 = 86;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1266,6 +1266,10 @@ pub const AggregationRequest = extern struct {
     context_json: BorrowedBytes = .{},
     hits: ?[*]const AggregationHit = null,
     hit_count: u64 = 0,
+    execution_deadline_ns: u64 = 0,
+    has_execution_deadline: u8 = 0,
+    cancellation_ctx: ?*anyopaque = null,
+    cancellation_fn: ?CancellationCheckFn = null,
 };
 
 /// Synchronous coarse dispatch of one generated document-artifact child range.

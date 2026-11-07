@@ -81,8 +81,7 @@ pub fn scalarFromJsonAlloc(alloc: Allocator, field_type: []const u8, json_value:
             .string => |v| try canonicalAlloc(alloc, .datetime, v),
             .integer, .number_string => blk: {
                 const ns = @import("../../../datetime.zig").rangeNanoseconds(json_value) orelse break :blk null;
-                const unsigned = std.math.cast(u64, ns) orelse break :blk null;
-                const timestamp = try @import("../../../datetime.zig").formatDateTimeNsAlloc(alloc, unsigned);
+                const timestamp = try @import("../../../datetime.zig").formatDateTimeSignedNsAlloc(alloc, ns);
                 defer alloc.free(timestamp);
                 break :blk try canonicalAlloc(alloc, .datetime, timestamp);
             },

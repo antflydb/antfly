@@ -13,7 +13,8 @@ T = TypeVar("T", bound="AggregationRequestDateBounds")
 @_attrs_define
 class AggregationRequestDateBounds:
     """Explicit half-open RFC3339 extent for date_histogram empty buckets. Does not filter documents; use a matching date
-    range filter. Limited to 10000 buckets.
+    range filter. Limited to 10000 buckets per histogram and 100000 generated cells (buckets plus metrics) per request.
+    Only scalar metric sub-aggregations are supported with these bounds.
 
         Attributes:
             start (datetime.datetime):

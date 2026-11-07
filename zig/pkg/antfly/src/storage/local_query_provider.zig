@@ -247,22 +247,20 @@ fn applyAggregations(
     result: db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
 ) !void {
-    var full: ?db_mod.types.SearchResult = null;
-    defer if (full) |*value| value.deinit();
-    var aggregation_req = req;
-    const selected = if (aggregation_plan.aggregationCanUseCurrentResult(req, result)) result else blk: {
-        aggregation_req = try aggregation_plan.aggregationFullResultRequest(req, result, "local-owner");
-        full = try aggregation_plan.collectAggregationFullResult(alloc, req, aggregation_req, LeaseSearcher{ .lease = lease }, "local-owner");
-        break :blk full.?;
-    };
+    const aggregation_req = req;
     const requests = try query_api.parseAggregationRequestsJson(alloc, aggregation_req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
+    const algebraic_name = if (db_mod.aggregations.containsDateHistogram(requests)) blk: {
+        const entry = db_mod.aggregations.resolveTemporalAlgebraicIndex(db.core.index_manager, aggregation_req.index_name) orelse break :blk aggregation_req.index_name;
+        break :blk @as(?[]const u8, entry.config.name);
+    } else aggregation_req.index_name;
     var ctx: db_mod.aggregations.Context = .{
+        .control = .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
         .index_manager = db.core.index_manager,
         .doc_store = db.core.store,
         .full_text_index_name = if (aggregation_req.full_text_queries.len == 1) aggregation_req.full_text_queries[0].index_name else aggregation_req.index_name,
-        .algebraic_index_name = aggregation_req.index_name,
-        .algebraic_available = try local_query.algebraicIndexFreshEnoughForName(alloc, aggregation_req.index_name, db),
+        .algebraic_index_name = algebraic_name,
+        .algebraic_available = try local_query.algebraicIndexFreshEnoughForName(alloc, algebraic_name, db),
         .identity_read_generation = aggregation_req.identity_read_generation,
     };
     const constraints = if (aggregation_plan.canConsiderAlgebraicAggregations(aggregation_req))
@@ -274,6 +272,37 @@ fn applyAggregations(
         ctx.algebraic_scope = .root;
         ctx.algebraic_constraints = items;
     };
+    var schema_view = db.core.acquireSchemaView();
+    defer if (schema_view) |*view| view.release();
+    const time = @import("antfly_platform").time;
+    const visibility_proven = if (schema_view) |view|
+        local_query_contract.temporalRangeVisibleThroughDeadline(req, ctx.algebraic_constraints, view.tableSchema().ttl_field, view.visibilityTtlDurationNs(), time.realtimeNs(), time.monotonicNs())
+    else
+        true;
+    _ = try db.currentIdentityReadGenerationForRequest(aggregation_req.identity_read_generation);
+    ctx.temporal_materializations_exact = visibility_proven;
+    if (try db_mod.aggregations.tryTemporalMaterializedAggregations(alloc, requests, ctx)) |accelerated| {
+        errdefer db_mod.aggregations.deinitResults(alloc, accelerated);
+        for (accelerated) |*aggregation| try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, aggregation);
+        meta.aggregation_results = accelerated;
+        meta.aggregation_execution = "materialized_temporal";
+        return;
+    }
+    // A declined temporal attempt must not immediately rescan the same index
+    // during the exact stored-row fallback.
+    ctx.temporal_materializations_exact = false;
+    if (db_mod.aggregations.containsDateHistogram(requests)) {
+        ctx.algebraic_available = false;
+        ctx.algebraic_scope = .disabled;
+    }
+    var full: ?db_mod.types.SearchResult = null;
+    defer if (full) |*value| value.deinit();
+    const selected = if (aggregation_plan.aggregationCanUseCurrentResult(req, result)) result else blk: {
+        const full_req = try aggregation_plan.aggregationFullResultRequest(req, result, "local-owner");
+        full = try aggregation_plan.collectAggregationFullResult(alloc, req, full_req, LeaseSearcher{ .lease = lease }, "local-owner");
+        break :blk full.?;
+    };
+    if (db_mod.aggregations.containsDateHistogram(requests)) meta.aggregation_execution = "scan";
     const results = try db_mod.aggregations.computeSearchAggregations(alloc, requests, selected, ctx);
     errdefer db_mod.aggregations.deinitResults(alloc, results);
     for (results) |*aggregation| try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, aggregation);
@@ -364,11 +393,19 @@ fn executeAlgebraicPartials(
     out_response: *abi.OwnedBytes,
     out_failure: *abi.FailureIdentity,
 ) abi.Status {
-    const response = local_query.executeStorageKernelAlgebraicPartials(
-        std.heap.c_allocator,
-        db,
-        request.request_json.slice(),
-    ) catch |err| return fail(err, .algebraic_partials, out_failure);
+    var envelope = std.json.parseFromSlice(std.json.Value, std.heap.c_allocator, request.request_json.slice(), .{}) catch |err| return fail(err, .algebraic_partials, out_failure);
+    defer envelope.deinit();
+    const response = if (envelope.value == .object and envelope.value.object.contains("temporal_query"))
+        local_query.executeTemporalQuery(std.heap.c_allocator, db, request.request_json.slice(), .{
+            .cancellation = requestCancellationToken(request),
+            .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else null,
+        }) catch |err| return fail(err, .algebraic_partials, out_failure)
+    else
+        local_query.executeStorageKernelAlgebraicPartials(
+            std.heap.c_allocator,
+            db,
+            request.request_json.slice(),
+        ) catch |err| return fail(err, .algebraic_partials, out_failure);
     out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
     return .ok;
 }

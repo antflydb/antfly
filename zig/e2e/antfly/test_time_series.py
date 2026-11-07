@@ -15,6 +15,9 @@
 
 """Time-series SQL/JSON semantics, exact reads, and algebraic maintenance."""
 
+import copy
+import json
+from pathlib import Path
 import time
 
 import pytest
@@ -284,3 +287,256 @@ def test_time_series_ttl_removes_exact_aggregate_contributions(stateful_api):
     buckets = response(_query())["aggregations"]["points"]["buckets"]
     assert buckets[0]["doc_count"] == 1, buckets
     assert buckets[0]["sub_aggregations"]["average"]["avg"] == 20, buckets
+
+
+@pytest.mark.parametrize("shards", [1, 2])
+def test_sdk_preset_grouped_materializations(stateful_api, shards):
+    """Exercise the exact SDK wire shape, including presence counts and aliases."""
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/time-series-sdk.json").read_text()
+    )
+    api = stateful_api
+    names = []
+    for indexed in [False, True]:
+        config = copy.deepcopy(fixture["table"])
+        config["num_shards"] = shards
+        if not indexed:
+            config.pop("indexes")
+        name = f"sdk_series_{shards}_{indexed}_{time.time_ns()}"
+        finish_create_table(api, name, api._request("POST", f"/tables/{name}", config))
+        names.append(name)
+    readings = {
+        "a": {
+            "device_id": "sensor",
+            "region": "west",
+            "observed_at": "2026-11-06T12:01:00Z",
+            "temperature": 10,
+        },
+        "b": {
+            "device_id": "sensor",
+            "region": "west",
+            "observed_at": "2026-11-06T12:02:00Z",
+            "temperature": 30,
+        },
+        "c": {
+            "device_id": "sensor",
+            "region": "west",
+            "observed_at": "2026-11-06T12:10:00Z",
+        },
+        "d": {
+            "device_id": "sensor",
+            "region": "west",
+            "observed_at": "2026-11-06T12:15:00Z",
+            "temperature": 0,
+        },
+        "tie_newline": {
+            "device_id": "AA\n",
+            "region": "west",
+            "observed_at": "2026-11-06T12:01:00Z",
+            "temperature": 1,
+        },
+        "tie_space": {
+            "device_id": "AA ",
+            "region": "west",
+            "observed_at": "2026-11-06T12:01:00Z",
+            "temperature": 1,
+        },
+        "excluded": {
+            "device_id": "sensor",
+            "region": "east",
+            "observed_at": "2026-11-06T12:01:00Z",
+            "temperature": 900,
+        },
+        "other": {
+            "device_id": "other",
+            "region": "west",
+            "observed_at": "2026-11-06T12:01:00Z",
+            "temperature": 100,
+        },
+        "boundary": {
+            "device_id": "sensor",
+            "region": "west",
+            "observed_at": "2026-11-06T12:20:00Z",
+            "temperature": 900,
+        },
+    }
+    for name in names:
+        api.batch_write(name, inserts=readings, sync_level="full_index")
+    index_info = api.get_index(names[1], "series_aggregates")
+    for recipe in index_info["config"]["aggregates"]:
+        assert recipe["time"] == "observed_at", index_info
+        assert recipe["bucket"] == "5m", index_info
+
+    def run(name, query=None):
+        payload = api.post("/query", dict(query or fixture["query"], table=name))
+        result = payload.get("responses", [payload])[0]
+        assert result.get("status", 200) == 200, payload
+        assert not result.get("error"), payload
+        assert result["hits"]["hits"] == [], payload
+        return result
+
+    def compare():
+        scan, indexed = [run(name) for name in names]
+        assert indexed["aggregations"] == scan["aggregations"]
+        assert (
+            indexed["profile"].get("aggregation_execution") == "materialized_temporal"
+        ), indexed
+        buckets = indexed["aggregations"]["series"]["buckets"]
+        assert buckets[0]["key"] == "sensor", buckets
+        assert buckets[0]["doc_count"] == 4, buckets
+        points = buckets[0]["sub_aggregations"]["points"]["buckets"]
+        assert [p["doc_count"] for p in points] == [2, 0, 1, 1], points
+        assert points[0]["sub_aggregations"]["average"]["avg"] == 20
+        assert (
+            points[2]["sub_aggregations"]["__antfly_series_count_total"]["count"] == 0
+        )
+        assert (
+            points[3]["sub_aggregations"]["__antfly_series_count_total"]["count"] == 1
+        )
+        assert points[3]["sub_aggregations"]["total"]["value"] == 0
+
+    compare()
+    alias_only = {
+        "limit": 0,
+        "profile": True,
+        "aggregations": {"date_histogram": {"type": "avg", "field": "temperature"}},
+    }
+    plain, indexed_plain = [run(name, alias_only) for name in names]
+    assert indexed_plain["aggregations"] == plain["aggregations"]
+    assert "temporal" not in indexed_plain["profile"].get(
+        "aggregation_execution", ""
+    ), indexed_plain
+    composite = copy.deepcopy(fixture["query"])
+    composite["aggregations"]["series"]["fields"] = ["device_id", "region"]
+    scan, indexed = [run(name, composite) for name in names]
+    assert indexed["aggregations"] == scan["aggregations"]
+    assert indexed["profile"].get("aggregation_execution") == "materialized_temporal", (
+        indexed
+    )
+    # A replay is an upsert, and a correction/deletion changes maintained state.
+    for name in names:
+        api.batch_write(name, inserts=readings, sync_level="full_index")
+    compare()
+    for name in names:
+        api.batch_write(
+            name,
+            inserts={"a": dict(readings["a"], temperature=50)},
+            deletes=["b"],
+            sync_level="full_index",
+        )
+    scan, indexed = [run(name) for name in names]
+    assert indexed["aggregations"] == scan["aggregations"]
+    assert indexed["profile"].get("aggregation_execution") == "materialized_temporal", (
+        indexed
+    )
+    # Non-aligned source predicates cannot be answered by whole stored buckets.
+    unaligned = copy.deepcopy(fixture["query"])
+    unaligned["filter_query"]["conjuncts"][0]["start"] = "2026-11-06T12:00:01Z"
+    unaligned["aggregations"]["series"]["sub_aggregations"]["points"]["date_bounds"][
+        "start"
+    ] = "2026-11-06T12:00:01Z"
+    scan, indexed = [run(name, unaligned) for name in names]
+    assert indexed["aggregations"] == scan["aggregations"]
+    assert indexed["profile"].get("aggregation_execution") != "materialized_temporal", (
+        indexed
+    )
+    # Extra unfiltered dimensions can omit source documents, so exact scanning
+    # must retain the source time predicate after declining the temporal plan.
+    unfiltered = copy.deepcopy(fixture["query"])
+    unfiltered["filter_query"]["conjuncts"] = unfiltered["filter_query"]["conjuncts"][
+        :1
+    ]
+    scan, indexed = [run(name, unfiltered) for name in names]
+    assert indexed["aggregations"] == scan["aggregations"]
+    assert indexed["profile"].get("aggregation_execution") != "materialized_temporal", (
+        indexed
+    )
+
+
+def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
+    """A maintained query must not hydrate the fallback's first 100,000 hits."""
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/time-series-sdk.json").read_text()
+    )
+    api = stateful_api
+    name = f"sdk_series_scale_{time.time_ns()}"
+    finish_create_table(
+        api, name, api._request("POST", f"/tables/{name}", fixture["table"])
+    )
+    count = 100_001
+    for first in range(0, count, 1000):
+        api.batch_write(
+            name,
+            inserts={
+                str(i): {
+                    "device_id": "sensor",
+                    "region": "west",
+                    "observed_at": "2026-11-06T12:01:00Z",
+                    "temperature": 1,
+                }
+                for i in range(first, min(first + 1000, count))
+            },
+            sync_level="full_index",
+        )
+    payload = api.post("/query", dict(fixture["query"], table=name))
+    result = payload.get("responses", [payload])[0]
+    assert not result.get("error"), payload
+    assert result["hits"]["hits"] == [], payload
+    assert result["profile"].get("aggregation_execution") == "materialized_temporal", (
+        result
+    )
+    bucket = result["aggregations"]["series"]["buckets"][0]
+    assert bucket["doc_count"] == count
+    metrics = bucket["sub_aggregations"]["points"]["buckets"][0]["sub_aggregations"]
+    assert metrics["total"]["value"] == count
+    assert metrics["average"]["avg"] == 1
+
+
+def test_signed_origin_and_bounded_nesting_rejection(stateful_api):
+    api = stateful_api
+    name = f"series_epoch_{time.time_ns()}"
+    finish_create_table(
+        api,
+        name,
+        api._request("POST", f"/tables/{name}", {"num_shards": 1, "schema": _schema()}),
+    )
+    api.batch_write(
+        name,
+        inserts={
+            "epoch": {
+                "observed_at": "1970-01-01T00:00:01Z",
+                "device_id": "sensor",
+                "temperature": 2,
+            }
+        },
+        sync_level="full_index",
+    )
+    histogram = {
+        "type": "date_histogram",
+        "field": "observed_at",
+        "fixed_interval": "5m",
+        "bucket_origin": "1970-01-01T00:02:00Z",
+        "min_doc_count": 0,
+        "date_bounds": {"start": "1970-01-01T00:00:00Z", "end": "1970-01-01T00:05:00Z"},
+        "sub_aggregations": {"average": {"type": "avg", "field": "temperature"}},
+    }
+    payload = api.query_table(name, {"limit": 0, "aggregations": {"points": histogram}})
+    result = payload.get("responses", [payload])[0]
+    points = result["aggregations"]["points"]["buckets"]
+    assert points[0]["key"] == "1969-12-31T23:57:00Z", payload
+    assert points[0]["doc_count"] == 1
+    sql = api.post(
+        "/sql",
+        {
+            "statement": f"SELECT date_bin('5m', observed_at, '1970-01-01T00:02:00Z'::datetime) FROM \"{name}\""
+        },
+    )
+    assert str(sql["rows"][0][0]).startswith("1969-12-31T23:57:00"), sql
+    nested = copy.deepcopy(histogram)
+    nested["sub_aggregations"] = {"nested": histogram}
+    rejected = api._request(
+        "POST",
+        f"/tables/{name}/query",
+        {"limit": 0, "aggregations": {"points": nested}},
+    )
+    assert rejected.status_code == 400, rejected.text

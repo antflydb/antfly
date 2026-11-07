@@ -528,7 +528,7 @@ pub const AggregationRequest = struct {
     date_ranges: ?[]const AggregationDateRange = null,
     /// Fixed interval for histogram aggregations
     interval: ?f32 = null,
-    /// Explicit half-open RFC3339 extent for date_histogram empty buckets. Does not filter documents; use a matching date range filter. Limited to 10000 buckets.
+    /// Explicit half-open RFC3339 extent for date_histogram empty buckets. Does not filter documents; use a matching date range filter. Limited to 10000 buckets per histogram and 100000 generated cells (buckets plus metrics) per request. Only scalar metric sub-aggregations are supported with these bounds.
     date_bounds: ?std.json.Value = null,
     /// Positive elapsed duration for date_histogram (for example 30s, 5m, 1h30m). Mutually exclusive with calendar_interval. Nanosecond precision; UTC epoch alignment by default.
     fixed_interval: ?[]const u8 = null,
@@ -45661,6 +45661,8 @@ pub const QueryHitsTotal = struct {
 
 /// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
 pub const QueryProfile = struct {
+    /// Aggregation execution path, such as materialized_temporal or scan. Present when the executor reports it.
+    aggregation_execution: ?[]const u8 = null,
     /// Actual logical value verification work, summed across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per shard.
     value_verification: ?std.json.Value = null,
     /// Shard-level execution statistics.
@@ -45678,6 +45680,7 @@ pub const QueryProfile = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "aggregation_execution", "aggregation_execution", true },
         .{ "value_verification", "value_verification", true },
         .{ "shards", "shards", true },
         .{ "join", "join", true },
@@ -45697,6 +45700,10 @@ pub const QueryProfile = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.aggregation_execution) |value| {
+            try jw.objectField("aggregation_execution");
+            try jw.write(value);
+        }
         if (self.value_verification) |value| {
             try jw.objectField("value_verification");
             try jw.write(value);

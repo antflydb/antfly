@@ -577,6 +577,7 @@ export type {
 } from "./time-series.js";
 export {
   fixedDurationNanoseconds,
+  seriesTimestampNanoseconds,
   SeriesImportError,
   seriesBatch,
   seriesQuery,

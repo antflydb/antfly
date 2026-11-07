@@ -639,6 +639,7 @@ pub const QueryResponseMeta = struct {
     merge: ?MergeProfile = null,
     dense_search: ?DenseSearchProfile = null,
     aggregation_results: []aggregations_mod.SearchAggregationResult = &.{},
+    aggregation_execution: ?[]const u8 = null,
 
     pub fn deinit(self: *QueryResponseMeta, alloc: std.mem.Allocator) void {
         if (self.evaluation_json) |data| alloc.free(data);
@@ -5569,6 +5570,7 @@ fn parseAggregationRequestsAlloc(
         out[initialized] = try parseSingleAggregationRequestAlloc(alloc, name, aggregation);
         initialized += 1;
     }
+    aggregations_mod.validateTemporalRequests(out) catch return error.InvalidQueryRequest;
     return out;
 }
 
@@ -5688,8 +5690,8 @@ fn parseSingleAggregationRequestAlloc(
         const start = bounds.object.get("start") orelse return error.InvalidQueryRequest;
         const end = bounds.object.get("end") orelse return error.InvalidQueryRequest;
         if (start != .string or end != .string) return error.InvalidQueryRequest;
-        const first = @import("../datetime.zig").parseRfc3339ToNs(start.string) orelse return error.InvalidQueryRequest;
-        const last = @import("../datetime.zig").parseRfc3339ToNs(end.string) orelse return error.InvalidQueryRequest;
+        const first = @import("../datetime.zig").parseRfc3339ToSignedNs(start.string) orelse return error.InvalidQueryRequest;
+        const last = @import("../datetime.zig").parseRfc3339ToSignedNs(end.string) orelse return error.InvalidQueryRequest;
         if (first >= last) return error.InvalidQueryRequest;
     }
 
@@ -5741,7 +5743,7 @@ fn parseSingleAggregationRequestAlloc(
 fn aggregationDateBoundAlloc(alloc: std.mem.Allocator, value: std.json.Value, field: []const u8) ![]u8 {
     if (value != .object) return error.InvalidQueryRequest;
     const bound = value.object.get(field) orelse return error.InvalidQueryRequest;
-    if (bound != .string or @import("../datetime.zig").parseRfc3339ToNs(bound.string) == null) return error.InvalidQueryRequest;
+    if (bound != .string or @import("../datetime.zig").parseRfc3339ToSignedNs(bound.string) == null) return error.InvalidQueryRequest;
     return alloc.dupe(u8, bound.string);
 }
 
@@ -7234,6 +7236,7 @@ fn buildProfileValue(
         try parsed.value.object.put(alloc, "sort", try buildSortProfileValue(alloc, req, sort_profile));
     }
     if (result.document_authority_version != 0) try parsed.value.object.put(alloc, "document_authority_version", .{ .integer = result.document_authority_version });
+    if (meta.aggregation_execution) |execution| try parsed.value.object.put(alloc, "aggregation_execution", .{ .string = execution });
     return parsed.value;
 }
 
@@ -20974,4 +20977,27 @@ test "time series JSON aggregation keeps SQL float64 measurement precision" {
     });
     try std.testing.expectEqual(@as(f64, 23.123456789), result.avg.?);
     try std.testing.expectEqual(@as(f64, 23.123456789), result.sum.?);
+}
+
+test "time series range proof preserves the exact source predicate" {
+    const a = std.testing.allocator;
+    const execution = @import("query_execution_contract.zig");
+    var request = try parseQueryRequest(a, null, "readings",
+        \\{"limit":0,"timeout_ms":30000,"filter_query":{"conjuncts":[{"field":"ts","start":"2026-11-06T12:00:00Z","end":"2026-11-06T12:20:00Z","inclusive_start":true,"inclusive_end":false},{"field":"device_id","equals":"sensor"}]},"aggregations":{"series":{"type":"terms","fields":["device_id"],"size":20,"sub_aggregations":{"points":{"type":"date_histogram","field":"ts","fixed_interval":"5m","date_bounds":{"start":"2026-11-06T12:00:00Z","end":"2026-11-06T12:20:00Z"},"sub_aggregations":{"average":{"type":"avg","field":"v"}}}}}}}
+    );
+    defer request.deinit(a);
+    try std.testing.expect(execution.canConsiderAlgebraicAggregations(request.req));
+    const constraints = (try execution.algebraicConstraintsForRequestAlloc(a, request.req)) orelse return error.MissingTemporalRangeProof;
+    defer execution.freeAlgebraicConstraints(a, constraints);
+    try std.testing.expectEqual(@as(usize, 2), constraints.len);
+    var found = false;
+    for (constraints) |constraint| if (constraint.time_range != null) {
+        found = true;
+    };
+    try std.testing.expect(found);
+    var malformed = request.req;
+    malformed.filter_query_json = "{\"date_range\":{\"field\":\"ts\",\"start\":\"2026-11-06T12:00:00Z\",\"end\":\"2026-11-06T12:20:00Z\"},\"term\":{\"path\":\"tenant\",\"value\":\"restricted\"}}";
+    const rejected = try execution.algebraicConstraintsForRequestAlloc(a, malformed);
+    defer if (rejected) |items| execution.freeAlgebraicConstraints(a, items);
+    try std.testing.expect(rejected == null);
 }

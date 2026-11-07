@@ -1405,7 +1405,7 @@ export class AntflyClient {
     options?: WriteOptions & {
       batchSize?: number;
       syncLevel?: BatchRequest["sync_level"];
-      onBatch?: (outcome: BatchResult, submitted: number) => void;
+      onBatch?: (outcome: BatchResult, submitted: number) => void | Promise<void>;
     }
   ) {
     const batchSize = options?.batchSize ?? 500;
@@ -1416,35 +1416,62 @@ export class AntflyClient {
     let committedPendingBatches = 0;
     let repairRequiredBatches = 0;
     let lastOutcome: BatchResult | undefined;
+    const state: { phase: "source" | "validation" | "submission" | "callback" | "aborted" } = {
+      phase: "source",
+    };
+    let pendingIds: string[] = [];
+    const checkAbort = () => {
+      if (options?.signal?.aborted) {
+        state.phase = "aborted";
+        options.signal.throwIfAborted();
+      }
+    };
     const flush = async () => {
       if (!batch.length) return;
-      options?.signal?.throwIfAborted();
-      let outcome: BatchResult;
-      try {
-        outcome = await this.tables.batchWithOptions(
-          table,
-          { ...seriesBatch(batch, timestamp), sync_level: options?.syncLevel },
-          options
-        );
-      } catch (cause) {
-        throw new SeriesImportError(
-          submitted,
-          batch.map((reading) => reading.id),
-          cause
-        );
-      }
+      checkAbort();
+      state.phase = "validation";
+      const request = { ...seriesBatch(batch, timestamp), sync_level: options?.syncLevel };
+      state.phase = "submission";
+      pendingIds = Object.keys(request.inserts ?? {});
+      const outcome = await this.tables.batchWithOptions(table, request, options);
       submitted += batch.length;
       lastOutcome = outcome;
       if (outcome.status === "committed_pending") committedPendingBatches++;
       if (outcome.status === "committed_repair_required") repairRequiredBatches++;
-      options?.onBatch?.(outcome, submitted);
       batch = [];
+      pendingIds = [];
+      state.phase = "callback";
+      await options?.onBatch?.(outcome, submitted);
+      state.phase = "source";
     };
-    for await (const reading of readings) {
-      batch.push(reading);
-      if (batch.length === batchSize) await flush();
+    try {
+      checkAbort();
+      for await (const reading of readings) {
+        batch.push(reading);
+        checkAbort();
+        if (batch.length === batchSize) await flush();
+      }
+      await flush();
+    } catch (cause) {
+      throw new SeriesImportError(submitted, pendingIds, cause, {
+        phase: state.phase,
+        bufferedIds:
+          state.phase === "submission"
+            ? []
+            : batch.flatMap((reading) => {
+                try {
+                  const id = reading?.id;
+                  return typeof id === "string" ? [id] : [];
+                } catch {
+                  return [];
+                }
+              }),
+        mayHaveCommitted: state.phase === "submission",
+        committedPendingBatches,
+        repairRequiredBatches,
+        lastOutcome,
+      });
     }
-    await flush();
     return { submitted, committedPendingBatches, repairRequiredBatches, lastOutcome };
   }
 
@@ -1481,6 +1508,10 @@ export class AntflyClient {
   async series(request: SeriesQueryOptions, options?: QueryExecutionOptions) {
     const result = await this.query(seriesQuery(request), options);
     if (!result) throw new Error("Time-series query returned no result");
+    if (result.error || (result.status !== undefined && result.status >= 400))
+      throw new AntflyResponseError(
+        `Time-series query failed (${result.status ?? "unknown"}): ${result.error ?? "unsuccessful query result"}`
+      );
     return { series: seriesResults(result, request.fill), result };
   }
 

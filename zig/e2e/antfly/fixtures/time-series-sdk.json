@@ -1,0 +1,183 @@
+{
+  "table": {
+    "num_shards": 1,
+    "schema": {
+      "index_sort": [
+        {
+          "field": "observed_at",
+          "order": "desc"
+        }
+      ],
+      "default_type": "reading",
+      "document_schemas": {
+        "reading": {
+          "schema": {
+            "type": "object",
+            "required": [
+              "observed_at",
+              "device_id",
+              "region"
+            ],
+            "properties": {
+              "observed_at": {
+                "type": "string",
+                "format": "date-time",
+                "x-antfly-field": {
+                  "type": "date",
+                  "sortable": true
+                }
+              },
+              "device_id": {
+                "type": "string",
+                "x-antfly-field": {
+                  "type": "keyword",
+                  "sortable": true
+                }
+              },
+              "region": {
+                "type": "string",
+                "x-antfly-field": {
+                  "type": "keyword",
+                  "sortable": true
+                }
+              },
+              "temperature": {
+                "type": "number",
+                "x-antfly-field": {
+                  "type": "number",
+                  "sortable": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "indexes": {
+      "series_aggregates": {
+        "type": "algebraic",
+        "derive_from_schema": true,
+        "aggregates": [
+          {
+            "name": "reading_count",
+            "op": "count",
+            "group_by": [
+              "device_id",
+              "region"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          },
+          {
+            "name": "m0_sum",
+            "op": "sum",
+            "measure": "temperature",
+            "group_by": [
+              "device_id",
+              "region"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          },
+          {
+            "name": "m0_avg",
+            "op": "avg",
+            "measure": "temperature",
+            "group_by": [
+              "device_id",
+              "region"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          },
+          {
+            "name": "m0_min",
+            "op": "min",
+            "measure": "temperature",
+            "group_by": [
+              "device_id",
+              "region"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          },
+          {
+            "name": "m0_max",
+            "op": "max",
+            "measure": "temperature",
+            "group_by": [
+              "device_id",
+              "region"
+            ],
+            "time": "observed_at",
+            "bucket": "5m"
+          }
+        ]
+      }
+    }
+  },
+  "query": {
+    "table": "fixture",
+    "timeout_ms": 30000,
+    "profile": true,
+    "filter_query": {
+      "conjuncts": [
+        {
+          "field": "observed_at",
+          "start": "2026-11-06T12:00:00Z",
+          "end": "2026-11-06T12:20:00Z",
+          "inclusive_start": true,
+          "inclusive_end": false
+        },
+        {
+          "field": "region",
+          "equals": "west"
+        }
+      ]
+    },
+    "limit": 0,
+    "aggregations": {
+      "series": {
+        "type": "terms",
+        "fields": [
+          "device_id"
+        ],
+        "size": 100,
+        "sub_aggregations": {
+          "points": {
+            "type": "date_histogram",
+            "field": "observed_at",
+            "fixed_interval": "300s",
+            "min_doc_count": 0,
+            "date_bounds": {
+              "start": "2026-11-06T12:00:00Z",
+              "end": "2026-11-06T12:20:00Z"
+            },
+            "sub_aggregations": {
+              "average": {
+                "type": "avg",
+                "field": "temperature"
+              },
+              "total": {
+                "type": "sum",
+                "field": "temperature"
+              },
+              "minimum": {
+                "type": "min",
+                "field": "temperature"
+              },
+              "maximum": {
+                "type": "max",
+                "field": "temperature"
+              },
+              "__antfly_series_count_total": {
+                "type": "avg",
+                "field": "temperature"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

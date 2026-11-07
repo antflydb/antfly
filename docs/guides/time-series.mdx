@@ -130,7 +130,7 @@ matching range filter to restrict measurements. Empty generation is limited to
 aggregations. Grouped requests use a terms limit; increase it deliberately or
 select explicit series rather than assuming all high-cardinality series fit.
 
-Missing measurements remain null. A count of zero is different from a temperature
+The series helpers preserve missing measurements as null. A count of zero is different from a temperature
 of zero. If a visualization requires zero filling, perform it explicitly for that
 measurement. Do not interpolate values implicitly.
 
@@ -208,15 +208,30 @@ result = client.query("readings", query=series_query(
 
 Go exposes `NewSeriesQuery(SeriesQueryOptions{...})`, using `time.Time` bounds and
 `time.Duration` intervals. Rust exposes `time_series::series_query`, returning a
-normal typed query request. All SDKs expose the generated temporal aggregation
+`GlobalStatefulQueryRequest` accepted directly by `client.global_query(&request)`. All SDKs expose the generated temporal aggregation
 and recipe fields directly.
 
 ## Algebraic maintenance and retention
 
 Public aggregate recipes can declare `time` and `bucket` along with dimensions,
 operation, and measurement. Fixed buckets align to the epoch. The engine owns
-physical state and only reuses compatible, complete materializations. A query
-with a custom origin can fall back rather than reuse misaligned state.
+physical state and only reuses compatible, complete materializations. Grouped
+`terms → date_histogram → metrics` queries reuse the preset when their half-open
+source range aligns to the maintained bucket boundaries. Equivalent fixed widths
+such as `5m` and `300s` match. Extra maintained dimensions constrained by exact keyword filters are reduced,
+and those filters are applied, and complete shard states merge before global series
+ranking. A custom origin, unaligned boundary, unsupported predicate, stale index,
+or incompatible layout uses the exact scan path. Unconstrained extra dimensions also
+fall back because documents missing those fields may be absent from the materialization. Profiled responses report
+`aggregation_execution: "materialized_temporal"` when this path succeeds, or a
+`scan_...` reason when a temporal plan declines.
+
+Execution is bounded to one million maintained cells and 64 MiB of distributed
+partial data. The scan fallback retains its normal source-row limit. Choose
+bounded time ranges and dimensions; the accelerator scans maintained state rather
+than guaranteeing a constant-cost range lookup. TTL reuse additionally requires
+proof that every matching observation remains visible through the query deadline;
+otherwise the exact visibility-filtered scan runs.
 
 AVG merges sum and non-null count state, never averages of averages. Late inserts,
 overwrite corrections, and deletes follow the ordinary algebraic maintenance
@@ -234,3 +249,23 @@ Open a table's **Time series** section. Choose the timestamp, measurement, group
 fields, range, and interval; inspect charts or bucket data and copy SQL/JSON.
 Refresh polling is opt-in, cancels obsolete requests, and uses a fixed selected
 range. It is not a live subscription or an automatically advancing window.
+
+
+Bounded empty histograms accept metric children only and share a request-wide
+budget of 100,000 generated cells (bucket plus metrics), in addition to the 10,000
+bucket limit per histogram. Nested bucket generation is rejected before execution.
+Cancellation and deadlines are checked while folding and filling.
+
+The TypeScript series helpers use the maintained AVG non-null count as an
+internal measurement-presence companion for SUM. The `count` operation counts
+observations (SQL `COUNT(*)`), consistent with JSON document-count semantics.
+An absent measurement is returned as the selected fill value, while a measured
+zero stays zero; raw JSON SUM keeps its normal empty-sum identity. Internal
+`__antfly_series_` metric names are reserved. `writeSeries` failures preserve
+acknowledged progress and report the failure phase, buffered IDs, ambiguous
+submitted IDs, and pending or repair-required batch counts. A callback failure
+occurs after acknowledgement and does not make that batch ambiguous.
+
+Charts retain extrema within a bounded pixel budget, show isolated observations
+as dots, and never bridge missing intervals. The bucket table mounts on expansion
+and displays 100 rows per page.

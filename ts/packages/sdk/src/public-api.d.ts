@@ -10048,7 +10048,7 @@ export interface components {
              * @description Fixed interval for histogram aggregations
              */
             interval?: number;
-            /** @description Explicit half-open RFC3339 extent for date_histogram empty buckets. Does not filter documents; use a matching date range filter. Limited to 10000 buckets. */
+            /** @description Explicit half-open RFC3339 extent for date_histogram empty buckets. Does not filter documents; use a matching date range filter. Limited to 10000 buckets per histogram and 100000 generated cells (buckets plus metrics) per request. Only scalar metric sub-aggregations are supported with these bounds. */
             date_bounds?: {
                 /** Format: date-time */
                 start: string;
@@ -14013,6 +14013,8 @@ export interface components {
          *     when the request sets `profile: true`.
          */
         QueryProfile: {
+            /** @description Aggregation execution path, such as materialized_temporal or scan. Present when the executor reports it. */
+            aggregation_execution?: string;
             /** @description Actual logical value verification work, summed across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per shard. */
             value_verification?: {
                 /** Format: int64 */

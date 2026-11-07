@@ -1258,6 +1258,8 @@ pub fn algebraicConstraintsForRequestAlloc(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
 ) !?[]db_mod.aggregations.FixedConstraint {
+    if (try temporalMaterializedConstraintsAlloc(alloc, req)) |constraints| return constraints;
+    if (req.filter_text != null) return null;
     var out = std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint).empty;
     errdefer freeAlgebraicConstraints(alloc, out.items);
 
@@ -7548,3 +7550,221 @@ test "api query contract worker computed spans preserve numbers and reject malfo
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(a, prefix ++ "{\"x\":1,\"x\":2}" ++ suffix));
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(a, prefix ++ "{\"x\":NaN}" ++ suffix));
 }
+
+/// A range can be eliminated from the document predicate only when every output
+/// uses that exact range and both boundaries are complete materialized buckets.
+fn temporalMaterializedConstraintsAlloc(a: std.mem.Allocator, req: db_mod.types.SearchRequest) !?[]db_mod.aggregations.FixedConstraint {
+    if (req.query != .match_all or (if (req.full_text) |text| text != .match_all else false) or req.aggregations_json.len == 0) return null;
+    const requests = query_contract.parseAggregationRequestsJson(a, req.aggregations_json) catch return null;
+    defer query_contract.freeAggregationRequests(a, requests);
+    if (requests.len == 0) return null;
+    var field: []const u8 = "";
+    var range: ?db_mod.algebraic.ir.TimeRange = null;
+    for (requests) |request| {
+        const hist = if (std.mem.eql(u8, request.type, "date_histogram")) request else blk: {
+            if (!std.mem.eql(u8, request.type, "terms") or request.aggregations.len != 1) return null;
+            break :blk request.aggregations[0];
+        };
+        if (!std.mem.eql(u8, hist.type, "date_histogram") or hist.bucket_origin.len != 0) return null;
+        const dt = @import("../datetime.zig");
+        const first = dt.parseRfc3339ToSignedNs(hist.date_bounds_start) orelse return null;
+        const last = dt.parseRfc3339ToSignedNs(hist.date_bounds_end) orelse return null;
+        const agg = @import("../search/aggregation.zig");
+        const interval = agg.parseDateInterval(hist.calendar_interval, hist.fixed_interval, "") catch return null;
+        if ((agg.truncateSignedToInterval(first, interval) catch return null) != first or (agg.truncateSignedToInterval(last, interval) catch return null) != last) return null;
+        if (range) |prior| {
+            if (!std.mem.eql(u8, field, hist.field) or prior.start_ns != first or prior.end_ns != last) return null;
+        } else {
+            field = hist.field;
+            range = .{ .start_ns = first, .end_ns = last };
+        }
+    }
+    var constraints = std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint).empty;
+    defer {
+        for (constraints.items) |c| {
+            a.free(c.field);
+            a.free(c.value);
+        }
+        constraints.deinit(a);
+    }
+    var found = false;
+    if (req.filter_text) |text| {
+        if (!try collectTemporalTextPredicate(a, text, field, range.?, &found, &constraints)) return null;
+    }
+    if (req.filter_query_json.len > 0) {
+        var json = std.json.parseFromSlice(std.json.Value, a, req.filter_query_json, .{}) catch return null;
+        defer json.deinit();
+        if (!try collectTemporalMaterializedPredicate(a, json.value, field, range.?, &found, &constraints)) return null;
+    }
+    if (!found) return null;
+    try constraints.append(a, .{ .field = try a.dupe(u8, field), .value = try a.dupe(u8, ""), .time_range = range });
+    return try constraints.toOwnedSlice(a);
+}
+
+fn collectTemporalMaterializedPredicate(a: std.mem.Allocator, value: std.json.Value, field: []const u8, range: db_mod.algebraic.ir.TimeRange, found: *bool, out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint)) anyerror!bool {
+    if (value != .object) return false;
+    if (value.object.get("conjuncts")) |children| {
+        if (value.object.count() != 1 or children != .array) return false;
+        for (children.array.items) |child| if (!try collectTemporalMaterializedPredicate(a, child, field, range, found, out)) return false;
+        return true;
+    }
+    if (value.object.get("bool")) |clauses| {
+        if (value.object.count() != 1 or clauses != .object) return false;
+        var it = clauses.object.iterator();
+        while (it.next()) |entry| {
+            if ((!std.mem.eql(u8, entry.key_ptr.*, "must") and !std.mem.eql(u8, entry.key_ptr.*, "filter")) or entry.value_ptr.* != .array) return false;
+            for (entry.value_ptr.array.items) |child| if (!try collectTemporalMaterializedPredicate(a, child, field, range, found, out)) return false;
+        }
+        return true;
+    }
+    if (value.object.get("date_range")) |predicate| {
+        if (value.object.count() != 1 or predicate != .object) return false;
+        const path = predicate.object.get("field") orelse predicate.object.get("path") orelse return false;
+        if (path != .string) return false;
+        const simple = if (std.mem.startsWith(u8, path.string, "/")) path.string[1..] else path.string;
+        if (!std.mem.eql(u8, simple, field)) return false;
+        const first = predicate.object.get("start_ns") orelse predicate.object.get("start") orelse return false;
+        const last = predicate.object.get("end_ns") orelse predicate.object.get("end") orelse return false;
+        if (predicate.object.get("inclusive_start")) |flag| if (flag != .bool or !flag.bool) return false;
+        if (predicate.object.get("inclusive_end")) |flag| if (flag != .bool or flag.bool) return false;
+        const dt = @import("../datetime.zig");
+        const first_ns = if (first == .string) dt.parseRfc3339ToSignedNs(first.string) else dt.rangeNanoseconds(first);
+        const last_ns = if (last == .string) dt.parseRfc3339ToSignedNs(last.string) else dt.rangeNanoseconds(last);
+        if ((first_ns orelse return false) != range.start_ns or (last_ns orelse return false) != range.end_ns) return false;
+        found.* = true;
+        return true;
+    }
+    if (value.object.get("range")) |predicate| {
+        if (value.object.count() != 1 or predicate != .object or predicate.object.count() != 3) return false;
+        const path = predicate.object.get("path") orelse predicate.object.get("field") orelse return false;
+        const first = predicate.object.get("gte") orelse return false;
+        const last = predicate.object.get("lt") orelse return false;
+        if (path != .string or first != .string or last != .string) return false;
+        const simple = if (std.mem.startsWith(u8, path.string, "/")) path.string[1..] else path.string;
+        if (!std.mem.eql(u8, simple, field)) return false;
+        const dt = @import("../datetime.zig");
+        if ((dt.parseRfc3339ToSignedNs(first.string) orelse return false) != range.start_ns or (dt.parseRfc3339ToSignedNs(last.string) orelse return false) != range.end_ns) return false;
+        found.* = true;
+        return true;
+    }
+    return try collectAlgebraicFilterConstraints(a, value, out);
+}
+
+/// A TTL table can use materialized counts only if the actual source predicate
+/// excludes every document that can expire before the execution deadline.
+pub fn temporalRangeVisibleThroughDeadline(req: db_mod.types.SearchRequest, constraints: []const db_mod.aggregations.FixedConstraint, ttl_field: []const u8, duration_ns: u64, wall_ns: u64, monotonic_ns: u64) bool {
+    if (duration_ns == 0) return true;
+    const deadline = req.execution_deadline_ns orelse return false;
+    const horizon = @as(i128, wall_ns) + (deadline -| monotonic_ns) - @as(i128, duration_ns);
+    for (constraints) |constraint| if (constraint.time_range) |range| {
+        if (std.mem.eql(u8, constraint.field, ttl_field) and range.start_ns >= horizon) return true;
+    };
+    return false;
+}
+
+pub fn temporalTextFilterCanConsider(query: db_mod.types.TextQuery) bool {
+    return switch (query) {
+        .date_range => true,
+        .value => |value| value.kind == .equals and value.case_sensitive,
+        .bool_query => |clauses| blk: {
+            if (clauses.should.len != 0 or clauses.must_not.len != 0 or clauses.min_should != 0 or clauses.must.len == 0) break :blk false;
+            for (clauses.must) |child| if (!temporalTextFilterCanConsider(child)) break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn temporalTextRangeMatches(query: db_mod.types.TextQuery, field: []const u8, range: db_mod.algebraic.ir.TimeRange) bool {
+    return switch (query) {
+        .date_range => |predicate| std.mem.eql(u8, predicate.field, field) and predicate.start_ns != null and predicate.end_ns != null and predicate.start_ns.? == range.start_ns and predicate.end_ns.? == range.end_ns and predicate.inclusive_start and !predicate.inclusive_end,
+        .bool_query => |clauses| blk: {
+            if (!temporalTextFilterCanConsider(query)) break :blk false;
+            for (clauses.must) |child| if (!temporalTextRangeMatches(child, field, range)) break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn collectTemporalTextPredicate(a: std.mem.Allocator, query: db_mod.types.TextQuery, field: []const u8, range: db_mod.algebraic.ir.TimeRange, found: *bool, out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint)) anyerror!bool {
+    switch (query) {
+        .date_range => {
+            if (!temporalTextRangeMatches(query, field, range)) return false;
+            found.* = true;
+            return true;
+        },
+        .value => |value| {
+            if (value.kind != .equals or !value.case_sensitive) return false;
+            try appendAlgebraicConstraint(out, a, value.field, value.text);
+            return true;
+        },
+        .bool_query => |clauses| {
+            if (!temporalTextFilterCanConsider(query)) return false;
+            for (clauses.must) |child| if (!try collectTemporalTextPredicate(a, child, field, range, found, out)) return false;
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Private coarse protocol: planners and physical index handles stay at the
+/// storage owner. Shards export complete algebraic states, never local top-N.
+pub const TemporalShard = struct {
+    signature: []const u8,
+    partials: [][]const db_mod.algebraic.distributed.Partial,
+};
+pub const TemporalWire = struct {
+    temporal_query: []const u8,
+    table_name: []const u8,
+    shards_json: ?[]const u8 = null,
+};
+pub const temporal_max_cells: usize = 1_000_000;
+pub const temporal_max_bytes: usize = 64 * 1024 * 1024;
+
+test "time series TTL visibility must hold through the entire deadline" {
+    const constraints = [_]db_mod.aggregations.FixedConstraint{.{ .field = "ts", .value = "", .time_range = .{ .start_ns = 950, .end_ns = 1000 } }};
+    const req: db_mod.types.SearchRequest = .{ .execution_deadline_ns = 150 };
+    try std.testing.expect(temporalRangeVisibleThroughDeadline(req, &constraints, "ts", 100, 1000, 100));
+    try std.testing.expect(!temporalRangeVisibleThroughDeadline(.{ .execution_deadline_ns = 151 }, &constraints, "ts", 100, 1000, 100));
+    try std.testing.expect(!temporalRangeVisibleThroughDeadline(req, &constraints, "other", 100, 1000, 100));
+    try std.testing.expect(!temporalRangeVisibleThroughDeadline(.{}, &constraints, "ts", 100, 1000, 100));
+    try std.testing.expect(temporalRangeVisibleThroughDeadline(.{}, &.{}, "", 0, 1000, 100));
+}
+
+pub fn canConsiderAlgebraicAggregations(req: db_mod.types.SearchRequest) bool {
+    return (if (req.full_text) |query| query == .match_all else true) and
+        (if (req.filter_text) |query| temporalTextFilterCanConsider(query) else true) and
+        req.exclusion_text == null and
+        req.exclusion_query_json.len == 0 and
+        req.full_text_queries.len == 0 and
+        req.dense == null and
+        req.sparse == null and
+        req.dense_queries.len == 0 and
+        req.sparse_queries.len == 0 and
+        req.graph_queries.len == 0 and
+        req.merge_config == null and
+        req.reranker == null and
+        req.pruner == null and
+        req.filter_prefix.len == 0 and
+        req.filter_ids.len == 0 and
+        req.exclude_ids.len == 0 and
+        req.filter_doc_ids.len == 0 and
+        !req.filter_doc_ids_positive and
+        req.exclude_doc_ids.len == 0 and
+        !searchRequestHasResolvedDocFilter(req) and
+        req.distance_over == null and
+        req.distance_under == null;
+}
+
+pub const TemporalDecline = enum {
+    scan_unsupported_temporal_shape,
+    scan_unproven_temporal_predicate,
+    scan_missing_temporal_index,
+    scan_temporal_index_not_ready,
+    scan_stale_temporal_index,
+    scan_temporal_ttl_visibility,
+    scan_temporal_materialization_declined,
+    scan_temporal_schema_changed,
+    scan_temporal_owner_unavailable,
+};

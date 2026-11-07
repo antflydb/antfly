@@ -27,6 +27,8 @@ class QueryProfile:
     when the request sets `profile: true`.
 
         Attributes:
+            aggregation_execution (str | Unset): Aggregation execution path, such as materialized_temporal or scan. Present
+                when the executor reports it.
             value_verification (QueryProfileValueVerification | Unset): Actual logical value verification work, summed
                 across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain
                 per shard.
@@ -44,6 +46,7 @@ class QueryProfile:
                 internal debug logs or explicit debug surfaces.
     """
 
+    aggregation_execution: str | Unset = UNSET
     value_verification: QueryProfileValueVerification | Unset = UNSET
     shards: ShardsProfile | Unset = UNSET
     join: JoinProfile | Unset = UNSET
@@ -54,6 +57,8 @@ class QueryProfile:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        aggregation_execution = self.aggregation_execution
+
         value_verification: dict[str, Any] | Unset = UNSET
         if not isinstance(self.value_verification, Unset):
             value_verification = self.value_verification.to_dict()
@@ -88,6 +93,8 @@ class QueryProfile:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if aggregation_execution is not UNSET:
+            field_dict["aggregation_execution"] = aggregation_execution
         if value_verification is not UNSET:
             field_dict["value_verification"] = value_verification
         if shards is not UNSET:
@@ -116,6 +123,8 @@ class QueryProfile:
         from ..models.sort_profile import SortProfile
 
         d = dict(src_dict)
+        aggregation_execution = d.pop("aggregation_execution", UNSET)
+
         _value_verification = d.pop("value_verification", UNSET)
         value_verification: QueryProfileValueVerification | Unset
         if isinstance(_value_verification, Unset):
@@ -168,6 +177,7 @@ class QueryProfile:
             sort = SortProfile.from_dict(_sort)
 
         query_profile = cls(
+            aggregation_execution=aggregation_execution,
             value_verification=value_verification,
             shards=shards,
             join=join,

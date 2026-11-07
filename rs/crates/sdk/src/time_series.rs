@@ -27,7 +27,7 @@ pub fn series_query(
     measurement: &str,
     every: &str,
     group_by: &[&str],
-) -> Result<crate::types::QueryRequest, serde_json::Error> {
+) -> Result<crate::types::GlobalStatefulQueryRequest, serde_json::Error> {
     let points = json!({"type":"date_histogram","field":timestamp,
         "fixed_interval":every,"date_bounds":{"start":start,"end":end},
         "min_doc_count":0,"sub_aggregations":{
@@ -60,7 +60,9 @@ mod tests {
             &["device_id"],
         )
         .unwrap();
-        let value = serde_json::to_value(query).unwrap();
+        let client = crate::Client::new("http://localhost:8080");
+        let _request = client.global_query(&query);
+        let value = serde_json::to_value(&query).unwrap();
         assert_eq!(
             value["aggregations"]["series"]["sub_aggregations"]["points"]["fixed_interval"],
             "5m"
