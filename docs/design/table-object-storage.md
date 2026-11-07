@@ -98,7 +98,9 @@ A compact projection is written in the same native transaction as lifecycle
 state, so fresh queries do not transfer retained publication history. Native
 snapshots include both projections; older checkpoints reconstruct the compact
 view on the metadata owner. Absence is materialized too, keeping unowned sources
-on a small point read. Every accepted write advances or invalidates that
+on a small point read. During rolling upgrades, an older peer rejecting this
+private tag selects the existing authoritative lifecycle read. Permission and
+identity failures never select that fallback. Every accepted write advances or invalidates that
 record before acknowledgment.
 Catalog changes invalidate it before returning success. If remote commitment
 succeeds but native acknowledgment fails, the API reports `state: unknown`
