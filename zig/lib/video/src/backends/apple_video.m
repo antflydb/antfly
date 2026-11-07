@@ -61,13 +61,13 @@ int32_t av_decoder_create_coded(uint32_t codec, const uint8_t *config, size_t le
                                av_output output, void *context, void **result) {
     *result = NULL;
     if (!output || !config || !length || !width || !height || width > 16384 || height > 16384 ||
-        (codec != 0x76703039 && codec != 0x61763031)) return paramErr;
+        (codec != 0x76703039 && codec != 0x61763031 && codec != 0x68766331)) return paramErr;
     AVDecoder *d = calloc(1, sizeof(*d));
     if (!d) return memFullErr;
     d->output = output; d->context = context;
     @autoreleasepool {
         if (__builtin_available(macOS 11.0, *)) VTRegisterSupplementalVideoDecoderIfAvailable(codec);
-        NSString *atom = codec == 0x76703039 ? @"vpcC" : @"av1C";
+        NSString *atom = codec == 0x76703039 ? @"vpcC" : codec == 0x68766331 ? @"hvcC" : @"av1C";
         NSData *data = [NSData dataWithBytes:config length:length];
         NSDictionary *extensions = @{
             (__bridge NSString *)kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: @{atom: data}

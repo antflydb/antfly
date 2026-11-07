@@ -20,7 +20,7 @@
 const std = @import("std");
 const publication = @import("artifact_publication.zig");
 pub const key = "\x00\x00__artifact_publication__:validation";
-pub const max_cursor_bytes = 1024 * 1024;
+pub const max_cursor_bytes = publication.max_cursor_bytes;
 pub const State = struct {
     namespace: publication.Namespace,
     authority_epoch: u64,
@@ -179,7 +179,7 @@ pub fn prepareRaft(alloc: std.mem.Allocator, store_handle: anytype) !?Prepared {
         // Reserve command space before doing work; leave this reference for
         // the next page rather than skipping it when a repair key is large.
         if (source.document_key.len > max_cursor_bytes) return error.ArtifactCatalogCorrupt;
-        if (visited != 0 and source.document_key.len > 2 * 1024 * 1024 - repair_bytes) break;
+        if (visited != 0 and source.document_key.len > 2 * 1024 * 1024 -| repair_bytes) break;
         var accepted = provenance.readConvergedForSource(alloc, &read, proof.proof.inputCommand(), source) catch |err| switch (err) {
             error.EnrichmentSourceChanged => blk: {
                 try repairs.append(owned, try owned.dupe(u8, source.document_key));
@@ -230,7 +230,7 @@ pub fn stageRaft(alloc: std.mem.Allocator, txn: anytype, command: publication.Co
         if (cursor.len != 0 and (cursor.len != prefix.len + 32 or !std.mem.startsWith(u8, cursor, &prefix))) return error.InvalidBatchRequest;
     }
     const obligations = @import("artifact_producer_obligations.zig");
-    const pending = (try obligations.load(txn)) orelse return error.ArtifactCatalogCorrupt;
+    const pending = (try obligations.loadMetadata(txn)) orelse return error.ArtifactCatalogCorrupt;
     try pending.requireAuthority(authority);
     if (pending.sealed_attempt != null) return error.ArtifactCatalogDrift;
     // Serialize the borrowed cursor before mark() replaces any store values.

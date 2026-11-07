@@ -19,11 +19,11 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-// The callback borrows an NV12 surface on the caller's CUDA context/stream.
+// The callback borrows an NV12 or P016 surface on the caller's CUDA context/stream.
 // It must finish reading before returning. No pixels ever cross the host ABI.
 typedef int (*frame_callback)(void *, uint64_t, unsigned, unsigned, unsigned,
-                             int64_t, unsigned, unsigned);
-typedef int (*reserve_decoder)(void *, unsigned, unsigned, unsigned);
+                             int64_t, unsigned, unsigned, unsigned, unsigned);
+typedef int (*reserve_decoder)(void *, unsigned, unsigned, unsigned, unsigned);
 typedef void (*release_decoder)(void *);
 typedef struct {
     void *library, *user;
@@ -35,11 +35,13 @@ typedef struct {
     CUvideodecoder decoder;
     CUstream stream;
     frame_callback frame;
-    unsigned width, height, matrix, full_range, coded_width, coded_height;
+    unsigned width, height, matrix, full_range, coded_width, coded_height, bit_depth, transfer;
     int failed, sequence_seen;
     unsigned surfaces, expected_width, expected_height;
     cudaVideoCodec codec, expected_codec;
-    int display_left, display_top, matrix_override, range_override;
+    int display_left, display_top, matrix_override, range_override, transfer_override, primaries_override;
+    unsigned sar_h, sar_v;
+    int aspect_declared;
     tcuvidCreateVideoParser *create_parser;
     tcuvidDestroyVideoParser *destroy_parser;
     tcuvidParseVideoData *parse;
@@ -70,41 +72,52 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
     unsigned full_range = f->video_signal_description.video_full_range_flag;
     unsigned primaries = f->video_signal_description.color_primaries;
     unsigned transfer = f->video_signal_description.transfer_characteristics;
+    unsigned bit_depth = f->bit_depth_luma_minus8 + 8u;
     if (d->matrix_override >= 0 && matrix != 2 && matrix != (unsigned)d->matrix_override) { d->failed = 2; return 0; }
     if (d->range_override >= 0 && matrix != 2 && full_range != (unsigned)d->range_override) { d->failed = 2; return 0; }
+    if (d->transfer_override >= 0 && transfer != 2 && transfer != (unsigned)d->transfer_override) { d->failed = 2; return 0; }
+    if (d->primaries_override >= 0 && primaries != 2 && primaries != (unsigned)d->primaries_override) { d->failed = 2; return 0; }
     if (d->matrix_override >= 0) matrix = d->matrix_override;
     if (d->range_override >= 0) full_range = d->range_override;
-    if (f->codec != d->expected_codec || !f->progressive_sequence ||
-        f->chroma_format != cudaVideoChromaFormat_420 || w != d->expected_width || h != d->expected_height || f->bit_depth_luma_minus8 ||
-        f->bit_depth_chroma_minus8 || !w || !h || (w&1) || (h&1) ||
+    if (d->transfer_override >= 0) transfer = d->transfer_override;
+    if (d->primaries_override >= 0) primaries = d->primaries_override;
+    // HDR tone mapping needs an explicit, consistent gamut, as the portable policy does.
+    int hdr = transfer == 16 || transfer == 18;
+    if (w == 0 || h == 0 || w % 2 || h % 2 || w > 4096 || h > 4096 || w != d->expected_width || h != d->expected_height ||
+        f->codec != d->expected_codec || !f->progressive_sequence || f->chroma_format != cudaVideoChromaFormat_420 ||
+        (bit_depth != 8 && bit_depth != 10) || f->bit_depth_chroma_minus8 != f->bit_depth_luma_minus8 ||
         f->coded_width > 4096 || f->coded_height > 4096 ||
         f->display_area.left < 0 || f->display_area.top < 0 ||
         f->display_area.right > (int)f->coded_width || f->display_area.bottom > (int)f->coded_height ||
-        (f->display_aspect_ratio.x && f->display_aspect_ratio.y &&
-         (uint64_t)f->display_aspect_ratio.x * h != (uint64_t)f->display_aspect_ratio.y * w) ||
-        (matrix != 1 && matrix != 2 && matrix != 5 && matrix != 6) ||
-        (primaries != 1 && primaries != 2 && primaries != 5 && primaries != 6) ||
-        (transfer != 1 && transfer != 2 && transfer != 6 && transfer != 13) ||
+        // A declared container aspect wins. Without one, this came from the stream's
+        // own record; a stream only signalled in-band isn't known here, so must agree.
+        (!d->aspect_declared && f->display_aspect_ratio.x && f->display_aspect_ratio.y &&
+         (uint64_t)f->display_aspect_ratio.x * h * (d->sar_v ? d->sar_v : 1) != (uint64_t)f->display_aspect_ratio.y * w * (d->sar_h ? d->sar_h : 1)) ||
+        (hdr ? !((matrix == 9 && primaries == 9) || (matrix == 1 && primaries == 1))
+             : ((matrix != 1 && matrix != 2 && matrix != 5 && matrix != 6) ||
+                (primaries != 1 && primaries != 2 && primaries != 5 && primaries != 6) ||
+                (transfer != 1 && transfer != 2 && transfer != 6 && transfer != 13))) ||
         !f->min_num_decode_surfaces || f->min_num_decode_surfaces > 32) { d->failed = 2; return 0; }
     // Never silently reinterpret a stream whose geometry or color changes.
     int compatible = d->codec == f->codec && d->width == w && d->height == h && d->coded_width == f->coded_width &&
-        d->coded_height == f->coded_height && d->surfaces >= f->min_num_decode_surfaces &&
+        d->coded_height == f->coded_height && d->surfaces >= f->min_num_decode_surfaces && d->bit_depth == bit_depth &&
         d->display_left == f->display_area.left && d->display_top == f->display_area.top;
     if (d->sequence_seen) {
-        if (!compatible || d->matrix != matrix || d->full_range != full_range) {
+        if (!compatible || d->matrix != matrix || d->full_range != full_range || d->transfer != transfer) {
             d->failed = 2; return 0;
         }
         return d->surfaces;
     }
     d->sequence_seen = 1;
     if (d->decoder && compatible) {
-        d->matrix = matrix; d->full_range = full_range;
+        d->matrix = matrix; d->full_range = full_range; d->transfer = transfer;
         return d->surfaces;
     }
     if (d->decoder) { d->destroy_decoder(d->decoder); d->decoder = NULL; release_budget(d); }
     CUVIDDECODECAPS caps = {0};
-    caps.eCodecType = f->codec; caps.eChromaFormat = f->chroma_format;
-    if (d->caps(&caps) || !caps.bIsSupported || !(caps.nOutputFormatMask & 1) ||
+    caps.eCodecType = f->codec; caps.eChromaFormat = f->chroma_format; caps.nBitDepthMinus8 = f->bit_depth_luma_minus8;
+    cudaVideoSurfaceFormat output = bit_depth == 10 ? cudaVideoSurfaceFormat_P016 : cudaVideoSurfaceFormat_NV12;
+    if (d->caps(&caps) || !caps.bIsSupported || !(caps.nOutputFormatMask & (1u << output)) ||
         f->coded_width > caps.nMaxWidth || f->coded_height > caps.nMaxHeight ||
         f->coded_width < caps.nMinWidth || f->coded_height < caps.nMinHeight ||
         ((f->coded_width+15)/16)*((f->coded_height+15)/16) > caps.nMaxMBCount) {
@@ -115,19 +128,20 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
     c.ulWidth = f->coded_width; c.ulHeight = f->coded_height;
     c.ulNumDecodeSurfaces = f->min_num_decode_surfaces;
     c.ulCreationFlags = cudaVideoCreate_PreferCUVID;
-    c.OutputFormat = cudaVideoSurfaceFormat_NV12;
+    c.bitDepthMinus8 = f->bit_depth_luma_minus8;
+    c.OutputFormat = output;
     c.DeinterlaceMode = cudaVideoDeinterlaceMode_Weave;
     c.ulTargetWidth = w; c.ulTargetHeight = h; c.ulNumOutputSurfaces = 1;
     c.display_area.left = f->display_area.left; c.display_area.top = f->display_area.top;
     c.display_area.right = f->display_area.right; c.display_area.bottom = f->display_area.bottom;
     if (!d->reserve_budget || !d->release_budget ||
-        !d->reserve_budget(d->budget_user, f->coded_width, f->coded_height, c.ulNumDecodeSurfaces)) {
+        !d->reserve_budget(d->budget_user, f->coded_width, f->coded_height, c.ulNumDecodeSurfaces, bit_depth == 10 ? 2 : 1)) {
         d->failed = 6; return 0;
     }
     d->budget_live = 1;
     if (d->create_decoder(&d->decoder, &c)) { release_budget(d); d->failed = 3; return 0; }
     d->width = w; d->height = h; d->coded_width = f->coded_width; d->coded_height = f->coded_height;
-    d->matrix = matrix; d->full_range = full_range;
+    d->matrix = matrix; d->full_range = full_range; d->bit_depth = bit_depth; d->transfer = transfer;
     d->display_left = f->display_area.left; d->display_top = f->display_area.top;
     d->surfaces = c.ulNumDecodeSurfaces;
     d->codec = f->codec;
@@ -143,7 +157,7 @@ static int display(void *opaque, CUVIDPARSERDISPINFO *picture) {
     if (!picture) return 1;
     if (!picture->progressive_frame) { d->failed = 2; return 0; }
     // Ask whether this presentation timestamp is wanted before mapping a surface.
-    int wanted = d->frame(d->user, 0, 0, d->width, d->height, picture->timestamp, d->matrix, d->full_range);
+    int wanted = d->frame(d->user, 0, 0, d->width, d->height, picture->timestamp, d->matrix, d->full_range, d->bit_depth, d->transfer);
     if (wanted < 0) { d->failed = 4; return 0; }
     if (!wanted) return 1;
     CUVIDPROCPARAMS p = {0};
@@ -156,7 +170,7 @@ static int display(void *opaque, CUVIDPARSERDISPINFO *picture) {
         status.decodeStatus == cuvidDecodeStatus_Error || status.decodeStatus == cuvidDecodeStatus_Error_Concealed) {
         d->unmap(d->decoder, device); d->failed = 3; return 0;
     }
-    int ok = d->frame(d->user, device, pitch, d->width, d->height, picture->timestamp, d->matrix, d->full_range);
+    int ok = d->frame(d->user, device, pitch, d->width, d->height, picture->timestamp, d->matrix, d->full_range, d->bit_depth, d->transfer);
     int unmapped = d->unmap(d->decoder, device);
     if (ok < 0 || unmapped) { d->failed = 4; return 0; }
     return 1;
@@ -189,12 +203,13 @@ int antfly_nvdec_open(Decoder **out, void *stream, void *user, frame_callback ca
 }
 // The previous request must have drained EOS before reuse. A new parser owns
 // the new stream's reference-picture state; compatible decoder surfaces persist.
-int antfly_nvdec_begin(Decoder *d, void *stream, void *user, frame_callback callback, unsigned width, unsigned height, int codec, int matrix, int range) {
+int antfly_nvdec_begin(Decoder *d, void *stream, void *user, frame_callback callback, unsigned width, unsigned height, int codec, int matrix, int range, int transfer, int primaries, unsigned sar_h, unsigned sar_v, int aspect_declared) {
     if (d->parser) return 3;
     if (codec != cudaVideoCodec_H264 && codec != cudaVideoCodec_HEVC && codec != cudaVideoCodec_AV1) return 2;
     d->stream = stream; d->user = user; d->frame = callback;
     d->failed = 0; d->sequence_seen = 0;
     d->expected_width = width; d->expected_height = height; d->matrix_override = matrix; d->range_override = range;
+    d->transfer_override = transfer; d->primaries_override = primaries; d->sar_h = sar_h; d->sar_v = sar_v; d->aspect_declared = aspect_declared;
     d->expected_codec = codec;
     CUVIDPARSERPARAMS p = {0};
     p.CodecType = codec; p.ulMaxNumDecodeSurfaces = 1;

@@ -75,6 +75,9 @@ pub const numElements = data.numElements;
 
 pub const extractFloat32 = data.extractFloat32;
 
+pub const ExternalDataReader = data.ExternalDataReader;
+pub const extractFloat32WithReader = data.extractFloat32WithReader;
+pub const extractNativeBytesWithReader = data.extractNativeBytesWithReader;
 pub const extractFloat32WithExternal = data.extractFloat32WithExternal;
 
 pub const extractNativeBytesWithExternal = data.extractNativeBytesWithExternal;

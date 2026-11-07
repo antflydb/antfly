@@ -2904,6 +2904,7 @@ fn validateEncodedReadCapabilities(
 test "encoded reader ABI enforces resolved model capabilities" {
     var bytes = @as([24]u8, @splat(0));
     @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(bytes[12..16], "IHDR");
     std.mem.writeInt(u32, bytes[16..20], 2, .big);
     std.mem.writeInt(u32, bytes[20..24], 3, .big);
     const image = readers.EncodedImage{ .bytes = &bytes, .mime_type = "image/png" };
@@ -3114,9 +3115,10 @@ fn localModelCapabilitiesInScope(
         .rewrite => "rewriters",
         .transcribe => "transcribers",
     };
-    const model_path = if (task == .read and scope_override == null) try node.resolveReadModelPath(io, if (model.len > 0) model else null) else try node.resolveModelPath(io, if (model.len > 0) model else null, scope);
+    const selected = if (task == .read and scope_override == null) try node.resolveReadModelSelection(io, if (model.len > 0) model else null) else try node.resolveModelSelection(io, if (model.len > 0) model else null, scope);
+    const model_path = selected.path;
     defer node.allocator.free(model_path);
-    var manifest = try inference.models.manifest.loadFromDir(node.allocator, model_path);
+    var manifest = try node.manifestForSelection(node.allocator, selected);
     defer manifest.deinit();
 
     var modalities = inference_work.Modalities{};
@@ -3853,7 +3855,7 @@ pub fn decodeLocalGenerateDataUri(
 }
 
 test "linked generator validates concrete MIME and decoded pixels" {
-    const uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    const uri = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD";
     const messages = [_]inference_types.ChatMessage{.{
         .role = .user,
         .content = .{ .parts = &.{.{ .image_url = .{ .url = uri } }} },

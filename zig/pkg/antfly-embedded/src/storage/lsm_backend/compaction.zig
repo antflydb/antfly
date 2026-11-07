@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const byte_copy = @import("../../common/byte_copy.zig");
 const work_budget = @import("work_budget.zig");
 const lsm_table_file = @import("../lsm/table_file.zig");
 const state_mod = @import("state.zig");
@@ -1308,7 +1309,7 @@ pub const DomainIndex = struct {
                 const rhs = ctx.runs[b];
                 const ns = state_mod.compareNamespace(.{ .name = lhs.smallest_namespace_name }, .{ .name = rhs.smallest_namespace_name });
                 if (ns != .eq) return ns == .lt;
-                const domain = std.mem.order(u8, ctx.partition(lhs.smallest_key), ctx.partition(rhs.smallest_key));
+                const domain = byte_copy.orderBytes(ctx.partition(lhs.smallest_key), ctx.partition(rhs.smallest_key));
                 return if (domain == .eq) a < b else domain == .lt;
             }
         };
@@ -6511,7 +6512,7 @@ fn rangesOverlapRun(lhs: Run, rhs: Run) bool {
 fn compareRunBound(lhs_namespace_name: ?[]const u8, lhs_key: []const u8, rhs_namespace_name: ?[]const u8, rhs_key: []const u8) std.math.Order {
     const namespace_order = state_mod.compareNamespace(.{ .name = lhs_namespace_name }, .{ .name = rhs_namespace_name });
     if (namespace_order != .eq) return namespace_order;
-    return std.mem.order(u8, lhs_key, rhs_key);
+    return byte_copy.orderBytes(lhs_key, rhs_key);
 }
 
 fn makeStateRunsFromSelectedRuns(comptime BackendType: type, backend: *BackendType, runs: []const *Run, level: u32, drop_tombstones: bool) !std.ArrayListUnmanaged(Run) {
@@ -7537,7 +7538,7 @@ fn ensureRunStateForBackend(comptime BackendType: type, backend: *BackendType, r
 fn compareTableEntry(lhs: lsm_table_file.Entry, rhs: lsm_table_file.Entry) std.math.Order {
     const namespace_order = state_mod.compareNamespace(.{ .name = lhs.namespace_name }, .{ .name = rhs.namespace_name });
     if (namespace_order != .eq) return namespace_order;
-    return std.mem.order(u8, lhs.key, rhs.key);
+    return byte_copy.orderBytes(lhs.key, rhs.key);
 }
 
 pub fn makeRun(comptime BackendType: type, backend: *BackendType, state: State) !Run {

@@ -36,12 +36,13 @@ def management_plan(project, image=None):
     image = image or RUNTIME["image"]
     if not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", project):
         raise ValueError("Invalid showcase project")
+    version = re.escape(RUNTIME["version"].removeprefix("v"))
     match = re.fullmatch(
-        r"[a-zA-Z0-9./_-]+(?::v?0\.3\.0-rc\.6)?@(sha256:[a-f0-9]{64})", image
+        rf"[a-zA-Z0-9./_-]+(?::v?{version})?@(sha256:[a-f0-9]{{64}})", image
     )
     if not match or match[1] != RUNTIME["image"].rsplit("@", 1)[1]:
         raise ValueError(
-            "Supply the published, verified RC.9 multi-platform image digest recorded in runtime.json"
+            "Supply the published multi-platform image digest recorded in runtime.json"
         )
 
     def binding(name, bucket, prefix, mode):
@@ -123,6 +124,10 @@ def native_plan(project, archive_auth, current_auth, archive_prefix="archive"):
     archive["schema"]["base_source"] = {
         "kind": "external",
         "format": "parquet",
+        # HN exports use fresh object names. This promises immutable file
+        # contents, not immutable prefix membership, and avoids per-file HEAD
+        # revalidation when using the published index.
+        "object_mutability": "immutable",
         "table_id": "hn-archive",
         "uri": f"gs://{project}-hn-archive/{archive_prefix}",
         "credentials": {"ref": connection(archive_auth)},

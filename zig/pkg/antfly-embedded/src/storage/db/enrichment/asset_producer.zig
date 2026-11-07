@@ -689,7 +689,16 @@ fn invocationResolutionLimit(requests: []const Request) !usize {
 
 fn invocationResolutionScaledLimit(requests: []const Request) !usize {
     var source_bytes: usize = 0;
-    for (requests) |request| {
+    var config_structure: usize = 0;
+    var source_structure: usize = 0;
+    for (requests, 0..) |request, index| {
+        const privacy = @import("../../../privacy/document.zig");
+        if (std.mem.indexOf(u8, request.config_json, privacy.config_key) != null) {
+            if (index == 0 or !std.mem.eql(u8, request.config_json, requests[index - 1].config_json)) {
+                config_structure = try std.math.add(usize, config_structure, try std.math.mul(usize, 4, try privacy.jsonStructureBytes(request.config_json)));
+            }
+            source_structure = @max(source_structure, try privacy.jsonStructureBytes(request.source_text));
+        }
         source_bytes = std.math.add(usize, source_bytes, request.config_json.len) catch
             return error.InferenceEncodedBytesExceeded;
         source_bytes = std.math.add(usize, source_bytes, request.source_text.len) catch
@@ -704,8 +713,9 @@ fn invocationResolutionScaledLimit(requests: []const Request) !usize {
         return error.InferenceEncodedBytesExceeded;
     const control = std.math.mul(usize, @max(requests.len, 1), 4096) catch
         return error.InferenceEncodedBytesExceeded;
-    return std.math.add(usize, parsed, control) catch
-        error.InferenceEncodedBytesExceeded;
+    const structures = std.math.add(usize, config_structure, source_structure) catch return error.InferenceEncodedBytesExceeded;
+    const base = std.math.add(usize, parsed, control) catch return error.InferenceEncodedBytesExceeded;
+    return std.math.add(usize, base, structures) catch error.InferenceEncodedBytesExceeded;
 }
 
 test "invocation resolution budget never falls below the fixed planning floor" {

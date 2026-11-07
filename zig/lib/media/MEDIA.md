@@ -209,8 +209,8 @@ pixel aspect and raw color declarations alongside decode-order packet metadata.
 By default it supports qualified AVC and complete JPEG visual entries. Consumers
 can explicitly opt into HEVC (hvc1/hev1) and AV1 (av01) metadata and packet
 indexing through `Limits.codecs`. Their hvcC/av1C configuration is structurally
-validated and borrowed through `Track.codec_config`; this does not add portable
-CPU or Metal decoding. EmbeddingGemma2 CUDA uses that opt-in for NVDEC.
+validated and borrowed through `Track.codec_config`. The inference pipelines opt
+in: NVDEC decodes both, VideoToolbox decodes HEVC, and AV1 uses the WebM lane.
 Indexing reads bounded
 metadata, including tail `moov`, while payloads are independently leased.
 Container sync flags are hints; video validates actual IDR dependencies before

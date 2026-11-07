@@ -209,12 +209,38 @@ pub const StreamVerifier = struct {
         return .{ .root = root, .requirement = node.id, .observation = observation, .value = .{ .skipped = .{ .arena = arena, .document = owned, .observation = observation, .root = root } } };
     }
 
+    fn retiredDocument(alloc: std.mem.Allocator, txn: anytype, document: []const u8) !bool {
+        if (@import("group_source_identity.zig").isAnchor(document)) return false;
+        const authority = (try publication.authority(txn)) orelse return false;
+        const tombstone = publication.capturePrimaryTombstoneSource(alloc, txn, authority.namespace, document) catch |err| switch (err) {
+            error.EnrichmentSourceChanged => return false,
+            else => return err,
+        };
+        defer alloc.free(tombstone.document_key);
+        // A primary tombstone alone cannot retire an orphaned producer tail.
+        // Prove the complete output directory empty in this same snapshot.
+        // Generation heads/clocks live beside outputs and deliberately survive
+        // their retirement; they do not constitute materialized output.
+        const selected = try @import("../internal_keys.zig").artifactRootPrefixAlloc(alloc, document);
+        defer alloc.free(selected);
+        var cursor = try txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        const row = try cursor.seekAtOrAfter(selected);
+        return row == null or !std.mem.startsWith(u8, row.?.key, selected);
+    }
+
     pub fn verify(self: *StreamVerifier, alloc: std.mem.Allocator, txn: anytype, root: u128, document: []const u8, node: *const @import("artifact_completion_plan.zig").Node) !?Witness {
         self.blocked_unit = null;
         if (self.group_producers and node.kind != .generated and node.kind != .unit_children) return try skipped(alloc, txn, root, document, node);
         if (node.template orelse node.parent_template) |ordinal| {
             if (ordinal >= self.plan.generated_templates.len) return error.ArtifactCatalogDrift;
             if (!@import("enrichment/enrichment_types.zig").appliesToDocument(self.plan.generated_templates[ordinal], document)) return try skipped(alloc, txn, root, document, node);
+        }
+        if ((node.kind == .generated or node.kind == .unit_children) and try retiredDocument(alloc, txn, document)) {
+            // The source's ordered delete already retired these outputs.
+            // Keep the tombstone's materialization observation as a writer
+            // fence: resurrection or any new artifact revokes this witness.
+            return try skipped(alloc, txn, root, document, node);
         }
         if (node.kind == .native_effects and @import("group_source_identity.zig").isAnchor(document)) return try skipped(alloc, txn, root, document, node);
         if (node.kind == .unit_children) {
@@ -379,7 +405,7 @@ const Start = struct { state: State, selected: Key, expected: ?Encoded };
 
 fn start(alloc: std.mem.Allocator, txn: anytype, root: u128, plan: *const Plan, document: []const u8, limits: Limits) !?Start {
     if (root == 0) return error.DurableRootIncarnationUnavailable;
-    if (document.len == 0 or document.len > obligations.max_cursor_bytes or plan.nodes.len == 0 or plan.nodes.len > std.math.maxInt(u32) or limits.visits == 0 or limits.visits > 128 or limits.bytes == 0 or limits.bytes > 64 * 1024) return error.InvalidBatchRequest;
+    if (document.len > obligations.max_cursor_bytes or plan.nodes.len == 0 or plan.nodes.len > std.math.maxInt(u32) or limits.visits == 0 or limits.visits > 128 or limits.bytes == 0 or limits.bytes > 64 * 1024) return error.InvalidBatchRequest;
     const observation = try Observation.capture(txn, document);
     const item = (try obligations.lookupWork(alloc, txn, observation.authority, document)) orelse return null;
     const selected = domainKey(observation, root, limits.group_producers);
@@ -418,7 +444,7 @@ pub fn prepare(alloc: std.mem.Allocator, txn: anytype, root: u128, plan: *const 
     while (state.next < state.total) {
         const node = &plan.nodes[state.next];
         const cost = node.byteCost() +| document.len +| @sizeOf(Witness);
-        if (cost > publication.max_payload_bytes) return error.ResourceBudgetExceeded;
+        if (cost > publication.max_identity_bytes) return error.ResourceBudgetExceeded;
         if (witnesses.items.len != 0 and (witnesses.items.len >= limits.visits or bytes +| cost > limits.bytes or @import("antfly_platform").time.monotonicNs() >= deadline)) break;
         var witness = (try verifier.verify(alloc, txn, root, document, node)) orelse break;
         errdefer witness.deinit();
@@ -611,7 +637,7 @@ pub fn refreshProjectionsWithAdoption(alloc: std.mem.Allocator, store: anytype, 
         for (initial.state.next..plan.nodes.len) |ordinal| {
             const node = &plan.nodes[ordinal];
             const cost = node.byteCost() +| document.len +| @sizeOf(StreamVerifier.Witness);
-            if (cost > publication.max_payload_bytes) return error.ResourceBudgetExceeded;
+            if (cost > publication.max_identity_bytes) return error.ResourceBudgetExceeded;
             if (visits != 0 and (visits >= limits.visits or bytes +| cost > limits.bytes)) break;
             visits += 1;
             bytes +|= cost;
@@ -695,7 +721,7 @@ pub fn groupReady(alloc: std.mem.Allocator, txn: anytype, root: u128, document: 
 pub fn groupReadiness(alloc: std.mem.Allocator, txn: anytype, root: u128, document: []const u8) !GroupReadiness {
     if (root == 0) return .{ .phase = .inactive };
     const active = (try publication.authority(txn)) orelse return .{ .phase = .inactive };
-    const progress = (try obligations.load(txn)) orelse return .{ .phase = .inactive };
+    const progress = (try obligations.loadMetadata(txn)) orelse return .{ .phase = .inactive };
     try progress.requireAuthority(active);
     if (!progress.baseline_complete) return .{ .phase = .baseline_pending };
     const work = (try obligations.lookupWork(alloc, txn, active, document)) orelse return .{ .phase = .ready };
@@ -1358,4 +1384,103 @@ test "ordered artifact inventory completion checkpoint resumes all requirements 
         // Lost replies never recreate work or decrement the counter twice.
         try std.testing.expect((try prepare(alloc, &read, 41, &plan, "doc", &verifier, .{})) == null);
     }
+}
+
+test "privacy ordered artifact tombstone completion rejects orphan tails and resurrection" {
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const adapter = @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter;
+    const keys = @import("../internal_keys.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/privacy-retired-source", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.addEnrichment(.{ .name = "asset", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"copy\"}" });
+    var catalog = try db.artifactInventoryCommand(alloc);
+    defer catalog.catalogs.deinit(alloc);
+    catalog.binding.effect_protocol = 15;
+    try adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
+    var activate: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activate.publication_digest = activate.digest();
+    try adapter.applyOrdered(&db, .{ .artifact_publication = activate }, .{ .term = 1, .index = 2 });
+    try adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 3 });
+    var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer pin.release();
+    const node = for (pin.plan().completion_plan.?.nodes) |*candidate| {
+        if (candidate.kind == .generated) break candidate;
+    } else return error.TestExpectedGeneratedRequirement;
+    var verifier: StreamVerifier = .{ .plan = pin.plan() };
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try verifier.verify(alloc, &read, db.root_incarnation, "doc", node)) == null);
+    }
+    const intent = @import("artifact_reprocess_intent.zig");
+    const asset_intent = try intent.keyAlloc(alloc, "doc", "asset");
+    defer alloc.free(asset_intent);
+    const embedding_intent = try intent.embeddingKeyAlloc(alloc, "doc", "embedding");
+    defer alloc.free(embedding_intent);
+    const target = intent.encode("{}", 1);
+    try db.core.store.putBatch(&.{ .{ .key = asset_intent, .value = &target }, .{ .key = embedding_intent, .value = &target } }, &.{});
+    try adapter.applyOrdered(&db, .{ .deletes = &.{"doc"} }, .{ .term = 1, .index = 4 });
+    // Ordered producer generation clocks remain durable after output retirement.
+    const directory = try keys.documentExactPrefixAlloc(alloc, "doc");
+    defer alloc.free(directory);
+    const clock = try std.mem.concat(alloc, u8, &.{ directory, &.{keys.producer_generation_clock_kind} });
+    defer alloc.free(clock);
+    try db.core.store.putBatch(&.{.{ .key = clock, .value = "retired generation" }}, &.{});
+    var retired = blk: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(asset_intent));
+        try std.testing.expectError(error.NotFound, read.get(embedding_intent));
+        break :blk (try verifier.verify(alloc, &read, db.root_incarnation, "doc", node)) orelse return error.TestExpectedRetiredWitness;
+    };
+    defer retired.deinit();
+    try adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .timestamp_ns = 200 }, .{ .term = 1, .index = 5 });
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.EnrichmentSourceChanged, retired.requireCurrent(&read, db.root_incarnation));
+    }
+    try adapter.applyOrdered(&db, .{ .deletes = &.{"doc"} }, .{ .term = 1, .index = 6 });
+    var write = try db.core.store.beginWriteTxn();
+    defer write.abort();
+    const orphan = try keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "asset");
+    defer alloc.free(orphan);
+    try write.put(orphan, "unaccepted orphan");
+    try std.testing.expect((try verifier.verify(alloc, &write, db.root_incarnation, "doc", node)) == null);
+}
+
+test "privacy local source audit follows catalog replacement" {
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/privacy-source-audit", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .open_mode = .writer_no_replay, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    _ = try db.advanceArtifactProducerWorkPage();
+    const first_generation = db.local_source_completion_audit_generation.?;
+    try db.addEnrichment(.{ .name = "asset", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"copy\"}" });
+    try db.addIndex(.{ .name = "late_text", .kind = .full_text, .config_json = "{\"chunk_name\":\"asset\"}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"text\"}" }}, .sync_level = .write });
+    try std.testing.expect(db.core.index_manager.writePlanGeneration() != first_generation);
+    db.artifact_producer_scheduler.retry_after_ns.store(0, .release);
+    _ = try db.advanceArtifactProducerWorkPage();
+    try std.testing.expectEqual(db.core.index_manager.writePlanGeneration(), db.local_source_completion_audit_generation.?);
+    var repairs = try db.loadIndexRepairState(alloc);
+    defer repairs.deinit(alloc);
+    const ordinal = repairs.findIndex("late_text") orelse return error.TestExpectedReceiptRecovery;
+    const intent = repairs.entries.items[ordinal].intent;
+    try std.testing.expectEqual(@import("derived/index_repair_state.zig").WorkClass.initial_build, intent.work_class);
+    db.artifact_producer_scheduler.retry_after_ns.store(0, .release);
+    _ = try db.advanceArtifactProducerWorkPage();
+    var again = try db.loadIndexRepairState(alloc);
+    defer again.deinit(alloc);
+    try std.testing.expectEqual(intent.repair_id, again.entries.items[again.findIndex("late_text").?].intent.repair_id);
 }

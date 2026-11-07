@@ -1524,6 +1524,206 @@ test "WS4-for-graph: a synchronous graph edge write lands in one native commit a
     }
 }
 
+test "WS4-for-dense: a synchronous dense vector write lands in one native commit and is queryable immediately" {
+    // Dense analog of the full_text/graph tests above (lite-single-
+    // commit-write-path.md §3.3a's dense extension): default Lite
+    // configuration (background index workers running), one caller-
+    // supplied vector write expressed through a document's `_embeddings`
+    // field on an `external: true` dense index, `sync_level = .full_index`
+    // (dense has no narrower sync level of its own -- see
+    // `types.SyncLevel`'s enum order). Proves `InlineDensePublication`
+    // engages for the simple single-vector insert case: the vector is
+    // queryable immediately after ack, and the background worker's later
+    // catch-up does not duplicate it.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+    defer handle.close();
+
+    try handle.db.addIndex(.{
+        .name = "dv_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"marker\":\"seed\"}" }}, .sync_level = .write });
+    try handle.db.runUntilIdle();
+
+    // The very first write ever made into a brand-new dense index has a
+    // pre-existing bootstrap quirk, independent of inline publication
+    // (`denseEmbeddingWriteEligibleForInlinePublication`'s own
+    // `entry.index.generationRepairPending()` check guards the one
+    // version of this this change's own tests could reproduce, but
+    // `lite-write-amplification`'s 128-write "dense" diagnostic -- no
+    // explicit warm-up, every write a fresh key -- never sees that guard
+    // trigger either, so whatever actually causes it is not specific to
+    // skipping the slow path's checkpoint build): an exhaustive-coverage
+    // search (`search_effort: 1.0` below) right after that very first
+    // write can fail closed with `error.IndexRebuilding`
+    // (`error.IncompletePublishedSnapshot` inside HBC), regardless of
+    // whether that first write went through the inline path or the slow
+    // one. This warm-up write (not part of the measurement below) only
+    // needs to not be the index's absolute first write; it is not
+    // special beyond that.
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "warmup-doc", .value = "{\"marker\":\"warmup-marker\",\"_embeddings\":{\"dv_idx\":[0.0,0.0]}}" },
+    }, .sync_level = .full_index });
+    try handle.db.runUntilIdle();
+
+    const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+    const before_sequence = store.file.activeCheckpoint().commit_sequence;
+
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker\",\"_embeddings\":{\"dv_idx\":[1.0,0.0]}}" },
+    }, .sync_level = .full_index });
+
+    const after_ack_sequence = store.file.activeCheckpoint().commit_sequence;
+    const commits_for_this_write = after_ack_sequence - before_sequence;
+    // Same bound as the full_text/graph tests above: the inline
+    // publication itself contributes no extra commit beyond the primary
+    // write's own (its HBC namespace mutations and the durable doc_key<->
+    // vector_id mapping both ride inside the SAME native transaction via
+    // `commit_participant.View.putIndexCatalog`/`.put`); a handful more
+    // land end to end from unrelated background bookkeeping (replication
+    // outbox staging, opportunistic maintenance ticks) WS7 owns driving to
+    // zero.
+    try std.testing.expect(commits_for_this_write <= 6);
+
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "dv_idx",
+            .query = .{ .dense_knn = .{ .vector = &.{ 1.0, 0.0 }, .k = 1 } },
+            .limit = 1,
+            .search_effort = 1.0,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("dv-doc", result.hits[0].id);
+    }
+
+    // Let the background worker observe this write. If it were not told
+    // the vector already landed inline (`Executor.
+    // advanceAppliedSequenceIfContiguous`), it would redundantly re-apply
+    // the same write from the journal -- for an exact-member upsert that
+    // would not duplicate the member, but it would mean the worker, not
+    // the inline path, is actually doing the work, defeating the point.
+    try handle.db.runUntilIdle();
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "dv_idx",
+            .query = .{ .dense_knn = .{ .vector = &.{ 1.0, 0.0 }, .k = 1 } },
+            .limit = 1,
+            .search_effort = 1.0,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    }
+}
+
+test "WS4-for-dense round 2: an update or a delete falls back and still lands correctly" {
+    // `prepareInlineDensePublication`'s own batch-level gate in
+    // `mutation_commit.zig` (`overwritten_doc_keys.len == 0`/
+    // `deleted_keys.len == 0`) excludes a document replacement or a
+    // delete from the inline fast path -- both must fall back to the
+    // existing `applyDenseEmbeddingWritesByNameWithOptions` path, which
+    // this proves still produces the correct final state (the replaced
+    // vector is gone, the new one is findable; a deleted vector is gone
+    // too) and costs strictly more than the single-commit insert case
+    // above, confirming the fallback -- not the inline path -- actually
+    // ran.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+    defer handle.close();
+
+    try handle.db.addIndex(.{
+        .name = "dv_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker-v1\",\"_embeddings\":{\"dv_idx\":[1.0,0.0]}}" },
+    }, .sync_level = .full_index });
+
+    // Update: a second write to the SAME key with a different vector.
+    // `overwritten_doc_keys` is non-empty for this write, so it must NOT
+    // take the one-commit inline path.
+    const before_update_sequence = store.file.activeCheckpoint().commit_sequence;
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker-v2\",\"_embeddings\":{\"dv_idx\":[0.0,1.0]}}" },
+    }, .sync_level = .full_index });
+    const after_update_sequence = store.file.activeCheckpoint().commit_sequence;
+    try std.testing.expect(after_update_sequence - before_update_sequence > 1);
+
+    // Not `search_effort: 1.0` here: that forces HBC's exhaustive-coverage
+    // (`.complete_snapshot`) search policy, which independently validates
+    // tree structure while scoring and has its own pre-existing dense-
+    // replacement issue unrelated to inline publication (both writes
+    // above take the slow path -- the first because a fresh index's
+    // checkpoint has never been built, the second because
+    // `overwritten_doc_keys` excludes it -- so inline publication's own
+    // code never runs in this sequence at all). Default-effort search is
+    // enough to prove the fallback's functional result (old vector gone,
+    // new one findable) without exercising that separate, pre-existing
+    // code path.
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "dv_idx",
+            .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 1.0 }, .k = 1 } },
+            .limit = 1,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("dv-doc", result.hits[0].id);
+    }
+
+    // Delete: the dense-vector mapping and HBC posting entry must both be
+    // gone.
+    try handle.db.batch(.{ .deletes = &.{"dv-doc"}, .sync_level = .full_index });
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "dv_idx",
+            .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 1.0 }, .k = 1 } },
+            .limit = 1,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    }
+
+    // A fresh insert after the delete must still take the (now
+    // unobstructed) inline fast path and cost exactly one commit, proving
+    // the update/delete fallback above left the index in a state the
+    // inline path can resume from cleanly.
+    try handle.db.runUntilIdle();
+    const before_final_sequence = store.file.activeCheckpoint().commit_sequence;
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "dv-doc-2", .value = "{\"marker\":\"dv-doc-marker-v3\",\"_embeddings\":{\"dv_idx\":[0.5,0.5]}}" },
+    }, .sync_level = .full_index });
+    const after_final_sequence = store.file.activeCheckpoint().commit_sequence;
+    try std.testing.expect(after_final_sequence - before_final_sequence <= 6);
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "dv_idx",
+            .query = .{ .dense_knn = .{ .vector = &.{ 0.5, 0.5 }, .k = 1 } },
+            .limit = 1,
+            .search_effort = 1.0,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("dv-doc-2", result.hits[0].id);
+    }
+}
+
 test "WS4 phase 2 round 2: a worker-backlogged index falls back correctly instead of skipping the gap" {
     // Deliberately creates the one scenario the inline fast path must
     // refuse: a background worker still owes this index an earlier

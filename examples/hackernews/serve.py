@@ -226,12 +226,20 @@ class Gateway(BaseHTTPRequestHandler):
             raise ValueError("Search response too large")
         return json.loads(raw)
 
-    def respond(self, status, body, content_type="application/json"):
+    def respond(
+        self, status, body, content_type="application/json", *, backend_seconds=None
+    ):
         payload = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        if backend_seconds is not None:
+            # Includes the managed proxy, transport and response read. This is
+            # not an engine timer. Never forward arbitrary upstream headers.
+            self.send_header(
+                "Server-Timing", f"antfly_upstream;dur={backend_seconds * 1000:.3f}"
+            )
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header(
@@ -314,10 +322,12 @@ class Gateway(BaseHTTPRequestHandler):
                 429, {"error": "Search capacity reached; retry shortly"}
             )
         try:
+            started = time.monotonic()
             result = self.upstream(
                 f"/tables/{query['table']}/query" if "table" in query else "/query",
                 {k: v for k, v in query.items() if k != "table"},
             )["responses"][0]
+            backend_seconds = time.monotonic() - started
             output = {
                 "hits": result["hits"],
                 "cursor": next_cursor(query, result),
@@ -326,16 +336,26 @@ class Gateway(BaseHTTPRequestHandler):
                 predicate = query["filter_query"]
                 dates = predicate.get("range") or predicate["conjuncts"][0]["range"]
                 output["recent_since"] = dates["gte"]
-            return self.respond(200, output)
+            return self.respond(200, output, backend_seconds=backend_seconds)
         except HTTPError as error:
             error.close()
             if error.code in (409, 410):
                 return self.respond(
-                    409, {"error": "Search snapshot expired; start a new search"}
+                    409,
+                    {"error": "Search snapshot expired; start a new search"},
+                    backend_seconds=time.monotonic() - started,
                 )
-            return self.respond(503, {"error": "Search is temporarily unavailable"})
+            return self.respond(
+                503,
+                {"error": "Search is temporarily unavailable"},
+                backend_seconds=time.monotonic() - started,
+            )
         except (URLError, TimeoutError, ValueError, KeyError, IndexError, TypeError):
-            return self.respond(503, {"error": "Search is temporarily unavailable"})
+            return self.respond(
+                503,
+                {"error": "Search is temporarily unavailable"},
+                backend_seconds=time.monotonic() - started,
+            )
         finally:
             self.server.searches.release()
 

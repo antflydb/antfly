@@ -96,6 +96,10 @@ const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 const transactions_mod = @import("../transactions.zig");
 const transform_mod = @import("transform.zig");
 const types = @import("types.zig");
+/// `InlineDensePublication`'s staged-write type (lite-single-commit-write-
+/// path.md §3.3a): the same module `../hbc_adapter.zig` (imported above as
+/// `hbc_mod`) itself imports to return it from `HBCIndex.insertWithMetadataStaged`.
+const vectorindex_hbc_index = @import("antfly_vectorindex").hbc_index;
 
 pub fn ImplementationFor(comptime S: type, comptime D: type) type {
     return struct {
@@ -3416,6 +3420,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const advances = try batchAdvancesManagedIndexApplyState(ctx.index_manager, batch, index_ref);
                 {
                     const async_ctx = AsyncContext{
+                        .apply_exclusive_held = ctx.apply_exclusive_held,
                         .alloc = ctx.alloc,
                         .io = ctx.io,
                         .store = ctx.store,
@@ -3962,6 +3967,178 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return result;
         }
 
+        /// lite-single-commit-write-path.md §3.3a's dense extension of WS4
+        /// phase 2, mirroring `InlineGraphPublication`/`InlineSparsePublication`
+        /// but wrapping `hbc_mod.HBCIndex.insertWithMetadataStaged` (the
+        /// library's own stage-without-commit single-vector insert; see its
+        /// doc comment for the full stage/install/abort contract) instead of
+        /// a graph/sparse-specific staged-publication type. Holds this dense
+        /// index's apply guard from prepare through `install`/`abort`,
+        /// serializing against every other writer of this index for the
+        /// whole window -- same deliberate concurrency trade as text's,
+        /// graph's and sparse's own apply guards.
+        ///
+        /// Side effects `applyDenseEmbeddingWritesEntry`'s slow path
+        /// performs for an eligible (caller-supplied-vector, external,
+        /// non-chunked, single-write) batch that this type deliberately does
+        /// NOT replicate, and why that is still correct:
+        /// - The "_embeddings" artifact write (`writeDenseEmbeddingArtifactTxn`)
+        ///   is already staged into this SAME primary transaction by the
+        ///   ordinary document-write path, well before this type ever runs
+        ///   (`mutation_commit.zig`'s `write_buffers.explicit_embedding_
+        ///   artifact_writes`, merged into `write_buffers.store_writes`
+        ///   before any inline publication is prepared). The slow path's own
+        ///   second write of the identical bytes is itself a no-op there
+        ///   (the `existing` equality check in `writeDenseEmbeddingArtifactTxn`).
+        /// - The posting-sidecar capture lease, the local HBC streaming
+        ///   session and the exact-vector-mutation capture it feeds are
+        ///   derived-batch/bulk-replay machinery with no single-write
+        ///   equivalent; `denseEmbeddingWriteEligibleForInlinePublication`
+        ///   also excludes the one case (`experimentalPostingWalAuthoritative`)
+        ///   where the capture lease would not already be a no-op.
+        /// - Derived-coverage accounting (`accountDenseCoverageWithPlan`) and
+        ///   embedding-artifact repair-issue bookkeeping
+        ///   (`clearPublishedEmbeddingArtifactRepairIssuesContext`) are
+        ///   skipped exactly as `InlineSparsePublication` already skips
+        ///   their sparse equivalents: both are recomputable bookkeeping
+        ///   under lite-single-commit-write-path.md §3.2a's ride-along
+        ///   model, not data this write's durability depends on, and their
+        ///   keys (`replay_namespace`-prefixed) are outside
+        ///   `commit_participant.View.put`'s `\x00\x00`-only write surface
+        ///   in any case.
+        pub const InlineDensePublication = struct {
+            alloc: Allocator,
+            index_manager: *index_manager_mod.IndexManager,
+            entry: *index_manager_mod.IndexManager.DenseIndex,
+            apply_guard: index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+            staged: vectorindex_hbc_index.StagedWrite,
+            scope: []const u8,
+            index_name: []const u8,
+            doc_key: []const u8,
+            vector_id: u64,
+            vector: []const f32,
+            progress: apply_state.Progress,
+
+            fn reset(_: *anyopaque) void {}
+            fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
+            fn stage(ptr: *anyopaque, view: commit_participant.View, _: []const u8) anyerror!void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                if (self.staged.mutations.len != 0) {
+                    // `vectorindex`'s own generic `store.PendingMutation` (the
+                    // HBC library's stage-only harvest type) has the exact
+                    // same fields as `native_catalog_backend.Mutation` (what
+                    // `View.putIndexCatalog` requires) but is a distinct
+                    // nominal type -- graph's and sparse's own staged
+                    // publications are built to return the latter directly,
+                    // HBC's is not. Converted on a short-lived scratch
+                    // allocation; one vector insert touches a bounded number
+                    // of HBC namespace records (routing-tree nodes,
+                    // posting/vector payload, metadata), never a batch-sized
+                    // count.
+                    const converted = try self.alloc.alloc(native_catalog_backend.Mutation, self.staged.mutations.len);
+                    defer self.alloc.free(converted);
+                    for (self.staged.mutations, converted) |pending, *out| {
+                        out.* = .{ .namespace = pending.namespace, .key = pending.key, .value = pending.value, .is_delete = pending.is_delete };
+                    }
+                    try view.putIndexCatalog(self.scope, converted);
+                }
+                try self.index_manager.writeDenseVectorMappingForInlinePublicationTxn(view, self.index_name, self.doc_key, self.vector_id, self.vector);
+                try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            /// Call only once the host transaction's commit has actually
+            /// returned successfully (see `InlineTextPublication.install`'s
+            /// identical warning).
+            pub fn participant(self: *InlineDensePublication) commit_participant.Participant {
+                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+            }
+
+            pub fn install(self: *InlineDensePublication) void {
+                std.debug.assert(self.apply_guard.locked());
+                self.entry.index.installStagedWrite(&self.staged) catch |err| {
+                    std.log.err("inline dense publication install: mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+                };
+                self.apply_guard.unlock();
+                self.alloc.destroy(self);
+            }
+
+            pub fn abort(self: *InlineDensePublication) void {
+                std.debug.assert(self.apply_guard.locked());
+                self.entry.index.abortStagedWrite(&self.staged);
+                self.apply_guard.unlock();
+                self.alloc.destroy(self);
+            }
+        };
+
+        /// WS4-for-vectors' dense extension of the fast path above: prepares
+        /// one managed dense index's single-vector inline publication.
+        /// Returns `error.InlineDensePublicationUnsupported` for every case
+        /// outside `IndexManager.denseEmbeddingWriteEligibleForInlinePublication`'s
+        /// own narrow scope (non-`.native_catalog` stores, via
+        /// `nativeCatalogScope()`) AND for every case needing a vector-id
+        /// collision resolved through `reserveDenseVectorIdTxn`'s durable
+        /// counter (`assignDenseVectorIdInlineTxn` returning `null`) or the
+        /// library's own staged-publication support (`insertWithMetadataStaged`
+        /// returning `error.StagedPublicationUnsupported`, e.g. a LEANN-backed
+        /// index), so the caller falls back to
+        /// `applyDenseEmbeddingWritesByNameWithOptions`, which remains
+        /// correct (and is not changed by any of this) for all of them.
+        pub fn prepareInlineDensePublication(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_manager: *index_manager_mod.IndexManager,
+            write: derived_types.DerivedDenseEmbeddingWrite,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            sequence: u64,
+        ) !*InlineDensePublication {
+            if (index_ref.kind != .dense_vector) return error.InlineDensePublicationUnsupported;
+            const entry = index_manager.denseIndex(index_ref.name) orelse return error.InlineDensePublicationUnsupported;
+            if (!index_manager.denseEmbeddingWriteEligibleForInlinePublication(entry, write)) return error.InlineDensePublicationUnsupported;
+
+            const scope = entry.index.nativeCatalogScope() orelse return error.InlineDensePublicationUnsupported;
+
+            var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
+            errdefer apply_guard.unlock();
+
+            // Mirrors `prepareInlineSparsePublication`'s own read-only probe
+            // transaction: the deterministic, conflict-free branch of vector
+            // id assignment only needs point reads against the primary
+            // store's durable state as of just before this write, not a
+            // mutable transaction (the one real mutation path --
+            // `reserveDenseVectorIdTxn`'s durable counter -- is exactly what
+            // `assignDenseVectorIdInlineTxn` refuses to reach).
+            var probe_txn = try store.beginProbeTxn();
+            defer probe_txn.abort();
+            const assignment = (try index_manager.assignDenseVectorIdInlineTxn(&probe_txn, entry, index_ref.name, write.doc_key)) orelse
+                return error.InlineDensePublicationUnsupported;
+
+            const staged = entry.index.insertWithMetadataStaged(assignment.vector_id, write.vector, write.doc_key) catch |err| switch (err) {
+                error.StagedPublicationUnsupported => return error.InlineDensePublicationUnsupported,
+                else => return err,
+            };
+
+            const result = try alloc.create(InlineDensePublication);
+            result.* = .{
+                .alloc = alloc,
+                .index_manager = index_manager,
+                .entry = entry,
+                .apply_guard = apply_guard,
+                .staged = staged,
+                .scope = scope,
+                .index_name = index_ref.name,
+                .doc_key = write.doc_key,
+                .vector_id = assignment.vector_id,
+                .vector = write.vector,
+                .progress = .{
+                    .consumer = index_ref.name,
+                    .sequence = sequence,
+                    .generation = entry.config.coverage_generation,
+                    .config_hash = types.indexConfigHash(entry.config),
+                },
+            };
+            return result;
+        }
+
         pub fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {
             try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null, false, null);
         }
@@ -4053,11 +4230,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         var applied_chunk = false;
                         var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
                         if (ctx.text_merge_runtime) |runtime| {
-                            merge_permit = try runtime.acquireProducerPermit(
-                                index_ref.name,
-                                planned.estimate.segment_count,
-                                planned.estimate.byte_count,
-                            );
+                            merge_permit = if (ctx.apply_exclusive_held)
+                                try runtime.acquireProducerPermitAssumeApply(index_ref.name, planned.estimate.segment_count, planned.estimate.byte_count)
+                            else
+                                try runtime.acquireProducerPermit(index_ref.name, planned.estimate.segment_count, planned.estimate.byte_count);
                         }
                         defer if (merge_permit) |*permit| permit.release();
 
@@ -4617,9 +4793,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
             coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
         ) !void {
+            const privacy_output = try @import("../../privacy/materialize.zig").output(alloc, item.source_text, item.request.producer_json, produced);
+            defer if (privacy_output) |value| alloc.free(value);
+            const validated = privacy_output orelse produced;
             try artifact_writes.append(alloc, .{
                 .key = try alloc.dupe(u8, item.artifact_key),
-                .value = try alloc.dupe(u8, produced),
+                .value = try alloc.dupe(u8, validated),
             });
             try artifact_writes.append(alloc, .{
                 .key = try alloc.dupe(u8, item.state_key),
@@ -4627,7 +4806,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             });
 
             const text_indexes: []const []const u8 = item.request.consumer_indexes;
-            try appendInlineFullTextDocument(alloc, documents, item.artifact_key, produced, text_indexes);
+            try appendInlineFullTextDocument(alloc, documents, item.artifact_key, validated, text_indexes);
             try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, item.request, .produced);
         }
 
@@ -5710,6 +5889,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (upper) |key| alloc.free(key);
             const ScanContext = struct {
                 alloc: Allocator,
+                document_prefix_len: usize,
                 artifact_prefix: []const u8,
                 asset_state_prefix: []const u8,
                 graph_asset_state_prefix: []const u8,
@@ -5724,7 +5904,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     _ = value;
                     const ctx: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
                     const is_artifact = std.mem.startsWith(u8, key, ctx.artifact_prefix);
-                    if (!is_artifact and
+                    // Fulfilled rerun targets remain document-owned metadata.
+                    // Delete them beside outputs so resurrection starts with
+                    // a fresh generation and tombstone completion can settle.
+                    const is_reprocess_intent = key.len > ctx.document_prefix_len and
+                        (key[ctx.document_prefix_len] == internal_keys.asset_reprocess_intent_kind or
+                            key[ctx.document_prefix_len] == internal_keys.embedding_reprocess_intent_kind);
+                    if (!is_artifact and !is_reprocess_intent and
                         !std.mem.startsWith(u8, key, ctx.asset_state_prefix) and
                         !std.mem.startsWith(u8, key, ctx.graph_asset_state_prefix) and
                         !std.mem.startsWith(u8, key, ctx.graph_edge_contender_prefix) and
@@ -5745,6 +5931,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             var scan_context = ScanContext{
                 .alloc = alloc,
+                .document_prefix_len = document_prefix.len,
                 .artifact_prefix = artifact_prefix,
                 .asset_state_prefix = asset_state_prefix,
                 .graph_asset_state_prefix = graph_asset_state_prefix,
@@ -5759,6 +5946,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const retired_prefix = try internal_keys.graphRetirementPrefixAlloc(alloc, doc_key);
             defer alloc.free(retired_prefix);
             try collectDeleteKeysForPrefix(alloc, store, retired_prefix, delete_keys, owned_delete_keys, null);
+
+            // Standalone privacy witnesses live in the control namespace, but
+            // preserve the exact document prefix after their own prefix. Retire
+            // every policy generation beside the document, even if an older
+            // producer's artifact has already been garbage-collected.
+            const privacy_prefix = try @import("../../privacy/local_publication.zig").key(alloc, document_prefix);
+            defer alloc.free(privacy_prefix);
+            try collectDeleteKeysForPrefix(alloc, store, privacy_prefix, delete_keys, owned_delete_keys, null);
+            const retry_prefix = try @import("../../privacy/retry.zig").key(alloc, document_prefix);
+            defer alloc.free(retry_prefix);
+            try collectDeleteKeysForPrefix(alloc, store, retry_prefix, delete_keys, owned_delete_keys, null);
 
             // Incoming artifacts can span an arbitrarily large number of owners.
             // The primary delete records a durable job instead of retaining them here.
@@ -5777,7 +5975,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const explicit_deletes = for (extracted) |row| {
                 if (row.deleted_embedding_indexes.len > 0) break true;
             } else false;
-            if (!explicit_deletes and !S.ownerField(self, "core").*.hasArtifactCleanupMaybe() and vector_effects.len == 0) return try S.ownerField(self, "alloc").*.alloc([]u8, 0);
+            if (req.deletes.len == 0 and !explicit_deletes and !S.ownerField(self, "core").*.hasArtifactCleanupMaybe() and vector_effects.len == 0) return try S.ownerField(self, "alloc").*.alloc([]u8, 0);
 
             var deleted = std.ArrayListUnmanaged([]u8).empty;
             errdefer deleted.deinit(S.ownerField(self, "alloc").*);
@@ -6488,7 +6686,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // is re-driven by the per-document replay record once the upstream lands.
             const consumes_upstream = request.upstream_artifact_name.len > 0 and
                 producer_cfg.type != .document_extraction;
-            const source_text: ?[]const u8 = if (consumes_upstream) blk: {
+            var source_text: ?[]const u8 = if (consumes_upstream) blk: {
                 const upstream_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", request.upstream_artifact_name);
                 defer alloc.free(upstream_key);
                 var i = artifact_writes.items.len;
@@ -6504,6 +6702,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 break :blk try S.ownerField(db, "core").*.getStoreValue(alloc, upstream_key);
             } else try extractAssetSourceValue(alloc, db, doc_value, request);
+            if (consumes_upstream and source_text != null and @import("../../privacy/document.zig").isProtectedArtifactName(request.upstream_artifact_name)) {
+                const sanitized = try @import("../../privacy/consumer.zig").document(alloc, source_text.?);
+                alloc.free(source_text.?);
+                source_text = sanitized;
+            }
+            if (consumes_upstream and source_text != null and (request.source_field.len != 0 or request.source_template.len != 0)) {
+                const upstream = source_text.?;
+                defer alloc.free(upstream);
+                source_text = try extractAssetSourceValue(alloc, db, upstream, request);
+            }
             if (source_text == null or source_text.?.len == 0) {
                 if (source_text) |s| alloc.free(s);
                 try appendFullTextDeleteDocument(alloc, documents, key, text_indexes);
@@ -6636,12 +6844,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 });
             };
             defer if (producer_cfg.type != .copy) alloc.free(value);
+            const privacy_output = try @import("../../privacy/materialize.zig").output(alloc, source_text.?, request.producer_json, value);
+            defer if (privacy_output) |output| alloc.free(output);
+            const validated = privacy_output orelse value;
 
             try artifact_writes.append(alloc, .{
                 .key = try alloc.dupe(u8, key),
-                .value = try alloc.dupe(u8, value),
+                .value = try alloc.dupe(u8, validated),
             });
-            try appendInlineFullTextDocument(alloc, documents, key, value, text_indexes);
+            try appendInlineFullTextDocument(alloc, documents, key, validated, text_indexes);
 
             try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, .produced);
 
@@ -6985,6 +7196,33 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendForConsumers(alloc, dense_embeddings, request.doc_key, null, artifact_key, vector, consumer_indexes);
         }
 
+        fn reuseDocumentExtractionByFingerprint(
+            alloc: Allocator,
+            db: anytype,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            fingerprint: []const u8,
+            existing_state: ?[]const u8,
+            existing_manifest: ?[]const u8,
+            manifest_key: []const u8,
+            generation: u64,
+            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+        ) !bool {
+            const state = existing_state orelse return false;
+            const manifest = existing_manifest orelse return false;
+            if (!documentExtractionStateFingerprintMatches(alloc, state, fingerprint) or
+                !documentExtractionStateHasChunkUnitFingerprints(alloc, state)) return false;
+            const has_error = documentExtractionManifestHasLastError(alloc, manifest) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => true,
+            };
+            if (has_error) return false;
+            try appendDocumentExtractionNavigationBackfill(alloc, db, doc_key, artifact_name, fingerprint, state, generation, artifact_writes, artifact_delete_keys);
+            try artifact_writes.append(alloc, .{ .key = try alloc.dupe(u8, manifest_key), .value = try alloc.dupe(u8, manifest) });
+            return true;
+        }
+
         pub fn computeDocumentExtractionAssetRequestDerived(
             alloc: Allocator,
             db: anytype,
@@ -7037,38 +7275,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, source_url, config_json, config);
             defer if (metadata_fingerprint) |fingerprint| alloc.free(fingerprint);
+            // As in async replay, checksum opt-in requires verified bytes;
+            // metadata-only legacy fingerprints cannot prove that provenance.
             if (!force_reprocess) {
                 if (metadata_fingerprint) |fingerprint| {
-                    if (existing_state) |state| {
-                        if (documentExtractionStateFingerprintMatches(alloc, state, fingerprint) and
-                            documentExtractionStateHasChunkUnitFingerprints(alloc, state))
-                        {
-                            if (existing_manifest) |value| {
-                                const manifest_has_last_error = documentExtractionManifestHasLastError(alloc, value) catch |err| switch (err) {
-                                    error.OutOfMemory => return err,
-                                    else => true,
-                                };
-                                if (!manifest_has_last_error) {
-                                    try appendDocumentExtractionNavigationBackfill(
-                                        alloc,
-                                        db,
-                                        request.doc_key,
-                                        artifact_name,
-                                        fingerprint,
-                                        state,
-                                        from_generation,
-                                        artifact_writes,
-                                        artifact_delete_keys,
-                                    );
-                                    try artifact_writes.append(alloc, .{
-                                        .key = try alloc.dupe(u8, manifest_key),
-                                        .value = try alloc.dupe(u8, value),
-                                    });
-                                    return;
-                                }
-                            }
-                        }
-                    }
+                    if (try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
                 }
             }
 
@@ -7088,6 +7299,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (extraction_budgeted) |*budgeted| budgeted.deinit();
             const extraction_alloc = if (extraction_budgeted) |*budgeted| budgeted.allocator() else alloc;
 
+            // See the matching log in enrichment_runtime.zig's
+            // processDocumentExtractionAsset: past this point the declared
+            // digest, if any, did not already prove this extraction
+            // unnecessary.
+            std.log.info("document extraction fetching source: doc_key={s} artifact={s}", .{ request.doc_key, artifact_name });
             const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
                 extraction_alloc,
                 remoteRenderConfig(db, null),
@@ -7115,6 +7331,30 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             var downloaded_mut = downloaded;
             defer downloaded_mut.deinit(extraction_alloc);
+
+            // Verify the declared digest against the bytes actually fetched,
+            // before any of them can be extracted, embedded, or otherwise
+            // referenced. downloaded_mut.data is already fully buffered by
+            // this path, so hashing it here adds no additional buffering,
+            // only an extra pass over memory already resident.
+            if (config.checksum_algorithm != null and config.checksum.len > 0) {
+                var content_digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(downloaded_mut.data, &content_digest, .{});
+                document_extraction_mod.verifyChecksumDigest(config, &content_digest) catch |raw_err| {
+                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(raw_err), "declared checksum does not match the downloaded bytes", "document_checksum_verification", artifact_writes);
+                    return;
+                };
+            }
+
+            const byte_source_fingerprint = if (metadata_fingerprint == null)
+                try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded_mut.content_type) orelse try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
+            else
+                null;
+            defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
+            const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
+
+            if (metadata_fingerprint == null and !force_reprocess and
+                try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, source_fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
 
             // Downloaded bytes, inspection state, and decoded extraction results are
             // charged at their actual live allocator size. OCR render scratch plus
@@ -7182,13 +7422,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return error.MissingAssetProducer;
             }
             document_extraction_mod.rebaseUnitCharOffsets(extraction.units);
-
-            const byte_source_fingerprint = if (metadata_fingerprint == null)
-                try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
-            else
-                null;
-            defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
-            const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
 
             var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
             defer {
@@ -9019,7 +9252,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_value, .{ .parse_numbers = false });
             defer parsed.deinit();
             if (parsed.value != .object) return null;
-            const source = parsed.value.object.get(request.source_field) orelse return null;
+            const source = enrichment_types.sourceFieldValue(parsed.value, request.source_field, request.group_artifact_name.len > 0);
             return switch (source) {
                 .null => null,
                 .string => |value| blk: {

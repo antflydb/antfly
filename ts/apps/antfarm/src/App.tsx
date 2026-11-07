@@ -52,6 +52,7 @@ const tableSections = new Set([
   "bulk",
   "document-builder",
   "artifacts",
+  "privacy",
   "reprocess",
 ]);
 

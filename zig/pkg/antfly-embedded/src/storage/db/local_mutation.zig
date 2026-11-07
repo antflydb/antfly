@@ -262,6 +262,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const loadDenseArtifactCounterBootstrap = materialization.loadDenseArtifactCounterBootstrap;
         pub const loadDenseArtifactTargetCounter = materialization.loadDenseArtifactTargetCounter;
         pub const lockApplyForPortableRuntime = commit.lockApplyForPortableRuntime;
+        pub const tryLockApplyForPortableRuntime = commit.tryLockApplyForPortableRuntime;
         pub const maintenanceRequiresOrderedApply = commit.maintenanceRequiresOrderedApply;
         pub const markPrecomputedEnrichmentAppliedForSync = commit.markPrecomputedEnrichmentAppliedForSync;
         pub const maybeFinalizePendingRowPolicyPublication = commit.maybeFinalizePendingRowPolicyPublication;
@@ -394,6 +395,8 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const prepareInlineGraphPublication = materialization.prepareInlineGraphPublication;
         pub const InlineSparsePublication = materialization.InlineSparsePublication;
         pub const prepareInlineSparsePublication = materialization.prepareInlineSparsePublication;
+        pub const InlineDensePublication = materialization.InlineDensePublication;
+        pub const prepareInlineDensePublication = materialization.prepareInlineDensePublication;
         pub const applyGraphArtifactMutationPages = materialization.applyGraphArtifactMutationPages;
         pub const applyGraphDocClearsForIndex = materialization.applyGraphDocClearsForIndex;
         pub const applyPrecomputeAssetProducerOutput = materialization.applyPrecomputeAssetProducerOutput;

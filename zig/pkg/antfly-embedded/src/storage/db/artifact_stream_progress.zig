@@ -226,7 +226,7 @@ pub const ExtractionClosure = struct {
 
 pub fn prepareExtractionClosure(alloc: std.mem.Allocator, txn: anytype, root: u128, request: Request, plan: *const Plan) !ExtractionClosure {
     if (root == 0) return error.DurableRootIncarnationUnavailable;
-    if (request.doc_key.len == 0 or request.doc_key.len > checkpoints.max_cursor_bytes or request.artifact_name.len == 0 or request.kind != .asset) return error.InvalidBatchRequest;
+    if (request.doc_key.len > checkpoints.max_cursor_bytes or request.artifact_name.len == 0 or request.kind != .asset) return error.InvalidBatchRequest;
     const authorized = (try @import("artifact_producer_input.zig").authorizeTemplate(alloc, txn, request, plan)) orelse return error.ArtifactCatalogDrift;
     if (authorized.requirement.scope != .producer_defined) return error.ArtifactCatalogDrift;
     const extraction = @import("artifact_extraction_generation.zig");
@@ -289,8 +289,7 @@ pub fn prepareExtractionClosure(alloc: std.mem.Allocator, txn: anytype, root: u1
 /// scope census and cannot borrow this boundary.
 pub fn prepareEnrichmentClosure(alloc: std.mem.Allocator, txn: anytype, root: u128, request: Request, plan: *const Plan) !DocumentClosure {
     if (root == 0) return error.DurableRootIncarnationUnavailable;
-    if (request.doc_key.len == 0 or request.doc_key.len > checkpoints.max_cursor_bytes) return error.InvalidBatchRequest;
-    if (request.kind == .chunk_text and request.upstream_artifact_name.len != 0) return error.OnlineMergeArtifactTailsUnsupported;
+    if (request.doc_key.len > checkpoints.max_cursor_bytes) return error.InvalidBatchRequest;
     const authorized = (try @import("artifact_asset_publication.zig").authorize(alloc, txn, request, plan)) orelse return error.ArtifactCatalogDrift;
     if (authorized.requirement.scope != .document) return error.ArtifactCatalogDrift;
     const name = if (request.artifact_name.len != 0) request.artifact_name else request.index_name;
@@ -331,7 +330,7 @@ pub fn prepareEnrichmentClosure(alloc: std.mem.Allocator, txn: anytype, root: u1
 
 pub fn prepareDocumentClosure(alloc: std.mem.Allocator, txn: anytype, root: u128, request: Request, plan: *const Plan) !DocumentClosure {
     if (root == 0) return error.DurableRootIncarnationUnavailable;
-    if (request.doc_key.len == 0 or request.doc_key.len > checkpoints.max_cursor_bytes) return error.InvalidBatchRequest;
+    if (request.doc_key.len > checkpoints.max_cursor_bytes) return error.InvalidBatchRequest;
     const input = @import("artifact_producer_input.zig");
     const authorized = (try input.authorizeDocument(alloc, txn, request, plan)) orelse return error.ArtifactCatalogDrift;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -588,6 +587,9 @@ test "ordered artifact inventory document stream closure requires current output
                 const MetadataAndPrimary = struct {
                     txn: *@TypeOf(read),
                     output: []const u8,
+                    pub fn openPhysicalCursorAdapter(self: *@This()) @TypeOf(self.txn.openPhysicalCursorAdapter()) {
+                        return self.txn.openPhysicalCursorAdapter();
+                    }
                     pub fn get(self: *@This(), selected: []const u8) ![]const u8 {
                         // Provenance/revision witnesses replace vector-body
                         // reads during preparation, not only final commit.
@@ -667,7 +669,9 @@ test "ordered artifact inventory document stream closure requires current output
                 const primary = if (dense) try keys.relationalRowKeyAlloc(arena.allocator(), "doc") else try keys.documentKeyAlloc(arena.allocator(), "doc");
                 var token = (try input.capture(alloc, &read, db.root_incarnation, request, plan, primary, try read.get(primary), null)).?;
                 defer token.deinit();
-                try std.testing.expectError(error.EnrichmentSourceChanged, token.accepted(&read));
+                // The input is still current: replaced output is a cache
+                // miss that schedules fresh work, while the old closure fails.
+                try std.testing.expect(!try token.accepted(&read));
                 try std.testing.expectError(error.EnrichmentSourceChanged, previous.?.requireCurrent(&read, db.root_incarnation));
                 try std.testing.expectError(error.EnrichmentSourceChanged, prepareDocumentClosure(alloc, &read, db.root_incarnation, request, plan));
                 var refs: @import("artifact_producer_dispatch.zig").Buffer = undefined;
@@ -819,7 +823,7 @@ pub fn stage(txn: anytype, root: u128, prepared: *const Prepared) !bool {
     if (root == 0 or root != prepared.record.root) return error.DurableRootIncarnationUnavailable;
     try prepared.record.progress.observation.requireCurrent(txn, prepared.document);
     const obligations = @import("artifact_producer_obligations.zig");
-    const work = (try obligations.load(txn)) orelse return error.ArtifactCoverageBaselinePending;
+    const work = (try obligations.loadMetadata(txn)) orelse return error.ArtifactCoverageBaselinePending;
     try work.requireAuthority(prepared.record.progress.observation.authority);
     if (work.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
     const raw = txn.get(&prepared.selected) catch |err| switch (err) {

@@ -19,7 +19,8 @@ class DocumentExtractionSourceConfig:
         filename_field (str | Unset): Row field holding the source filename.
         content_type_field (str | Unset): Row field holding the source content type.
         etag_field (str | Unset): Row field holding the source ETag.
-        checksum_field (str | Unset): Row field holding the source checksum.
+        checksum_field (str | Unset): Row field holding the source checksum. May name a dotted path (e.g.
+            `metadata.sha256`) to reach a value nested under another row field.
         version_field (str | Unset): Row field holding the source version.
         last_modified_field (str | Unset): Row field holding the source last-modified timestamp.
     """

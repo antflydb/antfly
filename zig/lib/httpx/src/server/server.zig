@@ -140,6 +140,9 @@ pub const ServerConfig = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 8080,
     max_body_size: usize = 10 * 1024 * 1024,
+    /// Optional ceiling for explicitly limited buffered routes. The fallback
+    /// limit for routes without an override remains max_body_size.
+    max_route_body_size: ?usize = null,
     /// Optional ceiling for explicitly bounded raw-streaming routes. It does
     /// not enlarge ordinary bodies or the process-wide buffering budget.
     max_streamed_body_size: ?usize = null,
@@ -204,7 +207,7 @@ pub const ServerConfig = struct {
     /// in-flight requests a client can have on one connection. 0 = use default (100).
     h2_max_concurrent_streams: u32 = 100,
     /// Aggregate request-body bytes retained across every HTTP/1 and HTTP/2
-    /// connection. Values below max_body_size are raised to it so one valid
+    /// connection. Values below the buffered route ceiling are raised to it so one valid
     /// request can always complete; 0 selects that minimum.
     request_body_buffer_budget_bytes: usize = 64 * 1024 * 1024,
     /// Reserved for future server-side TLS support. Zig 0.16 only provides
@@ -216,6 +219,10 @@ pub const ServerConfig = struct {
     /// Resolves every sentinel/default and enforces dependent bounds. Shared
     /// HttpRuntime owners must size their lanes from this value so the runtime
     /// and Server cannot interpret the same listener configuration differently.
+    pub fn bufferedBodyCeiling(config: @This()) usize {
+        return @max(config.max_body_size, config.max_route_body_size orelse config.max_body_size);
+    }
+
     pub fn normalized(config: @This()) @This() {
         var resolved = config;
         if (resolved.max_connections == 0) resolved.max_connections = 1000;
@@ -224,7 +231,7 @@ pub const ServerConfig = struct {
         // Do not advertise more simultaneous streams on one connection than
         // this listener can ever publish to its bounded handler lane.
         resolved.h2_max_concurrent_streams = @min(resolved.h2_max_concurrent_streams, resolved.max_request_tasks);
-        resolved.request_body_buffer_budget_bytes = @max(resolved.request_body_buffer_budget_bytes, resolved.max_body_size);
+        resolved.request_body_buffer_budget_bytes = @max(resolved.request_body_buffer_budget_bytes, resolved.bufferedBodyCeiling());
         resolved.accept_error_backoff_initial_ms = @max(resolved.accept_error_backoff_initial_ms, 1);
         resolved.accept_error_backoff_max_ms = @max(resolved.accept_error_backoff_max_ms, resolved.accept_error_backoff_initial_ms);
         return resolved;
@@ -327,7 +334,7 @@ fn hasCompleteBufferedH1Request(allocator: Allocator, input: []const u8, config:
     // In particular, do not reserve the declared Content-Length before the
     // complete body is known to be buffered.
     probe.store_body = false;
-    probe.max_body_size = config.max_body_size;
+    probe.max_body_size = config.bufferedBodyCeiling();
     probe.max_headers = config.max_headers;
     _ = probe.feed(input) catch return false;
     return probe.isComplete();
@@ -2233,6 +2240,7 @@ pub const Server = struct {
         var parser = Parser.init(self.allocator);
         defer parser.deinit();
         parser.max_body_size = self.config.max_body_size;
+        parser.max_route_body_size = self.config.max_route_body_size;
         parser.max_headers = self.config.max_headers;
         parser.body_budget = &self.body_budget;
         if (self.router.hasBodyLimits()) {
@@ -2628,7 +2636,7 @@ pub const Server = struct {
         const ceiling = if (self.router.requestBodyStreaming(method, path) == .raw)
             self.config.max_streamed_body_size orelse self.config.max_body_size
         else
-            self.config.max_body_size;
+            self.config.bufferedBodyCeiling();
         return @min(route_limit, ceiling);
     }
 
@@ -4104,6 +4112,46 @@ test "route body limits resolve before transport body admission" {
 
     try std.testing.expectEqual(@as(?usize, 64), Server.resolveRequestBodyLimit(&server, .POST, "/bounded/7?x=1"));
     try std.testing.expectEqual(@as(?usize, null), Server.resolveRequestBodyLimit(&server, .POST, "/global"));
+}
+
+test "privacy buffered route opt-in raises only explicitly limited bodies" {
+    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .max_body_size = 4,
+        .max_route_body_size = 16,
+        .request_body_buffer_budget_bytes = 0,
+    });
+    defer server.deinit();
+    const handler = struct {
+        fn h(ctx: *Context) !Response {
+            return ctx.text("ok");
+        }
+    }.h;
+    try server.postWithBodyLimit("/privacy", 32, handler);
+    try server.postWithBodyLimit("/small", 2, handler);
+    try server.post("/ordinary", handler);
+    try std.testing.expectEqual(@as(usize, 16), server.config.request_body_buffer_budget_bytes);
+    try std.testing.expectEqual(@as(?usize, 16), Server.resolveRequestBodyLimit(&server, .POST, "/privacy"));
+    try std.testing.expectEqual(@as(?usize, 2), Server.resolveRequestBodyLimit(&server, .POST, "/small"));
+    try std.testing.expectEqual(@as(?usize, null), Server.resolveRequestBodyLimit(&server, .POST, "/ordinary"));
+    var parser = Parser.init(std.testing.allocator);
+    defer parser.deinit();
+    parser.max_body_size = server.config.max_body_size;
+    parser.max_route_body_size = server.config.max_route_body_size;
+    parser.request_body_limit_context = &server;
+    parser.request_body_limit_resolver = Server.resolveRequestBodyLimit;
+    const request = "POST /privacy HTTP/1.1\r\nHost: local\r\nContent-Length: 10\r\n\r\n0123456789";
+    _ = try parser.feed(request);
+    try std.testing.expect(parser.isComplete());
+    try std.testing.expect(hasCompleteBufferedH1Request(std.testing.allocator, request, server.config));
+    var ordinary = Parser.init(std.testing.allocator);
+    defer ordinary.deinit();
+    ordinary.max_body_size = server.config.max_body_size;
+    ordinary.max_route_body_size = server.config.max_route_body_size;
+    ordinary.request_body_limit_context = &server;
+    ordinary.request_body_limit_resolver = Server.resolveRequestBodyLimit;
+    _ = try ordinary.feed("POST /ordinary HTTP/1.1\r\nHost: local\r\nContent-Length: 10\r\n\r\n0123456789");
+    try std.testing.expect(ordinary.isError());
+    try std.testing.expectEqual(.body_too_large, ordinary.error_reason);
 }
 
 test "attachment body streaming requires route opt-in and framed content type" {

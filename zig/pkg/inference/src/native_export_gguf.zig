@@ -922,6 +922,7 @@ fn preferClipclapDefaultOnnxInputs(
     replaceOptionalPath(allocator, &manifest.gguf_path, null);
     replaceOptionalPath(allocator, &manifest.gguf_projector_path, null);
     try replaceOptionalPathJoined(allocator, &manifest.onnx_path, model_dir, "text_model.onnx");
+    try replaceOptionalPathJoined(allocator, &manifest.onnx_logical_path, model_dir, "text_model.onnx");
     try replaceOptionalPathJoined(allocator, &manifest.visual_model_path, model_dir, "visual_model.onnx");
     try replaceOptionalPathJoined(allocator, &manifest.audio_model_path, model_dir, "audio_model.onnx");
     try replaceOptionalPathJoined(allocator, &manifest.text_projection_path, model_dir, "text_projection.onnx");

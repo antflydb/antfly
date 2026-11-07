@@ -42,6 +42,7 @@ pub const ReadinessChecker = struct {
 
     pub const VTable = struct {
         check: *const fn (ptr: *anyopaque) bool,
+        sql_check: ?*const fn (ptr: *anyopaque) bool = null,
     };
 
     pub fn check(self: ReadinessChecker) bool {
@@ -111,6 +112,7 @@ pub const HealthServer = struct {
         self.listener_task = httpx.ListenerTask.init(&self.server);
         try self.server.get("/healthz", httpx.Handler.bind(self, healthz));
         try self.server.get("/readyz", httpx.Handler.bind(self, readyz));
+        try self.server.get("/readyz/sql", httpx.Handler.bind(self, readyzSql));
         try self.server.get("/metrics", httpx.Handler.bind(self, metricsHandler));
         if (metrics != null) {
             self.refreshMetricsCacheSync() catch {};
@@ -224,6 +226,11 @@ pub const HealthServer = struct {
         const is_ready = if (self.ready) |ready| ready.check() else true;
         if (is_ready) return try ctx.json(.{ .status = "ready" });
         return try ctx.status(503).json(.{ .status = "not_ready" });
+    }
+
+    fn readyzSql(self: *HealthServer, ctx: *httpx.Context) anyerror!httpx.Response {
+        const ready = if (self.ready) |checker| if (checker.vtable.sql_check) |check| check(checker.ptr) else false else false;
+        return if (ready) try ctx.json(.{ .status = "ready" }) else try ctx.status(503).json(.{ .status = "not_ready" });
     }
 
     fn metricsHandler(self: *HealthServer, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -522,4 +529,23 @@ test "health server appendPromMetricLabeled formats and escapes labels" {
         "# TYPE my_metric_total counter\n" ++
         "my_metric_total{kind=\"run_table_index\",path=\"quote\\\"slash\\\\line\\n\"} 9\n";
     try testing.expectEqualStrings(expected, writer.buffered());
+}
+
+test "distributed SQL capability readiness is explicit on the health listener" {
+    var fake = FakeReady{ .ready = true };
+    const unavailable = try HealthServer.init(testing.allocator, std.testing.io, .{ .bind_port = 0 }, fake.iface(), null);
+    defer unavailable.deinit();
+    var absent = try unavailable.executeForTest(.GET, "/readyz/sql");
+    defer absent.deinit();
+    try testing.expectEqual(@as(u16, 503), absent.status.code);
+    const capable: ReadinessChecker = .{ .ptr = &fake, .vtable = &.{ .check = FakeReady.check, .sql_check = FakeReady.check } };
+    const server = try HealthServer.init(testing.allocator, std.testing.io, .{ .bind_port = 0 }, capable, null);
+    defer server.deinit();
+    var ready = try server.executeForTest(.GET, "/readyz/sql");
+    defer ready.deinit();
+    try testing.expectEqual(@as(u16, 200), ready.status.code);
+    fake.ready = false;
+    var stopped = try server.executeForTest(.GET, "/readyz/sql");
+    defer stopped.deinit();
+    try testing.expectEqual(@as(u16, 503), stopped.status.code);
 }

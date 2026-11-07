@@ -54,6 +54,7 @@ pub fn build(b: *std.Build) void {
     const test_files = [_][]const u8{
         "src/hlo.zig",
         "src/pjrt.zig",
+        "src/abi_test.zig",
     };
 
     for (test_files) |file| {
@@ -66,8 +67,24 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "xla_proto", .module = xla_proto_mod },
             },
         });
+        if (std.mem.eql(u8, file, "src/abi_test.zig")) {
+            mod.addIncludePath(b.path("vendor/openxla"));
+            mod.addCSourceFile(.{ .file = b.path("src/abi_test.c"), .flags = &.{"-std=c11"} });
+        }
         const t = b.addTest(.{ .root_module = mod });
         t.root_module.link_libc = true;
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+    const upload_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/upload_failure_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "protobuf", .module = protobuf_mod },
+            .{ .name = "xla_proto", .module = xla_proto_mod },
+        },
+    });
+    upload_tests_mod.link_libc = true;
+    const upload_tests = b.addExecutable(.{ .name = "pjrt-upload-failure-test", .root_module = upload_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(upload_tests).step);
 }

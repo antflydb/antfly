@@ -9,6 +9,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.decision_batch_item import DecisionBatchItem
+    from ..models.decision_cascade_trace import DecisionCascadeTrace
     from ..models.decision_usage import DecisionUsage
     from ..models.embedding_choice_answer import EmbeddingChoiceAnswer
     from ..models.embedding_multi_choice_answer import EmbeddingMultiChoiceAnswer
@@ -39,6 +40,9 @@ class InferenceDecideResponse:
                 GeneratedMultiChoiceAnswer | GeneratedPredicateAnswer | GeneratedScoreAnswer | TrainedChoiceAnswer |
                 TrainedPredicateAnswer | TrainedScoreAnswer] | Unset):
             data (list[DecisionBatchItem] | Unset):
+            cascade (DecisionCascadeTrace | Unset): Present when a cascade decider answered. Lists the stages that ran for
+                this input, in order. The top-level model and answers come from the answering stage, and usage is the sum over
+                these stages.
     """
 
     model: str
@@ -60,6 +64,7 @@ class InferenceDecideResponse:
         | Unset
     ) = UNSET
     data: list[DecisionBatchItem] | Unset = UNSET
+    cascade: DecisionCascadeTrace | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.embedding_choice_answer import EmbeddingChoiceAnswer
@@ -112,6 +117,10 @@ class InferenceDecideResponse:
                 data_item = data_item_data.to_dict()
                 data.append(data_item)
 
+        cascade: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.cascade, Unset):
+            cascade = self.cascade.to_dict()
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -128,12 +137,15 @@ class InferenceDecideResponse:
             field_dict["answers"] = answers
         if data is not UNSET:
             field_dict["data"] = data
+        if cascade is not UNSET:
+            field_dict["cascade"] = cascade
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.decision_batch_item import DecisionBatchItem
+        from ..models.decision_cascade_trace import DecisionCascadeTrace
         from ..models.decision_usage import DecisionUsage
         from ..models.embedding_choice_answer import EmbeddingChoiceAnswer
         from ..models.embedding_multi_choice_answer import EmbeddingMultiChoiceAnswer
@@ -269,6 +281,13 @@ class InferenceDecideResponse:
 
                 data.append(data_item)
 
+        _cascade = d.pop("cascade", UNSET)
+        cascade: DecisionCascadeTrace | Unset
+        if isinstance(_cascade, Unset):
+            cascade = UNSET
+        else:
+            cascade = DecisionCascadeTrace.from_dict(_cascade)
+
         inference_decide_response = cls(
             model=model,
             usage=usage,
@@ -276,6 +295,7 @@ class InferenceDecideResponse:
             renderer_version=renderer_version,
             answers=answers,
             data=data,
+            cascade=cascade,
         )
 
         return inference_decide_response

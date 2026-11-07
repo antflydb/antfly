@@ -79,6 +79,17 @@ type CollaborationConnector struct {
 	DownloadTransport                           http.RoundTripper
 }
 
+// newAcquisition shares immutable transports and configuration while giving
+// each sync or preview its own cursors, hydration and authorization caches.
+func (c *CollaborationConnector) newAcquisition() *CollaborationConnector {
+	return &CollaborationConnector{
+		ProviderName: c.ProviderName, HTTPClient: c.HTTPClient, AccessToken: c.AccessToken,
+		Services: c.Services, APIBase: c.APIBase, GmailBase: c.GmailBase, CalendarBase: c.CalendarBase,
+		DriveBase: c.DriveBase, Extractor: c.Extractor, DownloadTransport: c.DownloadTransport,
+		NativeAttachments: c.NativeAttachments, ExtractorVersion: c.ExtractorVersion, accessAuditWindow: c.accessAuditWindow, accessWait: c.accessWait,
+	}
+}
+
 type collaborationRef struct {
 	Resource   string `json:"resource"`
 	Container  string `json:"container"`

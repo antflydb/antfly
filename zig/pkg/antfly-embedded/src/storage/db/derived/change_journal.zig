@@ -199,7 +199,7 @@ pub fn deinitRecord(alloc: Allocator, record: *Record) void {
 }
 
 fn appendUniqueStringIndexed(alloc: Allocator, list: *std.ArrayListUnmanaged([]const u8), seen: *std.StringHashMapUnmanaged(void), value: []const u8) !void {
-    if (value.len == 0 or seen.contains(value)) return;
+    if (seen.contains(value)) return;
     const owned = try alloc.dupe(u8, value);
     errdefer alloc.free(owned);
     try seen.put(alloc, owned, {});
@@ -1599,4 +1599,17 @@ test "change journal asset metadata decode retains only root descriptors" {
     try std.testing.expectEqualStrings(root, decoded.changed_artifact_keys[0]);
     try std.testing.expect(scratch.changed_artifact_keys.capacity < 16);
     try std.testing.expectError(error.UnexpectedEndOfInput, decodeBinaryRecordBorrowedScratchSelected(a, raw[0 .. raw.len - 1], &scratch, .{ .asset_roots_only = true }));
+}
+
+test "privacy change journal preserves empty document references and deletions" {
+    const a = std.testing.allocator;
+    var record = try recordFromDerivedBatch(a, .{
+        .generated_enrichment_refs = &.{.{ .kind = .asset, .index_name = "privacy", .artifact_name = "privacy", .doc_key = "" }},
+        .deleted_keys = &.{""},
+    }, 1);
+    defer deinitRecord(a, &record);
+    try std.testing.expectEqual(@as(usize, 1), record.changed_doc_keys.len);
+    try std.testing.expectEqualStrings("", record.changed_doc_keys[0]);
+    try std.testing.expectEqual(@as(usize, 1), record.deleted_doc_keys.len);
+    try std.testing.expectEqualStrings("", record.deleted_doc_keys[0]);
 }
