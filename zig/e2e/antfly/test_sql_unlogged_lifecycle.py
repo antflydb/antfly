@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import requests
 from sql_observation_retry import definite_observation_abort
+from sql_prepared_setup import prepare_named_setup
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     REPO_ROOT,
@@ -188,6 +189,21 @@ def test_unlogged_originals_preserve_clean_rows_and_reset_real_process_loss(case
     try:
         completed_constraints = set()
         completed_jobs = set()
+
+        def prepared_setup(connection_id, statements, prepare):
+            def execute(statement):
+                response = requests.post(
+                    server.api_url + "/sql",
+                    json={"statement": statement, "connection_id": connection_id},
+                    timeout=30,
+                )
+                return response.status_code, response.json()
+
+            try:
+                return prepare_named_setup(execute, statements, prepare)
+            except Exception:
+                print(server.debug_logs())
+                raise
 
         def sql(statement, connection=None, *, read=False):
             deadline = time.monotonic() + 60
@@ -463,9 +479,11 @@ def test_unlogged_originals_preserve_clean_rows_and_reset_real_process_loss(case
             # process shutdown, matching PostgreSQL's independent decision life.
             sql("CREATE UNLOGGED TABLE lifecycle_prepared(id BIGINT PRIMARY KEY)")
             prepared = connection()
-            sql("BEGIN", prepared)
-            sql("INSERT INTO lifecycle_prepared VALUES (18)", prepared)
-            sql("PREPARE TRANSACTION 'unlogged_clean_restart'", prepared)
+            prepared_setup(
+                prepared,
+                ("INSERT INTO lifecycle_prepared VALUES (18)",),
+                "PREPARE TRANSACTION 'unlogged_clean_restart'",
+            )
             closed = requests.delete(
                 server.api_url + "/sql/connections/" + prepared, timeout=10
             )
@@ -493,17 +511,20 @@ def test_unlogged_originals_preserve_clean_rows_and_reset_real_process_loss(case
                 ["18"]
             ]
             mixed = connection()
-            sql("BEGIN", mixed)
-            sql(
-                "INSERT INTO lifecycle_permanent VALUES ('00000000-0000-0000-0000-000000000010', 'committed-after-loss')",
+            prepared_setup(
                 mixed,
+                (
+                    "INSERT INTO lifecycle_permanent VALUES ('00000000-0000-0000-0000-000000000010', 'committed-after-loss')",
+                    "INSERT INTO lifecycle_prepared VALUES (19)",
+                ),
+                "PREPARE TRANSACTION 'mixed_native_crash'",
             )
-            sql("INSERT INTO lifecycle_prepared VALUES (19)", mixed)
-            sql("PREPARE TRANSACTION 'mixed_native_crash'", mixed)
             native_only = connection()
-            sql("BEGIN", native_only)
-            sql("INSERT INTO lifecycle_prepared VALUES (20)", native_only)
-            sql("PREPARE TRANSACTION 'unlogged_native_crash'", native_only)
+            prepared_setup(
+                native_only,
+                ("INSERT INTO lifecycle_prepared VALUES (20)",),
+                "PREPARE TRANSACTION 'unlogged_native_crash'",
+            )
             for prepared_connection in (mixed, native_only):
                 closed = requests.delete(
                     server.api_url + "/sql/connections/" + prepared_connection,

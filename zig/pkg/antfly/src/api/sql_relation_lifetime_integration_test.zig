@@ -9,6 +9,92 @@ const client = @import("sql_owner_test_client.zig");
 const Wire = @import("antfly_metadata_openapi").types;
 const first_id = "11111111-1111-4111-8111-111111111111";
 const second_id = "22222222-2222-4222-8222-222222222222";
+// Transport-local fault owner: the final authenticated metadata body is
+// forwarded byte-for-byte with its original executor/pointer and credentials.
+// Only the selected admission is delayed by a real unrelated public DDL.
+const PrepareCatalogRace = struct {
+    const http = @import("../raft/transport/http_common.zig");
+    const P = @import("../system_catalog/prepared_transactions.zig");
+    const gid = "lifetime_definite_prepare_abort";
+    // Preserve the actual four-lane metadata client pool. Collapsing every
+    // request onto one original executor would change unrelated scheduling.
+    forwarders: [4]Forward = undefined,
+    context: ?*fixture.Context = null,
+    armed: std.atomic.Value(bool) = .init(false),
+    txn_id: ?[16]u8 = null,
+    digest: ?[32]u8 = null,
+    capture_ready: std.atomic.Value(bool) = .init(false),
+    cancellation_seen: std.atomic.Value(bool) = .init(false),
+
+    const Forward = struct {
+        inner: http.RequestExecutor,
+        owner: *PrepareCatalogRace,
+        vtable: http.RequestExecutor.VTable,
+        fn init(inner: http.RequestExecutor, owner: *PrepareCatalogRace) @This() {
+            return .{ .inner = inner, .owner = owner, .vtable = .{
+                .execute = forward,
+                .execute_stream = if (inner.vtable.execute_stream != null) stream else null,
+                .supports_concurrent_requests = if (inner.vtable.supports_concurrent_requests != null) concurrent else null,
+            } };
+        }
+        fn executor(self: *@This()) http.RequestExecutor {
+            return .{ .ptr = self, .vtable = &self.vtable, .clock_io = self.inner.clock_io, .realtime_ns_fn = if (self.inner.realtime_ns_fn != null) realtime else null };
+        }
+        fn concurrent(ptr: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            return self.inner.supportsConcurrentRequests();
+        }
+        fn realtime(ptr: *anyopaque) i128 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.inner.realtimeNs().?;
+        }
+        fn stream(ptr: *anyopaque, a: std.mem.Allocator, request: http.HttpRequest, writer: http.StreamWriter) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return (try self.inner.executeStream(a, request, writer)) orelse error.TestUnexpectedResult;
+        }
+        fn forward(ptr: *anyopaque, a: std.mem.Allocator, request: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.owner.intercept(self.inner, a, request);
+        }
+    };
+    fn intercept(self: *@This(), inner: http.RequestExecutor, a: std.mem.Allocator, request: http.HttpRequest) !http.HttpResponse {
+        if (request.method != .POST or !std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"))
+            return inner.execute(a, request);
+        const body = request.body;
+        // All other transport traffic forwards directly. Parse only this
+        // fixture GID, including its exact sealed cancellation request.
+        if (std.mem.indexOf(u8, body, gid) == null) return inner.execute(a, request);
+        var parsed = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, a, body, .{});
+        defer parsed.deinit();
+        if (parsed.value != .sql_prepared_mutate) return inner.execute(a, request);
+        const mutation = parsed.value.sql_prepared_mutate;
+        if (mutation.operation == .admit and std.mem.eql(u8, mutation.operation.admit.identity.gid, gid) and self.armed.swap(false, .acq_rel)) {
+            const ctx = self.context orelse return error.TestUnexpectedResult;
+            self.txn_id = mutation.operation.admit.identity.txn_id;
+            self.digest = try P.commandDigest(a, mutation);
+            self.capture_ready.store(true, .release);
+            var authenticated = ctx.*;
+            authenticated.headers = ctx.admin_headers;
+            var changed = try client.executeConnected(&authenticated, null, null, "CREATE TABLE lifetime_prepare_catalog_race(id BIGINT)", .never);
+            defer changed.deinit(ctx.alloc);
+            try std.testing.expect(changed.status == 200 or changed.status == 202);
+        }
+        var response = try inner.execute(a, request);
+        errdefer response.deinit(a);
+        if (mutation.operation == .cancel_admission and self.capture_ready.load(.acquire) and
+            std.mem.eql(u8, &mutation.operation.cancel_admission.original.identity.txn_id, &self.txn_id.?))
+        {
+            try std.testing.expectEqualDeep(self.digest.?, try P.commandDigest(a, mutation));
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            var outcome = try std.json.parseFromSlice(?P.outcomes.Outcome, a, response.body, .{});
+            defer outcome.deinit();
+            try std.testing.expect(outcome.value != null and outcome.value.? == .rejected);
+            self.cancellation_seen.store(true, .release);
+        }
+        return response;
+    }
+};
+
 const Campaign = struct {
     pub const native_auth = true;
     pub const native_sessions = true;
@@ -23,7 +109,80 @@ const Campaign = struct {
         }
     }
     credentials: client.ApiKeyHeaders = .{},
+    prepare_race: PrepareCatalogRace = .{},
     connection: [32]u8 = undefined,
+    pub fn configureData(self: *@This(), data: *@import("../data/runtime.zig").DataServer, _: std.Io) !void {
+        const remote = data.remote_metadata orelse return error.TestUnexpectedResult;
+        // Install before ingress/background progress. Preserve the original
+        // executor and its opaque pointer for every forwarded request. Remote
+        // owns the allocated slice; this campaign owns the proxy through close.
+        try std.testing.expectEqual(@as(usize, 0), remote.request_executors.len);
+        try std.testing.expectEqual(@as(usize, self.prepare_race.forwarders.len), remote.http_executors.len);
+        const executors = try remote.alloc.alloc(@import("../raft/transport/http_common.zig").RequestExecutor, remote.http_executors.len);
+        for (remote.http_executors, executors, 0..) |*inner, *out, i| {
+            self.prepare_race.forwarders[i] = PrepareCatalogRace.Forward.init(inner.executor(), &self.prepare_race);
+            out.* = self.prepare_race.forwarders[i].executor();
+        }
+        remote.request_executors = executors;
+    }
+    fn rejectedPrepare(self: *@This(), ctx: *fixture.Context) !void {
+        const id = try open(ctx);
+        const prior = self.connection;
+        defer self.connection = prior;
+        self.connection = id;
+        try self.command(ctx, "BEGIN");
+        try self.command(ctx, "INSERT INTO lifetime_unrelated_prepared VALUES (17)");
+        self.prepare_race.context = ctx;
+        defer self.prepare_race.context = null;
+        self.prepare_race.armed.store(true, .release);
+        var response = try client.executeConnected(ctx, null, &id, "PREPARE TRANSACTION '" ++ PrepareCatalogRace.gid ++ "'", .never);
+        defer response.deinit(ctx.alloc);
+        errdefer std.debug.print("rejected PREPARE status={d} body={s}\n", .{ response.status, response.body });
+        try std.testing.expectEqual(@as(u16, 409), response.status);
+        var diagnostic = try std.json.parseFromSlice(std.json.Value, ctx.alloc, response.body, .{});
+        defer diagnostic.deinit();
+        const fields = diagnostic.value.object;
+        try std.testing.expectEqualStrings("40001", fields.get("code").?.string);
+        try std.testing.expect(fields.get("retryable").?.bool);
+        try std.testing.expectEqualStrings("idle", fields.get("transaction_status").?.string);
+        inline for (.{ "transaction_id", "reconciliation_id", "mutation_outcome", "admission_outcome", "status", "ddl_receipt", "catalog_receipt", "rows", "columns", "rows_affected", "command_tag" }) |key|
+            if (fields.get(key)) |value| try std.testing.expect(value == .null);
+        try std.testing.expect(self.prepare_race.capture_ready.load(.acquire));
+        try std.testing.expect(self.prepare_race.cancellation_seen.load(.acquire));
+        const api = &ctx.data.http_server.?;
+        var durable = (try api.txn_sessions.durable.?.loadInto(ctx.alloc, self.prepare_race.txn_id.?)).?;
+        defer durable.deinit(ctx.alloc);
+        try std.testing.expect(durable.terminal_abort and durable.external_receipt_acknowledged);
+        try std.testing.expect(!durable.external_preparation_prepared and durable.external_decision == null);
+        var seal = try std.json.parseFromSlice(@import("transactions.zig").ExternalPreparationSeal, ctx.alloc, durable.external_preparation.?, .{});
+        defer seal.deinit();
+        try std.testing.expectEqualDeep(self.prepare_race.digest.?, try PrepareCatalogRace.P.commandDigest(ctx.alloc, try seal.value.admissionRequest()));
+        const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+        const bytes = try source.systemCatalog(ctx.alloc, .{ .setting_admin = true }, .{ .sql_prepared_read = .{ .gid = PrepareCatalogRace.gid } });
+        defer ctx.alloc.free(bytes);
+        var absent = try std.json.parseFromSlice(PrepareCatalogRace.P.Snapshot, ctx.alloc, bytes, .{});
+        defer absent.deinit();
+        try std.testing.expectEqual(@as(usize, 0), absent.value.records.len);
+        try std.testing.expectEqual(@as(usize, 0), absent.value.receipts.len);
+        // Only a fresh complete transaction can retry the abandoned mutations.
+        // The same GID is available and no old row became visible.
+        try self.rows(ctx, "SELECT id FROM lifetime_unrelated_prepared", &.{}, &.{23});
+        // This unrelated no-PK declaration only advanced the catalog. It is
+        // not a participating Raft donor; observe its actual serving schema
+        // and canonical logical publication before the fresh transaction.
+        _ = try fixture.waitServingSchema(ctx, "lifetime_prepare_catalog_race", 0);
+        try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "lifetime_prepare_catalog_race");
+        try self.command(ctx, "BEGIN");
+        try self.command(ctx, "INSERT INTO lifetime_unrelated_prepared VALUES (17)");
+        try self.command(ctx, "PREPARE TRANSACTION '" ++ PrepareCatalogRace.gid ++ "'");
+        try self.command(ctx, "ROLLBACK PREPARED '" ++ PrepareCatalogRace.gid ++ "'");
+        try self.rows(ctx, "SELECT id FROM lifetime_unrelated_prepared", &.{}, &.{23});
+        const path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/connections/{s}", .{id});
+        defer ctx.alloc.free(path);
+        var closed = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, path, .DELETE, null, 30000);
+        defer closed.deinit(ctx.alloc);
+        try std.testing.expect(closed.status == 200 or closed.status == 204);
+    }
     fn open(ctx: *fixture.Context) ![32]u8 {
         var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "/db/v1/sql/connections", .POST, "{}", 15000);
         defer response.deinit(ctx.alloc);
@@ -141,6 +300,8 @@ const Campaign = struct {
         defer ctx.alloc.free(fresh_close_target);
         var fresh_closed = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, fresh_close_target, .DELETE, null, 30000);
         defer fresh_closed.deinit(ctx.alloc);
+        if (fresh_closed.status != 200 and fresh_closed.status != 204)
+            std.debug.print("native lifetime fresh TEMP connection close status={d} body={s} truncated={}\n", .{ fresh_closed.status, fresh_closed.body[0..@min(fresh_closed.body.len, 1024)], fresh_closed.body.len > 1024 });
         try std.testing.expect(fresh_closed.status == 200 or fresh_closed.status == 204);
         self.connection = original_owner;
         // An unrelated named PREPARED keeps its own row/range custody. It
@@ -152,6 +313,7 @@ const Campaign = struct {
         // only the existing bounded pure-read admission policy may retry.
         try self.rows(ctx, "SELECT id FROM lifetime_unrelated_prepared", &.{}, &.{23});
         try self.rows(ctx, "SELECT id FROM lifetime_unrelated_permanent", &.{}, &.{23});
+        try self.rejectedPrepare(ctx);
         const temp_owner = self.connection;
         self.connection = try open(ctx);
         try self.command(ctx, "BEGIN");

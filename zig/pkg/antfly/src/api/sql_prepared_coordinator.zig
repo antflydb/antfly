@@ -881,6 +881,12 @@ pub fn execute(root: *execution.Adapter, session: *sql_session.Session, coordina
         var observed = (try server.txn_sessions.getSqlState(server.alloc, id)) orelse return error.SqlTransactionOutcomeUnknown;
         defer observed.deinit(server.alloc);
         if (observed.terminal_abort) {
+            // Exact cancellation proved this immutable PREPARE was never
+            // admitted. Complete its durable connection detachment before
+            // advertising idle/no reconciliation ID. A lost detach reply
+            // remains owned by this same aborted session, never a SQL retry.
+            if (root.connection_id != null)
+                session.owner.vtable.rollback(session.owner.ptr, session.scope, id) catch return error.SqlTransactionOutcomeUnknown;
             session.transaction_id = null;
             root.outcome_transaction_id = null;
             return err;

@@ -26429,13 +26429,13 @@
     },
     {
       "id": "sql-1150",
-      "status": "rejected",
-      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "status": "superseded",
+      "reason": "The original rejection is superseded by PostgreSQL-compatible ordinary trigger support. The unchanged declaration executes against its genuine table and trigger function; native writes verify event/column/WHEN selection, statement TRUNCATE, literal arguments, DROP and cold retained activation.",
       "evidence": [
         {
-          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
-          "test": "SQL original unsupported catalog object commands reject before backend access",
-          "gate": "sql-compiler-rejections"
+          "path": "zig/pkg/antfly/src/api/sql_trigger_integration_test.zig",
+          "test": "mounted PostgreSQL original ordinary trigger supersessions preserve events predicates arguments and cold activation",
+          "gate": "sql-table-trigger-originals-public-debug"
         }
       ]
     },
@@ -26465,37 +26465,37 @@
     },
     {
       "id": "sql-1153",
-      "status": "rejected",
-      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "status": "superseded",
+      "reason": "The original rejection is superseded by PostgreSQL-compatible ordinary trigger support. The unchanged declaration executes against its genuine table and trigger function; native writes verify event/column/WHEN selection, statement TRUNCATE, literal arguments, DROP and cold retained activation.",
       "evidence": [
         {
-          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
-          "test": "SQL original unsupported catalog object commands reject before backend access",
-          "gate": "sql-compiler-rejections"
+          "path": "zig/pkg/antfly/src/api/sql_trigger_integration_test.zig",
+          "test": "mounted PostgreSQL original ordinary trigger supersessions preserve events predicates arguments and cold activation",
+          "gate": "sql-table-trigger-originals-public-debug"
         }
       ]
     },
     {
       "id": "sql-1154",
-      "status": "rejected",
-      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "status": "superseded",
+      "reason": "The original rejection is superseded by PostgreSQL-compatible ordinary trigger support. The unchanged declaration executes against its genuine table and trigger function; native writes verify event/column/WHEN selection, statement TRUNCATE, literal arguments, DROP and cold retained activation.",
       "evidence": [
         {
-          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
-          "test": "SQL original unsupported catalog object commands reject before backend access",
-          "gate": "sql-compiler-rejections"
+          "path": "zig/pkg/antfly/src/api/sql_trigger_integration_test.zig",
+          "test": "mounted PostgreSQL original ordinary trigger supersessions preserve events predicates arguments and cold activation",
+          "gate": "sql-table-trigger-originals-public-debug"
         }
       ]
     },
     {
       "id": "sql-1155",
-      "status": "rejected",
-      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "status": "superseded",
+      "reason": "The original rejection is superseded by PostgreSQL-compatible ordinary trigger support. The unchanged declaration executes against its genuine table and trigger function; native writes verify event/column/WHEN selection, statement TRUNCATE, literal arguments, DROP and cold retained activation.",
       "evidence": [
         {
-          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
-          "test": "SQL original unsupported catalog object commands reject before backend access",
-          "gate": "sql-compiler-rejections"
+          "path": "zig/pkg/antfly/src/api/sql_trigger_integration_test.zig",
+          "test": "mounted PostgreSQL original ordinary trigger supersessions preserve events predicates arguments and cold activation",
+          "gate": "sql-table-trigger-originals-public-debug"
         }
       ]
     },
@@ -26513,13 +26513,13 @@
     },
     {
       "id": "sql-1157",
-      "status": "rejected",
-      "reason": "The original rejects this unsupported catalog-object command. The current compiler rejects the exact source SQL with a nonempty diagnostic before any catalog or storage access.",
+      "status": "superseded",
+      "reason": "The original rejection is superseded by PostgreSQL-compatible ordinary trigger support. The unchanged declaration executes against its genuine table and trigger function; native writes verify event/column/WHEN selection, statement TRUNCATE, literal arguments, DROP and cold retained activation.",
       "evidence": [
         {
-          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
-          "test": "SQL original unsupported catalog object commands reject before backend access",
-          "gate": "sql-compiler-rejections"
+          "path": "zig/pkg/antfly/src/api/sql_trigger_integration_test.zig",
+          "test": "mounted PostgreSQL original ordinary trigger supersessions preserve events predicates arguments and cold activation",
+          "gate": "sql-table-trigger-originals-public-debug"
         }
       ]
     },

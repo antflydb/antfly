@@ -352,7 +352,7 @@ const OrdinaryTriggerCampaign = struct {
         var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, failed.body, .{ .ignore_unknown_fields = true });
         defer diagnostic.deinit();
         try std.testing.expectEqualStrings("22012", diagnostic.value.code);
-        try std.testing.expectEqual(@as(usize, 0), (diagnostic.value.notices orelse &.{}).len);
+        if (diagnostic.value.notices) |notices| try std.testing.expectEqual(@as(usize, 0), notices.len);
         try std.testing.expectEqual(before, try tableIdentity(ctx));
         var rows = try query(ctx, "SELECT count(*) FROM truncate_notices");
         defer rows.deinit();
@@ -361,8 +361,9 @@ const OrdinaryTriggerCampaign = struct {
         _ = try fixture.waitServingSchema(ctx, "truncate_notices", 0);
         var accepted = try query(ctx, "TRUNCATE truncate_notices");
         defer accepted.deinit();
-        try std.testing.expectEqual(@as(usize, 1), (accepted.value.notices orelse &.{}).len);
-        try std.testing.expectEqualStrings("audit fired", accepted.value.notices.?[0].message);
+        const accepted_notices = accepted.value.notices orelse return error.MissingTriggerNotices;
+        try std.testing.expectEqual(@as(usize, 1), accepted_notices.len);
+        try std.testing.expectEqualStrings("audit fired", accepted_notices[0].message);
         self.truncate_job = try ctx.alloc.dupe(u8, accepted.value.ddl_receipt.?.restore_job_id.?);
         try awaitCommandResult(ctx, accepted.value);
         self.truncate_result = try completedNotices(ctx, self.truncate_job.?);

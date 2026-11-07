@@ -5584,6 +5584,39 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn provisionRestoreOwners(self: *LocalStandaloneMetadata) !void {
+        const Primer = struct {
+            server: *antfly.data.runtime.DataServer,
+            alloc: std.mem.Allocator,
+            fn prime(primer: @This(), plan: Staging.Plan, plan_digest: Staging.Digest, target: Staging.Target, range_index: usize, scope: @import("antfly_local_sources").storage_db_restore_staging_contract.Scope, cancel_recovery: bool) !void {
+                const source = &primer.server.write_source;
+                const owner_range = target.ranges[range_index];
+                if (comptime control_only_storage_sources) {
+                    const bootstrap = try Staging.ownerBootstrapForRangeIndex(primer.alloc, plan, plan_digest, target, range_index);
+                    return primer.server.primePrivateRestoreOwner(source, .{
+                        .plan_id = plan.id,
+                        .plan_digest = plan_digest,
+                        .table = target.table,
+                        .range = owner_range,
+                        .bootstrap = bootstrap,
+                        .scope = scope,
+                        .cancel_recovery = cancel_recovery,
+                        .native_reset = target.native_reset,
+                    });
+                }
+                const range: antfly.db.types.ByteRange = .{ .start = owner_range.start_key, .end = owner_range.end_key orelse "" };
+                if (cancel_recovery)
+                    try source.primeRestoreStagingWriterForCancellation(primer.alloc, owner_range.group_id, target.table, range, scope)
+                else
+                    try source.primeRestoreStagingWriter(primer.alloc, owner_range.group_id, target.table, range, scope);
+            }
+        };
+        const server = self.data_server orelse return;
+        try self.provisionRestoreOwnersWithPrimer(Primer{ .server = server, .alloc = self.alloc });
+    }
+
+    // The injected primer is private compile-time orchestration, preserving
+    // the actual provisioning loop for deterministic publication-race tests.
+    fn provisionRestoreOwnersWithPrimer(self: *LocalStandaloneMetadata, primer: anytype) !void {
         lockAtomic(&self.initial_fk_round_mutex);
         defer self.initial_fk_round_mutex.unlock();
         const server = self.data_server orelse return;
@@ -5628,7 +5661,7 @@ const LocalStandaloneMetadata = struct {
         }
         if (self.localFkPublicationSupported())
             try self.retireTerminalInitialOwners(server, store, projection.initial_fk_owners);
-        for (projection.jobs_json) |bytes| {
+        jobs: for (projection.jobs_json) |bytes| {
             var job = try std.json.parseFromSlice(Staging.Job, self.alloc, bytes, .{});
             defer job.deinit();
             const progress = (try store.loadRestoreStagingProgress(self.alloc, group_ids.main_metadata_group_id, job.value.plan.id)) orelse return error.RestoreStagingChanged;
@@ -5647,26 +5680,27 @@ const LocalStandaloneMetadata = struct {
                     }
                 }
                 const scope = try Staging.ownerScope(self.alloc, job.value.plan, job.value.plan_digest, target, range);
-                if (comptime control_only_storage_sources) {
-                    const bootstrap = try Staging.ownerBootstrapForRangeIndex(self.alloc, job.value.plan, job.value.plan_digest, target, range_index);
-                    try server.primePrivateRestoreOwner(&server.write_source, .{
-                        .plan_id = job.value.plan.id,
-                        .plan_digest = job.value.plan_digest,
-                        .table = target.table,
-                        .range = range,
-                        .bootstrap = bootstrap,
-                        .scope = scope,
-                        .cancel_recovery = progress.state == .canceling,
-                        .native_reset = target.native_reset,
-                    });
-                    continue;
-                }
-                if (progress.state == .canceling)
-                    try server.write_source.primeRestoreStagingWriterForCancellation(self.alloc, range.group_id, target.table, .{ .start = range.start_key, .end = range.end_key orelse "" }, scope)
-                else
-                    try server.write_source.primeRestoreStagingWriter(self.alloc, range.group_id, target.table, .{ .start = range.start_key, .end = range.end_key orelse "" }, scope);
+                primer.prime(job.value.plan, job.value.plan_digest, target, range_index, scope, progress.state == .canceling) catch |err| {
+                    // Publication can retire the private empty-target grant
+                    // between the projection/progress cut and owner admission.
+                    // Do not reopen it as a serving owner while Boot recovers.
+                    if (err == error.SqlRelationRecoveryIncomplete and target.table.sql_persistence != null and scope.native_empty_origin != null and
+                        try self.restorePrimingTerminal(store, job.value, progress)) continue :jobs;
+                    return err;
+                };
             };
         }
+    }
+
+    fn restorePrimingTerminal(self: *LocalStandaloneMetadata, store: *antfly.metadata.RaftApplyStore, captured: Staging.Job, prior: Staging.Progress) !bool {
+        var current = (try store.loadRestoreStaging(self.alloc, group_ids.main_metadata_group_id, captured.plan.id)) orelse return error.RestoreStagingChanged;
+        defer current.deinit();
+        if (!std.mem.eql(u8, &current.value.plan.id, &captured.plan.id) or
+            !std.mem.eql(u8, &current.value.plan_digest, &captured.plan_digest) or
+            !std.mem.eql(u8, &try current.value.plan.digest(self.alloc), &captured.plan_digest)) return error.RestoreStagingScopeChanged;
+        if (current.value.revision < prior.revision or
+            (current.value.revision == prior.revision and (current.value.state != prior.state or current.value.completed_owners != prior.completed_owners))) return error.RestoreStagingProgressChanged;
+        return current.value.state == .published or current.value.state == .canceled;
     }
 
     fn trackInitialOwner(self: *LocalStandaloneMetadata, owner: @import("../data/private_provisioning.zig").InitialOwner) !void {
@@ -20113,4 +20147,90 @@ test "privacy standalone compact bindings refresh on policy publication and surv
     metadata.catalog_durability_failed = true;
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null));
     metadata.catalog_durability_failed = false;
+}
+
+test "standalone shared catalog resumes private restore and publishes atomically across priming publication races" {
+    const stages = @import("../metadata/restore_staging.zig");
+    const Mode = enum { published, canceled, active, canceling, foreign, regressed, auth };
+    const Primer = struct {
+        metadata: *LocalStandaloneMetadata,
+        mode: Mode,
+        calls: *usize,
+        fn prime(primer: @This(), plan: stages.Plan, _: stages.Digest, _: stages.Target, _: usize, scope: @import("antfly_local_sources").storage_db_restore_staging_contract.Scope, _: bool) !void {
+            primer.calls.* += 1;
+            try std.testing.expect(scope.native_empty_origin != null);
+            // Inject the authoritative progress change exactly after the real
+            // provisioning loop captured its active projection. This tests
+            // orchestration only: no physical completion receipt is invented.
+            if (primer.mode != .active) {
+                const store = primer.metadata.lifecycle_store.?;
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                var key: [320]u8 = undefined;
+                const state: stages.State = if (primer.mode == .canceled) .canceled else if (primer.mode == .canceling) .canceling else .published;
+                const revision: u64 = if (primer.mode == .regressed) 1 else 3;
+                const bytes = try std.json.Stringify.valueAlloc(primer.metadata.alloc, stages.Progress{ .state = state, .revision = revision }, .{});
+                defer primer.metadata.alloc.free(bytes);
+                try txn.put(try stages.progressKey(&key, group_ids.main_metadata_group_id, plan.id), bytes);
+                if (state == .published or state == .canceled) try txn.delete(try stages.activeKey(&key, group_ids.main_metadata_group_id, plan.id));
+                if (primer.mode == .foreign) {
+                    const raw = try txn.get(try stages.jobKey(&key, group_ids.main_metadata_group_id, plan.id));
+                    var job = try std.json.parseFromSlice(stages.Job, primer.metadata.alloc, raw, .{});
+                    defer job.deinit();
+                    job.value.plan_digest[0] ^= 1;
+                    const changed = try std.json.Stringify.valueAlloc(primer.metadata.alloc, job.value, .{});
+                    defer primer.metadata.alloc.free(changed);
+                    try txn.put(try stages.jobKey(&key, group_ids.main_metadata_group_id, plan.id), changed);
+                }
+                try txn.commit();
+            }
+            return if (primer.mode == .auth) error.SqlRelationOwnerChanged else error.SqlRelationRecoveryIncomplete;
+        }
+    };
+    const a = std.testing.allocator;
+    inline for (std.meta.tags(Mode)) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/priming-race", .{tmp.sub_path});
+        defer a.free(path);
+        const catalog = try std.fmt.allocPrint(a, "{s}/catalog.json", .{path});
+        defer a.free(catalog);
+        var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+        defer runtime.deinit();
+        var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", path, catalog, runtime.ptr(), null, .local);
+        defer metadata.deinit();
+        var server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(a, .{ .replica_root_dir = path, .backend_runtime = runtime.ptr(), .api_server_cfg = .{ .deployment_mode = .standalone } }, metadata.catalogSource(), metadata.statusSource());
+        defer server.deinit();
+        metadata.data_server = &server;
+        defer metadata.data_server = null;
+        const target: stages.Target = .{ .source_table_id = 7, .empty_generation = true, .schema_only_snapshot = .{ .manifest_digest = @splat(3), .schema_digest = @splat(4), .source_table_id = 7 }, .table = .{ .table_id = 8, .name = "hidden-race", .schema_json = "{}", .desired_replica_count = 1, .sql_persistence = .{ .kind = .unlogged, .owner_node_id = 1, .owner_store_id = 1, .generation_instance = @splat(8), .data_generation = 1 } }, .ranges = &.{.{ .table_id = 8, .group_id = 43, .range_id = 43, .doc_identity_shard_id = 43, .doc_identity_range_id = 43, .start_key = "" }} };
+        const plan: stages.Plan = .{ .id = @splat(1), .cohort_digest = @splat(2), .targets = &.{target} };
+        try plan.validate(a);
+        const job: stages.Job = .{ .plan = plan, .plan_digest = try plan.digest(a) };
+        const job_bytes = try std.json.Stringify.valueAlloc(a, job, .{});
+        defer a.free(job_bytes);
+        const progress_bytes = try std.json.Stringify.valueAlloc(a, stages.Progress{ .state = .activating, .revision = 2 }, .{});
+        defer a.free(progress_bytes);
+        {
+            const store = metadata.lifecycle_store.?;
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var key: [320]u8 = undefined;
+            try txn.put(try stages.jobKey(&key, group_ids.main_metadata_group_id, plan.id), job_bytes);
+            try txn.put(try stages.progressKey(&key, group_ids.main_metadata_group_id, plan.id), progress_bytes);
+            try txn.put(try stages.activeKey(&key, group_ids.main_metadata_group_id, plan.id), &plan.id);
+            try txn.commit();
+        }
+        var calls: usize = 0;
+        const primer: Primer = .{ .metadata = &metadata, .mode = mode, .calls = &calls };
+        switch (mode) {
+            .published, .canceled => try metadata.provisionRestoreOwnersWithPrimer(primer),
+            .active, .canceling => try std.testing.expectError(error.SqlRelationRecoveryIncomplete, metadata.provisionRestoreOwnersWithPrimer(primer)),
+            .foreign => try std.testing.expectError(error.RestoreStagingScopeChanged, metadata.provisionRestoreOwnersWithPrimer(primer)),
+            .regressed => try std.testing.expectError(error.RestoreStagingProgressChanged, metadata.provisionRestoreOwnersWithPrimer(primer)),
+            .auth => try std.testing.expectError(error.SqlRelationOwnerChanged, metadata.provisionRestoreOwnersWithPrimer(primer)),
+        }
+        try std.testing.expectEqual(@as(usize, 1), calls);
+        try std.testing.expect(server.kernel_owner_source == null);
+    }
 }

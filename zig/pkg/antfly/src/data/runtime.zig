@@ -37936,6 +37936,79 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "data runtime native restore phase two rejoins activating descriptor authority" {
+            const stages = @import("../metadata/restore_staging.zig");
+            const a = std.testing.allocator;
+            var region: std.heap.ArenaAllocator = .init(a);
+            defer region.deinit();
+            const scratch = region.allocator();
+            const native: @import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor = .{
+                .kind = .unlogged,
+                .owner_node_id = 9,
+                .owner_store_id = 11,
+                .generation_instance = @splat(3),
+                .data_generation = 1,
+            };
+            const table: @import("antfly_local_sources").common_topology_records.TableRecord = .{ .table_id = 71, .name = "native-phase-two", .schema_json = "{}", .sql_persistence = native };
+            const range: @import("antfly_local_sources").common_topology_records.RangeRecord = .{ .table_id = table.table_id, .group_id = 72, .range_id = 72, .doc_identity_shard_id = 72, .doc_identity_range_id = 72, .start_key = "" };
+            const target: stages.Target = .{ .source_table_id = 7, .table = table, .ranges = &.{range}, .empty_generation = true, .schema_only_snapshot = .{ .manifest_digest = @splat(4), .schema_digest = try stages.runtimeSchemaDigestForTable(scratch, table.schema_json), .source_table_id = 7 } };
+            const plan: stages.Plan = .{ .id = @splat(5), .cohort_digest = @splat(6), .targets = &.{target} };
+            try plan.validate(scratch);
+            const digest = try plan.digest(scratch);
+            const scope = try stages.ownerScope(scratch, plan, digest, target, range);
+            const Probe = struct {
+                job: stages.Job,
+                progress: stages.Progress,
+                job_reads: usize = 0,
+                progress_reads: usize = 0,
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return error.TestUnexpectedGenericCatalogRead;
+                }
+                fn jobRead(raw: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, _: antfly.public_api.operation.RequestContext) !?[]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expectEqual(self.job.plan.id, id);
+                    self.job_reads += 1;
+                    return try std.json.Stringify.valueAlloc(alloc, self.job, .{});
+                }
+                fn progressRead(raw: *anyopaque, _: std.mem.Allocator, id: [16]u8, _: antfly.public_api.operation.RequestContext) !?stages.Progress {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expectEqual(self.job.plan.id, id);
+                    self.progress_reads += 1;
+                    return self.progress;
+                }
+            };
+            var probe: Probe = .{ .job = .{ .plan = plan, .plan_digest = digest, .state = .activating, .revision = 7 }, .progress = .{ .state = .activating, .revision = 7 } };
+            // Exercise the actual metadata-backed receiver descriptor path. No Raft
+            // route, physical initialization or serving proof is supplied by this unit.
+            var server: DataServer = undefined;
+            server.status_source = .{ .ptr = &probe, .vtable = &.{ .status = Probe.status, .get_restore_staging = Probe.jobRead, .get_restore_staging_progress = Probe.progressRead } };
+            server.provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a);
+            defer server.provisioned_storage.deinit();
+            try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, .mutate, .{}));
+            try std.testing.expectEqual(@as(usize, 0), probe.progress_reads);
+            inline for (.{ @FieldType(antfly.public_api.restore_owner.Request, "action").install_native_empty, .install_generation_admissions }) |action| {
+                try std.testing.expectEqual(antfly.public_api.ProvisionedKernelOwnerSource.RestoreDescriptorUse.resolve, DataServer.restoreOwnerDescriptorUse(action));
+                var captured = try DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, DataServer.restoreOwnerDescriptorUse(action), .{});
+                defer captured.deinit(a);
+                try std.testing.expect(captured.descriptor.sql_persistence.?.eql(native));
+                try std.testing.expectEqual(table.table_id, captured.descriptor.identity.table_id);
+                try DataServer.requireRestoreOwnerControlPhase(action, .activating);
+                try std.testing.expectError(error.RestoreStagingInProgress, DataServer.requireRestoreOwnerControlPhase(action, .validating));
+                try std.testing.expectError(error.RestoreStagingCanceled, DataServer.requireRestoreOwnerControlPhase(action, .canceled));
+            }
+            try std.testing.expectEqual(@as(usize, 2), probe.progress_reads);
+            try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, @splat(8), plan.id, .resolve, .{}));
+            probe.progress.revision += 1;
+            try std.testing.expectError(error.RestoreStagingProgressChanged, DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, .resolve, .{}));
+            inline for (.{ @FieldType(antfly.public_api.restore_owner.Request, "action").begin, .import_page, .validate }) |action| {
+                try std.testing.expectEqual(antfly.public_api.ProvisionedKernelOwnerSource.RestoreDescriptorUse.mutate, DataServer.restoreOwnerDescriptorUse(action));
+                try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.requireRestoreOwnerControlPhase(action, .activating));
+                try DataServer.requireRestoreOwnerControlPhase(action, .importing);
+            }
+            try DataServer.requireRestoreOwnerControlPhase(.install_native_empty, .published);
+            try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.requireRestoreOwnerControlPhase(.install_generation_admissions, .published));
+        }
+
         test "SQL drop retirement control retains ordered timestamps and requires every applying decoder" {
             const protocol = @import("../common/data_raft_protocol.zig");
             const contract = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
@@ -61781,77 +61854,4 @@ test "grouped source protocol dominates coexisting graph envelope features" {
     var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@TypeOf(request.group_source.?.action).activate_catalog, decoded.batch.req.group_source.?.action);
-}
-
-test "data runtime native restore phase two rejoins activating descriptor authority" {
-    const stages = @import("../metadata/restore_staging.zig");
-    const a = std.testing.allocator;
-    var region: std.heap.ArenaAllocator = .init(a);
-    defer region.deinit();
-    const scratch = region.allocator();
-    const native: @import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor = .{
-        .kind = .unlogged,
-        .owner_node_id = 9,
-        .owner_store_id = 11,
-        .generation_instance = @splat(3),
-        .data_generation = 1,
-    };
-    const table: @import("antfly_local_sources").common_topology_records.TableRecord = .{ .table_id = 71, .name = "native-phase-two", .schema_json = "{}", .sql_persistence = native };
-    const range: @import("antfly_local_sources").common_topology_records.RangeRecord = .{ .table_id = table.table_id, .group_id = 72, .range_id = 72, .start_key = "" };
-    const target: stages.Target = .{ .source_table_id = 7, .table = table, .ranges = &.{range}, .empty_generation = true, .schema_only_snapshot = .{ .manifest_digest = @splat(4), .schema_digest = try stages.runtimeSchemaDigestForTable(scratch, table.schema_json), .source_table_id = 7 } };
-    const plan: stages.Plan = .{ .id = @splat(5), .cohort_digest = @splat(6), .targets = &.{target} };
-    try plan.validate(scratch);
-    const digest = try plan.digest(scratch);
-    const scope = try stages.ownerScope(scratch, plan, digest, target, range);
-    const Probe = struct {
-        job: stages.Job,
-        progress: stages.Progress,
-        job_reads: usize = 0,
-        progress_reads: usize = 0,
-        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
-            return error.TestUnexpectedGenericCatalogRead;
-        }
-        fn jobRead(raw: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, _: antfly.public_api.operation.RequestContext) !?[]u8 {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            try std.testing.expectEqual(self.job.plan.id, id);
-            self.job_reads += 1;
-            return try std.json.Stringify.valueAlloc(alloc, self.job, .{});
-        }
-        fn progressRead(raw: *anyopaque, _: std.mem.Allocator, id: [16]u8, _: antfly.public_api.operation.RequestContext) !?stages.Progress {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            try std.testing.expectEqual(self.job.plan.id, id);
-            self.progress_reads += 1;
-            return self.progress;
-        }
-    };
-    var probe: Probe = .{ .job = .{ .plan = plan, .plan_digest = digest, .state = .activating, .revision = 7 }, .progress = .{ .state = .activating, .revision = 7 } };
-    // Exercise the actual metadata-backed receiver descriptor path. No Raft
-    // route, physical initialization or serving proof is supplied by this unit.
-    var server: DataServer = undefined;
-    server.status_source = .{ .ptr = &probe, .vtable = &.{ .status = Probe.status, .get_restore_staging = Probe.jobRead, .get_restore_staging_progress = Probe.progressRead } };
-    server.provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a);
-    defer server.provisioned_storage.deinit();
-    try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, .mutate, .{}));
-    try std.testing.expectEqual(@as(usize, 0), probe.progress_reads);
-    inline for (.{ @FieldType(antfly.public_api.restore_owner.Request, "action").install_native_empty, .install_generation_admissions }) |action| {
-        try std.testing.expectEqual(antfly.public_api.ProvisionedKernelOwnerSource.RestoreDescriptorUse.resolve, DataServer.restoreOwnerDescriptorUse(action));
-        var captured = try DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, DataServer.restoreOwnerDescriptorUse(action), .{});
-        defer captured.deinit(a);
-        try std.testing.expect(captured.descriptor.sql_persistence.?.eql(native));
-        try std.testing.expectEqual(table.table_id, captured.descriptor.identity.table_id);
-        try DataServer.requireRestoreOwnerControlPhase(action, .activating);
-        try std.testing.expectError(error.RestoreStagingInProgress, DataServer.requireRestoreOwnerControlPhase(action, .validating));
-        try std.testing.expectError(error.RestoreStagingCanceled, DataServer.requireRestoreOwnerControlPhase(action, .canceled));
-    }
-    try std.testing.expectEqual(@as(usize, 2), probe.progress_reads);
-    try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, @splat(8), plan.id, .resolve, .{}));
-    probe.progress.revision += 1;
-    try std.testing.expectError(error.RestoreStagingProgressChanged, DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, .resolve, .{}));
-    inline for (.{ @FieldType(antfly.public_api.restore_owner.Request, "action").begin, .import_page, .validate }) |action| {
-        try std.testing.expectEqual(antfly.public_api.ProvisionedKernelOwnerSource.RestoreDescriptorUse.mutate, DataServer.restoreOwnerDescriptorUse(action));
-        try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.requireRestoreOwnerControlPhase(action, .activating));
-        try DataServer.requireRestoreOwnerControlPhase(action, .importing);
-    }
-    try DataServer.requireRestoreOwnerControlPhase(.install_native_empty, .published);
-    try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.requireRestoreOwnerControlPhase(.install_generation_admissions, .published));
 }

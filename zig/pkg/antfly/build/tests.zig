@@ -6144,10 +6144,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
         // This root intentionally links the complete standalone runtime and
         // embedded inference ABI. With native policy coordinator/owner paths,
-        // macOS Debug codegen peaked at 16.42 GB; reserve scheduling headroom.
+        // macOS Debug codegen peaked at 21.98 GB; reserve scheduling headroom.
         // This is a compile-memory scheduling claim, not a service limit.
         // Native Linux has its own measured inline-inference owner profile.
-        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("standalone-runtime-owner-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024),
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("standalone-runtime-owner-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 24 else 7) * 1024 * 1024 * 1024),
     });
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
     // Bind the inline provider BEFORE cloning the consumer graph. A late

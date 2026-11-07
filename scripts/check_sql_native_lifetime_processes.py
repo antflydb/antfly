@@ -4,6 +4,8 @@
 """Build the matching Debug CLI and require all four real lifetime campaigns."""
 
 import argparse
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -35,6 +37,7 @@ def require_four_passes(report):
         observed.add(match[1])
     if observed != EXPECTED:
         raise ValueError("missing required process campaign")
+    return sorted(observed)
 
 
 def run_bounded(command, *, cwd, env, timeout):
@@ -124,7 +127,25 @@ def main():
             env=env,
             timeout=1800,
         )
-        require_four_passes(report)
+        observed = require_four_passes(report)
+        # Preserve the actual checked report digest and identities in the
+        # enclosing qualification log before the private report is removed.
+        print(
+            json.dumps(
+                {
+                    "native_lifetime_process_provenance": {
+                        "junit_sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
+                        "case_ids": observed,
+                        "tests": len(observed),
+                        "failures": 0,
+                        "errors": 0,
+                        "skipped": 0,
+                    }
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     print(
         "Matching Debug CLI: four real native lifetime process campaigns passed, no skips."
     )

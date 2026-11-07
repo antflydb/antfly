@@ -22729,7 +22729,7 @@ pub const RaftApplyStore = struct {
         try self.requireStoreRootEnrollmentTxn(txn, group, proof.identity);
     }
 
-    fn requireNativeRestorePublicationTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, record: metadata.TableRecord, scope: @import("../sql_relation_attestation.zig").CreationScope) !void {
+    fn requireNativeRestorePublicationTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, record: metadata.TableRecord, scope: @import("../sql_relation_attestation.zig").CreationScope) !@import("../sql_relation_attestation.zig").SignedBinding {
         const descriptor = record.sql_persistence orelse return error.InvalidSqlRelationPersistence;
         try requireNativeTableStorageShape(a, record);
         _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_relation_persistence_version);
@@ -22757,6 +22757,7 @@ pub const RaftApplyStore = struct {
             const previous = before.table.sql_persistence orelse return error.InvalidSqlRelationPersistence;
             if (descriptor.kind != previous.kind or descriptor.data_generation != (std.math.add(u64, previous.data_generation, 1) catch return error.CatalogGenerationExhausted)) return error.InvalidSqlRelationPersistence;
         } else if (descriptor.data_generation != 1) return error.InvalidSqlRelationPersistence;
+        return proof;
     }
 
     fn requireReadySqlRelationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, descriptor: @import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor) !sql_relation_boots.Record {
@@ -23400,27 +23401,6 @@ pub const RaftApplyStore = struct {
             !std.mem.eql(u8, &admission.descriptor_fingerprint, &try proof.binding.descriptor.fingerprint()) or !std.meta.eql(admission.namespace, @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace{ .table_id = proof.binding.table_id, .shard_id = proof.binding.shard_id, .range_id = proof.binding.range_id })) return error.SqlRelationOwnerChanged;
         if (!try self.activateDataTopologyFloorTxn(txn, group, metadata_table_manager.native_relation_protocol_version)) return error.TableTopologyProtocolUpgradeRequired;
         try @import("../sql_relation_target_images.zig").stageInitialized(txn, group, scope, request.attempt.number, request.attempt.digest, proof);
-    }
-
-    fn transferSqlRelationInitializedBindingTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, table: metadata.TableRecord) !void {
-        if (table.sql_persistence == null) return;
-        var key: [256]u8 = undefined;
-        const reservation = (try stagingGet(txn, try restore_staging.identityKey(&key, group, .table, table.table_id))) orelse return;
-        if (reservation.len != 16) return error.InvalidSqlRelationPersistence;
-        const id: restore_staging.Id = reservation[0..16].*;
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        const a = arena.allocator();
-        const raw = (try stagingGet(txn, try restore_staging.jobKey(&key, group, id))) orelse return error.SqlRelationOwnerChanged;
-        const job = try std.json.parseFromSliceLeaky(restore_staging.Job, a, raw, .{ .allocate = .alloc_always });
-        const scope: @import("../sql_relation_attestation.zig").CreationScope = .{ .plan_id = id, .plan_digest = job.plan_digest };
-        const proof = (try self.sqlRelationInitializedBindingTxn(a, txn, group, .{ .node = table.sql_persistence.?.owner_node_id, .binding_table = table.table_id, .creation_scope = scope })) orelse return error.SqlRelationRecoveryIncomplete;
-        try self.requireSqlRelationInitializedBootTxn(txn, group, proof);
-        const target = for (job.plan.targets) |candidate| {
-            if (candidate.table.table_id == table.table_id) break candidate;
-        } else return error.SqlRelationOwnerChanged;
-        try requireSqlRelationInitializedTarget(proof, table, target.ranges);
-        try sql_relation_lifetimes.stageInitialized(a, txn, group, proof);
     }
 
     fn sqlRelationGroupReportDigestTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, query: sql_relation_boots.Query) !?[32]u8 {
@@ -38359,11 +38339,7 @@ pub const RaftApplyStore = struct {
             defer metadata_table_manager.freeTable(self.alloc, existing);
             if (try self.relationalDropBlockedTxn(txn, group_id, existing)) return error.ConstraintRetirementRequired;
             try self.dropLakeIndexLifecycleTxn(txn, group_id, existing);
-            if (try trigger_catalog.present(self.alloc, existing, null)) {
-                _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_table_triggers_version);
-                try trigger_catalog.stageTable(self.alloc, txn, group_id, existing, null, try catalogIncarnationTxn(txn, group_id));
-            }
-            try sql_relation_lifetimes.stageTable(self.alloc, txn, group_id, existing, null);
+            try self.retireTableRuntimeBindingsTxn(txn, group_id, existing);
         }
         try self.settleSqlCompletionReferencesTxn(txn, group_id, table_id, null, false, false);
         {
@@ -39580,6 +39556,18 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    /// Rejoin exact irreversible loss without deciding retained transactions.
+    fn permitsLostNativeParticipantPublicationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, job: restore_staging.Job, progress: restore_staging.Progress, target: restore_staging.Target, plan_verified: *bool, scratch: std.mem.Allocator) !bool {
+        if (target.native_reset == null) return false;
+        const activation = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_relation_persistence_version);
+        if (!plan_verified.*) {
+            const actual_digest = try job.plan.digest(scratch);
+            if (!std.mem.eql(u8, &actual_digest, &job.plan_digest)) return error.InvalidRestoreStaging;
+            plan_verified.* = true;
+        }
+        return @import("../sql_relation_recovery_store.zig").permitsRetainedParticipants(self.alloc, txn, group, activation.incarnation, job, progress, target);
+    }
+
     /// Rejoin executable preparation against the actual reserve writer cut.
     /// No statement VM or externally observable callback runs during apply.
     fn requireTruncatePreparationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, plan: restore_staging.Plan, required: bool) !void {
@@ -39591,17 +39579,6 @@ pub const RaftApplyStore = struct {
         if (preparation) |prepared| {
             prepared.validate(a, plan) catch |err| return if (err == error.OutOfMemory) err else error.InvalidRestoreStaging;
             _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_truncate_preparation_version);
-        }
-        var strict_coverage = preparation != null;
-        if (required and preparation == null) {
-            // Published176 entries must replay with their original semantics.
-            // The sender requires177 for new affected SQL commands; only the
-            // actual durable all-voter activation enables the omission guard.
-            var activation_key: [160]u8 = undefined;
-            if (try stagingGet(txn, try topologyActivationKeyForGroup(&activation_key, group)) != null) {
-                const activation = try self.requireTopologyActivationTxn(txn, group, 0);
-                strict_coverage = activation.version >= topology_protocol.sql_truncate_preparation_version;
-            }
         }
         const meta = try system_catalog_storage.readMeta(a, txn, group);
         const incarnation = try catalogIncarnationTxn(txn, group);
@@ -39620,7 +39597,7 @@ pub const RaftApplyStore = struct {
             } else null;
             const has_truncate = if (state) |captured| restore_staging.truncateStateRequired(captured.value) else false;
             if (receipt == null) {
-                if (required and strict_coverage and has_truncate) return error.SqlTriggerCoordinationRequired;
+                if (required and has_truncate) return error.SqlTriggerCoordinationRequired;
                 continue;
             }
             const actual = if (state) |captured| captured.value else return error.CatalogGenerationChanged;
@@ -40137,8 +40114,10 @@ pub const RaftApplyStore = struct {
                 },
                 .begin_activation => {
                     try @import("../trigger_restore_claims.zig").requireHeld(catalog_arena.allocator(), txn, group_id, job.value.plan);
+                    var retained_plan_verified = false;
                     for (job.value.plan.targets) |target| if (target.replace) |old| {
-                        if (try tableHasSqlParticipants(self.alloc, txn, group_id, old.table.table_id)) return;
+                        if (try tableHasSqlParticipants(self.alloc, txn, group_id, old.table.table_id) and
+                            !try self.permitsLostNativeParticipantPublicationTxn(txn, group_id, job.value, progress.value, target, &retained_plan_verified, catalog_arena.allocator())) return;
                     };
                     if (parent_total + admission_total == 0 or
                         !((next.state == .cutover and next.completed_owners == old_total + parent_total) or
@@ -40166,9 +40145,13 @@ pub const RaftApplyStore = struct {
                 },
                 .publish, .finish_cancel => {
                     try @import("../trigger_restore_claims.zig").requireHeld(catalog_arena.allocator(), txn, group_id, job.value.plan);
-                    if (command.action == .publish) for (job.value.plan.targets) |target| if (target.replace) |old| {
-                        if (try tableHasSqlParticipants(self.alloc, txn, group_id, old.table.table_id)) return;
-                    };
+                    if (command.action == .publish) {
+                        var retained_plan_verified = false;
+                        for (job.value.plan.targets) |target| if (target.replace) |old| {
+                            if (try tableHasSqlParticipants(self.alloc, txn, group_id, old.table.table_id) and
+                                !try self.permitsLostNativeParticipantPublicationTxn(txn, group_id, job.value, progress.value, target, &retained_plan_verified, catalog_arena.allocator())) return;
+                        };
+                    }
                     // The irreversible decision and exact owner activation
                     // receipts must precede target publication. A receipt is
                     // admitted only for its planned fence and publication.
@@ -40288,6 +40271,7 @@ pub const RaftApplyStore = struct {
                     // restore plan throughout this transaction.
                     if (command.action == .publish) for (job.value.plan.targets, prepared_targets.items) |target, prepared| {
                         if (target.replace) |old| {
+                            try self.retireTableRuntimeBindingsTxn(txn, group_id, old.table);
                             var removed: std.ArrayList(u64) = .empty;
                             defer removed.deinit(self.alloc);
                             for (old.ranges) |range| {
@@ -40596,11 +40580,7 @@ pub const RaftApplyStore = struct {
                     try self.deleteTableRangeIndexTxn(txn, group_id, drop.table_id, range_group_id);
                     try self.deleteActiveRestoreRangeIndexTxn(txn, group_id, range_group_id);
                 }
-                if (try trigger_catalog.present(self.alloc, existing, null)) {
-                    _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_table_triggers_version);
-                    try trigger_catalog.stageTable(self.alloc, txn, group_id, existing, null, try catalogIncarnationTxn(txn, group_id));
-                }
-                try sql_relation_lifetimes.stageTable(self.alloc, txn, group_id, existing, null);
+                try self.retireTableRuntimeBindingsTxn(txn, group_id, existing);
                 if (binding_owner == .topology) try self.removeSystemCatalogTableTxn(txn, group_id, drop.table_id);
                 try txn.delete(table_key);
                 try self.deleteColumnIdentitiesTxn(txn, group_id, drop.table_id);
@@ -43765,6 +43745,9 @@ pub const RaftApplyStore = struct {
         source_changed: bool,
         fingerprint: [32]u8,
         named_type_guards: []sql_type_layouts.Guard = &.{},
+        // Value-owned proof validated against the same prepublication writer
+        // cut; no public wire or Engine payload carries this authority.
+        native_initialized: ?@import("../sql_relation_attestation.zig").SignedBinding = null,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.named_type_guards);
@@ -43866,9 +43849,10 @@ pub const RaftApplyStore = struct {
             error.NotFound => null,
             else => return err,
         };
+        var native_initialized: ?@import("../sql_relation_attestation.zig").SignedBinding = null;
         if (record.sql_persistence) |descriptor| {
             if (native_publication) |scope| {
-                try self.requireNativeRestorePublicationTxn(resolver_arena.allocator(), txn, group_id, input_record, scope);
+                native_initialized = try self.requireNativeRestorePublicationTxn(resolver_arena.allocator(), txn, group_id, input_record, scope);
             } else {
                 try self.requireNativeTablePlacementTxn(resolver_arena.allocator(), txn, group_id, record);
                 if (encoded_existing == null and descriptor.data_generation != 1) return error.InvalidSqlRelationPersistence;
@@ -44011,6 +43995,7 @@ pub const RaftApplyStore = struct {
         prepared_transferred = true;
         return .{
             .named_type_guards = type_guards,
+            .native_initialized = native_initialized,
             .identity = .{ .table_id = record.table_id, .name = record.name },
             .value = value,
             .previous_name = previous_name,
@@ -44042,6 +44027,16 @@ pub const RaftApplyStore = struct {
         }, renames);
     }
 
+    /// Retire only live-table reverse bindings. Immutable generation-loss
+    /// journals and named transaction custody have independent retention.
+    fn retireTableRuntimeBindingsTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, before: metadata.TableRecord) !void {
+        if (try trigger_catalog.present(self.alloc, before, null)) {
+            _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_table_triggers_version);
+            try trigger_catalog.stageTable(self.alloc, txn, group, before, null, try catalogIncarnationTxn(txn, group));
+        }
+        try sql_relation_lifetimes.stageTable(self.alloc, txn, group, before, null);
+    }
+
     /// No semantic rejection is permitted once publication starts. Failures
     /// here abort the containing transaction, including its catalog/outbox.
     fn writePreparedTableRecordTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, key: []const u8, prepared: PreparedTableRecordWrite) !void {
@@ -44055,8 +44050,16 @@ pub const RaftApplyStore = struct {
             _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_table_triggers_version);
             try trigger_catalog.stageTable(resolver_arena.allocator(), txn, group_id, previous, definition, try catalogIncarnationTxn(txn, group_id));
         }
+        // Every hidden native publication is prepared against the coherent
+        // predecessor cut. Never recapture after creating the uninitialized
+        // public lifetime: its table/ranges have not been published yet.
+        if (previous == null and definition.sql_persistence != null and prepared.native_initialized == null) {
+            var reservation_key: [320]u8 = undefined;
+            if (try stagingGet(txn, try restore_staging.identityKey(&reservation_key, group_id, .table, definition.table_id)) != null)
+                return error.RestoreSourceProofMissing;
+        }
         try sql_relation_lifetimes.stageTable(resolver_arena.allocator(), txn, group_id, previous, definition);
-        if (previous == null) try self.transferSqlRelationInitializedBindingTxn(txn, group_id, definition);
+        if (previous == null) if (prepared.native_initialized) |proof| try sql_relation_lifetimes.stageInitialized(resolver_arena.allocator(), txn, group_id, proof);
         const type_ids = try resolver_arena.allocator().alloc(u64, prepared.named_type_guards.len);
         for (type_ids, prepared.named_type_guards) |*id, guard| id.* = guard.id;
         try sql_type_uses.synchronize(resolver_arena.allocator(), txn, group_id, prepared.identity.table_id, type_ids);
@@ -55217,17 +55220,57 @@ fn requireSqlPreparedNativeRetirements(a: std.mem.Allocator, reader: anytype, gr
 fn verifySqlPreparedNativeRetirements(backing: std.mem.Allocator, group: u64, reader: anytype, rows: anytype, cancelled: ?*const std.atomic.Value(bool)) !void {
     var key: [160]u8 = undefined;
     const prefix = try std.fmt.bufPrint(&key, "\x00\x00__metadata__:sql_prepared:{d}:operation:", .{group});
+    var job_key: [160]u8 = undefined;
+    const jobs = try restore_staging.jobPrefix(&job_key, group);
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
     try rows.reset();
     while (try rows.next()) |row| {
         if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        if (std.mem.startsWith(u8, row.key, jobs)) {
+            _ = arena.reset(.retain_capacity);
+            try verifyCountedNativeLossJob(backing, arena.allocator(), group, reader, row.key, row.value);
+            continue;
+        }
         if (!std.mem.startsWith(u8, row.key, prefix)) continue;
         _ = arena.reset(.retain_capacity);
         const a = arena.allocator();
         if (row.value.len > RaftApplyStore.PreparedTransactions.max_bytes) return error.InvalidCatalogRecord;
         const record = try std.json.parseFromSliceLeaky(RaftApplyStore.PreparedTransactions.Record, a, row.value, .{});
         try requireSqlPreparedNativeRetirements(a, reader, group, record);
+    }
+}
+
+/// Rejoin counted old native images at cold/snapshot boundaries without
+/// deciding their named transactions or trusting a secondary address alone.
+fn verifyCountedNativeLossJob(backing: std.mem.Allocator, a: std.mem.Allocator, group: u64, reader: anytype, stored_key: []const u8, bytes: []const u8) !void {
+    if (bytes.len == 0 or bytes.len > restore_staging.max_encoded_bytes) return error.InvalidRestoreStaging;
+    const job = try std.json.parseFromSliceLeaky(restore_staging.Job, a, bytes, .{});
+    var key: [320]u8 = undefined;
+    if (!std.mem.eql(u8, stored_key, try restore_staging.jobKey(&key, group, job.plan.id))) return error.InvalidRestoreStaging;
+    const progress_raw = (try RaftApplyStore.relationOptional(reader, try restore_staging.progressKey(&key, group, job.plan.id))) orelse return error.InvalidRestoreStaging;
+    if (progress_raw.len == 0 or progress_raw.len > restore_staging.max_encoded_bytes) return error.InvalidRestoreStaging;
+    const progress = try std.json.parseFromSliceLeaky(restore_staging.Progress, a, progress_raw, .{});
+    if (progress.state != .activating and progress.state != .published) return;
+    var plan_verified = false;
+    for (job.plan.targets) |target| {
+        if (target.native_reset == null) continue;
+        const old = target.replace orelse return error.InvalidRestoreStaging;
+        const sql_incarnation = try RaftApplyStore.catalogIncarnationTxn(reader, group);
+        const incarnation_raw = (try RaftApplyStore.relationOptional(reader, try metadataIncarnationKeyForGroup(&key, group))) orelse return error.InvalidRestoreStaging;
+        const incarnation = (try decodeMetadataIncarnationRecord(incarnation_raw)).incarnation;
+        const counted = try RaftApplyStore.PreparedTransactions.tableCount(a, reader, group, old.table.table_id) != 0 or
+            try RaftApplyStore.SqlLocks.scopes.Data.tableCount(reader, .{ .home = .metadata, .group = group, .incarnation = sql_incarnation }, old.table.table_id) != 0;
+        if (!counted) continue;
+        if (!plan_verified) {
+            if (!std.mem.eql(u8, &try job.plan.digest(a), &job.plan_digest)) return error.InvalidRestoreStaging;
+            const raw = (try RaftApplyStore.relationOptional(reader, try RaftApplyStore.topologyActivationKeyForGroup(&key, group))) orelse return error.InvalidRestoreStaging;
+            const activation = try std.json.parseFromSliceLeaky(topology_protocol.Activation, a, raw, .{});
+            if (activation.version < topology_protocol.sql_relation_persistence_version or activation.version > topology_protocol.current_version or
+                activation.member_count == 0 or std.mem.allEqual(u8, &activation.membership_fingerprint, 0) or !std.meta.eql(activation.incarnation, incarnation)) return error.InvalidRestoreStaging;
+            plan_verified = true;
+        }
+        if (!try @import("../sql_relation_recovery_store.zig").permitsRetainedParticipants(backing, reader, group, incarnation, job, progress, target)) return error.InvalidRestoreStaging;
     }
 }
 
@@ -75855,6 +75898,31 @@ test "SQL relation lifetime native catalog publication requires data6 and persis
         try writeMetadataIncarnationRecordTxn(&txn, group, floor);
         try std.testing.expectError(error.InvalidMetadataIncarnation, decodeMetadataIncarnationRecord(try txn.get(address)));
     }
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expect((try sql_relation_lifetimes.read(a, &txn, group, table.table_id)) != null);
+        try store.retireTableRuntimeBindingsTxn(&txn, group, table);
+        try std.testing.expect((try sql_relation_lifetimes.read(a, &txn, group, table.table_id)) == null);
+    }
+    {
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expect((try sql_relation_lifetimes.read(a, &txn, group, table.table_id)) != null);
+    }
+    try store.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = table.table_id, .expected_transition_generation = 0 } });
+    store.deinit();
+    live = false;
+    store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    live = true;
+    {
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expect((try sql_relation_lifetimes.read(a, &txn, group, table.table_id)) == null);
+        const page = try sql_relation_lifetimes.list(a, &txn, group, .{ .node = table.sql_persistence.?.owner_node_id }, null, 1);
+        defer a.free(page.entries);
+        try std.testing.expectEqual(@as(usize, 0), page.entries.len);
+    }
 }
 
 test "SQL table trigger source qualification omits new wire fields under native172 activation" {
@@ -76500,11 +76568,12 @@ test "SQL TRUNCATE preparation rejoins actual writer schema routines notices and
     {
         var txn = try store.store.beginWriteTxn();
         defer txn.abort();
-        var legacy = decoded;
-        legacy.truncate_preparation = null;
-        // Exact already-published176 bare-command semantics are preserved.
-        try store.requireTruncatePreparationTxn(&txn, group, legacy, true);
-        // A new proof is never accepted under the old activation.
+        var bare = decoded;
+        bare.truncate_preparation = null;
+        // Receipt coverage is mandatory for this PR's SQL TRUNCATE lane,
+        // independently of whether the new proof decoder is activated yet.
+        try std.testing.expectError(error.SqlTriggerCoordinationRequired, store.requireTruncatePreparationTxn(&txn, group, bare, true));
+        // New proof bytes still require their actual decoder capability.
         try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.requireTruncatePreparationTxn(&txn, group, decoded, true));
     }
     const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.sql_truncate_preparation_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
@@ -76561,6 +76630,33 @@ test "SQL TRUNCATE preparation rejoins actual writer schema routines notices and
     try std.testing.expect(std.mem.indexOf(u8, old_bytes, "truncate_preparation") == null);
     try std.testing.expect(@import("../schema_reader_wire.zig").requiresTruncatePreparation(canonical));
     try std.testing.expect(!@import("../schema_reader_wire.zig").requiresTruncatePreparation(old_bytes));
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expect(try trigger_catalog.hasAttachments(&txn, group, record.id));
+        try store.retireTableRuntimeBindingsTxn(&txn, group, before);
+        try std.testing.expect(!try trigger_catalog.hasAttachments(&txn, group, record.id));
+    }
+    {
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expect(try trigger_catalog.hasAttachments(&txn, group, record.id));
+    }
+    {
+        var txn = try store.store.beginReadTxn();
+        const fence = try store.loadTableTransitionFenceTxn(&txn, group, before.table_id);
+        txn.abort();
+        try store.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = before.table_id, .expected_transition_generation = fence.generation } });
+    }
+    store.deinit();
+    live = false;
+    store = try RaftApplyStore.init(backing, .{ .root_dir = path });
+    live = true;
+    {
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expect(!try trigger_catalog.hasAttachments(&txn, group, record.id));
+    }
 }
 
 test "SQL relation lifetime native restore authority reads bind exact hidden plan and owner without Raft placement" {
@@ -77386,4 +77482,177 @@ test "privacy retained capacity denies staging atomically and releases only on f
     var legacy = try std.json.parseFromSlice(keys.Header, a, "{\"length\":1,\"created_at_millis\":1}", .{});
     defer legacy.deinit();
     try std.testing.expect(!legacy.value.accounted);
+}
+
+test "SQL native image publication captures recovering hidden proof before creating its public lifetime" {
+    const backing = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-publish-order", .{tmp.sub_path});
+    const group = group_ids.main_metadata_group_id;
+    const incarnation = "07070707070707070707070707070707".*;
+    const seed: [32]u8 = @splat(7);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const root: @import("antfly_local_sources").storage_db_root_signing_identity.State = .{ .root_incarnation = 11, .seed = seed, .public_key = pair.public_key.toBytes() };
+    const identity: store_root_enrollment.Identity = .{ .metadata_incarnation = incarnation, .node_id = 1, .store_id = 1, .root_incarnation = root.root_incarnation, .public_key = root.public_key };
+    const boot: sql_relation_boots.Record = .{ .node_id = 1, .identity = identity, .reporter_incarnation = 1, .generation = 2, .instance = @splat(8), .claim_digest = @splat(9), .unclean_restart = true, .phase = .recovering };
+    const table: metadata.TableRecord = .{ .table_id = 8, .name = "table:hidden-publish", .schema_json = "{\"version\":1}", .desired_replica_count = 1, .sql_persistence = .{ .kind = .unlogged, .owner_node_id = 1, .owner_store_id = 1, .generation_instance = boot.instance, .data_generation = 1 } };
+    const range: metadata.RangeRecord = .{ .table_id = table.table_id, .group_id = 43, .range_id = 43, .doc_identity_shard_id = 43, .doc_identity_range_id = 43, .start_key = "" };
+    const schema_digest = try restore_staging.runtimeSchemaDigestForTable(a, table.schema_json);
+    const target: restore_staging.Target = .{ .source_table_id = 7, .table = table, .ranges = &.{range}, .empty_generation = true, .schema_only_snapshot = .{ .manifest_digest = @splat(3), .schema_digest = schema_digest, .source_table_id = 7 } };
+    const plan: restore_staging.Plan = .{ .id = @splat(1), .cohort_digest = @splat(2), .targets = &.{target} };
+    try plan.validate(a);
+    const job: restore_staging.Job = .{ .plan = plan, .plan_digest = try plan.digest(a) };
+    const scope: @import("../sql_relation_attestation.zig").CreationScope = .{ .plan_id = plan.id, .plan_digest = job.plan_digest };
+    const proof = try @import("../sql_relation_attestation.zig").SignedBinding.sign(.{ .kind = .initialized, .creation_scope = scope, .metadata_group_id = group, .boot_generation = boot.generation, .identity = identity, .reporter_incarnation = boot.reporter_incarnation, .binding = .{ .descriptor = table.sql_persistence.?, .native_instance = boot.instance, .table_id = table.table_id, .shard_id = 43, .range_id = 43, .physical_root_incarnation = 91, .schema_version = 1, .schema_digest = schema_digest, .catalog_generation = 1, .catalog_fingerprint = @splat(4) } }, root);
+    // This metadata component supplies signed initialization, never a
+    // fabricated native install/activation ACK or full-job publication.
+    for (0..2) |pass| {
+        var store = try RaftApplyStore.init(backing, .{ .root_dir = path });
+        defer store.deinit();
+        if (pass == 0) {
+            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+            {
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                const reporter: metadata.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 1, .replica_root_incarnation = root.root_incarnation, .replica_root_public_key = root.public_key, .schema_reader = metadata_table_manager.SchemaReaderCapabilities.current, .role = "data", .live = true, .relational_topology_protocol_version = metadata_table_manager.native_relation_protocol_version };
+                _ = try store.writeStoreComponentsTxn(&txn, group, reporter.store_id, reporter, false, null, null);
+                try txn.commit();
+            }
+            try store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = try std.json.Stringify.valueAlloc(a, try store_root_enrollment.Request.sign(identity, seed), .{}) });
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var key: [320]u8 = undefined;
+            try txn.put(try sql_relation_boots.key(&key, group, boot.node_id), try std.json.Stringify.valueAlloc(a, boot, .{}));
+            try txn.put(try restore_staging.jobKey(&key, group, plan.id), try std.json.Stringify.valueAlloc(a, job, .{}));
+            try txn.put(try restore_staging.progressKey(&key, group, plan.id), try std.json.Stringify.valueAlloc(a, restore_staging.Progress{ .state = .importing }, .{}));
+            try txn.put(try restore_staging.identityKey(&key, group, .table, table.table_id), &plan.id);
+            try txn.put(try restore_staging.identityKey(&key, group, .group, range.group_id), &plan.id);
+            try @import("../sql_relation_hidden_lifetimes.zig").stagePlan(&txn, group, plan, job.plan_digest);
+            // Existing receiver validates the actual Boot, initialized signature,
+            // reservation and immutable schema before storing this image.
+            try store.stageSqlRelationInitializedBindingTxn(&txn, group, proof);
+            try txn.put(try restore_staging.progressKey(&key, group, plan.id), try std.json.Stringify.valueAlloc(a, restore_staging.Progress{ .state = .activating }, .{}));
+            try txn.commit();
+        }
+        {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            // Ordinary serving admission still diagnoses this incoherent
+            // placeholder; it must not catch missing-table corruption.
+            try sql_relation_lifetimes.stageTable(a, &txn, group, null, table);
+            try std.testing.expectError(error.InvalidSqlRelationPersistence, store.sqlRelationUninitializedAdmissionTxn(a, &txn, group, .{ .node = boot.node_id, .binding_table = table.table_id, .creation_scope = scope }, boot));
+        }
+        {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var key: [320]u8 = undefined;
+            const table_key = try tableKeyForGroup(&key, group, table.table_id);
+            try std.testing.expect((try sql_relation_lifetimes.read(a, &txn, group, table.table_id)) == null);
+            var prepared = (try store.prepareTableRecordWithNativePublicationTxnMode(&txn, group, table_key, table, false, .{}, &.{}, scope, null)) orelse return error.TestUnexpectedResult;
+            defer prepared.deinit(backing);
+            try std.testing.expectEqualSlices(u8, &try proof.digest(), &try prepared.native_initialized.?.digest());
+            var missing_capture = prepared;
+            missing_capture.native_initialized = null;
+            try std.testing.expectError(error.RestoreSourceProofMissing, store.writePreparedTableRecordTxn(&txn, group, table_key, missing_capture));
+            try std.testing.expect((try sql_relation_lifetimes.read(a, &txn, group, table.table_id)) == null);
+            try store.writePreparedTableRecordTxn(&txn, group, table_key, prepared);
+            const entry = (try sql_relation_lifetimes.read(a, &txn, group, table.table_id)).?;
+            try std.testing.expectEqualSlices(u8, &try proof.digest(), &try entry.initialized.?.digest());
+            try std.testing.expectEqualStrings(table.name, (try decodeTableRecord(a, try txn.get(table_key))).name);
+            try std.testing.expectError(error.NotFound, txn.get(try rangeKeyForGroup(&key, group, range.group_id)));
+            // Job/physical ACK ownership remains outside this final-writer
+            // component; abort restores the complete hidden predecessor cut.
+        }
+        {
+            var txn = try store.store.beginReadTxn();
+            defer txn.abort();
+            var key: [320]u8 = undefined;
+            try std.testing.expect((try sql_relation_lifetimes.read(a, &txn, group, table.table_id)) == null);
+            try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&key, group, table.table_id)));
+            const current = (try @import("../sql_relation_target_images.zig").effectiveInitialized(a, &txn, group, scope, table.table_id)).?;
+            try std.testing.expectEqualSlices(u8, &try proof.digest(), &try current.digest());
+        }
+    }
+}
+
+test "SQL native generation retirement counted publication rejoins exact loss proof across cold verification" {
+    const Observer = struct {
+        pub fn check(store: *RaftApplyStore, job: restore_staging.Job, original_progress: restore_staging.Progress) !void {
+            const a = std.testing.allocator;
+            var region = std.heap.ArenaAllocator.init(a);
+            defer region.deinit();
+            const scratch = region.allocator();
+            const group = group_ids.main_metadata_group_id;
+            const incarnation: [32]u8 = @splat('a');
+            for ([_]restore_staging.State{ .activating, .published }) |state| {
+                var progress = original_progress;
+                progress.state = state;
+                for ([_]u16{ 82, topology_protocol.sql_relation_persistence_version }) |version| {
+                    {
+                        var write = try store.store.beginWriteTxn();
+                        errdefer write.abort();
+                        var key: [320]u8 = undefined;
+                        try write.put(try restore_staging.progressKey(&key, group, job.plan.id), try std.json.Stringify.valueAlloc(scratch, progress, .{}));
+                        try write.put(try RaftApplyStore.topologyActivationKeyForGroup(&key, group), try std.json.Stringify.valueAlloc(scratch, topology_protocol.Activation{ .version = version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}));
+                        try write.commit();
+                    }
+                    var read = try store.store.beginReadTxn();
+                    defer read.abort();
+                    var job_key: [320]u8 = undefined;
+                    const canonical_key = try restore_staging.jobKey(&job_key, group, job.plan.id);
+                    const raw_job = try read.get(canonical_key);
+                    const substituted_key = try scratch.dupe(u8, canonical_key);
+                    substituted_key[substituted_key.len - 1] = if (substituted_key[substituted_key.len - 1] == '0') '1' else '0';
+                    try std.testing.expectError(error.InvalidRestoreStaging, verifyCountedNativeLossJob(a, scratch, group, &read, substituted_key, raw_job));
+                    var verified = false;
+                    if (version < topology_protocol.sql_relation_persistence_version)
+                        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.permitsLostNativeParticipantPublicationTxn(&read, group, job, progress, job.plan.targets[0], &verified, scratch))
+                    else {
+                        try std.testing.expect(try store.permitsLostNativeParticipantPublicationTxn(&read, group, job, progress, job.plan.targets[0], &verified, scratch));
+                        var healthy = job.plan.targets[0];
+                        healthy.native_reset = null;
+                        try std.testing.expect(!try store.permitsLostNativeParticipantPublicationTxn(&read, group, job, progress, healthy, &verified, scratch));
+                    }
+                    var rows: SequenceCheckpointRows = .{ .cursor = try read.openCursor(), .group = group };
+                    defer rows.cursor.close();
+                    if (version < topology_protocol.sql_relation_persistence_version)
+                        try std.testing.expectError(error.InvalidRestoreStaging, verifySqlPreparedNativeRetirements(a, group, &read, &rows, null))
+                    else
+                        try verifySqlPreparedNativeRetirements(a, group, &read, &rows, null);
+                }
+            }
+            // Missing activation cannot inherit permission from a present
+            // irreversible loss checkpoint or retained named transaction.
+            {
+                var write = try store.store.beginWriteTxn();
+                errdefer write.abort();
+                var key: [320]u8 = undefined;
+                try write.delete(try RaftApplyStore.topologyActivationKeyForGroup(&key, group));
+                try write.put(try restore_staging.progressKey(&key, group, job.plan.id), try std.json.Stringify.valueAlloc(scratch, original_progress, .{}));
+                try write.commit();
+            }
+            {
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                var verified = false;
+                try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.permitsLostNativeParticipantPublicationTxn(&read, group, job, original_progress, job.plan.targets[0], &verified, scratch));
+                var rows: SequenceCheckpointRows = .{ .cursor = try read.openCursor(), .group = group };
+                defer rows.cursor.close();
+                try std.testing.expectError(error.InvalidRestoreStaging, verifySqlPreparedNativeRetirements(a, group, &read, &rows, null));
+            }
+            // Restore the native-family capability before the next genuine
+            // cold open; the retained GID and loss proof are never rewritten.
+            var write = try store.store.beginWriteTxn();
+            errdefer write.abort();
+            var key: [320]u8 = undefined;
+            try write.put(try RaftApplyStore.topologyActivationKeyForGroup(&key, group), try std.json.Stringify.valueAlloc(scratch, topology_protocol.Activation{ .version = topology_protocol.sql_relation_persistence_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}));
+            try write.commit();
+        }
+    };
+    try @import("../sql_relation_recovery_store.zig").testRetainedNativeLossCustody(Observer);
 }

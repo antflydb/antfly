@@ -122,3 +122,30 @@ fenced route and body-bound owner signer, including the standalone path;
 linked/public runtime verification is still required. These implementation and
 component results grant no new original-case dispositions. Generation-transaction,
 artifact restore and publication/subscription activation are still unfinished.
+
+
+### Qualified ordinary trigger supersessions; native process closure remains pending
+
+The five original rejection cases `sql-1150`, `sql-1153`, `sql-1154`,
+`sql-1155` and `sql-1157` are superseded by tested PostgreSQL-compatible
+ordinary trigger behavior. Their exact immutable declarations run with real
+`usage_records` and `audit_usage` setup, verifying INSERT, statement TRUNCATE,
+UPDATE OF, WHEN, literal arguments, DROP and cold retained activation. The
+helper uses the supported straight-line callable subset; procedural IF support
+is not claimed. The separate extra TRUNCATE witnesses validate private failure
+notices, accepted BEFORE notices and exact published AFTER notices across cold
+re-observation without VM replay.
+
+The actual Debug public trigger-originals gate ran both mounted campaigns in
+R256: 2 passed, zero skipped/failed/leaked, with metadata177 active. This is the
+trigger owning result, not a claim the entire integrated R256 build passed;
+its independent Native fixture readiness failure was subsequently corrected.
+The same exact five declarations and helper chronology passed a fresh isolated
+PostgreSQL18.6 oracle in R219, with its owned private cluster stopped afterward.
+The pinned original source corpus and SQL hashes are unchanged.
+
+Only these five rejected-to-superseded dispositions change. Native TEMP and
+UNLOGGED process originals remain unresolved until the four matching-production
+real-process campaigns pass. Current counts are 941 implemented /133 rejected /
+463 superseded /49 unresolved. No killed-process, native image or whole-release
+credit is inferred from the trigger result.

@@ -30,6 +30,9 @@ const sql_schema_json =
 ;
 
 const Fixture = struct {
+    // The returned server borrows this stable executor until server.deinit;
+    // each test destroys its server before releasing the enclosing fixture.
+    api_io: ?*std.Io.Threaded = null,
     logical_name: []const u8 = "rows",
     second_logical_name: ?[]const u8 = null,
     unknown: bool = false,
@@ -55,6 +58,10 @@ const Fixture = struct {
         return @ptrCast(@alignCast(ptr));
     }
     pub fn deinit(self: *@This()) void {
+        if (self.api_io) |io| {
+            io.deinit();
+            alloc.destroy(io);
+        }
         if (self.job_key) |value| alloc.free(value);
         if (self.job_value) |value| alloc.free(value);
         if (self.plan) |value| alloc.free(value);
@@ -256,9 +263,21 @@ const Fixture = struct {
         return self.serverWith(null, null);
     }
     fn serverWith(self: *@This(), manager: ?*@import("../usermgr/mod.zig").UserManager, runtime: ?*@import("antfly_local_sources").storage_background_runtime.BackendRuntime) !http.ApiHttpServer {
-        var result = http.ApiHttpServer.init(alloc, .{ .user_manager = manager, .backend_runtime = runtime }, .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = catalog, .linearizable_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .supports_query_definitions = true } }, .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = undefined, .query = undefined } }, null);
+        if (self.api_io == null) {
+            const io = try alloc.create(std.Io.Threaded);
+            io.* = std.Io.Threaded.init(alloc, .{});
+            self.api_io = io;
+        }
+        const io = self.api_io.?.io();
+        var result = http.ApiHttpServer.init(alloc, .{ .user_manager = manager, .backend_runtime = runtime, .imported_runtime_io = .{
+            .api = io,
+            .api_network = if (runtime) |owner| owner.apiNetworkIo() else io,
+            .api_filesystem = if (runtime) |owner| owner.apiFilesystemIo() else io,
+            .durable = if (runtime) |owner| owner.io() else io,
+        } }, .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = catalog, .linearizable_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .supports_query_definitions = true } }, .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = undefined, .query = undefined } }, null);
         errdefer result.deinit();
-        result.restore_job_store.io = std.testing.io;
+        try std.testing.expect(result.sharedApiIo() != null);
+        result.restore_job_store.io = io;
         try result.restore_job_store.attachReplicated(self.persistence());
         // No owner mutation capability is provided. Admission must only
         // persist the compound metadata proposal, never dispatch live writes.

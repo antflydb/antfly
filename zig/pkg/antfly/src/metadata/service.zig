@@ -3682,7 +3682,7 @@ test "relation mutation admission projects naming capability without materializi
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
     if (command == .create_restore_job_with_staging) {
         const request = command.create_restore_job_with_staging;
-        if (@import("schema_reader_wire.zig").requiresLegacySqlTruncatePreparation(request.value, request.plan_json)) return metadata_topology_protocol.sql_truncate_preparation_version;
+        if (@import("schema_reader_wire.zig").requiresSqlTruncatePreparation(request.value, request.plan_json)) return metadata_topology_protocol.sql_truncate_preparation_version;
     }
     if (command == .compare_and_set_job_state) return if (std.mem.startsWith(u8, command.compare_and_set_job_state.key, "privacy/")) metadata_topology_protocol.privacy_version else metadata_topology_protocol.job_state_version;
     const paired = switch (command) {

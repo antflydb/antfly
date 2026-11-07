@@ -42,11 +42,11 @@ pub fn requiresStrongestDecoder(bytes: []const u8) bool {
     };
 }
 
-/// A delayed old producer may omit the new preparation. The existing
-/// canonical SQL job purpose plus captured source facts still require every
-/// metadata voter to understand the177 omission guard before new admission.
+/// Canonical SQL job purpose and captured source attachments select the
+/// TRUNCATE proof decoder before admission, even if a malformed producer
+/// omitted the preparation bytes.
 /// This is a bounded sender projection, not metadata execution authority.
-pub fn requiresLegacySqlTruncatePreparation(job_json: []const u8, plan_json: []const u8) bool {
+pub fn requiresSqlTruncatePreparation(job_json: []const u8, plan_json: []const u8) bool {
     if (job_json.len > 64 * 1024 or plan_json.len > 32 * 1024 * 1024) return true;
     var region: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer region.deinit();
@@ -629,7 +629,7 @@ test "SQL TRUNCATE preparation marker distinguishes actual plans from ordinary s
     try std.testing.expect(!requiresTruncatePreparation("{\"source_location\":\"truncate_preparation\"}"));
 }
 
-test "SQL TRUNCATE preparation sender recognizes legacy source attachments without upgrading reset or plain plans" {
+test "SQL TRUNCATE preparation sender recognizes required source attachments without upgrading reset or plain plans" {
     var region: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer region.deinit();
     const a = region.allocator();
@@ -646,8 +646,8 @@ test "SQL TRUNCATE preparation sender recognizes legacy source attachments witho
     defer a.free(affected);
     const plain = try std.json.Stringify.valueAlloc(a, .{ .targets = &.{.{ .replace = .{ .table = .{ .schema_json = insert_schema } } }} }, .{});
     defer a.free(plain);
-    try std.testing.expect(requiresLegacySqlTruncatePreparation(sql_job, affected));
-    try std.testing.expect(!requiresLegacySqlTruncatePreparation(reset_job, affected));
-    try std.testing.expect(!requiresLegacySqlTruncatePreparation(sql_job, plain));
-    try std.testing.expect(!requiresLegacySqlTruncatePreparation("{\"source_kind\":\"query_population\"}", affected));
+    try std.testing.expect(requiresSqlTruncatePreparation(sql_job, affected));
+    try std.testing.expect(!requiresSqlTruncatePreparation(reset_job, affected));
+    try std.testing.expect(!requiresSqlTruncatePreparation(sql_job, plain));
+    try std.testing.expect(!requiresSqlTruncatePreparation("{\"source_kind\":\"query_population\"}", affected));
 }
