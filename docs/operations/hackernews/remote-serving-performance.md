@@ -677,3 +677,13 @@ serving cache are different measurements. Clearing that cache does not flush the
 OS or provider caches. No earlier rc.10 or reader-sharing measurements establish
 the performance of native owner admission, and synthetic fixture results do not
 qualify the full Hacker News archive or the deployed Cloud service.
+
+
+Immutable Iceberg manifest lists use the same bounded decode-cache mechanism as
+immutable manifests. The cache key includes the credential scope, list URI and
+complete admitted metadata image. A lease pins the parsed list through delete
+planning; warm queries avoid both HEAD/range setup and repeated Avro decoding.
+Consumer size limits and cancellation still apply on hits, and cache admission
+failure falls back to the existing read path. Mutable sources continue remote
+revalidation. This caches immutable evidence after authority selection; it does
+not substitute a cached catalog pointer for current authority.

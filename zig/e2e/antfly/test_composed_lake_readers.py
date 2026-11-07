@@ -526,7 +526,15 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         if archive_rows > 100:
             query["filter_query"] = {
                 "disjuncts": [
-                    {"numeric_range": {"field": "id", "min": 0, "max": 99}},
+                    {
+                        "numeric_range": {
+                            "field": "id",
+                            "min": 0,
+                            "max": 99,
+                            "inclusive_min": True,
+                            "inclusive_max": True,
+                        }
+                    },
                     {"term": {"path": "/id", "value": extra_id}},
                     {"term": {"path": "/id", "value": later_id}},
                 ]
