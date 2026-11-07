@@ -82,6 +82,7 @@ pub const Store = struct {
         .delete_file_absolute = deleteFileAbsolute,
         .delete_files_absolute = deleteFilesAbsolute,
         .retire_text_segments = retireTextSegments,
+        .sweep_text_retirements = sweepTextRetirements,
         .delete_tree = deleteTree,
         .list_file_names_alloc = listFileNamesAlloc,
         .list_directory_names_alloc = listDirectoryNamesAlloc,
@@ -792,6 +793,75 @@ fn retireTextSegments(ptr: *anyopaque, root: []const u8, ids: []const u64) !bool
     var request: Retirement = .{ .allocator = self.allocator, .root = root, .ids = ids };
     try self.docs.submitArtifactRetirement(&request, Retirement.apply);
     return request.handled;
+}
+
+/// Native cleanup owns discovery and publication together. It never borrows
+/// an IndexWriter snapshot, changes a semantic namespace, or deletes an active
+/// alias. Range readers retain exact source roots independently of these names.
+fn sweepTextRetirements(ptr: *anyopaque, root: []const u8, after: ?u64) !?StorageIo.TextRetirementSweep {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateWritePath(self, root);
+    const Sweep = struct {
+        allocator: Allocator,
+        root: []const u8,
+        after: ?u64,
+        result: ?StorageIo.TextRetirementSweep = null,
+        fn apply(raw: *anyopaque, file: *native.NativeFile) !void {
+            const request: *@This() = @ptrCast(@alignCast(raw));
+            if (file.max_file_bytes != null and !file.free_pages_verified) return error.EnrichmentWaitCanceled;
+            var arena = std.heap.ArenaAllocator.init(request.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const namespaces = @import("namespace_store.zig");
+            const main = try std.mem.concat(a, u8, &.{ request.root, "/index" });
+            const generation_key = try std.mem.concat(a, u8, &.{ main, "/.native-state/generation" });
+            const generation = (try file.getIndexCatalogRecordAlloc(a, generation_key)) orelse return;
+            if (generation.len != 21 or !std.mem.startsWith(u8, generation, "AFNS1")) return error.InvalidNativeIndexGeneration;
+            const meta: @import("../backend_types.zig").Namespace = .{ .name = "meta" };
+            const legacy = try namespaces.catalogKey(a, main, meta, "active_segments");
+            if (try file.getIndexCatalogRecordSize(legacy) != null) return;
+            const prefix = try namespaces.catalogKey(a, main, meta, "retired_segment:");
+            var result: StorageIo.TextRetirementSweep = .{};
+            var mutations: [StorageIo.max_atomic_file_deletions * 2]native.CatalogMutation = undefined;
+            var count: usize = 0;
+            // Destroy the discovery cursor before editing its catalog root.
+            {
+                var cursor = try file.indexCatalogCursor(file.activeCheckpoint(), prefix);
+                defer cursor.deinit();
+                if (request.after) |id| {
+                    const suffix = std.mem.toBytes(std.mem.nativeToBig(u64, id));
+                    cursor.restartAfter(try namespaces.catalogKey(a, main, meta, try std.mem.concat(a, u8, &.{ "retired_segment:", &suffix })));
+                }
+                while (try cursor.nextRecordAlloc(a)) |marker| {
+                    if (marker.key.len != prefix.len + 16 or !std.mem.eql(u8, marker.value, &.{1})) return error.InvalidRetiredSegmentMetadata;
+                    if (result.count == result.ids.len) break;
+                    var suffix: [8]u8 = undefined;
+                    _ = std.fmt.hexToBytes(&suffix, marker.key[prefix.len..]) catch return error.InvalidRetiredSegmentMetadata;
+                    const id = std.mem.readInt(u64, &suffix, .big);
+                    const active = try namespaces.catalogKey(a, main, meta, try std.mem.concat(a, u8, &.{ "active_segment:", &suffix }));
+                    if (try file.getIndexCatalogRecordSize(active) == null) {
+                        const path = try std.fmt.allocPrint(a, "{s}/segments/{d}.seg", .{ request.root, id });
+                        mutations[count] = .{ .key = path, .is_delete = true };
+                        count += 1;
+                    }
+                    mutations[count] = .{ .key = marker.key, .is_delete = true };
+                    count += 1;
+                    result.ids[result.count] = id;
+                    result.count += 1;
+                } else {
+                    result.complete = true;
+                }
+            }
+            // No partial cohort can escape: malformed markers or IO failures
+            // leave both aliases and markers intact, and the caller's cursor
+            // advances only after submitArtifactRetirement returns success.
+            if (count != 0) try file.retireIndexCatalogRecords(mutations[0..count]);
+            request.result = result;
+        }
+    };
+    var request: Sweep = .{ .allocator = self.allocator, .root = root, .after = after };
+    try self.docs.submitArtifactRetirement(&request, Sweep.apply);
+    return request.result;
 }
 
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -4681,6 +4751,118 @@ test "lite typed text retirement preserves semantic plans and refuses active ali
     }
     try std.testing.expect(try storage.retireTextSegments("/indexes/text", &.{2}));
     try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "lite native retirement sweep bounds pages and survives stale index snapshots" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "retirement-sweep.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    const storage = adapter.storage();
+    var namespaces = try @import("namespace_store.zig").Backend.open(a, &docs, "/indexes/text/index", false);
+    defer namespaces.deinit();
+    const ns: @import("../backend_types.zig").Namespace = .{ .name = "meta" };
+    const active_id: u64 = 2;
+    {
+        var seed = try namespaces.beginWrite();
+        errdefer seed.abort();
+        for (1..71) |id| {
+            const suffix = std.mem.toBytes(std.mem.nativeToBig(u64, id));
+            const marker = "retired_segment:" ++ suffix;
+            try seed.put(ns, marker, &.{1});
+            if (id == active_id) {
+                const active = "active_segment:" ++ suffix;
+                try seed.put(ns, active, &.{1});
+            }
+        }
+        try seed.commit();
+    }
+    const SeedAliases = struct {
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            for (1..71) |id| {
+                var buffer: [128]u8 = undefined;
+                const alias = try std.fmt.bufPrint(&buffer, "/indexes/text/segments/{d}.seg", .{id});
+                try file.putIndexCatalogRecord(alias, "immutable artifact");
+            }
+        }
+    };
+    try docs.submitIndexMutation(&docs, SeedAliases.apply, true);
+    var source = try storage.openLeasedImmutableSource(a, "/indexes/text/segments/1.seg");
+    defer source.close();
+    var stale = try namespaces.beginRead();
+    defer stale.abort();
+    // A later semantic edit invalidates the detached index snapshot. Physical
+    // cleanup still proceeds against fresh current metadata and leaves this
+    // newer semantic generation untouched.
+    {
+        var edit = try namespaces.beginWrite();
+        errdefer edit.abort();
+        try edit.put(ns, "new-semantic-state", "current");
+        try edit.commit();
+    }
+    var prepared = try namespaces.beginWrite();
+    errdefer prepared.abort();
+    try prepared.put(ns, "prepared-after-cleanup", "ready");
+    const before = docs.file.activeCheckpoint();
+    const identity = (try docs.file.indexScopeIdentity("/indexes/text")).?;
+    const first = (try storage.sweepTextRetirements("/indexes/text", null)).?;
+    try std.testing.expectEqual(@as(usize, 64), first.count);
+    try std.testing.expect(!first.complete);
+    try std.testing.expectEqual(@as(u64, 64), first.ids[first.count - 1]);
+    try std.testing.expectEqualDeep(before.logical, docs.file.activeCheckpoint().logical);
+    try std.testing.expectEqual(identity, (try docs.file.indexScopeIdentity("/indexes/text")).?);
+    try std.testing.expectEqual(@as(?u64, null), try docs.file.getIndexCatalogRecordSize("/indexes/text/segments/1.seg"));
+    try std.testing.expectEqual(@as(?u64, 18), try docs.file.getIndexCatalogRecordSize("/indexes/text/segments/2.seg"));
+    var bytes: [18]u8 = undefined;
+    try source.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("immutable artifact", &bytes);
+    const last = (try storage.sweepTextRetirements("/indexes/text", first.ids[first.count - 1])).?;
+    try std.testing.expectEqual(@as(usize, 6), last.count);
+    try std.testing.expect(last.complete);
+    const settled = docs.file.activeCheckpoint();
+    const empty = (try storage.sweepTextRetirements("/indexes/text", null)).?;
+    try std.testing.expectEqual(@as(usize, 0), empty.count);
+    try std.testing.expect(empty.complete);
+    try std.testing.expectEqualDeep(settled, docs.file.activeCheckpoint());
+    try prepared.commit();
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "lite native retirement sweep rolls back a malformed page and respects namespace scopes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "retirement-sweep-refusal.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    const storage = adapter.storage();
+    var namespaces = try @import("namespace_store.zig").Backend.open(a, &docs, "/indexes/text/index", false);
+    defer namespaces.deinit();
+    const ns: @import("../backend_types.zig").Namespace = .{ .name = "meta" };
+    const one = std.mem.toBytes(std.mem.nativeToBig(u64, 1));
+    const two = std.mem.toBytes(std.mem.nativeToBig(u64, 2));
+    {
+        var seed = try namespaces.beginWrite();
+        errdefer seed.abort();
+        try seed.put(ns, "retired_segment:" ++ one, &.{1});
+        try seed.put(ns, "retired_segment:" ++ two, "invalid");
+        try seed.commit();
+    }
+    try storage.writeFileAbsolute("/indexes/text/segments/1.seg", "keep");
+    const before = docs.file.activeCheckpoint();
+    try std.testing.expectError(error.InvalidRetiredSegmentMetadata, storage.sweepTextRetirements("/indexes/text", null));
+    try std.testing.expectEqualDeep(before, docs.file.activeCheckpoint());
+    try std.testing.expectEqual(@as(?u64, 4), try docs.file.getIndexCatalogRecordSize("/indexes/text/segments/1.seg"));
+    var scoped = Store.initWithNamespace(a, &docs, "/other");
+    try std.testing.expectError(error.InvalidNativeIndexPath, scoped.storage().sweepTextRetirements("/indexes/text", null));
 }
 
 test "lite resident immutable sources retain owned bytes without durable range leases" {

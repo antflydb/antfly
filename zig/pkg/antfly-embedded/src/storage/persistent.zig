@@ -539,6 +539,15 @@ const RetiredSegmentFileDeleter = struct {
         self.removeCompletedLocked(seg_id);
     }
 
+    fn acknowledgeNativeSweep(self: *RetiredSegmentFileDeleter, ids: []const u64) void {
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
+        for (ids) |id| {
+            self.removeCompletedLocked(id);
+            self.removeRetryLocked(id);
+        }
+    }
+
     fn appendCompletedLocked(self: *RetiredSegmentFileDeleter, seg_id: u64) !void {
         const position = try self.completed_positions.getOrPut(self.allocator, seg_id);
         if (position.found_existing) return;
@@ -2732,6 +2741,22 @@ pub const PersistentIndex = struct {
         if (self.read_only) return;
         const deleter = self.retired_segment_file_deleter orelse return;
         if (!self.retirement_reconcile_pending and !deleter.hasRetirementWork()) return;
+        // Native cleanup reads current markers under its own bounded physical
+        // publication. A detached serving snapshot is not cleanup authority.
+        const root = std.fs.path.dirname(deleter.root_dir) orelse deleter.root_dir;
+        const native_page = deleter.storage.sweepTextRetirements(root, self.retirement_reconcile_after) catch |err| {
+            if (builtin.os.tag != .freestanding) std.log.warn("native text retirement sweep deferred: {s}", .{@errorName(err)});
+            return;
+        };
+        if (native_page) |page| {
+            deleter.acknowledgeNativeSweep(page.ids[0..page.count]);
+            self.retirement_reconcile_pending = !page.complete;
+            self.retirement_reconcile_after = if (page.complete or page.count == 0) null else page.ids[page.count - 1];
+            // Snapshot callbacks may queue already swept IDs. The typed retry
+            // path proves them absent idempotently, without rotating semantics.
+            deleter.retryFailedDeletes();
+            return;
+        }
         var txn = self.beginWriteMainTxn() catch |err| {
             if (builtin.os.tag != .freestanding) {
                 std.log.warn("retired text segment marker flush deferred: {s}", .{@errorName(err)});

@@ -582,6 +582,13 @@ pub const Storage = struct {
     pub const ContentRevision = [16]u8;
     pub const Trailer = FileTrailer;
     pub const max_atomic_file_deletions: usize = 64;
+    /// A bounded native cleanup page. IDs are returned only after the entire
+    /// page commits; callers may then retire their corresponding retry entries.
+    pub const TextRetirementSweep = struct {
+        ids: [max_atomic_file_deletions]u64 = undefined,
+        count: usize = 0,
+        complete: bool = false,
+    };
 
     pub const Lease = struct {
         view: Storage,
@@ -672,6 +679,10 @@ pub const Storage = struct {
         /// artifacts and remove retirement markers without changing semantics.
         /// False means this generation uses the compatibility metadata backend.
         retire_text_segments: ?*const fn (*anyopaque, []const u8, []const u64) anyerror!bool = null,
+        /// Discover and settle a bounded page against current native state.
+        /// Active aliases survive stale retirement markers. Null selects the
+        /// compatibility backend; no semantic generation is changed.
+        sweep_text_retirements: ?*const fn (*anyopaque, []const u8, ?u64) anyerror!?TextRetirementSweep = null,
         delete_tree: *const fn (*anyopaque, []const u8) anyerror!void,
         list_file_names_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![][]u8 = null,
         /// Immediate child directories, including virtual directories inferred
@@ -966,6 +977,11 @@ pub const Storage = struct {
         if (ids.len == 0) return true;
         const operation = self.vtable.retire_text_segments orelse return false;
         return BoundaryAbi.call("retire_text_segments", self.boundary_dispatch, operation, .{ self.ptr, root, ids });
+    }
+
+    pub fn sweepTextRetirements(self: Storage, root: []const u8, after: ?u64) !?TextRetirementSweep {
+        const operation = self.vtable.sweep_text_retirements orelse return null;
+        return BoundaryAbi.call("sweep_text_retirements", self.boundary_dispatch, operation, .{ self.ptr, root, after });
     }
 
     pub fn deleteTree(self: Storage, path: []const u8) !void {
