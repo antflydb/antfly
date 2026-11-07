@@ -64,7 +64,7 @@ func NewSeriesQuery(options SeriesQueryOptions) (*QueryRequest, error) {
 	points := map[string]any{"type": "date_histogram", "field": options.Timestamp, "fixed_interval": fmt.Sprintf("%dns", options.Every.Nanoseconds()), "date_bounds": map[string]any{"start": start, "end": end}, "min_doc_count": 0, "sub_aggregations": metrics}
 	aggregations := map[string]any{"points": points}
 	if len(options.GroupBy) > 0 {
-		aggregations = map[string]any{"series": map[string]any{"type": "terms", "fields": options.GroupBy, "size": maxSeries, "sub_aggregations": aggregations}}
+		aggregations = map[string]any{"series": map[string]any{"type": "terms", "fields": options.GroupBy, "exclude_null": true, "size": maxSeries, "sub_aggregations": aggregations}}
 	}
 	clauses := []any{map[string]any{"field": options.Timestamp, "start": start, "end": end, "inclusive_start": true, "inclusive_end": false}}
 	for field, value := range options.Dimensions {

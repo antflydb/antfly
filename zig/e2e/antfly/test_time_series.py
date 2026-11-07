@@ -135,6 +135,7 @@ def test_time_series_fixed_buckets_and_algebraic_corrections(stateful_api, shard
             "series": {
                 "type": "terms",
                 "fields": ["device_id"],
+                "exclude_null": True,
                 "size": 10,
                 "sub_aggregations": _query()["aggregations"],
             }
@@ -525,8 +526,11 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
     )
     count = 100_001
     for first in range(0, count, 1000):
-        api.batch_write(
+        # Bulk full-index visibility can include checkpoint warming. Allow a
+        # longer setup transport timeout without relaxing the query's budget.
+        api.batch_write_with_timeout(
             name,
+            timeout_s=120,
             inserts={
                 str(i): {
                     "device_id": "sensor",
@@ -739,10 +743,43 @@ def test_sdk_generated_sql_matches_group_selection_and_measurements(stateful_api
         (Path(__file__).parent / "fixtures/time-series-sdk-sql.json").read_text()
     )
     name = f"series_sdk_sql_{time.time_ns()}"
-    finish_create_table(
-        api, name, api._request("POST", f"/tables/{name}", fixture["table"])
-    )
+    config = copy.deepcopy(fixture["table"])
+    # Ordinary tables may have nullable/optional keyword dimensions. Terms skips
+    # null and missing values, so SQL must exclude both before top-series ranking.
+    schema = config["schema"]["document_schemas"]["reading"]["schema"]
+    schema["required"] = ["observed_at"]
+    for field in ("device_id", "region"):
+        schema["properties"][field]["type"] = ["string", "null"]
+    finish_create_table(api, name, api._request("POST", f"/tables/{name}", config))
     readings = {
+        **{
+            f"null_device_{i}": {
+                "device_id": None,
+                "region": "west",
+                "observed_at": "2026-11-06T12:01:00Z",
+                "temperature": 999,
+            }
+            for i in range(4)
+        },
+        **{
+            f"null_region_{i}": {
+                "device_id": "null_region",
+                "region": None,
+                "observed_at": "2026-11-06T12:01:00Z",
+                "temperature": 999,
+            }
+            for i in range(4)
+        },
+        "missing_device": {
+            "region": "west",
+            "observed_at": "2026-11-06T12:01:00Z",
+            "temperature": 999,
+        },
+        "missing_region": {
+            "device_id": "missing_region",
+            "observed_at": "2026-11-06T12:01:00Z",
+            "temperature": 999,
+        },
         "hot1": {
             "device_id": "hot",
             "region": "west",
@@ -878,6 +915,22 @@ def test_sdk_generated_sql_matches_group_selection_and_measurements(stateful_api
         assert actual == expected, (case["name"], actual, expected)
         assert len({tuple(row[:key_position]) for row in actual}) == 2
 
+    # Existing terms queries keep their null grouping policy. A temporal index
+    # that omits null dimensions must decline that policy instead of changing it.
+    legacy = copy.deepcopy(fixture["cases"][0]["query"])
+    legacy["aggregations"]["series"].pop("exclude_null")
+    response = api.post("/query", dict(legacy, table=name))
+    legacy_result = response.get("responses", [response])[0]
+    assert (
+        legacy_result["profile"].get("aggregation_execution") != "materialized_temporal"
+    ), legacy_result
+    assert legacy_result["aggregations"]["series"]["buckets"][0]["key"] == "null", (
+        legacy_result
+    )
+    assert legacy_result["aggregations"]["series"]["buckets"][0]["doc_count"] == 4, (
+        legacy_result
+    )
+
     populated = copy.deepcopy(fixture["cases"][0]["query"])
     hist = populated["aggregations"]["series"]["sub_aggregations"]["points"]
     hist.pop("date_bounds")
@@ -888,3 +941,112 @@ def test_sdk_generated_sql_matches_group_selection_and_measurements(stateful_api
         populated_result["profile"].get("aggregation_execution")
         == "materialized_temporal"
     ), populated_result
+
+
+@pytest.mark.parametrize("shards", [1, 2])
+def test_sdk_retention_preset_lifecycle(stateful_api, shards):
+    from datetime import UTC, datetime, timedelta
+    from helpers import wait_until
+
+    api = stateful_api
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/time-series-sdk.json").read_text()
+    )
+    config = copy.deepcopy(fixture["retentionTable"])
+    config["num_shards"] = shards
+    name = f"sdk_retention_{shards}_{time.time_ns()}"
+    finish_create_table(api, name, api._request("POST", f"/tables/{name}", config))
+    start_seconds = int(time.time()) // 300 * 300
+    start = datetime.fromtimestamp(start_seconds, UTC)
+    stamp = lambda value: value.isoformat().replace("+00:00", "Z")
+    documents = {
+        "a": {
+            "device_id": "sensor",
+            "region": "west",
+            "observed_at": stamp(start + timedelta(seconds=1)),
+            "temperature": 10,
+        },
+        "b": {
+            "device_id": "sensor",
+            "region": "west",
+            "observed_at": stamp(start + timedelta(seconds=2)),
+            "temperature": 20,
+        },
+        "expired": {
+            "device_id": "sensor",
+            "region": "west",
+            "observed_at": stamp(start - timedelta(days=8)),
+            "temperature": 999,
+        },
+    }
+    api.batch_write(name, inserts=documents, sync_level="full_index")
+    query = copy.deepcopy(fixture["query"])
+    query["table"] = name
+    query["filter_query"]["conjuncts"][0].update(
+        start=stamp(start), end=stamp(start + timedelta(minutes=5))
+    )
+    histogram = query["aggregations"]["series"]["sub_aggregations"]["points"]
+    histogram["date_bounds"] = {
+        "start": stamp(start),
+        "end": stamp(start + timedelta(minutes=5)),
+    }
+
+    def response(request):
+        payload = api.post("/query", dict(request, table=name))
+        return payload.get("responses", [payload])[0]
+
+    # Expiration maintenance can advance a derived watermark immediately after
+    # full_index. Wait for the stable indexed path rather than racing that work.
+    last_index_attempt = {}
+
+    def indexed_response():
+        result = response(query)
+        last_index_attempt.clear()
+        last_index_attempt.update(result)
+        return (
+            result
+            if result["profile"].get("aggregation_execution") == "materialized_temporal"
+            else None
+        )
+
+    result = wait_until(indexed_response, timeout_s=30, interval_s=0.25)
+    assert result, last_index_attempt.get("profile", {}).get("aggregation_execution")
+    point = result["aggregations"]["series"]["buckets"][0]["sub_aggregations"][
+        "points"
+    ]["buckets"][0]
+    assert point["doc_count"] == 2
+    assert point["sub_aggregations"]["total"]["value"] == 30
+    assert not response({"full_text_search": {"ids": ["expired"]}, "limit": 1})["hits"][
+        "hits"
+    ]
+
+    # Correcting a reading to an expired instant removes its recent contribution.
+    documents["a"]["observed_at"] = documents["expired"]["observed_at"]
+    api.batch_write(name, inserts={"a": documents["a"]}, sync_level="full_index")
+    result = wait_until(indexed_response, timeout_s=30, interval_s=0.25)
+    assert result, last_index_attempt.get("profile", {}).get("aggregation_execution")
+    point = result["aggregations"]["series"]["buckets"][0]["sub_aggregations"][
+        "points"
+    ]["buckets"][0]
+    assert point["doc_count"] == 1
+    assert point["sub_aggregations"]["total"]["value"] == 20
+
+    # Shortening retention expires the remaining reading. Reuse must decline
+    # when the source range is no longer visible through the query deadline.
+    updated = copy.deepcopy(config["schema"])
+    updated["ttl"]["duration"] = "1s"
+    api.update_schema(name, updated)
+    assert wait_until(
+        lambda: (
+            not response({"full_text_search": {"ids": ["b"]}, "limit": 1})["hits"][
+                "hits"
+            ]
+        ),
+        timeout_s=65,
+        interval_s=0.5,
+    )
+    result = response(query)
+    assert result["profile"].get("aggregation_execution") != "materialized_temporal", (
+        result
+    )
+    assert result["aggregations"]["series"].get("buckets", []) == [], result

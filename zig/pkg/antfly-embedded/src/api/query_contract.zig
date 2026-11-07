@@ -5695,6 +5695,7 @@ fn parseSingleAggregationRequestAlloc(
         if (first >= last) return error.InvalidQueryRequest;
     }
 
+    if ((aggregation.exclude_null orelse false) and aggregation.type != .terms) return error.InvalidQueryRequest;
     const cardinality_mode = try parseCardinalityModeJson(alloc, aggregation.mode);
 
     return .{
@@ -5703,6 +5704,7 @@ fn parseSingleAggregationRequestAlloc(
         .field = try alloc.dupe(u8, primary_field),
         .cardinality_mode = cardinality_mode,
         .fields = fields,
+        .exclude_null = aggregation.exclude_null orelse false,
         .size = aggregation.size orelse 0,
         .interval = if (aggregation.interval) |value| value else 0,
         .calendar_interval = if (aggregation.calendar_interval) |value|

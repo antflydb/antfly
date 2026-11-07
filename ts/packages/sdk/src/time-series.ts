@@ -176,6 +176,7 @@ export function seriesQuery(options: SeriesQueryOptions): GlobalQueryRequest {
           series: {
             type: "terms",
             fields: groupBy,
+            exclude_null: true,
             size: maxSeries,
             sub_aggregations: { points: histogram },
           },
@@ -394,7 +395,10 @@ export function seriesSQL(options: SeriesQueryOptions): SQLRequest {
       `${column(options.timestamp, prefix)}::datetime >= $1::datetime`,
       `${column(options.timestamp, prefix)}::datetime < $2::datetime`,
       ...dimensionFilters.map(([field, value]) => `${column(field, prefix)} = ${value}`),
-      ...groupBy.map((field) => `NOT is_missing(${column(field, prefix)})`),
+      ...groupBy.flatMap((field) => [
+        `NOT is_missing(${column(field, prefix)})`,
+        `${column(field, prefix)} IS NOT NULL`,
+      ]),
     ].join(" AND ");
   const dimensions = groupBy.map((field) => column(field, `${source}.`));
   const columns = [

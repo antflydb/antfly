@@ -13720,7 +13720,7 @@ fn tryApplyProvisionedAlgebraicDistributedAggregations(
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
     if (requests.len == 0) return false;
-    if (aggregation_contract.containsDateHistogram(requests)) return false;
+    if (aggregation_contract.containsDateHistogram(requests) or aggregation_contract.containsNullExclusion(requests)) return false;
 
     // The query coordinator still owns table read admission here. Lease the
     // writer/apply DB instead of opening a second full query catalog while an
@@ -13986,7 +13986,7 @@ fn tryApplyHostedAlgebraicDistributedAggregations(
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
     if (requests.len == 0) return false;
-    if (aggregation_contract.containsDateHistogram(requests)) return false;
+    if (aggregation_contract.containsDateHistogram(requests) or aggregation_contract.containsNullExclusion(requests)) return false;
 
     if (representative_group_id) |group_id| {
         const first_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -36063,6 +36063,7 @@ fn temporalOwnerCall(self: anytype, alloc: std.mem.Allocator, group_id: u64, tab
 }
 
 fn temporalOwnerBody(alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.SearchRequest, group_id: u64, shards_json: ?[]const u8) ![]u8 {
+    const timeout_ms = try queryRemainingTimeoutMs(req);
     var group_req = req;
     if (group_req.native_query_cut) |cut| group_req.native_query_cut = try cut.forGroup(group_id);
     const query_json = try local_query_contract.encodeQueryRequestWithGraphWireMode(alloc, group_req, false, true, true);
@@ -36071,6 +36072,7 @@ fn temporalOwnerBody(alloc: std.mem.Allocator, table_name: []const u8, req: db_m
         .temporal_query = query_json,
         .table_name = table_name,
         .shards_json = shards_json,
+        .timeout_ms = timeout_ms,
     }, .{}));
 }
 
@@ -36279,4 +36281,15 @@ test "time series temporal owner fanout bounds waves and joins failures" {
     try std.testing.expectEqual(@as(usize, 0), meta.aggregation_results.len);
     try std.testing.expect(!temporalOwnerErrorDeclined(&meta, error.UnsupportedQueryRequest));
     try std.testing.expectEqualStrings("scan_temporal_owner_unavailable", meta.aggregation_execution.?);
+}
+
+test "time series owner envelopes retain budgets without native cuts" {
+    const a = std.testing.allocator;
+    const body = try temporalOwnerBody(a, "readings", .{ .execution_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s }, 7, null);
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(local_query_contract.TemporalWire, a, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.timeout_ms != null);
+    try std.testing.expect(parsed.value.timeout_ms.? > 0 and parsed.value.timeout_ms.? <= 5000);
+    try std.testing.expectError(error.Timeout, temporalOwnerBody(a, "readings", .{ .execution_deadline_ns = 0 }, 7, null));
 }

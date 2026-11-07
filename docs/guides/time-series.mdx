@@ -152,6 +152,9 @@ origins and offset normalization. The SQL helper casts both source timestamps an
 range parameters to datetime, including the preset's JSON string columns. For grouped
 queries using the preset's scalar keyword dimension model, it selects the same top `maxSeries` by observation count and key before
 bucketing, including canonical JSON tuple tie-breaking for composite keyword groups.
+Series helpers set `exclude_null: true` on terms grouping: both paths exclude null
+and missing grouping keys before series ranking. Ordinary terms queries retain
+their existing null policy unless this option is enabled.
 Its selection CTE retains only the bounded series list; it does not materialize the
 entire filtered source. SQL COUNT results follow the SQL API's lossless bigint wire
 representation and can be decimal strings. JSON metric responses retain 64-bit floating-point
@@ -198,7 +201,9 @@ If the snapshot expires, restart the read rather than mixing snapshots. For late
 N per device, issue bounded per-device requests; a broad SQL window expression
 can be correct without having a bounded per-device access cost. The TypeScript
 `latestSeries` helper accepts an explicit selection of at most 100 series and
-limits concurrency to four requests, retaining each result’s snapshot.
+limits concurrency to four requests, retaining each result’s snapshot. On failure
+it stops admitting queued requests, cancels outstanding calls, and waits for them
+to finish before rejecting.
 
 ## Other SDKs
 
@@ -236,7 +241,10 @@ fall back because documents missing those fields may be absent from the material
 `scan_...` reason when a temporal plan declines.
 
 Execution is bounded to one million maintained cells and 64 MiB of retained distributed
-partial data. Owner exports use bounded parallel fanout, with at most four transport
+partial data. Owners apply proven time and dimension predicates before exporting
+states; unrelated history still counts against the maintained-scan work budget,
+but does not consume transfer or coordinator retention budgets. Owner exports
+use bounded parallel fanout, with at most four transport
 buffers alive in a window. Budget exhaustion declines the acceleration attempt
 rather than failing an otherwise valid exact scan. The scan fallback retains its normal source-row limit. Choose
 bounded time ranges and dimensions; the accelerator scans maintained state rather

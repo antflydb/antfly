@@ -71,7 +71,15 @@ def series_query(
         "sub_aggregations": {op: {"type": op, "field": measurement} for op in ("avg", "min", "max")},
     }
     aggregates = (
-        {"series": {"type": "terms", "fields": group_by, "size": max_series, "sub_aggregations": {"points": points}}}
+        {
+            "series": {
+                "type": "terms",
+                "fields": group_by,
+                "exclude_null": True,
+                "size": max_series,
+                "sub_aggregations": {"points": points},
+            }
+        }
         if group_by
         else {"points": points}
     )

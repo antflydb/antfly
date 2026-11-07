@@ -76,6 +76,9 @@ class AggregationRequest:
             - approximate: require a matching sketch; error if none applies.
         fields (list[str] | Unset): Ordered field list for multi-field terms aggregations. Each bucket key is a JSON
             string containing the serialized value array in the same order; clients should parse bucket.key as JSON.
+        exclude_null (bool | Unset): Exclude explicit nulls from terms grouping keys (including array elements). Missing
+            fields are always skipped. Series helpers enable this so scan, temporal indexes, and SQL use the same non-null
+            dimension model. Default: False.
         size (int | Unset): Maximum number of buckets to return (for bucketing aggregations) Example: 10.
         ranges (list[AggregationRange] | Unset): Ranges for range aggregations
         date_ranges (list[AggregationDateRange] | Unset): Date ranges for date_range aggregations
@@ -119,6 +122,7 @@ class AggregationRequest:
     field: str | Unset = UNSET
     mode: CardinalityMode | Unset = UNSET
     fields: list[str] | Unset = UNSET
+    exclude_null: bool | Unset = False
     size: int | Unset = UNSET
     ranges: list[AggregationRange] | Unset = UNSET
     date_ranges: list[AggregationDateRange] | Unset = UNSET
@@ -214,6 +218,8 @@ class AggregationRequest:
         fields: list[str] | Unset = UNSET
         if not isinstance(self.fields, Unset):
             fields = self.fields
+
+        exclude_null = self.exclude_null
 
         size = self.size
 
@@ -355,6 +361,8 @@ class AggregationRequest:
             field_dict["mode"] = mode
         if fields is not UNSET:
             field_dict["fields"] = fields
+        if exclude_null is not UNSET:
+            field_dict["exclude_null"] = exclude_null
         if size is not UNSET:
             field_dict["size"] = size
         if ranges is not UNSET:
@@ -445,6 +453,8 @@ class AggregationRequest:
             mode = CardinalityMode(_mode)
 
         fields = cast(list[str], d.pop("fields", UNSET))
+
+        exclude_null = d.pop("exclude_null", UNSET)
 
         size = d.pop("size", UNSET)
 
@@ -825,6 +835,7 @@ class AggregationRequest:
             field=field,
             mode=mode,
             fields=fields,
+            exclude_null=exclude_null,
             size=size,
             ranges=ranges,
             date_ranges=date_ranges,

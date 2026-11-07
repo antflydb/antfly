@@ -59,6 +59,7 @@ pub const SearchAggregationRequest = struct {
     // else exact).
     cardinality_mode: CardinalityMode = .auto,
     fields: []const []const u8 = &.{},
+    exclude_null: bool = false,
     size: i64 = 0,
     interval: f64 = 0,
     calendar_interval: []const u8 = "",
@@ -278,5 +279,11 @@ pub fn containsDateHistogram(requests: []const SearchAggregationRequest) bool {
     for (requests) |request| {
         if (std.mem.eql(u8, request.type, "date_histogram") or containsDateHistogram(request.aggregations)) return true;
     }
+    return false;
+}
+
+/// Legacy algebraic paths do not prove the explicit null exclusion policy.
+pub fn containsNullExclusion(requests: []const SearchAggregationRequest) bool {
+    for (requests) |request| if (request.exclude_null or containsNullExclusion(request.aggregations)) return true;
     return false;
 }

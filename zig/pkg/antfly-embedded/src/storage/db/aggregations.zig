@@ -516,6 +516,7 @@ fn computeAlgebraicAggregation(
     }
 
     if (try computeTemporalMaterializedAggregation(alloc, index, store, request, ctx.algebraic_constraints, ctx)) |temporal| return temporal;
+    if (request.exclude_null) return null;
     // Older algebraic plans understand equality constraints only. A typed
     // source range must never be reinterpreted as a scalar constraint.
     for (ctx.algebraic_constraints) |constraint| if (constraint.time_range != null) return null;
@@ -7076,7 +7077,7 @@ fn computeTermsAggregation(
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch continue;
         defer parsed.deinit();
         const value = extractValueAtPath(parsed.value, request.field) orelse continue;
-        try appendTermAggregationValues(alloc, &counts, &grouped, hit, value);
+        try appendTermAggregationValues(alloc, &counts, &grouped, hit, value, request.exclude_null);
     }
 
     var entries = std.ArrayList(struct { key: []const u8, count: i64 }).empty;
@@ -7181,7 +7182,7 @@ fn computeCompositeTermsAggregation(
                 missing_field = true;
                 break;
             };
-            components[i] = try compositeTermComponentsAlloc(alloc, value);
+            components[i] = try compositeTermComponentsAlloc(alloc, value, request.exclude_null);
             components_filled = i + 1;
             if (components[i].items.len == 0) {
                 missing_field = true;
@@ -15894,10 +15895,12 @@ fn appendTermAggregationValues(
     grouped: *std.StringHashMap(std.ArrayListUnmanaged(types.SearchHit)),
     hit: types.SearchHit,
     value: std.json.Value,
+    exclude_null: bool,
 ) !void {
+    if (exclude_null and value == .null) return;
     switch (value) {
         .array => |arr| {
-            for (arr.items) |item| try appendTermAggregationValues(alloc, counts, grouped, hit, item);
+            for (arr.items) |item| try appendTermAggregationValues(alloc, counts, grouped, hit, item, exclude_null);
         },
         else => {
             const key = try jsonValueToTermKey(alloc, value);
@@ -15918,28 +15921,20 @@ fn appendTermAggregationValues(
     }
 }
 
-fn compositeTermComponentsAlloc(alloc: Allocator, value: std.json.Value) !CompositeTermComponents {
-    return switch (value) {
-        .array => |arr| blk: {
-            const items = try alloc.alloc([]u8, arr.items.len);
-            var filled: usize = 0;
-            errdefer {
-                for (items[0..filled]) |item| alloc.free(item);
-                if (items.len > 0) alloc.free(items);
-            }
-            for (arr.items, 0..) |item, i| {
-                items[i] = try stringifyJsonValueCompact(alloc, item);
-                filled = i + 1;
-            }
-            break :blk .{ .items = items };
-        },
-        else => blk: {
-            const items = try alloc.alloc([]u8, 1);
-            errdefer alloc.free(items);
-            items[0] = try stringifyJsonValueCompact(alloc, value);
-            break :blk .{ .items = items };
-        },
-    };
+fn compositeTermComponentsAlloc(alloc: Allocator, value: std.json.Value, exclude_null: bool) !CompositeTermComponents {
+    var items = std.ArrayList([]u8).empty;
+    errdefer {
+        for (items.items) |item| alloc.free(item);
+        items.deinit(alloc);
+    }
+    const values: []const std.json.Value = if (value == .array) value.array.items else &.{value};
+    for (values) |item| {
+        if (exclude_null and item == .null) continue;
+        const encoded = try stringifyJsonValueCompact(alloc, item);
+        errdefer alloc.free(encoded);
+        try items.append(alloc, encoded);
+    }
+    return .{ .items = try items.toOwnedSlice(alloc) };
 }
 
 fn appendCompositeTermAggregationValues(
@@ -16244,7 +16239,7 @@ const TemporalShape = struct {
 
 fn temporalShape(request: SearchAggregationRequest) ?TemporalShape {
     const histogram = if (std.mem.eql(u8, request.type, "date_histogram")) request else blk: {
-        if (!std.mem.eql(u8, request.type, "terms") or request.aggregations.len != 1 or (request.fields.len == 0 and request.field.len == 0)) return null;
+        if (!std.mem.eql(u8, request.type, "terms") or !request.exclude_null or request.aggregations.len != 1 or (request.fields.len == 0 and request.field.len == 0)) return null;
         if (request.background_query != null or request.term_prefix.len != 0 or request.term_pattern.len != 0 or request.algebraic_join != null) return null;
         break :blk request.aggregations[0];
     };
@@ -16253,18 +16248,20 @@ fn temporalShape(request: SearchAggregationRequest) ?TemporalShape {
     return .{ .request = request, .histogram = histogram };
 }
 
+const TemporalPredicateToken = struct {
+    position: usize,
+    token: []u8,
+};
+
 const TemporalPlan = struct {
     shape: TemporalShape,
     plan: algebraic_mod.planner.PlanResult,
-    constraints: []FixedConstraint,
+    predicate_tokens: []const TemporalPredicateToken,
     range: ?algebraic_mod.ir.TimeRange,
     fn deinit(self: *@This(), a: Allocator) void {
         self.plan.deinit(a);
-        for (self.constraints) |constraint| {
-            a.free(constraint.field);
-            a.free(constraint.value);
-        }
-        a.free(self.constraints);
+        for (self.predicate_tokens) |predicate| a.free(predicate.token);
+        a.free(self.predicate_tokens);
     }
 };
 
@@ -16362,7 +16359,22 @@ fn temporalPlanAlloc(a: Allocator, index: *const algebraic_mod.index.Index, requ
             return null;
         }
     }
-    return .{ .shape = shape, .plan = plan, .constraints = try fixed.toOwnedSlice(a), .range = range };
+    // Compile dimension predicates once, rather than canonicalizing tokens and
+    // allocating for every maintained row during export and final folding.
+    const predicates = try a.alloc(TemporalPredicateToken, fixed.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (predicates[0..initialized]) |predicate| a.free(predicate.token);
+        a.free(predicates);
+    }
+    for (fixed.items, 0..) |constraint, i| {
+        predicates[i] = .{
+            .position = fieldPosition(count.materialization.group_by, constraint.field).?,
+            .token = try index.constraintTokenAlloc(a, constraint.field, constraint.value),
+        };
+        initialized += 1;
+    }
+    return .{ .shape = shape, .plan = plan, .predicate_tokens = predicates, .range = range };
 }
 
 pub fn temporalMaterializationsAlloc(a: Allocator, index: *const algebraic_mod.index.Index, request: SearchAggregationRequest, constraints: []const FixedConstraint) !?[][]const u8 {
@@ -16417,6 +16429,24 @@ fn temporalSortKeyAlloc(a: Allocator, key_json: []const u8) ![]u8 {
     return a.dupe(u8, if (parsed.value == .string) parsed.value.string else key_json);
 }
 
+const TemporalAxis = struct {
+    bucket_start: []const u8,
+    group: [][]u8,
+};
+
+/// The owner and final fold use the same proven predicate. Scratch allocations
+/// never escape the current maintained row; output still contains full states.
+fn selectTemporalAxisAlloc(a: Allocator, plan: TemporalPlan, canonical_axis: []const u8) !?TemporalAxis {
+    const axis = try algebraic_mod.token.decodeTupleAlloc(a, canonical_axis);
+    if (axis.len != 2) return error.InvalidAggregation;
+    const at = (try parseRfc3339ToSignedNs(axis[0])) orelse return error.InvalidAggregation;
+    if (plan.range) |range| if (at < range.start_ns or at >= range.end_ns) return null;
+    const group = try algebraic_mod.token.decodeTupleAlloc(a, axis[1]);
+    if (group.len != plan.plan.count_metric.?.materialization.group_by.len) return null;
+    for (plan.predicate_tokens) |predicate| if (!std.mem.eql(u8, group[predicate.position], predicate.token)) return null;
+    return .{ .bucket_start = axis[0], .group = group };
+}
+
 fn foldTemporalPartialsAlloc(a: Allocator, index: *algebraic_mod.index.Index, plan: TemporalPlan, rows: anytype, ctx: Context) !SearchAggregationResult {
     var local_fold_budget = algebraic_mod.index.TemporalScanBudget{ .control = ctx.control };
     const fold_budget = ctx.temporal_scan_budget orelse &local_fold_budget;
@@ -16468,12 +16498,8 @@ fn foldTemporalPartialsAlloc(a: Allocator, index: *algebraic_mod.index.Index, pl
         const raw_count = values[0] orelse continue;
         const count = try algebraic_mod.algebra.parseI64(raw_count);
         if (count <= 0) continue;
-        const axis = try algebraic_mod.token.decodeTupleAlloc(tmp, entry.key_ptr.*);
-        if (axis.len != 2) return error.InvalidAggregation;
-        const at = (try parseRfc3339ToSignedNs(axis[0])) orelse return error.InvalidAggregation;
-        if (plan.range) |range| if (at < range.start_ns or at >= range.end_ns) continue;
-        const decoded = try algebraic_mod.token.decodeTupleAlloc(tmp, axis[1]);
-        if (!decodedGroupMatchesConstraints(index, count_plan.materialization, decoded, plan.constraints)) continue;
+        const axis = (try selectTemporalAxisAlloc(tmp, plan, entry.key_ptr.*)) orelse continue;
+        const decoded = axis.group;
         const projected = try tmp.alloc([]const u8, shape.groupCount());
         for (projected, 0..) |*value, i| value.* = decoded[fieldPosition(count_plan.materialization.group_by, index.fieldConfig(shape.groupField(i), .group).?.name).?];
         const group_key = try algebraic_mod.token.canonicalTupleAlloc(tmp, projected);
@@ -16493,8 +16519,8 @@ fn foldTemporalPartialsAlloc(a: Allocator, index: *algebraic_mod.index.Index, pl
         };
         const group = &groups.items[group_index];
         group.count += count;
-        const point_index = group.by_time.get(axis[0]) orelse blk: {
-            const key = try a.dupe(u8, axis[0]);
+        const point_index = group.by_time.get(axis.bucket_start) orelse blk: {
+            const key = try a.dupe(u8, axis.bucket_start);
             errdefer a.free(key);
             const folds = try a.alloc(AlgebraicMetricFold, children.len);
             errdefer a.free(folds);
@@ -16700,6 +16726,9 @@ test "time series grouped materializations merge globally and reduce extra dimen
         .{ .key = "a", .action = .upsert, .cleaned_value = "{\"device\":\"s1\",\"region\":\"west\",\"ts\":\"2026-11-06T12:01:00Z\",\"v\":10}" },
         .{ .key = "b", .action = .upsert, .cleaned_value = "{\"device\":\"s2\",\"region\":\"west\",\"ts\":\"2026-11-06T12:06:00Z\",\"v\":20}" },
         .{ .key = "b2", .action = .upsert, .cleaned_value = "{\"device\":\"s2\",\"region\":\"west\",\"ts\":\"2026-11-06T12:06:00Z\",\"v\":25}" },
+        .{ .key = "history", .action = .upsert, .cleaned_value = "{\"device\":\"s1\",\"region\":\"west\",\"ts\":\"2026-11-06T11:55:00Z\",\"v\":999}" },
+        .{ .key = "exclusive_end", .action = .upsert, .cleaned_value = "{\"device\":\"s1\",\"region\":\"west\",\"ts\":\"2026-11-06T12:15:00Z\",\"v\":999}" },
+        .{ .key = "other_region", .action = .upsert, .cleaned_value = "{\"device\":\"s1\",\"region\":\"east\",\"ts\":\"2026-11-06T12:01:00Z\",\"v\":999}" },
     } });
     try right.applyBatch(&right_store, .{ .documents = &.{
         .{ .key = "c", .action = .upsert, .cleaned_value = "{\"device\":\"s1\",\"region\":\"west\",\"ts\":\"2026-11-06T12:01:00Z\",\"v\":30}" },
@@ -16709,7 +16738,7 @@ test "time series grouped materializations merge globally and reduce extra dimen
     const histogram: SearchAggregationRequest = .{ .name = "points", .type = "date_histogram", .field = "ts", .fixed_interval = "5m", .date_bounds_start = "2026-11-06T12:00:00Z", .date_bounds_end = "2026-11-06T12:15:00Z", .aggregations = &.{
         .{ .name = "average", .type = "avg", .field = "v" }, .{ .name = "total", .type = "sum", .field = "v" }, .{ .name = "duplicate_sum_alias", .type = "sum", .field = "v" },
     } };
-    const request: SearchAggregationRequest = .{ .name = "series", .type = "terms", .field = "device", .fields = &.{"device"}, .size = 1, .aggregations = &.{histogram} };
+    const request: SearchAggregationRequest = .{ .name = "series", .type = "terms", .field = "device", .fields = &.{"device"}, .exclude_null = true, .size = 1, .aggregations = &.{histogram} };
     const constraints = [_]FixedConstraint{ .{ .field = "ts", .value = "", .time_range = .{ .start_ns = @import("../../datetime.zig").parseRfc3339ToSignedNs(histogram.date_bounds_start).?, .end_ns = @import("../../datetime.zig").parseRfc3339ToSignedNs(histogram.date_bounds_end).? } }, .{ .field = "region", .value = "west" } };
     try std.testing.expectEqual(@as(?[][]const u8, null), try temporalMaterializationsAlloc(a, &left, request, constraints[0..1]));
     var duplicate_axes = request;
@@ -16724,11 +16753,16 @@ test "time series grouped materializations merge globally and reduce extra dimen
     try std.testing.expectError(error.QueryCandidateBudgetExceeded, left.scanMaterializedExpressionRowsBounded(&left_store, names, &no_bytes));
     var few_columns = algebraic_mod.index.TemporalScanBudget{ .remaining_fold_cells = 1 };
     try std.testing.expect((try computeTemporalMaterializedAggregation(a, &left, &left_store, request, &constraints, .{ .temporal_scan_budget = &few_columns })) == null);
-    const lp = try left.scanDistributedPartials(&left_store, names);
-    defer algebraic_mod.distributed.freePartials(a, lp);
-    const rp = try right.scanDistributedPartials(&right_store, names);
-    defer algebraic_mod.distributed.freePartials(a, rp);
-    try std.testing.expect(lp.len > 0 and rp.len > 0);
+    var export_budget = algebraic_mod.index.TemporalScanBudget{};
+    const lp = (try temporalPartialsAlloc(a, &left, &left_store, request, &constraints, .{ .temporal_scan_budget = &export_budget })) orelse return error.MissingTemporalResult;
+    defer algebraic_mod.distributed.freePartials(a, @constCast(lp));
+    const rp = (try temporalPartialsAlloc(a, &right, &right_store, request, &constraints, .{})) orelse return error.MissingTemporalResult;
+    defer algebraic_mod.distributed.freePartials(a, @constCast(rp));
+    // Five source axes are scanned, but only two matching axes cross the wire.
+    // Pruning preserves all three physical metrics and the complete global rank.
+    try std.testing.expectEqual(@as(usize, 1_000_000 - 15), export_budget.remaining_cells);
+    try std.testing.expectEqual(@as(usize, 6), lp.len);
+    try std.testing.expectEqual(@as(usize, 9), rp.len);
     var partials = std.ArrayList(algebraic_mod.distributed.Partial).empty;
     defer partials.deinit(a);
     try partials.appendSlice(a, lp);
@@ -16773,8 +16807,14 @@ pub fn temporalPartialsAlloc(a: Allocator, index: *algebraic_mod.index.Index, st
     }
     if (rows.len > 1_000_000 / @max(names.len, 1)) return error.QueryCandidateBudgetExceeded;
     var partials = std.ArrayList(algebraic_mod.distributed.Partial).empty;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
     for (rows) |row| {
         try ctx.control.check();
+        _ = scratch.reset(.retain_capacity);
+        // Scanned work remains charged even for rejected rows. Transfer and
+        // coordinator retention include only states selected by the predicate.
+        if (try selectTemporalAxisAlloc(scratch.allocator(), plan, row.group_key) == null) continue;
         for (row.values, names) |value, name| if (value) |raw| {
             var law_id: algebraic_mod.law.Id = .count;
             if (!std.mem.eql(u8, name, plan.plan.count_metric.?.materialization.name)) {
@@ -16832,4 +16872,29 @@ test "time series histogram allocation and in-flight cancellation are failure at
     defer deinitResults(std.testing.allocator, selected);
     try std.testing.expectEqual(@as(usize, 2), selected[0].buckets.len);
     for (selected[0].buckets) |bucket| try std.testing.expectEqual(@as(i64, 1), bucket.count);
+}
+
+test "time series explicit null exclusion preserves ordinary terms defaults" {
+    const a = std.testing.allocator;
+    const hits = [_]types.SearchHit{
+        .{ .id = @constCast("null"), .stored_data = @constCast("{\"device\":null,\"region\":\"west\"}"), .score = 1 },
+        .{ .id = @constCast("array"), .stored_data = @constCast("{\"device\":[\"a\",null],\"region\":[null,\"west\"]}"), .score = 1 },
+        .{ .id = @constCast("literal"), .stored_data = @constCast("{\"device\":\"null\",\"region\":\"west\"}"), .score = 1 },
+        .{ .id = @constCast("missing"), .stored_data = @constCast("{\"region\":\"west\"}"), .score = 1 },
+    };
+    const input: types.SearchResult = .{ .alloc = a, .hits = @constCast(&hits), .total_hits = hits.len };
+    var request: SearchAggregationRequest = .{ .name = "groups", .type = "terms", .field = "device" };
+    const defaults = try computeSearchAggregations(a, &.{request}, input, .{});
+    defer deinitResults(a, defaults);
+    try std.testing.expectEqual(@as(i64, 3), defaults[0].buckets[0].count);
+    request.exclude_null = true;
+    const scalar = try computeSearchAggregations(a, &.{request}, input, .{});
+    defer deinitResults(a, scalar);
+    try std.testing.expectEqual(@as(usize, 2), scalar[0].buckets.len);
+    for (scalar[0].buckets) |bucket| try std.testing.expectEqual(@as(i64, 1), bucket.count);
+    request.fields = &.{ "device", "region" };
+    const composite = try computeSearchAggregations(a, &.{request}, input, .{});
+    defer deinitResults(a, composite);
+    try std.testing.expectEqual(@as(usize, 2), composite[0].buckets.len);
+    for (composite[0].buckets) |bucket| try std.testing.expectEqual(@as(i64, 1), bucket.count);
 }

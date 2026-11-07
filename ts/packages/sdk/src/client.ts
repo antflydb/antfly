@@ -1487,20 +1487,36 @@ export class AntflyClient {
     options?: QueryExecutionOptions
   ) {
     if (request.series.length > 100) throw new RangeError("Select at most 100 series");
-    const results: (QueryResult | undefined)[] = new Array(request.series.length);
+    // Validate the complete selection before starting any network work.
+    const requests = request.series.map((dimensions) => seriesRead({ ...request, dimensions }));
+    const results: (QueryResult | undefined)[] = new Array(requests.length);
+    const stop = new AbortController();
+    const signal = options?.signal ? AbortSignal.any([options.signal, stop.signal]) : stop.signal;
+    signal.throwIfAborted();
     let next = 0;
+    let failed = false;
+    let failure: unknown;
+    // Each worker absorbs its error so Promise.all joins every in-flight call.
+    // The first failure closes admission and cancels siblings, preserving its cause.
     await Promise.all(
-      Array.from({ length: Math.min(4, request.series.length) }, async () => {
-        while (next < request.series.length) {
-          options?.signal?.throwIfAborted();
-          const index = next++;
-          results[index] = await this.query(
-            seriesRead({ ...request, dimensions: request.series[index] }),
-            options
-          );
+      Array.from({ length: Math.min(4, requests.length) }, async () => {
+        while (!failed && next < requests.length) {
+          try {
+            signal.throwIfAborted();
+            const index = next++;
+            results[index] = await this.query(requests[index]!, { ...options, signal });
+          } catch (cause) {
+            if (!failed) {
+              failed = true;
+              failure = cause;
+              stop.abort(cause);
+            }
+          }
         }
       })
     );
+    if (failed) throw failure;
+    signal.throwIfAborted();
     return results;
   }
 

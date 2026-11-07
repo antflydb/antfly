@@ -28661,6 +28661,12 @@ components:
           description: Ordered field list for multi-field terms aggregations. Each bucket key is a JSON
             string containing the serialized value array in the same order; clients should parse bucket.key
             as JSON.
+        exclude_null:
+          type: boolean
+          default: false
+          description: Exclude explicit nulls from terms grouping keys (including array elements). Missing
+            fields are always skipped. Series helpers enable this so scan, temporal indexes, and SQL use
+            the same non-null dimension model.
         size:
           type: integer
           x-go-type-skip-optional-pointer: false

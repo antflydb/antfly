@@ -7774,7 +7774,31 @@ pub const TemporalWire = struct {
     temporal_query: []const u8,
     table_name: []const u8,
     shards_json: ?[]const u8 = null,
+    /// Portable remaining budget; monotonic clock epochs differ between nodes.
+    /// Kept outside the query so it is present even without a native read cut.
+    timeout_ms: ?u32 = null,
+
+    pub fn executionDeadline(self: @This(), started_ns: u64, parsed: ?u64, transport: ?u64) ?u64 {
+        var deadline = parsed;
+        const relative: ?u64 = if (self.timeout_ms) |ms| started_ns +| @as(u64, ms) *| std.time.ns_per_ms else null;
+        for ([_]?u64{ relative, transport }) |candidate| if (candidate) |limit| {
+            deadline = if (deadline) |existing| @min(existing, limit) else limit;
+        };
+        return deadline;
+    }
 };
+
+test "time series owner budgets are portable and never extend an admitted deadline" {
+    const wire: TemporalWire = .{ .temporal_query = "{}", .table_name = "readings", .timeout_ms = 5 };
+    try std.testing.expectEqual(@as(?u64, 105_000_000), wire.executionDeadline(100_000_000, null, null));
+    try std.testing.expectEqual(@as(?u64, 15_000_000), wire.executionDeadline(10_000_000, null, null));
+    try std.testing.expectEqual(@as(?u64, 101_000_000), wire.executionDeadline(100_000_000, null, 101_000_000));
+    try std.testing.expectEqual(@as(?u64, 102_000_000), wire.executionDeadline(100_000_000, 102_000_000, 103_000_000));
+    const expired: TemporalWire = .{ .temporal_query = "{}", .table_name = "readings", .timeout_ms = 0 };
+    try std.testing.expectEqual(@as(?u64, 100_000_000), expired.executionDeadline(100_000_000, null, null));
+    const unbounded: TemporalWire = .{ .temporal_query = "{}", .table_name = "readings" };
+    try std.testing.expect(unbounded.executionDeadline(100_000_000, null, null) == null);
+}
 pub const temporal_max_cells: usize = 1_000_000;
 pub const temporal_max_bytes: usize = 64 * 1024 * 1024;
 

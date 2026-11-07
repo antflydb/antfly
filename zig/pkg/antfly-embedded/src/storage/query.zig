@@ -507,6 +507,7 @@ pub fn executeStorageKernelPreflight(
 /// Coarse temporal plan/export/fold operation. No physical pointers escape this
 /// owner. All intermediate allocations have one bounded request lifetime.
 pub fn executeTemporalQuery(alloc: std.mem.Allocator, db: *db_mod.DB, body: []const u8, control: @import("../search/query.zig").ExecutionControl) ![]u8 {
+    const started_ns = @import("antfly_platform").time.monotonicNs();
     if (body.len > contract.temporal_max_bytes) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_budget, .{});
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -514,7 +515,7 @@ pub fn executeTemporalQuery(alloc: std.mem.Allocator, db: *db_mod.DB, body: []co
     const wire = try std.json.parseFromSliceLeaky(contract.TemporalWire, a, body, .{ .ignore_unknown_fields = true });
     var owned = try query_api.parseQueryRequest(a, null, wire.table_name, wire.temporal_query);
     if (control.cancellation != null) owned.req.cancellation = control.cancellation;
-    if (control.deadline_ns) |deadline| owned.req.execution_deadline_ns = if (owned.req.execution_deadline_ns) |old| @min(old, deadline) else deadline;
+    owned.req.execution_deadline_ns = wire.executionDeadline(started_ns, owned.req.execution_deadline_ns, control.deadline_ns);
     const req = owned.req;
     const execution: @import("../search/query.zig").ExecutionControl = .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
     try execution.check();

@@ -422,3 +422,134 @@ it("applies explicit SQL zero fill after measurement aggregation", () => {
   );
   expect(sql.statement).toContain('COUNT(*) AS "readings"');
 });
+
+it("excludes null and missing grouping keys from both SQL scans", () => {
+  const sql = seriesSQL({ ...options, groupBy: ["device_id", "region"] }).statement;
+  for (const field of ["device_id", "region"]) {
+    expect(sql).toContain(`NOT is_missing("${field}")`);
+    expect(sql).toContain(`"${field}" IS NOT NULL`);
+    expect(sql).toContain(`"__antfly_series_source"."${field}" IS NOT NULL`);
+  }
+});
+
+it("stops latest-series admission, cancels siblings, and joins before rejecting", async () => {
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  const failure = new Error("owner unavailable");
+  let rejectFirst!: (error: unknown) => void;
+  const siblings: (() => void)[] = [];
+  const signals: AbortSignal[] = [];
+  const query = vi.spyOn(client, "query").mockImplementation((_request, execution) => {
+    signals.push(execution!.signal!);
+    if (signals.length === 1)
+      return new Promise((_resolve, reject) => {
+        rejectFirst = reject;
+      });
+    // Simulate a transport that takes time to finish even after cancellation.
+    return new Promise((resolve) => {
+      siblings.push(() => resolve({}));
+    });
+  });
+  let settled = false;
+  const work = client.latestSeries({
+    ...options,
+    series: Array.from({ length: 20 }, (_, i) => ({ device_id: String(i) })),
+  });
+  const outcome = work.then(
+    () => {
+      settled = true;
+      return undefined;
+    },
+    (cause) => {
+      settled = true;
+      return cause;
+    }
+  );
+  expect(query).toHaveBeenCalledTimes(4);
+  rejectFirst(failure);
+  await vi.waitFor(() => expect(signals.every((signal) => signal.aborted)).toBe(true));
+  expect(settled).toBe(false);
+  expect(query).toHaveBeenCalledTimes(4);
+  siblings.forEach((finish) => finish());
+  expect(await outcome).toBe(failure);
+  expect(query).toHaveBeenCalledTimes(4);
+});
+
+it("honors caller cancellation and validates latest-series selections before submission", async () => {
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  const query = vi.spyOn(client, "query").mockResolvedValue({});
+  const abort = new AbortController();
+  abort.abort(new Error("cancelled by caller"));
+  await expect(
+    client.latestSeries({ ...options, series: [{ device_id: "a" }] }, { signal: abort.signal })
+  ).rejects.toThrow("cancelled by caller");
+  await expect(
+    client.latestSeries({ ...options, series: [{ device_id: "a" }], limit: 0 })
+  ).rejects.toThrow("limit");
+  expect(query).not.toHaveBeenCalled();
+});
+
+it("returns latest-series results in selection order with bounded concurrency", async () => {
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  let active = 0,
+    peak = 0;
+  vi.spyOn(client, "query").mockImplementation(async (request) => {
+    peak = Math.max(peak, ++active);
+    await Promise.resolve();
+    active--;
+    return { table: JSON.stringify(request.filter_query) };
+  });
+  const series = Array.from({ length: 20 }, (_, i) => ({ device_id: String(i) }));
+  const results = await client.latestSeries({ ...options, series });
+  expect(peak).toBe(4);
+  expect(active).toBe(0);
+  results.forEach((result, i) =>
+    expect(result?.table).toBe(
+      JSON.stringify(seriesRead({ ...options, dimensions: series[i] }).filter_query)
+    )
+  );
+});
+
+it("shares the retention preset with native lifecycle tests", () => {
+  const fixture = JSON.parse(
+    readFileSync(
+      new URL("../../../../zig/e2e/antfly/fixtures/time-series-sdk.json", import.meta.url),
+      "utf8"
+    )
+  );
+  expect(fixture.retentionTable).toEqual(
+    timeSeriesTable({
+      timestamp: "observed_at",
+      dimensions: ["device_id", "region"],
+      measurements: ["temperature"],
+      bucket: "5m",
+      retention: "7d",
+    })
+  );
+});
+
+it("joins outstanding latest-series calls when the caller aborts in flight", async () => {
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  const abort = new AbortController();
+  const finishes: (() => void)[] = [];
+  const signals: AbortSignal[] = [];
+  const query = vi.spyOn(client, "query").mockImplementation((_request, execution) => {
+    signals.push(execution!.signal!);
+    return new Promise((resolve) => finishes.push(() => resolve({})));
+  });
+  let settled = false;
+  const work = client.latestSeries(
+    { ...options, series: Array.from({ length: 20 }, (_, i) => ({ device_id: String(i) })) },
+    { signal: abort.signal }
+  );
+  const outcome = work.catch((cause) => {
+    settled = true;
+    return cause;
+  });
+  const reason = new Error("caller stopped the selection");
+  abort.abort(reason);
+  expect(signals.every((signal) => signal.aborted)).toBe(true);
+  expect(settled).toBe(false);
+  finishes.forEach((finish) => finish());
+  expect(await outcome).toBe(reason);
+  expect(query).toHaveBeenCalledTimes(4);
+});

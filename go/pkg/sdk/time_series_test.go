@@ -32,7 +32,7 @@ func TestSeriesQueryPreservesTemporalContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, part := range []string{"300000000000ns", "2026-11-06T12:00:00.000000001Z", "date_bounds", "inclusive_end", `"limit":0`, "sub_aggregations", `"equals":"sensor"`} {
+	for _, part := range []string{"300000000000ns", "2026-11-06T12:00:00.000000001Z", "date_bounds", "inclusive_end", `"limit":0`, `"exclude_null":true`, "sub_aggregations", `"equals":"sensor"`} {
 		if !strings.Contains(string(data), part) {
 			t.Fatalf("missing %q: %s", part, data)
 		}

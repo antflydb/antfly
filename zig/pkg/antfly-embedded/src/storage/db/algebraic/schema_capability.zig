@@ -539,7 +539,9 @@ fn removeUnsafeStaticPaths(
     defer path_safety.deinit(alloc);
 
     for (fields.items, 0..) |field, i| {
-        if (schema.ttl_duration_ns > 0 and std.mem.eql(u8, field.path, schema.ttl_field)) {
+        // TTL values are not safe grouping/measurement axes, but their exact
+        // time projection is usable under the temporal planner's visibility fence.
+        if (schema.ttl_duration_ns > 0 and std.mem.eql(u8, field.path, schema.ttl_field) and field.role != .time) {
             remove[i] = true;
             continue;
         }
@@ -1209,20 +1211,22 @@ test "schema capability evaluates date formatted strings per algebraic role" {
     try expectCapability(dated_plan, "first", "published_at", "published_at", "datetime", .time);
 }
 
-test "schema capability suppresses ttl and schema ignored fields" {
+test "time series schema capability retains ttl time but suppresses unsafe roles" {
     const alloc = std.testing.allocator;
     var parsed = try schema_mod.parseValidatedTableSchema(alloc,
         \\{"version":9,"default_type":"dated","ttl_duration_ns":1000,"ttl_field":"expires_at","document_schemas":{"dated":{"schema":{"type":"object","properties":{"expires_at":{"type":"datetime"},"visible":{"type":"keyword"},"_private":{"type":"keyword"},"meta":{"type":"object","properties":{"public":{"type":"keyword"},"_private":{"type":"keyword"}},"additionalProperties":false}},"additionalProperties":false}},"plain":{"schema":{"type":"object","properties":{"expires_at":{"type":"datetime"},"visible":{"type":"keyword"}},"additionalProperties":false}}}}
     );
     defer parsed.deinit(alloc);
 
-    // TTL parsing intentionally accepts canonical integer timestamps even for
-    // datetime declarations, while datetime fact projection accepts strings.
+    // TTL accepts canonical integer timestamps even for datetime declarations;
+    // time projection preserves these alongside RFC3339 timestamp strings.
     try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = "{\"_type\":\"plain\",\"expires_at\":1700000000000000000,\"visible\":\"yes\"}" }});
 
     var plan = try compilePlanAlloc(alloc, parsed);
     defer plan.deinit(alloc);
-    try expectNoCapabilityPath(plan, "expires_at");
+    try expectNoCapabilityRolePath(plan, "expires_at", .group);
+    try expectNoCapabilityRolePath(plan, "expires_at", .measure);
+    try expectCapability(plan, "dated", "expires_at", "expires_at", "datetime", .time);
     try expectNoCapabilityPath(plan, "_private");
     try expectNoCapabilityPath(plan, "meta._private");
     try expectCapability(plan, "dated", "visible", "visible", "string", .group);

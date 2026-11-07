@@ -10035,6 +10035,11 @@ export interface components {
             /** @description Ordered field list for multi-field terms aggregations. Each bucket key is a JSON string containing the serialized value array in the same order; clients should parse bucket.key as JSON. */
             fields?: string[];
             /**
+             * @description Exclude explicit nulls from terms grouping keys (including array elements). Missing fields are always skipped. Series helpers enable this so scan, temporal indexes, and SQL use the same non-null dimension model.
+             * @default false
+             */
+            exclude_null?: boolean;
+            /**
              * @description Maximum number of buckets to return (for bucketing aggregations)
              * @example 10
              */

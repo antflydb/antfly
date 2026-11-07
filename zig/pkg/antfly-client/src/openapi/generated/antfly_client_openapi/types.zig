@@ -520,6 +520,8 @@ pub const AggregationRequest = struct {
     mode: ?std.json.Value = null,
     /// Ordered field list for multi-field terms aggregations. Each bucket key is a JSON string containing the serialized value array in the same order; clients should parse bucket.key as JSON.
     fields: ?[]const []const u8 = null,
+    /// Exclude explicit nulls from terms grouping keys (including array elements). Missing fields are always skipped. Series helpers enable this so scan, temporal indexes, and SQL use the same non-null dimension model.
+    exclude_null: ?bool = null,
     /// Maximum number of buckets to return (for bucketing aggregations)
     size: ?i64 = null,
     /// Ranges for range aggregations
@@ -561,6 +563,7 @@ pub const AggregationRequest = struct {
         .{ "field", "field", true },
         .{ "mode", "mode", true },
         .{ "fields", "fields", true },
+        .{ "exclude_null", "exclude_null", true },
         .{ "size", "size", true },
         .{ "ranges", "ranges", true },
         .{ "date_ranges", "date_ranges", true },
@@ -602,6 +605,10 @@ pub const AggregationRequest = struct {
         }
         if (self.fields) |value| {
             try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.exclude_null) |value| {
+            try jw.objectField("exclude_null");
             try jw.write(value);
         }
         if (self.size) |value| {

@@ -37,7 +37,7 @@ pub fn series_query(
     let aggregations: Value = if group_by.is_empty() {
         json!({"points":points})
     } else {
-        json!({"series":{"type":"terms","fields":group_by,"size":100,
+        json!({"series":{"type":"terms","fields":group_by,"exclude_null":true,"size":100,
             "sub_aggregations":{"points":points}}})
     };
     serde_json::from_value(json!({"table":table,"limit":0,
@@ -67,6 +67,7 @@ mod tests {
             value["aggregations"]["series"]["sub_aggregations"]["points"]["fixed_interval"],
             "5m"
         );
+        assert_eq!(value["aggregations"]["series"]["exclude_null"], true);
         assert_eq!(value["filter_query"]["inclusive_end"], false);
         assert_eq!(
             value["filter_query"]["start"],
