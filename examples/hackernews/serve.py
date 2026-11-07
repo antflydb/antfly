@@ -29,7 +29,12 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
-from managed_api import authorization_headers, open_request, validate_backend
+from managed_api import (
+    authorization_headers,
+    correlation_evidence,
+    open_request,
+    validate_backend,
+)
 
 
 class RateLimit:
@@ -213,6 +218,7 @@ class Gateway(BaseHTTPRequestHandler):
         pass
 
     def upstream(self, path, body=None, timeout=15):
+        self.backend_correlation = {}
         headers = {"Content-Type": "application/json"}
         headers.update(getattr(self.server, "backend_headers", {}))
         request = Request(
@@ -220,8 +226,13 @@ class Gateway(BaseHTTPRequestHandler):
             None if body is None else json.dumps(body).encode(),
             headers,
         )
-        with open_request(request, timeout=timeout) as response:
-            raw = response.read(4194305)
+        try:
+            with open_request(request, timeout=timeout) as response:
+                self.backend_correlation = correlation_evidence(response.headers)
+                raw = response.read(4194305)
+        except HTTPError as error:
+            self.backend_correlation = correlation_evidence(error.headers)
+            raise
         if len(raw) > 4194304:
             raise ValueError("Search response too large")
         return json.loads(raw)
@@ -240,6 +251,13 @@ class Gateway(BaseHTTPRequestHandler):
             self.send_header(
                 "Server-Timing", f"antfly_upstream;dur={backend_seconds * 1000:.3f}"
             )
+            for field, header in (
+                ("request_id", "X-Antfly-Upstream-Request-ID"),
+                ("cf_ray", "X-Antfly-Upstream-CF-Ray"),
+            ):
+                value = getattr(self, "backend_correlation", {}).get(field)
+                if value:
+                    self.send_header(header, value)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header(
