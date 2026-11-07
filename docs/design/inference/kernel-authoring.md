@@ -26,6 +26,7 @@ The agent-facing rules are in `zig/pkg/inference/src/ops/AGENTS.md`.
 | Relative training attention | `kernels/relative_attention_training.cuh`, `relative_attention_tensor_*` and the GPU training renderer | Relative terms, bucket layout, deterministic replay and distinct tensor-core schedules |
 | Dense attention physical storage | `src/ops/kernel_geometry.zig` (`DenseAttentionLayout`) | Token-major 2D and head-major 3D/4D contracts; reject mixed layouts and preserve backend compatibility defaults |
 | CPU online attention rows | `linalg.attention.updateOnlineRow` | Conditional/scalar/SIMD maxima, empty-tile handling, rescale guards, vector width and statistic read/store order |
+| CPU causal query tiles | `linalg.attention.flashCausalAttentionHostInto` | Original tile sizes, packed strides, alignment and reduction order; explicit scratch and destination; ordinary empty shapes retain compatibility |
 | Quantized Metal matrix phases | `ANTFLY_MSL_QUANT_SWIZZLE16`, `ANTFLY_MSL_MATRIX_4X1_*`, `ANTFLY_MSL_MATRIX_4X2_*` | Swizzle groups, scalar/vector acquisition, unroll and SIMD barriers, M32/M64 right-operand advance, output pitch and scratch publication |
 | Wide CPU segment GEMM | `native.WideSegmentAttentionGemm` | 512-query BLAS tile, explicit key reuse; model admission remains in adapters |
 | F32 attention input normalization and partial M-RoPE | `src/ops/cuda/attention_inputs_f32.zig` | Separate Q/K norms, gate extraction, coordinate axes and partial rotary width |

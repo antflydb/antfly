@@ -961,6 +961,7 @@ pub const PreparedSingleToken = struct {
     backend: ComputeBackend,
     schedule: *@import("../execution/dense_decoder_schedule.zig").Schedule,
     source_data: *const anyopaque,
+    initial: ?Initial = null,
     self_slabs: []Slab,
     token_node: @import("ml").graph.NodeId,
     position_node: @import("ml").graph.NodeId,
@@ -976,6 +977,14 @@ pub const PreparedSingleToken = struct {
     const schedule_mod = @import("../execution/dense_decoder_schedule.zig");
     const NodeId = @import("ml").graph.NodeId;
     const Slab = struct { k: CT, v: CT, cross_k: CT, cross_v: CT };
+    const Initial = struct {
+        schedule: *schedule_mod.Schedule,
+        token_node: NodeId,
+        position_node: NodeId,
+        tokens: []i64,
+        positions: []i64,
+    };
+    const Authored = struct { schedule: *schedule_mod.Schedule, token_node: NodeId, position_node: NodeId };
     const Author = struct {
         b: *schedule_mod.Builder,
         cb: *const ComputeBackend,
@@ -999,6 +1008,7 @@ pub const PreparedSingleToken = struct {
     /// identity crosses into the immutable Definition.
     pub fn definitionKey(cb: *const ComputeBackend, source_data: *const anyopaque, config: Config, rows: usize, weights: *const PreparedDecoderWeights) ![32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("whisper.decode.prefix.v1");
         inline for (@typeInfo(Config).@"struct".field_names) |name| {
             const value = @field(config, name);
             hash.update(std.mem.asBytes(&value));
@@ -1058,54 +1068,8 @@ pub const PreparedSingleToken = struct {
             slab.* = .{ .k = k, .v = v, .cross_k = cross_k, .cross_v = cross_v };
             built += 1;
         }
-        var b = schedule_mod.Builder.initPrepared(a, cb, preparation);
-        defer b.deinit();
-        const author = Author{ .b = &b, .cb = cb, .source_data = source_data };
-        for (weights.cross.?, slabs) |cross, slab| {
-            const k_desc = try schedule_mod.projectionDescriptor(cb, source_data, encoder, cross.k.w, cross.k.b, slab.cross_k, rows, config.d_model, config.d_model);
-            const v_desc = try schedule_mod.projectionDescriptor(cb, source_data, encoder, cross.v.w, cross.v.b, slab.cross_v, rows, config.d_model, config.d_model);
-            if (!Native.NativeCompute.canApplyDenseProjectionInto(cb, &k_desc, if (cross.k.b) |bias| &.{ encoder, cross.k.w, bias } else &.{ encoder, cross.k.w }, slab.cross_k) or !Native.NativeCompute.canApplyDenseProjectionInto(cb, &v_desc, if (cross.v.b) |bias| &.{ encoder, cross.v.w, bias } else &.{ encoder, cross.v.w }, slab.cross_v)) return error.UnsupportedDenseSchedule;
-        }
-        const token_node = try b.hostParameter(@import("ml").graph.Shape.init(.i64, &.{1}));
-        const position_node = try b.hostParameter(@import("ml").graph.Shape.init(.i64, &.{1}));
-        const embedded = try b.gather(try author.weight(weights.weights.embed), token_node, config.d_model);
-        const positioned = try b.gather(try author.weight(weights.weights.positions), position_node, config.d_model);
-        var sum = try b.add(embedded, positioned);
-        var pending: ?NodeId = null;
-        for (weights.weights.layers, slabs) |w, slab| {
-            if (pending) |p| sum = try b.add(p, sum);
-            const norm = try author.norm(sum, w.self_ln, config.d_model);
-            const q = try author.linear(norm, w.q, 1, config.d_model, config.d_model);
-            const k = try author.linear(norm, w.k, 1, config.d_model, config.d_model);
-            const v = try author.linear(norm, w.v, 1, config.d_model, config.d_model);
-            // The original eager append copies K/V into the external slab.
-            // Rooting these values conservatively extends their physical life
-            // past that synchronous copy without inventing a graph KV write.
-            try b.output(k);
-            try b.output(v);
-            const slab_shape = @import("ml").graph.Shape.init(.f32, &.{ @intCast(geometry.capacity), @intCast(config.d_model) });
-            const self_k = try b.parameter(slab_shape, slab.k);
-            const self_v = try b.parameter(slab_shape, slab.v);
-            const self_attention = try b.prefix(q, self_k, self_v, config.decoder_attention_heads, config.decoderHeadDim(), geometry.capacity);
-            const self_out = try author.linear(self_attention, w.o, 1, config.d_model, config.d_model);
-            const after_self = try b.add(self_out, sum);
-            const cross_norm = try author.norm(after_self, w.cross_ln, config.d_model);
-            const cross_q = try author.linear(cross_norm, w.cross_q, 1, config.d_model, config.d_model);
-            const cross_shape = @import("ml").graph.Shape.init(.f32, &.{ @intCast(rows), @intCast(config.d_model) });
-            const cross_k = try b.parameter(cross_shape, slab.cross_k);
-            const cross_v = try b.parameter(cross_shape, slab.cross_v);
-            const cross_attention = try b.prefix(cross_q, cross_k, cross_v, config.decoder_attention_heads, config.decoderHeadDim(), rows);
-            const cross_out = try author.linear(cross_attention, w.cross_o, 1, config.d_model, config.d_model);
-            sum = try b.add(cross_out, after_self);
-            const ffn_norm = try author.norm(sum, w.ffn_ln, config.d_model);
-            const fc1 = try author.linear(ffn_norm, w.fc1, 1, config.d_model, config.decoder_ffn_dim);
-            const activated = try b.gelu(fc1);
-            pending = try author.linear(activated, w.fc2, 1, config.decoder_ffn_dim, config.d_model);
-        }
-        if (pending) |p| sum = try b.add(p, sum);
-        const norm = try author.norm(sum, weights.weights.final_ln, config.d_model);
-        const logits = try b.linear(norm, try author.weight(weights.weights.lm_head), null, config.d_model, config.vocab_size);
-        try b.output(logits);
+        const authored = try authorPhase(cb, source_data, a, config, encoder, rows, weights, slabs, preparation, 1, false);
+        errdefer authored.schedule.deinit(.{ .outside_execution = true });
         const cache_layers = try a.alloc(DecodeCache.LayerCache, config.decoder_layers);
         errdefer a.free(cache_layers);
         const encoder_mask = try a.alloc(i64, geometry.encoder_mask_elements);
@@ -1114,8 +1078,107 @@ pub const PreparedSingleToken = struct {
         const self_mask = try a.alloc(i64, geometry.self_mask_elements);
         errdefer a.free(self_mask);
         @memset(self_mask, 1);
-        const schedule = try schedule_mod.Schedule.create(&b);
-        return .{ .allocator = a, .backend = cb.withoutSynchronousBorrows(), .schedule = schedule, .source_data = source_data, .self_slabs = slabs, .token_node = token_node, .position_node = position_node, .cache_layers = cache_layers, .encoder_mask = encoder_mask, .self_mask = self_mask, .token_rows = @intCast(embed_shape.dims[0]), .position_rows = @intCast(position_shape.dims[0]) };
+        return .{ .allocator = a, .backend = cb.withoutSynchronousBorrows(), .schedule = authored.schedule, .source_data = source_data, .self_slabs = slabs, .token_node = authored.token_node, .position_node = authored.position_node, .cache_layers = cache_layers, .encoder_mask = encoder_mask, .self_mask = self_mask, .token_rows = @intCast(embed_shape.dims[0]), .position_rows = @intCast(position_shape.dims[0]) };
+    }
+    fn authorPhase(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, slabs: []const Slab, preparation: ?*schedule_mod.Preparation, query_rows: usize, initial: bool) !Authored {
+        const geometry = try CacheGeometry.init(config, rows);
+        const Native = @import("../ops/native_compute.zig");
+        var b = schedule_mod.Builder.initPrepared(a, cb, preparation);
+        defer b.deinit();
+        const author = Author{ .b = &b, .cb = cb, .source_data = source_data };
+        for (weights.cross.?, slabs) |cross, slab| {
+            const k_desc = try schedule_mod.projectionDescriptor(cb, source_data, encoder, cross.k.w, cross.k.b, slab.cross_k, rows, config.d_model, config.d_model);
+            const v_desc = try schedule_mod.projectionDescriptor(cb, source_data, encoder, cross.v.w, cross.v.b, slab.cross_v, rows, config.d_model, config.d_model);
+            if (!Native.NativeCompute.canApplyDenseProjectionInto(cb, &k_desc, if (cross.k.b) |bias| &.{ encoder, cross.k.w, bias } else &.{ encoder, cross.k.w }, slab.cross_k) or !Native.NativeCompute.canApplyDenseProjectionInto(cb, &v_desc, if (cross.v.b) |bias| &.{ encoder, cross.v.w, bias } else &.{ encoder, cross.v.w }, slab.cross_v)) return error.UnsupportedDenseSchedule;
+        }
+        const token_node = try b.hostParameter(@import("ml").graph.Shape.init(.i64, &.{@intCast(query_rows)}));
+        const position_node = try b.hostParameter(@import("ml").graph.Shape.init(.i64, &.{@intCast(query_rows)}));
+        const embedded = try b.gather(try author.weight(weights.weights.embed), token_node, config.d_model);
+        const positioned = try b.gather(try author.weight(weights.weights.positions), position_node, config.d_model);
+        var sum = try b.add(embedded, positioned);
+        var pending: ?NodeId = null;
+        for (weights.weights.layers, slabs) |w, slab| {
+            if (pending) |p| sum = try b.add(p, sum);
+            const norm = try author.norm(sum, w.self_ln, config.d_model);
+            const q = try author.linear(norm, w.q, query_rows, config.d_model, config.d_model);
+            const k = try author.linear(norm, w.k, query_rows, config.d_model, config.d_model);
+            const v = try author.linear(norm, w.v, query_rows, config.d_model, config.d_model);
+            // The original eager append copies K/V into the external slab.
+            // Rooting these values conservatively extends their physical life
+            // past that synchronous copy without inventing a graph KV write.
+            try b.output(k);
+            try b.output(v);
+            const slab_shape = @import("ml").graph.Shape.init(.f32, &.{ @intCast(geometry.capacity), @intCast(config.d_model) });
+            const self_k = try b.parameter(slab_shape, slab.k);
+            const self_v = try b.parameter(slab_shape, slab.v);
+            const self_attention = if (initial) try b.attentionRows(.causal, q, k, v, config.decoder_attention_heads, config.decoderHeadDim(), query_rows, query_rows) else try b.prefix(q, self_k, self_v, config.decoder_attention_heads, config.decoderHeadDim(), geometry.capacity);
+            const self_out = try author.linear(self_attention, w.o, query_rows, config.d_model, config.d_model);
+            const after_self = try b.add(self_out, sum);
+            const cross_norm = try author.norm(after_self, w.cross_ln, config.d_model);
+            const cross_q = try author.linear(cross_norm, w.cross_q, query_rows, config.d_model, config.d_model);
+            const cross_shape = @import("ml").graph.Shape.init(.f32, &.{ @intCast(rows), @intCast(config.d_model) });
+            const cross_k = try b.parameter(cross_shape, slab.cross_k);
+            const cross_v = try b.parameter(cross_shape, slab.cross_v);
+            const cross_attention = if (initial) try b.attentionRows(.cross, cross_q, cross_k, cross_v, config.decoder_attention_heads, config.decoderHeadDim(), query_rows, rows) else try b.prefix(cross_q, cross_k, cross_v, config.decoder_attention_heads, config.decoderHeadDim(), rows);
+            const cross_out = try author.linear(cross_attention, w.cross_o, query_rows, config.d_model, config.d_model);
+            sum = try b.add(cross_out, after_self);
+            const ffn_norm = try author.norm(sum, w.ffn_ln, config.d_model);
+            const fc1 = try author.linear(ffn_norm, w.fc1, query_rows, config.d_model, config.decoder_ffn_dim);
+            const activated = try b.gelu(fc1);
+            pending = try author.linear(activated, w.fc2, query_rows, config.decoder_ffn_dim, config.d_model);
+        }
+        if (pending) |p| sum = try b.add(p, sum);
+        const norm = try author.norm(sum, weights.weights.final_ln, config.d_model);
+        const last = if (query_rows == 1) norm else try b.lastRow(norm, query_rows, config.d_model);
+        const logits = try b.linear(last, try author.weight(weights.weights.lm_head), null, config.d_model, config.vocab_size);
+        try b.output(logits);
+        return .{ .schedule = try schedule_mod.Schedule.create(&b), .token_node = token_node, .position_node = position_node };
+    }
+    pub fn initInitial(self: *PreparedSingleToken, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, preparation: ?*schedule_mod.Preparation, query_rows: usize) !void {
+        if (self.initial != null or query_rows == 0 or query_rows > config.max_target_positions or query_rows > 2048) return error.UnsupportedDenseSchedule;
+        const tokens = try self.allocator.alloc(i64, query_rows);
+        errdefer self.allocator.free(tokens);
+        const positions = try self.allocator.alloc(i64, query_rows);
+        errdefer self.allocator.free(positions);
+        @memset(tokens, 0);
+        for (positions, 0..) |*position, i| position.* = @intCast(i);
+        const phase = try authorPhase(&self.backend, self.source_data, self.allocator, config, encoder, rows, weights, self.self_slabs, preparation, query_rows, true);
+        self.initial = .{ .schedule = phase.schedule, .token_node = phase.token_node, .position_node = phase.position_node, .tokens = tokens, .positions = positions };
+    }
+    pub fn initialDefinitionKey(decode_key: [32]u8, query_rows: usize) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("whisper.initial.causal.v1");
+        hash.update(&decode_key);
+        hash.update(std.mem.asBytes(&query_rows));
+        return hash.finalResult();
+    }
+    fn bindInitial(self: *PreparedSingleToken, capability: ?@import("../execution/storage_admission.zig").Capability, current: @import("../execution/cleanup_context.zig").Context, enter: bool) !void {
+        const phase = if (self.initial) |*value| value else return error.UnsupportedDenseSchedule;
+        const Tensor = @import("../backends/tensor.zig").Tensor;
+        const shape = [_]i64{@intCast(phase.tokens.len)};
+        var tokens = Tensor{ .allocator = self.allocator, .name = "decoder.initial.tokens", .dtype = .i64, .shape = &shape, .data = std.mem.sliceAsBytes(phase.tokens), .owns_data = false, .owns_shape = false };
+        var positions = Tensor{ .allocator = self.allocator, .name = "decoder.initial.positions", .dtype = .i64, .shape = &shape, .data = std.mem.sliceAsBytes(phase.positions), .owns_data = false, .owns_shape = false };
+        const inputs = [_]@import("../execution/host_ingress.zig").Input{ .{ .node_id = phase.token_node, .value = &tokens }, .{ .node_id = phase.position_node, .value = &positions } };
+        if (enter) try phase.schedule.enter(capability, current, &inputs) else {
+            const frame = phase.schedule.frame orelse return error.DenseScheduleNotEntered;
+            for (try frame.rebindNativeProgramHostInputs(&inputs)) |input| phase.schedule.values[input.node_id] = input.value;
+        }
+    }
+    fn beginInitial(self: *PreparedSingleToken, tokens: []const i64) !?*schedule_mod.Schedule {
+        const phase = if (self.initial) |*value| value else return null;
+        // A truthful declaration is a routing hint, never permission to change
+        // token shape or replay numerical work. Mismatches keep ordinary math.
+        if (phase.tokens.len != tokens.len) return null;
+        for (tokens) |token| if (token < 0 or @as(u64, @intCast(token)) >= self.token_rows) return error.InvalidTensorShape;
+        if (tokens.len > self.position_rows) return error.InvalidTensorShape;
+        @memcpy(phase.tokens, tokens);
+        try self.bindInitial(null, .{}, false);
+        phase.schedule.cursor = 0;
+        return phase.schedule;
+    }
+    pub fn beginExecution(self: *PreparedSingleToken, current: @import("../execution/cleanup_context.zig").Context) !void {
+        try self.schedule.beginExecution(current);
+        if (self.initial) |phase| try phase.schedule.beginExecution(current);
     }
     fn bindInputs(self: *PreparedSingleToken, capability: ?@import("../execution/storage_admission.zig").Capability, current: @import("../execution/cleanup_context.zig").Context, enter: bool) !void {
         const Tensor = @import("../backends/tensor.zig").Tensor;
@@ -1130,6 +1193,7 @@ pub const PreparedSingleToken = struct {
     }
     pub fn prepareInto(self: *PreparedSingleToken, capability: ?@import("../execution/storage_admission.zig").Capability, current: @import("../execution/cleanup_context.zig").Context) !void {
         try self.bindInputs(capability, current, true);
+        if (self.initial != null) try self.bindInitial(capability, current, true);
     }
     fn beginStep(self: *PreparedSingleToken, token: i64, position: usize) !void {
         // Generic gather permits normalized negative indices; original embedding
@@ -1141,6 +1205,11 @@ pub const PreparedSingleToken = struct {
         self.schedule.cursor = 0;
     }
     pub fn deinit(self: *PreparedSingleToken, current: @import("../execution/cleanup_context.zig").Context) void {
+        if (self.initial) |phase| {
+            phase.schedule.deinit(current);
+            self.allocator.free(phase.tokens);
+            self.allocator.free(phase.positions);
+        }
         self.schedule.deinit(current);
         if (!self.adopted) {
             for (self.self_slabs) |slab| {
@@ -1536,13 +1605,14 @@ fn stepAdd(cb: *const ComputeBackend, profile: ?*StepProfile, a: CT, b: CT) !CT 
 fn stepEmbedding(cb: *const ComputeBackend, profile: *StepProfile, weight: CT, ids: []const i64, rows: usize, width: usize) !CT {
     if (profile.assigned) |schedule| {
         const node = schedule.graph.node(schedule.steps[schedule.cursor]);
-        if (rows != 1 or ids.len != 1 or node.op != .gather) return error.DenseScheduleOrderChanged;
+        if (rows != ids.len or node.op != .gather or node.output_shape.dims[0] != rows) return error.DenseScheduleOrderChanged;
         return schedule.execute(&.{ weight, schedule.values[node.inputs[1]] orelse return error.MissingValue }, null);
     }
     return cb.embeddingLookup(weight, ids, rows, width);
 }
 fn stepPrefix(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, mask: []const i64, live: usize, heads: usize, dim: usize) !CT {
     if (profile.assigned) |schedule| {
+        if (schedule.descriptors[schedule.steps[schedule.cursor]].?.operation == .dense_attention_rows) return stepCrossRows(cb, profile, q, k, v, mask, 1, live, heads, dim);
         const mod = @import("../execution/dense_decoder_schedule.zig");
         const node = schedule.graph.node(schedule.steps[schedule.cursor]);
         const whole_k = schedule.values[node.inputs[1]] orelse return error.MissingValue;
@@ -1556,6 +1626,21 @@ fn stepPrefix(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v:
         return schedule.execute(&.{ q, whole_k, whole_v }, &attention);
     }
     return cb.crossAttention(q, k, v, mask, 1, 1, live, heads, dim);
+}
+
+fn stepCausal(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, rows: usize, heads: usize, dim: usize) !CT {
+    if (profile.assigned) |schedule| {
+        const attention = ops.AttentionContext{ .total_sequence_len = rows, .query_sequence_len = rows, .kv_sequence_len = rows, .dense_attention_rows = .{} };
+        return schedule.execute(&.{ q, k, v }, &attention);
+    }
+    return cb.causalSelfAttention(q, k, v, null, 1, rows, heads, dim);
+}
+fn stepCrossRows(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, mask: []const i64, rows: usize, keys: usize, heads: usize, dim: usize) !CT {
+    if (profile.assigned) |schedule| {
+        const attention = ops.AttentionContext{ .total_sequence_len = keys, .query_sequence_len = rows, .kv_sequence_len = keys, .dense_attention_rows = .{ .mask = mask } };
+        return schedule.execute(&.{ q, k, v }, &attention);
+    }
+    return cb.crossAttention(q, k, v, mask, 1, rows, keys, heads, dim);
 }
 
 fn addNorm(cb: *const ComputeBackend, a: CT, b: CT, norm: Norm, dim: usize, profile: ?*StepProfile) !AddNormPair {
@@ -1605,6 +1690,9 @@ fn decodeBlockCached(
         try program.beginStep(tokens[0], start);
         profile.assigned = program.schedule;
     };
+    if (start == 0 and !pipelined) if (cache.native_program) |*program| {
+        profile.assigned = try program.beginInitial(tokens);
+    };
     profile.planned_scope = scope_active;
     profile.start();
 
@@ -1652,7 +1740,7 @@ fn decodeBlockCached(
 
     // Only the last row feeds sampling; project it alone.
     const last_row = if (n == 1) normed else blk: {
-        const row = try cb.sliceRows2D(allocator, normed, n - 1, 1, d_model);
+        const row = if (profile.assigned) |schedule| try schedule.execute(&.{normed}, null) else try cb.sliceRows2D(allocator, normed, n - 1, 1, d_model);
         stepRelease(cb, &profile, normed);
         normed_live = false;
         break :blk row;
@@ -1852,7 +1940,7 @@ fn decoderBlockCached(
     var self_attn: CT = undefined;
     if (start == 0 and !cache.preallocated()) {
         // First block without slabs: the projections become the cache.
-        self_attn = try cb.causalSelfAttention(proj.q, proj.k, proj.v, null, 1, dec_seq, num_heads, head_dim);
+        self_attn = try stepCausal(cb, profile, proj.q, proj.k, proj.v, dec_seq, num_heads, head_dim);
         layer_cache.k_self = proj.k;
         layer_cache.v_self = proj.v;
         kv_consumed = true;
@@ -1872,7 +1960,7 @@ fn decoderBlockCached(
         defer if (v_rows.owned_view) stepRelease(cb, profile, v_rows.tensor);
         profile.mark(cb, .kv_append);
         if (start == 0) {
-            self_attn = try cb.causalSelfAttention(proj.q, proj.k, proj.v, null, 1, dec_seq, num_heads, head_dim);
+            self_attn = try stepCausal(cb, profile, proj.q, proj.k, proj.v, dec_seq, num_heads, head_dim);
         } else {
             // One new query over every cached key: causal by construction.
             self_attn = if (dec_seq == 1) try stepPrefix(cb, profile, proj.q, k_rows.tensor, v_rows.tensor, cache.self_mask[0..total], total, num_heads, head_dim) else try cb.crossAttention(proj.q, k_rows.tensor, v_rows.tensor, cache.self_mask[0..total], 1, dec_seq, total, num_heads, head_dim);
@@ -1893,7 +1981,7 @@ fn decoderBlockCached(
     const Q_cross = try stepLinear(cb, profile, w.cross_q, after_self.normed, dec_seq, d_model, d_model);
     defer stepRelease(cb, profile, Q_cross);
     profile.mark(cb, .cross_norm_q);
-    const cross_attn = if (dec_seq == 1) try stepPrefix(cb, profile, Q_cross, layer_cache.k_cross, layer_cache.v_cross, cache.encoder_mask, cache.enc_seq, num_heads, head_dim) else try cb.crossAttention(Q_cross, layer_cache.k_cross, layer_cache.v_cross, cache.encoder_mask, 1, dec_seq, cache.enc_seq, num_heads, head_dim);
+    const cross_attn = if (dec_seq == 1) try stepPrefix(cb, profile, Q_cross, layer_cache.k_cross, layer_cache.v_cross, cache.encoder_mask, cache.enc_seq, num_heads, head_dim) else try stepCrossRows(cb, profile, Q_cross, layer_cache.k_cross, layer_cache.v_cross, cache.encoder_mask, dec_seq, cache.enc_seq, num_heads, head_dim);
     defer stepRelease(cb, profile, cross_attn);
     profile.mark(cb, .cross_attn);
     const cross_proj = try stepLinear(cb, profile, w.cross_o, cross_attn, dec_seq, d_model, d_model);

@@ -57,6 +57,14 @@ pub const ReadTelemetry = struct {
     cuda_graph_capture_steps: usize = 0,
     cuda_graph_replay_steps: usize = 0,
     generated_tokens: ?usize = null,
+    /// Actual successful private Frame dispatches/steps, copied before death.
+    /// Encoder, ordinary vocabulary head, quota and total/peak work are excluded.
+    native_decoder_program: ?struct {
+        scope: enum { florence_single_token_decoder_frame } = .florence_single_token_decoder_frame,
+        outcome: enum { interval_returned, interval_unwound },
+        successful_dispatches: u64,
+        completed_steps: usize,
+    } = null,
 };
 
 threadlocal var last_read_telemetry: ReadTelemetry = .{};
@@ -1250,6 +1258,48 @@ pub const ReadingPipeline = struct {
             self.config.max_length,
         ));
 
+        if (backend == .native and !florenceKvCacheDisabled() and self.config.max_length > 0) {
+            var source = session_mod.PreparedSource{};
+            defer source.deinit();
+            const rows = try florence_arch.encoderSequenceLength(florence_cfg, prompt_i64.len);
+            if (try @import("../execution/architecture_session.zig").prepareColdNativeFlorence(self.vision_encoder, allocator, self.execution_control, florence_cfg, rows, self.config.max_length, &run_permit.?)) |cold| {
+                // Frame/provider work retires under actual B; Model/lane then
+                // leave before AA/cache callbacks, and B drains only afterbody.
+                defer {
+                    const epoch = source.epoch();
+                    if (epoch) |current| cold.retirePhysical(.{ .boundary = current });
+                    source.finishInputLifetime();
+                    cold.destroyOutsideExecution(epoch);
+                }
+                const token_rows = cold.program.?.token_rows;
+                const initial_token = self.config.decoder_start_token_id;
+                const first_supported = initial_token >= 0 and @as(u64, @intCast(initial_token)) < token_rows;
+                const forced_supported = if (self.config.forced_bos_token_id) |token| self.config.max_length <= 1 or (token >= 0 and @as(u64, @intCast(token)) < token_rows) else true;
+                if (first_supported and forced_supported and try source.initOwningSynchronousTaskPermitBeforeExecutionInto(&run_permit.?, allocator, self.execution_control)) {
+                    try cold.finishConstructionBeforeExecution(&source);
+                    try source.bindExecutionLaneBeforeExecution(self.native_execution_lane, false);
+                    try source.enter();
+                    const permit = try cold.bindSource(&source);
+                    var invocation = @import("../execution/invocation_context.zig").Context{ .cleanup = .{ .boundary = source.epoch().? }, .native_weights = permit.native_weights };
+                    var receiving = cold.backend().*;
+                    receiving.call_context = &invocation;
+                    var completed = false;
+                    defer {
+                        const program = cold.program.?;
+                        const dispatches = program.schedule.?.frame.?.stats.dispatches;
+                        if (dispatches != 0) last_read_telemetry.native_decoder_program = .{
+                            .outcome = if (completed) .interval_returned else .interval_unwound,
+                            .successful_dispatches = dispatches,
+                            .completed_steps = program.completed_steps,
+                        };
+                    }
+                    const result = try self.readFlorenceWithBackend(&receiving, florence_cfg, pixel_values, prompt_i64, cold.program.?, &invocation);
+                    completed = result != null;
+                    return result;
+                }
+            }
+        }
+
         const PreparedOcrRequest = if (build_options.enable_cuda) @import("../execution/architecture_session.zig").PreparedComputeAdmission.LockedRequest else struct {};
         var prepared_ocr: ?*PreparedOcrRequest = null;
         if (comptime build_options.enable_cuda) if (run_permit.?.lease) |*primary| {
@@ -1271,7 +1321,12 @@ pub const ReadingPipeline = struct {
                 if (prepared_ocr) |prepared| prepared.closeManaged(&managed) else managed.deinit();
             } else managed.deinit();
         }
-        const cb = &managed.backend;
+        return self.readFlorenceWithBackend(&managed.backend, florence_cfg, pixel_values, prompt_i64, null, null);
+    }
+
+    fn readFlorenceWithBackend(self: *ReadingPipeline, cb: *const ComputeBackend, florence_cfg: florence_arch.Config, pixel_values: []const f32, prompt_i64: []const i64, prepared: ?*florence_arch.PreparedSingleToken, receiving: ?*@import("../execution/invocation_context.zig").Context) !?ReadResult {
+        const allocator = self.allocator;
+        const backend = self.vision_encoder.backend();
 
         const encoder = (try session_factory.runFlorenceEncoderResident(
             self.vision_encoder,
@@ -1283,6 +1338,12 @@ pub const ReadingPipeline = struct {
             prompt_i64.len,
         )) orelse return null;
         defer cb.free(encoder.hidden);
+        if (prepared) |program| {
+            const invocation = receiving orelse return error.MissingFlorenceSource;
+            invocation.native_weights = null;
+            try program.initializeCross(encoder.hidden, encoder.seq_len, self.execution_control);
+            try program.beginExecution(invocation.cleanup);
+        }
 
         if (florenceDebugStats()) {
             const hidden_host = try cb.toFloat32(encoder.hidden, allocator);
@@ -1315,6 +1376,13 @@ pub const ReadingPipeline = struct {
             last_read_telemetry.cuda_graph_replay = false;
             last_read_telemetry.cuda_graph_fallback_reason = if (florenceCudaGraphEnabled()) null else "florence_graph_disabled";
             const decode_start = nowNs();
+            if (prepared) |program| {
+                var decoder = PreparedFlorenceDecoder{
+                    .context = .{ .allocator = allocator, .backend = cb, .model = &florence_cfg, .control = self.execution_control, .profile_stages = readProfileEnabled(), .replay_key = "florence.lm_head_argmax", .replay_input_label = "florence.lm_head_input", .unsupported_suppression = error.UnsupportedFlorence2NoRepeatMetal },
+                    .program = program,
+                };
+                return try self.decodeFlorenceIncrementalLoop(cb, florence_cfg, dec_ids, dec_len, &decoder);
+            }
             const result = self.decodeFlorenceResidentIncremental(
                 cb,
                 florence_cfg,
@@ -1390,6 +1458,34 @@ pub const ReadingPipeline = struct {
         last_read_telemetry.kv_cache_mode = if (decoder.preallocated()) "preallocated" else "concat";
         logReadProfile("florence_decoder_kv_cache_build", cache_start);
 
+        return self.decodeFlorenceIncrementalLoop(cb, florence_cfg, dec_ids, initial_len, &decoder);
+    }
+
+    const PreparedFlorenceDecoder = struct {
+        context: FlorenceDecoder.Context,
+        program: *florence_arch.PreparedSingleToken,
+        hidden: ?CT = null,
+        head_events: FlorenceDecoder.HeadEvents = .{},
+        fn step(self: *@This(), tokens: []const i64, want_logits: bool) !void {
+            if (tokens.len != 1 or want_logits) return error.UnsupportedDenseSchedule;
+            self.hidden = null;
+            self.hidden = try self.program.stepWithControl(tokens[0], self.context.control);
+        }
+        fn selectScalar(self: *@This(), suppressed: []const i32, fused: bool, graph: bool) !u32 {
+            self.head_events = .{};
+            const hidden = self.hidden orelse return error.MissingDecoderHidden;
+            self.hidden = null;
+            const shape = [_]i64{ 1, @intCast(self.context.model.d_model) };
+            // A retained header protects the exact unchanged Frame row through
+            // the original consuming head call; no numerical copy or CT escape.
+            const owned = try self.context.backend.primReshape(hidden, &shape);
+            return FlorenceDecoder.selectOwnedHidden(self.context, owned, &self.head_events, suppressed, fused, graph);
+        }
+    };
+
+    fn decodeFlorenceIncrementalLoop(self: *ReadingPipeline, cb: *const ComputeBackend, florence_cfg: florence_arch.Config, dec_ids: []i64, initial_len: usize, decoder: anytype) !ReadResult {
+        const allocator = self.allocator;
+        const max_len = self.config.max_length;
         const bias_check_start = nowNs();
         const fused_lm_head_allowed = try self.florenceFinalLogitsBiasIsZero(cb, florence_cfg.vocab_size);
         logReadProfile("florence_decoder_final_logits_bias_check", bias_check_start);
@@ -1627,28 +1723,14 @@ fn nativeFlorenceRunRequestWithLogitMode(
         }
     };
     if (batch == 0) return error.InvalidInputShape;
-    var side: usize = cfg.image_size;
-    for (cfg.patch_size, cfg.patch_stride, cfg.patch_padding) |patch, stride, padding| {
-        if (stride == 0) return error.InvalidInputShape;
-        const padded = try Checked.add(side, try Checked.mul(padding, 2));
-        if (padded < patch) return error.InvalidInputShape;
-        side = try Checked.add((padded - patch) / stride, 1);
-    }
-    if (cfg.image_feature_source_count > cfg.image_feature_sources.len) return error.InvalidInputShape;
-    const spatial_tokens = try Checked.mul(side, side);
-    var image_tokens: usize = 0;
-    for (cfg.image_feature_sources[0..cfg.image_feature_source_count]) |source| {
-        image_tokens = try Checked.add(image_tokens, switch (source) {
-            .spatial_avg_pool => 1,
-            .temporal_avg_pool, .last_frame => spatial_tokens,
-        });
-    }
-    const encoder_length = try Checked.add(image_tokens, prompt_length);
+    const encoder_length = florence_arch.encoderSequenceLength(cfg, prompt_length) catch |err| switch (err) {
+        error.Overflow => return error.ResourceLimitExceeded,
+        else => return err,
+    };
     const decoder_length = @max(max_length, 1);
     const encoder_bytes = try Checked.mul(try Checked.mul(batch, encoder_length), try Checked.mul(cfg.d_model, @sizeOf(f32)));
     const logits_bytes = try Checked.mul(try Checked.mul(batch, if (incremental) @as(usize, 1) else decoder_length), try Checked.mul(cfg.vocab_size, @sizeOf(f32)));
-    const cache_length = try Checked.add(encoder_length, decoder_length);
-    const kv_bytes = try Checked.mul(try Checked.mul(batch, cache_length), try Checked.mul(cfg.decoder_layers, try Checked.mul(cfg.d_model, 2 * @sizeOf(f32))));
+    const kv_bytes = florence_arch.decoderKvBytes(cfg, batch, encoder_length, decoder_length) catch return error.ResourceLimitExceeded;
     const prompt_bytes = try Checked.mul(prompt_length, try Checked.add(try Checked.mul(batch, @sizeOf(i64)), @sizeOf(i32)));
     return .{
         .batch = batch,
@@ -3107,4 +3189,150 @@ test "reading default imported stages keep encoder resident and preserve host re
         candidate.execution_control = .{ .check_fn = Cancel.check };
         try std.testing.expectError(error.Cancelled, candidate.readDecoded(.{ .data = &pixels, .width = 1, .height = 1, .channels = 4 }));
     }
+}
+
+fn nativeFlorencePublicScheduleCase(a: std.mem.Allocator, cold_only: bool, tight: bool) !void {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const architecture = @import("../execution/architecture_session.zig");
+    const Fixture = architecture.FlorenceScheduleTesting;
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    defer std.testing.expectEqualDeep(@import("../runtime/tier/memory.zig").AdmissionAmounts{}, domain.controller.snapshot()) catch @panic("public Florence quota leaked");
+    var session = try Fixture.session(std.testing.allocator);
+    defer session.close();
+    const original = try Fixture.session(std.testing.allocator);
+    defer original.close();
+    const ResourceTrace = struct {
+        gate: ?*std.atomic.Mutex = null,
+        next: usize = 0,
+        released_under_gate: bool = false,
+        fn reserve(raw: *anyopaque, _: @import("../runtime/tier/memory.zig").AdmissionAmounts) @import("../runtime/tier/memory.zig").AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.next += 1;
+            return self.next;
+        }
+        fn retain(_: *anyopaque, _: usize, _: @import("../runtime/tier/memory.zig").AdmissionAmounts) @import("../runtime/tier/memory.zig").AdmissionResourceError!void {}
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.gate) |gate| {
+                if (gate.tryLock()) gate.unlock() else self.released_under_gate = true;
+            }
+        }
+    };
+    var resources = ResourceTrace{ .gate = session.execution_gate };
+    defer resources.gate = null; // later Model.close owns/frees the gate itself
+    defer std.testing.expect(!resources.released_under_gate) catch @panic("Florence refunded resources under Model gate");
+    try domain.controller.configureResourceBudget(.{ .context = &resources, .try_reserve = ResourceTrace.reserve, .retain = ResourceTrace.retain, .release = ResourceTrace.release });
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    session.model_lifetime.?.admission_domain = domain.pin();
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 128 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    const tokenizer_data =
+        \\{"version":"1.0","model":{"type":"BPE","vocab":{"[UNK]":0,"one":1,"two":2},"merges":[],"unk_token":"[UNK]"}}
+    ;
+    const hf = try tokenizer_mod.hf.HfTokenizer.loadFromBytes(std.testing.allocator, tokenizer_data);
+    defer hf.deinitSelf();
+    if (tight) {
+        const prompt = try buildFlorencePromptIds(std.testing.allocator, hf.tokenizer(), Fixture.config, "one");
+        defer std.testing.allocator.free(prompt);
+        const request = try nativeFlorenceRunRequest(Fixture.config, 1, 12, prompt.len, 4);
+        const plan = try session.run_admission.?.planRequest(request, session.outputInfo());
+        session.run_admission.?.limits.host_limit_bytes = plan.required.hostTotalBytes();
+    }
+    const cfg = ReadConfig{ .image_size = 2, .image_mean = .{ 0, 0, 0 }, .image_std = .{ 1, 1, 1 }, .prompt = "one", .max_length = 4, .decoder_start_token_id = 0, .eos_token_id = 7, .no_repeat_ngram_size = 2 };
+    var lane = @import("../execution_control.zig").ExecutionLane{};
+    var candidate = ReadingPipeline.init(a, session, session, hf.tokenizer(), cfg, null);
+    candidate.native_execution_lane = if (tight) null else &lane;
+    candidate.execution_control = .{ .native_call_policy = .in_process };
+    var reference = ReadingPipeline.init(std.testing.allocator, original, original, hf.tokenizer(), cfg, null);
+    reference.execution_control = .{ .native_call_policy = .in_process };
+    var pixels = [_]u8{ 255, 0, 20, 255, 50, 80, 110, 255, 5, 150, 40, 255, 10, 20, 200, 255 };
+    const img = image.Image{ .data = &pixels, .width = 2, .height = 2, .channels = 4 };
+    var expected = try reference.readDecoded(img);
+    defer expected.deinit();
+    try std.testing.expect(lastReadTelemetry().native_decoder_program == null);
+    if (cold_only) {
+        const CancelAtModel = struct {
+            gate: *std.atomic.Mutex,
+            fn check(raw: ?*anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                if (self.gate.tryLock()) self.gate.unlock() else return error.Cancelled;
+            }
+        };
+        var cancel = CancelAtModel{ .gate = session.execution_gate.? };
+        candidate.execution_control = .{ .ptr = &cancel, .check_fn = CancelAtModel.check, .native_call_policy = .in_process };
+        var unexpected = candidate.readDecoded(img) catch |err| switch (err) {
+            error.Cancelled => {
+                try std.testing.expect(lastReadTelemetry().native_decoder_program == null);
+                return;
+            },
+            else => return err,
+        };
+        unexpected.deinit();
+        return error.ExpectedFlorenceReceivingCancellation;
+    }
+    var first = try candidate.readDecoded(img);
+    defer first.deinit();
+    if (tight) {
+        try std.testing.expect(lastReadTelemetry().native_decoder_program == null);
+        try std.testing.expectEqual(@as(u64, 0), Fixture.cacheStats(session).builds);
+        try std.testing.expectEqualStrings(expected.text, first.text);
+        try std.testing.expectEqual(expected.completion, first.completion);
+        try std.testing.expectEqual(expected.completion_tokens, first.completion_tokens);
+        try std.testing.expectEqualDeep(@import("../runtime/tier/memory.zig").AdmissionAmounts{}, domain.controller.snapshot());
+        return;
+    }
+    const first_program = lastReadTelemetry().native_decoder_program orelse return error.MissingExecutedFlorenceProgram;
+    try std.testing.expect(first_program.successful_dispatches > @as(u64, @intCast(first_program.completed_steps)) and first_program.completed_steps > 0);
+    try std.testing.expectEqual(.interval_returned, first_program.outcome);
+    try std.testing.expectEqualStrings(expected.text, first.text);
+    try std.testing.expectEqual(expected.completion, first.completion);
+    try std.testing.expectEqual(expected.completion_tokens, first.completion_tokens);
+    try std.testing.expect(Fixture.cacheStats(session).builds == 1);
+    const saved = try std.testing.allocator.dupe(u8, first.text);
+    defer std.testing.allocator.free(saved);
+    var second = try candidate.readDecoded(img);
+    defer second.deinit();
+    const second_program = lastReadTelemetry().native_decoder_program orelse return error.MissingExecutedFlorenceProgram;
+    try std.testing.expectEqual(first_program, second_program);
+    try std.testing.expectEqualStrings(expected.text, second.text);
+    try std.testing.expectEqualSlices(u8, saved, first.text);
+    try std.testing.expect(Fixture.cacheStats(session).hits > 0);
+    const CancelAtSampling = struct {
+        cancelled: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+        fn update(raw: ?*anyopaque, progress: @import("../execution_control.zig").Progress) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (progress.phase == .executing and progress.completed == 1 and progress.total == 4) self.cancelled = true;
+        }
+    };
+    var cancel = CancelAtSampling{};
+    candidate.execution_control = .{ .ptr = &cancel, .check_fn = CancelAtSampling.check, .progress = .{ .ptr = &cancel, .update_fn = CancelAtSampling.update }, .native_call_policy = .in_process };
+    var unexpected = candidate.readDecoded(img) catch |err| switch (err) {
+        error.Cancelled => {
+            const partial = lastReadTelemetry().native_decoder_program orelse return error.MissingPartialFlorenceExecution;
+            try std.testing.expectEqual(.interval_unwound, partial.outcome);
+            try std.testing.expectEqual(@as(usize, 1), partial.completed_steps);
+            try std.testing.expect(partial.successful_dispatches > 0);
+            try std.testing.expectEqualSlices(u8, saved, first.text);
+            return;
+        },
+        else => return err,
+    };
+    unexpected.deinit();
+    return error.ExpectedFlorenceSamplingCancellation;
+}
+
+test "public Native Florence reading installs cold Source schedule and reuses admitted pure Definition with original token policy" {
+    try nativeFlorencePublicScheduleCase(std.testing.allocator, false, false);
+}
+test "public Native Florence complete cold and Source handoff OOM cancellation preserve full admission before encoder" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeFlorencePublicScheduleCase, .{ true, false });
+}
+
+test "public Native Florence exact original full floor declines optional cold metadata before encoder and preserves compatibility" {
+    try nativeFlorencePublicScheduleCase(std.testing.allocator, false, true);
 }

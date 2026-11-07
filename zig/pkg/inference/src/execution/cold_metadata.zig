@@ -25,6 +25,8 @@ pub const Owner = struct {
     held_floor: ?memory.AdmissionAmounts = null,
     shared_metadata_floor: ?memory.AdmissionAmounts = null,
     shared_preparing: ?*Shared = null,
+    shared_contributions: u8 = 0,
+    shared_identities: [2]usize = @splat(0),
     pending_additional: ?memory.AdmissionAmounts = null,
     phase: Phase = .preparing,
 
@@ -86,7 +88,7 @@ pub const Owner = struct {
         if (self.phase != .preparing) return error.MetadataPreparationSealed;
         if (self.held_floor != null) return error.MetadataAdmissionOwnersFrozen;
         const floor = try sumPermits(self.session, permits);
-        if (self.session.run_admission) |policy| try policy.validateOwnedRunAmounts(try (try floor.merge(self.admittedAmounts())).merge(self.sharedMetadataAmounts()));
+        if (self.session.run_admission) |policy| try policy.validateOwnedRunAmounts(try (try floor.merge(self.admittedAmounts())).merge(try self.sharedMetadataAmounts()));
         @memset(&self.held, null);
         for (permits, 0..) |permit, index| self.held[index] = permit;
         self.held_count = permits.len;
@@ -113,7 +115,7 @@ pub const Owner = struct {
         inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |field| {
             if (@field(floor, field) < @field(required, field)) return error.MetadataPendingAdmissionIncomplete;
         }
-        if (self.session.run_admission) |policy| try policy.validateOwnedRunAmounts(try (try floor.merge(self.admittedAmounts())).merge(self.sharedMetadataAmounts()));
+        if (self.session.run_admission) |policy| try policy.validateOwnedRunAmounts(try (try floor.merge(self.admittedAmounts())).merge(try self.sharedMetadataAmounts()));
         @memset(&self.held, null);
         for (permits, 0..) |permit, index| self.held[index] = permit;
         self.held_count = permits.len;
@@ -129,29 +131,52 @@ pub const Owner = struct {
         if (self.shared_metadata_floor != null or self.shared_preparing != null) return error.MetadataSharedFloorAlreadyBound;
         try self.validateAdditional(amounts);
         self.shared_metadata_floor = amounts;
+        self.shared_contributions = 1;
     }
 
-    fn sharedMetadataAmounts(self: *const Owner) memory.AdmissionAmounts {
-        if (self.shared_preparing) |shared| return shared.admittedAmounts();
-        return self.shared_metadata_floor orelse .{};
+    /// Two independent immutable phase Definitions may be prepared in order.
+    /// Only one actual Shared owner is borrowed at a time; sealed contributions
+    /// remain value-only denial floors and confer no quota or bank credit.
+    pub fn addSharedDefinitionFloor(self: *Owner, shared: *const Shared) !void {
+        const identity = @intFromPtr(shared);
+        for (self.shared_identities[0..self.shared_contributions]) |prior| if (prior == identity) return error.DuplicateMetadataSharedOwner;
+        const amounts = shared.admittedAmounts();
+        if (self.phase != .preparing) return error.MetadataPreparationSealed;
+        if (self.shared_preparing != null or self.shared_contributions >= 2) return error.MetadataSharedFloorAlreadyBound;
+        const combined = try (self.shared_metadata_floor orelse .{}).merge(amounts);
+        try self.validateAdditional(amounts);
+        self.shared_metadata_floor = combined;
+        self.shared_identities[self.shared_contributions] = identity;
+        self.shared_contributions += 1;
+    }
+    fn sharedMetadataAmounts(self: *const Owner) !memory.AdmissionAmounts {
+        const sealed = self.shared_metadata_floor orelse memory.AdmissionAmounts{};
+        return if (self.shared_preparing) |shared| try sealed.merge(shared.admittedAmounts()) else sealed;
     }
     fn registerSharedConstruction(self: *Owner, shared: *Shared) !void {
+        const identity = @intFromPtr(shared);
+        for (self.shared_identities[0..self.shared_contributions]) |prior| if (prior == identity) return error.DuplicateMetadataSharedOwner;
         if (self.phase != .preparing) return error.MetadataPreparationSealed;
-        if (self.shared_preparing != null or self.shared_metadata_floor != null) return error.MetadataSharedFloorAlreadyBound;
+        if (self.shared_preparing != null or self.shared_contributions >= 2) return error.MetadataSharedFloorAlreadyBound;
         try self.validateAdditional(shared.admittedAmounts());
         self.shared_preparing = shared;
+        self.shared_identities[self.shared_contributions] = identity;
+        self.shared_contributions += 1;
     }
-    /// Construction is single-owner. The exact live contribution becomes an
-    /// immutable denial value before either direction of the borrow is erased.
-    /// Abort uses the same snapshot only until this terminal request tears down.
-    fn detachSharedConstruction(self: *Owner, shared: *Shared) void {
-        std.debug.assert(self.shared_preparing == shared and self.shared_metadata_floor == null);
-        self.shared_metadata_floor = shared.admittedAmounts();
+    fn detachSharedConstruction(self: *Owner, shared: *Shared) !void {
+        std.debug.assert(self.shared_preparing == shared);
+        const combined = try (self.shared_metadata_floor orelse .{}).merge(shared.admittedAmounts());
+        self.shared_metadata_floor = combined;
         self.shared_preparing = null;
     }
     fn restoreSharedConstruction(self: *Owner, shared: *Shared) void {
         std.debug.assert(self.shared_preparing == null and self.shared_metadata_floor != null);
-        self.shared_metadata_floor = null;
+        var previous = self.shared_metadata_floor.?;
+        const amount = shared.admittedAmounts();
+        inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |field| {
+            @field(previous, field) = std.math.sub(usize, @field(previous, field), @field(amount, field)) catch unreachable;
+        }
+        self.shared_metadata_floor = if (self.shared_contributions == 1) null else previous;
         self.shared_preparing = shared;
     }
 
@@ -191,7 +216,7 @@ pub const Owner = struct {
         if (self.phase != .preparing) return error.MetadataPreparationSealed;
         const policy = self.session.run_admission orelse return;
         const owned = try (try self.heldAmounts()).merge(self.admittedAmounts());
-        const shared = try owned.merge(self.sharedMetadataAmounts());
+        const shared = try owned.merge(try self.sharedMetadataAmounts());
         const total = try shared.merge(self.pending_additional orelse .{});
         try policy.validateOwnedRunAmounts(try total.merge(additional));
     }
@@ -316,7 +341,7 @@ pub const Shared = struct {
         const request = self.preparing orelse return error.MetadataPreparationSealed;
         try request.validateAdditional(.{});
         if (self.finalizer == null) return error.MetadataFinalizerRequired;
-        request.detachSharedConstruction(self);
+        try request.detachSharedConstruction(self);
         self.admitted.numerical_scope_active = true;
         self.admitted.admission_context = null;
         self.admitted.admit = null;
@@ -333,7 +358,11 @@ pub const Shared = struct {
             const retained = try epoch.retain();
             const previous = self.phase;
             const preparing = self.preparing;
-            if (preparing) |request| request.detachSharedConstruction(self);
+            if (preparing) |request| request.detachSharedConstruction(self) catch |err| {
+                var held = retained;
+                held.release();
+                return err;
+            };
             self.preparing = null;
             self.epoch = retained;
             self.node = .{ .context = self, .release_fn = ended };
@@ -351,7 +380,7 @@ pub const Shared = struct {
             return;
         }
         if (!current.outside_execution) return error.MetadataCleanupBoundaryRequired;
-        if (self.preparing) |request| request.detachSharedConstruction(self);
+        if (self.preparing) |request| try request.detachSharedConstruction(self);
         self.preparing = null;
         self.phase = .retiring;
         self.drop();
@@ -742,4 +771,109 @@ test "aborted shared construction detaches its request before deferred metadata 
     try std.testing.expectEqualDeep(actual, domain.controller.snapshot());
     guard.finish(); // request allocator endpoint is already physically gone
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+fn sequentialPhaseMetadataCase(a: std.mem.Allocator) !void {
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    defer std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot()) catch @panic("phase metadata quota leaked");
+    var closed = false;
+    const Close = struct {
+        fn destroy(raw: *anyopaque) void {
+            const flag: *bool = @ptrCast(@alignCast(raw));
+            flag.* = true;
+        }
+    };
+    var model = sessions.Session.ModelLifetime{ .owner = &closed, .destroy_fn = Close.destroy, .admission_domain = domain.pin() };
+    const session = sessions.Session{ .ptr = &closed, .vtable = &TestSession.table, .model_lifetime = &model, .run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var model_open = true;
+    defer if (model_open) session.close();
+    const request = try Owner.create(a, session, &.{});
+    var request_open = true;
+    defer if (request_open) request.deinitOutsideExecution();
+    var deaths: usize = 0;
+    const Body = struct {
+        allocator: std.mem.Allocator,
+        deaths: *usize,
+        payload: []u8 = &.{},
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const allocator = self.allocator;
+            const count = self.deaths;
+            allocator.free(self.payload);
+            allocator.destroy(self);
+            count.* += 1;
+        }
+        fn init(shared: *Shared, count: *usize) !void {
+            const allocator = shared.allocator();
+            const self = try allocator.create(@This());
+            self.* = .{ .allocator = allocator, .deaths = count };
+            try shared.setFinalizer(self, destroy);
+            self.payload = try allocator.alloc(u8, 701);
+            @memset(self.payload, 17);
+        }
+    };
+    const decode = (try Shared.create(a, request)) orelse return error.ExpectedSharedMetadata;
+    var decode_open = true;
+    defer if (decode_open) decode.releaseWithCleanup(.{ .outside_execution = true }) catch @panic("decode metadata abort");
+    try Body.init(decode, &deaths);
+    try decode.sealBeforeExecution();
+    const decode_amounts = decode.admittedAmounts();
+    const initial = (try Shared.create(a, request)) orelse return error.ExpectedSharedMetadata;
+    var initial_open = true;
+    defer if (initial_open) initial.releaseWithCleanup(.{ .outside_execution = true }) catch @panic("initial metadata abort");
+    try Body.init(initial, &deaths);
+    // Actual private growth interleaves with the second phase's real Shared AA.
+    const private = try request.allocator().alloc(u8, 1003);
+    defer if (request_open) request.allocator().free(private);
+    const live_total = try decode_amounts.merge(initial.admittedAmounts());
+    try std.testing.expectEqualDeep(live_total, try request.sharedMetadataAmounts());
+    const before = domain.controller.snapshot();
+    const too_much = memory.AdmissionAmounts{ .host_scratch_bytes = 1024 * 1024 - before.hostTotalBytes() + 1 };
+    try std.testing.expectError(error.ResourceLimitExceeded, request.validateAdditional(too_much));
+    try initial.sealBeforeExecution();
+    try std.testing.expectEqualDeep(live_total, try request.sharedMetadataAmounts());
+    try std.testing.expectError(error.ResourceLimitExceeded, request.validateAdditional(too_much));
+    // A fresh cached-hit owner binds the two actual distinct retained owners.
+    const hit = try Owner.create(a, session, &.{});
+    var hit_open = true;
+    defer if (hit_open) hit.deinitOutsideExecution();
+    try hit.addSharedDefinitionFloor(decode);
+    try std.testing.expectError(error.DuplicateMetadataSharedOwner, hit.addSharedDefinitionFloor(decode));
+    try hit.addSharedDefinitionFloor(initial);
+    try std.testing.expectEqualDeep(live_total, try hit.sharedMetadataAmounts());
+    hit.deinitOutsideExecution();
+    hit_open = false;
+    request.allocator().free(private);
+    request.deinitOutsideExecution();
+    request_open = false;
+    session.close();
+    model_open = false;
+    // Both independently admitted Shared definitions retain Domain only.
+    try std.testing.expect(closed);
+    const sink = try @import("retirement_sink.zig").Ref.create();
+    defer {
+        sink.close() catch @panic("phase sink close");
+        var owned = sink;
+        owned.release();
+    }
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    try decode.releaseWithCleanup(.{ .boundary = &epoch });
+    decode_open = false;
+    try initial.releaseWithCleanup(.{ .boundary = &epoch });
+    initial_open = false;
+    try std.testing.expectEqual(@as(usize, 0), deaths);
+    const reserved = domain.controller.snapshot();
+    try std.testing.expect(reserved.host_scratch_bytes >= live_total.host_scratch_bytes);
+    guard.finish();
+    try std.testing.expectEqual(@as(usize, 2), deaths);
+}
+test "sequential decode and initial Shared definitions preserve both live and sealed denial floors without duplicated quota" {
+    try sequentialPhaseMetadataCase(std.testing.allocator);
+}
+test "sequential two phase Shared cold creation and partial publication unwind every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sequentialPhaseMetadataCase, .{});
 }

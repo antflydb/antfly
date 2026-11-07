@@ -968,7 +968,10 @@ pub const DenseAttentionPrefixBinding = struct {
     mask: []const i64,
 };
 
+pub const DenseAttentionRowsBinding = struct { mask: ?[]const i64 = null };
+
 pub const AttentionContext = struct {
+    dense_attention_rows: ?DenseAttentionRowsBinding = null,
     dense_attention_prefix: ?DenseAttentionPrefixBinding = null,
     mode: AttentionMode = .dense_causal,
     total_sequence_len: usize,

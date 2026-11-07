@@ -53110,6 +53110,13 @@ fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) any
 }
 
 fn assignedKernelWorkspaceOp(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) !ops.kernel_descriptor.WorkspaceRequirement {
+    if (descriptor.operation == .dense_attention_rows) {
+        const rows = descriptor.operation.dense_attention_rows;
+        if (!rows.valid(descriptor)) return error.InvalidAttentionShape;
+        if (rows.kind == .cross) return .{ .host_byte_size = try std.math.mul(usize, try std.math.mul(usize, rows.query_rows, rows.key_rows), 4) };
+        const plan = try linalg.FlashCausalWorkspace.init(rows.query_rows, rows.key_rows, rows.head_dim);
+        return .{ .host_byte_size = try std.math.mul(usize, plan.floats, 4) };
+    }
     if (descriptor.operation != .dense_attention_prefix) return .{};
     const prefix = descriptor.operation.dense_attention_prefix;
     if (!prefix.valid(descriptor)) return error.InvalidAttentionShape;
@@ -53121,6 +53128,7 @@ fn assignedKernelSupportedOp(_: *anyopaque, descriptor: *const ops.kernel_descri
     return switch (descriptor.operation) {
         .paged_attention => |geometry| geometry.valid(descriptor),
         .dense_attention_prefix => |geometry| geometry.valid(descriptor),
+        .dense_attention_rows => |geometry| geometry.valid(descriptor),
         // Reduced DOT weights remain on the existing converting compatibility
         // path until their source staging has an exact assigned-workspace route.
         .dot => descriptor.input_shapes[0].dtype == .f32 and descriptor.input_shapes[1].dtype == .f32,
@@ -53201,10 +53209,16 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         break :prepared @ptrCast(@alignCast(selected.context));
     } else null;
     if (!assignedKernelSupportedOp(ctx, descriptor)) return false;
-    if ((descriptor.operation == .paged_attention or descriptor.operation == .dense_attention_prefix) and request.prepared_route == null) return false;
+    if ((descriptor.operation == .paged_attention or descriptor.operation == .dense_attention_prefix or descriptor.operation == .dense_attention_rows) and request.prepared_route == null) return false;
     const dense_prefix: ?@import("../graph/backend_contracts.zig").DenseAttentionPrefixBinding = if (descriptor.operation == .dense_attention_prefix) (request.attention orelse return false).dense_attention_prefix orelse return false else null;
     if (dense_prefix) |binding| {
         if (binding.live_key_rows == 0 or binding.live_key_rows > descriptor.operation.dense_attention_prefix.max_key_rows or binding.mask.len != binding.live_key_rows) return error.InvalidAttentionShape;
+    }
+    const dense_rows: ?@import("../graph/backend_contracts.zig").DenseAttentionRowsBinding = if (descriptor.operation == .dense_attention_rows) (request.attention orelse return false).dense_attention_rows orelse return false else null;
+    if (dense_rows) |binding| {
+        const rows = descriptor.operation.dense_attention_rows;
+        if (rows.kind == .causal and binding.mask != null) return error.InvalidAttentionShape;
+        if (binding.mask) |mask| if (mask.len != rows.key_rows) return error.InvalidAttentionShape;
     }
     const paged: ?AssignedPagedBinding = if (descriptor.operation == .paged_attention)
         try validateAssignedPagedAttention(descriptor.operation.paged_attention, request.attention orelse return false)
@@ -53263,7 +53277,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         if (kernel_geometry.byteRangesOverlap(@intFromPtr(source.ptr), source.len * 4, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
     };
     if (target.physical_lease == null or output.len != descriptor.elements()) return error.InvalidTensorShape;
-    if (descriptor.operation == .paged_attention or descriptor.operation == .dense_attention_prefix) {
+    if (descriptor.operation == .paged_attention or descriptor.operation == .dense_attention_prefix or descriptor.operation == .dense_attention_rows) {
         const assigned = request.assigned_output orelse return error.MissingAssignedOutput;
         const selected = request.prepared_route orelse return error.MissingPreparedKernelRoute;
         if (!target.physical_lease.?.acceptsWritableRegion(assigned.slot.allocation, assigned.slot.epoch, assigned.slot.writable_bytes, assigned.region) or assigned.slot.writable_bytes != output.len * @sizeOf(f32) or !assigned.slot.logical.eq(descriptor.output_shape)) return error.InvalidAssignedOutputAuthority;
@@ -53285,6 +53299,24 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         if (kernel_geometry.byteRangesOverlap(@intFromPtr(source.ptr), source.len * 4, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
     }
     switch (descriptor.operation) {
+        .dense_attention_rows => |geometry| {
+            const binding = dense_rows orelse return error.InvalidAttentionShape;
+            const required = try assignedKernelWorkspaceOp(ctx, descriptor);
+            const alignment: usize = if (geometry.kind == .causal) 64 else @alignOf(f32);
+            if (request.host_workspace.len < required.host_byte_size or @intFromPtr(request.host_workspace.ptr) % alignment != 0) return error.InsufficientAttentionWorkspace;
+            const workspace = request.host_workspace[0..required.host_byte_size];
+            for (dense_inputs) |input| if (kernel_geometry.byteRangesOverlap(@intFromPtr(input.ptr), input.len * 4, @intFromPtr(workspace.ptr), workspace.len)) return error.InvalidAssignedAlias;
+            if (kernel_geometry.byteRangesOverlap(@intFromPtr(output.ptr), output.len * 4, @intFromPtr(workspace.ptr), workspace.len)) return error.InvalidAssignedAlias;
+            if (binding.mask) |mask| {
+                const bytes = try std.math.mul(usize, mask.len, @sizeOf(i64));
+                if (kernel_geometry.byteRangesOverlap(@intFromPtr(mask.ptr), bytes, @intFromPtr(output.ptr), output.len * 4) or kernel_geometry.byteRangesOverlap(@intFromPtr(mask.ptr), bytes, @intFromPtr(workspace.ptr), workspace.len)) return error.InvalidAssignedAlias;
+            }
+            if (geometry.kind == .causal) {
+                try linalg.flashCausalAttentionHostInto(dense_inputs[0], dense_inputs[1], dense_inputs[2], null, null, 0, 1, geometry.query_rows, geometry.key_rows, 0, 0, geometry.num_heads, geometry.num_heads, geometry.head_dim, output, std.mem.bytesAsSlice(f32, @as([]align(64) u8, @alignCast(workspace))));
+            } else {
+                linalg.crossAttentionHostInto(dense_inputs[0], dense_inputs[1], dense_inputs[2], binding.mask orelse return error.InvalidAttentionShape, 1, geometry.query_rows, geometry.key_rows, geometry.num_heads, geometry.head_dim, output, std.mem.bytesAsSlice(f32, @as([]align(@alignOf(f32)) u8, @alignCast(workspace))));
+            }
+        },
         .dense_attention_prefix => |geometry| {
             const binding = dense_prefix orelse return error.InvalidAttentionShape;
             const bytes = try std.math.mul(usize, geometry.max_key_rows, @sizeOf(f32));
@@ -56562,9 +56594,9 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../execution/kernel_r
     const target = ops.ComputeBackend{ .ptr = ctx, .vtable = @ptrCast(@alignCast(implementation.table)) };
     if ((target.vtable.kernels orelse return null).runAssignedKernel != &runAssignedKernelOp) return null;
     if (descriptor.operation == .gather) if (try preparePackedRowRoute(self, target, request)) |selected| return selected;
-    if (descriptor.operation == .dense_attention_prefix) {
+    if (descriptor.operation == .dense_attention_prefix or descriptor.operation == .dense_attention_rows) {
         var selected = (try @import("../execution/assigned_kernel_route.zig").prepareImmutable(target, request, nativeDirectRouteSupported)) orelse return null;
-        selected.requirements.host_alignment = @alignOf(f32);
+        selected.requirements.host_alignment = if (descriptor.operation == .dense_attention_rows and descriptor.operation.dense_attention_rows.kind == .causal) 64 else @alignOf(f32);
         return selected;
     }
     if (descriptor.operation != .linear) return @import("../execution/assigned_kernel_route.zig").prepareImmutable(target, request, nativeDirectRouteSupported);
@@ -61018,4 +61050,72 @@ fn nativeHeldGatherDiscardCase(a: std.mem.Allocator) !void {
 test "Direct F32 gather keeps original pinned mapped-source discard policy counts without allocations" {
     try nativeHeldGatherDiscardCase(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeHeldGatherDiscardCase, .{});
+}
+
+fn nativeDeclaredAttentionRowsCase(a: std.mem.Allocator) !void {
+    const Shape = @import("ml").graph.Shape;
+    const route = @import("../execution/kernel_route.zig");
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const queries = [_]f32{ 0.5, -0.25, 0.75, 0.125, -1, 2, 0.5, -0.5, 0.25, 0.75, -0.5, 1 };
+    const keys = [_]f32{ 1, 2, 3, 4, -1, 0.5, 2, -2, 0.25, -0.75, 1.5, 0.5, 2, 0, -1, 3, 0.5, 1, 2, -0.5 };
+    const values = [_]f32{ 1, -2, 3, 0.5, 4, 1, -1, 2, -3, 0.25, 2, 4, 0.75, 3, -2, 1, 5, -1, 0.5, 2 };
+    const mask = [_]i64{ 1, 0, 1, 1, 1 };
+    for ([_]ops.kernel_descriptor.DenseAttentionRows.Kind{ .causal, .cross }) |kind| {
+        const key_rows: usize = if (kind == .causal) 3 else 5;
+        const q = try cb.fromFloat32Shape(&queries, &.{ 3, 4 });
+        defer cb.free(q);
+        const k = try cb.fromFloat32Shape(keys[0 .. key_rows * 4], &.{ @intCast(key_rows), 4 });
+        defer cb.free(k);
+        const v = try cb.fromFloat32Shape(values[0 .. key_rows * 4], &.{ @intCast(key_rows), 4 });
+        defer cb.free(v);
+        const inputs = [_]CT{ q, k, v };
+        const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .dense_attention_rows = .{ .kind = kind, .query_rows = 3, .key_rows = @intCast(key_rows), .num_heads = 2, .head_dim = 2 } }, .input_count = 3, .input_shapes = .{ Shape.init(.f32, &.{ 3, 4 }), Shape.init(.f32, &.{ @intCast(key_rows), 4 }), Shape.init(.f32, &.{ @intCast(key_rows), 4 }) }, .output_shape = Shape.init(.f32, &.{ 3, 4 }) };
+        const implementation = route.Implementation{ .context = &compute, .table = &vtable_impl };
+        var facts: [3]route.Binding = undefined;
+        for (inputs, &facts) |input, *fact| fact.* = .{ .tensor = .{ .value = input, .implementation = implementation } };
+        const slot = route.OutputSlot{ .allocation = 1, .node = 4, .epoch = 3, .logical = descriptor.output_shape, .writable_bytes = 48 };
+        var selected = (try prepareKernelRouteOp(&compute, .{ .allocator = a, .implementation = implementation, .descriptor = &descriptor, .inputs = &facts, .output = slot })) orelse return error.MissingDeclaredRowsRoute;
+        defer selected.deinit();
+        try std.testing.expect(selected.requirements.capture == .unsupported);
+        const lease = (try ops.physical_storage.Lease.create(a, cb, 48)).?;
+        defer lease.release();
+        try lease.bindAllocationSlot(1, 3, 48);
+        const output = (try physicalTensorViewOp(&compute, .{ .storage = lease, .shape = &.{ 3, 4 } })).?;
+        defer cb.free(output);
+        const assigned = route.AssignedOutput{ .slot = slot, .region = try lease.writableRegion(1, 3, 48) };
+        const bytes = selected.requirements.workspace.host_byte_size;
+        const scratch = try a.alignedAlloc(f32, .@"64", bytes / 4);
+        defer a.free(scratch);
+        var context = ops.AttentionContext{ .total_sequence_len = key_rows, .query_sequence_len = 3, .kv_sequence_len = key_rows, .dense_attention_rows = .{ .mask = if (kind == .cross) &mask else null } };
+        var invocation = ops.kernel_descriptor.Invocation{ .descriptor = &descriptor, .inputs = &inputs, .output = output, .host_workspace = std.mem.sliceAsBytes(scratch), .prepared_route = &selected, .assigned_output = &assigned, .attention = &context };
+        const original = if (kind == .causal) try cb.causalSelfAttention(q, k, v, null, 1, 3, 2, 2) else try cb.crossAttention(q, k, v, &mask, 1, 3, key_rows, 2, 2);
+        defer cb.free(original);
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        compute.allocator = failing.allocator();
+        const result = runAssignedKernelOp(&compute, invocation);
+        compute.allocator = a;
+        try std.testing.expect(try result);
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqualSlices(f32, getData(original), toBuf(output).data);
+        const held = toBuf(output).data[0..12].*;
+        invocation.host_workspace = invocation.host_workspace[0 .. bytes - 1];
+        try std.testing.expectError(error.InsufficientAttentionWorkspace, runAssignedKernelOp(&compute, invocation));
+        invocation.host_workspace = std.mem.sliceAsBytes(scratch);
+        context.dense_attention_rows.?.mask = mask[0..4];
+        try std.testing.expectError(error.InvalidAttentionShape, runAssignedKernelOp(&compute, invocation));
+        context.dense_attention_rows.?.mask = if (kind == .cross) &mask else null;
+        invocation.prepared_route = null;
+        try std.testing.expect(!try runAssignedKernelOp(&compute, invocation));
+        try std.testing.expectEqualSlices(f32, &held, toBuf(output).data);
+    }
+}
+test "Native static causal and multiquery cross attention retain exact routes masks scratch authority and allocation free original math" {
+    try nativeDeclaredAttentionRowsCase(std.testing.allocator);
+}
+test "Native declared multiquery attention cold owner allocation failures release every route and physical root" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeDeclaredAttentionRowsCase, .{});
 }

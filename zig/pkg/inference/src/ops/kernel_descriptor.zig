@@ -186,7 +186,30 @@ pub const DenseAttentionPrefix = struct {
     }
 };
 
-pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather, paged_attention: PagedAttention, dense_attention_prefix: DenseAttentionPrefix };
+/// Authored exact static multi-query attention. Initial causal rows are
+/// fresh Q/K/V, never a live-prefix reinterpretation or padded capacity plane.
+pub const DenseAttentionRows = struct {
+    pub const Kind = enum { causal, cross };
+    kind: Kind,
+    query_rows: u32,
+    key_rows: u32,
+    num_heads: u32,
+    head_dim: u32,
+    pub fn valid(self: @This(), descriptor: *const Descriptor) bool {
+        if (self.query_rows == 0 or self.key_rows == 0 or self.num_heads == 0 or self.head_dim == 0 or descriptor.input_count != 3) return false;
+        if (self.kind == .causal and self.query_rows != self.key_rows) return false;
+        const width = std.math.mul(i64, self.num_heads, self.head_dim) catch return false;
+        if (descriptor.output_shape.dtype != .f32 or descriptor.output_shape.rank() != 2 or descriptor.output_shape.dims[0] != self.query_rows or descriptor.output_shape.dims[1] != width) return false;
+        for (descriptor.input_shapes[0..3], 0..) |shape, i| {
+            if (shape.dtype != .f32 or shape.rank() != 2 or shape.dims[0] != (if (i == 0) self.query_rows else self.key_rows) or shape.dims[1] != width) return false;
+            const count = shape.numElements() orelse return false;
+            _ = std.math.mul(usize, std.math.cast(usize, count) orelse return false, 4) catch return false;
+        }
+        return true;
+    }
+};
+
+pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather, paged_attention: PagedAttention, dense_attention_prefix: DenseAttentionPrefix, dense_attention_rows: DenseAttentionRows };
 
 /// Value-only semantics for original independent, fused-pair, and grouped QKV
 /// projection heads. It never owns a CT, prepared slot, or execution policy.
@@ -526,7 +549,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         else => .{ .unary = unary(node.op) orelse return null },
     };
     const inputs: u8 = switch (operation) {
-        .paged_attention, .dense_attention_prefix => 3,
+        .paged_attention, .dense_attention_prefix, .dense_attention_rows => 3,
         .unary => 1,
         .binary, .dot, .concat, .gather => 2,
         .softmax, .rope, .reduction, .transpose, .broadcast, .slice => 1,

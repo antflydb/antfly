@@ -36304,7 +36304,7 @@ fn physicalReplayTensorSupportedOp(ctx: *anyopaque, value: CT) bool {
 fn physicalReplayKernelSupportedOp(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     const compute: *CudaCompute = @ptrCast(@alignCast(ctx));
     return switch (descriptor.operation) {
-        .paged_attention, .dense_attention_prefix => false,
+        .paged_attention, .dense_attention_prefix, .dense_attention_rows => false,
         .dot => descriptor.input_shapes[0].rank() != 2 or compute.training_blas == null,
         // Strict-F32 cuBLASLt linear dispatch uses the bounded warmed plan
         // cache and an explicit zero-workspace invocation. Bias is the same
@@ -36462,7 +36462,7 @@ fn assignedProjectionWeightSupported(weight: *const CudaTensor, bias: bool) bool
 }
 
 fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
-    if (request.descriptor.operation == .paged_attention or request.descriptor.operation == .dense_attention_prefix) return false;
+    if (request.descriptor.operation == .paged_attention or (request.descriptor.operation == .dense_attention_prefix or request.descriptor.operation == .dense_attention_rows)) return false;
     if (request.descriptor.output_shape.dtype != .f32) return false;
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (request.prepared_route) |selected| {
@@ -36531,7 +36531,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
     for (request.auxiliaries) |auxiliary| try retainPhysicalCaptureTensor(self, auxiliary.tensor);
     const a = tensorFromCt(request.inputs[0]);
     switch (descriptor.operation) {
-        .paged_attention, .dense_attention_prefix => return false,
+        .paged_attention, .dense_attention_prefix, .dense_attention_rows => return false,
         .transpose, .broadcast => |layout| {
             const input_dims = ops.kernel_descriptor.nativeDimensions(u32, descriptor.input_shapes[0]);
             if (descriptor.operation == .transpose) {
@@ -54960,4 +54960,13 @@ test "CUDA ordinary F32 paged batch writes parent spans without child allocation
     const retained = try cb.toFloat32(held, a);
     defer a.free(retained);
     try std.testing.expectEqualSlices(f32, actual, retained);
+}
+
+test "CUDA refuses Native declared multiquery attention before opaque provider or tensor access" {
+    const Shape = @import("ml").graph.Shape;
+    const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .dense_attention_rows = .{ .kind = .causal, .query_rows = 3, .key_rows = 3, .num_heads = 2, .head_dim = 2 } }, .input_count = 3, .input_shapes = .{ Shape.init(.f32, &.{ 3, 4 }), Shape.init(.f32, &.{ 3, 4 }), Shape.init(.f32, &.{ 3, 4 }) }, .output_shape = Shape.init(.f32, &.{ 3, 4 }) };
+    const foreign_context: *anyopaque = @ptrFromInt(16);
+    const functions = vtable.kernels.?;
+    try std.testing.expect(!try functions.runAssignedKernel.?(foreign_context, .{ .descriptor = &descriptor, .inputs = &.{} }));
+    try std.testing.expect(!physicalReplayKernelSupportedOp(foreign_context, &descriptor));
 }

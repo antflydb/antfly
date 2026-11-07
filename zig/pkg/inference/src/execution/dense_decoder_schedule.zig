@@ -223,7 +223,8 @@ pub const Builder = struct {
         return id;
     }
     pub fn gather(self: *Builder, weight: Node, indices: Node, width: usize) !Node {
-        const shape = Shape.init(.f32, &.{ 1, @intCast(width) });
+        const rows = self.logicalShape(indices).numElements() orelse return error.InvalidShape;
+        const shape = Shape.init(.f32, &.{ rows, @intCast(width) });
         const id = if (self.cached()) |definition| reuse: {
             if (self.replay_cursor >= definition.graph.nodeCount()) return error.DenseDefinitionChanged;
             const id: Node = @intCast(self.replay_cursor);
@@ -281,8 +282,25 @@ pub const Builder = struct {
         const geometry = ops.kernel_descriptor.DenseAttentionPrefix{ .num_heads = std.math.cast(u32, heads) orelse return error.DimensionOverflow, .head_dim = std.math.cast(u32, dim) orelse return error.DimensionOverflow, .max_key_rows = std.math.cast(u32, capacity) orelse return error.DimensionOverflow };
         return self.operation(.{ .fused_cross_attention = .{ .batch = 1, .dec_seq = 1, .enc_seq = geometry.max_key_rows, .num_heads = geometry.num_heads, .head_dim = geometry.head_dim } }, &.{ q, k, v }, .{ .operation = .{ .dense_attention_prefix = geometry }, .input_count = 3, .output_shape = self.logicalShape(q), .input_shapes = .{ self.logicalShape(q), self.logicalShape(k), self.logicalShape(v) } });
     }
+    pub fn attentionRows(self: *Builder, kind: ops.kernel_descriptor.DenseAttentionRows.Kind, q: Node, k: Node, v: Node, heads: usize, dim: usize, query_rows: usize, key_rows: usize) !Node {
+        const geometry = ops.kernel_descriptor.DenseAttentionRows{ .kind = kind, .num_heads = std.math.cast(u32, heads) orelse return error.DimensionOverflow, .head_dim = std.math.cast(u32, dim) orelse return error.DimensionOverflow, .query_rows = std.math.cast(u32, query_rows) orelse return error.DimensionOverflow, .key_rows = std.math.cast(u32, key_rows) orelse return error.DimensionOverflow };
+        const op: ml.graph.OpCode = .{ .fused_cross_attention = .{ .batch = 1, .dec_seq = geometry.query_rows, .enc_seq = geometry.key_rows, .num_heads = geometry.num_heads, .head_dim = geometry.head_dim } };
+        return self.operation(op, &.{ q, k, v }, .{ .operation = .{ .dense_attention_rows = geometry }, .input_count = 3, .output_shape = self.logicalShape(q), .input_shapes = .{ self.logicalShape(q), self.logicalShape(k), self.logicalShape(v) } });
+    }
+    pub fn lastRow(self: *Builder, input: Node, rows: usize, width: usize) !Node {
+        var slice = ops.kernel_descriptor.Slice{};
+        slice.starts[0] = std.math.cast(u32, rows - 1) orelse return error.DimensionOverflow;
+        var attrs = @TypeOf(@as(ml.graph.Node, undefined).op.slice){ .num_axes = 2 };
+        attrs.starts[0] = @intCast(rows - 1);
+        attrs.limits[0] = @intCast(rows);
+        attrs.limits[1] = @intCast(width);
+        return self.operation(.{ .slice = attrs }, &.{input}, .{ .operation = .{ .slice = slice }, .input_count = 1, .output_shape = Shape.init(.f32, &.{ 1, @intCast(width) }), .input_shapes = .{ self.logicalShape(input), undefined, undefined } });
+    }
     pub fn gelu(self: *Builder, x: Node) !Node {
         return self.operation(.{ .fused_gelu = {} }, &.{x}, .{ .operation = .{ .unary = .gelu }, .output_shape = self.logicalShape(x), .input_shapes = .{ self.logicalShape(x), undefined, undefined }, .input_count = 1 });
+    }
+    pub fn geluExact(self: *Builder, x: Node) !Node {
+        return self.operation(.{ .fused_gelu_exact = {} }, &.{x}, .{ .operation = .{ .unary = .gelu_exact }, .output_shape = self.logicalShape(x), .input_shapes = .{ self.logicalShape(x), undefined, undefined }, .input_count = 1 });
     }
 };
 

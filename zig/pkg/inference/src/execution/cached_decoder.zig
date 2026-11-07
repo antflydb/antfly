@@ -199,102 +199,120 @@ pub fn CachedDecoder(comptime Architecture: type) type {
         /// Task-supplied suppression is already resolved. This owner selects
         /// graph replay/fused projection/reduction without retaining task policy.
         pub fn selectScalar(self: *Self, suppress_tokens: []const i32, fused_lm_head_allowed: bool, allow_cuda_graph: bool) !u32 {
-            const allocator = self.context.allocator;
-            const cb = self.context.backend;
-            const model = self.context.model.*;
             self.head_events = .{};
-            var owned_hidden = try self.takeHidden();
-            var owned_live = true;
-            errdefer if (owned_live) cb.free(owned_hidden);
-            const hidden = &owned_hidden;
-            const hidden_live = &owned_live;
+            return selectOwnedHidden(self.context, try self.takeHidden(), &self.head_events, suppress_tokens, fused_lm_head_allowed, allow_cuda_graph);
+        }
 
-            if (fused_lm_head_allowed) {
-                var capture_graph = false;
-                errdefer if (capture_graph) cb.debugCudaGraphCaptureEnd(false) catch {};
-                if (allow_cuda_graph) {
-                    if (suppress_tokens.len == 0) {
-                        if (try cb.debugCudaGraphPrepareGreedyTokenReplayInput(self.context.replay_key, hidden.*, 0)) |prepared| {
-                            cb.free(hidden.*);
-                            hidden.* = prepared;
-                            hidden_live.* = true;
-                            _ = try cb.debugCudaGraphPrepareDecodeScalars(0, 0, 0, 0, 0);
-                            if (try cb.debugCudaGraphReplayFinalHidden(hidden.*)) |token_tensor| {
-                                defer cb.free(token_tensor);
+        /// Consumes the original owning hidden header synchronously. A caller
+        /// may use a retained view only while its backing stays unchanged for
+        /// this COMPLETE head call; neither it nor a Frame borrow can escape.
+        pub fn selectOwnedHidden(context: Context, input: CT, events: *HeadEvents, suppress_tokens: []const i32, fused_lm_head_allowed: bool, allow_cuda_graph: bool) !u32 {
+            var head = ScalarHead{ .context = context };
+            defer events.* = head.head_events;
+            return head.selectOwned(input, suppress_tokens, fused_lm_head_allowed, allow_cuda_graph);
+        }
+
+        const ScalarHead = struct {
+            context: Context,
+            head_events: HeadEvents = .{},
+            fn selectOwned(self: *ScalarHead, input: CT, suppress_tokens: []const i32, fused_lm_head_allowed: bool, allow_cuda_graph: bool) !u32 {
+                const allocator = self.context.allocator;
+                const cb = self.context.backend;
+                const model = self.context.model.*;
+                self.head_events = .{};
+                var owned_hidden = input;
+                var owned_live = true;
+                errdefer if (owned_live) cb.free(owned_hidden);
+                const hidden = &owned_hidden;
+                const hidden_live = &owned_live;
+
+                if (fused_lm_head_allowed) {
+                    var capture_graph = false;
+                    errdefer if (capture_graph) cb.debugCudaGraphCaptureEnd(false) catch {};
+                    if (allow_cuda_graph) {
+                        if (suppress_tokens.len == 0) {
+                            if (try cb.debugCudaGraphPrepareGreedyTokenReplayInput(self.context.replay_key, hidden.*, 0)) |prepared| {
                                 cb.free(hidden.*);
-                                hidden_live.* = false;
-                                self.head_events.cuda_graph_replay = true;
-                                self.head_events.cuda_graph_replay_steps += 1;
-                                self.head_events.lm_head_path = "fused_argmax_graph";
-                                return try self.downloadToken(token_tensor);
-                            }
-                            capture_graph = try cb.debugCudaGraphCaptureBegin(self.context.replay_key);
-                            if (capture_graph) {
-                                try cb.debugCudaTraceTensor(self.context.replay_input_label, hidden.*);
-                                try cb.debugCudaGraphRegisterFinalHiddenReplayInput(hidden.*);
+                                hidden.* = prepared;
+                                hidden_live.* = true;
+                                _ = try cb.debugCudaGraphPrepareDecodeScalars(0, 0, 0, 0, 0);
+                                if (try cb.debugCudaGraphReplayFinalHidden(hidden.*)) |token_tensor| {
+                                    defer cb.free(token_tensor);
+                                    cb.free(hidden.*);
+                                    hidden_live.* = false;
+                                    self.head_events.cuda_graph_replay = true;
+                                    self.head_events.cuda_graph_replay_steps += 1;
+                                    self.head_events.lm_head_path = "fused_argmax_graph";
+                                    return try self.downloadToken(token_tensor);
+                                }
+                                capture_graph = try cb.debugCudaGraphCaptureBegin(self.context.replay_key);
+                                if (capture_graph) {
+                                    try cb.debugCudaTraceTensor(self.context.replay_input_label, hidden.*);
+                                    try cb.debugCudaGraphRegisterFinalHiddenReplayInput(hidden.*);
+                                } else if (self.head_events.cuda_graph_fallback_reason == null) {
+                                    self.head_events.cuda_graph_fallback_reason = .capture_unavailable;
+                                }
                             } else if (self.head_events.cuda_graph_fallback_reason == null) {
-                                self.head_events.cuda_graph_fallback_reason = .capture_unavailable;
+                                self.head_events.cuda_graph_fallback_reason = .prepare_unavailable;
                             }
                         } else if (self.head_events.cuda_graph_fallback_reason == null) {
-                            self.head_events.cuda_graph_fallback_reason = .prepare_unavailable;
+                            self.head_events.cuda_graph_fallback_reason = .dynamic_suppression;
                         }
-                    } else if (self.head_events.cuda_graph_fallback_reason == null) {
-                        self.head_events.cuda_graph_fallback_reason = .dynamic_suppression;
                     }
-                }
-                const fused_start = platform.time.monotonicNs();
-                if (try Architecture.decoderFusedTokenFromFinalHiddenTensor(cb, model, hidden.*, suppress_tokens)) |token_tensor| {
-                    self.recordHeadTiming(.fused_argmax, fused_start);
-                    defer cb.free(token_tensor);
+                    const fused_start = platform.time.monotonicNs();
+                    if (try Architecture.decoderFusedTokenFromFinalHiddenTensor(cb, model, hidden.*, suppress_tokens)) |token_tensor| {
+                        self.recordHeadTiming(.fused_argmax, fused_start);
+                        defer cb.free(token_tensor);
+                        if (capture_graph) {
+                            try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(hidden.*, token_tensor);
+                            try cb.debugCudaGraphCaptureEnd(true);
+                            self.head_events.cuda_graph_capture_steps += 1;
+                            capture_graph = false;
+                        }
+                        cb.free(hidden.*);
+                        hidden_live.* = false;
+                        if (self.head_events.lm_head_path == null) self.head_events.lm_head_path = "fused_argmax";
+                        return try self.downloadToken(token_tensor);
+                    }
+                    self.recordHeadTiming(.fused_unavailable, fused_start);
                     if (capture_graph) {
-                        try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(hidden.*, token_tensor);
-                        try cb.debugCudaGraphCaptureEnd(true);
-                        self.head_events.cuda_graph_capture_steps += 1;
+                        try cb.debugCudaGraphCaptureEnd(false);
                         capture_graph = false;
                     }
-                    cb.free(hidden.*);
-                    hidden_live.* = false;
-                    if (self.head_events.lm_head_path == null) self.head_events.lm_head_path = "fused_argmax";
-                    return try self.downloadToken(token_tensor);
+                    if (self.head_events.lm_head_path == null) self.head_events.lm_head_path = "full_logits_fused_unavailable";
                 }
-                self.recordHeadTiming(.fused_unavailable, fused_start);
-                if (capture_graph) {
-                    try cb.debugCudaGraphCaptureEnd(false);
-                    capture_graph = false;
-                }
-                if (self.head_events.lm_head_path == null) self.head_events.lm_head_path = "full_logits_fused_unavailable";
+
+                const logits = try Architecture.decoderLmHeadLogitsFromFinalHiddenTensor(cb, allocator, model, hidden.*);
+                hidden_live.* = false;
+                defer cb.free(logits);
+
+                if (suppress_tokens.len == 0 and self.head_events.lm_head_path == null) self.head_events.lm_head_path = "full_logits";
+                const selected = try selectLogitsHead(cb, allocator, logits, 1, model.vocab_size, suppress_tokens, self.context.unsupported_suppression);
+                if (self.head_events.lm_head_path == null) self.head_events.lm_head_path = "full_logits";
+                return switch (selected) {
+                    .token => |value| value,
+                    .tensor => |value| blk: {
+                        defer cb.free(value);
+                        break :blk try self.downloadToken(value);
+                    },
+                };
             }
 
-            const logits = try Architecture.decoderLmHeadLogitsFromFinalHiddenTensor(cb, allocator, model, hidden.*);
-            hidden_live.* = false;
-            defer cb.free(logits);
+            fn recordHeadTiming(self: *ScalarHead, stage: HeadEvents.Stage, start: u64) void {
+                if (!self.context.profile_stages) return;
+                self.head_events.timings[self.head_events.timing_count] = .{ .stage = stage, .elapsed_ns = platform.time.monotonicNs() - start };
+                self.head_events.timing_count += 1;
+            }
 
-            if (suppress_tokens.len == 0 and self.head_events.lm_head_path == null) self.head_events.lm_head_path = "full_logits";
-            const selected = try selectLogitsHead(cb, allocator, logits, 1, model.vocab_size, suppress_tokens, self.context.unsupported_suppression);
-            if (self.head_events.lm_head_path == null) self.head_events.lm_head_path = "full_logits";
-            return switch (selected) {
-                .token => |value| value,
-                .tensor => |value| blk: {
-                    defer cb.free(value);
-                    break :blk try self.downloadToken(value);
-                },
-            };
-        }
-
-        fn recordHeadTiming(self: *Self, stage: HeadEvents.Stage, start: u64) void {
-            if (!self.context.profile_stages) return;
-            self.head_events.timings[self.head_events.timing_count] = .{ .stage = stage, .elapsed_ns = platform.time.monotonicNs() - start };
-            self.head_events.timing_count += 1;
-        }
-
-        fn downloadToken(self: *Self, tensor: CT) !u32 {
-            const started = platform.time.monotonicNs();
-            const values = try self.context.backend.toFloat32(tensor, self.context.allocator);
-            self.recordHeadTiming(.token_download, started);
-            defer self.context.allocator.free(values);
-            if (values.len != 1 or values[0] < 0) return error.InvalidTensorShape;
-            return @intFromFloat(values[0]);
-        }
+            fn downloadToken(self: *ScalarHead, tensor: CT) !u32 {
+                const started = platform.time.monotonicNs();
+                const values = try self.context.backend.toFloat32(tensor, self.context.allocator);
+                self.recordHeadTiming(.token_download, started);
+                defer self.context.allocator.free(values);
+                if (values.len != 1 or values[0] < 0) return error.InvalidTensorShape;
+                return @intFromFloat(values[0]);
+            }
+        };
 
         /// Task supplies only retained cache indices, preserving its separate
         /// original-page map. Unsupported layouts disable later compaction.

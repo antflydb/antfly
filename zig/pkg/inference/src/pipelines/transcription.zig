@@ -503,7 +503,11 @@ pub const TranscriptionPipeline = struct {
         var logprob_sum: f64 = 0;
         var no_speech_prob: f32 = 0;
 
-        var decoder_runtime = try decoder_stage.Decoder.initWithSource(allocator, self.decoder, encoder_output, enc_seq_len, enc_mask, self.config.vocab_size, self.execution_control, .{}, incremental_source);
+        // Complete only already-known contiguous forced positions, using the
+        // exact same operation as later iterations. Dynamic slots stay pending.
+        whisper_prompt.appendKnownForced(dec_ids, &dec_len, forced, &forced_index, offset);
+        const initial_query_rows: ?usize = if (dec_len < max_len and !(dec_len >= prompt_end and self.output_token_budget.remaining == 0)) dec_len else null;
+        var decoder_runtime = try decoder_stage.Decoder.initWithSource(allocator, self.decoder, encoder_output, enc_seq_len, enc_mask, self.config.vocab_size, self.execution_control, .{ .expected_initial_query_rows = initial_query_rows }, incremental_source);
         defer decoder_runtime.deinit();
         timing.kv_cached = decoder_runtime.native != null;
         // Suppression list handed to the device token-choice kernel.
@@ -515,14 +519,8 @@ pub const TranscriptionPipeline = struct {
         var completed = false;
         var termination: Termination = .context_limit;
         while (dec_len < max_len) {
-            if (forced_index < forced.len and forced[forced_index].position + offset == dec_len) {
-                if (forced[forced_index].token_id) |token_id| {
-                    dec_ids[dec_len] = token_id;
-                    dec_len += 1;
-                    forced_index += 1;
-                    continue;
-                }
-            }
+            whisper_prompt.appendKnownForced(dec_ids, &dec_len, forced, &forced_index, offset);
+            if (dec_len == max_len) break;
 
             const generated_position = dec_len;
             if (generated_position >= prompt_end and self.output_token_budget.remaining == 0) {

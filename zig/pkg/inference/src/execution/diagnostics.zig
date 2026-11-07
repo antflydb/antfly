@@ -94,20 +94,27 @@ pub const PublicationScope = enum { program_execution, session_numerical_dispatc
 /// neither scope represents this invocation's template hits.
 pub const NativeDefinitionTemplates = struct {
     scope: enum { retained_definition_lifetime_successful_constructor_publications, model_whisper_cache_lifetime_at_constructor_observation } = .retained_definition_lifetime_successful_constructor_publications,
+    phase: enum { unspecified, decode_prefix, initial_causal } = .unspecified,
     availability: enum { sampled, busy } = .busy,
     stats: ?Specializations = null,
 };
 pub const NativeProgramConstruction = struct {
     scope: enum { retained_runtime_constructor_result, whisper_cold_preparation_result } = .retained_runtime_constructor_result,
-    producer: enum { decoder_runtime, whisper_single_token_schedule } = .decoder_runtime,
+    producer: enum { decoder_runtime, whisper_single_token_schedule, whisper_dense_decoder_schedule } = .decoder_runtime,
     outcome: enum { not_attempted, declined, prepared, failed },
     error_name: ?Text = null,
+    initial_query_rows: ?usize = null,
+    /// Independently sampled initial-phase cache; not an atomic two-cache view.
+    initial_definition_templates: ?NativeDefinitionTemplates = null,
     /// Actual independently held admission, copied while the cold owner lives.
     /// These are distinct lifetime reservations, not new grants or memory peaks.
     metadata: ?struct {
         scope: enum { retained_cold_owner_admission_snapshot } = .retained_cold_owner_admission_snapshot,
         private_host_scratch_bytes: usize,
+        /// Sum of distinct retained phase Definition reservations, not a new grant.
         shared_definition_host_scratch_bytes: ?usize = null,
+        decode_definition_host_scratch_bytes: ?usize = null,
+        initial_definition_host_scratch_bytes: ?usize = null,
     } = null,
 };
 pub const Snapshot = struct {

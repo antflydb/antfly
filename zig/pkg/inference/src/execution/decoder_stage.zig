@@ -48,6 +48,7 @@ pub const Decoder = struct {
         allow_native: bool = true,
         allow_merged: bool = true,
         output_rows: enum { final_available, full_prefix } = .final_available,
+        expected_initial_query_rows: ?usize = null,
     };
     allocator: std.mem.Allocator,
     session: backends.Session,
@@ -74,8 +75,8 @@ pub const Decoder = struct {
         };
         var native: ?Native.State = if (source) |resident| blk: {
             if (!options.allow_native) return error.InvalidIncrementalSource;
-            break :blk try Native.fromResident(session, allocator, control, try resident.retained());
-        } else if (options.allow_native and host != null) try Native.fromHost(session, allocator, control, host.?.asFloat32(), encoder_length) else null;
+            break :blk try Native.fromResidentPrepared(session, allocator, control, try resident.retained(), .{ .expected_initial_query_rows = options.expected_initial_query_rows });
+        } else if (options.allow_native and host != null) try Native.fromHostPrepared(session, allocator, control, host.?.asFloat32(), encoder_length, .{ .expected_initial_query_rows = options.expected_initial_query_rows }) else null;
         errdefer if (native) |*value| value.deinit();
         return .{
             .allocator = allocator,

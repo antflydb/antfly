@@ -272,7 +272,10 @@ preparation API do not by themselves complete these remaining requirements:
   supplies operation order and state bindings; its existing numerical forward
   consumes the prepared views. Cross K/V projections write directly into the
   original KV slabs, and self attention receives actual live prefixes without
-  allocating slice headers. The initial causal prompt retains eager execution.
+  allocating slice headers. Declared contiguous initial prompts use a separate
+  causal/multiquery schedule with the original tiled arithmetic and explicit
+  scratch. Both phase banks are funded together, with shared KV funded once;
+  undeclared or mismatched initial queries retain eager execution.
   Managed decoders share immutable graph, descriptor, liveness and layout facts
   through a bounded Model cache; weights, KV, Frames and execution epochs stay
   private. Shared metadata retains its admission Domain, with final quota refunds
@@ -321,6 +324,12 @@ preparation API do not by themselves complete these remaining requirements:
   pairs and supervision in its execution owner. Florence's full-prefix and
   incremental decoder paths share architecture bindings and ordered vocabulary
   head selection; tasks retain suppression construction, EOS and publication.
+  Eligible scalar Native F32 readers reuse the same immutable Definition cache
+  and private physical schedule. The original full task permit moves into the
+  Source owner without another KV reservation. Construction cleanup drains
+  before scheduling selection; physical retirement precedes numerical unlock
+  and metadata refunds. Reading telemetry copies actual decoder Frame counts
+  before teardown, excluding encoder and vocabulary-head execution.
 - Metal installs synchronous assigned pair/QKV regions for complete F32
   projection heads through the production partition executor. Row-one regions
   use the existing source ownership. One semantic descriptor recognizes independent

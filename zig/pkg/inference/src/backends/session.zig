@@ -3409,6 +3409,10 @@ pub const PreparedSource = struct {
     // Adopted host tasks retain their ORIGINAL permit through caller-owned
     // input/output death. They do not publish escaping admitted Tensor owners.
     synchronous_host_task: bool = false,
+    // Set only by the canonical direct-task adopter. Its ordinary encoder may
+    // use the EXISTING typed release/fund/reenter weight service; older matrix
+    // adopters keep their original dispatch behavior.
+    task_native_weight_control: bool = false,
     host_run_completed: bool = false,
     native_matrix_scratch: ?struct {
         geometry: ops.kernel_descriptor.NativeMatrixScratchGeometry,
@@ -3667,6 +3671,60 @@ pub const PreparedSource = struct {
     pub fn initOwningSynchronousHostTaskPermitBeforeExecutionInto(self: *PreparedSource, original: *RunPermit, preprocessing: ?*const RunPermit, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !bool {
         return self.initOwningNativePermitImpl(original, preprocessing, inputs, allocator, control, true);
     }
+    /// Internal synchronous direct-task handoff. The caller completed its
+    /// actual cold metadata/banks under C before this call, outside every
+    /// Model/lane/FIFO numerical owner. This adopts the SAME original full task
+    /// request and its KV/IO/opaque floors; it neither infers a narrower model
+    /// invocation nor acquires a second base. Task values must die before Source.
+    /// The receiving task must attest its cold owner against the returned
+    /// dispatch permit's exact session, not merely a shared controller/Domain.
+    pub fn initOwningSynchronousTaskPermitBeforeExecutionInto(self: *PreparedSource, original: *RunPermit, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !bool {
+        if (self.phase != .empty) return error.SourceInvocationAlreadyInitialized;
+        const source = original.session;
+        const model = @import("../execution/architecture_session.zig").nativeSynchronousTaskPermitModel(source) orelse return false;
+        if (source.preparesInvocation() or
+            original.invocation_started or original.execution_yielded or original.prepared != null or
+            original.physical_storage != null or original.physical_prepared or original.dispatch_cleanup_epoch != null or
+            original.native_weights != null or original.declared_storage_floor != null or original.temporary_recurrent != null or
+            original.existing_workspace != null or original.existing_workspace_prepared or original.output_retirement_shell != null or
+            original.host_output_allowance != null or original.eager_preentry_declined or
+            !std.meta.eql(original.physical_credit, memory.AdmissionAmounts{})) return false;
+        const held = original.lease orelse return false;
+        const request = original.request orelse return false;
+        if (request.workspace_planned or request.retained_backend_workspace_bytes != 0 or request.pre_admitted_host_bytes != 0) return false;
+        const policy = source.run_admission.?; // exact Model/Domain proof above
+        if (held.controller != policy.controller or held.retain_backend_class != policy.backend_class) return error.ForeignAdmissionDomain;
+        if (source.resourcePin()) |expected| {
+            const actual = original.resource_pin orelse return false;
+            if (actual.ptr != expected.ptr or actual.retain_fn != expected.retain_fn or actual.release_fn != expected.release_fn or
+                actual.release_with_boundary_fn != expected.release_with_boundary_fn or actual.payload_charge_fn != expected.payload_charge_fn) return false;
+        } else if (original.resource_pin != null) return false;
+        const floor = (try policy.planRequest(request, source.outputInfo())).required;
+        inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |name| if (@field(held.amounts, name) < @field(floor, name)) return false;
+        try policy.validateOwnedRunAmounts(held.amounts);
+        try source.validateEagerHostServices();
+        if (control) |active| try active.check();
+        self.allocator = allocator;
+        self.control = control;
+        self.scheduling_session = source;
+        self.phase = .preparing;
+        errdefer self.deinit();
+        self.source_model = model.retain();
+        self.cleanup = try Owner.beginResident(source);
+        // The caller still owns cold C. Return with no FIFO place selected,
+        // so it can finish real construction retirement/refunds before enter().
+        var moved = original.*;
+        try moved.bindCurrentCleanupEpoch(self.epoch() orelse return error.MissingCurrentCleanupEpoch);
+        // No fallible work follows this move. Declines/errors above leave the
+        // caller's lease/resource pin/request exactly where they began.
+        self.permit = moved;
+        original.* = .{ .session = source, .lease = null };
+        self.synchronous_host_task = true;
+        self.task_native_weight_control = true;
+        self.phase = .ready;
+        return true;
+    }
+
     fn initOwningNativePermitImpl(self: *PreparedSource, original: *RunPermit, preprocessing: ?*const RunPermit, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, preserve_host_task_floor: bool) !bool {
         if (self.phase != .empty) return error.SourceInvocationAlreadyInitialized;
         const source = original.session;
@@ -3926,7 +3984,7 @@ pub const PreparedSource = struct {
     /// same-result host fallback within it, but cannot start a second encoder.
     pub fn beginExecutionDispatch(self: *PreparedSource) !*RunPermit {
         if (self.phase != .executing or self.executed) return error.SourceInvocationAlreadyExecuted;
-        try self.bindNativeWeightControl(false);
+        try self.bindNativeWeightControl(self.task_native_weight_control);
         self.executed = true;
         return self.selectedPermit();
     }
@@ -4043,6 +4101,10 @@ pub const PreparedSource = struct {
     pub fn enter(self: *PreparedSource) !void {
         if (self.phase != .ready) return error.SourceInvocationNotReady;
         const scheduling = self.scheduling_session.?;
+        // Only the direct task adopter leaves ready without selecting FIFO:
+        // cold C must retire outside that logical turn as well as Model/lane.
+        if (self.task_native_weight_control and !self.waiter.ready)
+            try scheduling.selectReadyCohort(scheduling.execution_gate, self.control orelse .{}, &self.waiter);
         if (self.shape_scope) |*scope| try scope.beginNumerical();
         errdefer if (self.shape_scope) |*scope| scope.endNumerical();
         try scheduling.acquireSelectedCohort(self.control orelse .{}, &self.waiter);

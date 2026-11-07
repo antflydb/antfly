@@ -324,6 +324,72 @@ pub fn flashCausalAttentionHost(
     num_kv_heads: usize,
     head_dim: usize,
 ) ![]f32 {
+    // Preserve ordinary refusal before any allocation, including malformed
+    // tensor geometry and position offsets. Into repeats these pure checks.
+    if (num_kv_heads == 0 or num_heads == 0 or head_dim == 0 or num_heads % num_kv_heads != 0) return error.InvalidAttentionShape;
+    const hq = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
+    const hkv = std.math.mul(usize, num_kv_heads, head_dim) catch return error.InvalidAttentionShape;
+    const q_count = std.math.mul(usize, std.math.mul(usize, batch, q_seq_len) catch return error.InvalidAttentionShape, hq) catch return error.InvalidAttentionShape;
+    const kv_count = std.math.mul(usize, std.math.mul(usize, batch, kv_seq_len) catch return error.InvalidAttentionShape, hkv) catch return error.InvalidAttentionShape;
+    if (Q.len != q_count or K.len != kv_count or V.len != kv_count) return error.InvalidAttentionShape;
+    _ = std.math.add(usize, query_position_offset, q_seq_len) catch return error.InvalidAttentionShape;
+    _ = std.math.add(usize, kv_position_offset, kv_seq_len) catch return error.InvalidAttentionShape;
+    const plan = try FlashCausalWorkspace.init(q_seq_len, kv_seq_len, head_dim);
+    const output = try allocator.alloc(f32, q_count);
+    errdefer allocator.free(output);
+    const workspace = try allocator.alignedAlloc(f32, .@"64", plan.floats);
+    defer allocator.free(workspace);
+    try flashCausalAttentionHostInto(Q, K, V, bias, attn_or_mask, sliding_window, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim, output, workspace);
+    return output;
+}
+
+/// Exact original flash tiles plus disjoint row statistics and head packs.
+/// One workspace is reused across batches/heads, matching the original loop.
+pub const FlashCausalWorkspace = struct {
+    floats: usize,
+    score_count: usize,
+    row_max_offset: usize,
+    row_sum_offset: usize,
+    q_offset: usize,
+    k_offset: usize,
+    v_offset: usize,
+    out_offset: usize,
+    bq: usize,
+    bkv: usize,
+    pub fn init(query_rows: usize, key_rows: usize, dim: usize) !@This() {
+        if (dim == 0) return error.InvalidAttentionShape;
+        const bq = @min(BLOCK_Q, query_rows);
+        const bkv = @min(BLOCK_KV, key_rows);
+        const scores = try std.math.mul(usize, bq, bkv);
+        const row_max = (try std.math.add(usize, scores, 15)) & ~@as(usize, 15);
+        const row_sum = try std.math.add(usize, row_max, (try std.math.add(usize, bq, 15)) & ~@as(usize, 15));
+        const q = try std.math.add(usize, row_sum, bq);
+        const k = try std.math.add(usize, q, try std.math.mul(usize, bq, dim));
+        const v = try std.math.add(usize, k, try std.math.mul(usize, bkv, dim));
+        const out = try std.math.add(usize, v, try std.math.mul(usize, bkv, dim));
+        return .{ .floats = try std.math.add(usize, out, try std.math.mul(usize, bq, dim)), .score_count = scores, .row_max_offset = row_max, .row_sum_offset = row_sum, .q_offset = q, .k_offset = k, .v_offset = v, .out_offset = out, .bq = bq, .bkv = bkv };
+    }
+};
+
+/// Allocation-free original tiled causal schedule. All validation precedes writes.
+pub fn flashCausalAttentionHostInto(
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    bias: ?[]const f32,
+    attn_or_mask: ?[]const u8,
+    sliding_window: usize,
+    batch: usize,
+    q_seq_len: usize,
+    kv_seq_len: usize,
+    query_position_offset: usize,
+    kv_position_offset: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    output: []f32,
+    workspace: []align(64) f32,
+) !void {
     if (num_kv_heads == 0 or num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
     if (num_heads % num_kv_heads != 0) return error.InvalidAttentionShape;
     const H_q = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
@@ -337,35 +403,33 @@ pub fn flashCausalAttentionHost(
     const kv_total_end = std.math.add(usize, kv_position_offset, kv_seq_len) catch return error.InvalidAttentionShape;
     const mask_seq_len = @max(query_end, kv_total_end);
 
-    const output_elems = std.math.mul(usize, batch, q_seq_len) catch return error.InvalidAttentionShape;
-    const output = try allocator.alloc(f32, std.math.mul(usize, output_elems, H_q) catch return error.InvalidAttentionShape);
-    errdefer allocator.free(output);
+    const plan = try FlashCausalWorkspace.init(q_seq_len, kv_seq_len, head_dim);
+    if (output.len != q_expected or workspace.len < plan.floats) return error.InvalidAttentionShape;
+    const used = workspace[0..plan.floats];
+    const Alias = struct {
+        fn overlaps(a: []const f32, b: []const f32) bool {
+            return @intFromPtr(a.ptr) < @intFromPtr(b.ptr) + b.len * 4 and @intFromPtr(b.ptr) < @intFromPtr(a.ptr) + a.len * 4;
+        }
+    };
+    for ([_][]const f32{ Q, K, V, bias orelse &.{} }) |input| {
+        if (Alias.overlaps(input, output) or Alias.overlaps(input, used)) return error.InvalidAttentionAlias;
+    }
+    if (Alias.overlaps(output, used)) return error.InvalidAttentionAlias;
+    if (attn_or_mask) |mask| {
+        const output_bytes = std.mem.sliceAsBytes(output);
+        const scratch_bytes = std.mem.sliceAsBytes(used);
+        if ((@intFromPtr(mask.ptr) < @intFromPtr(output_bytes.ptr) + output_bytes.len and @intFromPtr(output_bytes.ptr) < @intFromPtr(mask.ptr) + mask.len) or (@intFromPtr(mask.ptr) < @intFromPtr(scratch_bytes.ptr) + scratch_bytes.len and @intFromPtr(scratch_bytes.ptr) < @intFromPtr(mask.ptr) + mask.len)) return error.InvalidAttentionAlias;
+    }
     @memset(output, 0.0);
-
-    const bq = @min(BLOCK_Q, q_seq_len);
-    const bkv = @min(BLOCK_KV, kv_seq_len);
-    const scratch = try FlashScratch.init(allocator, std.math.mul(usize, bq, bkv) catch return error.InvalidAttentionShape, bq);
-    defer allocator.free(scratch.storage);
-    const score_tile = scratch.scores;
-    const row_max = scratch.row_max;
-    const row_sum = scratch.row_sum;
-
-    // Q/K/V are token-major here (each token packs all heads contiguously),
-    // so the per-head rows are strided by H_q/H_kv.  The register-tiled SGEMM
-    // expects contiguous matrices, so we pack each head's current Q-/K-/V-
-    // block into scratch buffers, run the GEMM, then scatter the packed
-    // output rows back to the strided `output` at the end of each Q-block.
-    // Packing cost: cur_bq + 2*cur_bkv head_dim-sized memcpys per K-block,
-    // which is < 2% of the GEMM work it enables.
-    const q_pack = try allocator.alloc(f32, bq * head_dim);
-    defer allocator.free(q_pack);
-    const k_pack = try allocator.alloc(f32, bkv * head_dim);
-    defer allocator.free(k_pack);
-    const v_pack = try allocator.alloc(f32, bkv * head_dim);
-    defer allocator.free(v_pack);
-    const out_pack = try allocator.alloc(f32, bq * head_dim);
-    defer allocator.free(out_pack);
-
+    const bq = plan.bq;
+    const bkv = plan.bkv;
+    const score_tile = used[0..plan.score_count];
+    const row_max = used[plan.row_max_offset..][0..bq];
+    const row_sum = used[plan.row_sum_offset..][0..bq];
+    const q_pack = used[plan.q_offset..][0 .. bq * head_dim];
+    const k_pack = used[plan.k_offset..][0 .. bkv * head_dim];
+    const v_pack = used[plan.v_offset..][0 .. bkv * head_dim];
+    const out_pack = used[plan.out_offset..][0 .. bq * head_dim];
     for (0..batch) |b| {
         for (0..num_heads) |h| {
             const kv_h = h / heads_per_group;
@@ -480,8 +544,6 @@ pub fn flashCausalAttentionHost(
             }
         }
     }
-
-    return output;
 }
 
 fn mul3(a: usize, b: usize, c: usize) ?usize {
@@ -3972,4 +4034,258 @@ test "attention synchronous observed relative API preserves original noncancelab
     try std.testing.expectEqual(@as(usize, 1), context[0].calls);
     try std.testing.expectEqual(@as(u64, 1), values.entries);
     try std.testing.expectEqual(@as(u64, 1), values.returns);
+}
+
+fn originalFlashCausalForDeclaredTest(
+    allocator: std.mem.Allocator,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    bias: ?[]const f32,
+    attn_or_mask: ?[]const u8,
+    sliding_window: usize,
+    batch: usize,
+    q_seq_len: usize,
+    kv_seq_len: usize,
+    query_position_offset: usize,
+    kv_position_offset: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) ![]f32 {
+    if (num_kv_heads == 0 or num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
+    if (num_heads % num_kv_heads != 0) return error.InvalidAttentionShape;
+    const H_q = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
+    const H_kv = std.math.mul(usize, num_kv_heads, head_dim) catch return error.InvalidAttentionShape;
+    const heads_per_group = num_heads / num_kv_heads;
+    const q_expected = std.math.mul(usize, std.math.mul(usize, batch, q_seq_len) catch return error.InvalidAttentionShape, H_q) catch return error.InvalidAttentionShape;
+    const kv_expected = std.math.mul(usize, std.math.mul(usize, batch, kv_seq_len) catch return error.InvalidAttentionShape, H_kv) catch return error.InvalidAttentionShape;
+    if (Q.len != q_expected or K.len != kv_expected or V.len != kv_expected) return error.InvalidAttentionShape;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const query_end = std.math.add(usize, query_position_offset, q_seq_len) catch return error.InvalidAttentionShape;
+    const kv_total_end = std.math.add(usize, kv_position_offset, kv_seq_len) catch return error.InvalidAttentionShape;
+    const mask_seq_len = @max(query_end, kv_total_end);
+
+    const output_elems = std.math.mul(usize, batch, q_seq_len) catch return error.InvalidAttentionShape;
+    const output = try allocator.alloc(f32, std.math.mul(usize, output_elems, H_q) catch return error.InvalidAttentionShape);
+    errdefer allocator.free(output);
+    @memset(output, 0.0);
+
+    const bq = @min(BLOCK_Q, q_seq_len);
+    const bkv = @min(BLOCK_KV, kv_seq_len);
+    const scratch = try FlashScratch.init(allocator, std.math.mul(usize, bq, bkv) catch return error.InvalidAttentionShape, bq);
+    defer allocator.free(scratch.storage);
+    const score_tile = scratch.scores;
+    const row_max = scratch.row_max;
+    const row_sum = scratch.row_sum;
+
+    // Q/K/V are token-major here (each token packs all heads contiguously),
+    // so the per-head rows are strided by H_q/H_kv.  The register-tiled SGEMM
+    // expects contiguous matrices, so we pack each head's current Q-/K-/V-
+    // block into scratch buffers, run the GEMM, then scatter the packed
+    // output rows back to the strided `output` at the end of each Q-block.
+    // Packing cost: cur_bq + 2*cur_bkv head_dim-sized memcpys per K-block,
+    // which is < 2% of the GEMM work it enables.
+    const q_pack = try allocator.alloc(f32, bq * head_dim);
+    defer allocator.free(q_pack);
+    const k_pack = try allocator.alloc(f32, bkv * head_dim);
+    defer allocator.free(k_pack);
+    const v_pack = try allocator.alloc(f32, bkv * head_dim);
+    defer allocator.free(v_pack);
+    const out_pack = try allocator.alloc(f32, bq * head_dim);
+    defer allocator.free(out_pack);
+
+    for (0..batch) |b| {
+        for (0..num_heads) |h| {
+            const kv_h = h / heads_per_group;
+            var q_start: usize = 0;
+            while (q_start < q_seq_len) {
+                const q_end = @min(q_start + BLOCK_Q, q_seq_len);
+                const cur_bq = q_end - q_start;
+
+                for (0..cur_bq) |r| {
+                    row_max[r] = -std.math.inf(f32);
+                    row_sum[r] = 0.0;
+                }
+
+                // Pack Q for this head's Q-block into a contiguous tile.
+                // Q is token-major so each Q row is at stride H_q in memory.
+                for (0..cur_bq) |qi_local| {
+                    const qi = q_start + qi_local;
+                    const src = Q[(b * q_seq_len + qi) * H_q + h * head_dim ..][0..head_dim];
+                    @memcpy(q_pack[qi_local * head_dim ..][0..head_dim], src);
+                }
+                // Packed output accumulator for this Q-block; scattered back
+                // to `output` at the end.
+                @memset(out_pack[0 .. cur_bq * head_dim], 0.0);
+
+                var kv_start: usize = 0;
+                while (kv_start < kv_seq_len) {
+                    const kv_end = @min(kv_start + BLOCK_KV, kv_seq_len);
+                    const cur_bkv = kv_end - kv_start;
+
+                    // Pack K and V for this K-block (one head's slab) into
+                    // contiguous tiles so the GEMM kernel's register tiling
+                    // can reuse each K/V row across all Q rows in the block.
+                    for (0..cur_bkv) |ki_local| {
+                        const ki = kv_start + ki_local;
+                        const k_src = K[(b * kv_seq_len + ki) * H_kv + kv_h * head_dim ..][0..head_dim];
+                        const v_src = V[(b * kv_seq_len + ki) * H_kv + kv_h * head_dim ..][0..head_dim];
+                        @memcpy(k_pack[ki_local * head_dim ..][0..head_dim], k_src);
+                        @memcpy(v_pack[ki_local * head_dim ..][0..head_dim], v_src);
+                    }
+
+                    // QK^T as a single register-tiled GEMM with prescaled Q
+                    // (alpha=scale folds the per-cell `* scale` into the
+                    // matmul, dropping cur_bq*cur_bkv scalar muls).
+                    gemm.sgemmTransBSequential(cur_bq, cur_bkv, head_dim, scale, q_pack[0 .. cur_bq * head_dim], k_pack[0 .. cur_bkv * head_dim], 0.0, score_tile[0 .. cur_bq * cur_bkv]);
+
+                    if (bias) |bias_data| {
+                        for (0..cur_bq) |qi_local| {
+                            const qi = q_start + qi_local;
+                            const query_pos = query_position_offset + qi;
+                            for (0..cur_bkv) |ki_local| {
+                                const ki = kv_start + ki_local;
+                                const key_pos = kv_position_offset + ki;
+                                if (causalBiasValue(bias_data, b, h, qi, query_pos, ki, key_pos, batch, q_seq_len, kv_seq_len, mask_seq_len, num_heads)) |bias_value| {
+                                    score_tile[qi_local * cur_bkv + ki_local] += bias_value;
+                                }
+                            }
+                        }
+                    }
+
+                    for (0..cur_bq) |qi_local| {
+                        const query_pos = query_position_offset + q_start + qi_local;
+                        for (0..cur_bkv) |ki_local| {
+                            const key_pos = kv_position_offset + kv_start + ki_local;
+                            if ((key_pos > query_pos and !allowsFutureAttention(attn_or_mask, mask_seq_len, query_pos, key_pos)) or
+                                !allowsPastAttention(sliding_window, query_pos, key_pos))
+                            {
+                                score_tile[qi_local * cur_bkv + ki_local] = -std.math.inf(f32);
+                            }
+                        }
+                    }
+
+                    // Streaming softmax: per Q-row, find block max, rescale
+                    // out_pack, then turn score_row into exp(score - new_max).
+                    // V projection is deferred to a single batched GEMM after
+                    // the loop (see below).
+                    for (0..cur_bq) |qi_local| {
+                        const out_row = out_pack[qi_local * head_dim ..][0..head_dim];
+
+                        updateOnlineRow(.flash, score_tile[qi_local * cur_bkv ..][0..cur_bkv], out_row, &row_max[qi_local], &row_sum[qi_local]);
+                    }
+
+                    // Batched V projection: out_pack[bq, hd] += score_tile[bq, bkv] @ V_pack[bkv, hd].
+                    gemm.sgemmSequential(cur_bq, head_dim, cur_bkv, 1.0, score_tile[0 .. cur_bq * cur_bkv], v_pack[0 .. cur_bkv * head_dim], 1.0, out_pack[0 .. cur_bq * head_dim]);
+
+                    kv_start = kv_end;
+                }
+
+                // Scatter packed output back to the strided `output`,
+                // applying the final 1/row_sum normalization in the same
+                // pass to avoid an extra memory sweep.
+                for (0..cur_bq) |qi_local| {
+                    const qi = q_start + qi_local;
+                    const dst = output[(b * q_seq_len + qi) * H_q + h * head_dim ..][0..head_dim];
+                    const src = out_pack[qi_local * head_dim ..][0..head_dim];
+                    if (row_sum[qi_local] != 0.0) {
+                        const inv_sum = 1.0 / row_sum[qi_local];
+                        const inv_splat: F32xN = @splat(inv_sum);
+                        var d: usize = 0;
+                        while (d + vec_len <= head_dim) : (d += vec_len) {
+                            const sv: F32xN = src[d..][0..vec_len].*;
+                            dst[d..][0..vec_len].* = sv * inv_splat;
+                        }
+                        while (d < head_dim) : (d += 1) {
+                            dst[d] = src[d] * inv_sum;
+                        }
+                    } else {
+                        @memcpy(dst, src);
+                    }
+                }
+
+                q_start = q_end;
+            }
+        }
+    }
+
+    return output;
+}
+
+fn declaredCausalIntoCase(a: std.mem.Allocator) !void {
+    for ([_]usize{ 1, 2, 3, 65, 257 }) |rows| {
+        const width = 4;
+        const q = try a.alloc(f32, rows * width);
+        defer a.free(q);
+        const k = try a.alloc(f32, rows * width);
+        defer a.free(k);
+        const v = try a.alloc(f32, rows * width);
+        defer a.free(v);
+        for (q, k, v, 0..) |*qq, *kk, *vv, i| {
+            qq.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) / 16;
+            kk.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) / 8;
+            vv.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) / 4;
+        }
+        const expected = try originalFlashCausalForDeclaredTest(a, q, k, v, null, null, 0, 1, rows, rows, 0, 0, 2, 2, 2);
+        defer a.free(expected);
+        const plan = try FlashCausalWorkspace.init(rows, rows, 2);
+        const scratch = try a.alignedAlloc(f32, .@"64", plan.floats);
+        defer a.free(scratch);
+        const result = try a.alloc(f32, q.len);
+        defer a.free(result);
+        try flashCausalAttentionHostInto(q, k, v, null, null, 0, 1, rows, rows, 0, 0, 2, 2, 2, result, scratch);
+        try std.testing.expectEqualSlices(f32, expected, result);
+        // Independent scalar F64 causal dot/softmax/value oracle, including
+        // both original query and key tile boundaries with nonzero data.
+        for (0..rows) |row| for (0..2) |head| {
+            var maximum: f64 = -std.math.inf(f64);
+            for (0..row + 1) |key| {
+                var dot: f64 = 0;
+                for (0..2) |d| dot += @as(f64, q[row * width + head * 2 + d]) * k[key * width + head * 2 + d];
+                maximum = @max(maximum, dot / @sqrt(@as(f64, 2)));
+            }
+            var denominator: f64 = 0;
+            var sums = [_]f64{ 0, 0 };
+            for (0..row + 1) |key| {
+                var dot: f64 = 0;
+                for (0..2) |d| dot += @as(f64, q[row * width + head * 2 + d]) * k[key * width + head * 2 + d];
+                const weight = @exp(dot / @sqrt(@as(f64, 2)) - maximum);
+                denominator += weight;
+                for (0..2) |d| sums[d] += weight * v[key * width + head * 2 + d];
+            }
+            for (0..2) |d| try std.testing.expectApproxEqAbs(@as(f32, @floatCast(sums[d] / denominator)), result[row * width + head * 2 + d], 0.00001);
+        };
+        @memset(result, 77);
+        try std.testing.expectError(error.InvalidAttentionShape, flashCausalAttentionHostInto(q, k, v, null, null, 0, 1, rows, rows, 0, 0, 2, 2, 2, result, scratch[0 .. scratch.len - 1]));
+        for (result) |value| try std.testing.expectEqual(@as(f32, 77), value);
+        try std.testing.expectError(error.InvalidAttentionAlias, flashCausalAttentionHostInto(q, k, v, null, null, 0, 1, rows, rows, 0, 0, 2, 2, 2, q, scratch));
+    }
+}
+test "declared causal Into preserves frozen tiled arithmetic scalar oracle and short workspace refusal at both tile boundaries" {
+    try declaredCausalIntoCase(std.testing.allocator);
+}
+test "declared causal allocation and original oracle unwind every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, declaredCausalIntoCase, .{});
+}
+
+test "ordinary causal attention retains frozen empty query and empty key compatibility without widening assigned descriptors" {
+    const a = std.testing.allocator;
+    const values = [_]f32{ 1, -2, 3, -4 };
+    for ([_][2]usize{ .{ 0, 2 }, .{ 2, 0 }, .{ 0, 0 } }) |shape| {
+        const q = values[0 .. shape[0] * 2];
+        const kv = values[0 .. shape[1] * 2];
+        const original = try originalFlashCausalForDeclaredTest(a, q, kv, kv, null, null, 0, 1, shape[0], shape[1], 0, 0, 1, 1, 2);
+        defer a.free(original);
+        const ordinary = try flashCausalAttentionHost(a, q, kv, kv, null, null, 0, 1, shape[0], shape[1], 0, 0, 1, 1, 2);
+        defer a.free(ordinary);
+        try std.testing.expectEqualSlices(f32, original, ordinary);
+        const plan = try FlashCausalWorkspace.init(shape[0], shape[1], 2);
+        const workspace = try a.alignedAlloc(f32, .@"64", plan.floats);
+        defer a.free(workspace);
+        const assigned = try a.alloc(f32, q.len);
+        defer a.free(assigned);
+        try flashCausalAttentionHostInto(q, kv, kv, null, null, 0, 1, shape[0], shape[1], 0, 0, 1, 1, 2, assigned, workspace);
+        try std.testing.expectEqualSlices(f32, original, assigned);
+    }
 }
