@@ -18562,6 +18562,17 @@ pub const IndexManager = struct {
                 applied_sequence,
                 @errorName(err),
             });
+            // Bug-3/open-risk diagnostic: the generic error name alone does
+            // not say which of persistExperimentalPostingSidecarAtApplied
+            // SequenceWithLease's internal calls (openExperimentalPostingStore,
+            // finishExperimentalPostingMutationCapture, publishExperimental
+            // PostingCheckpoint, posting_store.commitPrepared, ...) actually
+            // failed. Dump the Debug-build error-return trace captured at the
+            // point of failure so a real repro's log pinpoints the call site.
+            if (@errorReturnTrace()) |trace| {
+                std.debug.print("dense posting sidecar failure trace index={s} sequence={} err={s}:\n", .{ name, applied_sequence, @errorName(err) });
+                std.debug.dumpErrorReturnTrace(trace);
+            }
             entry.index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
                 std.log.warn("dense posting sidecar invalidation failed index={s} err={s}", .{ name, @errorName(invalidate_err) });
             };
