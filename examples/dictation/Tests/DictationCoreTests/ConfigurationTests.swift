@@ -77,3 +77,24 @@ import Testing
   }
   #expect(events == ["one\ntwo", "[DONE]"])
 }
+
+@Test func cleanupPickerOnlyOffersSupportedNamedGenerators() throws {
+  let catalog = try JSONDecoder().decode(
+    ModelCatalog.self,
+    from: Data(
+      """
+      {"data":[{"id":"generators/cleanup","task":"generate"},
+      {"id":"connections/vendor/models/model","task":"generate"},
+      {"id":"chains/cleanup","task":"generate"},{"id":"local/model","task":"generate"}]}
+      """.utf8))
+  var preset = Preset(id: "test", name: "Test")
+  #expect(preset.cleanupChoices(from: catalog.data).map(\.id) == ["generators/cleanup"])
+  preset.model = "local/openai/whisper-small"
+  #expect(preset.cleanupChoices(from: catalog.data).isEmpty)
+  var config = Configuration()
+  config.presets[0].cleanupModel = "connections/vendor/models/model"
+  #expect(throws: DictationError.self) { try config.validated() }
+  config.presets[0].model = "openai/whisper-small"
+  config.presets[0].cleanupModel = "generators/cleanup"
+  #expect(throws: DictationError.self) { try config.validated() }
+}

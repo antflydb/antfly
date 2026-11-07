@@ -626,7 +626,9 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             return forward(server, ctx, if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id, execution_options.operation orelse "generate", body, fallback, observation, execution_options);
         }
     }
-    if (execution_options.attachments) |attachments| request = try inlineTaskAttachments(a, task, request, attachments);
+    if (task != .transcribe) {
+        if (execution_options.attachments) |attachments| request = try inlineTaskAttachments(a, task, request, attachments);
+    }
     const caller_owns_admission = if (generator_override) |cfg| !(cfg.provider == .antfly and cfg.url.len == 0 and server.antfly_provider != null and server.antfly_provider.?.owns_invocation_admission) else !try ownsLocalAdmission(server, named, target.configured.task, target.configured.name);
     if (caller_owns_admission and !server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
     defer if (caller_owns_admission) server.releaseInference();
@@ -874,6 +876,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             const cleanup_name = configuredCleanupName(request) orelse "";
             const run_cleanup = cleanup_name.len > 0 and cleanup.needsCleanup(options);
             if (run_cleanup) _ = try executor.generatorConfig(a, cleanup_name);
+            const attachment = try dictationAttachment(value.audio, execution_options.attachments);
             const transcript = if (transcription_cfg.provider == .antfly) blk: {
                 const recognized = try nativeDictationTranscript(server, ctx, a, request, named, name, observation, execution_options);
                 switch (recognized) {
@@ -889,16 +892,18 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                     },
                 }
             } else blk: {
-                var result = try executor.transcribe(a, name, .{
-                    .url = try std.fmt.allocPrint(a, "data:audio/wav;base64,{s}", .{value.audio}),
+                var result = try executor.transcribeWithAudio(a, name, .{
+                    .url = if (attachment != null) value.audio else try std.fmt.allocPrint(a, "data:audio/wav;base64,{s}", .{value.audio}),
                     .language = value.language,
                     .timestamps = value.timestamps,
-                });
+                }, if (attachment) |item| item.data else null);
                 defer @import("antfly_transcribing").deinitResponse(a, &result);
                 const encoded = try std.json.Stringify.valueAlloc(a, .{ .text = result.text orelse "", .language = result.language, .duration_ms = result.duration_ms, .segments = result.segments }, .{ .emit_null_optional_fields = false });
                 break :blk try std.json.parseFromSliceLeaky(Json, a, encoded, .{ .allocate = .alloc_always });
             };
-            const raw = try string(transcript.object.get("text") orelse return error.InvalidInferenceResponse);
+            const transcript_text = transcript.object.get("text") orelse return error.InvalidInferenceResponse;
+            if (transcript_text != .string) return error.InvalidInferenceResponse;
+            const raw = transcript_text.string;
             const id = try std.fmt.allocPrint(a, "dictation-{d}", .{@import("antfly_platform").time.monotonicNs()});
             var writer: ?httpx.StreamWriter = null;
             if (value.stream orelse false) {
@@ -915,7 +920,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                     .{ .role = .system, .content = .{ .text = try cleanup.buildSystemPrompt(a, options) } },
                     .{ .role = .user, .content = .{ .text = try cleanup.buildUserPrompt(a, raw) } },
                 };
-                var generated = executor.generate(a, cleanup_name, &messages, .{ .max_tokens = value.max_tokens orelse cleanup.suggestedMaxTokens(raw.len) }) catch |err| {
+                var generated = generateDictationCleanup(a, executor, cleanup_name, &messages, value.max_tokens orelse cleanup.suggestedMaxTokens(raw.len)) catch |err| {
                     if (writer) |*stream| {
                         try dictationEvent(a, stream, .{ .type = "error", .id = id, .@"error" = @errorName(err), .message = "Dictation cleanup failed; raw transcript is available." });
                         try stream.writeEvent(null, "[DONE]");
@@ -924,7 +929,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                     return err;
                 };
                 defer generated.deinit();
-                text = try cleanup.normalizeOutput(a, generated.content);
+                text = try a.dupe(u8, generated.content);
                 usage = generated.usage;
             }
             try executor.context.check();
@@ -2302,8 +2307,9 @@ fn nativeDictationTranscript(server: anytype, ctx: *httpx.Context, a: std.mem.Al
     var buffered = options;
     buffered.response_delivery = .buffered;
     buffered.admission_held = true;
-    // Attachments were inlined before reaching provider execution.
-    buffered.attachments = null;
+    // Keep recognition audio borrowed in its original binary envelope.
+    // The forwarding transport accounts for media separately from metadata.
+    buffered.attachments = options.attachments;
     var response = try forward(server, &nested, try std.fmt.allocPrint(a, "transcribers/{s}", .{name}), "dictate", encoded, false, observation, buffered);
     if (response.status.code < 200 or response.status.code >= 300) return .{ .failure = response };
     defer response.deinit();
@@ -2312,4 +2318,24 @@ fn nativeDictationTranscript(server: anytype, ctx: *httpx.Context, a: std.mem.Al
     const transcript = value.object.get("transcript") orelse return error.InvalidInferenceResponse;
     if (transcript != .object) return error.InvalidInferenceResponse;
     return .{ .transcript = transcript };
+}
+
+fn dictationAttachment(audio: []const u8, attachments: ?[]const httpx.attachment_envelope.Attachment) !?httpx.attachment_envelope.Attachment {
+    const index = try payloads.attachmentIndex(audio);
+    if (attachments) |items| {
+        if (items.len != 1 or index == null or index.? != 0) return error.InvalidInferenceRequest;
+        if (!std.mem.startsWith(u8, items[0].mime_type, "audio/")) return error.InvalidInferenceMedia;
+        return items[0];
+    }
+    if (index != null) return error.InvalidInferenceRequest;
+    return null;
+}
+
+fn generateDictationCleanup(a: std.mem.Allocator, executor: tasks.Executor, name: []const u8, messages: []const generating.ChatMessage, max_tokens: i64) !generating.GenerateResult {
+    var result = try executor.generate(a, name, messages, .{ .max_tokens = max_tokens, .require_completion = true });
+    errdefer result.deinit();
+    const normalized = try generating.dictation.normalizeCleanupOutput(result.allocator, result);
+    result.allocator.free(result.content);
+    result.content = normalized;
+    return result;
 }

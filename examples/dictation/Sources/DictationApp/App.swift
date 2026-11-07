@@ -159,17 +159,21 @@ struct SettingsView: View {
             Menu("Choose discovered transcriber") {
               ForEach(store.models.filter { $0.task == "transcribe" }) { model in
                 Button("\(model.id) · \(model.executor ?? "runtime")") {
-                  preset.model = model.id
-                  if model.dictation?.live_preview == false { preset.livePreview = false }
+                  preset.selectTranscriber(model)
                 }
               }
             }.disabled(store.models.isEmpty)
             TextField("Cleanup generator alias (empty = raw)", text: $preset.cleanupModel)
             Menu("Choose discovered cleanup generator") {
               Button("No cleanup") { preset.cleanupModel = "" }
-              ForEach(store.models.filter { $0.task == "generate" }) { model in
+              ForEach(preset.cleanupChoices(from: store.models)) { model in
                 Button(model.id) { preset.cleanupModel = model.id }
               }
+            }
+            if !preset.usesNamedTranscriber {
+              Text(
+                "Runtime transcribers use a raw cleanup model name. Choose a named transcriber to select shared cleanup above."
+              ).font(.caption).foregroundStyle(.secondary)
             }
             TextField("Language (empty = model default)", text: $preset.language)
             Picker("Style", selection: $preset.style) {
@@ -223,6 +227,8 @@ struct SettingsView: View {
   }
   var history: some View {
     VStack(alignment: .leading) {
+      Text(store.historySyncStatus).font(.caption).foregroundStyle(.secondary).textSelection(
+        .enabled)
       HStack {
         TextField("Search Antfly history", text: $store.searchText)
         Button("Search") { store.search() }

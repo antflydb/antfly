@@ -299,9 +299,10 @@ pub fn generateApple(alloc: std.mem.Allocator, cfg: GeneratorConfig, messages: [
         .messages = normalized,
         .max_tokens = cfg.max_tokens,
         .temperature = cfg.temperature,
+        .require_completion = control.require_completion,
     }, .{});
     defer alloc.free(request);
-    return .{ .content = try apple_native.invoke(alloc, .generate, request, &.{}, limit, control), .allocator = alloc };
+    return .{ .content = try apple_native.invoke(alloc, .generate, request, &.{}, limit, control), .allocator = alloc, .finish_reason = if (control.require_completion) .stop else null };
 }
 
 test "Apple generation configuration is local and rejects unsupported options" {

@@ -28,13 +28,28 @@ public struct Preset: Codable, Identifiable, Equatable, Sendable {
     self.name = name
     self.style = style
     self.context = context
-    model = "openai/whisper-small"
+    model = "transcribers/whisper"
     cleanupModel = ""
     language = ""
     instructions = ""
     dictionary = []
     appIDs = []
     livePreview = false
+  }
+}
+
+extension Preset {
+  /// Shared cleanup is a gateway feature of named transcribers. Runtime model
+  /// requests retain their existing raw-model cleanup contract.
+  public var usesNamedTranscriber: Bool { model.hasPrefix("transcribers/") || !model.contains("/") }
+  public func cleanupChoices(from catalog: [DiscoveredModel]) -> [DiscoveredModel] {
+    usesNamedTranscriber
+      ? catalog.filter { $0.task == "generate" && $0.id.hasPrefix("generators/") } : []
+  }
+  public mutating func selectTranscriber(_ selection: DiscoveredModel) {
+    model = selection.id
+    if selection.dictation?.live_preview == false { livePreview = false }
+    if !usesNamedTranscriber && cleanupModel.hasPrefix("generators/") { cleanupModel = "" }
   }
 }
 
@@ -90,6 +105,18 @@ public struct Configuration: Codable, Equatable, Sendable {
         ["clean", "formal", "casual", "verbatim"].contains(preset.style),
         preset.context.utf8.count <= 4096, preset.instructions.utf8.count <= 4096
       else { throw DictationError.invalid("Invalid preset model, style, or instructions.") }
+      if preset.cleanupModel.hasPrefix("connections/") || preset.cleanupModel.hasPrefix("chains/")
+        || preset.cleanupModel.hasPrefix("local/")
+      {
+        throw DictationError.invalid(
+          "Cleanup must use a configured generator name, or a raw generator model for a runtime transcriber."
+        )
+      }
+      if !preset.usesNamedTranscriber && preset.cleanupModel.hasPrefix("generators/") {
+        throw DictationError.invalid(
+          "Choose a named transcriber to use shared named cleanup, or enter a raw cleanup model for the runtime transcriber."
+        )
+      }
       let terms = dictionary + preset.dictionary
       guard terms.count <= 256,
         terms.allSatisfy({

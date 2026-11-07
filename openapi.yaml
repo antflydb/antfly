@@ -15897,6 +15897,21 @@ paths:
         is delivered before cleanup starts. Missing token usage remains absent.
 
 
+        Empty recognition is a successful empty result and does not run cleanup.
+
+        Cleanup must confirm a complete text response: token-limited, filtered,
+
+        tool-only, empty, and unconfirmed outputs fail rather than replacing the
+
+        transcript. In streaming mode the error follows `dictation.transcript`
+
+        and no `dictation.completed` event is emitted. Strict Apple cleanup runs
+
+        to natural completion within context, deadline, and bounded output bytes;
+
+        macOS 27+ also verifies measured output tokens against the token budget.
+
+
         Set `cleanup_model` to the generator that rewrites the transcript.
 
         Without it, or with `style: verbatim`, the response carries the raw
@@ -15939,6 +15954,12 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/InferenceDictateRequest'
+          application/vnd.antfly.attachments.v1:
+            schema:
+              type: string
+              format: binary
+              description: AFATT001 envelope with DictateRequest metadata, audio set to attachment:0,
+                and exactly one audio attachment.
       responses:
         '200':
           description: >

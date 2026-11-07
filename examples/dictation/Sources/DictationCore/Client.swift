@@ -49,14 +49,16 @@ public actor AntflyClient {
     progress: @Sendable @escaping (String) async -> Void
   ) async throws -> DictationResult {
     var body: [String: Any] = [
-      "model": preset.model, "audio": audio.base64EncodedString(), "style": preset.style,
+      "model": preset.model, "audio": "attachment:0", "style": preset.style,
       "dictionary": dictionary + preset.dictionary, "context": preset.context,
       "instructions": preset.instructions, "stream": true,
     ]
     if !preset.language.isEmpty { body["language"] = preset.language }
     if !preset.cleanupModel.isEmpty { body["cleanup_model"] = preset.cleanupModel }
-    let (bytes, response) = try await session.bytes(
-      for: request("ai/v1/dictate", body: encode(body)))
+    var upload = request(
+      "ai/v1/dictate", body: try AttachmentEnvelope.audio(metadata: encode(body), recording: audio))
+    upload.setValue(AttachmentEnvelope.contentType, forHTTPHeaderField: "Content-Type")
+    let (bytes, response) = try await session.bytes(for: upload)
     guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
       throw DictationError.invalid(
         "Dictation request failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)). Check model readiness and connection."

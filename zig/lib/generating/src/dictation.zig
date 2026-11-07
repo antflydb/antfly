@@ -223,3 +223,37 @@ test "dictation output normalization strips fences labels and quotes" {
         try std.testing.expectEqualStrings(case.want, got);
     }
 }
+
+/// Only a naturally completed text answer may replace the user's transcript.
+/// Missing completion evidence is an error, rather than an inferred stop.
+pub fn validateCleanupResult(result: anytype) !void {
+    if (result.finish_reason != .stop or result.tool_calls.len != 0 or std.mem.trim(u8, result.content, " \t\r\n").len == 0)
+        return error.InferenceOutputIncomplete;
+}
+
+test "dictation rejects truncated filtered tool and unconfirmed cleanup" {
+    const Reason = enum { stop, length, content_filter, tool_calls };
+    const Result = struct { finish_reason: ?Reason, tool_calls: []const u8 = &.{}, content: []const u8 = "clean text" };
+    try validateCleanupResult(Result{ .finish_reason = .stop });
+    for ([_]?Reason{ .length, .content_filter, .tool_calls, null }) |reason|
+        try std.testing.expectError(error.InferenceOutputIncomplete, validateCleanupResult(Result{ .finish_reason = reason }));
+    try std.testing.expectError(error.InferenceOutputIncomplete, validateCleanupResult(Result{ .finish_reason = .stop, .tool_calls = "call" }));
+    try std.testing.expectError(error.InferenceOutputIncomplete, validateCleanupResult(Result{ .finish_reason = .stop, .content = "  " }));
+}
+
+pub fn normalizeCleanupOutput(allocator: std.mem.Allocator, result: anytype) ![]u8 {
+    try validateCleanupResult(result);
+    const text = try normalizeOutput(allocator, result.content);
+    errdefer allocator.free(text);
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return error.InferenceOutputIncomplete;
+    return text;
+}
+
+test "dictation rejects normalized empty cleanup rather than deleting speech" {
+    const Reason = enum { stop };
+    const Result = struct { finish_reason: ?Reason = .stop, tool_calls: []const u8 = &.{}, content: []const u8 };
+    try std.testing.expectError(error.InferenceOutputIncomplete, normalizeCleanupOutput(std.testing.allocator, Result{ .content = "\"\"" }));
+    const text = try normalizeCleanupOutput(std.testing.allocator, Result{ .content = "Cleaned text: \"Hello.\"" });
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Hello.", text);
+}

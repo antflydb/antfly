@@ -218,3 +218,13 @@ Antfly instance.
 - [Inference providers](/docs/guides/inference-providers): every provider and component
 - [Index PDFs and Scanned Documents](/docs/guides/index-documents): document extraction and OCR options
 - [Apple native provider design](https://github.com/antflydb/antfly/blob/main/docs/design/apple-intelligence-provider.md): bridge loading, validation, and test commands
+
+
+Dictation cleanup requires Apple bridge ABI 2 so completion checks cannot be
+silently skipped by an older sidecar. Apple’s token limit can return partial text
+without an error ([maximumResponseTokens](https://developer.apple.com/documentation/foundationmodels/generationoptions/maximumresponsetokens)).
+For dictation cleanup, the bridge therefore allows natural completion under the
+request deadline and a streaming byte bound of eight times the token budget.
+macOS 27 additionally checks measured output tokens against the budget. Failed
+or incomplete cleanup never replaces the raw transcript. Other generation calls
+retain their configured token cap.

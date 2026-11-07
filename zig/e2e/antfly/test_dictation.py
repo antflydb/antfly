@@ -16,9 +16,13 @@
 """Provider-backed dictation shares cleanup and preserves runtime decoding hints."""
 
 import base64
+import io
 import json
 import os
+import struct
 import threading
+import time
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -43,7 +47,33 @@ import requests
     ],
 )
 def test_named_dictation_cleanup_and_streaming(tmp_path, provider):
-    state = {"recognition": [], "cleanup": [], "fail_cleanup": False}
+    state = {
+        "recognition": [],
+        "cleanup": [],
+        "fail_cleanup": False,
+        "raw": "um ant fly",
+        "finish": "stop",
+    }
+
+    def frame(metadata, audio, mime="audio/wav"):
+        encoded = json.dumps(metadata).encode()
+        mime = mime.encode()
+        return (
+            b"AFATT001"
+            + struct.pack("<QII", len(encoded), 1, 0)
+            + struct.pack("<IIQ", len(mime), 0, len(audio))
+            + encoded
+            + mime
+            + audio
+        )
+
+    def decode_frame(body):
+        assert body[:8] == b"AFATT001"
+        size, count, reserved = struct.unpack_from("<QII", body, 8)
+        assert count == 1 and reserved == 0
+        mime_size, reserved, audio_size = struct.unpack_from("<IIQ", body, 24)
+        assert reserved == 0 and len(body) == 40 + size + mime_size + audio_size
+        return json.loads(body[40 : 40 + size]), body[40 + size + mime_size :]
 
     class Fixture(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -52,16 +82,23 @@ def test_named_dictation_cleanup_and_streaming(tmp_path, provider):
         def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"]))
             if self.path.endswith("/dictate"):
-                value = json.loads(body)
+                if self.headers.get("Content-Type", "").startswith(
+                    "application/vnd.antfly.attachments.v1"
+                ):
+                    value, recording = decode_frame(body)
+                    value["recording_bytes"] = len(recording)
+                    assert recording.startswith(b"RIFF")
+                else:
+                    value = json.loads(body)
                 state["recognition"].append(value)
                 assert value["stream"] is False
                 assert "cleanup_model" not in value
                 self.reply(
                     {
                         "object": "dictation",
-                        "text": "um ant fly",
+                        "text": state["raw"],
                         "transcript": {
-                            "text": "um ant fly",
+                            "text": state["raw"],
                             "duration_ms": 1000,
                             "segments": [],
                         },
@@ -71,7 +108,7 @@ def test_named_dictation_cleanup_and_streaming(tmp_path, provider):
                 state["recognition"].append({"multipart": len(body)})
                 self.reply(
                     {
-                        "text": "um ant fly",
+                        "text": state["raw"],
                         "duration": 1.0,
                         "language": "en",
                         "segments": [],
@@ -94,7 +131,7 @@ def test_named_dictation_cleanup_and_streaming(tmp_path, provider):
                                         "role": "assistant",
                                         "content": "Antfly.",
                                     },
-                                    "finish_reason": "stop",
+                                    "finish_reason": state["finish"],
                                 }
                             ],
                             "usage": {
@@ -208,6 +245,15 @@ def test_named_dictation_cleanup_and_streaming(tmp_path, provider):
         if provider == "antfly":
             assert state["recognition"][-1]["dictionary"] == ["Antfly"]
 
+        framed_result = requests.post(
+            server.url + "/ai/v1/dictate",
+            data=frame({**request, "audio": "attachment:0"}, audio),
+            headers={"Content-Type": "application/vnd.antfly.attachments.v1"},
+            timeout=40,
+        )
+        assert framed_result.status_code == 200, framed_result.text
+        assert framed_result.json()["transcript"]["text"] == expected_raw
+
         before = len(state["cleanup"])
         response = requests.post(
             server.url + "/ai/v1/dictate",
@@ -234,6 +280,87 @@ def test_named_dictation_cleanup_and_streaming(tmp_path, provider):
         ]
         assert events[-1]["text"] == "Antfly."
         assert "data: [DONE]" in response.text
+
+        if provider != "apple":
+            # Silence is a successful empty result, never a malformed request or cleanup call.
+            before = len(state["cleanup"])
+            state["raw"] = ""
+            empty = requests.post(
+                server.url + "/ai/v1/dictate", json=request, timeout=40
+            )
+            assert empty.status_code == 200, empty.text
+            assert (
+                empty.json()["text"] == "" and empty.json()["transcript"]["text"] == ""
+            )
+            empty = requests.post(
+                server.url + "/ai/v1/dictate",
+                json={**request, "stream": True},
+                timeout=40,
+            )
+            assert (
+                empty.status_code == 200
+                and '"type":"dictation.completed"' in empty.text
+            ), empty.text
+            assert len(state["cleanup"]) == before
+            state["raw"] = expected_raw
+
+            # The app's full ten-minute PCM16 clip travels as binary through the
+            # gateway and native forwarder, without exhausting the metadata arena.
+            wav_data = io.BytesIO()
+            with wave.open(wav_data, "wb") as recording:
+                recording.setnchannels(1)
+                recording.setsampwidth(2)
+                recording.setframerate(16000)
+                recording.writeframes(bytes(16000 * 2 * 600))
+            clip = wav_data.getvalue()
+            metadata = {**request, "audio": "attachment:0"}
+            long_result = requests.post(
+                server.url + "/ai/v1/dictate",
+                data=frame(metadata, clip),
+                headers={"Content-Type": "application/vnd.antfly.attachments.v1"},
+                timeout=60,
+            )
+            assert long_result.status_code == 200, long_result.text
+            assert long_result.json()["text"] == "Antfly."
+            if provider == "antfly":
+                assert state["recognition"][-1]["recording_bytes"] == len(clip)
+
+            before = len(state["recognition"])
+            invalid = requests.post(
+                server.url + "/ai/v1/dictate",
+                data=frame({**metadata, "audio": "attachment:1"}, audio),
+                headers={"Content-Type": "application/vnd.antfly.attachments.v1"},
+                timeout=40,
+            )
+            assert invalid.status_code == 400 and len(state["recognition"]) == before, (
+                invalid.text
+            )
+            invalid = requests.post(
+                server.url + "/ai/v1/dictate", json=metadata, timeout=40
+            )
+            assert invalid.status_code == 400 and len(state["recognition"]) == before, (
+                invalid.text
+            )
+
+        for reason in ["length", "content_filter", "tool_calls", None]:
+            state["finish"] = reason
+            rejected = requests.post(
+                server.url + "/ai/v1/dictate",
+                json={**request, "stream": True},
+                timeout=40,
+            )
+            assert rejected.status_code == 200 and '"type":"error"' in rejected.text, (
+                rejected.text
+            )
+            assert (
+                "dictation.transcript" in rejected.text
+                and "dictation.completed" not in rejected.text
+            )
+        rejected = requests.post(
+            server.url + "/ai/v1/dictate", json=request, timeout=40
+        )
+        assert rejected.status_code >= 400, rejected.text
+        state["finish"] = "stop"
 
         # The example's persistence contracts are real database APIs, not UI mocks.
         table = server.url + "/db/v1/tables/dictation"
@@ -287,20 +414,54 @@ def test_named_dictation_cleanup_and_streaming(tmp_path, provider):
             provider == "apple"
             and described["dictation"]["native_status"]["generation_status"] == 0
         ):
+            started = time.monotonic()
             response = requests.post(
                 server.url + "/ai/v1/dictate",
                 json={
                     **request,
                     "cleanup_model": "generators/native-cleanup",
                     "style": "clean",
+                    "stream": True,
+                },
+                timeout=40,
+                stream=True,
+            )
+            assert response.status_code == 200
+            stages = {}
+            completed = None
+            for line in response.iter_lines(chunk_size=1):
+                if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
+                    continue
+                event = json.loads(line[5:])
+                stages[event["type"]] = round(time.monotonic() - started, 3)
+                assert event["type"] != "error", event
+                if event["type"] == "dictation.completed":
+                    completed = event
+            assert completed is not None
+            assert (
+                "fox" in completed["text"].lower()
+                and "dog" in completed["text"].lower()
+            )
+            print(f"Apple dictation stage seconds: {json.dumps(stages)}", flush=True)
+
+        if (
+            provider == "apple"
+            and described["dictation"]["native_status"]["generation_status"] == 0
+        ):
+            limited = requests.post(
+                server.url + "/ai/v1/dictate",
+                json={
+                    **request,
+                    "cleanup_model": "generators/native-cleanup",
+                    "max_tokens": 1,
+                    "stream": True,
                 },
                 timeout=40,
             )
-            assert response.status_code == 200, response.text
             assert (
-                "fox" in response.json()["text"].lower()
-                and "dog" in response.json()["text"].lower()
-            )
+                '"type":"error"' in limited.text
+                and "dictation.completed" not in limited.text
+            ), limited.text
 
         state["fail_cleanup"] = True
         response = requests.post(

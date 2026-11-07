@@ -5435,6 +5435,14 @@ export interface paths {
          *     cleanup, a delta may contain the entire cleaned result; the raw transcript
          *     is delivered before cleanup starts. Missing token usage remains absent.
          *
+         *     Empty recognition is a successful empty result and does not run cleanup.
+         *     Cleanup must confirm a complete text response: token-limited, filtered,
+         *     tool-only, empty, and unconfirmed outputs fail rather than replacing the
+         *     transcript. In streaming mode the error follows `dictation.transcript`
+         *     and no `dictation.completed` event is emitted. Strict Apple cleanup runs
+         *     to natural completion within context, deadline, and bounded output bytes;
+         *     macOS 27+ also verifies measured output tokens against the token budget.
+         *
          *     Set `cleanup_model` to the generator that rewrites the transcript.
          *     Without it, or with `style: verbatim`, the response carries the raw
          *     transcript and no generation runs.
@@ -44109,6 +44117,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["InferenceDictateRequest"];
+                "application/vnd.antfly.attachments.v1": string;
             };
         };
         responses: {

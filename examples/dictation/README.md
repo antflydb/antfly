@@ -71,7 +71,9 @@ Start your Antfly runtime/server using your normal configuration. Configure a
 named transcriber (`transcribers/whisper`) and a named generator (`cleanup`) to
 use the same cleanup path as Apple. A raw local Whisper model also works; its
 cleanup field then uses a raw local generator model, as in the runtime's existing
-`/dictate` contract. Named Whisper transcribers accept named cleanup generators,
+`/dictate` contract. The cleanup picker offers only named generators for named transcribers; changing
+to a raw runtime transcriber clears the named cleanup selection. Named Whisper
+transcribers accept named cleanup generators,
 including Apple or hosted generators. The gateway preserves Whisper dictionary
 hints and decoding options on the recognition stage.
 
@@ -93,8 +95,9 @@ previously registered shortcut. Only one app instance should register a shortcut
 Recording stops after ten minutes and audio is bounded to 120 MiB. Live preview
 has a separate bounded queue. AVAudioConverter turns microphone audio into 16 kHz mono speech audio; final
 clips are PCM16 WAV (about 19 MiB for ten minutes), while preview uses float PCM.
-A server can impose a smaller request limit; shorten the recording if that limit
-is reached.
+Final clips use the binary AFATT001 attachment envelope, keeping audio out of
+JSON and avoiding base64 expansion and metadata allocation limits. A server can
+impose a smaller audio limit; shorten the recording if that limit is reached.
 
 Apple is a recorded-file backend. Enable live preview only for Whisper models
 with transcription sessions. Preview chunks are appended sequentially and sessions
@@ -102,7 +105,13 @@ are deleted on stop/cancel; idle expiry bounds sessions whose creation response
 was interrupted. The final full clip is submitted to `/dictate` for authoritative
 transcription and cleanup, so preview deliberately adds recognition work. Provider
 cleanup may deliver one entire-text delta, while the raw transcript arrives first.
-There is no silent engine or cloud fallback.
+Only naturally completed, nonempty cleanup output can replace the transcript.
+Truncation, filtering, tool calls, missing completion evidence, or empty cleanup
+produce an error while preserving the raw transcript for recovery. Empty speech
+recognition succeeds without invoking cleanup. Apple cleanup requires bridge ABI
+2 and runs to natural completion under the request deadline and a byte bound of
+eight times the configured token budget; macOS 27 also verifies measured output
+tokens against that budget. There is no silent engine or cloud fallback.
 
 ## Insertion and recovery
 
@@ -143,13 +152,18 @@ the chosen remote snapshot. Use separate profile names for independent devices.
 History and audio retention are off by default:
 
 - With history enabled, up to 500 transcripts are cached locally and each result
-  is written to Antfly with raw/final text, model, preset, application, time, and
-  insertion status. Upload local history retries failed remote writes by stable
-  document ID; it does not create duplicates.
+  is queued for Antfly with raw/final text, model, preset, application, time, and
+  insertion status. Network uploads run independently of recording and retry with
+  backoff across app restarts. The durable outbox holds at most 500 jobs / 64 MiB,
+  preserving each original server and table without storing credentials. History
+  sync status is separate from dictation status. Upload local history can also
+  retry writes by stable document ID without creating duplicates.
 - The table's full-text index searches final transcript text. Search results are
   shown as the server's JSON response, including document IDs and sources.
 - Clear local history removes the local cache. Delete local history and matching
-  Antfly documents removes the cached entries' remote IDs too. Older remote
+  Antfly documents pauses uploads, removes matching pending jobs, and deletes the
+  cached entries' remote IDs before resuming. Turning history retention off removes
+  pending uploads and the local archive. Older remote
   records beyond the local 500-entry window need normal Antfly table management.
 - Audio retention keeps only `last-recording.wav` locally, never in Antfly. Saving
   settings with retention disabled deletes retained local data; remote transcripts

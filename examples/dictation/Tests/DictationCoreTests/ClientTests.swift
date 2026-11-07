@@ -50,6 +50,7 @@ final class FixtureProtocol: URLProtocol, @unchecked Sendable {
   @Test func dictationConsumesTranscriptAndCompletedEvents() async throws {
     FixtureProtocol.reply = { request in
       #expect(request.url?.path == "/ai/v1/dictate")
+      #expect(request.value(forHTTPHeaderField: "Content-Type") == AttachmentEnvelope.contentType)
       return (
         200, "text/event-stream",
         "data: {\"type\":\"dictation.transcript\",\"transcript\":{\"text\":\"um hello\"}}\n\ndata: {\"type\":\"dictation.delta\",\"delta\":\"Hello.\"}\n\ndata: {\"type\":\"dictation.completed\",\"text\":\"Hello.\"}\n\ndata: [DONE]\n\n"
@@ -91,4 +92,33 @@ final class FixtureProtocol: URLProtocol, @unchecked Sendable {
     #expect(text == "hello")
     await client.closeSession(id)
   }
+}
+
+@Test func binaryAudioEnvelopeHasExactLittleEndianLayout() throws {
+  let metadata = Data("{\"audio\":\"attachment:0\"}".utf8)
+  let audio = Data([0, 1, 2, 255])
+  let frame = try AttachmentEnvelope.audio(metadata: metadata, recording: audio)
+  #expect(String(decoding: frame.prefix(8), as: UTF8.self) == "AFATT001")
+  #expect(
+    frame.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian }
+      == metadata.count)
+  #expect(
+    frame.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 16, as: UInt32.self).littleEndian }
+      == 1)
+  #expect(
+    frame.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 24, as: UInt32.self).littleEndian }
+      == 9)
+  #expect(
+    frame.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 32, as: UInt64.self).littleEndian }
+      == 4)
+  #expect(frame.subdata(in: 40..<(40 + metadata.count)) == metadata)
+  #expect(frame.suffix(4) == audio)
+}
+
+@Test func tenMinuteClipRemainsBinaryWithSmallMetadata() throws {
+  let audio = Data(repeating: 0, count: 16000 * 2 * 600 + 44)
+  let metadata = Data("{\"model\":\"transcribers/whisper\",\"audio\":\"attachment:0\"}".utf8)
+  let frame = try AttachmentEnvelope.audio(metadata: metadata, recording: audio)
+  #expect(frame.count == audio.count + metadata.count + 49)
+  #expect(frame.count - audio.count < 1024)
 }

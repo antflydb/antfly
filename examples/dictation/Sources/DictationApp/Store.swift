@@ -19,46 +19,72 @@ import SwiftUI
   @Published var searchResult = ""
   @Published var token = ""
   @Published var working = false
-  private let hotkey = Hotkey()
+  @Published var historySyncStatus = "History sync idle."
+  @Published var historyWorking = false
+  private let hotkey: Hotkey?
+  private(set) var outbox: HistoryOutbox?
+  private var historyRevision: UInt64 = 0
   private var microphone: Microphone?
   private var target: InsertionTarget?
   private var selected: Preset?
   private var recordingConfig: Configuration?
-  private var requestTask: Task<Void, Never>?
+  private(set) var requestTask: Task<Void, Never>?
   private var previewTask: Task<Void, Never>?
   private var timeoutTask: Task<Void, Never>?
   private var generation = UUID()
   private var registered: (UInt32, UInt32)?
   private var retryAudio: Data?
   private var retryPreset: Preset?
+  private let clientFactory: (@Sendable (Configuration) throws -> AntflyClient)?
   private let directory: URL
   private var settingsFile: URL { directory.appendingPathComponent("settings.json") }
   private var historyFile: URL { directory.appendingPathComponent("history.json") }
-  init() {
-    directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+  init(
+    directory storageDirectory: URL? = nil, registerHotkey: Bool = true,
+    historyUpload: HistoryOutbox.Upload? = nil,
+    clientFactory: (@Sendable (Configuration) throws -> AntflyClient)? = nil
+  ) {
+    self.clientFactory = clientFactory
+    self.directory =
+      storageDirectory
+      ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
       .appendingPathComponent("AntflyDictation")
+    hotkey = registerHotkey ? Hotkey() : nil
     do {
       try FileManager.default.createDirectory(
         at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
       if FileManager.default.fileExists(atPath: settingsFile.path) {
         config = try Configuration.decode(Data(contentsOf: settingsFile))
       }
-      if config.retainHistory, let data = try? Data(contentsOf: historyFile) {
-        history = try JSONDecoder().decode([HistoryEntry].self, from: data)
-      }
-      try registerShortcut()
     } catch { message = error.localizedDescription }
-    token = Credentials.read(server: config.server)
-    hotkey.changed = { [weak self] down in self?.shortcut(down: down) }
+    if config.retainHistory, let data = try? Data(contentsOf: historyFile) {
+      do { history = try JSONDecoder().decode([HistoryEntry].self, from: data) } catch {
+        historySyncStatus = "Local history could not be loaded: " + error.localizedDescription
+      }
+    }
+    do { try registerShortcut() } catch { message = error.localizedDescription }
+    do {
+      outbox = try HistoryOutbox(
+        directory: self.directory.appendingPathComponent("outbox"), paused: true,
+        upload: historyUpload ?? { entry, destination in
+          let token = await MainActor.run { Credentials.read(server: destination.server) }
+          try await AntflyClient(server: destination.server, token: token).saveHistory(
+            entry, table: destination.table)
+        }, changed: { [weak self] status in await self?.updateHistoryStatus(status) })
+      if config.retainHistory { Task { await outbox?.resume() } }
+    } catch { historySyncStatus = "History sync unavailable: " + error.localizedDescription }
+    token = registerHotkey ? Credentials.read(server: config.server) : ""
+    hotkey?.changed = { [weak self] down in self?.shortcut(down: down) }
   }
   private func client(_ snapshot: Configuration? = nil) throws -> AntflyClient {
     let settings = snapshot ?? config
+    if let clientFactory { return try clientFactory(settings) }
     return try AntflyClient(
       server: settings.server, token: Credentials.read(server: settings.server))
   }
   private func registerShortcut() throws {
     if registered?.0 == config.shortcutKey && registered?.1 == config.shortcutModifiers { return }
-    try hotkey.register(key: config.shortcutKey, modifiers: config.shortcutModifiers)
+    try hotkey?.register(key: config.shortcutKey, modifiers: config.shortcutModifiers)
     registered = (config.shortcutKey, config.shortcutModifiers)
   }
   private func write(_ data: Data, to url: URL) throws {
@@ -72,7 +98,21 @@ import SwiftUI
     try write(JSONEncoder().encode(config), to: settingsFile)
     if !config.retainHistory {
       history = []
-      try write(JSONEncoder().encode(history), to: historyFile)
+      historyRevision += 1
+      let revision = historyRevision
+      Task {
+        await outbox?.setEnabled(false)
+        guard !config.retainHistory else {
+          await outbox?.setEnabled(true)
+          return
+        }
+        do {
+          try await outbox?.discardAll()
+          try await outbox?.storeArchive([], revision: revision)
+        } catch { historySyncStatus = error.localizedDescription }
+      }
+    } else {
+      Task { await outbox?.resume() }
     }
     if !config.retainAudio { try removeAudio() }
   }
@@ -208,7 +248,7 @@ import SwiftUI
       message = error.localizedDescription
     }
   }
-  private func submit(
+  func submit(
     audio: Data, preset: Preset, snapshot: Configuration, destination: InsertionTarget?
   ) {
     state = .processing
@@ -252,12 +292,7 @@ import SwiftUI
           let entry = HistoryEntry(
             preset: preset.name, model: preset.model, application: destination?.bundleID ?? "",
             raw: output.raw, text: output.text, status: status)
-          history.insert(entry, at: 0)
-          history = Array(history.prefix(500))
-          try write(JSONEncoder().encode(history), to: historyFile)
-          do { try await connection.saveHistory(entry, table: snapshot.table) } catch {
-            message += " History saved locally; Antfly save failed: \(error.localizedDescription)"
-          }
+          await recordHistory(entry, snapshot: snapshot)
         }
         guard generation == run else { return }
         if !snapshot.retainAudio { retryAudio = nil }
@@ -273,12 +308,7 @@ import SwiftUI
             preset: preset.name, model: preset.model, application: destination?.bundleID ?? "",
             raw: preview, text: "",
             status: "error: " + String(error.localizedDescription.prefix(2048)))
-          history.insert(entry, at: 0)
-          history = Array(history.prefix(500))
-          try? write(JSONEncoder().encode(history), to: historyFile)
-          if let connection = try? client(snapshot) {
-            try? await connection.saveHistory(entry, table: snapshot.table)
-          }
+          await recordHistory(entry, snapshot: snapshot)
         }
       }
     }
@@ -363,33 +393,85 @@ import SwiftUI
       self.message = "Settings replaced from Antfly."
     }
   }
+  private func updateHistoryStatus(_ status: HistoryOutbox.Status) {
+    historySyncStatus =
+      status.error.map { "\(status.pending) pending · " + $0 }
+      ?? (status.pending == 0 ? "History synced." : "\(status.pending) pending upload(s).")
+  }
+  /// Enqueue waits for durable local persistence only, never for the remote upload.
+  func recordHistory(_ entry: HistoryEntry, snapshot: Configuration) async {
+    guard config.retainHistory else { return }
+    history.insert(entry, at: 0)
+    history = Array(history.prefix(500))
+    historyRevision += 1
+    let revision = historyRevision
+    let archive = history
+    guard let outbox else {
+      historySyncStatus = "History sync unavailable; transcript remains in this session."
+      return
+    }
+    do {
+      try await outbox.storeArchive(archive, revision: revision)
+      guard config.retainHistory else { return }
+      try await outbox.enqueue(
+        entry, destination: HistoryDestination(server: snapshot.server, table: snapshot.table))
+    } catch { historySyncStatus = "Local history / sync error: " + error.localizedDescription }
+  }
+  private func runHistory(_ action: @escaping @MainActor () async throws -> Void) {
+    guard !historyWorking else { return }
+    historyWorking = true
+    Task {
+      defer { historyWorking = false }
+      do { try await action() } catch { historySyncStatus = error.localizedDescription }
+    }
+  }
   func search() {
-    run {
-      self.searchResult = try await self.client().search(self.searchText, table: self.config.table)
+    runHistory {
+      let snapshot = try self.config.validated()
+      self.searchResult = try await self.client(snapshot).search(
+        self.searchText, table: snapshot.table)
     }
   }
   func syncHistory() {
-    run {
-      let connection = try self.client()
-      for entry in self.history {
-        try await connection.saveHistory(entry, table: self.config.table)
+    runHistory {
+      let snapshot = try self.config.validated()
+      guard let outbox = self.outbox else {
+        throw DictationError.invalid("History sync unavailable.")
       }
-      self.message = "Local history uploaded."
+      for entry in self.history {
+        try await outbox.enqueue(
+          entry, destination: HistoryDestination(server: snapshot.server, table: snapshot.table))
+      }
+      await outbox.resume()
     }
   }
   func clearHistory() {
-    run {
-      try await self.client().deleteHistory(ids: self.history.map(\.id), table: self.config.table)
-      self.history = []
-      try self.write(JSONEncoder().encode(self.history), to: self.historyFile)
-      self.message = "Local history and its corresponding Antfly documents deleted."
+    runHistory {
+      let snapshot = try self.config.validated()
+      let ids = Set(self.history.map(\.id))
+      let pauseToken = await self.outbox?.pause()
+      do {
+        try await self.client(snapshot).deleteHistory(ids: Array(ids), table: snapshot.table)
+        try await self.outbox?.discard(
+          ids: ids, destination: HistoryDestination(server: snapshot.server, table: snapshot.table))
+        self.history.removeAll { ids.contains($0.id) }
+        self.historyRevision += 1
+        try await self.outbox?.storeArchive(self.history, revision: self.historyRevision)
+        if let pauseToken { await self.outbox?.resume(pauseToken) }
+      } catch {
+        if let pauseToken { await self.outbox?.resume(pauseToken) }
+        throw error
+      }
     }
   }
   func clearLocalHistory() {
-    perform {
-      self.history = []
-      try self.write(JSONEncoder().encode(self.history), to: self.historyFile)
-      self.message = "Local history cleared. Remote documents are unchanged."
+    history = []
+    historyRevision += 1
+    let revision = historyRevision
+    Task {
+      do { try await outbox?.storeArchive([], revision: revision) } catch {
+        historySyncStatus = error.localizedDescription
+      }
     }
   }
   private func removeAudio() throws {
