@@ -42646,8 +42646,14 @@ components:
                 type: number
                 minimum: 0
                 maximum: 1
-              description: Lower and upper bound, lower strictly below upper. The previous stage must
-                not be verdict_only.
+              description: Lower and upper bound, lower strictly below upper. Inputs must have measured
+                probabilities. The previous stage must not be verdict_only; a dynamically returned proxy
+                verdict fails its producing stage under on_failure instead of driving the band.
+        require_agreement:
+          type: boolean
+          description: Require this stage to agree with the preceding stage on the band question, or every
+            question when unscoped. True is allowed only after the first stage. Disagreement stops this
+            input and abstains; a keep_previous failure leaves agreement unverified and also abstains.
         on_failure:
           type: string
           enum:
@@ -42710,10 +42716,11 @@ components:
             - generated
             - cascade
           default: typed
-          description: Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma
-            2 choice and multi_choice questions; rejects score and predicate requests and returns raw
-            cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate
-            questions only.
+          description: Execution contract. With provider antfly, typed invokes the Decisions endpoint;
+            remote named deciders may return validated typed or generated answers, including upstream
+            cascade outcomes. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and
+            multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
+            cascade runs the stages in `cascade` and accepts choice and predicate questions only.
         cascade:
           $ref: '#/components/schemas/DeciderCascade'
         generator:
@@ -52465,6 +52472,11 @@ components:
             config_generation:
               type: integer
               format: uint64
+            adjudication_execution_hash:
+              type: string
+              pattern: ^[0-9a-f]{64}$
+              description: Shared base policy and source binding for adjudication receipts, independent
+                of model revisions. Omitted by older writers.
             skipped_mentions:
               type: integer
               minimum: 0
@@ -69349,6 +69361,80 @@ components:
         - $ref: '#/components/schemas/TrainedPredicateAnswer'
         - $ref: '#/components/schemas/EmbeddingChoiceAnswer'
         - $ref: '#/components/schemas/EmbeddingMultiChoiceAnswer'
+    DecisionCascadeAgreementStatus:
+      type: string
+      enum:
+        - agreed
+        - disagreed
+        - unverified
+      description: A required comparison agreed, disagreed, or could not run because its stage failed
+        with keep_previous or its upstream abstained. Disagreed and unverified outcomes abstain without
+        discarding model answers or usage.
+    DecisionRevisionDependency:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - path
+        - identity
+      properties:
+        kind:
+          type: string
+          enum:
+            - model
+            - cascade
+            - unverified
+        path:
+          type: array
+          maxItems: 8
+          items:
+            type: string
+            minLength: 1
+            maxLength: 64
+        identity:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        model:
+          type: string
+          minLength: 1
+          maxLength: 2048
+      description: Flat execution dependency relative to the upstream Decisions invocation. Model entries
+        pin generated model revisions; cascade entries pin definitions. Unverified entries mark incomplete
+        historical provenance and cannot authorize receipt reuse.
+    DecisionCascadeUpstreamAgreement:
+      type: object
+      additionalProperties: false
+      required:
+        - agreement_status
+      description: Bounded agreement summary reported by the stage's upstream provider. This preserves
+        upstream abstention without recursively embedding its trace; the upstream definition is not locally
+        verified. A disagreed or unverified upstream stops the input, including at the first or an unguarded
+        stage.
+      properties:
+        agreement_status:
+          $ref: '#/components/schemas/DecisionCascadeAgreementStatus'
+        agreed:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: True for agreed, false for disagreed, absent for unverified.
+        disagreed_questions:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: Sorted names from this stage's answers; required only for disagreed.
+        decider:
+          type: string
+          minLength: 1
+        definition_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        answered_by:
+          type: string
+          minLength: 1
     DecisionUsage:
       type: object
       additionalProperties: false
@@ -69377,6 +69463,61 @@ components:
         - decision_method
         - escalated
       properties:
+        upstream_revisions_complete:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Whether the version-2 projection has complete provenance. False preserves uncertainty
+            without consuming a dependency slot. Required with version 2; absent with version 1, whose
+            legacy unverified entries still imply incompleteness. Unversioned projections remain incomplete.
+        upstream_revisions_version:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 2
+          description: Version 2 requires upstream_revisions_complete and separates provenance from the
+            bounded dependency nodes. Version 1 uses legacy unverified entries to represent incompleteness.
+            Unversioned historical projections may have lost definitions and cannot authorize identity
+            verdict reuse.
+        agreement_questions:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: Sorted question names compared by this stage. Present only when a local comparison
+            ran. Allows upstream consumers to verify scoped agreement directly from the stage answers
+            without reconstructing its policy. Historical traces may omit this field; ambiguous historical
+            agreement abstains.
+        upstream_revisions:
+          type: array
+          x-go-type-skip-optional-pointer: false
+          maxItems: 32
+          items:
+            $ref: '#/components/schemas/DecisionRevisionDependency'
+          description: Bounded upstream execution dependencies. New version-2 projections contain actual
+            dependencies and use upstream_revisions_complete for uncertainty. Complete empty projections
+            record no versioned dependencies. Version-1 legacy unverified entries are still readable;
+            unversioned projections cannot prove completeness.
+        upstream_agreement:
+          $ref: '#/components/schemas/DecisionCascadeUpstreamAgreement'
+        agreement_status:
+          $ref: '#/components/schemas/DecisionCascadeAgreementStatus'
+        agreed:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Derived comparison result. Present only for agreed or disagreed checks; absent
+            when no check ran or verification was unavailable.
+        disagreed_questions:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: Sorted question names that disagreed. Present only when agreement_status is disagreed.
         name:
           type: string
         decision_method:
@@ -69420,6 +69561,22 @@ components:
         in order. The top-level model and answers come from the answering stage, and usage is the sum
         over these stages.
       properties:
+        agreement_status:
+          $ref: '#/components/schemas/DecisionCascadeAgreementStatus'
+        agreed:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Derived comparison result. Present only for agreed or disagreed checks; absent
+            when no check ran or verification was unavailable.
+        disagreed_questions:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: Sorted question names that disagreed. Present only when agreement_status is disagreed.
         decider:
           type: string
           description: The configured cascade name.

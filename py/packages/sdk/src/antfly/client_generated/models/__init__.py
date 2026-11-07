@@ -298,10 +298,12 @@ from .decider_config_embedding_options import DeciderConfigEmbeddingOptions
 from .decider_config_embedding_options_task_type import DeciderConfigEmbeddingOptionsTaskType
 from .decider_config_provider import DeciderConfigProvider
 from .decision_batch_item import DecisionBatchItem
+from .decision_cascade_agreement_status import DecisionCascadeAgreementStatus
 from .decision_cascade_stage_trace import DecisionCascadeStageTrace
 from .decision_cascade_stage_trace_decision_method import DecisionCascadeStageTraceDecisionMethod
 from .decision_cascade_stage_trace_provenance import DecisionCascadeStageTraceProvenance
 from .decision_cascade_trace import DecisionCascadeTrace
+from .decision_cascade_upstream_agreement import DecisionCascadeUpstreamAgreement
 from .decision_choice import DecisionChoice
 from .decision_choice_probability import DecisionChoiceProbability
 from .decision_evidence_image import DecisionEvidenceImage
@@ -318,6 +320,8 @@ from .decision_evidence_text_type import DecisionEvidenceTextType
 from .decision_input import DecisionInput
 from .decision_level import DecisionLevel
 from .decision_level_probability import DecisionLevelProbability
+from .decision_revision_dependency import DecisionRevisionDependency
+from .decision_revision_dependency_kind import DecisionRevisionDependencyKind
 from .decision_similarity import DecisionSimilarity
 from .decision_table_source import DecisionTableSource
 from .decision_table_source_filter_query import DecisionTableSourceFilterQuery
@@ -2940,10 +2944,12 @@ __all__ = (
     "DeciderConfigEmbeddingOptionsTaskType",
     "DeciderConfigProvider",
     "DecisionBatchItem",
+    "DecisionCascadeAgreementStatus",
     "DecisionCascadeStageTrace",
     "DecisionCascadeStageTraceDecisionMethod",
     "DecisionCascadeStageTraceProvenance",
     "DecisionCascadeTrace",
+    "DecisionCascadeUpstreamAgreement",
     "DecisionChoice",
     "DecisionChoiceProbability",
     "DecisionEvidenceImage",
@@ -2960,6 +2966,8 @@ __all__ = (
     "DecisionInput",
     "DecisionLevel",
     "DecisionLevelProbability",
+    "DecisionRevisionDependency",
+    "DecisionRevisionDependencyKind",
     "DecisionSimilarity",
     "DecisionTableSource",
     "DecisionTableSourceFilterQuery",
