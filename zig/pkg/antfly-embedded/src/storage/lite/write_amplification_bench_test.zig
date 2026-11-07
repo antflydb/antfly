@@ -335,6 +335,32 @@ fn insertOneVector(
     try std.testing.expectEqual(capi_types.ErrorCode.ok, api.antfly_db_batch_json(handle, .fromSlice(body), &output));
 }
 
+/// One single-doc write that carries BOTH a text `body` field (for the
+/// default full-text index) and a caller-supplied sparse embedding (for
+/// `sparse_index_name`) in the SAME `inserts` entry -- the mixed-kind case
+/// lite-single-commit-write-path.md §3.3a asks for: each eligible index
+/// (text's `InlineTextPublication`, sparse's `InlineSparsePublication`)
+/// must contribute its own commit_participant to the SAME native
+/// transaction as the primary row, not fall back to a slower path just
+/// because another index is also present in the write.
+fn insertOneMixedTextSparse(alloc: std.mem.Allocator, handle: *anyopaque, key: []const u8, text: []const u8, vector_json: []const u8, sync_level: []const u8) !void {
+    const key_json = try jsonString(alloc, key);
+    defer alloc.free(key_json);
+    const text_json = try jsonString(alloc, text);
+    defer alloc.free(text_json);
+    const sync_level_json = try jsonString(alloc, sync_level);
+    defer alloc.free(sync_level_json);
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"inserts\":{{{s}:{{\"body\":{s},\"_embeddings\":{{\"" ++ sparse_index_name ++ "\":{s}}}}}}},\"sync_level\":{s}}}",
+        .{ key_json, text_json, vector_json, sync_level_json },
+    );
+    defer alloc.free(body);
+    var output: capi_types.Buffer = .{};
+    defer api.antfly_buffer_free(&output);
+    try std.testing.expectEqual(capi_types.ErrorCode.ok, api.antfly_db_batch_json(handle, .fromSlice(body), &output));
+}
+
 // ---------------------------------------------------------------------------
 // Measurement modes
 // ---------------------------------------------------------------------------
@@ -1239,6 +1265,45 @@ test "lite write amplification: sparse_vector inline fast path engages every wri
 
     const sparse = try measureSingleWriterVector(alloc, "lite-write-amp-sparse-inline-steady", true, updates);
     try expectAtMost(sparse.durableCommitsPerWrite(), 1.35, "sparse_vector inline fast path steady-state durable commits/write");
+}
+
+// lite-single-commit-write-path.md §3.3a: a mixed-kind write -- one doc
+// carrying both a text `body` field and a caller-supplied sparse
+// embedding -- must still cost one native commit: each eligible index
+// (InlineTextPublication, InlineSparsePublication) contributes its own
+// commit_participant to the SAME transaction, and the other's presence
+// must never push either one onto its own slower, separate-commit path.
+test "lite write amplification: mixed text+sparse write engages both inline fast paths in one commit" {
+    const alloc = std.testing.allocator;
+    const updates = default_updates;
+
+    var fixture = try Fixture.open(alloc, "lite-write-amp-mixed-text-sparse", .full_text);
+    defer fixture.close();
+    try addExternalVectorIndex(alloc, fixture.handle, sparse_index_name, true);
+
+    var buffer: [text_bytes]u8 = undefined;
+    var key_buffer: [32]u8 = undefined;
+    wal_trace.reset();
+    wal_trace.registerCallingThread();
+    for (0..updates) |i| {
+        const key = try std.fmt.bufPrint(&key_buffer, "doc-{d}", .{i % 128});
+        const text = payload(&buffer, 0, i);
+        const vector_json = try sparseVectorJsonAlloc(alloc, i);
+        defer alloc.free(vector_json);
+        try insertOneMixedTextSparse(alloc, fixture.handle, key, text, vector_json, "full_index");
+    }
+    const mixed: ModeReport = .{ .updates = updates, .report = wal_trace.snapshot() };
+
+    std.debug.print("lite write amplification report, mixed text+sparse (updates={d}):\n", .{updates});
+    printStageTable("mixed text+sparse-visible (sync_level=full_index, workers on)", mixed);
+
+    // Same headroom as every other inline fast-path report test: one
+    // amortized startup write per eligible index (each index's own
+    // worker-catchup precheck defers its very first write to the slow
+    // path) plus slack. Two indexes' startup writes can land on the SAME
+    // update (doc-0's very first write touches both), so this stays at
+    // the single-index ceiling, not double it.
+    try expectAtMost(mixed.durableCommitsPerWrite(), 1.25, "mixed text+sparse durable commits/write (workers on)");
 }
 
 fn expectAtMost(actual: f64, ceiling: f64, comptime label: []const u8) !void {
