@@ -65,6 +65,24 @@ pub fn create(ctx: Context) Suite {
     // section. Separate functions let the linker insert range-extension thunks.
     tests.link_function_sections = ctx.optimize == .debug and
         ctx.target.result.cpu.arch == .aarch64 and ctx.target.result.ofmt == .elf;
+    if (ctx.backend.enable_pjrt) {
+        const fixture = b.addLibrary(.{
+            .name = "pjrt-admission-fixture",
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/pjrt/src/test_plugin.zig" })),
+                .target = ctx.target,
+                .optimize = ctx.optimize,
+                .link_libc = true,
+            }),
+        });
+        // Embed the provider so tests remain runnable from any working
+        // directory (including zig build --build-file from the repo root).
+        const fixture_files = b.addWriteFiles();
+        _ = fixture_files.addCopyFile(fixture.getEmittedBin(), "plugin");
+        const fixture_module = fixture_files.add("fixture.zig", "pub const bytes = @embedFile(\"plugin\");\n");
+        tests.root_module.addAnonymousImport("pjrt_admission_fixture", .{ .root_source_file = fixture_module });
+    }
     tests.root_module.strip = ctx.strip;
     tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
     tests.root_module.addImport("antfly_cloudflare", ctx.graph.inference_mod.import_table.get("antfly_cloudflare").?);

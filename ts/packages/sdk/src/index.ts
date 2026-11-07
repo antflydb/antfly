@@ -43,6 +43,7 @@ export {
   type IndexMutationTemporarilyUnavailableCode,
   IndexMutationTemporarilyUnavailableError,
   type IndexOperations,
+  type PrivacyTableTarget,
   QUERY_TEMPORARILY_UNAVAILABLE_CODES,
   type QueryExecutionOptions,
   type QueryTemporarilyUnavailableCode,
@@ -553,4 +554,16 @@ export type {
   TablespaceCatalogRecord,
 } from "./types.js";
 
+export type {
+  PrivacyProducer,
+  PrivacyCategory,
+  PrivacyPolicy,
+  PrivacyFinding,
+  PrivacyStatus,
+  PrivacyPreviewRequest,
+  PrivacyPreview,
+  PrivacyScanRequest,
+  PrivacyScan,
+  PrivacyFindingsPage,
+} from "./types.js";
 export type { AudioReadOptions, AudioReadMetadata, AudioReadSegment } from "./inference-types.js";

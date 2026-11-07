@@ -83,6 +83,7 @@ pub const ImportedOnnxSession = struct {
     cb: @import("../ops/ops.zig").ComputeBackend,
     executable: executable_mod.Executable,
     source_path: ?[]u8 = null,
+    logical_source_path: ?[]u8 = null,
     shape_template: ?[]u8 = null,
     requested_strategy: graph_runtime_mod.Strategy = .interpreter,
     io: ?std.Io = null,
@@ -121,6 +122,7 @@ pub const ImportedOnnxSession = struct {
         self.specializations.deinit(self.allocator);
         if (self.shape_key) |key| self.allocator.free(key);
         if (self.source_path) |path| self.allocator.free(path);
+        if (self.logical_source_path) |path| self.allocator.free(path);
         if (self.shape_template) |bytes| self.allocator.free(bytes);
         for (self.input_info) |info| {
             self.allocator.free(info.name);
@@ -159,23 +161,27 @@ pub fn createSession(allocator: std.mem.Allocator, onnx_path: []const u8, reques
 /// malformed external-data references, unsupported operators, and invalid graph topology
 /// fail early without constant-folding a potentially large model during listing.
 pub fn inspectGraphCompatibility(allocator: std.mem.Allocator, onnx_path: []const u8) !void {
+    return inspectGraphCompatibilityWithContext(allocator, onnx_path, null, null);
+}
+
+pub fn inspectGraphCompatibilityWithContext(allocator: std.mem.Allocator, onnx_path: []const u8, external_base_dir: ?[]const u8, logical_path: ?[]const u8) !void {
     var mapped = try c_file.MmapRegion.init(allocator, onnx_path);
     defer mapped.deinit();
     if (mapped.data.len > max_onnx_model_bytes) return error.FileTooLarge;
     mapped.adviseSequentialPrefix(@min(mapped.data.len, 16 * 1024 * 1024));
 
-    const model_dir = std.fs.path.dirname(onnx_path) orelse ".";
+    const model_dir = external_base_dir orelse std.fs.path.dirname(onnx_path) orelse ".";
     var model = try onnx_graph.parseLazyAsModelWithBaseDir(allocator, mapped.data, model_dir);
     defer model.deinit();
 
     var clipclap_dim_overrides: onnx_graph.DimOverrides = .empty;
     defer clipclap_dim_overrides.deinit(allocator);
     var use_clipclap_dim_overrides = false;
-    if (shouldSpecializeClipclapAudioInputTime(onnx_path)) {
+    if (shouldSpecializeClipclapAudioInputTime(logical_path orelse onnx_path)) {
         try clipclap_dim_overrides.put(allocator, "time", clipclap_audio_input_frames);
         use_clipclap_dim_overrides = true;
     }
-    if (shouldSpecializeClipclapTextInputShape(onnx_path)) {
+    if (shouldSpecializeClipclapTextInputShape(logical_path orelse onnx_path)) {
         try clipclap_dim_overrides.put(allocator, "batch_size", clipclap_text_batch);
         try clipclap_dim_overrides.put(allocator, "sequence_length", clipclap_text_sequence_length);
         use_clipclap_dim_overrides = true;
@@ -236,12 +242,16 @@ pub fn inspectArtifactSet(
     allocator: std.mem.Allocator,
     onnx_path: []const u8,
 ) !OnnxArtifactSet {
+    return inspectArtifactSetWithBase(allocator, onnx_path, null);
+}
+
+pub fn inspectArtifactSetWithBase(allocator: std.mem.Allocator, onnx_path: []const u8, external_base_dir: ?[]const u8) !OnnxArtifactSet {
     var mapped = try c_file.MmapRegion.init(allocator, onnx_path);
     defer mapped.deinit();
     if (mapped.data.len > max_onnx_model_bytes) return error.FileTooLarge;
     mapped.adviseSequentialPrefix(@min(mapped.data.len, 16 * 1024 * 1024));
 
-    const model_dir = std.fs.path.dirname(onnx_path) orelse ".";
+    const model_dir = external_base_dir orelse std.fs.path.dirname(onnx_path) orelse ".";
     var model = try onnx_graph.parseLazyAsModelWithBaseDir(allocator, mapped.data, model_dir);
     defer model.deinit();
 
@@ -359,6 +369,10 @@ fn snapshotShapeTemplate(allocator: std.mem.Allocator, model: *onnx_graph.Model)
 }
 
 pub const ImportedOnnxSessionOptions = struct {
+    /// Captured directory of the logical graph; independent of its physical filename.
+    external_base_dir: ?[]const u8 = null,
+    /// Logical filename supplies model-specific shape hints, never file IO.
+    logical_path: ?[]const u8 = null,
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
     shared_backend_ctx: ?*SharedBackendContext = null,
     /// Observe native backend-owner allocations from construction.
@@ -394,18 +408,19 @@ pub fn createSessionWithOptions(
         try c_file.readFileMax(allocator, onnx_path, max_onnx_model_bytes);
     defer if (options.static_source == null) allocator.free(model_bytes);
 
-    const model_dir = std.fs.path.dirname(onnx_path) orelse ".";
+    const model_dir = options.external_base_dir orelse std.fs.path.dirname(onnx_path) orelse ".";
     var model = try onnx_graph.parseLazyAsModelWithBaseDir(allocator, model_bytes, if (options.static_source == null) model_dir else null);
     defer model.deinit();
 
+    const logical_path = options.logical_path orelse onnx_path;
     var clipclap_dim_overrides: onnx_graph.DimOverrides = .empty;
     defer clipclap_dim_overrides.deinit(allocator);
     var use_clipclap_dim_overrides = false;
-    if (options.dim_overrides == null and shouldSpecializeClipclapAudioInputTime(onnx_path)) {
+    if (options.dim_overrides == null and shouldSpecializeClipclapAudioInputTime(logical_path)) {
         try clipclap_dim_overrides.put(allocator, "time", clipclap_audio_input_frames);
         use_clipclap_dim_overrides = true;
     }
-    if (options.dim_overrides == null and shouldSpecializeClipclapTextInputShape(onnx_path)) {
+    if (options.dim_overrides == null and shouldSpecializeClipclapTextInputShape(logical_path)) {
         try clipclap_dim_overrides.put(allocator, "batch_size", clipclap_text_batch);
         try clipclap_dim_overrides.put(allocator, "sequence_length", clipclap_text_sequence_length);
         use_clipclap_dim_overrides = true;
@@ -548,6 +563,8 @@ pub fn createSessionWithOptions(
         }
     }
     errdefer if (self.source_path) |path| allocator.free(path);
+    if (self.source_path != null) self.logical_source_path = try allocator.dupe(u8, logical_path);
+    errdefer if (self.logical_source_path) |path| allocator.free(path);
     if (requested_backend == .cuda and self.requested_strategy == .interpreter and self.source_path == null) {
         for (self.program.graph.nodes.items, 0..) |node, id| {
             if (!@import("../graph/cuda_capabilities.zig").decide(.{ .graph = &self.program.graph, .node_id = @intCast(id), .op = node.op }).can_execute)
@@ -1164,6 +1181,7 @@ fn specializeForInputsDetached(self: *ImportedOnnxSession, inputs: session_mod.S
     }
     if (self.specializations.get(key.items)) |entry| return entry.session;
     const session = try createSessionWithOptions(self.allocator, self.source_path.?, self.shared_backend_ctx.backendType(), .{
+        .logical_path = self.logical_source_path,
         .graph_runtime_strategy = self.requested_strategy,
         .shared_backend_ctx = self.shared_backend_ctx,
         .input_shapes = inputs,
@@ -6645,4 +6663,38 @@ test "actual Imported Metal cache attachment is concurrent idempotent and reject
     try std.testing.expectEqualSlices(f32, &.{ -1, -2, -3, -4, -5, -6, -7, -8 }, same_outputs[0].asFloat32());
     // This fixture owns no packed payload. The combined packed fixture checks
     // real SDK/Charge retention across the same two-Model lifetime boundary.
+}
+
+test "imported onnx bound source preserves logical filename shape hints" {
+    const a = std.testing.allocator;
+    const proto = onnx_graph.proto;
+    var dims = [_]proto.TensorShapeProto.Dimension{ .{ .dim_param = "batch_size" }, .{ .dim_param = "sequence_length" } };
+    var inputs = [_]proto.ValueInfoProto{.{ .name = "x", .type_proto = .{ .tensor_type = .{ .elem_type = .float32, .shape = .{ .dims = &dims } } } }};
+    var outputs = [_]proto.ValueInfoProto{.{ .name = "y", .type_proto = .{ .tensor_type = .{ .elem_type = .float32, .shape = .{ .dims = &dims } } } }};
+    var node_inputs = [_][]const u8{"x"};
+    var node_outputs = [_][]const u8{"y"};
+    var nodes = [_]proto.NodeProto{.{ .op_type = "Identity", .inputs = &node_inputs, .outputs = &node_outputs }};
+    var opsets = [_]proto.OpsetImport{.{ .domain = "", .version = 14 }};
+    const model = proto.ModelProto{ .ir_version = 7, .opset_import = &opsets, .graph = .{ .name = "symbolic", .nodes = &nodes, .inputs = &inputs, .outputs = &outputs } };
+    const bytes = try onnx_graph.serializeModel(a, &model);
+    defer a.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "blob", .data = bytes });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "blob", a);
+    defer a.free(path);
+    const session = try createSessionWithOptions(a, path, .native, .{ .logical_path = "text_model.onnx" });
+    defer session.close();
+    const implementation: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    const shape = implementation.program.graph.node(implementation.input_node_ids[0]).output_shape;
+    try std.testing.expectEqualSlices(i64, &.{ 1, 77 }, shape.dims[0..shape.rank()]);
+    const input_values: [77]f32 = @splat(1);
+    var input = try Tensor.initFloat32(a, "x", &.{ 1, 77 }, &input_values);
+    defer input.deinit();
+    const actual = try session.run(&.{input}, a);
+    defer {
+        for (actual) |*tensor| tensor.deinit();
+        a.free(actual);
+    }
+    try std.testing.expectEqualSlices(f32, &input_values, actual[0].asFloat32());
 }

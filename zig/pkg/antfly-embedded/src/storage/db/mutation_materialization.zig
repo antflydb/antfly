@@ -3405,6 +3405,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const advances = try batchAdvancesManagedIndexApplyState(ctx.index_manager, batch, index_ref);
                 {
                     const async_ctx = AsyncContext{
+                        .apply_exclusive_held = ctx.apply_exclusive_held,
                         .alloc = ctx.alloc,
                         .io = ctx.io,
                         .store = ctx.store,
@@ -3537,11 +3538,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         var applied_chunk = false;
                         var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
                         if (ctx.text_merge_runtime) |runtime| {
-                            merge_permit = try runtime.acquireProducerPermit(
-                                index_ref.name,
-                                planned.estimate.segment_count,
-                                planned.estimate.byte_count,
-                            );
+                            merge_permit = if (ctx.apply_exclusive_held)
+                                try runtime.acquireProducerPermitAssumeApply(index_ref.name, planned.estimate.segment_count, planned.estimate.byte_count)
+                            else
+                                try runtime.acquireProducerPermit(index_ref.name, planned.estimate.segment_count, planned.estimate.byte_count);
                         }
                         defer if (merge_permit) |*permit| permit.release();
 
@@ -4090,9 +4090,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
             coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
         ) !void {
+            const privacy_output = try @import("../../privacy/materialize.zig").output(alloc, item.source_text, item.request.producer_json, produced);
+            defer if (privacy_output) |value| alloc.free(value);
+            const validated = privacy_output orelse produced;
             try artifact_writes.append(alloc, .{
                 .key = try alloc.dupe(u8, item.artifact_key),
-                .value = try alloc.dupe(u8, produced),
+                .value = try alloc.dupe(u8, validated),
             });
             try artifact_writes.append(alloc, .{
                 .key = try alloc.dupe(u8, item.state_key),
@@ -4100,7 +4103,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             });
 
             const text_indexes: []const []const u8 = item.request.consumer_indexes;
-            try appendInlineFullTextDocument(alloc, documents, item.artifact_key, produced, text_indexes);
+            try appendInlineFullTextDocument(alloc, documents, item.artifact_key, validated, text_indexes);
             try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, item.request, .produced);
         }
 
@@ -5178,6 +5181,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (upper) |key| alloc.free(key);
             const ScanContext = struct {
                 alloc: Allocator,
+                document_prefix_len: usize,
                 artifact_prefix: []const u8,
                 asset_state_prefix: []const u8,
                 graph_asset_state_prefix: []const u8,
@@ -5192,7 +5196,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     _ = value;
                     const ctx: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
                     const is_artifact = std.mem.startsWith(u8, key, ctx.artifact_prefix);
-                    if (!is_artifact and
+                    // Fulfilled rerun targets remain document-owned metadata.
+                    // Delete them beside outputs so resurrection starts with
+                    // a fresh generation and tombstone completion can settle.
+                    const is_reprocess_intent = key.len > ctx.document_prefix_len and
+                        (key[ctx.document_prefix_len] == internal_keys.asset_reprocess_intent_kind or
+                            key[ctx.document_prefix_len] == internal_keys.embedding_reprocess_intent_kind);
+                    if (!is_artifact and !is_reprocess_intent and
                         !std.mem.startsWith(u8, key, ctx.asset_state_prefix) and
                         !std.mem.startsWith(u8, key, ctx.graph_asset_state_prefix) and
                         !std.mem.startsWith(u8, key, ctx.graph_edge_contender_prefix) and
@@ -5213,6 +5223,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             var scan_context = ScanContext{
                 .alloc = alloc,
+                .document_prefix_len = document_prefix.len,
                 .artifact_prefix = artifact_prefix,
                 .asset_state_prefix = asset_state_prefix,
                 .graph_asset_state_prefix = graph_asset_state_prefix,
@@ -5227,6 +5238,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const retired_prefix = try internal_keys.graphRetirementPrefixAlloc(alloc, doc_key);
             defer alloc.free(retired_prefix);
             try collectDeleteKeysForPrefix(alloc, store, retired_prefix, delete_keys, owned_delete_keys, null);
+
+            // Standalone privacy witnesses live in the control namespace, but
+            // preserve the exact document prefix after their own prefix. Retire
+            // every policy generation beside the document, even if an older
+            // producer's artifact has already been garbage-collected.
+            const privacy_prefix = try @import("../../privacy/local_publication.zig").key(alloc, document_prefix);
+            defer alloc.free(privacy_prefix);
+            try collectDeleteKeysForPrefix(alloc, store, privacy_prefix, delete_keys, owned_delete_keys, null);
+            const retry_prefix = try @import("../../privacy/retry.zig").key(alloc, document_prefix);
+            defer alloc.free(retry_prefix);
+            try collectDeleteKeysForPrefix(alloc, store, retry_prefix, delete_keys, owned_delete_keys, null);
 
             // Incoming artifacts can span an arbitrarily large number of owners.
             // The primary delete records a durable job instead of retaining them here.
@@ -5245,7 +5267,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const explicit_deletes = for (extracted) |row| {
                 if (row.deleted_embedding_indexes.len > 0) break true;
             } else false;
-            if (!explicit_deletes and !S.ownerField(self, "core").*.hasArtifactCleanupMaybe() and vector_effects.len == 0) return try S.ownerField(self, "alloc").*.alloc([]u8, 0);
+            if (req.deletes.len == 0 and !explicit_deletes and !S.ownerField(self, "core").*.hasArtifactCleanupMaybe() and vector_effects.len == 0) return try S.ownerField(self, "alloc").*.alloc([]u8, 0);
 
             var deleted = std.ArrayListUnmanaged([]u8).empty;
             errdefer deleted.deinit(S.ownerField(self, "alloc").*);
@@ -5956,7 +5978,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // is re-driven by the per-document replay record once the upstream lands.
             const consumes_upstream = request.upstream_artifact_name.len > 0 and
                 producer_cfg.type != .document_extraction;
-            const source_text: ?[]const u8 = if (consumes_upstream) blk: {
+            var source_text: ?[]const u8 = if (consumes_upstream) blk: {
                 const upstream_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", request.upstream_artifact_name);
                 defer alloc.free(upstream_key);
                 var i = artifact_writes.items.len;
@@ -5972,6 +5994,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 break :blk try S.ownerField(db, "core").*.getStoreValue(alloc, upstream_key);
             } else try extractAssetSourceValue(alloc, db, doc_value, request);
+            if (consumes_upstream and source_text != null and @import("../../privacy/document.zig").isProtectedArtifactName(request.upstream_artifact_name)) {
+                const sanitized = try @import("../../privacy/consumer.zig").document(alloc, source_text.?);
+                alloc.free(source_text.?);
+                source_text = sanitized;
+            }
+            if (consumes_upstream and source_text != null and (request.source_field.len != 0 or request.source_template.len != 0)) {
+                const upstream = source_text.?;
+                defer alloc.free(upstream);
+                source_text = try extractAssetSourceValue(alloc, db, upstream, request);
+            }
             if (source_text == null or source_text.?.len == 0) {
                 if (source_text) |s| alloc.free(s);
                 try appendFullTextDeleteDocument(alloc, documents, key, text_indexes);
@@ -6104,12 +6136,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 });
             };
             defer if (producer_cfg.type != .copy) alloc.free(value);
+            const privacy_output = try @import("../../privacy/materialize.zig").output(alloc, source_text.?, request.producer_json, value);
+            defer if (privacy_output) |output| alloc.free(output);
+            const validated = privacy_output orelse value;
 
             try artifact_writes.append(alloc, .{
                 .key = try alloc.dupe(u8, key),
-                .value = try alloc.dupe(u8, value),
+                .value = try alloc.dupe(u8, validated),
             });
-            try appendInlineFullTextDocument(alloc, documents, key, value, text_indexes);
+            try appendInlineFullTextDocument(alloc, documents, key, validated, text_indexes);
 
             try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, .produced);
 
@@ -8487,7 +8522,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_value, .{ .parse_numbers = false });
             defer parsed.deinit();
             if (parsed.value != .object) return null;
-            const source = parsed.value.object.get(request.source_field) orelse return null;
+            const source = enrichment_types.sourceFieldValue(parsed.value, request.source_field, request.group_artifact_name.len > 0);
             return switch (source) {
                 .null => null,
                 .string => |value| blk: {

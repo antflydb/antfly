@@ -85,6 +85,12 @@ pub const LoadedModel = struct {
         return fromOwnedManifest(allocator, path, try manifest_mod.loadFromDir(allocator, path));
     }
 
+    /// Capture an already authenticated selection without rediscovering paths.
+    /// LoadedModel retains its ordinary sole ownership of all metadata.
+    pub fn fromManifest(allocator: std.mem.Allocator, path: []const u8, manifest: *const manifest_mod.ModelManifest) !LoadedModel {
+        return fromOwnedManifest(allocator, path, try manifest.clone(allocator));
+    }
+
     /// Consumes metadata on success and failure. Admission can inspect one
     /// snapshot before opening weights without reparsing the artifact manifest.
     pub fn fromOwnedManifest(allocator: std.mem.Allocator, path: []const u8, owned_manifest: manifest_mod.ModelManifest) !LoadedModel {
@@ -93,7 +99,7 @@ pub const LoadedModel = struct {
         const weights = try tensor_store_mod.openFromManifest(allocator, manifest);
         errdefer weights.deinit();
         // Reuse parsed GGUF metadata instead of mapping and parsing it again.
-        var architecture = try detectArchitectureWithGgufFile(allocator, path, manifest, weights.ggufFile());
+        var architecture = try detectArchitectureWithGgufFile(allocator, manifest.source_root orelse path, manifest, weights.ggufFile());
         if (architecture == .gpt) {
             if (weights.ggufFile()) |file| {
                 if (weights.ggufArtifactBytes()) |bytes| refineRopeDimFromFreqs(&architecture.gpt, file, bytes);
@@ -133,10 +139,19 @@ pub fn detectArchitectureWithGgufFile(
         return .{ .gliner_boundary = config };
     }
     // Try to read config.json for model_type
-    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_path});
-    defer allocator.free(config_path);
+    const config_path: ?[]u8 = if (mf.config_path) |selected|
+        try allocator.dupe(u8, selected)
+    else if (mf.source_root == null)
+        try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_path})
+    else
+        null;
+    defer if (config_path) |path| allocator.free(path);
 
-    if (c_file.readFile(allocator, config_path)) |config_bytes| {
+    const maybe_config_bytes = if (config_path) |path| c_file.readFile(allocator, path) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    } else null;
+    if (maybe_config_bytes) |config_bytes| {
         defer allocator.free(config_bytes);
 
         if (try detectModelType(allocator, config_bytes)) |model_type| {
@@ -216,8 +231,6 @@ pub fn detectArchitectureWithGgufFile(
                 return .{ .bert = try bert.parseConfig(allocator, config_bytes) };
             }
         }
-    } else |err| {
-        if (err == error.OutOfMemory) return err;
     }
 
     if (mf.usesGgufWeights()) {
@@ -428,9 +441,9 @@ fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8
     if (mf.gliner_token_e != 0) cfg.entity_token_id = mf.gliner_token_e;
     if (mf.gliner_token_r != 0) cfg.relation_token_id = mf.gliner_token_r;
 
-    // Authenticated specialty tokenizer markers cannot be replaced by an
-    // unpinned legacy added_tokens.json read after identity capture.
-    if (mf.gliner_specialty_profile != null) return;
+    // Captured catalog markers, including rebound legacy manifests, remain
+    // authoritative. Never reopen a later or unlisted default token sidecar.
+    if (mf.source_root != null or mf.gliner_specialty_profile != null) return;
 
     const at_path = try std.fmt.allocPrint(allocator, "{s}/added_tokens.json", .{model_path});
     defer allocator.free(at_path);
@@ -937,4 +950,24 @@ test "qualified PII specialty requires DeBERTa F32 mirrors without changing GLiG
     var guard = ArchConfig{ .gliner = .{} };
     try applyQualifiedGlinerSpecialtyExecutionPolicy(&guard, .gliguard);
     try std.testing.expect(!guard.gliner.metal_require_f32_weight_mirrors);
+}
+
+test "GLiNER captured markers ignore later default token overrides" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "added_tokens.json", .data = "{\"[C]\":9,\"[E]\":10,\"[R]\":11,\"[L]\":12}" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const mf = manifest_mod.ModelManifest{ .allocator = a, .source_root = root, .gliner_token_c = 3, .gliner_token_e = 4, .gliner_token_r = 5, .gliner_token_l = 6 };
+    var cfg = deberta_mod.Config{};
+    try applyGlinerLabelTokenIds(a, root, mf, &cfg);
+    try std.testing.expectEqual(@as(i64, 3), cfg.classification_token_id);
+    try std.testing.expectEqual(@as(i64, 4), cfg.entity_token_id);
+    try std.testing.expectEqual(@as(i64, 5), cfg.relation_token_id);
+    var label = mf;
+    label.gliner_classification_head = .label_marker_mlp;
+    try applyGlinerLabelTokenIds(a, root, label, &cfg);
+    try std.testing.expectEqual(@as(i64, 6), cfg.classification_token_id);
 }

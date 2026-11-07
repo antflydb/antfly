@@ -1422,15 +1422,17 @@ pub fn projectorAudioTensorNames(store: TensorStore, allocator: std.mem.Allocato
 pub fn openFromManifest(allocator: std.mem.Allocator, manifest: manifest_mod.ModelManifest) !TensorStore {
     if (manifest.hasIncompleteGlinerBundle()) return error.IncompleteGlinerBundle;
     if (manifest.hasIncompleteFlorence2GgufBundle()) return error.IncompleteFlorence2Bundle;
-    if (manifest.gliner_model_type.len > 0 and manifest.gguf_path != null and (manifest.gliner_head_gguf_path != null or manifest.gliner_head_safetensors_path != null)) {
-        const head_path = manifest.gliner_head_gguf_path orelse manifest.gliner_head_safetensors_path.?;
-        const store = try CompositeGlinerStore.initAbsolute(allocator, manifest.gguf_path.?, head_path, manifest.gliner_head_gguf_path != null);
-        return store.tensorStore();
-    }
-    if (manifest.gguf_path != null and manifest.gguf_projector_path != null) {
-        const store = try CompositeProjectorStore.initAbsolute(allocator, manifest.gguf_path.?, manifest.gguf_projector_path.?);
-        if (store.hasGemma4AudioEncoder()) return store.tensorStore();
-        store.tensorStore().deinit();
+    switch (manifest.nativeCompanion()) {
+        .none => {},
+        .gliner_gguf, .gliner_safetensors => |kind| {
+            const store = try CompositeGlinerStore.initAbsolute(allocator, manifest.gguf_path.?, manifest.nativeCompanionPath().?, kind == .gliner_gguf);
+            return store.tensorStore();
+        },
+        .projector => {
+            const store = try CompositeProjectorStore.initAbsolute(allocator, manifest.gguf_path.?, manifest.gguf_projector_path.?);
+            if (store.hasGemma4AudioEncoder()) return store.tensorStore();
+            store.tensorStore().deinit();
+        },
     }
     return switch (manifest.nativeWeightArtifactKind() orelse return error.NoTensorStoreFound) {
         .gguf => (try GgufStore.initAbsolute(allocator, manifest.gguf_path.?)).tensorStore(),
@@ -1545,6 +1547,9 @@ test "safetensors tensor store preserves f16 dtype" {
         .allocator = allocator,
         .safetensors_path = try allocator.dupe(u8, path),
         .gguf_path = try allocator.dupe(u8, gguf_path),
+        // A colocated projector cannot turn the unused GGUF export into the
+        // primary source when SafeTensors won artifact selection.
+        .gguf_projector_path = try allocator.dupe(u8, "missing-unused-projector.gguf"),
     };
     defer manifest.deinit();
 

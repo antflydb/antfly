@@ -155,3 +155,8 @@ pub const getGlinerSpecialtyIdentity = implementation.getGlinerSpecialtyIdentity
 pub const getEagerCudaMirrorWeightBytes = implementation.getEagerCudaMirrorWeightBytes;
 pub const retainedCudaMirrorWeightBytes = implementation.retainedCudaMirrorWeightBytes;
 pub const getCoordinatedCudaComputeBackend = implementation.getCoordinatedCudaComputeBackend;
+
+pub const createSessionFromManifest = implementation.createSessionFromManifest;
+pub const widenBudgetLimitsForManifest = implementation.widenBudgetLimitsForManifest;
+pub const usesJinaRetrievalAdapter = implementation.usesJinaRetrievalAdapter;
+pub const validateJinaRetrievalAdapter = implementation.validateJinaRetrievalAdapter;

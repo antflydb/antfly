@@ -69,10 +69,12 @@ const LocalSchemaProgressProvider = struct {
 };
 const default_public_port: u16 = 8080;
 const cors_default_methods = [_][]const u8{ "GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH" };
-const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin" };
+const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin", "If-Match" };
 const cors_default_exposed_headers = [_][]const u8{
     "X-Request-ID",
     "Retry-After",
+    "ETag",
+    "X-Antfly-Raft-Mutation-Outcome",
     "Deprecation",
     "X-RateLimit-Limit",
     "X-RateLimit-Remaining",
@@ -744,6 +746,8 @@ const LocalStandaloneMetadata = struct {
         table_name: []u8,
         bootstrap: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap,
     };
+    privacy_binding_epoch: u64 = std.math.maxInt(u64),
+    privacy_binding_versions: std.AutoHashMapUnmanaged(u64, [64]u8) = .empty,
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     vector_migration_commands: @import("antfly_local_sources").common_vector_migration.CommandAdmissions = .{},
@@ -825,6 +829,8 @@ const LocalStandaloneMetadata = struct {
         previous_ranges: std.AutoHashMapUnmanaged(u64, ?antfly.metadata.RangeRecord) = .empty,
         previous_extensions: ?antfly.extensions.ExtensionCatalog = null,
         compare_and_replace_table: ?u64 = null,
+        privacy_progress_only: bool = false,
+        previous_privacy_due: ?i64 = null,
         catalog_change: ?system_catalog.MutableState.Change = null,
         setting_command: ?@import("antfly_local_sources").system_catalog_settings.Command = null,
         previous_settings: ?system_catalog.MutableState.OwnedSettings = null,
@@ -922,7 +928,18 @@ const LocalStandaloneMetadata = struct {
             }
             var tables = self.previous_tables.iterator();
             while (tables.next()) |entry| {
-                if (!self.committed) {
+                if (!self.committed and self.privacy_progress_only) {
+                    // Both cuts retain the policy and its due node. Restore
+                    // that node in place: rollback must not allocate after OOM.
+                    const old = entry.value_ptr.*.?;
+                    const current = metadata.manager.tables.getPtr(entry.key_ptr.*).?;
+                    _ = metadata.manager.table_names.remove(current.name);
+                    antfly.metadata.table_manager.freeTable(metadata.alloc, current.*);
+                    current.* = old;
+                    if (metadata.manager.index_table_names) metadata.manager.table_names.putAssumeCapacity(old.name, old.table_id);
+                    std.debug.assert(metadata.manager.privacy_work.dueTime(old.table_id) != null);
+                    metadata.manager.privacy_work.update(metadata.alloc, old.table_id, self.previous_privacy_due) catch unreachable;
+                } else if (!self.committed) {
                     _ = metadata.manager.removeTable(entry.key_ptr.*);
                     if (entry.value_ptr.*) |row| {
                         metadata.manager.tables.putAssumeCapacity(entry.key_ptr.*, row);
@@ -1044,6 +1061,7 @@ const LocalStandaloneMetadata = struct {
         if (self.operator_lock) |file| file.close(self.backend_runtime.filesystemIo().?);
         self.extension_catalog.deinit();
         self.manager.deinit();
+        self.privacy_binding_versions.deinit(self.alloc);
         self.alloc.free(self.catalog_path);
         self.alloc.free(self.replica_root_dir);
         self.alloc.free(self.api_url);
@@ -1070,10 +1088,33 @@ const LocalStandaloneMetadata = struct {
                 .linearizable_routing_snapshot = catalogRoutingSnapshot,
                 .table_routing_snapshot = catalogTableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = catalogTableRoutingSnapshot,
+                .privacy_policy_binding = catalogPrivacyPolicyBinding,
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .wait_for_routing_change = catalogWaitForRoutingChange,
             },
         };
+    }
+
+    fn privacyAuthorityTerm(ptr: *anyopaque) !?u64 {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return if (self.hot_standby_mirror) |mirror| mirror.publisher.identity().epoch else @as(u64, 1);
+    }
+    fn nextPrivacyWork(ptr: *anyopaque, a: std.mem.Allocator, now: i64) !?antfly.metadata.table_manager.PrivacyWork {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const id = self.manager.privacy_work.first(now) orelse return null;
+        const table = self.manager.tables.get(id) orelse return error.InvalidPrivacyCatalog;
+        return .{ .term = if (self.hot_standby_mirror) |mirror| mirror.publisher.identity().epoch else @as(u64, 1), .table = try antfly.metadata.table_manager.cloneTable(a, table) };
+    }
+    fn tableRecord(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) !?antfly.metadata.TableRecord {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const table = self.manager.findTableByName(name) orelse return null;
+        return try antfly.metadata.table_manager.cloneTable(a, table.*);
     }
 
     fn statusSource(self: *LocalStandaloneMetadata) antfly.public_api.http_server.StatusSource {
@@ -1087,6 +1128,9 @@ const LocalStandaloneMetadata = struct {
             .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .status = status,
+                .privacy_authority_term = privacyAuthorityTerm,
+                .privacy_work = nextPrivacyWork,
+                .table_record = tableRecord,
                 .system_catalog = systemCatalog,
                 .tracks_sql_submission = true,
                 .supports_query_definitions = true,
@@ -1363,7 +1407,7 @@ const LocalStandaloneMetadata = struct {
             if (existing == null and (parsed.value.state == .queued or parsed.value.state == .running) and try self.lifecycle_store.?.getJobOwnerCount(self.alloc, group_ids.main_metadata_group_id, parsed.value.owner) >= 16) return error.TooManyActiveJobs;
         }
         try self.applyJobCommandLocked(.{ .compare_and_set_job_state = .{ .key = key, .expected_hash = expected orelse "", .value = value } });
-        const current = (try self.lifecycle_store.?.getJobState(self.alloc, group_ids.main_metadata_group_id, key)) orelse return false;
+        const current = (try self.lifecycle_store.?.getJobState(self.alloc, group_ids.main_metadata_group_id, key)) orelse return std.mem.startsWith(u8, key, "privacy/") and std.mem.eql(u8, value, "\x00");
         defer self.alloc.free(current);
         return std.mem.eql(u8, current, value);
     }
@@ -2024,6 +2068,26 @@ const LocalStandaloneMetadata = struct {
         if (self.lifecycle_store) |store| if (try store.standaloneRevision() != self.durable_revision) try self.reloadLifecycleProjectionLocked();
 
         return self.routingSnapshotLocked(deadline_ns);
+    }
+
+    fn catalogPrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.PrivacyPolicyBinding {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        defer self.mutex.unlock();
+        if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
+        if (self.lifecycle_store != null and self.durable_revision == 0) try self.reloadLifecycleProjectionLocked();
+        if (self.privacy_binding_epoch != self.epoch) {
+            self.privacy_binding_versions.clearRetainingCapacity();
+            self.privacy_binding_epoch = self.epoch;
+        }
+        const version: [64]u8 = if (self.manager.findTableByName(table_name)) |table| blk: {
+            if (self.privacy_binding_versions.get(table.table_id)) |version| break :blk version;
+            const version = try @import("antfly_local_sources").privacy_catalog.policyBinding(self.alloc, table.indexes_json);
+            try self.privacy_binding_versions.put(self.alloc, table.table_id, version);
+            break :blk version;
+        } else @splat(0);
+        try (antfly.public_api.table_catalog.RoutingBudget{ .deadline_ns = deadline_ns }).checkpoint();
+        return .{ .metadata_group_id = group_ids.main_metadata_group_id, .metadata_incarnation = self.metadata_incarnation, .catalog_revision = self.epoch, .policy_version = version };
     }
 
     fn catalogTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
@@ -3086,6 +3150,16 @@ const LocalStandaloneMetadata = struct {
                     .data_shapes = shapes,
                 }, .{});
             },
+            .table_record_read => |name| {
+                try context.ensureActive();
+                if (self.lifecycle_store) |store| {
+                    const table = try store.tableByName(alloc, group_ids.main_metadata_group_id, name);
+                    defer if (table) |value| antfly.metadata.table_manager.freeTable(alloc, value);
+                    return std.json.Stringify.valueAlloc(alloc, table, .{});
+                }
+                const table = self.manager.findTableByName(name);
+                return std.json.Stringify.valueAlloc(alloc, if (table) |value| @as(?antfly.metadata.TableRecord, value.*) else null, .{});
+            },
             .query_definition => |name| {
                 if (self.lifecycle_store) |store| {
                     var definition = try store.queryTableDefinition(alloc, group_ids.main_metadata_group_id, name);
@@ -3492,13 +3566,18 @@ const LocalStandaloneMetadata = struct {
         // replicates while reporting itself as configured.
         if (self.haRejectsReplicationSources() and !std.mem.eql(u8, replacement.replication_sources_json, "[]"))
             return error.HACatalogReplicationSourcesUnsupported;
-        try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(self.alloc, replacement.indexes_json);
-        try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(self.alloc, replacement.indexes_json);
+        const progress_only = try antfly.metadata.table_manager.privacyProgressOnly(self.alloc, current.*, replacement);
+        if (!progress_only) {
+            try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(self.alloc, replacement.indexes_json);
+            try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(self.alloc, replacement.indexes_json);
+        }
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
+        mutation.privacy_progress_only = progress_only;
+        mutation.previous_privacy_due = self.manager.privacy_work.dueTime(replacement.table_id);
         try mutation.upsertTable(self, replacement);
         mutation.compare_and_replace_table = replacement.table_id;
-        self.epoch +|= 1;
+        if (!progress_only) self.epoch +|= 1;
         try mutation.commit(self);
     }
 
@@ -4733,6 +4812,8 @@ const LocalStandaloneMetadata = struct {
         // partial replacement failures. Existing readers retain their immutable
         // cut; an in-flight builder must not republish it under a reused epoch.
         self.projection_incarnation += 1;
+        self.privacy_binding_versions.clearRetainingCapacity();
+        self.privacy_binding_epoch = std.math.maxInt(u64);
         if (self.routing_generation) |generation| generation.release();
         self.routing_generation = null;
         if (self.join_planning_generation) |generation| generation.release();
@@ -4974,8 +5055,12 @@ const LocalStandaloneMetadata = struct {
         var changed_tables = mutation.previous_tables.keyIterator();
         while (changed_tables.next()) |id| {
             if (mutation.compare_and_replace_table == id.*) {
+                var expected = mutation.previous_tables.get(id.*).? orelse return error.InvalidStandaloneCatalog;
+                const digest = @import("../metadata/job_state.zig").digest(expected.indexes_json);
+                expected.indexes_json = "";
                 try replacements.append(a, .{
-                    .expected = mutation.previous_tables.get(id.*).? orelse return error.InvalidStandaloneCatalog,
+                    .expected = expected,
+                    .expected_indexes_digest = digest,
                     .replacement = self.manager.tables.get(id.*) orelse return error.InvalidStandaloneCatalog,
                 });
                 continue;
@@ -5006,7 +5091,7 @@ const LocalStandaloneMetadata = struct {
                 // revision while the outbox gates future proposals and retries.
                 mutation.committed = true;
                 self.durable_revision += 1;
-                self.epoch = self.durable_revision;
+                if (!mutation.privacy_progress_only) self.epoch = self.durable_revision;
                 return error.MetadataMutationOutcomeUnknown;
             }
             if (err == error.MetadataMutationOutcomeUnknown) {
@@ -5024,7 +5109,7 @@ const LocalStandaloneMetadata = struct {
         };
         mutation.committed = true;
         self.durable_revision += 1;
-        self.epoch = self.durable_revision;
+        if (!mutation.privacy_progress_only) self.epoch = self.durable_revision;
         var projected_tables = mutation.previous_tables.keyIterator();
         while (projected_tables.next()) |id| {
             if (!self.manager.tables.contains(id.*)) continue;
@@ -5346,6 +5431,7 @@ pub fn runFromIterator(
         });
         try storage_kernel_context.configureRemoteContent(remote_content);
         try storage_kernel_context.configureSecrets(&secret_store);
+        if (loaded_config) |*cfg| try storage_kernel_context.configureInferenceDefaults(cfg.inference.api_url, cfg.inference.api_key);
         const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, if (loaded_config) |*cfg| cfg else null, .standalone, data_dir);
         defer alloc.free(retained_setup);
         try storage_kernel_context.configureNativeQueries(retained_setup);
@@ -5616,7 +5702,13 @@ pub fn runFromIterator(
     // Attach before opening any context-backed auth/system stores. Those
     // handles intentionally retain the storage context for their lifetime;
     // attaching afterward is rejected as a live-owner configuration mutation.
-    if (comptime control_only_storage_sources)
+    //
+    // With an explicit inference.api_url, skip the in-process provider (same
+    // isolation as the API server; see `embedded_inference_enabled`) so
+    // storage-owned chunkers and asset producers use the configured endpoint
+    // and its default credential, not the disabled embedded runtime, which
+    // would answer ModelNotFound or run the model in-process.
+    if (comptime control_only_storage_sources) if (embedded_inference_enabled)
         try storage_kernel_context.attachInferenceProvider(antfly_node);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.initWithOptions(
@@ -6017,6 +6109,7 @@ pub fn runFromIterator(
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
             .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,
+            .native_retained_cuts = lite_path == null,
             .native_lake_artifact_base_dir = data_dir,
             .backup_staging_root = data_dir,
             .user_manager = if (user_manager) |*manager| manager else null,
@@ -6180,6 +6273,9 @@ pub fn runFromIterator(
     if (hot_standby_role_requested and cli.hot_standby_table_id == 0 and cli.hot_standby_shard_id == 0) {
         local_metadata.hot_standby_catalog_server = &data_server;
     }
+    var sql_configuration = std.heap.ArenaAllocator.init(alloc);
+    defer sql_configuration.deinit();
+    data_server.api_server_cfg.sql_deployment = try @import("../serverless/sql/deployment.zig").Config.fromEnv(sql_configuration.allocator(), init.environ_map, &secret_store);
     try data_server.initApiServer();
     local_metadata.data_server = &data_server;
     defer local_metadata.shutdownCdc();
@@ -6749,6 +6845,7 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         .host = bind_host,
         .port = bind_port,
         .max_body_size = antfly.public_api.http_server.public_api_max_request_body_bytes,
+        .max_route_body_size = @import("antfly_public_limits").max_route_body_bytes,
         .max_streamed_body_size = native_checkpoint_upload_limit,
         // Bound aggregate request-body buffering across HTTP/1 and HTTP/2.
         // Four maximum-sized public requests may complete while excess uploads
@@ -9823,7 +9920,7 @@ test "standalone runtime local generator accepts media url data uris" {
         .content = .{ .parts = &.{
             .{ .text = "describe" },
             .{ .media = .{
-                .url = "DATA:IMAGE/PNG;BASE64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD",
+                .url = "DATA:IMAGE/PNG;BASE64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD",
                 .mime_type = "image/png",
             } },
         } },
@@ -9839,6 +9936,7 @@ test "standalone runtime local generator accepts media url data uris" {
     try std.testing.expectEqual(@as(usize, 1), message.image_bytes.?.len);
     var expected = @as([24]u8, @splat(0));
     @memcpy(expected[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(expected[12..16], "IHDR");
     std.mem.writeInt(u32, expected[16..20], 2, .big);
     std.mem.writeInt(u32, expected[20..24], 3, .big);
     try std.testing.expectEqualSlices(u8, &expected, message.image_bytes.?[0]);
@@ -10111,14 +10209,14 @@ test "standalone runtime local generator preflights mixed resident media exactly
                 .data = "AQID",
                 .mime_type = "audio/wav",
             } },
-            .{ .image_url = .{ .url = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD" } },
+            .{ .image_url = .{ .url = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD" } },
         } },
     }};
 
     const preflight = try inference_host.preflightLocalGenerateMessages(&messages);
     try std.testing.expectEqual(@as(usize, "listen".len), preflight.text_bytes);
     try std.testing.expectEqual(
-        @as(usize, "AQID".len + "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD".len),
+        @as(usize, "AQID".len + "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD".len),
         preflight.encoded_media_bytes,
     );
     try std.testing.expectEqual(@as(usize, 27), preflight.decoded_media_bytes);
@@ -10430,7 +10528,7 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
         try std.testing.expectEqual(@as(u16, 209), response.status.code);
         try std.testing.expectEqualStrings("*", response.headers.get("Access-Control-Allow-Origin").?);
         try std.testing.expectEqualStrings(
-            "X-Request-ID, Retry-After, Deprecation, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-Antfly-Next-Cursor",
+            "X-Request-ID, Retry-After, ETag, X-Antfly-Raft-Mutation-Outcome, Deprecation, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-Antfly-Next-Cursor",
             response.headers.get("Access-Control-Expose-Headers").?,
         );
     }
@@ -10445,7 +10543,7 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 204), response.status.code);
         try std.testing.expectEqualStrings("GET, POST, PUT, DELETE, OPTIONS, PATCH", response.headers.get("Access-Control-Allow-Methods").?);
-        try std.testing.expectEqualStrings("Content-Type, Authorization, X-Requested-With, Accept, Origin", response.headers.get("Access-Control-Allow-Headers").?);
+        try std.testing.expectEqualStrings("Content-Type, Authorization, X-Requested-With, Accept, Origin, If-Match", response.headers.get("Access-Control-Allow-Headers").?);
         try std.testing.expectEqualStrings("3600", response.headers.get("Access-Control-Max-Age").?);
     }
     {
@@ -10458,6 +10556,13 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
         var response = try Harness.execute(&defaults, .OPTIONS, null, "POST", null);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 209), response.status.code);
+    }
+
+    // A privacy replacement needs If-Match even with otherwise default CORS.
+    {
+        var response = try Harness.execute(&defaults, .OPTIONS, "https://any.example", "PUT", "content-type, if-match");
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 204), response.status.code);
     }
 
     var exact_origin = "https://allowed.example".*;
@@ -10477,6 +10582,19 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
         .max_age = 7,
     };
     try validateCorsConfig(&exact);
+    {
+        var conditional = exact;
+        conditional.allowed_methods = null;
+        var content_type = "Content-Type".*;
+        var conditional_headers = [_][]u8{content_type[0..]};
+        conditional.allowed_headers = &conditional_headers;
+        var ordinary = try Harness.execute(&conditional, .OPTIONS, exact_origin[0..], "PUT", "content-type");
+        defer ordinary.deinit();
+        try std.testing.expectEqual(@as(u16, 204), ordinary.status.code);
+        var response = try Harness.execute(&conditional, .OPTIONS, exact_origin[0..], "PUT", "content-type, if-match");
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+    }
     {
         var response = try Harness.execute(&exact, .POST, exact_origin[0..], null, null);
         defer response.deinit();
@@ -16313,6 +16431,65 @@ test "standalone cdc review rejects replication sources with scoped HA ownership
     try std.testing.expectError(error.HACatalogReplicationSourcesUnsupported, LocalStandaloneMetadata.createTable(&metadata, a, "tickets", .{ .replication_sources_json = sources }));
 }
 
+test "privacy standalone progress retains routing and join planning generations" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    try LocalStandaloneMetadata.createTable(&metadata, alloc, "private", .{});
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    var before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("private").?.*);
+    var installed = before;
+    installed.indexes_json = try privacy.install(a, "{}", resource);
+    try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, installed);
+    before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("private").?.*);
+    const old = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, null, false);
+    defer old.release();
+    const old_plan = (try LocalStandaloneMetadata.acquireJoinPlanning(&metadata, .{})).?;
+    defer old_plan.release();
+    const epoch = metadata.epoch;
+    const durable = metadata.durable_revision;
+    resource.coverage.retry_after_millis = 200;
+    var replacement = before;
+    replacement.indexes_json = try privacy.replaceResource(a, before.indexes_json, resource);
+    try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, replacement);
+    try std.testing.expectEqual(epoch, metadata.epoch);
+    try std.testing.expect(metadata.durable_revision > durable);
+    const current = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, null, false);
+    defer current.release();
+    const plan = (try LocalStandaloneMetadata.acquireJoinPlanning(&metadata, .{})).?;
+    defer plan.release();
+    try std.testing.expect(old == current);
+    try std.testing.expect(old_plan == plan);
+    try std.testing.expect(metadata.manager.privacy_work.first(199) == null);
+    try std.testing.expectEqual(replacement.table_id, metadata.manager.privacy_work.first(200).?);
+    try std.testing.expectError(error.TableGenerationChanged, LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, replacement));
+    {
+        var mutation = try metadata.beginCatalogMutationLocked();
+        mutation.privacy_progress_only = true;
+        mutation.previous_privacy_due = metadata.manager.privacy_work.dueTime(replacement.table_id);
+        resource.coverage.retry_after_millis = 400;
+        var tentative = replacement;
+        tentative.indexes_json = try privacy.replaceResource(a, replacement.indexes_json, resource);
+        try mutation.upsertTable(&metadata, tentative);
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        metadata.alloc = failing.allocator();
+        mutation.deinit(&metadata);
+        metadata.alloc = alloc;
+    }
+    try std.testing.expectEqual(@as(?i64, 200), metadata.manager.privacy_work.dueTime(replacement.table_id));
+    try std.testing.expectEqualStrings(replacement.indexes_json, metadata.findTableByNameLocked("private").?.indexes_json);
+}
+
 test "standalone metadata admission observes cancellation while queued and after grant" {
     const Control = struct {
         checks: usize = 0,
@@ -16355,4 +16532,68 @@ test "standalone metadata admission observes cancellation while queued and after
     try lockAtomicForRequest(&mutex, antfly.public_api.operation.RequestContext{ .cancellation = .{ .ptr = &probe, .is_cancelled_fn = Probe.canceled } });
     mutex.unlock();
     try std.testing.expect(!probe.contended);
+}
+
+test "privacy standalone compact bindings refresh on policy publication and survive progress" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    try LocalStandaloneMetadata.createTable(&metadata, alloc, "private", .{});
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const absent = try LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null);
+    try std.testing.expect(std.mem.allEqual(u8, &absent.policy_version, 0));
+    var resource = try privacy.next(a, null, .{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} }, null);
+    var before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("private").?.*);
+    var installed = before;
+    installed.indexes_json = try privacy.install(a, "{}", resource);
+    try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, installed);
+    const protected = try LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null);
+    try std.testing.expectEqual(resource.policy_version, protected.policy_version);
+    const epoch = metadata.privacy_binding_epoch;
+    before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("private").?.*);
+    const saved = try std.json.parseFromSliceLeaky(std.json.Value, a, before.indexes_json, .{});
+    var persisted = (try privacy.current(a, saved)).?;
+    defer persisted.deinit();
+    resource = persisted.value;
+    resource.coverage.retry_after_millis = 200;
+    installed.indexes_json = try privacy.replaceResource(a, before.indexes_json, resource);
+    try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, installed);
+    const current = try LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null);
+    try std.testing.expectEqual(epoch, metadata.privacy_binding_epoch);
+    try std.testing.expectEqual(protected.policy_version, current.policy_version);
+    const prior_alloc = metadata.alloc;
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0, .resize_fail_index = 0 });
+    metadata.alloc = failing.allocator();
+    const warm = LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null);
+    metadata.alloc = prior_alloc;
+    try std.testing.expectEqual(current.policy_version, (try warm).policy_version);
+    before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("private").?.*);
+    const monitor = try privacy.next(a, resource, .{ .mode = .monitor, .fields = &.{"body"} }, try privacy.etag(a, resource));
+    installed.indexes_json = try privacy.install(a, before.indexes_json, monitor);
+    try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, installed);
+    const unprotected = try LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null);
+    try std.testing.expect(std.mem.allEqual(u8, &unprotected.policy_version, 0));
+    // Restore/HA replacement may reuse the semantic epoch and table identity.
+    // Its old "unprotected" cache entry must not survive the new catalog cut.
+    const restored = try std.json.Stringify.valueAlloc(a, LocalStandaloneMetadata.PersistedCatalog{
+        .epoch = metadata.epoch,
+        .tables = &.{.{ .table_id = before.table_id, .name = "private", .indexes_json = try privacy.install(a, "{}", resource) }},
+    }, .{});
+    try metadata.loadCatalogBytes(restored);
+    const restored_binding = try LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null);
+    try std.testing.expectEqual(resource.policy_version, restored_binding.policy_version);
+    try std.testing.expectEqual(unprotected.catalog_revision, restored_binding.catalog_revision);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", 1));
+    metadata.catalog_durability_failed = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null));
+    metadata.catalog_durability_failed = false;
 }

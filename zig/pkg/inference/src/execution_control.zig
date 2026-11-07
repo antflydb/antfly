@@ -125,6 +125,10 @@ pub const UninterruptibleGuard = struct {
 /// monotonic clock domain. The legacy check hook is retained so existing
 /// callers can migrate without weakening cancellation coverage.
 pub const InferenceExecutionControl = struct {
+    /// False only for Node-owned startup/offline work with no request waiter.
+    request_owned: bool = true,
+    /// Verified selection carried by value through async admission/loading.
+    model_selection: ?@import("registry/model_selection.zig").Constraint = null,
     /// The HTTP route owns a request slot; audio leaves reserve only work units.
     /// Internal execution policy, never decoded from a public request.
     http_request_admitted: bool = false,
@@ -154,6 +158,16 @@ pub const InferenceExecutionControl = struct {
     /// A cancelled request may finish an in-flight native call before the
     /// watchdog replaces the worker. Checks outside native calls stay immediate.
     cancellation_grace_ns: ?u64 = null,
+
+    /// Request-owned readers can construct sessions outside ModelManager.
+    /// Their outer acquisition must preserve the same selected publication.
+    pub fn verifyModelSelection(self: InferenceExecutionControl, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+        try self.check();
+        if (self.model_selection) |selected| {
+            const publication = try @import("registry/managed_receipt.zig").publicationGeneration(allocator, io, path);
+            if (!selected.matches(path) or !std.meta.eql(selected.publication, publication)) return error.ModelArtifactsChanging;
+        }
+    }
 
     /// Borrow this control for structured image work. The caller must retain
     /// it until all preprocessing workers have joined.
@@ -240,15 +254,19 @@ pub const InferenceExecutionControl = struct {
         };
     }
 
+    /// Fail policy checks before reserving resources, without starting a native
+    /// call monitor while admission may still wait or reclaim other sessions.
+    pub fn validateUninterruptible(self: InferenceExecutionControl, interruption: Interruption) !void {
+        if (interruption == .uninterruptible and self.hard_cancellation == null and self.native_call_policy != .in_process) return error.ProcessIsolationRequired;
+    }
+
     pub fn enterUninterruptible(
         self: InferenceExecutionControl,
         interruption: Interruption,
     ) !UninterruptibleGuard {
+        try self.validateUninterruptible(interruption);
         if (interruption != .uninterruptible) return .{};
-        const boundary = self.hard_cancellation orelse {
-            if (self.native_call_policy == .in_process) return .{};
-            return error.ProcessIsolationRequired;
-        };
+        const boundary = self.hard_cancellation orelse return .{};
         return .{
             .boundary = boundary,
             .token = try boundary.arm(.{
@@ -985,4 +1003,33 @@ test "scoped execution access retains pause policy and binds backend only while 
     pause.resumeWithStepLocked();
     probe.mutex.unlock();
     try std.testing.expect(!lane.owned and lane.head == null and lane.tail == null);
+}
+
+test "uninterruptible admission preflight validates without arming a monitor" {
+    const Hooks = struct {
+        arms: usize = 0,
+        disarms: usize = 0,
+        fn arm(raw: *anyopaque, _: MonitorControl) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.arms += 1;
+            return 1;
+        }
+        fn disarm(raw: *anyopaque, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.disarms += 1;
+        }
+    };
+    try std.testing.expectError(error.ProcessIsolationRequired, (InferenceExecutionControl{}).validateUninterruptible(.uninterruptible));
+    try (InferenceExecutionControl{}).validateUninterruptible(.cooperative);
+    try (InferenceExecutionControl{ .native_call_policy = .in_process }).validateUninterruptible(.uninterruptible);
+    var hooks = Hooks{};
+    const control = InferenceExecutionControl{ .hard_cancellation = .{ .ptr = &hooks, .arm_fn = Hooks.arm, .disarm_fn = Hooks.disarm } };
+    try control.validateUninterruptible(.uninterruptible);
+    try std.testing.expectEqual(@as(usize, 0), hooks.arms);
+    {
+        var guard = try control.enterUninterruptible(.uninterruptible);
+        defer guard.deinit();
+        try std.testing.expectEqual(@as(usize, 1), hooks.arms);
+    }
+    try std.testing.expectEqual(hooks.arms, hooks.disarms);
 }

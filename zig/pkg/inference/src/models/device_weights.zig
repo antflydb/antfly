@@ -112,13 +112,14 @@ pub fn estimateNativeWeightBytes(allocator: std.mem.Allocator, mf: manifest_mod.
     return switch (mf.nativeWeightArtifactKind() orelse return 0) {
         .gguf => blk: {
             var total = try c_file.fileSize(allocator, mf.gguf_path.?);
-            if (mf.gliner_head_gguf_path) |head_path| {
-                total = std.math.add(u64, total, try c_file.fileSize(allocator, head_path)) catch
-                    return error.ResourceLimitExceeded;
-            }
-            if (mf.gliner_head_safetensors_path) |head_path| {
-                total = std.math.add(u64, total, try c_file.fileSize(allocator, head_path)) catch
-                    return error.ResourceLimitExceeded;
+            switch (mf.nativeCompanion()) {
+                .gliner_gguf, .gliner_safetensors => {
+                    total = std.math.add(u64, total, try c_file.fileSize(allocator, mf.nativeCompanionPath().?)) catch
+                        return error.ResourceLimitExceeded;
+                },
+                // Projector request admission is accounted separately. Merely
+                // inspecting a projector does not make all its weights resident.
+                .none, .projector => {},
             }
             break :blk total;
         },
@@ -1050,12 +1051,13 @@ pub const PreparedDeviceWeights = struct {
 
 pub fn prepare(
     allocator: std.mem.Allocator,
-    model_path: []const u8,
+    requested_model_path: []const u8,
     override: ?TaskOverride,
     backend_type: BackendType,
     kernel_jit_config: kernel_jit.Config,
     kernel_jit_load_context: kernel_jit.LoadContext,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
+    selected_manifest: ?*const manifest_mod.ModelManifest,
 ) !PreparedDeviceWeights {
     try kernel_jit_config.validate();
     try metal_runtime.validateMetalJitLoadContext(kernel_jit_config, kernel_jit_load_context);
@@ -1063,9 +1065,13 @@ pub fn prepare(
     if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     const direct_quant_enabled = directQuantEnabled();
 
-    var loaded_model = try model_definition.LoadedModel.open(allocator, model_path);
+    var loaded_model = if (selected_manifest) |selected|
+        try model_definition.LoadedModel.fromManifest(allocator, requested_model_path, selected)
+    else
+        try model_definition.LoadedModel.open(allocator, requested_model_path);
     defer loaded_model.deinit();
     var mf = loaded_model.manifest;
+    const model_path = mf.source_root orelse requested_model_path;
     var gpu_jina_lora_adapter: ?*gpu_hosted_store_mod.JinaLoraAdapter = null;
     errdefer if (gpu_jina_lora_adapter) |adapter| adapter.destroy();
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
@@ -1275,10 +1281,9 @@ pub fn prepare(
             if (tensor_store.?.kind() != .gguf) {
                 try refineArchConfigFromStore(allocator, tensor_store.?, all_names, &arch_config);
             }
-            if (backend_type == .metal and std.mem.eql(u8, mf.config_model_arch, "jina_embeddings_v5")) {
-                if (try jinaRetrievalAdapterPaths(allocator, model_path)) |paths| {
-                    defer allocator.free(paths.config);
-                    defer allocator.free(paths.weights);
+            if (host_weights.usesJinaRetrievalAdapter(mf, backend_type)) {
+                if (try jinaRetrievalAdapterPaths(allocator, model_path, mf)) |paths| {
+                    defer paths.deinit(allocator);
                     const cfg = try parseJinaLoraConfig(allocator, paths.config);
                     gpu_jina_lora_adapter = try gpu_hosted_store_mod.JinaLoraAdapter.create(allocator, paths.weights, cfg.scale());
                 }

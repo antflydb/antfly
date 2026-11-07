@@ -326,10 +326,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     } else opts.draft_model;
     const started_at = std.Io.Timestamp.now(io, .awake);
 
-    var preflight_manifest = try manifest_mod.loadFromDir(allocator, opts.model_dir);
-    defer preflight_manifest.deinit();
-    try preflightModelLoadBudget(allocator, &preflight_manifest, opts);
-
     const loaded_video = if (opts.video_path) |path| try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 * 1024 * 1024)) else null;
     defer if (loaded_video) |bytes| allocator.free(bytes);
     var loaded_images = std.ArrayListUnmanaged([]u8).empty;
@@ -416,6 +412,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .xla => "xla",
         else => null,
     };
+    if (artifact_backend != null and (opts.compiled_target == .partitioned or opts.raw_decode_bench or effective_draft_model != null or opts.video_path != null or opts.image_count != 0 or opts.audio_count != 0)) {
+        print("error: bounded XLA generation requires whole-model executable artifacts and text-only generation without a draft model\n", .{});
+        return error.UnsupportedPjrtFeature;
+    }
     const resolved_artifact_dir = if (artifact_backend != null)
         if (opts.artifact_dir) |artifact_dir|
             try allocator.dupe(u8, artifact_dir)
@@ -436,8 +436,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (artifact_backend != null) .pjrt else null,
     );
 
+    var load_resources = try model_manager_mod.ModelManager.SharedResources.init(allocator, try budgetOverrides(opts).toByteLimits());
+    defer load_resources.deinit();
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
+    var load_budget = ModelLoadBudget{ .allocator = allocator, .options = opts, .resources = &load_resources };
+    try load_budget.configure(&model_manager);
 
     var draft_session_manager = backends.SessionManager.initWithIo(allocator, io);
     configureBackendPreference(&draft_session_manager, opts.backend);
@@ -450,27 +454,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     draft_session_manager.kernel_jit_load_context = .startup_preload;
     var draft_model_manager = model_manager_mod.ModelManager.init(allocator, draft_session_manager);
     defer draft_model_manager.deinit();
-
-    if (artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.video_path == null and opts.image_count == 0 and opts.audio_count == 0) {
-        var artifact_arena = std.heap.ArenaAllocator.init(allocator);
-        defer artifact_arena.deinit();
-        const artifact_allocator = artifact_arena.allocator();
-        if (try native_run_artifact.tryRunMatchingArtifact(
-            artifact_allocator,
-            io,
-            resolved_artifact_dir.?,
-            artifact_backend.?,
-            opts.model_dir,
-            opts.prompt,
-            opts.no_chat_template,
-            opts.raw_prompt,
-        )) |artifact_result_const| {
-            var artifact_result = artifact_result_const;
-            defer artifact_result.deinit(artifact_allocator);
-            const finished_generate_at = std.Io.Timestamp.now(io, .awake);
-            emitArtifactResultAndExit(&artifact_result, &opts, started_at, finished_generate_at);
-        }
-    }
+    try load_budget.configure(&draft_model_manager);
 
     generation.gemma4_mtp_debug_override = opts.debug_mtp;
     try warmInitCudaBeforeLargeModelScan(opts.backend);
@@ -553,19 +537,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         prompt_media_allowance,
     ) catch return error.PromptTooLong;
 
-    if (artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.video_path == null and opts.image_count == 0 and opts.audio_count == 0) {
-        if (try tryRunArtifactForPromptShape(
-            allocator,
-            io,
-            &opts,
-            resolved_artifact_dir.?,
-            artifact_backend.?,
-            prompt_tokens,
-            prompt_tokens,
-            "paged_prefill",
-        )) return;
-    }
-
     if (opts.print_chat_template_status) {
         print("chat_template={}\n", .{apply_chat_template});
     }
@@ -597,7 +568,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     };
     try native_backend_choice.validateRequiredCompiledBackend(&session_manager, explicit_partition_backend);
     const compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = opts.compiled_target orelse blk: {
-        if (compiled_mode_requested and explicit_partition_backend == .metal) break :blk .whole_model;
+        if (explicit_partition_backend == .pjrt or (compiled_mode_requested and explicit_partition_backend == .metal)) break :blk .whole_model;
         break :blk .partitioned;
     };
     const graph_mode = native_backend_choice.forcesGraphMode(opts.backend) or
@@ -737,6 +708,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .config = gpt_config,
         .kv_capacity_policy = kv_capacity_policy,
         .workspace_capacity = model.session.generationWorkspaceCapacity(),
+        .backend_owns_kv = explicit_partition_backend == .pjrt,
+        .fixed_prefill_shape = explicit_partition_backend == .pjrt,
     };
     var budget_component_count: usize = 1;
     if (draft_gpt_config) |draft_cfg| {
@@ -760,6 +733,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             else
                 (runtime.scheduler.native_generate.Policy{}).max_idle_prefill_chunk_size,
         );
+    if (explicit_partition_backend == .pjrt and opts.prefill_chunk_size != 0 and opts.prefill_chunk_size < prompt_tokens) return error.UnsupportedPjrtFeature;
     const admission_prefill_ceiling = if (opts.prefill_chunk_size > 0)
         @min(opts.prefill_chunk_size, scheduler_prefill_ceiling)
     else
@@ -780,6 +754,19 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
         return err;
     };
+
+    var generation_resources = try acquireCliGenerationResources(
+        &model_manager,
+        model.session,
+        if (draft_model) |draft| draft.session else null,
+        budget_components[0..budget_component_count],
+        budget_limits,
+        prompt_tokens,
+        budget_max_tokens,
+        &config.prefill_chunk_size,
+        &run_budget,
+    );
+    defer generation_resources.release();
 
     // The live executor is an alternate implementation of this admitted
     // route, not an admission bypass. Reuse the effective KV dtype, capacity
@@ -824,6 +811,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         kv_dtype,
     );
     if (fallback_kv_capacity_policy != kv_capacity_policy) {
+        generation_resources.release();
         budget_components[0].kv_capacity_policy = fallback_kv_capacity_policy;
         run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         config.prefill_chunk_size = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
@@ -838,6 +826,17 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             }
             return err;
         };
+        generation_resources = try acquireCliGenerationResources(
+            &model_manager,
+            model.session,
+            if (draft_model) |draft| draft.session else null,
+            budget_components[0..budget_component_count],
+            budget_limits,
+            prompt_tokens,
+            budget_max_tokens,
+            &config.prefill_chunk_size,
+            &run_budget,
+        );
     }
 
     if (!graph_mode) {
@@ -872,7 +871,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         null;
     defer if (draft_cb) |*backend| backend.deinit();
 
-    const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, kvSlidingTrimForced());
+    var kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, kvSlidingTrimForced());
+    if (explicit_partition_backend == .pjrt) kv_pool_config.store_cpu_bytes = false;
     const pool_id = try kv_manager.addPool(kv_pool_config);
     var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
     defer kv_storage.deinit();
@@ -923,14 +923,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const use_scheduler = !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and !graph_mode and !decoder_runtime_scheduler_override and nativeGenerateSchedulerEnabled();
     var graph_cache = graph_mod.cache.GraphCache.init(allocator);
     defer graph_cache.deinit();
-    var pjrt_client: ?pjrt_lib.pjrt.Client = null;
-    defer if (pjrt_client) |*client| client.deinit();
+    const pjrt_admission_policy = @import("graph/pjrt_admission.zig").Context{ .allocator = allocator, .manager = &model_manager, .policy = try load_budget.policy(), .decode_steps_limit = @as(usize, @intCast(@max(opts.max_tokens, 1))) - 1 };
     var pjrt_plugin_path: ?[:0]u8 = null;
     defer if (pjrt_plugin_path) |path| allocator.free(path);
     if (explicit_partition_backend == .pjrt) {
         pjrt_plugin_path = try native_backend_choice.pjrtPluginPathFromEnv(allocator);
         const plugin_path = pjrt_plugin_path orelse return error.MissingPjrtPluginPath;
-        pjrt_client = try pjrt_lib.pjrt.Client.init(plugin_path);
+        _ = plugin_path;
+        if (compiled_attachment_target != .whole_model or draft_model != null or opts.video_path != null or opts.image_count != 0 or opts.audio_count != 0) return error.UnsupportedPjrtFeature;
     }
 
     var pipeline = generation.NativeGenerationPipeline{
@@ -938,14 +938,18 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .io = io,
         .cb = cb,
         .session = model.session,
+        .media_run_budget = &run_budget,
+        .explicit_scratch_limit = if (opts.scratch_budget_mb != 0) budget_limits.scratch_limit_bytes else 0,
         .gpt_config = gpt_config,
         .kv_dtype = kv_dtype,
         .shared_moe_cache = model.shared_moe_cache,
         .tokenizer = tokenizer,
-        .add_bos_token = model.manifest.add_bos_token,
+        .add_bos_token = !opts.no_bos and model.manifest.add_bos_token,
         .bos_token = model.manifest.bos_token,
         .chat_template = if (opts.no_chat_template) null else model.chat_tmpl,
-        .prompt_override = if (opts.raw_prompt) rendered_prompt else null,
+        .prompt_override = if (opts.raw_prompt and explicit_partition_backend != .pjrt) rendered_prompt else null,
+        .preformatted_prompt = if (explicit_partition_backend == .pjrt) rendered_prompt else null,
+        .pre_encoded_prompt = if (explicit_partition_backend == .pjrt) .{ .ids = prompt_encoded.ids, .attention_mask = prompt_encoded.attention_mask, .prompt_token_limit = prompt_token_limit } else null,
         .return_raw_token_ids = opts.print_token_ids,
         .print_timing = opts.print_timing,
         .model_dir = opts.model_dir,
@@ -961,7 +965,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .graph_cache = if (graph_mode) &graph_cache else null,
         .compiled_partition_backend = explicit_partition_backend,
         .compiled_attachment_target = compiled_attachment_target,
-        .pjrt_client = if (pjrt_client) |*client| client else null,
+        .pjrt_client = null,
+        .pjrt_admission = if (explicit_partition_backend == .pjrt) &pjrt_admission_policy else null,
+        .pjrt_plugin_path = pjrt_plugin_path,
     };
 
     const profile_started = if (opts.kernel_jit_profile_out != null)
@@ -7044,79 +7050,6 @@ fn tryRunLiveWholeModelExecutorGenerate(
     return true;
 }
 
-fn tryRunArtifactForPromptShape(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    opts: *const Options,
-    artifact_dir: []const u8,
-    artifact_backend: []const u8,
-    seq_len: usize,
-    query_seq_len: usize,
-    attention_mode: []const u8,
-) !bool {
-    const artifact_started_at = std.Io.Timestamp.now(io, .awake);
-    var artifact_arena = std.heap.ArenaAllocator.init(allocator);
-    defer artifact_arena.deinit();
-    const artifact_allocator = artifact_arena.allocator();
-    var found = (try compiled_artifact.findMatchingArtifactPath(allocator, io, artifact_dir, .{
-        .backend = artifact_backend,
-        .kind = null,
-        .model_dir = opts.model_dir,
-        .seq_len = seq_len,
-        .query_seq_len = query_seq_len,
-        .attention_mode = attention_mode,
-    })) orelse return false;
-    defer found.deinit(allocator);
-
-    var artifact_result = try native_run_artifact.runArtifactPrompt(
-        artifact_allocator,
-        io,
-        found.manifest_path,
-        opts.prompt,
-        false,
-        opts.no_chat_template,
-        opts.raw_prompt,
-    );
-    defer artifact_result.deinit(artifact_allocator);
-    const finished_generate_at = std.Io.Timestamp.now(io, .awake);
-    emitArtifactResultAndExit(&artifact_result, opts, artifact_started_at, finished_generate_at);
-    return true;
-}
-
-fn emitArtifactResultAndExit(
-    artifact_result: *const native_run_artifact.RunResult,
-    opts: *const Options,
-    started_at: std.Io.Timestamp,
-    finished_at: std.Io.Timestamp,
-) noreturn {
-    print(
-        "using offline artifact backend={s} manifest={s}\n",
-        .{ artifact_result.backend, artifact_result.manifest_path },
-    );
-    if (!artifact_result.has_token) std.process.exit(1);
-    print("{s}\n", .{artifact_result.token_text});
-    if (opts.print_token_ids) {
-        print("token_ids: {d}\n", .{artifact_result.token_id});
-    }
-    if (opts.print_finish_reason or opts.print_token_count) {
-        if (opts.print_finish_reason and opts.print_token_count) {
-            print("finish_reason=max_tokens tokens=1\n", .{});
-        } else if (opts.print_finish_reason) {
-            print("finish_reason=max_tokens\n", .{});
-        } else {
-            print("tokens=1\n", .{});
-        }
-    }
-    if (opts.print_timing) {
-        const total_ms = durationMillis(started_at, finished_at);
-        print(
-            "timing_ms: load_model=0 prompt_prep=0 scheduler=0 backend_setup=0 decode_setup=0 generate={d} total={d}\n",
-            .{ total_ms, total_ms },
-        );
-    }
-    std.process.exit(0);
-}
-
 const CliStreamPrinter = struct {
     wrote_text: bool = false,
 
@@ -8090,48 +8023,119 @@ fn a4bInferenceRequest(opts: Options) ?ops.A4bInferenceRequest {
     };
 }
 
+fn acquireCliGenerationResources(
+    manager: *model_manager_mod.ModelManager,
+    target: backends.Session,
+    draft: ?backends.Session,
+    components: []const runtime.tier.memory.GptGenerationBudgetComponent,
+    limits: runtime.tier.memory.Limits,
+    prompt_tokens: usize,
+    max_tokens: usize,
+    chunk: *usize,
+    budget: *runtime.tier.memory.RunBudget,
+) !model_manager_mod.GenerationAdmissionLease {
+    const memory = runtime.tier.memory;
+    var requests: [2]model_manager_mod.GenerationAdmissionRequest = undefined;
+    while (true) {
+        for (components, 0..) |component, i| {
+            requests[i] = .{
+                .session = if (i == 0) target else draft.?,
+                .resources = .{
+                    .backend_class = if (component.backend == .native) .cpu else .gpu,
+                    .limits = limits,
+                    .amounts = memory.AdmissionAmounts.fromEstimate(try component.estimate(prompt_tokens, max_tokens, chunk.*)),
+                },
+            };
+        }
+        return manager.acquireGenerationResources(requests[0..components.len]) catch |err| {
+            if (err != error.ResourceTemporarilyUnavailable and err != error.ResourceLimitExceeded) return err;
+            if (chunk.* <= 32) return err;
+            for (components) |component| if (component.fixed_prefill_shape) {
+                return err;
+            };
+            const ceiling = std.math.ceilPowerOfTwo(usize, chunk.*) catch chunk.*;
+            const smaller = @max(@as(usize, 32), ceiling / 2);
+            budget.* = runtime.tier.memory.RunBudget.init(limits);
+            chunk.* = try runtime.tier.memory.reserveGptGenerationAtLargestChunk(budget, components, prompt_tokens, max_tokens, smaller);
+            continue;
+        };
+    }
+}
+
+const ModelLoadBudget = struct {
+    allocator: std.mem.Allocator,
+    options: Options,
+    resources: ?*model_manager_mod.ModelManager.SharedResources = null,
+
+    fn policy(self: *ModelLoadBudget) !model_manager_mod.ModelLoadPolicy {
+        return .{
+            .limits = try budgetOverrides(self.options).toByteLimits(),
+            .resources = self.resources,
+            .preflight = .{ .context = self, .check = check },
+        };
+    }
+
+    fn configure(self: *ModelLoadBudget, manager: *model_manager_mod.ModelManager) !void {
+        // Pass selective overrides, not defaults: the exact plan must widen
+        // its envelope before the operator's caps are applied.
+        try (try self.policy()).configure(manager);
+    }
+
+    fn check(raw: *anyopaque, model_dir: []const u8, manifest: *const manifest_mod.ModelManifest, backend: backends.BackendType, a4b_request: ?ops.A4bInferenceRequest) !model_manager_mod.ModelLoadAdmission {
+        const self: *const ModelLoadBudget = @ptrCast(@alignCast(raw));
+        var opts = self.options;
+        opts.model_dir = model_dir;
+        return preflightModelLoadBudget(self.allocator, manifest, opts, backend, a4b_request);
+    }
+};
+
+fn loadWeightTier(backend: backends.BackendType) runtime.tier.memory.ResidencyTier {
+    return if (backend.usesGpuHostedSession()) .backend else .host;
+}
+
 fn preflightModelLoadBudget(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
     opts: Options,
-) !void {
-    const reservation_tier = predictedWeightTier(allocator, manifest, opts.backend) orelse return;
-    const predicted_backend_type = predictedBackendType(opts.backend, reservation_tier);
-    if (predicted_backend_type == .metal or predicted_backend_type == .cuda) {
-        const a4b_config = if (predicted_backend_type == .cuda)
+    backend: backends.BackendType,
+    a4b_request: ?ops.A4bInferenceRequest,
+) !model_manager_mod.ModelLoadAdmission {
+    const reservation_tier = loadWeightTier(backend);
+    if (backend == .metal or backend == .cuda) {
+        const a4b_config = if (backend == .cuda)
             try session_factory.resolveCudaA4bInferenceConfigForModelListing(
                 allocator,
                 opts.model_dir,
                 manifest.*,
-                a4bInferenceRequest(opts),
+                a4b_request,
             )
         else
             try session_factory.resolveA4bInferenceConfigForModelListing(
                 allocator,
                 opts.model_dir,
                 manifest.*,
-                a4bInferenceRequest(opts),
+                a4b_request,
             );
         if (a4b_config != null) {
-            // Exact A4B loads are leased as one bounded weights+KV+scratch
-            // envelope by ModelManager. Reserving the full encoded GGUF here
-            // would reject the compact path before that authoritative gate.
-            return;
+            // Require the exact weights+KV+scratch construction plan and a
+            // retained lease, including in offline managers without a serving
+            // policy. The encoded GGUF size is not the resident GPU envelope.
+            return .managed;
         }
     }
-    const weight_bytes = estimatePreflightWeightBytes(allocator, manifest, opts) catch 0;
-    if (weight_bytes == 0) return;
+    const weight_bytes = estimateModelArtifactBytes(allocator, manifest) catch 0;
+    if (weight_bytes == 0) return .managed;
 
     var limits = runtime.tier.memory.defaultLimitsForBackend(switch (reservation_tier) {
         .host => .cpu,
         .backend => .gpu,
-        .disk => return,
+        .disk => return .preflight_checked,
     });
     limits = try session_factory.widenBudgetLimitsForModelPath(
         allocator,
         opts.model_dir,
         limits,
-        predicted_backend_type,
+        backend,
     );
     limits = try applyBudgetOverrides(limits, opts);
     var run_budget = runtime.tier.memory.RunBudget.init(limits);
@@ -8139,54 +8143,17 @@ fn preflightModelLoadBudget(
         if (err == error.MemoryBudgetExceeded) {
             var buf: [512]u8 = undefined;
             const msg = run_budget.lastDenialString(&buf) catch "memory budget exceeded before model load";
-            print("{s}; model artifact requires ~{d} MB before prompt/KV/scratch\n", .{
+            print("model load preflight ({s}): {s}; model artifact requires ~{d} MB before prompt/KV/scratch\n", .{
+                @tagName(backend),
                 msg,
                 weight_bytes / (1024 * 1024),
             });
         }
         return err;
     };
-}
-
-fn predictedWeightTier(
-    allocator: std.mem.Allocator,
-    manifest: *const manifest_mod.ModelManifest,
-    choice: BackendChoice,
-) ?runtime.tier.memory.ResidencyTier {
-    switch (choice) {
-        .native => return .host,
-        .metal => {
-            if (!build_options.enable_metal) return .host;
-            return .backend;
-        },
-        .cuda => {
-            if (!build_options.enable_cuda) return .host;
-            return .backend;
-        },
-        .auto => {
-            if (build_options.enable_metal and !shouldPreferNativeAheadOfMetal(allocator, manifest)) return .backend;
-            return .host;
-        },
-        .xla, .webgpu => return .host,
-    }
-}
-
-fn predictedBackendType(choice: BackendChoice, tier: runtime.tier.memory.ResidencyTier) backends.BackendType {
-    if (tier != .backend) return .native;
-    return switch (choice) {
-        .metal => .metal,
-        .cuda => .cuda,
-        .auto => .metal,
-        .native, .xla, .webgpu => .native,
-    };
-}
-
-fn shouldPreferNativeAheadOfMetal(
-    allocator: std.mem.Allocator,
-    manifest: *const manifest_mod.ModelManifest,
-) bool {
-    const total_bytes = estimateModelArtifactBytes(allocator, manifest) catch return true;
-    return total_bytes == 0 or total_bytes > metalEagerDenseMaxBytes();
+    // The canonical plan accounts for format expansion, host staging and
+    // retained workspace. Keep one source of truth for every CLI load.
+    return .managed;
 }
 
 fn estimateModelArtifactBytes(
@@ -8199,34 +8166,148 @@ fn estimateModelArtifactBytes(
     ) orelse error.ResourceLimitExceeded;
 }
 
-fn estimatePreflightWeightBytes(
-    allocator: std.mem.Allocator,
-    manifest: *const manifest_mod.ModelManifest,
-    opts: Options,
-) !usize {
-    const artifact_bytes = try estimateModelArtifactBytes(allocator, manifest);
-    if (opts.backend != .cuda or manifest.safetensors_path == null or manifest.config_path == null) return artifact_bytes;
-
-    const config_bytes = try c_file.readFile(allocator, manifest.config_path.?);
-    defer allocator.free(config_bytes);
-    const cfg = gpt_mod.parseConfig(allocator, config_bytes) catch return artifact_bytes;
-    if (cfg.family != .gemma) return artifact_bytes;
-
-    const embed_elements = std.math.mul(usize, @intCast(cfg.vocab_size), @intCast(cfg.hidden_size)) catch return artifact_bytes;
-    const embed_bytes = std.math.mul(usize, embed_elements, @sizeOf(f32)) catch return artifact_bytes;
-    const overhead_bytes: usize = 512 * 1024 * 1024;
-    return @min(artifact_bytes, embed_bytes + overhead_bytes);
-}
-
-fn metalEagerDenseMaxBytes() u64 {
-    const mb = platform.env.getenvUsize("TERMITE_METAL_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
-    return mb * 1024 * 1024;
-}
-
 fn validateVideoOptions(opts: Options) !void {
     if (opts.video_path == null) return;
     if (opts.image_count > 0 or opts.audio_count > 0) return error.UnsupportedMixedVideoInput;
     if (opts.raw_prompt or opts.draft_model != null) return error.UnsupportedVideoGenerationOption;
+}
+
+test "native generate shares target draft and artifact admission with refunds" {
+    const a = std.testing.allocator;
+    const mib: usize = 1024 * 1024;
+    var budget = ModelLoadBudget{ .allocator = a, .options = .{
+        .model_dir = "target",
+        .prompt = "hello",
+        .host_budget_mb = 8,
+        .combined_budget_mb = 8,
+        .scratch_budget_mb = 8,
+    } };
+    var resources = try model_manager_mod.ModelManager.SharedResources.init(a, try budgetOverrides(budget.options).toByteLimits());
+    defer resources.deinit();
+    budget.resources = &resources;
+    var draft = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer draft.deinit();
+    try budget.configure(&draft);
+    {
+        var target = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+        defer target.deinit();
+        try budget.configure(&target);
+        var target_lease = try target.admitHostPreflight(5 * mib);
+        defer target_lease.release();
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, draft.admitHostPreflight(5 * mib));
+        var artifact = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+        defer artifact.deinit();
+        try (try budget.policy()).configure(&artifact);
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, artifact.admitHostPreflight(5 * mib));
+        try std.testing.expectEqual(5 * mib, draft.currentAdmissionAmounts().hostTotalBytes());
+    }
+    // Closing a sibling must neither close the shared domain nor keep its
+    // reservations. The still-live draft can now use the released capacity.
+    var retry = try draft.admitHostPreflight(5 * mib);
+    retry.release();
+    try std.testing.expectEqual(@as(usize, 0), draft.currentAdmissionAmounts().hostTotalBytes());
+}
+
+test "native generate artifact fast path rejects load caps before tokenizer or plugin work" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const weights = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(weights);
+    @memset(weights, 0);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = weights });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"llama\",\"hidden_size\":4,\"num_hidden_layers\":1,\"num_attention_heads\":2,\"intermediate_size\":8,\"vocab_size\":16}" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var budget = ModelLoadBudget{ .allocator = a, .options = .{
+        .model_dir = root,
+        .prompt = "hello",
+        .backend = .xla,
+        .max_tokens = 1,
+        .host_budget_mb = 1,
+    } };
+    // A missing tokenizer/plugin must not mask the caller's load cap. This
+    // invokes the actual pre-model-load artifact entry point without a GPU.
+    try std.testing.expectError(error.MemoryBudgetExceeded, native_run_artifact.tryRunMatchingArtifact(a, std.testing.io, root, "xla", root, "hello", true, true, try budget.policy()));
+    const artifact_path = try std.fs.path.join(a, &.{ root, "model.exec" });
+    defer a.free(artifact_path);
+    const manifest_path = try std.fs.path.join(a, &.{ root, "model.exec.inference.json" });
+    defer a.free(manifest_path);
+    try compiled_artifact.writeManifest(a, std.testing.io, manifest_path, .{
+        .backend = "xla",
+        .kind = "pjrt_executable",
+        .model_dir = root,
+        .artifact_path = artifact_path,
+        .prompt_tokens = 1,
+        .seq_len = 1,
+        .query_seq_len = 1,
+        .attention_mode = "paged_prefill",
+        .raw_prompt = true,
+        .chat_template_applied = false,
+    });
+    try std.testing.expectError(error.MemoryBudgetExceeded, native_run_artifact.runArtifactPrompt(a, std.testing.io, manifest_path, "hello", false, true, true, try budget.policy()));
+    const package_path = try compiled_artifact.packageManifestPath(a, root, "xla", root, "pjrt_executable", compiled_artifact.pjrt_parameter_mode_inputs);
+    defer a.free(package_path);
+    try compiled_artifact.writePackageManifest(a, std.testing.io, package_path, .{
+        .backend = "xla",
+        .model_dir = root,
+        .kind = "pjrt_executable",
+        .pjrt_parameter_mode = compiled_artifact.pjrt_parameter_mode_inputs,
+        .artifacts = &.{.{ .manifest_path = manifest_path, .artifact_path = artifact_path, .artifact_role = compiled_artifact.artifact_role_prefill, .seq_len = 1, .query_seq_len = 1, .attention_mode = "paged_prefill" }},
+    });
+    try std.testing.expectError(error.MemoryBudgetExceeded, native_run_artifact.runArtifactPrompt(a, std.testing.io, package_path, "hello", false, true, true, try budget.policy()));
+}
+
+test "native generate installs selective load caps for target and draft managers" {
+    const a = std.testing.allocator;
+    var budget = ModelLoadBudget{ .allocator = a, .options = .{
+        .model_dir = "target",
+        .prompt = "hello",
+        .backend_budget_mb = 8192,
+        .kv_budget_mb = 512,
+        .scratch_budget_mb = 256,
+    } };
+    var target = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer target.deinit();
+    var draft = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer draft.deinit();
+    for ([_]*model_manager_mod.ModelManager{ &target, &draft }) |manager| {
+        try budget.configure(manager);
+        try std.testing.expect(manager.model_load_preflight != null);
+        try std.testing.expect(manager.admission_enabled);
+        const limits = manager.admission_limit_overrides;
+        try std.testing.expectEqual(@as(usize, 8192 * 1024 * 1024), limits.backend_limit_bytes);
+        try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), limits.kv_limit_bytes);
+        try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), limits.scratch_limit_bytes);
+        // The manager derives the combined cap from its resolved host and
+        // backend limits, after widening for the exact load plan.
+        try std.testing.expectEqual(@as(usize, 0), limits.host_limit_bytes);
+        try std.testing.expectEqual(@as(usize, 0), limits.combined_limit_bytes);
+    }
+}
+
+test "native generate load budget uses the resolved backend when options are automatic" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const weights = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(weights);
+    @memset(weights, 0);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = weights });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"bert\",\"hidden_size\":4,\"num_hidden_layers\":1,\"num_attention_heads\":2,\"intermediate_size\":8,\"vocab_size\":16}" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "model.safetensors" });
+    defer a.free(path);
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .safetensors_path = path };
+    const options = Options{ .model_dir = root, .prompt = "hello", .backend = .auto, .host_budget_mb = 1, .backend_budget_mb = 8, .combined_budget_mb = 16 };
+    // No device is loaded: preflight must charge the actual candidate's tier,
+    // rather than rejecting the CUDA candidate against the CPU host cap.
+    try std.testing.expectEqual(.managed, try preflightModelLoadBudget(a, &manifest, options, .cuda, null));
+    try std.testing.expectError(error.MemoryBudgetExceeded, preflightModelLoadBudget(a, &manifest, options, .native, null));
+    var capped = options;
+    capped.backend_budget_mb = 1;
+    try std.testing.expectError(error.MemoryBudgetExceeded, preflightModelLoadBudget(a, &manifest, capped, .cuda, null));
 }
 
 test "video CLI accepts one clip and rejects conflicting inputs" {
@@ -8271,17 +8352,21 @@ fn printUsage() void {
 }
 
 fn budgetOverrideLimits(opts: Options) !runtime.tier.memory.Limits {
-    return (runtime.tier.memory.BudgetOverridesMib{
+    return budgetOverrides(opts).toByteLimits();
+}
+
+fn budgetOverrides(opts: Options) runtime.tier.memory.BudgetOverridesMib {
+    return .{
         .host = opts.host_budget_mb,
         .backend = opts.backend_budget_mb,
         .combined = opts.combined_budget_mb,
         .kv = opts.kv_budget_mb,
         .scratch = opts.scratch_budget_mb,
-    }).toByteLimits();
+    };
 }
 
 fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) !runtime.tier.memory.Limits {
-    return runtime.tier.memory.applyLimitOverrides(defaults, try budgetOverrideLimits(opts));
+    return budgetOverrides(opts).apply(defaults);
 }
 
 fn graphModeEnabled() bool {
@@ -9425,4 +9510,80 @@ test "native generation raw budget overrides preserve omitted composite and scra
     try std.testing.expectEqual(@as(usize, 2 * mib), explicit.scratch_limit_bytes);
     opts.host_budget_mb = std.math.maxInt(usize);
     try std.testing.expectError(error.Overflow, budgetOverrideLimits(opts));
+}
+
+test "native generate artifact tokenizer admission rejects oversized parse before lookup" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = "x" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"llama\",\"hidden_size\":4,\"num_hidden_layers\":1,\"num_attention_heads\":2,\"intermediate_size\":8,\"vocab_size\":2}" });
+    const json = "{\"version\":\"1.0\",\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0,\"b\":1},\"merges\":[]}}";
+    const padded = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(padded);
+    @memset(padded, ' ');
+    @memcpy(padded[0..json.len], json);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data = padded });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var budget = ModelLoadBudget{ .allocator = a, .options = .{
+        .model_dir = root,
+        .prompt = "a",
+        .backend = .xla,
+        .max_tokens = 1,
+        .host_budget_mb = 1,
+        .combined_budget_mb = 1,
+    } };
+    var resources = try model_manager_mod.ModelManager.SharedResources.init(a, try budgetOverrides(budget.options).toByteLimits());
+    defer resources.deinit();
+    budget.resources = &resources;
+    // Weights fit, but tokenizer construction must fail before parsing.
+    try std.testing.expectError(error.ResourceLimitExceeded, native_run_artifact.tryRunMatchingArtifact(a, std.testing.io, root, "xla", root, "a", true, true, try budget.policy()));
+    var observer = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer observer.deinit();
+    try budget.configure(&observer);
+    try std.testing.expectEqual(@as(usize, 0), observer.currentAdmissionAmounts().hostTotalBytes());
+}
+
+test "native generate admits target draft transients beside residency and shrinks prefill" {
+    const a = std.testing.allocator;
+    const memory = runtime.tier.memory;
+    const cfg = gpt_mod.Config{
+        .family = .llama,
+        .hidden_size = 128,
+        .num_hidden_layers = 4,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 4,
+        .intermediate_size = 256,
+        .vocab_size = 1024,
+    };
+    const small = memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 32));
+    const large = memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 256));
+    const resident_bytes = 4 * large.hostTotalBytes();
+    const limits = memory.Limits{ .host_limit_bytes = resident_bytes + 2 * small.hostTotalBytes(), .combined_limit_bytes = resident_bytes + 2 * small.hostTotalBytes() };
+    var resources = try model_manager_mod.ModelManager.SharedResources.init(a, limits);
+    defer resources.deinit();
+    var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    try (model_manager_mod.ModelLoadPolicy{ .limits = limits, .resources = &resources }).configure(&manager);
+    var residency = try manager.admitHostPreflight(resident_bytes);
+    defer residency.release();
+    const session = backends.Session{ .ptr = undefined, .vtable = undefined };
+    const component = memory.GptGenerationBudgetComponent{ .backend = .native, .kv_dtype = .f16, .config = cfg };
+    const components = [_]memory.GptGenerationBudgetComponent{ component, component };
+    var budget = memory.RunBudget.init(limits);
+    var chunk = try memory.reserveGptGenerationAtLargestChunk(&budget, &components, 256, 1, 256);
+    try std.testing.expectEqual(@as(usize, 256), chunk);
+    {
+        var lease = try acquireCliGenerationResources(&manager, session, session, &components, limits, 256, 1, &chunk, &budget);
+        defer lease.release();
+        try std.testing.expectEqual(@as(usize, 32), chunk);
+        try std.testing.expectEqual(limits.host_limit_bytes, manager.currentAdmissionAmounts().hostTotalBytes());
+    }
+    try std.testing.expectEqual(resident_bytes, manager.currentAdmissionAmounts().hostTotalBytes());
+    var extra = try manager.admitHostPreflight(small.hostTotalBytes());
+    defer extra.release();
+    const before = manager.currentAdmissionAmounts();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, acquireCliGenerationResources(&manager, session, session, &components, limits, 256, 1, &chunk, &budget));
+    try std.testing.expectEqualDeep(before, manager.currentAdmissionAmounts());
 }

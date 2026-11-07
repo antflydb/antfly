@@ -462,13 +462,14 @@ pub const PreparedCudaWeights = struct {
 
 pub fn prepare(
     allocator: std.mem.Allocator,
-    model_path: []const u8,
+    requested_model_path: []const u8,
     override: ?TaskOverride,
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
     required_profile_override: ?CudaCapabilityProfile,
     gliner_precision: GlinerCudaPrecision,
+    selected_manifest: ?*const manifest_mod.ModelManifest,
 ) !PreparedCudaWeights {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
     const load_started_ns = platform.time.monotonicNs();
@@ -478,7 +479,8 @@ pub fn prepare(
         return error.KernelJitRequiredDynamicLoad;
     }
 
-    var model_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+    var model_manifest = if (selected_manifest) |selected| try selected.clone(allocator) else try manifest_mod.loadFromDir(allocator, requested_model_path);
+    const model_path = model_manifest.source_root orelse requested_model_path;
     var manifest_owned = true;
     defer if (manifest_owned) model_manifest.deinit();
     try model_manifest.requireRecognizedGlinerArchitecture();

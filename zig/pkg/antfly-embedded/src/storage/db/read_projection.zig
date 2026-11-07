@@ -391,6 +391,7 @@ pub fn loadArtifactFieldValueTxn(
             while (try chunks.next()) |entry| {
                 var ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse return error.ArtifactCatalogCorrupt;
                 defer ref.deinit(alloc);
+                if (@import("../../privacy/document.zig").isManagedArtifactName(ref.name)) continue;
                 var value = try artifactProjectionValue(self, alloc, ref, entry.value, artifact_catalog);
                 errdefer freeJsonValue(alloc, &value);
                 try appendArtifactProjectionValue(alloc, &artifacts_obj, ref.name, ref.kind, value);
@@ -425,6 +426,7 @@ pub fn loadArtifactFieldValueTxn(
             for (artifacts) |entry| {
                 var ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse continue;
                 defer ref.deinit(alloc);
+                if (@import("../../privacy/document.zig").isManagedArtifactName(ref.name)) continue;
                 var value = try artifactProjectionValue(self, alloc, ref, entry.value, artifact_catalog);
                 errdefer freeJsonValue(alloc, &value);
                 try appendArtifactProjectionValue(alloc, &artifacts_obj, ref.name, ref.kind, value);

@@ -148,6 +148,11 @@ pub const StorageOwnerContext = struct {
     // An unconfigured facade denies destinations; acquisition errors propagate.
     remote_content: scraping.RemoteContentConfig = .{ .security = .{ .allowed_hosts = &.{}, .allowed_paths = &.{} } },
     secret_store: ?*common_secrets.FileStore = null,
+    /// Node-level default inference endpoint and unresolved credential
+    /// reference. Storage-owned enrichment inherits them exactly as the API
+    /// server does; the key resolves through `secret_store` per request.
+    inference_api_url: ?[]u8 = null,
+    inference_api_key: ?[]u8 = null,
     lite_backend: ?lite_backend.Handle = null,
     auth_backend: ?antfly.lsm_backend.BackendHandle = null,
     auth_users_store: ?antfly.storage_backend_erased.Store = null,
@@ -177,6 +182,17 @@ pub const StorageOwnerContext = struct {
         return inference_provider.inferenceBoundaryProvider(lifetime);
     }
 
+    pub fn inferenceDefaults(self: *const StorageOwnerContext) local_write.InferenceDefaults {
+        return .{ .api_url = self.inference_api_url, .api_key = self.inference_api_key, .secret_store = self.secret_store };
+    }
+
+    fn clearInferenceDefaults(self: *StorageOwnerContext) void {
+        if (self.inference_api_url) |value| self.alloc.free(value);
+        if (self.inference_api_key) |value| self.alloc.free(value);
+        self.inference_api_url = null;
+        self.inference_api_key = null;
+    }
+
     pub fn remoteContent(self: *const StorageOwnerContext) ?*const scraping.RemoteContentConfig {
         return if (self.remote_content_security != null or self.remote_content_source != null) &self.remote_content else null;
     }
@@ -194,6 +210,7 @@ pub const StorageOwnerContext = struct {
         if (self.auth_backend) |*backend| backend.close();
         if (self.lite_backend) |*backend| backend.deinit();
         if (self.remote_content_security) |*parsed| parsed.deinit();
+        self.clearInferenceDefaults();
         if (self.native_queries) |repository| {
             self.backend_runtime.ptr().query_cut_repository = null;
             repository.deinit();
@@ -529,7 +546,7 @@ pub const StorageOwnerRuntimeHooks = struct {
 
     pub fn artifactPublicationDispatcher(self: *StorageOwnerRuntimeHooks) ?db_mod.ArtifactPublicationDispatcher {
         if (self.config.artifact_publication_enqueue_fn == null) return null;
-        return .{ .ptr = self, .enqueue = enqueueArtifactPublication, .upload_recovery = .{ .recover = recoverArtifactUploads, .should_poll = shouldRecoverArtifactUploads } };
+        return .{ .ptr = self, .enqueue_status = enqueueArtifactPublicationStatus, .upload_recovery = .{ .recover = recoverArtifactUploads, .should_poll = shouldRecoverArtifactUploads } };
     }
 
     fn shouldRecoverArtifactUploads(ptr: *anyopaque, tick: @import("antfly_local_sources").storage_db_artifact_publication.UploadRecoveryTick) bool {
@@ -543,9 +560,13 @@ pub const StorageOwnerRuntimeHooks = struct {
     }
 
     pub fn enqueueArtifactPublication(ptr: *anyopaque, namespace: [24]u8, command: []const u8) !void {
+        try kernel_error_identity.statusToError(enqueueArtifactPublicationStatus(ptr, &namespace, command.ptr, command.len));
+    }
+
+    pub fn enqueueArtifactPublicationStatus(ptr: *anyopaque, namespace: *const [24]u8, command: [*]const u8, command_len: usize) callconv(.c) kernel_owner_abi.Status {
         const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
-        const enqueue = self.config.artifact_publication_enqueue_fn orelse return error.ArtifactCatalogDrift;
-        try kernel_error_identity.statusToError(enqueue(self.config.artifact_publication_ctx, self.group_id, &namespace, .fromSlice(command)));
+        const enqueue = self.config.artifact_publication_enqueue_fn orelse return .artifact_catalog_drift;
+        return enqueue(self.config.artifact_publication_ctx, self.group_id, namespace, .fromSlice(command[0..command_len]));
     }
 
     const CandidateCapture = struct {
@@ -872,6 +893,28 @@ pub fn storageOwnerContextConfigureSecrets(context: ?*anyopaque, store: ?*anyopa
     defer owner_context.mutex.unlock();
     if (owner_context.active_owners != 0) return .busy;
     owner_context.secret_store = if (store) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    return .ok;
+}
+
+/// Copies the node-level default inference endpoint and credential reference.
+/// Empty values clear them. Configure before opening any table owner.
+pub fn storageOwnerContextConfigureInferenceDefaults(
+    context: ?*anyopaque,
+    api_url: kernel_owner_abi.BorrowedBytes,
+    api_key: kernel_owner_abi.BorrowedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    owner_context.lock();
+    defer owner_context.mutex.unlock();
+    if (owner_context.active_owners != 0) return .busy;
+    const next_url: ?[]u8 = if (api_url.slice().len == 0) null else owner_context.alloc.dupe(u8, api_url.slice()) catch |err| return storageOwnerStatusFromError(err);
+    const next_key: ?[]u8 = if (api_key.slice().len == 0) null else owner_context.alloc.dupe(u8, api_key.slice()) catch |err| {
+        if (next_url) |value| owner_context.alloc.free(value);
+        return storageOwnerStatusFromError(err);
+    };
+    owner_context.clearInferenceDefaults();
+    owner_context.inference_api_url = next_url;
+    owner_context.inference_api_key = next_key;
     return .ok;
 }
 
@@ -1885,7 +1928,10 @@ pub fn metadataApplyStoreProjection(
             const Input = antfly.capi_dependencies.metadata_storage_raft_apply_contract.StandaloneCatalogUpdate;
             var input = std.json.parseFromSlice(Input, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
             defer input.deinit();
-            handle.store.updateStandaloneCatalog(request.group_id, request.arg0, input.value) catch |err| break :blk storageOwnerStatusFromError(err);
+            handle.store.updateStandaloneCatalog(request.group_id, request.arg0, input.value) catch |err| {
+                std.log.warn("standalone catalog update failed bytes={} err={s}", .{ request.key.len, @errorName(err) });
+                break :blk storageOwnerStatusFromError(err);
+            };
             break :blk metadataProjectionJson(alloc, out_json, true);
         },
         .system_catalog => blk: {
@@ -1923,6 +1969,14 @@ pub fn metadataApplyStoreProjection(
                 },
                 .catalog_list_tables => |input| {
                     const value = handle.store.listSystemCatalogTables(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .privacy_due_table => |now| {
+                    const value = handle.store.nextPrivacyTable(a, group_id, now) catch |err| break :blk metadataProjectionStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .table_by_name => |name| {
+                    const value = handle.store.tableByName(a, group_id, name) catch |err| break :blk metadataProjectionStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .catalog_meta => {
@@ -2219,7 +2273,7 @@ pub fn metadataApplyStoreProjection(
             const Input = struct { current: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, term: u64 = 0, index: u64 = 0 };
             var parsed = std.json.parseFromSlice(Input, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
             defer parsed.deinit();
-            const value = (if (request.arg0 == 1) handle.store.resolverNamespaceReplacementRejected(alloc, request.group_id, parsed.value.term, parsed.value.index, parsed.value.current, parsed.value.replacement) else handle.store.resolverNamespaceReplacementMatches(alloc, request.group_id, parsed.value.current, parsed.value.replacement)) catch |err| break :blk storageOwnerStatusFromError(err);
+            const value = (if (request.arg0 == 1) handle.store.tableDefinitionReplacementRejected(alloc, request.group_id, parsed.value.term, parsed.value.index, parsed.value.current, parsed.value.replacement) else handle.store.resolverNamespaceReplacementMatches(alloc, request.group_id, parsed.value.current, parsed.value.replacement)) catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
         .catalog_cursor => blk: {
@@ -2517,6 +2571,8 @@ pub fn dataApplyStoreOpen(
         .read_only = request.read_only != 0,
         .native_source_delegate = request.native_source_delegate != 0,
         .resource_manager = if (context) |value| &value.resources.resource_manager else null,
+        .backend_runtime = if (context) |value| value.backend_runtime.ptr() else null,
+        .io = if (context) |value| value.backend_runtime.ptr().filesystemIo() else null,
     }) catch |err| return storageOwnerStatusFromError(err);
     errdefer store.deinit();
     const handle = alloc.create(DataApplyStoreHandle) catch return .out_of_memory;
@@ -3592,6 +3648,7 @@ pub fn storageOwnerOpen(
             if (owner_context) |context| context.antflyProvider() else null,
             if (owner_context) |context| context.secret_store else null,
             if (owner_context) |context| context.remoteContent() else null,
+            if (owner_context) |context| context.inferenceDefaults() else .{},
             &handle.storage_owner_managed_config,
             request.historical_raft_apply != 0,
         ) catch |err| return storageOwnerStatusFromError(err);
@@ -3639,6 +3696,7 @@ pub fn storageOwnerConfigure(
         if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.antflyProvider() else null,
         if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.secret_store else null,
         if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.remoteContent() else null,
+        if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.inferenceDefaults() else .{},
         &handle.storage_owner_managed_config,
     ) catch |err| {
         std.log.err("storage owner configure failed table={s} err={s}", .{
@@ -3702,6 +3760,7 @@ pub fn storageOwnerReconcile(
             request.advance_index_repair != 0,
             if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.backend_runtime.ptr() else null,
             if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.antflyProvider() else null,
+            if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.inferenceDefaults() else .{},
             &handle.storage_owner_managed_config,
         ) catch |err| return storageOwnerStatusFromError(err);
     out_result.* = .{
@@ -4743,6 +4802,7 @@ pub fn prepareStorageSnapshot(request: *const kernel_owner_abi.SnapshotPrepareRe
         null,
         null,
         null,
+        .{},
         null,
     );
 

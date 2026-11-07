@@ -250,7 +250,18 @@ const decoder_candidates = &[_][]const u8{
 /// Discovery only. The runtime qualifies the loaded graph before choosing it;
 /// filename presence is not a cache capability declaration.
 pub fn findMergedDecoder(allocator: std.mem.Allocator, model_dir: []const u8) !?[]const u8 {
-    return findModelFile(allocator, model_dir, &.{"decoder_model_merged.onnx"});
+    var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, std.Options.debug_io, model_dir, null);
+    defer artifacts.deinit();
+    return findMergedDecoderWithArtifacts(&artifacts);
+}
+
+/// Warm planning resolves receipt membership only; graph hashing belongs to
+/// the coalesced cold constructor, not to every cached acquisition.
+pub fn findMergedDecoderWithArtifacts(artifacts: *const @import("../registry/published_artifacts.zig").PublishedArtifacts) !?[]const u8 {
+    for ([_][]const u8{ "decoder_model_merged.onnx", "onnx/decoder_model_merged.onnx" }) |relative| {
+        if (try artifacts.resolveModel(relative)) |path| return path;
+    }
+    return null;
 }
 
 /// Check if a model directory contains encoder-decoder ONNX files.
@@ -274,8 +285,15 @@ pub fn isEncoderDecoderModel(model_dir: []const u8) bool {
 pub const EncoderDecoderPaths = struct { encoder: []const u8, decoder: []const u8 };
 
 pub fn findEncoderDecoderPaths(allocator: std.mem.Allocator, model_dir: []const u8) !EncoderDecoderPaths {
-    const encoder_path = try findModelFile(allocator, model_dir, encoder_candidates);
-    const decoder_path = findModelFile(allocator, model_dir, decoder_candidates) catch |err| {
+    var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, std.Options.debug_io, model_dir, null);
+    defer artifacts.deinit();
+    return findEncoderDecoderPathsWithArtifacts(allocator, model_dir, &artifacts);
+}
+
+/// Reuse one acquisition's checksum proofs across selection and construction.
+pub fn findEncoderDecoderPathsWithArtifacts(allocator: std.mem.Allocator, model_dir: []const u8, artifacts: *@import("../registry/published_artifacts.zig").PublishedArtifacts) !EncoderDecoderPaths {
+    const encoder_path = try findPublishedModelFile(allocator, artifacts, encoder_candidates);
+    const decoder_path = findPublishedModelFile(allocator, artifacts, decoder_candidates) catch |err| {
         if (encoder_path) |path| allocator.free(path);
         return err;
     };
@@ -290,6 +308,21 @@ pub fn findEncoderDecoderPaths(allocator: std.mem.Allocator, model_dir: []const 
     defer manifest.deinit();
 
     return nativeFlorenceEncoderDecoderPaths(allocator, model_dir, manifest);
+}
+
+fn findPublishedModelFile(a: std.mem.Allocator, artifacts: *@import("../registry/published_artifacts.zig").PublishedArtifacts, candidates: []const []const u8) !?[]const u8 {
+    for ([_][]const u8{ "", "onnx" }) |directory| {
+        for (candidates) |name| {
+            const relative = if (directory.len == 0) try a.dupe(u8, name) else try std.fs.path.join(a, &.{ directory, name });
+            defer a.free(relative);
+            if (try artifacts.resolveModel(relative)) |path| {
+                errdefer a.free(path);
+                try artifacts.verifyFile(relative);
+                return path;
+            }
+        }
+    }
+    return null;
 }
 
 /// The Florence fallback of `findEncoderDecoderPaths`, against a manifest the caller
@@ -353,6 +386,10 @@ pub fn loadDecoderConfigFile(allocator: std.mem.Allocator, path: []const u8) !De
     const data = try c_file.readFile(allocator, path);
     defer allocator.free(data);
 
+    return parseDecoderConfig(data);
+}
+
+pub fn parseDecoderConfig(data: []const u8) !DecoderConfig {
     var config = DecoderConfig{};
     const hidden_width = jsonGetInt(data, "d_model") orelse jsonGetInt(data, "hidden_size");
     if (hidden_width) |value| {
@@ -544,4 +581,23 @@ test "encoder decoder task shares actual resident and host route owner without c
             try std.testing.checkAllAllocationFailures(a, Case.run, .{ &task, @as(*const stage_runtime.EncoderOutputs, &encoded) });
         }
     }
+}
+
+test "model selection component discovery preserves ONNX aliases before binding" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "blobs");
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/encoder", .data = "data" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/decoder", .data = "data" });
+    try tmp.dir.symLink(io, "blobs/encoder", "encoder_model.onnx", .{});
+    try tmp.dir.symLink(io, "blobs/decoder", "decoder_model.onnx", .{});
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const paths = try findEncoderDecoderPaths(a, root);
+    defer a.free(paths.encoder);
+    defer a.free(paths.decoder);
+    try std.testing.expect(std.mem.endsWith(u8, paths.encoder, "/encoder_model.onnx"));
+    try std.testing.expect(std.mem.endsWith(u8, paths.decoder, "/decoder_model.onnx"));
 }

@@ -155,12 +155,13 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
         progress.result.scanned_rows = try std.math.add(u64, progress.result.scanned_rows, scanned);
         if (live.items.len != 0) {
             if (progress.outputs.len == 65536) return error.LakeWriteTooLarge;
-            const output = try catalog.compaction.writeOutput(scratch, progress.parent, destination, job.operation_id, progress.outputs.len, live.items);
-            const appended = try scratch.alloc(catalog.compaction.Output, progress.outputs.len + 1);
+            const output = try catalog.compaction.writeOutputs(scratch, progress.parent, destination, job.operation_id, progress.outputs.len, live.items);
+            const appended = try scratch.alloc(catalog.compaction.Output, try std.math.add(usize, progress.outputs.len, output.len));
             @memcpy(appended[0..progress.outputs.len], progress.outputs);
-            appended[progress.outputs.len] = output;
+            if (appended.len > 65536) return error.LakeWriteTooLarge;
+            @memcpy(appended[progress.outputs.len..], output);
             progress.outputs = appended;
-            progress.result.output_rows += output.rows;
+            progress.result.output_rows += live.items.len;
             progress.result.output_files = progress.outputs.len;
         }
         if (progress.file == progress.selection.files.len) {

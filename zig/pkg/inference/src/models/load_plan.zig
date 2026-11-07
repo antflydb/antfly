@@ -16,6 +16,8 @@
 //! Artifact-derived load/admission geometry. This layer describes tokenizer,
 //! representation, persistent-weight and temporary preparation requirements;
 //! serving owns eviction, admission leases, publication and cancellation lanes.
+const PublishedArtifacts = @import("../registry/published_artifacts.zig").PublishedArtifacts;
+const ModelSource = @import("model_source.zig").ModelSource;
 const tokenizer_loader = @import("tokenizer_loader.zig");
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
@@ -112,9 +114,19 @@ pub fn tokenizerLoadAdmissionPlan(
     man: *const manifest_mod.ModelManifest,
     tokenizer_type: manifest_mod.TokenizerType,
 ) !ModelLoadAdmissionPlan {
+    return tokenizerLoadAdmissionPlanWithArtifacts(allocator, model_dir, man, tokenizer_type, null);
+}
+
+pub fn tokenizerLoadAdmissionPlanWithArtifacts(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    man: *const manifest_mod.ModelManifest,
+    tokenizer_type: manifest_mod.TokenizerType,
+    artifacts: ?*PublishedArtifacts,
+) !ModelLoadAdmissionPlan {
+    var sentencepiece_sidecar_bytes: usize = 0;
     // Admission and loading must inspect the same catalog-selected artifacts,
     // including export-local vocabularies and root metadata fallbacks.
-    var sentencepiece_sidecar_bytes: usize = 0;
     if (tokenizer_type == .huggingface) {
         if (man.tokenizer_json_path) |path| return tokenizerFileAdmissionPlan(allocator, path, .huggingface);
         if (man.vocab_txt_path) |path| {
@@ -128,24 +140,37 @@ pub fn tokenizerLoadAdmissionPlan(
             return tokenizerAdmissionPlan(encoded, .wordpiece);
         }
     } else {
+        var encoded: usize = 0;
         var found_sentencepiece = false;
-        for (0..1 + tokenizer_loader.sentencepiece_sidecars.len) |index| {
-            const name = if (index == 0) tokenizer_loader.sentencepiece_model_filename else tokenizer_loader.sentencepiece_sidecars[index - 1].filename;
-            const path = try std.fs.path.join(allocator, &.{ model_dir, name });
+        const sidecars = [_][]const u8{
+            "tokenizer.model",
+            "tokenizer.json",
+            "added_tokens.json",
+        };
+        for (sidecars) |name| {
+            const path = if (artifacts) |source|
+                (try source.resolve(name)) orelse continue
+            else
+                try std.fs.path.join(allocator, &.{ model_dir, name });
             defer allocator.free(path);
-            const size_u64 = c_file.fileSize(allocator, path) catch |err| switch (err) {
-                error.FileNotFound => continue,
-                else => return err,
-            };
-            const size = std.math.cast(usize, size_u64) orelse return error.ResourceLimitExceeded;
-            sentencepiece_sidecar_bytes = std.math.add(usize, sentencepiece_sidecar_bytes, size) catch return error.ResourceLimitExceeded;
-            if (index == 0) found_sentencepiece = true;
+            if (artifacts == null and !c_file.fileExists(allocator, path)) continue;
+            const size = std.math.cast(
+                usize,
+                try c_file.fileSize(allocator, path),
+            ) orelse return error.ResourceLimitExceeded;
+            encoded = std.math.add(usize, encoded, size) catch
+                return error.ResourceLimitExceeded;
+            if (std.mem.eql(u8, name, "tokenizer.model")) {
+                found_sentencepiece = true;
+            }
         }
         if (found_sentencepiece) {
-            return tokenizerAdmissionPlan(sentencepiece_sidecar_bytes, .sentencepiece);
+            return tokenizerAdmissionPlan(encoded, .sentencepiece);
         }
+        sentencepiece_sidecar_bytes = encoded;
     }
     if (man.gguf_path) |path| {
+        if (artifacts) |source| try source.verifyPath(path);
         var region = try c_file.MmapRegion.init(allocator, path);
         defer region.deinit();
         const encoded = try gguf_format.encodedMetadataBytesWithPrefix(
@@ -180,13 +205,14 @@ pub fn tokenizerLoadAdmissionPlan(
 pub const ComponentArtifactEstimate = union(enum) {
     disabled,
     onnx: usize,
-    native: manifest_mod.ModelManifest,
+    native: *const manifest_mod.ModelManifest,
 
-    pub fn init(allocator: std.mem.Allocator, model_path: []const u8) !ComponentArtifactEstimate {
-        if (std.mem.endsWith(u8, model_path, ".onnx")) {
-            var artifacts = try backends.imported_onnx_session.inspectArtifactSet(
+    pub fn init(allocator: std.mem.Allocator, source: ModelSource) !ComponentArtifactEstimate {
+        if (source.kind == .onnx) {
+            var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithBase(
                 allocator,
-                model_path,
+                source.path,
+                source.external_base_dir,
             );
             defer artifacts.deinit();
             return .{ .onnx = artifacts.encoded_bytes };
@@ -195,14 +221,10 @@ pub const ComponentArtifactEstimate = union(enum) {
         // Native sessions accept directories as well as direct GGUF paths.
         // Loading the manifest is essential here: a directory's stat size only
         // describes its entries and bears no relation to resident model bytes.
-        return .{ .native = try manifest_mod.loadFromDir(allocator, model_path) };
+        return .{ .native = source.manifest orelse return error.NoModelFileFound };
     }
 
     pub fn deinit(self: *ComponentArtifactEstimate) void {
-        switch (self.*) {
-            .native => |*man| man.deinit(),
-            .disabled, .onnx => {},
-        }
         self.* = .disabled;
     }
 
@@ -210,7 +232,7 @@ pub const ComponentArtifactEstimate = union(enum) {
         return switch (self.*) {
             .disabled => 0,
             .onnx => |bytes| bytes,
-            .native => |man| estimateModelArtifactBytes(man),
+            .native => |man| estimateModelArtifactBytes(man.*),
         };
     }
 
@@ -220,7 +242,7 @@ pub const ComponentArtifactEstimate = union(enum) {
     ) runtime.tier.memory.AdmissionAmounts {
         if (backend != .metal) return .{};
         return switch (self.*) {
-            .native => |man| session_factory.metalDebertaFastPathAdmissionAmounts(man),
+            .native => |man| session_factory.metalDebertaFastPathAdmissionAmounts(man.*),
             .disabled, .onnx => .{},
         };
     }
@@ -248,7 +270,11 @@ pub fn estimateModelArtifactBytes(man: manifest_mod.ModelManifest) !usize {
         total = std.math.add(usize, total, native_weight_bytes) catch
             return error.ResourceLimitExceeded;
     } else {
-        try addArtifactBytes(&total, man.allocator, man.onnx_path);
+        if (man.onnx_path) |path| {
+            var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithBase(man.allocator, path, if (man.onnx_logical_path) |logical| std.fs.path.dirname(logical) else null);
+            defer artifacts.deinit();
+            total = artifacts.encoded_bytes;
+        }
     }
 
     if (total == 0) return error.NoModelFileFound;
@@ -262,46 +288,8 @@ pub fn estimateModelLoadAdmission(
     a4b_request: ?backend_contracts.A4bInferenceRequest,
     laya_packed: bool,
 ) !ModelLoadAdmissionPlan {
-    const weights = try estimateModelArtifactBytes(man);
-    if (!manifestHasNativeAssets(man)) return onnxModelLoadAdmission(weights, backend_runtime);
-    if (backend_runtime.backend == .metal) {
-        if (!laya_packed) {
-            if (try session_factory.layaResidentLoadAmounts(man, weights)) |resident| {
-                return .{ .peak = resident.peak, .resident = resident.resident };
-            }
-        }
-        if (try session_factory.glinerBoundaryResidentLoadAmounts(man, weights)) |resident| {
-            return .{ .peak = resident.peak, .resident = resident.resident };
-        }
-    }
-    if (backend_runtime.backend == .metal or backend_runtime.backend == .cuda) {
-        const config = if (backend_runtime.backend == .cuda)
-            try session_factory.resolveCudaA4bInferenceConfigForModelListing(
-                man.allocator,
-                model_path,
-                man,
-                a4b_request,
-            )
-        else
-            try session_factory.resolveA4bInferenceConfigForModelListing(
-                man.allocator,
-                model_path,
-                man,
-                a4b_request,
-            );
-        if (config) |resolved| {
-            return a4bGpuModelLoadAdmission(resolved, weights, backend_runtime.backend);
-        }
-    }
-    const extra_backend_resident = if (backend_runtime.backend == .metal)
-        session_factory.metalDebertaFastPathAdmissionAmounts(man)
-    else
-        runtime.tier.memory.AdmissionAmounts{};
-    var plan = try nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
-    if (backend_runtime.backend == .metal) {
-        try addMetalResidentHostSource(&plan, metalQualifiedSpecialtyF32HostSourceBytes(man, weights));
-    }
-    return plan;
+    const base = try estimateBaseModelLoadAdmission(model_path, man, backend_runtime, a4b_request, laya_packed);
+    return withJinaAdapterAdmission(man, backend_runtime.backend, base);
 }
 
 pub fn a4bGpuModelLoadAdmission(
@@ -552,4 +540,68 @@ pub fn addMetalResidentHostSource(plan: *ModelLoadAdmissionPlan, bytes: usize) !
     ) catch return error.ResourceLimitExceeded;
     plan.resident.host_weight_bytes = resident_host;
     plan.peak.host_weight_bytes = peak_host;
+}
+
+pub fn withJinaAdapterAdmission(man: manifest_mod.ModelManifest, backend: backends.BackendType, base: ModelLoadAdmissionPlan) !ModelLoadAdmissionPlan {
+    if (!session_factory.usesJinaRetrievalAdapter(man, backend)) return base;
+    const adapter = (try man.jinaRetrievalAdapter()) orelse return base;
+    const weights = std.math.cast(usize, try c_file.fileSize(man.allocator, adapter.weights)) orelse return error.ResourceLimitExceeded;
+    const config = std.math.cast(usize, try c_file.fileSize(man.allocator, adapter.config)) orelse return error.ResourceLimitExceeded;
+    // Mapping/header parsing and F32 staging are temporary on CPU/CUDA. Metal
+    // retains the adapter reader for lazy merges; its encoded mapping stays live.
+    const peak = try checkedScaledBytes(weights, 5, try checkedScaledBytes(config, 13, 0));
+    var result = base;
+    result.peak.host_weight_bytes = std.math.add(usize, result.peak.host_weight_bytes, peak) catch return error.ResourceLimitExceeded;
+    if (backend == .metal) result.resident.host_weight_bytes = std.math.add(usize, result.resident.host_weight_bytes, weights) catch return error.ResourceLimitExceeded;
+    return result;
+}
+
+pub fn estimateBaseModelLoadAdmission(
+    model_path: []const u8,
+    man: manifest_mod.ModelManifest,
+    backend_runtime: backends.BackendRuntime,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+    laya_packed: bool,
+) !ModelLoadAdmissionPlan {
+    const weights = try estimateModelArtifactBytes(man);
+    if (!manifestHasNativeAssets(man)) return onnxModelLoadAdmission(weights, backend_runtime);
+    if (backend_runtime.backend == .metal) {
+        if (!laya_packed) {
+            if (try session_factory.layaResidentLoadAmounts(man, weights)) |resident| {
+                return .{ .peak = resident.peak, .resident = resident.resident };
+            }
+        }
+        if (try session_factory.glinerBoundaryResidentLoadAmounts(man, weights)) |resident| {
+            return .{ .peak = resident.peak, .resident = resident.resident };
+        }
+    }
+    if (backend_runtime.backend == .metal or backend_runtime.backend == .cuda) {
+        const config = if (backend_runtime.backend == .cuda)
+            try session_factory.resolveCudaA4bInferenceConfigForModelListing(
+                man.allocator,
+                model_path,
+                man,
+                a4b_request,
+            )
+        else
+            try session_factory.resolveA4bInferenceConfigForModelListing(
+                man.allocator,
+                model_path,
+                man,
+                a4b_request,
+            );
+        if (config) |resolved| {
+            return a4bGpuModelLoadAdmission(resolved, weights, backend_runtime.backend);
+        }
+    }
+    const extra_backend_resident = if (backend_runtime.backend == .metal)
+        session_factory.metalDebertaFastPathAdmissionAmounts(man)
+    else
+        runtime.tier.memory.AdmissionAmounts{};
+    var plan = try nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
+    if (backend_runtime.backend == .metal) {
+        const host_source_bytes = metalQualifiedSpecialtyF32HostSourceBytes(man, weights);
+        try addMetalResidentHostSource(&plan, host_source_bytes);
+    }
+    return plan;
 }

@@ -20,6 +20,8 @@ const backends = @import("../backends/backends.zig");
 const runtime = @import("../runtime/root.zig");
 const manifest_mod = @import("manifest.zig");
 const managed_receipt = @import("../registry/managed_receipt.zig");
+const PublishedArtifacts = @import("../registry/published_artifacts.zig").PublishedArtifacts;
+const ResolvedModel = @import("../registry/model_selection.zig").ResolvedModel;
 const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
 const encoder_decoder = @import("../pipelines/encoder_decoder.zig");
 const tokenizer_mod = @import("inference_tokenizer");
@@ -35,6 +37,7 @@ pub const Request = struct {
     component_paths: []const []const u8,
     preferred_backends: []const backends.BackendType,
     asset_generation: ComponentPlanKey,
+    publication: ?[32]u8 = null,
     runtime_id: RuntimeId,
     model_type: manifest_mod.ModelType,
     kind: CompositeKind,
@@ -42,7 +45,7 @@ pub const Request = struct {
 pub const Host = struct {
     context: *anyopaque,
     io: std.Io,
-    load_tokenizer_fn: *const fn (*anyopaque, []const u8) anyerror!ManagedHfTokenizer,
+    load_tokenizer_fn: *const fn (*anyopaque, []const u8, ?*const PublishedArtifacts) anyerror!ManagedHfTokenizer,
     plan_components_fn: *const fn (*anyopaque, []const u8, []const backends.BackendType, []const []const u8) anyerror!ComponentLoader,
     identity_fn: *const fn (*anyopaque, Request) anyerror!ComponentPlanKey,
 };
@@ -52,6 +55,7 @@ pub const CompositeKind = enum { whisper_metadata, whisper, seq2seq };
 /// One immutable publication pinned across tokenization, encode and decode.
 /// Component sessions keep their resident admission and backend ownership.
 pub const CompositeAssets = struct {
+    managed_publication: ?[32]u8 = null,
     runtime_id: RuntimeId = 0,
     allocator: std.mem.Allocator = std.heap.page_allocator,
     model_dir: []u8 = &.{},
@@ -104,6 +108,7 @@ const ResolvedWhisperSidecars = struct {
     tokenizer_path: []u8,
     config_path: []u8,
     generation_config_path: ?[]u8,
+    managed_publication: ?[32]u8,
 
     pub fn deinit(self: *ResolvedWhisperSidecars) void {
         self.allocator.free(self.tokenizer_path);
@@ -157,6 +162,7 @@ fn resolveWhisperSidecars(
         .tokenizer_path = owned_tokenizer_path,
         .config_path = owned_config_path,
         .generation_config_path = generation_config_path,
+        .managed_publication = manifest.managed_publication,
     };
 }
 pub fn load(allocator: std.mem.Allocator, host: Host, request: Request, control: ?InferenceExecutionControl) !*CompositeAssets {
@@ -169,22 +175,39 @@ pub fn load(allocator: std.mem.Allocator, host: Host, request: Request, control:
     const kind = request.kind;
 
     if (control) |active| try active.check();
-    var sidecars = try resolveWhisperSidecars(allocator, host.io, model_dir);
+    const io = if (control) |active| active.io orelse host.io else host.io;
+    var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, io, model_dir);
+    defer publication_lease.deinit(io);
+    const publication = try managed_receipt.publicationGeneration(allocator, io, model_dir);
+    if (!std.meta.eql(request.publication, publication)) return error.ModelArtifactsChanging;
+    var artifacts = try PublishedArtifacts.init(allocator, io, model_dir, .{ .publication = publication });
+    defer artifacts.deinit();
+    for (component_paths) |path| {
+        if (std.mem.endsWith(u8, path, ".onnx")) {
+            try artifacts.verifyOnnx(path);
+        } else try artifacts.verifyPath(path);
+    }
+    var sidecars = try resolveWhisperSidecars(allocator, io, model_dir);
     defer sidecars.deinit();
 
-    var managed_tokenizer = try host.load_tokenizer_fn(host.context, sidecars.tokenizer_path);
+    if (publication != null and !std.meta.eql(publication, sidecars.managed_publication)) return error.ModelArtifactsChanging;
+    var managed_tokenizer = try host.load_tokenizer_fn(host.context, sidecars.tokenizer_path, &artifacts);
     errdefer managed_tokenizer.deinit();
-    var prompt_cache: ?whisper_prompt.PromptCache = if (kind == .seq2seq) null else try whisper_prompt.PromptCache.initFromPaths(
+    const config_bytes = try artifacts.readPath(sidecars.config_path, 16 * 1024 * 1024);
+    defer allocator.free(config_bytes);
+    const generation_bytes = if (kind != .seq2seq and sidecars.generation_config_path != null)
+        try artifacts.readPath(sidecars.generation_config_path.?, 16 * 1024 * 1024)
+    else
+        null;
+    defer if (generation_bytes) |bytes| allocator.free(bytes);
+    var prompt_cache: ?whisper_prompt.PromptCache = if (kind == .seq2seq) null else try whisper_prompt.PromptCache.initFromBytes(
         allocator,
-        sidecars.generation_config_path,
-        sidecars.config_path,
+        generation_bytes,
+        config_bytes,
         managed_tokenizer.tokenizer.tokenizer(),
     );
     errdefer if (prompt_cache) |*cache| cache.deinit();
-    const decoder_config = try encoder_decoder.loadDecoderConfigFile(
-        allocator,
-        sidecars.config_path,
-    );
+    const decoder_config = try encoder_decoder.parseDecoderConfig(config_bytes);
     var encoder: ?ManagedSession = null;
     errdefer if (encoder) |*managed| managed.deinit();
     var decoder: ?ManagedSession = null;
@@ -204,7 +227,7 @@ pub fn load(allocator: std.mem.Allocator, host: Host, request: Request, control:
             const selected = [_][]const u8{ component_paths[0], component_paths[2] };
             // Optional graph support must not constrain fallback placement.
             const loaded = blk: {
-                var loader = host.plan_components_fn(host.context, model_dir, preferred_backends, &selected) catch |err| break :blk err;
+                var loader = (host.plan_components_fn(host.context, model_dir, preferred_backends, &selected) catch |err| break :blk err).withArtifacts(&artifacts);
                 encoder = (if (control) |active| loader.loadWithControl(selected[0], active) else loader.load(selected[0])) catch |err| break :blk err;
                 var strict = loader.restrictToBackend(encoder.?.session.backend()) catch |err| break :blk err;
                 decoder = strict.loadWithImportedOnnxContextAndControl(selected[1], backends.imported_onnx_session.sharedBackendContext(encoder.?.session), control) catch |err| break :blk err;
@@ -223,12 +246,13 @@ pub fn load(allocator: std.mem.Allocator, host: Host, request: Request, control:
             }
         }
         if (decoder == null) {
-            var loader = try host.plan_components_fn(host.context, model_dir, preferred_backends, component_paths[0..2]);
+            var loader = (try host.plan_components_fn(host.context, model_dir, preferred_backends, component_paths[0..2])).withArtifacts(&artifacts);
             encoder = if (control) |active| try loader.loadWithControl(component_paths[0], active) else try loader.load(component_paths[0]);
             var strict = try loader.restrictToBackend(encoder.?.session.backend());
             decoder = try strict.loadWithImportedOnnxContextAndControl(component_paths[1], backends.imported_onnx_session.sharedBackendContext(encoder.?.session), control);
         }
     }
+    try artifacts.verify();
     const verified_generation = try host.identity_fn(host.context, request);
     if (!std.mem.eql(u8, asset_generation[0..], verified_generation[0..]))
         return error.ModelArtifactsChanging;
@@ -241,7 +265,9 @@ pub fn load(allocator: std.mem.Allocator, host: Host, request: Request, control:
     errdefer allocator.free(owned_model_dir);
     const owned_preferred_backends = try allocator.dupe(backends.BackendType, preferred_backends);
     errdefer allocator.free(owned_preferred_backends);
+    if (!std.meta.eql(publication, try managed_receipt.publicationGeneration(allocator, io, model_dir))) return error.ModelArtifactsChanging;
     assets.* = .{
+        .managed_publication = publication,
         .runtime_id = runtime_id,
         .allocator = allocator,
         .model_dir = owned_model_dir,
@@ -306,7 +332,7 @@ test "model composite construction releases admitted peers on every allocation f
         fn backend(_: *anyopaque) backends.BackendType {
             return .native;
         }
-        fn loadSession(raw: *anyopaque, _: []const u8, preferred: []const backends.BackendType, _: ?*backends.imported_onnx_session.SharedBackendContext, control: ?InferenceExecutionControl) !ManagedSession {
+        fn loadSession(raw: *anyopaque, _: []const u8, preferred: []const backends.BackendType, _: ?*backends.imported_onnx_session.SharedBackendContext, control: ?InferenceExecutionControl, _: ResolvedModel, _: ?*PublishedArtifacts) !ManagedSession {
             const self = ptr(raw);
             if (control) |active| try active.check();
             try std.testing.expectEqualSlices(backends.BackendType, &.{.native}, preferred);
@@ -315,14 +341,15 @@ test "model composite construction releases admitted peers on every allocation f
             self.opened += 1;
             return .{ .resource_lease = lease, .session = .{ .ptr = self, .vtable = &.{ .run = undefined, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close } } };
         }
-        fn tokenizer(_: *anyopaque, _: []const u8) !ManagedHfTokenizer {
+        fn tokenizer(_: *anyopaque, _: []const u8, _: ?*const PublishedArtifacts) !ManagedHfTokenizer {
             // Tokenizer parsing has separate exhaustive allocation coverage.
             // Keep its global initialization outside the composite sweep.
             return .{ .tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(std.testing.allocator, tokenizer_json) };
         }
-        fn plan(raw: *anyopaque, _: []const u8, _: []const backends.BackendType, paths: []const []const u8) !ComponentLoader {
+        fn plan(raw: *anyopaque, root: []const u8, _: []const backends.BackendType, paths: []const []const u8) !ComponentLoader {
             const self = ptr(raw);
-            var result = ComponentLoader{ .services = .{ .allocator = self.allocator, .context = self, .load_session_fn = loadSession, .load_tokenizer_fn = tokenizer } };
+            var result = ComponentLoader{ .services = .{ .allocator = self.allocator, .io = std.testing.io, .context = self, .load_session_fn = loadSession, .load_tokenizer_fn = tokenizer } };
+            try result.bindOwner(root, null);
             result.allowed_backends[0] = .native;
             result.allowed_backend_count = 1;
             for (paths) |path| try result.addComponentPath(path);
@@ -355,6 +382,14 @@ test "model composite construction releases admitted peers on every allocation f
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Probe.run, .{directory});
+    // A selection from another publication must fail before tokenizer parsing
+    // or component admission, even when its artifact-generation hint matches.
+    var stale_request = Probe.request(directory);
+    stale_request.publication = @splat(1);
+    var stale = Probe{ .allocator = a };
+    try std.testing.expectError(error.ModelArtifactsChanging, load(a, stale.host(), stale_request, null));
+    try std.testing.expectEqual(@as(usize, 0), stale.opened);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, stale.admission.snapshot());
     var changed = Probe{ .allocator = a, .identity_changed = true };
     try std.testing.expectError(error.ModelArtifactsChanging, load(a, changed.host(), Probe.request(directory), null));
     try std.testing.expectEqual(@as(usize, 2), changed.closed);

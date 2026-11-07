@@ -33,13 +33,17 @@ pub const Sequence = extern struct {
     display_top: u32,
     matrix: u32,
     full_range: u32,
+    bit_depth: u32 = 8,
+    transfer: u32 = 2,
     pub fn bytes(self: Sequence) !usize {
         if (self.width == 0 or self.height == 0 or self.width % 2 != 0 or self.height % 2 != 0 or
             self.width > self.coded_width or self.height > self.coded_height or
             self.display_left > self.coded_width - self.width or self.display_top > self.coded_height - self.height or
             (self.codec != 4 and self.codec != 8 and self.codec != 11) or
-            (self.matrix != 1 and self.matrix != 2 and self.matrix != 5 and self.matrix != 6) or self.full_range > 1) return error.InvalidVideoGeometry;
-        return envelope(self.coded_width, self.coded_height, self.surfaces);
+            (self.matrix != 1 and self.matrix != 2 and self.matrix != 5 and self.matrix != 6 and !((self.transfer == 16 or self.transfer == 18) and self.matrix == 9)) or self.full_range > 1 or
+            (self.bit_depth != 8 and self.bit_depth != 10) or
+            (self.transfer != 1 and self.transfer != 2 and self.transfer != 6 and self.transfer != 13 and self.transfer != 16 and self.transfer != 18)) return error.InvalidVideoGeometry;
+        return envelopeForSampleBytes(self.coded_width, self.coded_height, self.surfaces, if (self.bit_depth == 10) 2 else 1);
     }
 };
 
@@ -60,12 +64,27 @@ pub fn envelope(width: u32, height: u32, surfaces: u32) !usize {
     return 64 * 1024 * 1024 + pitch * rows * 3 * (surfaces + 2);
 }
 
+pub fn envelopeForSampleBytes(width: u32, height: u32, surfaces: u32, sample_bytes: u32) !usize {
+    if (sample_bytes != 1 and sample_bytes != 2) return error.InvalidVideoGeometry;
+    return std.math.mul(usize, try envelope(width, height, surfaces), sample_bytes);
+}
+
 pub const CacheBudget = struct {
     admission: ?Admission = null,
     physical: ?*Physical = null,
     quota: CacheQuota = .none,
     bytes: usize = 0,
     failure: ?anyerror = null,
+    /// A running model's scratch can already fill an automatic cap, which would
+    /// refuse a large clip's surfaces indefinitely. Physical limits still hold.
+    grow_automatic_scratch: bool = false,
+
+    /// True when the retained reservation holds the shared scratch over its cap.
+    pub fn exceedsScratchCap(self: *const CacheBudget) bool {
+        const admission = self.admission orelse return false;
+        if (self.bytes == 0 or admission.limits.scratch_limit_bytes == 0) return false;
+        return admission.controller.snapshot().scratchTotalBytes() > admission.limits.scratch_limit_bytes;
+    }
 
     pub fn currentCleanupPrepared(self: *const CacheBudget) bool {
         if (self.admission != null and self.bytes != 0 and !self.quota.hasLease()) return false;
@@ -80,7 +99,10 @@ pub const CacheBudget = struct {
         try physical.reserve(bytes);
         errdefer physical.release(bytes);
         const lease = if (self.admission) |admission|
-            try admission.controller.tryAcquire(.gpu, admission.limits, .{ .backend_scratch_bytes = bytes }, admission.check_live_memory)
+            try admission.controller.tryAcquire(.gpu, if (self.grow_automatic_scratch)
+                try memory.withAutomaticScratchFloor(admission.limits, 0, admission.controller.snapshot().scratchTotalBytes(), bytes)
+            else
+                admission.limits, .{ .backend_scratch_bytes = bytes }, admission.check_live_memory)
         else
             null;
         self.physical = physical;
@@ -114,6 +136,22 @@ pub const CacheBudget = struct {
         self.releaseWithCleanup(.{ .outside_execution = true }) catch @panic("invalid raw video cache quota");
     }
 };
+
+test "NVDEC surfaces can outgrow an automatic scratch cap and report it" {
+    var controller = memory.AdmissionController{};
+    var physical = Physical{ .limit = 4096 };
+    const limits: memory.Limits = .{ .scratch_limit_bytes = 1024 };
+    var run = try controller.tryAcquire(.gpu, limits, .{ .backend_scratch_bytes = 1000 }, false);
+    defer run.release();
+    var budget = CacheBudget{ .admission = .{ .controller = &controller, .limits = limits, .check_live_memory = false } };
+    defer budget.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, budget.reserve(&physical, 512));
+    budget.grow_automatic_scratch = true;
+    try budget.reserve(&physical, 512);
+    try std.testing.expect(budget.exceedsScratchCap());
+    budget.release();
+    try std.testing.expect(!budget.exceedsScratchCap());
+}
 
 test "embeddinggemma2 NVDEC retained admission shares limits and rolls back failed reservations" {
     var controller = memory.AdmissionController{};
@@ -149,10 +187,20 @@ test "embeddinggemma2 NVDEC surface envelope bounds supported geometry and rejec
 }
 
 test "CUDA decoder sequence ABI and conservative envelope reject unsupported metadata before SDK" {
-    try std.testing.expectEqual(@as(usize, 40), @sizeOf(Sequence));
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(Sequence));
     try std.testing.expectEqual(@as(usize, 4), @alignOf(Sequence));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(Sequence, "bit_depth"));
+    try std.testing.expectEqual(@as(usize, 44), @offsetOf(Sequence, "transfer"));
     const base: Sequence = .{ .width = 160, .height = 96, .coded_width = 160, .coded_height = 96, .surfaces = 4, .codec = 4, .display_left = 0, .display_top = 0, .matrix = 1, .full_range = 0 };
     try std.testing.expectEqual(try envelope(160, 96, 4), try base.bytes());
+    var hdr = base;
+    hdr.bit_depth = 10;
+    hdr.transfer = 18;
+    hdr.matrix = 9;
+    try std.testing.expectEqual(try std.math.mul(usize, try envelope(160, 96, 4), 2), try hdr.bytes());
+    hdr.bit_depth = 12;
+    try std.testing.expectError(error.InvalidVideoGeometry, hdr.bytes());
+    try std.testing.expectError(error.InvalidVideoGeometry, envelopeForSampleBytes(160, 96, 4, 3));
     var invalid = base;
     invalid.surfaces = 33;
     try std.testing.expectError(error.InvalidVideoGeometry, invalid.bytes());

@@ -16,6 +16,9 @@
 //! Immutable component loading plan. Services enforce process protection,
 //! admission and health; this owner preserves the validated artifact/backend
 //! set across immediate and lazy component construction.
+const PublishedArtifacts = @import("../registry/published_artifacts.zig").PublishedArtifacts;
+const ResolvedModel = @import("../registry/model_selection.zig").ResolvedModel;
+const ComponentConstruction = @import("session_loader.zig").ComponentConstruction;
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const ManagedSession = @import("session_loader.zig").ManagedSession;
@@ -25,9 +28,10 @@ const InferenceExecutionControl = @import("../execution_control.zig").InferenceE
 
 pub const Services = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     context: *anyopaque,
-    load_session_fn: *const fn (*anyopaque, []const u8, []const backends.BackendType, ?*backends.imported_onnx_session.SharedBackendContext, ?InferenceExecutionControl) anyerror!ManagedSession,
-    load_tokenizer_fn: *const fn (*anyopaque, []const u8) anyerror!ManagedHfTokenizer,
+    load_session_fn: *const fn (*anyopaque, []const u8, []const backends.BackendType, ?*backends.imported_onnx_session.SharedBackendContext, ?InferenceExecutionControl, ResolvedModel, ?*PublishedArtifacts) anyerror!ManagedSession,
+    load_tokenizer_fn: *const fn (*anyopaque, []const u8, ?*const PublishedArtifacts) anyerror!ManagedHfTokenizer,
 };
 
 pub const ComponentLoader = struct {
@@ -35,11 +39,33 @@ pub const ComponentLoader = struct {
     const PathDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
     services: Services,
+    owner_path: [std.fs.max_path_bytes]u8 = undefined,
+    owner_path_len: usize = 0,
+    owner_publication: ?[32]u8 = null,
+    borrowed_artifacts: ?*PublishedArtifacts = null,
     validated_generation: ?ComponentPlanKey = null,
     allowed_backends: [7]backends.BackendType = undefined,
     allowed_backend_count: usize = 0,
     component_path_digests: [max_component_paths]PathDigest = undefined,
     component_path_count: usize = 0,
+
+    pub fn bindOwner(self: *ComponentLoader, path: []const u8, publication: ?[32]u8) !void {
+        if (path.len > self.owner_path.len) return error.NameTooLong;
+        @memcpy(self.owner_path[0..path.len], path);
+        self.owner_path_len = path.len;
+        self.owner_publication = publication;
+    }
+
+    fn selection(self: *const ComponentLoader) !ResolvedModel {
+        if (self.owner_path_len == 0) return error.UnvalidatedModelComponent;
+        return .{ .path = self.owner_path[0..self.owner_path_len], .publication = self.owner_publication };
+    }
+
+    pub fn withArtifacts(self: ComponentLoader, artifacts: *PublishedArtifacts) ComponentLoader {
+        var result = self;
+        result.borrowed_artifacts = artifacts;
+        return result;
+    }
 
     pub fn preferredBackends(self: *const ComponentLoader) []const backends.BackendType {
         return self.allowed_backends[0..self.allowed_backend_count];
@@ -92,6 +118,8 @@ pub const ComponentLoader = struct {
             self.preferredBackends(),
             null,
             null,
+            try self.selection(),
+            self.borrowed_artifacts,
         );
     }
 
@@ -107,6 +135,8 @@ pub const ComponentLoader = struct {
             self.preferredBackends(),
             null,
             control,
+            try self.selection(),
+            self.borrowed_artifacts,
         );
     }
 
@@ -122,6 +152,8 @@ pub const ComponentLoader = struct {
             self.preferredBackends(),
             shared_backend_ctx,
             null,
+            try self.selection(),
+            self.borrowed_artifacts,
         );
     }
 
@@ -134,7 +166,7 @@ pub const ComponentLoader = struct {
         control: ?InferenceExecutionControl,
     ) !ManagedSession {
         try self.ensureComponentPath(model_path);
-        return self.services.load_session_fn(self.services.context, model_path, self.preferredBackends(), shared_backend_ctx, control);
+        return self.services.load_session_fn(self.services.context, model_path, self.preferredBackends(), shared_backend_ctx, control, try self.selection(), self.borrowed_artifacts);
     }
 
     /// Use the supplied resource owner for tokenizer admission and cache policy.
@@ -142,9 +174,13 @@ pub const ComponentLoader = struct {
         self: *const ComponentLoader,
         tokenizer_path: []const u8,
     ) !ManagedHfTokenizer {
-        return self.services.load_tokenizer_fn(self.services.context, tokenizer_path);
+        var proof = try ComponentConstruction.init(self.services.allocator, self.services.io, try self.selection(), null, self.borrowed_artifacts);
+        defer proof.deinit();
+        var tokenizer = try self.services.load_tokenizer_fn(self.services.context, tokenizer_path, proof.artifacts());
+        errdefer tokenizer.deinit();
+        try proof.finish();
+        return tokenizer;
     }
-
     /// Adapter for SessionPool's lazy factory. The pool takes ownership of
     /// a heap copy of this immutable plan, so lazy loads cannot retain a
     /// pointer to a caller's stack-local ComponentLoader.
@@ -154,6 +190,7 @@ pub const ComponentLoader = struct {
             .allocator = self.services.allocator,
             .loader = self.*,
         };
+        context.loader.borrowed_artifacts = null;
         return .{
             .context = context,
             .load_fn = loadForSessionPool,

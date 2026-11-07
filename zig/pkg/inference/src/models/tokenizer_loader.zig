@@ -21,6 +21,7 @@
 //! Model tokenizer artifact loading and checkpoint conventions. This owner
 //! performs no serving-cache publication, eviction or admission lease handling;
 //! callers admit construction peaks before entering it and retain the result.
+const PublishedArtifacts = @import("../registry/published_artifacts.zig").PublishedArtifacts;
 const std = @import("std");
 const platform = @import("antfly_platform");
 const manifest_mod = @import("manifest.zig");
@@ -244,7 +245,17 @@ fn loadLegacyWordPieceTokenizer(
     config_path: ?[]const u8,
     special_path: ?[]const u8,
 ) !*hf_tokenizer.HfTokenizer {
-    const vocab_bytes = try c_file.readFile(allocator, vocab_path);
+    return loadLegacyWordPieceTokenizerWithArtifacts(allocator, vocab_path, config_path, special_path, null);
+}
+
+fn loadLegacyWordPieceTokenizerWithArtifacts(
+    allocator: std.mem.Allocator,
+    vocab_path: []const u8,
+    config_path: ?[]const u8,
+    special_path: ?[]const u8,
+    artifacts: ?*PublishedArtifacts,
+) !*hf_tokenizer.HfTokenizer {
+    const vocab_bytes = if (artifacts) |source| try source.readPath(vocab_path, std.math.maxInt(usize)) else try c_file.readFile(allocator, vocab_path);
     defer allocator.free(vocab_bytes);
     var meta = LegacyWordPieceMeta{};
     defer meta.deinit(allocator);
@@ -254,7 +265,7 @@ fn loadLegacyWordPieceTokenizer(
     };
     for ([_]?[]const u8{ config_path, special_path }, 0..) |path, i| {
         if (path) |selected| {
-            const bytes = (try readOptionalFile(allocator, selected)) orelse continue;
+            const bytes = if (artifacts) |source| try source.readPath(selected, std.math.maxInt(usize)) else (try readOptionalFile(allocator, selected)) orelse continue;
             metadata_bytes[i] = bytes;
             try applyLegacyTokenizerJson(&meta, bytes, allocator);
         }
@@ -363,14 +374,7 @@ pub fn loadHuggingFaceTokenizerFromDirOrGguf(
 }
 
 pub fn loadHuggingFaceTokenizerFromManifest(allocator: std.mem.Allocator, man: *const manifest_mod.ModelManifest) !*hf_tokenizer.HfTokenizer {
-    if (man.tokenizer_json_path) |path| {
-        return loadHuggingFaceTokenizerFile(allocator, path);
-    }
-    if (man.vocab_txt_path) |path| {
-        return loadLegacyWordPieceTokenizer(allocator, path, man.tokenizer_config_path, man.special_tokens_map_path);
-    }
-    if (man.gguf_path) |path| return loadHuggingFaceTokenizerFromGguf(allocator, path);
-    return error.NoTokenizerFound;
+    return loadHuggingFaceTokenizerFromManifestWithArtifacts(allocator, man, null);
 }
 
 fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []const u8) !*hf_tokenizer.HfTokenizer {
@@ -867,6 +871,7 @@ test "tokenizer source compatibility uses resolved architecture and rejects non-
 /// Construction follows model metadata; serving admits the selected parse peak
 /// before calling this owner and adopts the result with its retained lease.
 pub const Options = struct {
+    artifacts: ?*PublishedArtifacts = null,
     cache: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
     parallel: hf_tokenizer.HfTokenizer.ParallelBpeConfig = .{},
 };
@@ -896,7 +901,7 @@ pub fn loadSelected(allocator: std.mem.Allocator, model_dir: []const u8, manifes
         .huggingface => {
             result.hf = if (man.gliner_architecture == .boundary) blk: {
                 const path = man.tokenizer_json_path orelse return error.NoTokenizerFound;
-                const bytes = try c_file.readFileMax(allocator, path, 32 * 1024 * 1024);
+                const bytes = if (options.artifacts) |artifacts| try artifacts.readPath(path, 32 * 1024 * 1024) else try c_file.readFileMax(allocator, path, 32 * 1024 * 1024);
                 defer allocator.free(bytes);
                 // Parse the same bytes that pass the receipt check. A
                 // separate pathname check leaves a replacement window.
@@ -904,7 +909,7 @@ pub fn loadSelected(allocator: std.mem.Allocator, model_dir: []const u8, manifes
                 break :blk try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(allocator, bytes, .{ .strict_unigram_normalizer = true });
             } else if (man.gliner_architecture == .span and (man.gliner_span_declared or man.gliner_specialty_profile != null)) blk: {
                 const path = man.tokenizer_json_path orelse return error.NoTokenizerFound;
-                const bytes = try c_file.readFileMax(allocator, path, 32 * 1024 * 1024);
+                const bytes = if (options.artifacts) |artifacts| try artifacts.readPath(path, 32 * 1024 * 1024) else try c_file.readFileMax(allocator, path, 32 * 1024 * 1024);
                 defer allocator.free(bytes);
                 const digest = @import("gliner_decide_qualification.zig").Digest.of(bytes);
                 if (man.gliner_span_tokenizer_digest) |expected| {
@@ -916,22 +921,22 @@ pub fn loadSelected(allocator: std.mem.Allocator, model_dir: []const u8, manifes
                 });
                 result.decision_digest = digest;
                 break :blk tokenizer;
-            } else try loadHuggingFaceTokenizerFromManifest(allocator, &man);
+            } else try loadHuggingFaceTokenizerFromManifestWithArtifacts(allocator, &man, options.artifacts);
             try result.hf.?.configureBpeCache(options.cache);
             try result.hf.?.configureParallelBpe(
                 options.parallel,
             );
         },
         .sentencepiece => {
-            const sp = try loadSentencePieceTokenizerFromDirOrGguf(allocator, model_dir, man.gguf_path);
+            const sp = if (options.artifacts) |artifacts| try loadSentencePieceTokenizerWithArtifacts(allocator, &man, artifacts) else try loadSentencePieceTokenizerFromDirOrGguf(allocator, model_dir, man.gguf_path);
             errdefer {
                 sp.deinit();
                 allocator.destroy(sp);
             }
-            if (shouldEnableGemmaSentencePieceCompat(man, model_dir, allocator)) {
+            if (tokenizerGemmaCompat(man, model_dir)) {
                 sp.setPreserveInlineSpecialsAfterLiteralBos(true);
             }
-            try loadSentencePieceAddedTokens(model_dir, allocator, sp);
+            if (options.artifacts) |artifacts| try loadSentencePieceAddedTokensWithArtifacts(allocator, sp, artifacts) else try loadSentencePieceAddedTokens(model_dir, allocator, sp);
             result.sp = sp;
         },
     }
@@ -968,4 +973,69 @@ test "selected tokenizer construction owns parse failures and verifies the exact
     try std.testing.expectEqualDeep(decision.gliner_span_tokenizer_digest, loaded.decision_digest);
     decision.gliner_span_tokenizer_digest.?.sha256[0] ^= 1;
     try std.testing.expectError(error.GlinerDecisionArtifactMismatch, loadSelected(a, directory, &decision, .huggingface, .{}));
+}
+
+pub fn loadHuggingFaceTokenizerFromManifestWithArtifacts(allocator: std.mem.Allocator, man: *const manifest_mod.ModelManifest, artifacts: ?*PublishedArtifacts) !*hf_tokenizer.HfTokenizer {
+    if (man.tokenizer_json_path) |path| {
+        const bytes = if (artifacts) |source| try source.readPath(path, std.math.maxInt(usize)) else try c_file.readFile(allocator, path);
+        defer allocator.free(bytes);
+        return hf_tokenizer.HfTokenizer.loadFromBytes(allocator, bytes);
+    }
+    if (man.vocab_txt_path) |path| {
+        return loadLegacyWordPieceTokenizerWithArtifacts(allocator, path, man.tokenizer_config_path, man.special_tokens_map_path, artifacts);
+    }
+    if (man.gguf_path) |path| {
+        if (artifacts) |source| try source.verifyPath(path);
+        return loadHuggingFaceTokenizerFromGguf(allocator, path);
+    }
+    return error.NoTokenizerFound;
+}
+
+fn readOptionalTokenizerSidecar(artifacts: *const PublishedArtifacts, relative: []const u8) !?[]u8 {
+    const path = (try artifacts.resolve(relative)) orelse return null;
+    defer artifacts.allocator.free(path);
+    return try artifacts.readPath(path, std.math.maxInt(usize));
+}
+
+pub fn tokenizerGemmaCompat(man: manifest_mod.ModelManifest, model_dir: []const u8) bool {
+    // Configuration was selected and parsed by the bound manifest loader.
+    // Reopening it here duplicates parsing before tokenizer admission and can
+    // select metadata from an unrelated export at the installation root.
+    return std.mem.indexOf(u8, model_dir, "gemma") != null or
+        std.mem.startsWith(u8, man.config_model_arch, "gemma") or man.gguf_generator_gemma4;
+}
+
+pub fn tokenizerKindWithArtifacts(man: manifest_mod.ModelManifest, artifacts: *const PublishedArtifacts, gemma_compat: bool) !manifest_mod.TokenizerType {
+    if (gemma_compat) {
+        if (try artifacts.resolve("tokenizer.model")) |path| {
+            artifacts.allocator.free(path);
+            return .sentencepiece;
+        }
+    }
+    return man.tokenizer_type orelse error.NoTokenizerFound;
+}
+
+pub fn loadSentencePieceTokenizerWithArtifacts(allocator: std.mem.Allocator, man: *const manifest_mod.ModelManifest, artifacts: *PublishedArtifacts) !*sentencepiece.Processor {
+    const sp = try allocator.create(sentencepiece.Processor);
+    errdefer allocator.destroy(sp);
+    if (try readOptionalTokenizerSidecar(artifacts, "tokenizer.model")) |bytes| {
+        defer artifacts.allocator.free(bytes);
+        sp.* = try sentencepiece.Processor.init(allocator, bytes);
+    } else {
+        const path = man.gguf_path orelse return error.NoTokenizerFound;
+        try artifacts.verifyPath(path);
+        sp.* = try loadSentencePieceTokenizerFromGguf(allocator, path);
+    }
+    return sp;
+}
+
+pub fn loadSentencePieceAddedTokensWithArtifacts(allocator: std.mem.Allocator, sp: *sentencepiece.Processor, artifacts: *const PublishedArtifacts) !void {
+    if (try readOptionalTokenizerSidecar(artifacts, "added_tokens.json")) |bytes| {
+        defer artifacts.allocator.free(bytes);
+        try loadSentencePieceAddedTokenMap(allocator, bytes, sp);
+    }
+    if (try readOptionalTokenizerSidecar(artifacts, "tokenizer.json")) |bytes| {
+        defer artifacts.allocator.free(bytes);
+        try loadSentencePieceAddedTokenArray(allocator, bytes, sp);
+    }
 }

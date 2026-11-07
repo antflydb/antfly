@@ -16,6 +16,8 @@
 //! Loaded model generation: component sessions, resident caches, identity and
 //! task construction. Serving supplies retirement and admission services through
 //! Host, retaining registry/handle/health ownership outside this module.
+const PublishedArtifacts = @import("../registry/published_artifacts.zig").PublishedArtifacts;
+const ComponentConstruction = @import("session_loader.zig").ComponentConstruction;
 const session_loader = @import("session_loader.zig");
 const tokenizer_loader = @import("tokenizer_loader.zig");
 
@@ -33,7 +35,7 @@ pub const Host = struct {
             fn unhealthy(_: *anyopaque, _: []const u8, _: backends.BackendType) bool {
                 return false;
             }
-            fn limits(_: *anyopaque, _: []const u8, _: backends.BackendRuntime, fallback: runtime.tier.memory.Limits) !runtime.tier.memory.Limits {
+            fn limits(_: *anyopaque, _: session_loader.ModelSource, _: backends.BackendRuntime, fallback: runtime.tier.memory.Limits) !runtime.tier.memory.Limits {
                 return fallback;
             }
             fn reserveLoad(_: *anyopaque, _: []const u8, _: backends.BackendRuntime, _: runtime.tier.memory.Limits, _: @import("load_plan.zig").ModelLoadAdmissionPlan) !session_loader.Reservation {
@@ -505,15 +507,12 @@ pub const Runtime = struct {
         if (assets.gliner_span_tokenizer_digest) |digest|
             try session_factory.sealGlinerDecisionTokenizerDigest(session, digest);
 
-        var whisper_prompt_cache: ?whisper_prompt.PromptCache = if (session_factory.getWhisperConfig(session) != null)
-            try whisper_prompt.PromptCache.init(
-                allocator,
-                model_dir,
-                if (hf_tok) |ht| ht.tokenizer() else sp_tok.?.tokenizer(),
-            )
-        else
-            null;
-        errdefer if (whisper_prompt_cache) |*cache| cache.deinit();
+        var managed_whisper_prompt = assets.managed_whisper_prompt;
+        assets.managed_whisper_prompt = null;
+        if (!assets.whisper_prompt_prepared and session_factory.getWhisperConfig(session) != null) {
+            managed_whisper_prompt = .{ .cache = try whisper_prompt.PromptCache.init(allocator, model_dir, if (hf_tok) |ht| ht.tokenizer() else sp_tok.?.tokenizer()), .admission = null };
+        }
+        errdefer if (managed_whisper_prompt) |*prompt| prompt.deinit();
 
         // Embedding checkpoints can ship their decoder backbone's chat
         // template, but embedding execution never uses it. Qwen rerankers use
@@ -642,7 +641,9 @@ pub const Runtime = struct {
             .executor_io = assets.executor_io,
             .florence_reader_config = florence_reader_config,
             .chat_tmpl = chat_tmpl,
-            .whisper_prompt_cache = whisper_prompt_cache,
+            .managed_publication = man.managed_publication,
+            .whisper_prompt_cache = if (managed_whisper_prompt) |prompt| prompt.cache else null,
+            .whisper_prompt_admission = if (managed_whisper_prompt) |prompt| prompt.admission else null,
             .chat_template_failed = chat_template_failed,
             .shared_moe_cache = shared_moe_cache,
             .shared_prefetch = shared_prefetch,
@@ -669,7 +670,7 @@ pub const Runtime = struct {
         shared_prefetch = null;
         native_generate_coordinator = null;
         chat_tmpl = null;
-        whisper_prompt_cache = null;
+        managed_whisper_prompt = null;
         owned_model_dir_owned = false;
         model_storage_owned = false;
         errdefer {
@@ -705,6 +706,7 @@ pub const Runtime = struct {
         }
     }
 
+    managed_publication: ?[32]u8 = null,
     runtime_id: RuntimeId = 0,
     residency_mode: RuntimeResidencyMode = .backend_managed,
     chunk_planning: ?ChunkPlanningSnapshot = null,
@@ -741,6 +743,7 @@ pub const Runtime = struct {
     florence_reader_config: ?vision_config.RuntimeConfig = null,
     chat_tmpl: ?*ChatTemplate = null,
     whisper_prompt_cache: ?whisper_prompt.PromptCache = null,
+    whisper_prompt_admission: ?runtime.tier.memory.AdmissionLease = null,
     /// The model shipped a chat template that we could not parse, so chat requests fall
     /// back to raw prompting. Distinct from `chat_tmpl == null` with no template at all.
     chat_template_failed: bool = false,
@@ -1026,6 +1029,24 @@ pub const Runtime = struct {
         });
     }
 
+    fn checkOwnerSelection(self: *const LoadedModel, control: ?InferenceExecutionControl) !void {
+        if (control) |active| {
+            try active.check();
+            if (active.model_selection) |selected| {
+                if (!selected.matches(self.model_dir) or !std.meta.eql(selected.publication, self.managed_publication)) return error.ModelArtifactsChanging;
+            }
+        }
+    }
+
+    fn publicationIo(self: *const LoadedModel, control: ?InferenceExecutionControl) std.Io {
+        return if (control) |active| active.io orelse self.session_manager.io orelse std.Options.debug_io else self.session_manager.io orelse std.Options.debug_io;
+    }
+
+    fn verifyOwnerPublication(self: *const LoadedModel, control: ?InferenceExecutionControl) !void {
+        try self.checkOwnerSelection(control);
+        if (!std.meta.eql(self.managed_publication, try managed_receipt.publicationGeneration(self.allocator, self.publicationIo(control), self.model_dir))) return error.ModelArtifactsChanging;
+    }
+
     pub fn ensureOptionalSessionWithControl(
         self: *LoadedModel,
         kind: DeclaredOptionalSessionKind,
@@ -1034,9 +1055,13 @@ pub const Runtime = struct {
         path: ?[]const u8,
         control: ?InferenceExecutionControl,
     ) !bool {
-        if (control) |active| try active.check();
+        try self.checkOwnerSelection(control);
         if (slot.* != null) return false;
         const session_path = path orelse return false;
+        const io = self.publicationIo(control);
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, self.model_dir);
+        defer publication_lease.deinit(io);
+        try self.verifyOwnerPublication(control);
         const shared_ctx = backends.imported_onnx_session.sharedBackendContext(self.session);
         const strict_backend = [_]backends.BackendType{if (shared_ctx) |shared|
             shared.backendType()
@@ -1060,9 +1085,11 @@ pub const Runtime = struct {
             shared_ctx,
             &session_manager,
             control,
+            .{ .path = self.model_dir, .publication = self.managed_publication },
+            null,
         );
         defer loaded.deinit();
-        if (control) |active| try active.check();
+        try self.verifyOwnerPublication(control);
         const owned = loaded.take();
         slot.* = owned.session;
         lease_slot.* = owned.resource_lease;
@@ -1610,11 +1637,26 @@ pub const Runtime = struct {
     /// The model's open projector file, opened on first use. Null when the
     /// manifest has no GGUF projector.
     pub fn ensureProjectorStore(self: *LoadedModel) !?*gemma4_projector.ProjectorStore {
+        return self.ensureProjectorStoreWithControl(null);
+    }
+
+    pub fn ensureProjectorStoreWithControl(self: *LoadedModel, control: ?InferenceExecutionControl) !?*gemma4_projector.ProjectorStore {
+        try self.checkOwnerSelection(control);
+        if (control) |active| try active.check();
         const path = self.manifest.gguf_projector_path orelse return null;
         platform.sync.lockYielding(&self.projector_store_mutex);
         defer self.projector_store_mutex.unlock();
         if (self.projector_store) |store| return store;
-        const store = try gemma4_projector.ProjectorStore.open(self.allocator, path);
+        const io = self.publicationIo(control);
+        var proof = try ComponentConstruction.init(self.allocator, io, .{ .path = self.model_dir, .publication = self.managed_publication }, control, null);
+        defer proof.deinit();
+        proof.artifacts().verification_cache = self.host.session_loading.verification_cache;
+        const physical = try proof.artifacts().constructionPath(path);
+        defer self.allocator.free(physical);
+        try proof.artifacts().verifyPath(physical);
+        const store = try gemma4_projector.ProjectorStore.open(self.allocator, physical);
+        errdefer store.close();
+        try proof.finish();
         self.projector_store = store;
         return store;
     }
@@ -1655,6 +1697,7 @@ pub const Runtime = struct {
         if (self.visual_projection_resource_lease) |*lease| lease.release();
         if (self.audio_projection_resource_lease) |*lease| lease.release();
         if (self.whisper_prompt_cache) |*cache| cache.deinit();
+        if (self.whisper_prompt_admission) |*lease| lease.release();
         if (self.shared_moe_cache) |cache| cache.releaseOwned();
         if (self.shared_prefetch) |state| {
             state.deinit();
@@ -1756,10 +1799,16 @@ pub fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manif
         };
     }
     var external: std.ArrayList([]const u8) = .empty;
+    var inspected_primary = false;
     for (paths.items) |path| {
-        if (!std.mem.endsWith(u8, path, ".onnx")) continue;
-        var artifacts = try backends.imported_onnx_session.inspectArtifactSet(alloc, path);
+        const primary = (manifest.onnx_path != null and std.mem.eql(u8, path, manifest.onnx_path.?)) or
+            (manifest.onnx_logical_path != null and std.mem.eql(u8, path, manifest.onnx_logical_path.?));
+        if (primary and inspected_primary) continue;
+        if (!primary and !std.mem.endsWith(u8, path, ".onnx")) continue;
+        const base = if (primary and manifest.onnx_logical_path != null) std.fs.path.dirname(manifest.onnx_logical_path.?) else null;
+        var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithBase(alloc, if (primary) manifest.onnx_path.? else path, base);
         defer artifacts.deinit();
+        if (primary) inspected_primary = true;
         for (artifacts.external_paths) |tensor_path| try external.append(alloc, try alloc.dupe(u8, tensor_path));
     }
     try paths.appendSlice(alloc, external.items);
@@ -1771,6 +1820,8 @@ const encoder_decoder = @import("../pipelines/encoder_decoder.zig");
 const florence_arch = @import("../architectures/florence.zig");
 
 pub const Assets = struct {
+    managed_whisper_prompt: ?ManagedWhisperPrompt = null,
+    whisper_prompt_prepared: bool = false,
     manifest: manifest_mod.ModelManifest,
     hf_tok: ?*hf_tokenizer.HfTokenizer,
     sp_tok: ?*sentencepiece.Processor,
@@ -1791,6 +1842,7 @@ pub const Assets = struct {
 
     fn deinit(self: *Assets, allocator: std.mem.Allocator) void {
         self.session.deinit();
+        if (self.managed_whisper_prompt) |*prompt| prompt.deinit();
         if (self.hf_tok) |tokenizer| tokenizer.deinitSelf();
         if (self.sp_tok) |tokenizer| {
             tokenizer.deinit();
@@ -1856,34 +1908,7 @@ test "loaded runtime owned asset construction unwinds model and shared state at 
 }
 
 pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
-    var receipt = try managed_receipt.loadValidated(a, io, model_dir);
-    defer if (receipt) |*validated| validated.deinit();
-    if (receipt) |*validated| {
-        const artifacts = try a.dupe(managed_receipt.ValidatedArtifact, validated.artifacts);
-        defer a.free(artifacts);
-        std.mem.sort(managed_receipt.ValidatedArtifact, artifacts, {}, struct {
-            fn less(_: void, left: managed_receipt.ValidatedArtifact, right: managed_receipt.ValidatedArtifact) bool {
-                return std.mem.lessThan(u8, left.path, right.path);
-            }
-        }.less);
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        for (artifacts) |artifact| {
-            const decoded = try ArtifactDigestCache.digest(io, artifact);
-            if (artifact.sha256) |digest| {
-                if (digest.len != 64) return error.InvalidManagedDownload;
-                var expected: [32]u8 = undefined;
-                _ = std.fmt.hexToBytes(&expected, digest) catch return error.InvalidManagedDownload;
-                if (!std.mem.eql(u8, &expected, &decoded)) return error.ChecksumMismatch;
-            }
-            hash.update(artifact.path);
-            hash.update(&.{0});
-            hash.update(&decoded);
-        }
-        var result: [32]u8 = undefined;
-        hash.final(&result);
-        return result;
-    }
-    return resolutionModelRevision(a, io, manifest);
+    return modelIdentityWithArtifacts(a, io, model_dir, manifest, null);
 }
 
 /// The resource domain supplies admission; all model preparation and backend
@@ -1912,10 +1937,15 @@ pub fn loadPrimary(allocator: std.mem.Allocator, model_dir: []const u8, source_s
 
     if (control) |active| try active.update(.loading_model, 0, 4);
 
+    const io = sm.io orelse std.Options.debug_io;
+    var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, io, model_dir);
+    defer publication_lease.deinit(io);
+    const managed_publication = try managed_receipt.publicationGeneration(allocator, io, model_dir);
     // Load manifest
     var man = try manifest_mod.loadFromDir(allocator, model_dir);
     var man_owned = true;
     errdefer if (man_owned) man.deinit();
+    if (!std.meta.eql(managed_publication, man.managed_publication)) return error.ModelArtifactsChanging;
     if (control) |active| try active.update(.loading_model, 1, 4);
     var policy_backend_scratch: [7]backends.BackendType = undefined;
     if (preparation.serving_policy) |policy| {
@@ -1958,8 +1988,11 @@ pub fn loadPrimary(allocator: std.mem.Allocator, model_dir: []const u8, source_s
         defer files.deinit();
         break :native_generation native_kv_identity.fileGeneration(std.Io.Dir.cwd(), sm.io orelse std.Options.debug_io, &files.entries) catch null;
     };
+    var tokenizer_artifacts = try PublishedArtifacts.init(allocator, io, model_dir, .{ .publication = managed_publication });
+    defer tokenizer_artifacts.deinit();
+    tokenizer_artifacts.verification_cache = preparation.host.session_loading.verification_cache;
     const resolution_file_revision = try resolutionModelRevision(allocator, sm.io orelse std.Options.debug_io, man);
-    const resolution_revision = try modelIdentity(allocator, sm.io orelse std.Options.debug_io, model_dir, man);
+    const resolution_revision = try modelIdentityWithArtifacts(allocator, io, model_dir, man, &tokenizer_artifacts);
     const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
         try eg2_identity.signature(allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
     else
@@ -1989,13 +2022,14 @@ pub fn loadPrimary(allocator: std.mem.Allocator, model_dir: []const u8, source_s
     var sp_tok: ?*sentencepiece.Processor = null;
     var gliner_span_tokenizer_digest: ?@import("gliner_decide_qualification.zig").Digest = null;
 
-    const tokenizer_type = try tokenizer_loader.select(allocator, model_dir, man);
+    const tokenizer_type = try tokenizer_loader.tokenizerKindWithArtifacts(man, &tokenizer_artifacts, tokenizer_loader.tokenizerGemmaCompat(man, model_dir));
     const tokenizer_admission_plan: ?@import("load_plan.zig").ModelLoadAdmissionPlan = if (preparation.host.session_loading.admission_enabled)
-        try @import("load_plan.zig").tokenizerLoadAdmissionPlan(
+        try @import("load_plan.zig").tokenizerLoadAdmissionPlanWithArtifacts(
             allocator,
             model_dir,
             &man,
             tokenizer_type,
+            &tokenizer_artifacts,
         )
     else
         null;
@@ -2014,6 +2048,7 @@ pub fn loadPrimary(allocator: std.mem.Allocator, model_dir: []const u8, source_s
 
     if (control) |active| try active.check();
     const parsed_tokenizer = try tokenizer_loader.loadSelected(allocator, model_dir, &man, tokenizer_type, .{
+        .artifacts = &tokenizer_artifacts,
         .cache = preparation.tokenizer_options.cache,
         .parallel = preparation.tokenizer_options.parallel,
     });
@@ -2027,10 +2062,18 @@ pub fn loadPrimary(allocator: std.mem.Allocator, model_dir: []const u8, source_s
 
     // Plan and reserve resources before the backend begins allocating weights.
     if (control) |active| try active.update(.loading_weights, 0, 1);
-    var loaded_session = try session_loader.loadPreferred(allocator, preparation.host.session_loading, sm.preferred_backends, model_dir, man, sm, control);
+    var loaded_session = try session_loader.loadPreferredWithArtifacts(allocator, preparation.host.session_loading, sm.preferred_backends, model_dir, man, sm, control, &tokenizer_artifacts);
     defer loaded_session.deinit();
     if (control) |active| try active.update(.loading_model, 3, 4);
+    var managed_prompt: ?ManagedWhisperPrompt = if (session_factory.getWhisperConfig(loaded_session.session) != null)
+        try loadNativeWhisperPrompt(allocator, preparation.tokenizer_admission, &man, &tokenizer_artifacts, if (hf_tok) |tok| tok.tokenizer() else sp_tok.?.tokenizer())
+    else
+        null;
+    errdefer if (managed_prompt) |*prompt| prompt.deinit();
+    try tokenizer_artifacts.verify();
     const assets = Assets{
+        .managed_whisper_prompt = managed_prompt,
+        .whisper_prompt_prepared = true,
         .manifest = man,
         .hf_tok = hf_tok,
         .sp_tok = sp_tok,
@@ -2049,6 +2092,7 @@ pub fn loadPrimary(allocator: std.mem.Allocator, model_dir: []const u8, source_s
         .tokenizer_resource_lease = tokenizer_resource_lease,
         .kernel_jit_profile_bundle = qualified_profile_bundle,
     };
+    managed_prompt = null;
     man_owned = false;
     hf_tok = null;
     sp_tok = null;
@@ -2147,6 +2191,8 @@ pub fn embeddingPlanningBackend(manager: backends.SessionManager) backends.Backe
 /// A metadata-only planning snapshot uses the same tokenizer resource service
 /// as a full model load. No backend or driver is constructed here.
 pub const PlanningPreparation = struct {
+    expected_publication: ?[32]u8 = null,
+    verification_cache: ?*@import("../registry/published_artifacts.zig").VerificationCache = null,
     backend_snapshot: backends.SessionManager,
     identity_io: ?std.Io,
     tokenizer_options: @import("tokenizer_loader.zig").Options = .{},
@@ -2155,12 +2201,18 @@ pub const PlanningPreparation = struct {
 };
 pub fn loadPlanningAssets(allocator: std.mem.Allocator, model_dir: []const u8, io: std.Io, preparation: PlanningPreparation, control: InferenceExecutionControl) !ChunkPlanningAssets {
     try control.check();
+    var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, io, model_dir);
+    defer publication_lease.deinit(io);
     var man = try manifest_mod.loadFromDir(allocator, model_dir);
     errdefer man.deinit();
-    const revision = try modelIdentity(allocator, preparation.identity_io orelse return error.MissingIoRuntime, model_dir, man);
+    if (preparation.expected_publication != null and !std.meta.eql(preparation.expected_publication, man.managed_publication)) return error.ModelArtifactsChanging;
+    var artifacts = try PublishedArtifacts.init(allocator, io, model_dir, .{ .publication = man.managed_publication });
+    defer artifacts.deinit();
+    artifacts.verification_cache = preparation.verification_cache;
+    const revision = try modelIdentityWithArtifacts(allocator, preparation.identity_io orelse return error.MissingIoRuntime, model_dir, man, &artifacts);
     const planning = try chunkPlanningSnapshotWithControl(allocator, io, man, revision, control);
-    const kind = try tokenizer_loader.select(allocator, model_dir, man);
-    const plan = try @import("load_plan.zig").tokenizerLoadAdmissionPlan(allocator, model_dir, &man, kind);
+    const kind = try tokenizer_loader.tokenizerKindWithArtifacts(man, &artifacts, tokenizer_loader.tokenizerGemmaCompat(man, model_dir));
+    const plan = try @import("load_plan.zig").tokenizerLoadAdmissionPlanWithArtifacts(allocator, model_dir, &man, kind, &artifacts);
     var lease = if (preparation.tokenizer_admission) |service| try service.reserve(plan) else if (preparation.admission_enabled) return error.MissingTokenizerAdmissionService else null;
     errdefer if (lease) |*active| active.release();
     var hf: ?*hf_tokenizer.HfTokenizer = null;
@@ -2171,6 +2223,7 @@ pub fn loadPlanningAssets(allocator: std.mem.Allocator, model_dir: []const u8, i
         allocator.destroy(tok);
     };
     const parsed_tokenizer = try tokenizer_loader.loadSelected(allocator, model_dir, &man, kind, .{
+        .artifacts = &artifacts,
         .cache = preparation.tokenizer_options.cache,
         .parallel = preparation.tokenizer_options.parallel,
     });
@@ -2184,6 +2237,7 @@ pub fn loadPlanningAssets(allocator: std.mem.Allocator, model_dir: []const u8, i
     else
         std.fmt.bytesToHex(revision, .lower);
     if (lease) |*active| try active.retain(plan.resident);
+    try artifacts.verify();
     try control.check();
     return .{ .model_dir = model_dir, .identity_signature = if (man.embedding_style == .embedding_gemma2) try @import("../models/embedding_gemma2_identity.zig").signature(allocator, io, model_dir, man.safetensors_path.?) else null, .allocator = allocator, .manifest = man, .hf_tok = hf, .sp_tok = sp, .lease = lease, .revision = revision, .identity = identity, .planning = planning, .io = io };
 }
@@ -2300,4 +2354,99 @@ test "actual optional text head stays numeric and quota funded after asset slot 
     retained.deinitOutsideExecution();
     pipeline.text_projection = null; // borrowed descriptor dies with pin custody
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+pub fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest, published: ?*PublishedArtifacts) ![32]u8 {
+    var owned: ?managed_receipt.ValidatedReceipt = null;
+    defer if (owned) |*validated| validated.deinit();
+    const receipt: ?*managed_receipt.ValidatedReceipt = if (published) |source|
+        if (source.receipt) |*validated| validated else null
+    else blk: {
+        const receipt_root = try managed_receipt.publicationRootAlloc(a, io, model_dir);
+        defer a.free(receipt_root);
+        const standalone = std.mem.endsWith(u8, model_dir, ".gguf") and std.mem.eql(u8, model_dir, receipt_root);
+        owned = if (standalone) null else try managed_receipt.loadValidated(a, io, receipt_root);
+        break :blk if (owned) |*validated| validated else null;
+    };
+    if (receipt) |validated| {
+        const artifacts = try a.dupe(managed_receipt.ValidatedArtifact, validated.artifacts);
+        defer a.free(artifacts);
+        std.mem.sort(managed_receipt.ValidatedArtifact, artifacts, {}, struct {
+            fn less(_: void, left: managed_receipt.ValidatedArtifact, right: managed_receipt.ValidatedArtifact) bool {
+                return std.mem.lessThan(u8, left.path, right.path);
+            }
+        }.less);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        for (artifacts) |artifact| {
+            var decoded: [32]u8 = undefined;
+            if (published) |source| {
+                try source.verifyFile(artifact.path);
+                if (artifact.sha256) |digest| {
+                    // verifyFile authenticated this digest against the actual
+                    // file and retained its complete construction stamp.
+                    _ = std.fmt.hexToBytes(&decoded, digest) catch return error.InvalidManagedDownload;
+                } else decoded = try ArtifactDigestCache.digest(io, artifact);
+            } else decoded = try ArtifactDigestCache.digest(io, artifact);
+            if (artifact.sha256) |digest| {
+                if (digest.len != 64) return error.InvalidManagedDownload;
+                var expected: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&expected, digest) catch return error.InvalidManagedDownload;
+                if (!std.mem.eql(u8, &expected, &decoded)) return error.ChecksumMismatch;
+            }
+            hash.update(artifact.path);
+            hash.update(&.{0});
+            hash.update(&decoded);
+        }
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+    return resolutionModelRevision(a, io, manifest);
+}
+
+pub const ManagedWhisperPrompt = struct {
+    cache: whisper_prompt.PromptCache,
+    admission: ?runtime.tier.memory.AdmissionLease,
+    pub fn deinit(self: *ManagedWhisperPrompt) void {
+        self.cache.deinit();
+        if (self.admission) |*lease| lease.release();
+    }
+};
+
+pub fn loadNativeWhisperPrompt(allocator: std.mem.Allocator, admission_service: ?TokenizerAdmission, man: *const manifest_mod.ModelManifest, artifacts: *PublishedArtifacts, tokenizer: tokenizer_mod.Tokenizer) !ManagedWhisperPrompt {
+    const config_fallback = if (man.config_path == null) try artifacts.resolve("config.json") else null;
+    defer if (config_fallback) |path| allocator.free(path);
+    const config_path = man.config_path orelse config_fallback;
+    const generation_path = try artifacts.resolve("generation_config.json");
+    defer if (generation_path) |path| allocator.free(path);
+    const max_bytes = 16 * 1024 * 1024;
+    var encoded: usize = 0;
+    var read_limits: [2]usize = .{ 0, 0 };
+    for ([_]?[]const u8{ config_path, generation_path }, 0..) |maybe_path, i| if (maybe_path) |path| {
+        const size = (try std.Io.Dir.cwd().statFile(artifacts.io, path, .{})).size;
+        if (size > max_bytes) return error.FileTooLarge;
+        read_limits[i] = @intCast(size);
+        encoded = std.math.add(usize, encoded, read_limits[i]) catch return error.ResourceLimitExceeded;
+    };
+    // JSON value trees can greatly exceed compact integer-list encodings.
+    // Reserve their parse peak before reading, then retain only owned IDs.
+    var admission = if (admission_service) |service| try service.reserve(.{
+        .peak = .{ .host_weight_bytes = try @import("load_plan.zig").checkedScaledBytes(encoded, 32, 1024 * 1024) },
+        .resident = .{},
+    }) else null;
+    errdefer if (admission) |*lease| lease.release();
+    var cache = blk: {
+        const config = if (config_path) |path| try artifacts.readPath(path, read_limits[0]) else null;
+        defer if (config) |bytes| allocator.free(bytes);
+        const generation_config = if (generation_path) |path| try artifacts.readPath(path, read_limits[1]) else null;
+        defer if (generation_config) |bytes| allocator.free(bytes);
+        break :blk try whisper_prompt.PromptCache.initFromBytes(allocator, generation_config, config, tokenizer);
+    };
+    errdefer cache.deinit();
+    const resident = @sizeOf(whisper_prompt.PromptCache) +
+        cache.automatic_ids.len * @sizeOf(whisper_prompt.ForcedDecoderId) +
+        cache.language_tokens.len * @sizeOf(whisper_prompt.LanguageToken) +
+        (cache.decode.suppress_tokens.len + cache.decode.begin_suppress_tokens.len) * @sizeOf(i32);
+    if (admission) |*lease| try lease.retain(.{ .host_weight_bytes = resident });
+    return .{ .cache = cache, .admission = admission };
 }

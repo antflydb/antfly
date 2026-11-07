@@ -91,19 +91,33 @@ pub const PromptCache = struct {
         );
     }
 
-    /// Build prompt metadata from already-resolved artifact paths. Managed
-    /// serving uses this entry point so completion receipts remain authoritative
-    /// and a stale, unreceipted sidecar can never influence decoding.
+    /// Compatibility entry point for filesystem callers. Managed construction
+    /// supplies authenticated config bytes to initFromBytes().
     pub fn initFromPaths(
         allocator: std.mem.Allocator,
         generation_config_path: ?[]const u8,
         config_path: ?[]const u8,
         tokenizer: tokenizer_mod.Tokenizer,
     ) !PromptCache {
+        const generation_data = try readOptionalSidecar(allocator, generation_config_path);
+        defer if (generation_data) |data| allocator.free(data);
+        const config_data = try readOptionalSidecar(allocator, config_path);
+        defer if (config_data) |data| allocator.free(data);
+        return initFromBytes(allocator, generation_data, config_data, tokenizer);
+    }
+
+    /// Parse the same verified bytes used by decoder construction, without
+    /// reopening mutable paths or treating integrity/IO failures as absence.
+    pub fn initFromBytes(
+        allocator: std.mem.Allocator,
+        generation_data: ?[]const u8,
+        config_data: ?[]const u8,
+        tokenizer: tokenizer_mod.Tokenizer,
+    ) !PromptCache {
         var languages = std.ArrayListUnmanaged(LanguageToken).empty;
         defer languages.deinit(allocator);
         for (whisper_language_codes) |code| {
-            const token_id = encodeLanguageToken(allocator, tokenizer, code) orelse continue;
+            const token_id = (try encodeLanguageToken(allocator, tokenizer, code)) orelse continue;
             try languages.append(allocator, .{ .token_id = token_id, .code = code });
         }
         const language_tokens = try languages.toOwnedSlice(allocator);
@@ -111,10 +125,10 @@ pub const PromptCache = struct {
 
         const transcribe_id = try requireSpecialToken(allocator, tokenizer, "<|transcribe|>");
         const no_timestamps_id = try requireSpecialToken(allocator, tokenizer, "<|notimestamps|>");
-        const automatic_ids = if (try loadForcedDecoderIdsFromPaths(
+        const automatic_ids = if (try loadForcedDecoderIdsFromBytes(
             allocator,
-            generation_config_path,
-            config_path,
+            generation_data,
+            config_data,
         )) |ids| blk: {
             makeLanguageSlotDynamic(ids, language_tokens);
             break :blk ids;
@@ -131,11 +145,11 @@ pub const PromptCache = struct {
         // <|startofprev|> and <|nospeech|> sit two and one slots before
         // <|notimestamps|>, and <|endoftext|> one before <|startoftranscript|>.
         var decode = DecodeSettings{
-            .start_of_prev_id = encodeSingleSpecialToken(allocator, tokenizer, "<|startofprev|>") orelse no_timestamps_id - 2,
-            .eot_id = encodeSingleSpecialToken(allocator, tokenizer, "<|endoftext|>") orelse 50257,
-            .timestamp_begin_id = encodeSingleSpecialToken(allocator, tokenizer, "<|0.00|>") orelse no_timestamps_id + 1,
+            .start_of_prev_id = (try encodeSingleSpecialToken(allocator, tokenizer, "<|startofprev|>")) orelse no_timestamps_id - 2,
+            .eot_id = (try encodeSingleSpecialToken(allocator, tokenizer, "<|endoftext|>")) orelse 50257,
+            .timestamp_begin_id = (try encodeSingleSpecialToken(allocator, tokenizer, "<|0.00|>")) orelse no_timestamps_id + 1,
         };
-        try loadDecodeSettingsFromPaths(allocator, generation_config_path, &decode);
+        if (generation_data) |data| try parseDecodeSettings(allocator, data, &decode);
         errdefer allocator.free(decode.suppress_tokens);
         errdefer allocator.free(decode.begin_suppress_tokens);
         if (decode.suppress_tokens.len == 0) {
@@ -210,20 +224,11 @@ pub const PromptCache = struct {
     }
 };
 
-fn loadDecodeSettingsFromPaths(
-    allocator: std.mem.Allocator,
-    generation_config_path: ?[]const u8,
-    decode: *DecodeSettings,
-) !void {
-    const path = generation_config_path orelse return;
-    const data = c_file.readFile(allocator, path) catch return;
-    defer allocator.free(data);
-    try parseDecodeSettings(allocator, data, decode);
-}
-
 fn parseDecodeSettings(allocator: std.mem.Allocator, data: []const u8, decode: *DecodeSettings) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch
-        return error.InvalidWhisperDecoderConfig;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidWhisperDecoderConfig,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidWhisperDecoderConfig;
     const object = parsed.value.object;
@@ -262,18 +267,18 @@ pub fn nonSpeechTokens(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.To
     };
     const musical = [_][]const u8{ "♩", "♪", "♫", "♬", "♭", "♮", "♯" };
     for ([_][]const u8{ " -", " '" }) |leading| {
-        if (firstToken(allocator, tokenizer, leading)) |id| try appendUnique(allocator, &out, id);
+        if (try firstToken(allocator, tokenizer, leading)) |id| try appendUnique(allocator, &out, id);
     }
     var spaced_buf: [32]u8 = undefined;
     for (symbols) |symbol| {
-        if (singleToken(allocator, tokenizer, symbol)) |id| try appendUnique(allocator, &out, id);
+        if (try singleToken(allocator, tokenizer, symbol)) |id| try appendUnique(allocator, &out, id);
         const spaced = std.fmt.bufPrint(&spaced_buf, " {s}", .{symbol}) catch continue;
-        if (singleToken(allocator, tokenizer, spaced)) |id| try appendUnique(allocator, &out, id);
+        if (try singleToken(allocator, tokenizer, spaced)) |id| try appendUnique(allocator, &out, id);
     }
     for (musical) |symbol| {
-        if (firstToken(allocator, tokenizer, symbol)) |id| try appendUnique(allocator, &out, id);
+        if (try firstToken(allocator, tokenizer, symbol)) |id| try appendUnique(allocator, &out, id);
         const spaced = std.fmt.bufPrint(&spaced_buf, " {s}", .{symbol}) catch continue;
-        if (firstToken(allocator, tokenizer, spaced)) |id| try appendUnique(allocator, &out, id);
+        if (try firstToken(allocator, tokenizer, spaced)) |id| try appendUnique(allocator, &out, id);
     }
     // Control tokens never appear inside a transcript.
     var control: i32 = eot_id + 1;
@@ -285,20 +290,20 @@ pub fn nonSpeechTokens(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.To
 pub fn beginSuppressTokens(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, eot_id: i32) ![]const i32 {
     var out = std.ArrayListUnmanaged(i32).empty;
     errdefer out.deinit(allocator);
-    if (singleToken(allocator, tokenizer, " ")) |id| try appendUnique(allocator, &out, id);
+    if (try singleToken(allocator, tokenizer, " ")) |id| try appendUnique(allocator, &out, id);
     try appendUnique(allocator, &out, eot_id);
     return out.toOwnedSlice(allocator);
 }
 
-fn singleToken(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, text: []const u8) ?i32 {
-    const ids = tokenizer.encode(allocator, text) catch return null;
+fn singleToken(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, text: []const u8) !?i32 {
+    const ids = try tokenizer.encode(allocator, text);
     defer allocator.free(ids);
     if (ids.len != 1 or ids[0] == tokenizer.specialTokens().unk_id) return null;
     return ids[0];
 }
 
-fn firstToken(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, text: []const u8) ?i32 {
-    const ids = tokenizer.encode(allocator, text) catch return null;
+fn firstToken(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, text: []const u8) !?i32 {
+    const ids = try tokenizer.encode(allocator, text);
     defer allocator.free(ids);
     if (ids.len == 0 or ids[0] == tokenizer.specialTokens().unk_id) return null;
     return ids[0];
@@ -332,23 +337,39 @@ pub fn loadForcedDecoderIds(allocator: std.mem.Allocator, model_dir: []const u8)
     return loadForcedDecoderIdsFromPaths(allocator, generation_config_path, config_path);
 }
 
+fn readOptionalSidecar(allocator: std.mem.Allocator, maybe_path: ?[]const u8) !?[]u8 {
+    const path = maybe_path orelse return null;
+    return c_file.readFile(allocator, path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => null,
+        else => return err,
+    };
+}
+
 fn loadForcedDecoderIdsFromPaths(
     allocator: std.mem.Allocator,
     generation_config_path: ?[]const u8,
     config_path: ?[]const u8,
 ) !?[]ForcedDecoderId {
     for ([_]?[]const u8{ generation_config_path, config_path }) |maybe_path| {
-        const path = maybe_path orelse continue;
-        const data = c_file.readFile(allocator, path) catch continue;
+        const data = (try readOptionalSidecar(allocator, maybe_path)) orelse continue;
         defer allocator.free(data);
         if (try parseForcedDecoderIds(allocator, data)) |ids| return ids;
     }
     return null;
 }
 
+fn loadForcedDecoderIdsFromBytes(allocator: std.mem.Allocator, generation_data: ?[]const u8, config_data: ?[]const u8) !?[]ForcedDecoderId {
+    for ([_]?[]const u8{ generation_data, config_data }) |maybe_data| {
+        if (maybe_data) |data| if (try parseForcedDecoderIds(allocator, data)) |ids| return ids;
+    }
+    return null;
+}
+
 fn parseForcedDecoderIds(allocator: std.mem.Allocator, data: []const u8) !?[]ForcedDecoderId {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch
-        return error.InvalidWhisperDecoderConfig;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidWhisperDecoderConfig,
+    };
     defer parsed.deinit();
 
     if (parsed.value != .object) return error.InvalidWhisperDecoderConfig;
@@ -426,15 +447,15 @@ fn requireSpecialToken(
     tokenizer: tokenizer_mod.Tokenizer,
     text: []const u8,
 ) !i32 {
-    return encodeSingleSpecialToken(allocator, tokenizer, text) orelse error.MissingWhisperSpecialToken;
+    return (try encodeSingleSpecialToken(allocator, tokenizer, text)) orelse error.MissingWhisperSpecialToken;
 }
 
 fn encodeLanguageToken(
     allocator: std.mem.Allocator,
     tokenizer: tokenizer_mod.Tokenizer,
     language: []const u8,
-) ?i32 {
-    const language_token = std.fmt.allocPrint(allocator, "<|{s}|>", .{language}) catch return null;
+) !?i32 {
+    const language_token = try std.fmt.allocPrint(allocator, "<|{s}|>", .{language});
     defer allocator.free(language_token);
     return encodeSingleSpecialToken(allocator, tokenizer, language_token);
 }
@@ -443,8 +464,8 @@ fn encodeSingleSpecialToken(
     allocator: std.mem.Allocator,
     tokenizer: tokenizer_mod.Tokenizer,
     text: []const u8,
-) ?i32 {
-    const ids = tokenizer.encode(allocator, text) catch return null;
+) !?i32 {
+    const ids = try tokenizer.encode(allocator, text);
     defer allocator.free(ids);
     if (ids.len != 1 or ids[0] == tokenizer.specialTokens().unk_id) return null;
     return ids[0];

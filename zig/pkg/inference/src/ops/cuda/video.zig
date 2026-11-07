@@ -25,15 +25,15 @@ const driver = @import("driver.zig");
 const ops = @import("../ops.zig");
 const cuda = @import("cuda_compute.zig");
 
-const Callback = *const fn (*anyopaque, u64, u32, u32, u32, i64, u32, u32) callconv(.c) c_int;
+const Callback = *const fn (*anyopaque, u64, u32, u32, u32, i64, u32, u32, u32, u32) callconv(.c) c_int;
 extern fn antfly_nvdec_open(*?*anyopaque, ?*anyopaque, *anyopaque, Callback) c_int;
 extern fn antfly_nvdec_packet(*anyopaque, ?[*]const u8, u32, i64, c_int) c_int;
 extern fn antfly_nvdec_close_checked(*anyopaque) c_int;
 extern fn antfly_nvdec_retirement_ready(*anyopaque, *anyopaque, *const fn (*anyopaque) callconv(.c) void) c_int;
 extern fn antfly_nvdec_detach_budget(*anyopaque, *anyopaque, *const fn (*anyopaque) callconv(.c) void, *anyopaque, *const fn (*anyopaque) callconv(.c) void) c_int;
-extern fn antfly_nvdec_begin(*anyopaque, ?*anyopaque, *anyopaque, Callback, u32, u32, c_int, c_int, c_int) c_int;
+extern fn antfly_nvdec_begin(*anyopaque, ?*anyopaque, *anyopaque, Callback, u32, u32, c_int, c_int, c_int, c_int, c_int, u32, u32, c_int) c_int;
 extern fn antfly_nvdec_finish_checked(*anyopaque) c_int;
-extern fn antfly_nvdec_probe_begin(*anyopaque, u32, u32, c_int, c_int, c_int) c_int;
+extern fn antfly_nvdec_probe_begin(*anyopaque, u32, u32, c_int, c_int, c_int, c_int, c_int, u32, u32, c_int) c_int;
 extern fn antfly_nvdec_probe_result(*anyopaque, *Sequence) c_int;
 extern fn antfly_nvdec_expect_sequence(*anyopaque, ?*const Sequence) c_int;
 extern fn antfly_nvdec_sequence_matches(*anyopaque, *const Sequence) c_int;
@@ -59,7 +59,7 @@ fn openDecoderOwned(out: *?*anyopaque, stream: ?*anyopaque, user: *anyopaque, ca
 /// uses an independent parser and stops before the first HW picture decode;
 /// no persistent surface, stream work or consumer callback is created. The
 /// context owner stays pinned by the caller; capture legality is authoritative.
-pub const EmbeddingProbe = struct { sequence: Sequence, samples: u6 = 0, unique_frames: u6 = 0 };
+pub const EmbeddingProbe = struct { sequence: Sequence, samples: u6 = 0, unique_frames: u6 = 0, display_width: u32 = 0, display_height: u32 = 0, raster_width: u32 = 0, raster_height: u32 = 0 };
 
 pub fn probeMp4Sequence(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes: []const u8, control: media.source.Control, preparation: *const cuda.CudaCompute.CacheMetadataPreparation) !Sequence {
     return (try probeSequence(allocator, ctx, bytes, control, preparation, false)).sequence;
@@ -77,8 +77,15 @@ fn probeSequence(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes:
     var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video-probe", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = control };
     var reader = try media.mp4.Reader.init(allocator, &source, mp4Limits(true));
     defer reader.deinit();
+    try validateTrack(reader.track);
+    const normalized = try @import("antfly_video").hevc_config.normalizeReader(allocator, &reader);
+    defer if (normalized) |config| allocator.free(config);
     const track = reader.track;
-    try validateTrack(track);
+    const rotation = try quarterTurns(track.display_matrix);
+    const sar = try displayAspect(allocator, track);
+    const probe_frame = Frame{ .device = 0, .pitch = 0, .width = track.width, .height = track.height, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = rotation, .sar = sar };
+    const display = try probe_frame.displaySize();
+    const raster = probe_frame.rasterSize();
     const color = try containerColor(track.color_info);
     if (reader.packets.len == 0) return error.EmptyVideo;
     const end_us = try validateTimeline(track, reader.packets);
@@ -96,7 +103,7 @@ fn probeSequence(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes:
         .mjpeg => return error.UnsupportedVideoFormat,
     };
     const NoFrames = struct {
-        fn call(_: *anyopaque, _: u64, _: u32, _: u32, _: u32, _: i64, _: u32, _: u32) callconv(.c) c_int {
+        fn call(_: *anyopaque, _: u64, _: u32, _: u32, _: u32, _: i64, _: u32, _: u32, _: u32, _: u32) callconv(.c) c_int {
             // Probe decode/display callbacks must not reach a consumer.
             return -1;
         }
@@ -106,7 +113,7 @@ fn probeSequence(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes:
     try ctx.makeCurrent();
     try openDecoderOwned(&decoder, null, &unused, NoFrames.call);
     defer if (antfly_nvdec_close_checked(decoder.?) != 0) @import("antfly_platform").inference_process_supervisor.restartWorker();
-    try checkStatusCode(antfly_nvdec_probe_begin(decoder.?, track.width, track.height, codec, color.matrix, color.range));
+    try checkStatusCode(antfly_nvdec_probe_begin(decoder.?, track.width, track.height, codec, color.matrix, color.range, color.transfer, color.primaries, sar.horizontal, sar.vertical, @intFromBool(track.pixel_aspect_declared)));
     var annex: std.ArrayList(u8) = .empty;
     defer annex.deinit(allocator);
     switch (track.codec) {
@@ -121,7 +128,7 @@ fn probeSequence(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes:
         if (status != 7) try checkStatusCode(status);
         if (antfly_nvdec_probe_result(decoder.?, &observed) != 0) {
             _ = try observed.bytes();
-            return .{ .sequence = observed, .samples = samples, .unique_frames = unique_frames };
+            return .{ .sequence = observed, .samples = samples, .unique_frames = unique_frames, .display_width = display[0], .display_height = display[1], .raster_width = raster[0], .raster_height = raster[1] };
         }
         if (status == 7) return error.InvalidVideoGeometry;
     }
@@ -135,7 +142,7 @@ fn probeSequence(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes:
         if (status != 7) try checkStatusCode(status);
         if (antfly_nvdec_probe_result(decoder.?, &observed) != 0) {
             _ = try observed.bytes();
-            return .{ .sequence = observed, .samples = samples, .unique_frames = unique_frames };
+            return .{ .sequence = observed, .samples = samples, .unique_frames = unique_frames, .display_width = display[0], .display_height = display[1], .raster_width = raster[0], .raster_height = raster[1] };
         }
         if (status == 7) return error.InvalidVideoGeometry;
     }
@@ -147,11 +154,11 @@ pub fn cachedSequenceMatches(ctx: *const context.CudaContext, sequence: Sequence
     return antfly_nvdec_sequence_matches(decoder, &sequence) != 0;
 }
 
-extern fn antfly_nvdec_set_budget(*anyopaque, *anyopaque, *const fn (*anyopaque, u32, u32, u32) callconv(.c) c_int, *const fn (*anyopaque) callconv(.c) void) void;
+extern fn antfly_nvdec_set_budget(*anyopaque, *anyopaque, *const fn (*anyopaque, u32, u32, u32, u32) callconv(.c) c_int, *const fn (*anyopaque) callconv(.c) void) void;
 
-fn reserveDecoder(raw: *anyopaque, width: u32, height: u32, surfaces: u32) callconv(.c) c_int {
+fn reserveDecoder(raw: *anyopaque, width: u32, height: u32, surfaces: u32, sample_bytes: u32) callconv(.c) c_int {
     const ctx: *context.CudaContext = @ptrCast(@alignCast(raw));
-    const bytes = @import("video_cache_budget.zig").envelope(width, height, surfaces) catch |err| {
+    const bytes = @import("video_cache_budget.zig").envelopeForSampleBytes(width, height, surfaces, sample_bytes) catch |err| {
         ctx.video_cache_budget.failure = err;
         return 0;
     };
@@ -160,7 +167,7 @@ fn reserveDecoder(raw: *anyopaque, width: u32, height: u32, surfaces: u32) callc
             ctx.video_cache_budget.failure = error.UnpreparedDecoderAdmission;
             return 0;
         };
-        if (expected.coded_width != width or expected.coded_height != height or expected.surfaces != surfaces) {
+        if (expected.coded_width != width or expected.coded_height != height or expected.surfaces != surfaces or (if (expected.bit_depth == 10) @as(u32, 2) else @as(u32, 1)) != sample_bytes) {
             ctx.video_cache_budget.failure = error.PreparedCacheAmountChanged;
             return 0;
         }
@@ -265,7 +272,25 @@ pub const Frame = struct {
     matrix: u32,
     full_range: u32,
     repetitions: usize = 1,
+    /// Clockwise quarter turns from coded to displayed pixels.
+    rotation: u32 = 0,
+    /// One for an MSB-aligned 16-bit P016 surface, zero for NV12.
+    high_depth: u32 = 0,
+    /// Zero for SDR, one for PQ, two for HLG; the portable HDR policy.
+    tone: u32 = 0,
+    sar: PixelAspect = .{},
+    /// Square-pixel size the model sees, after SAR and rotation.
+    pub fn displaySize(self: Frame) ![2]u32 {
+        if (self.rotation > 3) return error.UnsupportedVideoDisplay;
+        const display = try @import("antfly_video").display.sarLayout(self.width, self.height, self.sar.horizontal, self.sar.vertical, @fromBackingInt(@intCast(self.rotation)));
+        return .{ display.width, display.height };
+    }
+    /// Pixels in displayed orientation, before SAR changes their aspect.
+    pub fn rasterSize(self: Frame) [2]u32 {
+        return if (self.rotation & 1 != 0) .{ self.height, self.width } else .{ self.width, self.height };
+    }
 };
+pub const PixelAspect = struct { horizontal: u32 = 1, vertical: u32 = 1 };
 pub const Consumer = struct {
     context: *anyopaque,
     consume: *const fn (*anyopaque, Frame) anyerror!void,
@@ -376,11 +401,11 @@ test "embeddinggemma2 video HEVC AV1 and AVC NVDEC pixels match independent FFmp
         }
     };
     inline for (.{ "hevc-10bit.mp4", "av1-10bit.mp4" }) |name| {
-        try std.testing.expectError(error.UnsupportedVideoFormat, inspectEmbedding(a, @embedFile("../../testdata/video/codecs/" ++ name), .{}));
+        _ = try inspectEmbedding(a, @embedFile("../../testdata/video/codecs/" ++ name), .{});
     }
 }
 
-pub const EmbeddingInspection = struct { width: u32, height: u32, frames: usize, codec: media.mp4.Codec = .avc };
+pub const EmbeddingInspection = struct { width: u32, height: u32, frames: usize, codec: media.mp4.Codec = .avc, display_width: u32 = 0, display_height: u32 = 0 };
 
 test "embeddinggemma2 video container preflight shares six second sampling and cancellation" {
     const bytes = @embedFile("../../testdata/video/closed.mp4");
@@ -401,17 +426,21 @@ test "embeddinggemma2 video container preflight shares six second sampling and c
     }.run, .{bytes});
 }
 
-/// Container-only inspection under the caller's host preprocessing permit.
-/// Uses the decoder's validation and sampler, without opening NVDEC.
+/// Inspection under the caller's host preprocessing permit, without NVDEC.
+/// hev1 also reads sample zero to resolve in-band parameter sets before sizing.
 pub fn inspectEmbedding(allocator: std.mem.Allocator, bytes: []const u8, control: media.source.Control) !EmbeddingInspection {
     if (bytes.len > 256 * 1024 * 1024) return error.VideoInputTooLarge;
     var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = control };
     var reader = try media.mp4.Reader.init(allocator, &source, mp4Limits(true));
     defer reader.deinit();
     try validateTrack(reader.track);
+    const normalized = try @import("antfly_video").hevc_config.normalizeReader(allocator, &reader);
+    defer if (normalized) |config| allocator.free(config);
     const end_us = try validateTimeline(reader.track, reader.packets);
     const sampler = try embeddingSamplerForReader(&reader, end_us);
-    return .{ .width = reader.track.width, .height = reader.track.height, .frames = sampler.length, .codec = reader.track.codec };
+    const frame = Frame{ .device = 0, .pitch = 0, .width = reader.track.width, .height = reader.track.height, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = try quarterTurns(reader.track.display_matrix), .sar = try displayAspect(allocator, reader.track) };
+    const display = try frame.displaySize();
+    return .{ .width = reader.track.width, .height = reader.track.height, .frames = sampler.length, .codec = reader.track.codec, .display_width = display[0], .display_height = display[1] };
 }
 
 fn validateTrack(track: anytype) !void {
@@ -419,17 +448,45 @@ fn validateTrack(track: anytype) !void {
         .avc => if (track.inband_parameter_sets) return error.UnsupportedVideoFormat,
         .hevc => {
             const c = track.codec_config;
-            if (c.len < 23 or c[1] & 0x1f != 1 or c[16] & 3 != 1 or c[17] & 7 != 0 or c[18] & 7 != 0) return error.UnsupportedVideoFormat;
+            // Main and Main 10: 4:2:0 at 8 or 10 bits, the same depth on both planes.
+            if (c.len < 23 or c[1] & 0x1f > 2 or c[16] & 3 != 1 or (c[17] & 7 != 0 and c[17] & 7 != 2) or c[18] & 7 != c[17] & 7) return error.UnsupportedVideoFormat;
         },
         .av1 => {
             const c = track.codec_config;
-            if (c.len < 4 or c[1] >> 5 != 0 or c[2] & 0x70 != 0 or c[2] & 0x0c != 0x0c or c[2] & 3 == 3) return error.UnsupportedVideoFormat;
+            // Main profile 4:2:0 at 8 or 10 bits, excluding monochrome.
+            if (c.len < 4 or c[1] >> 5 != 0 or c[2] & 0x30 != 0 or c[2] & 0x0c != 0x0c or c[2] & 3 == 3) return error.UnsupportedVideoFormat;
         },
         .mjpeg => return error.UnsupportedVideoFormat,
     }
-    if (track.pixel_aspect.horizontal != track.pixel_aspect.vertical or
-        !std.mem.eql(i32, &track.display_matrix, &.{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 })) return error.UnsupportedVideoFormat;
+    if (track.pixel_aspect.horizontal == 0 or track.pixel_aspect.vertical == 0) return error.UnsupportedVideoFormat;
+    _ = try quarterTurns(track.display_matrix);
     _ = try containerColor(track.color_info);
+}
+
+/// In lowest terms. A container pasp wins; a stream's SAR applies without one.
+fn displayAspect(a: std.mem.Allocator, track: media.mp4.Track) !PixelAspect {
+    var horizontal = track.pixel_aspect.horizontal;
+    var vertical = track.pixel_aspect.vertical;
+    if (!track.pixel_aspect_declared and track.codec == .hevc) {
+        if (try @import("antfly_video").hevc_config.parse(a, track.codec_config)) |signal| {
+            horizontal = signal.sar.horizontal;
+            vertical = signal.sar.vertical;
+        }
+    }
+    const common = std.math.gcd(horizontal, vertical);
+    return .{ .horizontal = horizontal / common, .vertical = vertical / common };
+}
+
+/// Orthogonal MP4 display transforms, including translation. Reflection, shear and
+/// arbitrary angles stay with the portable route's rejection.
+fn quarterTurns(matrix: [9]i32) !u32 {
+    if (matrix[2] != 0 or matrix[5] != 0 or matrix[8] != 1073741824) return error.UnsupportedVideoFormat;
+    const basis = [4]i32{ matrix[0], matrix[1], matrix[3], matrix[4] };
+    if (std.mem.eql(i32, &basis, &.{ 65536, 0, 0, 65536 })) return 0;
+    if (std.mem.eql(i32, &basis, &.{ 0, 65536, -65536, 0 })) return 1;
+    if (std.mem.eql(i32, &basis, &.{ -65536, 0, 0, -65536 })) return 2;
+    if (std.mem.eql(i32, &basis, &.{ 0, -65536, 65536, 0 })) return 3;
+    return error.UnsupportedVideoFormat;
 }
 
 fn embeddingSamplerForReader(reader: *const media.mp4.Reader, end_us: i64) !EmbeddingSampler {
@@ -502,12 +559,14 @@ const DecodeState = struct {
     embedding_sampler: ?EmbeddingSampler = null,
     stats: Stats = .{},
     failure: ?anyerror = null,
+    rotation: u32 = 0,
+    sar: PixelAspect = .{},
     fn checkStatus(self: *DecodeState, status: c_int) !void {
         if (self.failure) |err| return err;
         if (self.ctx.video_cache_budget.failure) |err| return err;
         try checkStatusCode(status);
     }
-    fn callback(user_data: *anyopaque, device: u64, pitch: u32, width: u32, height: u32, pts: i64, matrix: u32, full_range: u32) callconv(.c) c_int {
+    fn callback(user_data: *anyopaque, device: u64, pitch: u32, width: u32, height: u32, pts: i64, matrix: u32, full_range: u32, bit_depth: u32, transfer: u32) callconv(.c) c_int {
         const self: *@This() = @ptrCast(@alignCast(user_data));
         if (self.failure != null) return -1;
         if (self.consumer.check) |check| check(self.consumer.context) catch |err| {
@@ -523,7 +582,7 @@ const DecodeState = struct {
         }
         const repetitions = if (self.embedding_sampler) |sampler| sampler.repetitions else 1;
         for (0..if (self.consumer.coalesce_repetitions) @as(usize, 1) else repetitions) |_| {
-            self.consumer.consume(self.consumer.context, .{ .device = device, .pitch = pitch, .width = width, .height = height, .timestamp_us = pts, .matrix = matrix, .full_range = full_range, .repetitions = if (self.consumer.coalesce_repetitions) repetitions else 1 }) catch |err| {
+            self.consumer.consume(self.consumer.context, .{ .device = device, .pitch = pitch, .width = width, .height = height, .timestamp_us = pts, .matrix = matrix, .full_range = full_range, .rotation = self.rotation, .sar = self.sar, .high_depth = @intFromBool(bit_depth == 10), .tone = if (transfer == 16) 1 else if (transfer == 18) 2 else 0, .repetitions = if (self.consumer.coalesce_repetitions) repetitions else 1 }) catch |err| {
                 self.failure = err;
                 break;
             };
@@ -565,11 +624,16 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     ctx.video_cache_budget.failure = null;
     var state = DecodeState{ .ctx = ctx, .consumer = consumer };
     var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = .{ .context = &state, .check_fn = sourceCheck } };
-    var reader = try media.mp4.Reader.init(allocator, &source, mp4Limits(sampling == .embedding_gemma2));
+    var reader = try media.mp4.Reader.init(allocator, &source, mp4Limits(true));
     defer reader.deinit();
+    try validateTrack(reader.track);
+    const normalized = try @import("antfly_video").hevc_config.normalizeReader(allocator, &reader);
+    defer if (normalized) |config| allocator.free(config);
     const track = reader.track;
-    try validateTrack(track);
     const color = try containerColor(track.color_info);
+    state.rotation = try quarterTurns(track.display_matrix);
+    state.sar = try displayAspect(allocator, track);
+    _ = try (Frame{ .device = 0, .pitch = 0, .width = track.width, .height = track.height, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = state.rotation, .sar = state.sar }).displaySize();
     if (reader.packets.len == 0) return error.EmptyVideo;
     state.sampler.end_us = try validateTimeline(track, reader.packets);
     if (sampling == .embedding_gemma2) {
@@ -618,7 +682,7 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
         .av1 => 11,
         .mjpeg => return error.UnsupportedVideoFormat,
     };
-    try state.checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, &state, DecodeState.callback, track.width, track.height, codec, color.matrix, color.range));
+    try state.checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, &state, DecodeState.callback, track.width, track.height, codec, color.matrix, color.range, color.transfer, color.primaries, state.sar.horizontal, state.sar.vertical, @intFromBool(track.pixel_aspect_declared)));
     var annex: std.ArrayList(u8) = .empty;
     defer annex.deinit(allocator);
     switch (track.codec) {
@@ -743,7 +807,7 @@ test "video MP4 truncated and mutated containers stay bounded and release leases
         mutated[i] = original[i];
     }
 }
-const Color = struct { matrix: c_int = -1, range: c_int = -1 };
+const Color = struct { matrix: c_int = -1, range: c_int = -1, transfer: c_int = -1, primaries: c_int = -1 };
 fn containerColor(bytes: []const u8) !Color {
     if (bytes.len == 0) return .{};
     if (bytes.len < 10) return error.UnsupportedVideoContainerColor;
@@ -752,18 +816,37 @@ fn containerColor(bytes: []const u8) !Color {
     const primaries = std.mem.readInt(u16, bytes[4..6], .big);
     const transfer = std.mem.readInt(u16, bytes[6..8], .big);
     const matrix = std.mem.readInt(u16, bytes[8..10], .big);
-    if ((primaries != 1 and primaries != 2 and primaries != 5 and primaries != 6) or
+    const hdr = transfer == 16 or transfer == 18;
+    if (hdr) {
+        if (!((matrix == 9 and primaries == 9) or (matrix == 1 and primaries == 1))) return error.UnsupportedVideoContainerColor;
+    } else if ((primaries != 1 and primaries != 2 and primaries != 5 and primaries != 6) or
         (transfer != 1 and transfer != 2 and transfer != 6 and transfer != 13) or
         (matrix != 1 and matrix != 2 and matrix != 5 and matrix != 6)) return error.UnsupportedVideoContainerColor;
     if (nclx and bytes[10] & 127 != 0) return error.UnsupportedVideoContainerColor;
-    return .{ .matrix = if (matrix == 2) -1 else matrix, .range = if (nclx) @intCast(bytes[10] >> 7) else -1 };
+    return .{
+        .matrix = if (matrix == 2) -1 else matrix,
+        .range = if (nclx) @intCast(bytes[10] >> 7) else -1,
+        .transfer = if (transfer == 2) -1 else transfer,
+        .primaries = if (primaries == 2) -1 else primaries,
+    };
 }
 
-test "video container color accepts SDR and rejects HDR or malformed metadata" {
-    try std.testing.expectEqual(Color{ .matrix = 1, .range = 1 }, try containerColor("nclx" ++ [_]u8{ 0, 1, 0, 1, 0, 1, 128 }));
-    try std.testing.expectEqual(Color{ .matrix = 6 }, try containerColor("nclc" ++ [_]u8{ 0, 6, 0, 6, 0, 6 }));
-    try std.testing.expectError(error.UnsupportedVideoContainerColor, containerColor("nclx" ++ [_]u8{ 0, 9, 0, 16, 0, 9, 0 }));
+test "video container color accepts SDR and consistent HDR, and rejects the rest" {
+    try std.testing.expectEqual(Color{ .matrix = 1, .range = 1, .transfer = 1, .primaries = 1 }, try containerColor("nclx" ++ [_]u8{ 0, 1, 0, 1, 0, 1, 128 }));
+    try std.testing.expectEqual(Color{ .matrix = 6, .transfer = 6, .primaries = 6 }, try containerColor("nclc" ++ [_]u8{ 0, 6, 0, 6, 0, 6 }));
+    try std.testing.expectEqual(Color{ .matrix = 9, .range = 0, .transfer = 18, .primaries = 9 }, try containerColor("nclx" ++ [_]u8{ 0, 9, 0, 18, 0, 9, 0 }));
+    try std.testing.expectError(error.UnsupportedVideoContainerColor, containerColor("nclx" ++ [_]u8{ 0, 9, 0, 16, 0, 6, 0 }));
+    try std.testing.expectError(error.UnsupportedVideoContainerColor, containerColor("nclx" ++ [_]u8{ 0, 9, 0, 1, 0, 9, 0 }));
     try std.testing.expectError(error.UnsupportedVideoContainerColor, containerColor("nclx"));
+}
+
+test "NVDEC display geometry applies SAR before quarter turns" {
+    var frame = Frame{ .device = 0, .pitch = 0, .width = 64, .height = 48, .timestamp_us = 0, .matrix = 0, .full_range = 0, .sar = .{ .horizontal = 2, .vertical = 1 } };
+    try std.testing.expectEqual([2]u32{ 128, 48 }, try frame.displaySize());
+    frame.rotation = try quarterTurns(.{ 0, 65536, 0, -65536, 0, 0, 0, 0, 1073741824 });
+    try std.testing.expectEqual([2]u32{ 48, 128 }, try frame.displaySize());
+    try std.testing.expectEqual([2]u32{ 48, 64 }, frame.rasterSize());
+    try std.testing.expectError(error.UnsupportedVideoFormat, quarterTurns(.{ 65536, 0, 0, 0, -65536, 0, 0, 0, 1073741824 }));
 }
 
 fn sourceCheck(user_data: ?*const anyopaque) !void {
@@ -845,14 +928,15 @@ pub const Preprocessor = struct {
     }
     pub fn rgb8(self: *Preprocessor, compute: *cuda.CudaCompute, frame: Frame) !ops.CT {
         if (frame.device == 0 or frame.width == 0 or frame.height == 0 or frame.width > 4096 or frame.height > 4096 or frame.pitch < frame.width or frame.width % 2 != 0 or frame.height % 2 != 0) return error.InvalidVideoGeometry;
-        const output = try compute.createEmbeddingGemma2Tensor(&.{ frame.height, frame.width, 3 }, .u8);
+        const raster = frame.rasterSize();
+        const output = try compute.createEmbeddingGemma2Tensor(&.{ raster[1], raster[0], 3 }, .u8);
         const tensor: *cuda.CudaTensor = @ptrCast(@alignCast(output));
         const cb = compute.computeBackend();
         errdefer cb.free(output);
         var src = frame.device;
         var dst = tensor.buffer.ptr;
-        var sizes = [_]u32{ frame.pitch, frame.width, frame.height, frame.matrix, frame.full_range };
-        var args: [7]?*anyopaque = undefined;
+        var sizes = [_]u32{ frame.pitch, frame.width, frame.height, frame.matrix, frame.full_range, frame.rotation, frame.high_depth, frame.tone };
+        var args: [10]?*anyopaque = undefined;
         args[0] = &src;
         args[1] = &dst;
         for (&sizes, 2..) |*value, i| args[i] = value;
@@ -869,13 +953,13 @@ pub const Preprocessor = struct {
         const tensor: *cuda.CudaTensor = @ptrCast(@alignCast(output));
         var src = frame.device;
         var dst = tensor.buffer.ptr;
-        var sizes = [_]u32{ frame.pitch, frame.width, frame.height, width, height, patch, frame.matrix, frame.full_range };
+        var sizes = [_]u32{ frame.pitch, frame.width, frame.height, width, height, patch, frame.matrix, frame.full_range, frame.rotation, frame.high_depth, frame.tone };
         var normalization = mean ++ stddev;
-        var args: [16]?*anyopaque = undefined;
+        var args: [19]?*anyopaque = undefined;
         args[0] = &src;
         args[1] = &dst;
         for (&sizes, 2..) |*value, i| args[i] = value;
-        for (&normalization, 10..) |*value, i| args[i] = value;
+        for (&normalization, 13..) |*value, i| args[i] = value;
         try self.ctx.launchKernel(self.program.function(.patches), (width * height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null);
         self.ctx.noteKernelLaunch();
         return output;
@@ -1200,6 +1284,153 @@ test "video CUDA preprocessing matches CPU RGB resize and planar patches" {
     };
 }
 
+test "video CUDA kernels match CPU for full and limited range SDR HDR and quarter turns" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const video = @import("antfly_video");
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var preprocess = try Preprocessor.init(a, &compute.ctx);
+    defer preprocess.deinit();
+    // Rectangular rasters also catch quarter-turn shape and indexing mistakes.
+    const width = 8;
+    const height = 6;
+    for ([_]u32{ 0, 1 }) |high| {
+        const pitch = width * (high + 1);
+        var storage: [width * height * 3]u8 = undefined;
+        const surface = storage[0 .. pitch * height * 3 / 2];
+        if (high != 0) {
+            for (0..surface.len / 2) |i| std.mem.writeInt(u16, surface[i * 2 ..][0..2], @intCast((64 + (i * 61) % 877) << 6), .little);
+            // Full-range PQ regression: without 1020/1023 scaling this saturated
+            // sample rendered red=34, versus zero in the portable reference.
+            for (0..2) |y| for (0..2) |x| std.mem.writeInt(u16, surface[y * pitch + x * 2 ..][0..2], 256 << 6, .little);
+            std.mem.writeInt(u16, surface[pitch * height ..][0..2], 959 << 6, .little);
+            std.mem.writeInt(u16, surface[pitch * height + 2 ..][0..2], 798 << 6, .little);
+        } else {
+            for (surface, 0..) |*byte, i| byte.* = @intCast(16 + (i * 61) % 220);
+        }
+        var buffer = try @import("buffer.zig").DeviceBuffer.alloc(&compute.ctx, surface.len);
+        defer buffer.free(&compute.ctx);
+        try buffer.copyFromHost(&compute.ctx, surface);
+        for ([_]u32{ 0, 1 }) |full| for ([_]video.tone.Policy{ .none, .pq_reinhard_100, .hlg_reinhard_100 }) |policy| for ([_]u32{ 0, 1, 2, 3 }) |rotation| {
+            const matrix: u32 = if (policy == .none) 1 else 9;
+            const frame = Frame{ .device = buffer.ptr, .pitch = pitch, .width = width, .height = height, .timestamp_us = 0, .matrix = matrix, .full_range = full, .high_depth = high, .tone = @backingInt(policy), .rotation = rotation };
+            const format: video.apple.Format = if (high != 0) (if (full != 0) .p010_full else .p010_video) else (if (full != 0) .nv12_full else .nv12_video);
+            const borrowed = video.preparation.BorrowedFrame{ .host = .{
+                .width = width,
+                .height = height,
+                .bit_depth = if (high != 0) 10 else 8,
+                .format = format,
+                .planes = .{
+                    .{ .bytes = surface[0 .. pitch * height], .stride = pitch, .width = width, .height = height },
+                    .{ .bytes = surface[pitch * height ..], .stride = pitch, .width = width / 2, .height = height / 2 },
+                },
+            } };
+            // Exercise the independent preparation path, including its f64 HDR
+            // transfer, gamut conversion and full-range bit-depth normalization.
+            var reference = try borrowed.display(a, .{ .width = width, .height = height, .matrix = if (policy == .none) .bt709 else .bt2020_ncl, .tone_mapping = policy, .rotation = @fromBackingInt(rotation) }, .{});
+            defer reference.deinit(a);
+            const output = try preprocess.patches(&cb, frame, reference.width, reference.height, 2, .{ 0, 0, 0 }, .{ 1, 1, 1 });
+            defer cb.free(output);
+            const actual = try cb.toFloat32(output, a);
+            defer a.free(actual);
+            for (0..reference.height / 2) |gy| for (0..reference.width / 2) |gx| for (0..3) |c| for (0..2) |py| for (0..2) |px| {
+                const dx = gx * 2 + px;
+                const dy = gy * 2 + py;
+                const index = (((gy * (reference.width / 2) + gx) * 3 + c) * 2 + py) * 2 + px;
+                const expected = @as(f32, @floatFromInt(reference.bytes[(dy * reference.width + dx) * 3 + c])) / 255;
+                try std.testing.expectApproxEqAbs(expected, actual[index], 1.5 / 255.0);
+            };
+            const rgb = try preprocess.rgb8(&compute, frame);
+            defer cb.free(rgb);
+            const tensor: *cuda.CudaTensor = @ptrCast(@alignCast(rgb));
+            var actual_rgb: [width * height * 3]u8 = undefined;
+            try tensor.buffer.copyToHost(&compute.ctx, &actual_rgb);
+            for (reference.bytes, actual_rgb) |expected, value| {
+                try std.testing.expect(@abs(@as(i16, expected) - @as(i16, value)) <= 1);
+            }
+        };
+    }
+}
+
+test "video CUDA kernel cost by depth and tone" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!@import("antfly_platform").env.getenvBoolDefault("ANTFLY_VIDEO_KERNEL_BENCH", false)) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var preprocess = try Preprocessor.init(a, &compute.ctx);
+    defer preprocess.deinit();
+    const events = try compute.ctx.createProfileEventPair();
+    defer compute.ctx.destroyProfileEventPair(events);
+    const width = 3840;
+    const height = 2160;
+    const pitch = width * 2;
+    const surface = try a.alloc(u8, pitch * height * 3 / 2);
+    defer a.free(surface);
+    for (surface, 0..) |*value, i| value.* = @truncate(i *% 2654435761 >> 13);
+    var buffer = try @import("buffer.zig").DeviceBuffer.alloc(&compute.ctx, surface.len);
+    defer buffer.free(&compute.ctx);
+    try buffer.copyFromHost(&compute.ctx, surface);
+    for ([_]struct { high: u32, tone: u32, full: u32 = 0, name: []const u8 }{ .{ .high = 0, .tone = 0, .name = "8-bit SDR" }, .{ .high = 1, .tone = 0, .name = "10-bit SDR" }, .{ .high = 1, .tone = 1, .name = "PQ" }, .{ .high = 1, .tone = 2, .name = "HLG" }, .{ .high = 1, .tone = 1, .full = 1, .name = "full-range PQ" }, .{ .high = 1, .tone = 2, .full = 1, .name = "full-range HLG" } }) |case| {
+        for (0..4) |round| {
+            const start = @import("antfly_platform").time.monotonicNs();
+            try compute.ctx.recordProfileStart(events);
+            const output = try preprocess.patches(&cb, .{ .device = buffer.ptr, .pitch = pitch, .width = width, .height = height, .timestamp_us = 0, .matrix = if (case.tone != 0) 9 else 1, .full_range = case.full, .high_depth = case.high, .tone = case.tone }, 960, 544, 16, .{ 0, 0, 0 }, .{ 1, 1, 1 });
+            try compute.ctx.recordProfileEnd(events);
+            // Readback fences both events. Their interval excludes host copy time.
+            const values = try cb.toFloat32(output, a);
+            defer a.free(values);
+            const elapsed = @import("antfly_platform").time.monotonicNs() - start;
+            const device_us = try compute.ctx.readProfileEventPairUs(events);
+            cb.free(output);
+            var sum: f64 = 0;
+            for (values) |value| sum += value;
+            try std.testing.expect(std.math.isFinite(sum));
+            if (round != 0) std.debug.print("video kernel bench {s}: {d:.3} ms CUDA interval, {d:.2} ms including readback, 960x544 from 4K\n", .{ case.name, @as(f64, @floatFromInt(device_us)) / 1000, @as(f64, @floatFromInt(elapsed)) / 1e6 });
+        }
+    }
+}
+
+test "NVDEC decodes Main 10 HDR and rotated HEVC with its display metadata" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    const Expected = struct { name: []const u8, high: u32, tone: u32, rotation: u32, sar: u32 = 1 };
+    const Seen = struct {
+        expected: Expected,
+        frames: usize = 0,
+        fn consume(raw: *anyopaque, frame: Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.expected.high, frame.high_depth);
+            try std.testing.expectEqual(self.expected.tone, frame.tone);
+            try std.testing.expect(frame.rotation % 2 == self.expected.rotation % 2);
+            try std.testing.expectEqual(self.expected.sar, frame.sar.horizontal);
+            try std.testing.expectEqual(@as(u32, 1), frame.sar.vertical);
+            self.frames += 1;
+        }
+    };
+    inline for ([_]Expected{
+        .{ .name = "hevc-10bit.mp4", .high = 1, .tone = 0, .rotation = 0 },
+        .{ .name = "hevc-hlg.mp4", .high = 1, .tone = 2, .rotation = 0 },
+        .{ .name = "hevc-pq.mp4", .high = 1, .tone = 1, .rotation = 0 },
+        .{ .name = "hevc-rot90.mp4", .high = 0, .tone = 0, .rotation = 3 },
+        .{ .name = "hevc-hlg-rot90.mp4", .high = 1, .tone = 2, .rotation = 3 },
+        .{ .name = "hevc-sar192-inband.mp4", .high = 0, .tone = 0, .rotation = 0, .sar = 2 },
+        .{ .name = "hevc-multi-sps192.mp4", .high = 0, .tone = 0, .rotation = 0, .sar = 2 },
+    }) |expected| {
+        var seen = Seen{ .expected = expected };
+        _ = decodeMp4(a, &compute.ctx, @embedFile("../../testdata/video/codecs/" ++ expected.name), .{ .context = &seen, .consume = Seen.consume }) catch |err| {
+            std.debug.print("NVDEC fixture {s} failed: {s}\n", .{ expected.name, @errorName(err) });
+            return err;
+        };
+        try std.testing.expect(seen.frames != 0);
+    }
+}
+
 test "video PTX matches its checked source" {
     const source = @embedFile("video_preprocess.cu");
     var digest: [32]u8 = undefined;
@@ -1207,6 +1438,8 @@ test "video PTX matches its checked source" {
     const hex = std.fmt.bytesToHex(digest, .lower);
     const prefix = "// source-sha256: ";
     try std.testing.expectEqualStrings(&hex, @embedFile("video_preprocess.ptx")[prefix.len..][0..64]);
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("video_preprocess.ptx"), ".version 7.8\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("video_preprocess.ptx"), "release 11.8") != null);
 }
 
 test "embeddinggemma2 video sampling matches fractional FPS and uniformly caps the entire clip" {
@@ -1354,13 +1587,13 @@ test "embeddinggemma2 video staging fences coalesce repeats and drain consumer e
     var sampler = try EmbeddingSampler.init(1, 1_000_000, 1_000_000);
     sampler.repetitions = 3;
     state.embedding_sampler = sampler;
-    try std.testing.expectEqual(@as(c_int, 1), DecodeState.callback(&state, 1, 256, 160, 96, 0, 2, 0));
+    try std.testing.expectEqual(@as(c_int, 1), DecodeState.callback(&state, 1, 256, 160, 96, 0, 2, 0, 8, 2));
     try std.testing.expectEqual(@as(usize, 1), consumer.calls);
     try std.testing.expectEqual(@as(usize, 3), consumer.copies);
     try std.testing.expectEqual(@as(usize, 1), consumer.ready);
     try std.testing.expectEqual(@as(usize, 0), Mock.synchronizations);
     consumer.fail = true;
-    try std.testing.expectEqual(@as(c_int, -1), DecodeState.callback(&state, 1, 256, 160, 96, 1, 2, 0));
+    try std.testing.expectEqual(@as(c_int, -1), DecodeState.callback(&state, 1, 256, 160, 96, 1, 2, 0, 8, 2));
     try std.testing.expectEqual(@as(usize, 1), consumer.ready);
     try std.testing.expectEqual(@as(usize, 1), Mock.synchronizations);
     try std.testing.expectEqual(error.Cancelled, state.failure.?);
@@ -1823,5 +2056,63 @@ test "embedding video cold callback count matches actual coalesced sampler inclu
         try std.testing.expectEqual(@as(usize, case.unique), callbacks);
         try std.testing.expectEqual(case.samples, samples);
         try std.testing.expectEqual(sampler.length, sampler.next);
+    }
+}
+
+test "HEVC inband inspection preserves stream SAR and partial configuration color" {
+    const a = std.testing.allocator;
+    const original = try inspectEmbedding(a, @embedFile("../../testdata/video/codecs/hevc-sar-nopasp.mp4"), .{});
+    const inband = try inspectEmbedding(a, @embedFile("../../testdata/video/codecs/hevc-sar-inband.mp4"), .{});
+    try std.testing.expectEqual(original, inband);
+    const multi = try inspectEmbedding(a, @embedFile("../../testdata/video/codecs/hevc-multi-sps.mp4"), .{});
+    try std.testing.expectEqual(original, multi);
+    try std.testing.expectEqual(@as(u32, 128), inband.display_width);
+    try std.testing.expectEqual(@as(u32, 64), inband.display_height);
+    const bytes = @embedFile("../../testdata/video/codecs/hevc-hlg-partial-inband.mp4");
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "partial-hevc" };
+    var reader = try media.mp4.Reader.init(a, &source, mp4Limits(true));
+    defer reader.deinit();
+    const config = (try @import("antfly_video").hevc_config.normalizeReader(a, &reader)).?;
+    defer a.free(config);
+    const signal = (try @import("antfly_video").hevc_config.parse(a, reader.track.codec_config)).?;
+    try std.testing.expectEqual(@as(?u8, 18), signal.transfer);
+    try std.testing.expectEqual(@as(?u8, 9), signal.primaries);
+    try std.testing.checkAllAllocationFailures(a, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            _ = try inspectEmbedding(allocator, @embedFile("../../testdata/video/codecs/hevc-sar-inband.mp4"), .{});
+        }
+    }.run, .{});
+}
+
+test "NVDEC display geometry rejects out of range SAR before decoder admission" {
+    const a = std.testing.allocator;
+    const bytes = try a.dupe(u8, @embedFile("../../testdata/video/codecs/hevc-sar192.mp4"));
+    defer a.free(bytes);
+    const pasp = std.mem.indexOf(u8, bytes, "pasp").?;
+    for ([_][2]u32{ .{ 1000, 1 }, .{ 1, 1000 } }) |sar| {
+        std.mem.writeInt(u32, bytes[pasp + 4 ..][0..4], sar[0], .big);
+        std.mem.writeInt(u32, bytes[pasp + 8 ..][0..4], sar[1], .big);
+        try std.testing.expectError(error.ResourceLimitExceeded, inspectEmbedding(a, bytes, .{}));
+        for (0..4) |rotation| {
+            const frame = Frame{ .device = 0, .pitch = 0, .width = 192, .height = 192, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = @intCast(rotation), .sar = .{ .horizontal = sar[0], .vertical = sar[1] } };
+            try std.testing.expectError(error.ResourceLimitExceeded, frame.displaySize());
+        }
+    }
+    if (comptime build_options.enable_cuda and builtin.os.tag == .linux) {
+        var compute = try cuda.CudaCompute.init(a);
+        defer compute.deinit();
+        const Reject = struct {
+            fn consume(_: *anyopaque, _: Frame) !void {
+                return error.TestUnexpectedResult;
+            }
+        };
+        var context_byte: u8 = 0;
+        try std.testing.expectError(error.ResourceLimitExceeded, decodeMp4(a, &compute.ctx, bytes, .{ .context = &context_byte, .consume = Reject.consume }));
+        try std.testing.expect(compute.ctx.video_decoder_cache == null);
+    }
+    // Inclusive upper bound, equivalent large ratios and all quarter turns.
+    for (0..4) |rotation| {
+        const frame = Frame{ .device = 0, .pitch = 0, .width = 4096, .height = 2160, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = @intCast(rotation), .sar = .{ .horizontal = 4000000000, .vertical = 1000000000 } };
+        try std.testing.expectEqual(if (rotation & 1 == 0) [2]u32{ 16384, 2160 } else [2]u32{ 2160, 16384 }, try frame.displaySize());
     }
 }

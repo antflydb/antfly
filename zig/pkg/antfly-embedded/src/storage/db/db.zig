@@ -3242,7 +3242,7 @@ pub const DB = struct {
     artifact_footprint_pending: std.atomic.Value(bool) = .init(true),
     artifact_producer_baseline_pending: std.atomic.Value(bool) = .init(true),
     artifact_producer_scheduler: @import("artifact_producer_scheduler.zig").Scheduler = .{},
-    local_source_completion_audit_pending: bool = true,
+    local_source_completion_audit_generation: ?u64 = null,
     local_source_recovery_pending: bool = false,
     /// Bounded no-progress guard for `runUntilIdle` (see `OpenOptions.
     /// run_until_idle_no_progress_timeout_ms` and `ReplayDrainOptions.
@@ -3338,6 +3338,7 @@ pub const DB = struct {
     /// owns one stable runtime-catalog generation without penalizing degraded
     /// requests with lock contention.
     pub const lockApplyForPortableRuntime = local_mutation.lockApplyForPortableRuntime;
+    pub const tryLockApplyForPortableRuntime = local_mutation.tryLockApplyForPortableRuntime;
 
     fn lockApplySharedForPortableRuntime(self: *DB) !void {
         try self.enforcePortableRuntimeGate();
@@ -3653,6 +3654,10 @@ pub const DB = struct {
     }
 
     fn beginRelationalRowsAtSnapshot(self: *DB, alloc: Allocator, request: RelationalRows.Request, statement: ?*RelationalStatementSnapshot) !RelationalRows.Reader {
+        var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+        defer privacy_arena.deinit();
+        const policy = try @import("privacy_read.zig").capture(self, privacy_arena.allocator());
+        if (policy != null and policy.?.prepared.policy.mode != .monitor) return error.PrivacyRelationalStorageUnsupported;
         // A delayed scan may use only the primary path. READY index state and
         // auto-index plans can change after the original visibility cut.
         if (statement != null and (request.index != null or request.auto_index)) return error.SqlStatementSnapshotRequired;
@@ -7924,7 +7929,12 @@ pub const DB = struct {
 
     pub fn orderedMutationAlreadyApplied(self: *DB, identity: OrderedApplyReceipt) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("orderedMutationAlreadyApplied", .{ self, identity });
-        lockApply(self);
+        // Raft invokes this preflight while holding its progress mutex. A
+        // reader may hold apply while resolving a quorum read through Raft;
+        // waiting here would invert that lock order. Defer the committed
+        // entry and let its owner release Raft before retrying. The actual
+        // mutation still rechecks the receipt under its own apply fence.
+        if (!self.core.tryLockApplyExclusive()) return error.WriterLocked;
         defer self.core.unlockApply();
         return switch (try orderedApplyDisposition(
             try readOrderedApplyReceipt(self.alloc, self.core.store),
@@ -9997,7 +10007,21 @@ pub const DB = struct {
         defer row_policy_lease.release();
         var artifact = (try self.getArtifact(alloc, artifact_id)) orelse return null;
         errdefer artifact.deinit(alloc);
-        const public_value = try hierarchy_navigation.publicArtifactPayloadAlloc(alloc, artifact.value);
+        if (@import("../../privacy/document.zig").isManagedArtifactName(artifact.artifact_ref.name)) {
+            artifact.deinit(alloc);
+            return null;
+        }
+        var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+        defer privacy_arena.deinit();
+        const privacy = @import("privacy_read.zig");
+        const policy = try privacy.capture(self, privacy_arena.allocator());
+        const safe = if (policy != null and policy.?.prepared.policy.mode != .monitor) blk: {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            const physical = try artifact_ids.internalKeyForArtifactRefAlloc(privacy_arena.allocator(), artifact.artifact_ref);
+            break :blk try privacy.projectArtifact(privacy_arena.allocator(), policy.?, physical, &read);
+        } else artifact.value;
+        const public_value = try hierarchy_navigation.publicArtifactPayloadAlloc(alloc, safe);
         alloc.free(artifact.value);
         artifact.value = public_value;
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -10034,10 +10058,48 @@ pub const DB = struct {
 
         manifest_owned = false;
         state_owned = false;
-        var result = try documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_name, manifest, state);
+        var result = try self.documentArtifactInspectionAlloc(alloc, doc_key, artifact_name, manifest, state);
         errdefer result.deinit(alloc);
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return result;
+    }
+
+    /// Builds the inspection entry for one stored asset value. Only document
+    /// extraction stores a structured manifest at its asset key; every other
+    /// asset producer (copy, generator, reader, transcriber, extractor, ...)
+    /// stores its output there directly, as `_artifacts` exposes it. Takes
+    /// ownership of `value` and `state`, freeing both on error. The caller
+    /// holds the apply lock shared.
+    fn documentArtifactInspectionAlloc(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        value: []u8,
+        state: ?[]u8,
+    ) !types.DocumentArtifactManifest {
+        const content_type = (self.producedAssetContentTypeAlloc(alloc, artifact_name) catch |err| {
+            alloc.free(value);
+            if (state) |bytes| alloc.free(bytes);
+            return err;
+        }) orelse return documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_name, value, state);
+        return producedAssetManifestAlloc(alloc, doc_key, artifact_name, value, state, content_type);
+    }
+
+    /// Returns the configured content type when `artifact_name` is an asset
+    /// enrichment whose producer writes its output directly, or null when the
+    /// value should be read as a document-artifact manifest (document
+    /// extraction, or no readable enrichment config).
+    fn producedAssetContentTypeAlloc(self: *DB, alloc: Allocator, artifact_name: []const u8) !?[]u8 {
+        var cfg = (try self.core.getEnrichment(alloc, .asset, artifact_name)) orelse return null;
+        defer cfg.deinit(alloc);
+        var producer = asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        defer producer.deinit(alloc);
+        if (producer.type == .document_extraction) return null;
+        return try alloc.dupe(u8, cfg.content_type);
     }
 
     pub fn listDocumentArtifactManifests(
@@ -10066,7 +10128,7 @@ pub const DB = struct {
         for (rows) |row| {
             var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, row.key)) orelse continue;
             defer artifact_ref.deinit(alloc);
-            if (artifact_ref.kind != .asset) continue;
+            if (artifact_ref.kind != .asset or @import("../../privacy/document.zig").isManagedArtifactName(artifact_ref.name)) continue;
             if (artifact_ref.unit_id != null) continue;
             if (!std.mem.eql(u8, artifact_ref.document_id, doc_key)) continue;
 
@@ -10076,14 +10138,15 @@ pub const DB = struct {
                 error.NotFound => null,
                 else => return err,
             };
-            errdefer if (state) |value| alloc.free(value);
-
-            const manifest_json = try alloc.dupe(u8, row.value);
-            errdefer alloc.free(manifest_json);
-            try artifacts.append(
-                alloc,
-                try documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_ref.name, manifest_json, state),
-            );
+            const manifest_json = alloc.dupe(u8, row.value) catch |err| {
+                if (state) |value| alloc.free(value);
+                return err;
+            };
+            // Ownership of manifest_json and state moves into the inspection,
+            // which frees both itself when it fails.
+            var artifact = try self.documentArtifactInspectionAlloc(alloc, doc_key, artifact_ref.name, manifest_json, state);
+            errdefer artifact.deinit(alloc);
+            try artifacts.append(alloc, artifact);
         }
 
         var result: types.DocumentArtifactManifestList = .{
@@ -18789,6 +18852,76 @@ pub const DB = struct {
         return try self.repairArtifactIssues(alloc, .embedding, limit);
     }
 
+    /// Discovery queues only durable document references. Source capture,
+    /// mapping and detector admission belong to the replay owner, after this
+    /// byte-bounded page has been released. One oversized ID may advance alone.
+    const PrivacyDiscoveryPage = struct {
+        alloc: Allocator,
+        artifact_name: []const u8,
+        limit: usize,
+        byte_limit: usize = 8 * 1024 * 1024,
+        bytes: usize,
+        more: bool = false,
+        references: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef) = .empty,
+
+        fn init(alloc: Allocator, artifact_name: []const u8, limit: usize) !@This() {
+            if (limit == 0 or limit > 1000) return error.InvalidPrivacyScan;
+            var self = @This(){ .alloc = alloc, .artifact_name = artifact_name, .limit = limit, .bytes = limit * @sizeOf(enrichment_types.GeneratedEnrichmentRef) };
+            try self.references.ensureTotalCapacityPrecise(alloc, limit);
+            return self;
+        }
+        fn deinit(self: *@This()) void {
+            for (self.references.items) |ref| enrichment_types.freeGeneratedRef(self.alloc, ref);
+            self.references.deinit(self.alloc);
+        }
+        fn append(self: *@This(), id: []const u8) !bool {
+            const size = std.math.add(usize, id.len, try std.math.mul(usize, 2, self.artifact_name.len)) catch return error.Overflow;
+            if (self.references.items.len == self.limit or (self.references.items.len != 0 and size > self.byte_limit -| self.bytes)) {
+                self.more = true;
+                return false;
+            }
+            const ref = try enrichment_types.cloneGeneratedRef(self.alloc, .{ .kind = .asset, .index_name = self.artifact_name, .artifact_name = self.artifact_name, .doc_key = id });
+            self.references.appendAssumeCapacity(ref);
+            self.bytes = try std.math.add(usize, self.bytes, size);
+            // Avoid reading a lookahead row (potentially another huge ID).
+            // An extra empty page at exact EOF is safe and advances no work.
+            self.more = self.references.items.len == self.limit or self.bytes >= self.byte_limit;
+            return !self.more;
+        }
+        fn visit(raw: ?*anyopaque, entry: types.ScanVisitEntry) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!try self.append(entry.id)) return error.Canceled;
+        }
+    };
+
+    fn collectPrivacyDiscovery(self: *DB, alloc: Allocator, artifact_name: []const u8, req: types.DocumentArtifactTableReprocessRequest) !PrivacyDiscoveryPage {
+        var page = try PrivacyDiscoveryPage.init(self.alloc, artifact_name, if (req.limit == 0) 100 else req.limit);
+        errdefer page.deinit();
+        self.scanVisit(alloc, req.from_key, req.to_key, .{ .privacy_original = true, .include_documents = false, .resume_from_key = req.resume_from_key }, .{ .context = &page, .visit = PrivacyDiscoveryPage.visit }) catch |err| {
+            if (!page.more or err != error.Canceled) return err;
+        };
+        return page;
+    }
+
+    fn reprocessPrivacyRange(self: *DB, alloc: Allocator, artifact_name: []const u8, req: types.DocumentArtifactTableReprocessRequest) !types.DocumentArtifactTableReprocessResult {
+        var page = try self.collectPrivacyDiscovery(alloc, artifact_name, req);
+        defer page.deinit();
+        const count = page.references.items.len;
+        if (count != 0 and self.enrichment_runtime == null) return error.PrivacyReadUnavailable;
+        var result = types.DocumentArtifactTableReprocessResult{ .limit = req.limit, .scanned = count, .reprocessed = count };
+        errdefer result.deinit(alloc);
+        if (page.more and count != 0) result.next_key = try alloc.dupe(u8, page.references.items[count - 1].doc_key);
+        if (count != 0) {
+            var pending = derived_types.DerivedBatch{ .generated_enrichment_refs = try page.references.toOwnedSlice(self.alloc) };
+            defer derived_types.deinitDerivedBatch(self.alloc, &pending);
+            const sequence = try appendDerivedBatchRecord(self, pending);
+            self.executor.notifySequence(sequence);
+            self.enrichment_runtime.?.notifySequence(sequence);
+            self.notifyResolverReplayRuntimes(sequence);
+        }
+        return result;
+    }
+
     pub fn reprocessDocumentArtifactRange(
         self: *DB,
         alloc: Allocator,
@@ -18796,6 +18929,27 @@ pub const DB = struct {
         req: types.DocumentArtifactTableReprocessRequest,
     ) !types.DocumentArtifactTableReprocessResult {
         if (comptime storage_engine.enabled) return storage_engine.call("reprocessDocumentArtifactRange", .{ self, alloc, artifact_name, req });
+        if (@import("../../privacy/document.zig").isArtifactName(artifact_name) and try self.maintenanceRequiresOrderedApply()) {
+            var catalog = try self.artifactInventoryCommand(alloc);
+            defer catalog.catalogs.deinit(alloc);
+            const active = blk: {
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                break :blk try @import("artifact_publication.zig").authority(&read);
+            };
+            if (active == null or active.?.epoch != catalog.binding.epoch or !std.mem.eql(u8, &active.?.catalog_digest, &catalog.binding.digest)) {
+                const dispatcher = self.local_execution.artifact_publication_dispatcher orelse return error.ArtifactPublicationPending;
+                const body = try std.json.Stringify.valueAlloc(alloc, catalog, .{});
+                defer alloc.free(body);
+                const encoded = try std.mem.concat(alloc, u8, &.{ "ACP1", body });
+                defer alloc.free(encoded);
+                try dispatcher.submit(catalog.namespace, encoded);
+                // Waiting is not an admitted page: do not manufacture an
+                // exclusive continuation from the initial (possibly empty)
+                // bound. The coordinator retries its unchanged checkpoint.
+                return error.ArtifactPublicationPending;
+            }
+        }
         var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse
             (try self.getEnrichment(alloc, .embedding, artifact_name)) orelse return error.NotFound;
         defer cfg.deinit(alloc);
@@ -18807,16 +18961,20 @@ pub const DB = struct {
             if (cursor.group_id != null) return error.InvalidArgument;
             effective_req = .{
                 .from_key = cursor.next_key,
+                .resume_from_key = true,
                 .to_key = req.to_key,
                 .limit = if (cursor.limit != 0) cursor.limit else req.limit,
             };
         }
 
         const limit = if (effective_req.limit == 0) @as(u32, 100) else effective_req.limit;
+        effective_req.limit = limit;
+        if (@import("../../privacy/document.zig").isArtifactName(artifact_name)) return self.reprocessPrivacyRange(alloc, artifact_name, effective_req);
         const scan_limit = if (limit == std.math.maxInt(u32)) limit else limit + 1;
         var scanned = try self.scan(alloc, effective_req.from_key, effective_req.to_key, .{
             .include_documents = true,
             .limit = scan_limit,
+            .resume_from_key = effective_req.resume_from_key,
         });
         defer scanned.deinit(alloc);
 
@@ -19447,7 +19605,7 @@ pub const DB = struct {
                 const authority = try @import("artifact_publication.zig").authority(&read);
                 var complete = query.documents.len == 0 or authority != null;
                 if (authority) |active| {
-                    const progress = try @import("artifact_producer_obligations.zig").load(&read);
+                    const progress = try @import("artifact_producer_obligations.zig").loadMetadata(&read);
                     if (progress) |value| try value.requireAuthority(active);
                     complete = progress != null and progress.?.baseline_complete;
                 }
@@ -19557,7 +19715,23 @@ pub const DB = struct {
             error.NotFound => return null,
             else => return err,
         });
+        var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+        defer privacy_arena.deinit();
+        const privacy = @import("privacy_read.zig");
+        const policy = if (opts.privacy_original) null else try privacy.capture(self, privacy_arena.allocator());
+        if (!opts.privacy_original) try privacy.requireExpected(privacy_arena.allocator(), opts.privacy_policy_version, policy);
+        const protected = policy != null and policy.?.prepared.policy.mode != .monitor;
+        if (protected) {
+            if (opts.include_primary_digest) return error.PrivacyUnsupportedMutation;
+            const special = db_query_projection.buildLookupFieldSelectionPlan(opts).special;
+            if (special.all_artifacts or special.all_chunks or special.all_embeddings) return error.PrivacyUnsupportedProjection;
+        }
+        const safe_raw = if (protected and internal_keys.isInternalUserKey(key)) try privacy.projectArtifact(privacy_arena.allocator(), policy.?, store_key, probe) else if (protected) privacy.project(privacy_arena.allocator(), policy.?, key, raw, probe) catch |err| {
+            if (privacy.pending(err)) return null;
+            return err;
+        } else raw;
         const relational = internal_keys.isRelationalRowKey(store_key);
+        if (protected and relational) return error.PrivacyRelationalStorageUnsupported;
         var historical_schema_view: ?schema_registry_mod.SchemaView = null;
         defer if (historical_schema_view) |*view| view.release();
         const ordinal_row = if (relational) blk: {
@@ -19629,11 +19803,11 @@ pub const DB = struct {
                     defer alloc.free(bytes);
                     break :blk try output.dupe(u8, bytes);
                 }
-                break :blk try output.dupe(u8, raw);
+                break :blk try output.dupe(u8, safe_raw);
             }
             const materialized = if (ordinal_row) |row| try row.reconstructValueAlloc(alloc) else null;
             defer if (materialized) |bytes| alloc.free(bytes);
-            break :blk try db_query_projection.projectLookupStoredBytesWithPlanAndOutput(alloc, output, key, materialized orelse raw, opts, .{
+            break :blk try db_query_projection.projectLookupStoredBytesWithPlanAndOutput(alloc, output, key, materialized orelse safe_raw, opts, .{
                 .ctx = self,
                 .load_chunks = loadChunkFieldValueCallback,
                 .load_embeddings = loadEmbeddingFieldValueCallback,
@@ -26773,7 +26947,7 @@ pub const DB = struct {
         defer if (chunk) |bytes| self.alloc.free(bytes);
         var mutation = self.core.snapshot_admission.acquireMutation();
         defer mutation.release();
-        try self.lockApplyForPortableRuntime();
+        try self.tryLockApplyForPortableRuntime();
         var apply_held = true;
         defer if (apply_held) self.core.unlockApply();
         if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
@@ -26829,7 +27003,7 @@ pub const DB = struct {
         // Keep accepted provenance intact and commit the rejection with the
         // applied watermark, so retries cannot wedge a committed Raft entry.
         if (command.completion) |page| if (page.group_producers) std.log.debug("group producer completion deferred reason={s}", .{@tagName(reason)});
-        if (command.mode == .publish and command.producer_kind == .enrichment) std.log.debug("producer publication deferred producer={s} reason={s}", .{ command.producer_name, @tagName(reason) });
+        if (command.mode == .publish) std.log.debug("producer publication deferred producer={s} kind={s} reason={s}", .{ command.producer_name, @tagName(command.producer_kind), @tagName(reason) });
         const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
@@ -27089,7 +27263,7 @@ pub const DB = struct {
         }
         var mutation = self.core.snapshot_admission.acquireMutation();
         defer mutation.release();
-        try self.lockApplyForPortableRuntime();
+        try self.tryLockApplyForPortableRuntime();
         var apply_held = true;
         defer if (apply_held) self.core.unlockApply();
         if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
@@ -27219,7 +27393,7 @@ pub const DB = struct {
             const producer = (try publication.authority(&read)) orelse return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held);
             if (producer.epoch != command.authority_epoch or !std.mem.eql(u8, &producer.namespace, &namespace) or
                 !std.mem.eql(u8, &producer.catalog_digest, &command.catalog_digest)) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held);
-            if (try @import("artifact_producer_obligations.zig").load(&read)) |obligations| {
+            if (try @import("artifact_producer_obligations.zig").loadMetadata(&read)) |obligations| {
                 try obligations.requireAuthority(producer);
                 if (obligations.sealed_attempt != null) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .sealed_source, &apply_held);
             }
@@ -27364,7 +27538,7 @@ pub const DB = struct {
             prepared_value.batch.sequence = sequence;
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
-            try applyDerivedBatchContext(&batch_ctx, prepared_value.batch);
+            try applyDerivedBatchInlineAssumeApply(&batch_ctx, prepared_value.batch);
         }
     }
 
@@ -27387,7 +27561,7 @@ pub const DB = struct {
         {
             var admission = self.core.snapshot_admission.acquireMutation();
             defer admission.release();
-            try self.lockApplyForPortableRuntime();
+            try self.tryLockApplyForPortableRuntime();
             defer self.core.unlockApply();
             if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
             var namespace: [24]u8 = undefined;
@@ -31325,6 +31499,8 @@ pub const DB = struct {
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
+        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{});
+
         const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
         entry.lockAnalysisShared();
         defer entry.unlockAnalysisShared();
@@ -33166,6 +33342,59 @@ pub const DB = struct {
         return true;
     }
 
+    // Readiness scans use disposable snapshots. Only their short metadata
+    // transactions share apply with primary enrollment, so counter/revision
+    // RMW cannot lose concurrent primary changes. Never wait for apply while
+    // holding a storage transaction or the Raft progress mutex.
+    const ProducerReadinessStore = struct {
+        db: *DB,
+
+        pub fn beginReadTxn(self: *@This()) !docstore_mod.DocStore.Txn {
+            return self.db.core.store.beginReadTxn();
+        }
+        pub fn beginReadTxnWithBlockCacheAdmission(self: *@This(), admission: backend_types.Namespace.BlockCacheAdmission) !docstore_mod.DocStore.Txn {
+            return self.db.core.store.beginReadTxnWithBlockCacheAdmission(admission);
+        }
+        pub fn beginWriteTxn(self: *@This()) !WriteTxn {
+            try self.db.tryLockApplyForPortableRuntime();
+            errdefer self.db.core.unlockApply();
+            return .{ .db = self.db, .inner = try self.db.core.store.beginWriteTxn() };
+        }
+        const WriteTxn = struct {
+            db: *DB,
+            inner: docstore_mod.DocStore.Txn,
+            held: bool = true,
+
+            fn release(self: *@This()) void {
+                if (self.held) {
+                    self.held = false;
+                    self.db.core.unlockApply();
+                }
+            }
+            pub fn abort(self: *@This()) void {
+                if (!self.held) return;
+                self.inner.abort();
+                self.release();
+            }
+            pub fn commit(self: *@This()) !void {
+                try self.inner.commit();
+                self.release();
+            }
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                return self.inner.get(key);
+            }
+            pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                return self.inner.put(key, value);
+            }
+            pub fn delete(self: *@This(), key: []const u8) !void {
+                return self.inner.delete(key);
+            }
+            pub fn openPhysicalCursorAdapter(self: *@This()) !docstore_mod.DocStore.Txn.CursorAdapter {
+                return self.inner.openPhysicalCursorAdapter();
+            }
+        };
+    };
+
     fn advanceArtifactProducerWorkPageWithAllocator(self: *DB, scratch: Allocator) !bool {
         const has_ordered_authority = blk: {
             var read = try self.core.store.beginReadTxn();
@@ -33173,22 +33402,31 @@ pub const DB = struct {
             break :blk try @import("artifact_publication.zig").authority(&read) != null;
         };
         if (!has_ordered_authority) {
-            if (self.local_source_completion_audit_pending) {
+            // A consumer admitted after its producer published needs the same
+            // bounded receipt recovery as startup. Wait for active replay;
+            // audit each catalog generation only after its producer is idle.
+            const generation = self.core.index_manager.writePlanGeneration();
+            if (self.enrichment_runtime) |runtime| {
+                const replay = runtime.stats();
+                if (replay.applied_sequence < replay.target_sequence) return false;
+            }
+            if (self.local_source_completion_audit_generation != generation) {
                 _ = try self.ensureGeneratedCoverageRecoveryIntents(scratch);
-                self.local_source_completion_audit_pending = false;
+                self.local_source_completion_audit_generation = generation;
             }
             return false;
         }
         var plan = try self.core.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
-        const readiness_progress = try @import("artifact_producer_readiness.zig").advance(scratch, self.core.store, self.root_incarnation, plan.plan());
+        var readiness_store: ProducerReadinessStore = .{ .db = self };
+        const readiness_progress = try @import("artifact_producer_readiness.zig").advance(scratch, &readiness_store, self.root_incarnation, plan.plan());
         const obligations = @import("artifact_producer_obligations.zig");
         var page = blk: {
             var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
             defer read.abort();
             const authority = (try @import("artifact_publication.zig").authority(&read)) orelse return false;
             // Protocol-14 owners have no required-stream work registry.
-            const state = (try obligations.load(&read)) orelse {
+            const state = (try obligations.loadMetadata(&read)) orelse {
                 var ordered = (try @import("artifact_inventory.zig").load(scratch, &read)) orelse return error.ArtifactCatalogDrift;
                 defer ordered.deinit();
                 if (ordered.value.command.binding.effect_protocol >= 15) return error.ArtifactCatalogCorrupt;
@@ -33442,7 +33680,7 @@ pub const DB = struct {
                 };
                 const encoded = try @import("artifact_publication_transport_codec.zig").encodeAlloc(scratch, validation.command);
                 defer scratch.free(encoded);
-                try dispatcher.enqueue(dispatcher.ptr, validation.command.namespace, encoded);
+                try dispatcher.enqueueCommand(validation.command.namespace, encoded);
                 self.artifact_producer_baseline_pending.store(true, .release);
                 return false;
             };
@@ -33453,7 +33691,7 @@ pub const DB = struct {
             };
             const encoded = try @import("artifact_publication_transport_codec.zig").encodeAlloc(scratch, prepared.command);
             defer scratch.free(encoded);
-            try dispatcher.enqueue(dispatcher.ptr, prepared.command.namespace, encoded);
+            try dispatcher.enqueueCommand(prepared.command.namespace, encoded);
             // Queue admission is not a baseline certificate. The next pass
             // observes only progress installed by the replicated transaction.
             self.artifact_producer_baseline_pending.store(true, .release);
@@ -36755,6 +36993,26 @@ pub const DB = struct {
         defer alloc.free(raw);
         if (raw.len != @sizeOf(u64)) return error.InvalidArtifactSourceRevision;
         return @max(published_sequence, std.mem.readInt(u64, raw[0..8], .big));
+    }
+
+    /// Same-cut standalone producer counters; never usable by ordered owners.
+    pub fn privacyLocalIndexSourcesComplete(self: *DB, alloc: Allocator, read: *docstore_mod.DocStore.Txn, index: []const u8, kind: @FieldType(types.IndexConfig, "kind"), plan: *const index_manager_mod.IndexManager.WritePlanSnapshot) !bool {
+        if (try @import("../source_authority.zig").maintenanceMode(read) != .local) return false;
+        const generation = self.core.index_manager.coverageGenerationForIndex(index) orelse return false;
+        const sources = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index);
+        defer {
+            for (sources) |source| alloc.free(source);
+            alloc.free(sources);
+        }
+        for (sources) |source| {
+            const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index, source, plan);
+            defer alloc.free(scope);
+            const counts = try DerivedCoverageCounters.load(alloc, read, if (kind == .dense_vector or kind == .sparse_vector) index else scope, generation);
+            const total = counts.source_total orelse (try range_cardinality.loadOrProveEmptyFromTxn(read)) orelse return false;
+            if (total == 0) continue;
+            if (counts.produced == null or counts.skipped == null or counts.terminal_failed != 0 or counts.produced.? +| counts.skipped.? != total) return false;
+        }
+        return true;
     }
 
     fn populateIndexSourceReplayStats(self: *DB, alloc: Allocator, index_name: []const u8, published_sequence: u64, aggregate_target_sequence: u64, item: *types.DBIndexStats) !void {
@@ -40825,6 +41083,11 @@ pub const DB = struct {
                 defer read.abort();
                 if (try @import("artifact_publication.zig").authority(&read) != null) continue;
                 const generation = self.core.index_manager.coverageGenerationForIndex(index_ref.name) orelse continue;
+                // Failure publication owns its repair/retry lifecycle. Older
+                // failure paths may have only an aggregate receipt; absent
+                // per-source tuples must never turn that debt into new work.
+                const aggregate = try DerivedCoverageCounters.load(alloc, &read, index_ref.name, generation);
+                if ((aggregate.terminal_failed orelse 0) != 0) continue;
                 var complete = primary_doc_count != null;
                 for (source_names) |source_name| {
                     const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index_ref.name, source_name, recovery_plan.plan());
@@ -40895,6 +41158,11 @@ pub const DB = struct {
         defer state.deinit(alloc);
         for (configs) |cfg| {
             if (!self.currentInitialBuildIntentMatches(&state, cfg)) return false;
+            const intent = state.entries.items[state.findIndex(cfg.name).?].intent;
+            // A finished discovery cursor cannot own missing publication
+            // forever at an idle producer watermark. Re-arm that same bounded
+            // source owner; candidate construction still owns its own work.
+            if (intent.phase == .detected and intent.source_replay_state != .pending) return false;
         }
         return true;
     }
@@ -40942,7 +41210,7 @@ pub const DB = struct {
         }
         var ensured: usize = 0;
         for (configs) |cfg| {
-            _ = try self.createGenerationRepairIntentAtTarget(
+            const id = try self.createGenerationRepairIntentAtTarget(
                 alloc,
                 cfg,
                 .replay_artifact_unavailable,
@@ -40957,6 +41225,27 @@ pub const DB = struct {
                 // repair, while retaining its non-repair lifecycle class.
                 .initial_build,
             );
+            var entry = try self.loadIndexRepairEntryById(alloc, id);
+            defer entry.deinit(alloc);
+            const intent = entry.intent;
+            const pending = self.pendingWorkStats().enrichment;
+            if (intent.work_class == .initial_build and intent.phase == .detected and
+                intent.automation != .paused and intent.source_replay_state != .pending and
+                intent.root_generation == self.core.root_generation and intent.group_id == self.localRepairGroupId() and
+                intent.config_hash == types.indexConfigHash(cfg) and pending.applied_sequence >= pending.target_sequence)
+            {
+                // Compare the exact control revision so a concurrent candidate
+                // handoff, pause, or replay page cannot be rewound by this audit.
+                self.updateIndexRepairIntentWithBindingEffect(alloc, id, .{
+                    .source_replay_state = .pending,
+                    .source_replay_resume_key = null,
+                    .replace_source_replay_resume_key = true,
+                    .next_retry_at_ms = 0,
+                }, .retain, intent.revision) catch |err| switch (err) {
+                    error.RepairTransitionConflict => continue,
+                    else => return err,
+                };
+            }
             ensured += 1;
         }
         return ensured;
@@ -41051,6 +41340,10 @@ pub const DB = struct {
         self.core.unlockApplyShared();
         locked = false;
         const session = try DocumentReadSession.openSnapshot(alloc, self.core.store, txn, schema, .{ .start = start, .end = end }, from_key, to_key, opts, now);
+        errdefer session.deinit();
+        session.privacy = try @import("privacy_read.zig").capture(self, session.arena.allocator());
+        try @import("privacy_read.zig").requireExpected(session.arena.allocator(), opts.privacy_policy_version, session.privacy);
+        if (session.privacy) |policy| if (policy.prepared.policy.mode != .monitor and (opts.sql_document_preimage or opts.include_content_hashes)) return error.UnsupportedSqlExecution;
         session.row_policy_lease = row_policy_lease;
         return session;
     }
@@ -41285,6 +41578,23 @@ pub const DB = struct {
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("scanVisit", .{ self, alloc, from_key, to_key, opts, visitor });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+        defer privacy_arena.deinit();
+        const privacy = @import("privacy_read.zig");
+        const policy = if (opts.privacy_original and !opts.privacy_status) null else try privacy.capture(self, privacy_arena.allocator());
+        if (!opts.privacy_original) try privacy.requireExpected(privacy_arena.allocator(), opts.privacy_policy_version, policy);
+        if (opts.privacy_status) {
+            const installed = policy orelse return error.IndexRebuilding;
+            const expected = opts.privacy_policy_version orelse return error.InvalidPrivacyReceipt;
+            if (!std.mem.eql(u8, &(installed.prepared.version), &expected)) return error.IndexRebuilding;
+        }
+        const protected = !opts.privacy_status and policy != null and policy.?.prepared.policy.mode != .monitor;
+        if (protected and opts.isRelational()) return error.PrivacyRelationalStorageUnsupported;
+        if (protected and opts.sql_document_preimage) return error.PrivacyUnsupportedMutation;
+        if (protected) {
+            const special = db_query_projection.buildLookupFieldSelectionPlan(.{ .fields = opts.fields, .include_all_fields = opts.include_all_fields }).special;
+            if (special.all_artifacts or special.all_chunks or special.all_embeddings) return error.PrivacyUnsupportedProjection;
+        }
         if (opts.isRelational()) return self.scanRelationalRowsVisit(alloc, from_key, to_key, opts, visitor);
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
@@ -41299,6 +41609,10 @@ pub const DB = struct {
         lockApplyShared(self);
         var apply_shared_held = true;
         errdefer if (apply_shared_held) self.core.unlockApplyShared();
+        const privacy_status_published = if (opts.privacy_status) privacy.requirePublished(self, alloc, .{}) catch |err| switch (err) {
+            error.IndexRebuilding => false,
+            else => return err,
+        } else false;
         var schema_view = self.core.acquireSchemaView();
         defer if (schema_view) |*view| view.release();
         const ttl_duration_ns = if (schema_view) |view| view.visibilityTtlDurationNs() else 0;
@@ -41306,9 +41620,9 @@ pub const DB = struct {
 
         const borrowed_range = self.core.byteRange();
         const range_start = try alloc.dupe(u8, borrowed_range.start);
-        errdefer alloc.free(range_start);
+        defer alloc.free(range_start);
         const range_end = try alloc.dupe(u8, borrowed_range.end);
-        errdefer alloc.free(range_end);
+        defer alloc.free(range_end);
         var artifact_catalog = if (needs_catalog_projection)
             try self.core.index_manager.assetContentTypeSnapshotAlloc(alloc)
         else
@@ -41316,8 +41630,6 @@ pub const DB = struct {
         defer if (artifact_catalog) |*artifact_snapshot| artifact_snapshot.deinit();
         self.core.unlockApplyShared();
         apply_shared_held = false;
-        defer alloc.free(range_start);
-        defer alloc.free(range_end);
         const byte_range = types.ByteRange{ .start = range_start, .end = range_end };
         const lower_raw = if (from_key.len == 0 or std.mem.order(u8, from_key, byte_range.start) == .lt) byte_range.start else from_key;
         const upper_raw = blk: {
@@ -41350,7 +41662,7 @@ pub const DB = struct {
         var columnar_progress: relational_columns.Progress = .{};
         defer columnar_progress.last_key.deinit(alloc);
         var column_materializer = ColumnScanMaterializer{ .context = &projection_context, .opts = opts };
-        const accelerated = if (schema_view != null and schema_view.?.storageMode() == .relational) relational_columns.scan(self, alloc, &read_txn, from_key, to_key, byte_range, opts, visitor, ttl_duration_ns, scan_now_ns, &columnar_progress, if (prepared_filter) |*filter| filter else null, .{ .context = &column_materializer, .project = ColumnScanMaterializer.project }) catch |err| switch (err) {
+        const accelerated = if (!protected and schema_view != null and schema_view.?.storageMode() == .relational) relational_columns.scan(self, alloc, &read_txn, from_key, to_key, byte_range, opts, visitor, ttl_duration_ns, scan_now_ns, &columnar_progress, if (prepared_filter) |*filter| filter else null, .{ .context = &column_materializer, .project = ColumnScanMaterializer.project }) catch |err| switch (err) {
             error.InvalidColumnSegment, error.InvalidData, error.NotFound => blk: {
                 if (columnar_progress.callback_failed) return err;
                 // Disposable derived corruption never makes valid primary rows
@@ -41400,6 +41712,11 @@ pub const DB = struct {
             stream_plan: ?*const @import("document_query.zig").SpanProjectionPlan,
             read_txn: *docstore_mod.DocStore.Txn,
             projection_context: *TransactionProjectionContext,
+            privacy_policy: ?privacy.PolicySnapshot,
+            privacy_status_published: bool,
+            // Reuse independently reclaimable row scratch even when the
+            // request allocator is an arena retaining NDJSON output.
+            privacy_row_arena: std.heap.ArenaAllocator,
             values_authenticated: bool,
             ttl_key_scratch: std.ArrayListUnmanaged(u8) = .empty,
             document_key_scratch: std.ArrayListUnmanaged(u8) = .empty,
@@ -41413,6 +41730,7 @@ pub const DB = struct {
             resume_after_key: ?[]const u8 = null,
 
             pub fn deinit(state: *@This()) void {
+                state.privacy_row_arena.deinit();
                 if (state.transient_schema_plan) |*plan| plan.deinit();
                 state.ttl_key_scratch.deinit(state.alloc);
                 state.document_key_scratch.deinit(state.alloc);
@@ -41527,14 +41845,22 @@ pub const DB = struct {
                 if (state.resume_after_key) |key| if (std.mem.order(u8, raw_key, key) != .gt) return .@"continue";
 
                 if (!state.byte_range.contains(raw_key)) return .@"continue";
-                if (state.from_key.len > 0 and !state.opts.inclusive_from and std.mem.eql(u8, raw_key, state.from_key))
+                if ((state.opts.resume_from_key or (state.from_key.len > 0 and !state.opts.inclusive_from)) and std.mem.eql(u8, raw_key, state.from_key))
                     return .@"continue";
                 if (state.to_key.len > 0) {
                     const order = std.mem.order(u8, raw_key, state.to_key);
                     if ((state.opts.exclusive_to and order != .lt) or (!state.opts.exclusive_to and order == .gt))
                         return .stop;
                 }
+                const privacy_row_arena = &state.privacy_row_arena;
+                defer _ = privacy_row_arena.reset(.retain_capacity);
+                const protected_row = !state.opts.privacy_status and if (state.privacy_policy) |configured| configured.prepared.policy.mode != .monitor else false;
+                const safe_stored = if (protected_row) privacy.project(privacy_row_arena.allocator(), state.privacy_policy.?, raw_key, stored_value, state.read_txn) catch |err| {
+                    if (privacy.pending(err)) return .@"continue";
+                    return err;
+                } else stored_value;
                 const relational = internal_keys.isRelationalRowKey(store_key);
+                if (protected_row and relational) return error.PrivacyRelationalStorageUnsupported;
                 const row_plan = if (relational)
                     try state.schemaPlan(try relational_store.rowSchemaVersion(stored_value))
                 else
@@ -41578,6 +41904,19 @@ pub const DB = struct {
                         return .@"continue";
                 }
 
+                if (state.opts.privacy_status) {
+                    var observed = privacy.observation(privacy_row_arena.allocator(), state.privacy_policy.?, raw_key, stored_value, state.read_txn) catch |err| switch (err) {
+                        error.ArtifactPublicationPending, error.EnrichmentSourceChanged, error.ArtifactCatalogDrift => @import("../../privacy/status.zig").Observation{},
+                        else => return err,
+                    };
+                    defer observed.deinit(privacy_row_arena.allocator());
+                    observed.protected_ready = observed.current and state.privacy_status_published;
+                    const json_status = try @import("../../privacy/status.zig").encode(privacy_row_arena.allocator(), state.privacy_policy.?.prepared.version, observed);
+                    try state.visitor.visitEntry(.{ .id = raw_key, .hash = 0, .document_json = json_status });
+                    state.count += 1;
+                    return if (state.opts.limit > 0 and state.count >= state.opts.limit) .stop else .@"continue";
+                }
+
                 const semantic_hash = if (ordinal_row) |row| row.semanticHash() else null;
                 var ordinal_filter_match: ?bool = null;
                 if (row_plan) |plan| if (plan.filter) |*filter| {
@@ -41591,14 +41930,18 @@ pub const DB = struct {
                 // Scan callbacks pin their borrowed storage slices until they
                 // return. A synchronous plain-document producer can keep that
                 // borrow instead of copying the entire input before projection.
-                const borrow_plain = !relational and state.visitor.borrow_documents and state.stream_plan != null;
+                // Every consumer finishes synchronously inside this callback.
+                // ID-only and hash-only scans need the same borrowing path;
+                // copying into a request arena can retain whole documents
+                // behind the visitor's much smaller output allocations.
+                const borrow_plain = !relational;
                 const logical_value: ?[]const u8 = if (needs_logical_value)
                     if (ordinal_row) |row|
                         try row.reconstructValueAlloc(state.alloc)
                     else if (borrow_plain)
-                        stored_value
+                        safe_stored
                     else
-                        try state.alloc.dupe(u8, stored_value)
+                        try state.alloc.dupe(u8, safe_stored)
                 else
                     null;
                 defer if (logical_value) |value| if (!borrow_plain) state.alloc.free(value);
@@ -41676,6 +42019,9 @@ pub const DB = struct {
             .stream_plan = if (stream_plan) |*plan| plan else null,
             .read_txn = &read_txn,
             .projection_context = &projection_context,
+            .privacy_policy = policy,
+            .privacy_status_published = privacy_status_published,
+            .privacy_row_arena = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)),
             .values_authenticated = self.core.store.valuesAreAuthenticated(),
             .visitor = visitor,
             .count = columnar_progress.delivered,
@@ -41768,6 +42114,10 @@ pub const DB = struct {
         policy: row_policy_gate_mod.Gate.Lease,
         window: DocumentPrimaryReadWindow,
         metadata: std.heap.ArenaAllocator,
+        // Heap-owned to keep parser allocator pointers stable if this reader
+        // moves into a SQL cursor. The query lease fences this catalog cut.
+        privacy_arena: *std.heap.ArenaAllocator,
+        privacy_policy: ?@import("privacy_read.zig").PolicySnapshot,
         keys: [64][]const u8 = undefined,
         ids: [64][]const u8 = undefined,
         sizes: [64]?u64 = undefined,
@@ -41842,6 +42192,12 @@ pub const DB = struct {
             if (documents.len == 0 or documents.len > 64 or max_bytes == 0) return error.InvalidBatch;
             self.window.retire();
             errdefer self.window.retire();
+            const policy = self.privacy_policy;
+            if (policy != null and policy.?.prepared.policy.mode != .monitor) {
+                self.values[0] = try self.lookup(documents[0]);
+                self.sources[0] = .{ .bytes = self.values[0].? };
+                return .{ .values = self.sources[0..1], .consumed = 1 };
+            }
             if (documents.len == 1 and fields.len == 0) {
                 self.values[0] = try self.lookup(documents[0]);
                 self.sources[0] = .{ .bytes = self.values[0].? };
@@ -42008,10 +42364,13 @@ pub const DB = struct {
             const physical = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self.db, a, key, self.schema);
             // Ranking already applied visibility/TTL at the captured cut.
             // Never fall back to a fresh read if the captured row is absent.
-            return self.window.get(&self.read, physical, 0) catch |err| switch (err) {
-                error.NotFound => error.StorageReadTemporarilyUnavailable,
-                else => err,
+            const raw = self.window.get(&self.read, physical, 0) catch |err| switch (err) {
+                error.NotFound => return error.StorageReadTemporarilyUnavailable,
+                else => return err,
             };
+            const privacy = @import("privacy_read.zig");
+            const policy = self.privacy_policy orelse return raw;
+            return privacy.project(a, policy, key, raw, &self.read);
         }
         /// Page cells already own their selected payloads. Retire the last
         /// source scope before a portal suspends, keeping only the snapshot.
@@ -42029,6 +42388,9 @@ pub const DB = struct {
             self.retireDirectories();
             self.directory_arena.deinit();
             self.metadata.deinit();
+            const privacy_backing = self.privacy_arena.child_allocator;
+            self.privacy_arena.deinit();
+            privacy_backing.destroy(self.privacy_arena);
             self.read.abort();
             self.schema.release();
             self.policy.release();
@@ -42062,9 +42424,17 @@ pub const DB = struct {
             var view = self.db.core.acquireSchemaView() orelse return error.PreparedGenerationChanged;
             errdefer view.release();
             if (view.storageMode() != .document or view.version() != schema_version) return error.PreparedGenerationChanged;
+            const privacy_backing = @import("antfly_platform").allocator.reclaimingScratch(alloc);
+            const privacy_arena = try privacy_backing.create(std.heap.ArenaAllocator);
+            privacy_arena.* = .init(privacy_backing);
+            errdefer {
+                privacy_arena.deinit();
+                privacy_backing.destroy(privacy_arena);
+            }
+            const privacy_policy = try @import("privacy_read.zig").capture(self.db, privacy_arena.allocator());
             var read = try self.db.core.store.beginReadTxn();
             errdefer read.abort();
-            return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .window = .init(alloc), .directory_arena = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)), .metadata = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)) };
+            return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .privacy_arena = privacy_arena, .privacy_policy = privacy_policy, .window = .init(alloc), .directory_arena = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)), .metadata = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)) };
         }
 
         pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
@@ -42131,6 +42501,17 @@ pub const DB = struct {
         // Keep degraded requests out of catalog/apply lock queues. Revalidate
         // after admission below to close publication's check-to-use race.
         try self.enforcePortableRuntimeGate();
+        var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+        defer privacy_arena.deinit();
+        const privacy_policy = try @import("privacy_read.zig").capture(self, privacy_arena.allocator());
+        try @import("privacy_read.zig").requireExpected(privacy_arena.allocator(), req.privacy_policy_version, privacy_policy);
+        if (privacy_policy != null and privacy_policy.?.prepared.policy.mode != .monitor) {
+            try self.lockApplySharedForPortableRuntime();
+            defer self.core.unlockApplyShared();
+            _ = try @import("privacy_read.zig").requirePublished(self, alloc, req);
+            const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+            return .{ .request = snapshot_req, .result = try self.searchLockedWithExecutionContext(alloc, snapshot_req, exec_ctx) };
+        }
         if (std.meta.eql(exec_ctx, types.ExecutionContext{})) {
             const snapshot_input = directSingleVectorRequest(req) orelse req;
             const dense = snapshot_input.dense orelse if (snapshot_input.query == .dense_knn) snapshot_input.query.dense_knn else null;
@@ -44304,6 +44685,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        _ = try @import("privacy_read.zig").requirePublished(self, alloc, req);
         return try self.collectPlanningStatsLocked(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), max_work, exec_ctx);
     }
 
@@ -44354,6 +44736,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{});
         return try db_query_search.collectExplicitTextStats(alloc, requests, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -44370,6 +44753,7 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
+        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{});
         return try db_query_search.collectExplicitBackgroundTextStats(alloc, requests, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -46009,6 +46393,10 @@ pub const DB = struct {
 
     pub fn trySnapshotDenseSearch(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery, include_profile: bool) !?SearchWithDenseProfileResult {
         if (comptime storage_engine.enabled) return storage_engine.call("trySnapshotDenseSearch", .{ self, alloc, req, dense, include_profile });
+        var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+        defer privacy_arena.deinit();
+        const privacy_policy = try @import("privacy_read.zig").capture(self, privacy_arena.allocator());
+        if (privacy_policy != null and privacy_policy.?.prepared.policy.mode != .monitor) return null;
         const manager = self.async_context.resource_manager orelse return null;
         if (!manager.dense_query_snapshot) return null;
         if (!snapshotDenseRequestEligible(req)) {
@@ -47717,6 +48105,21 @@ pub const DB = struct {
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
         const raw = (try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key)) orelse return null;
+        var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+        defer privacy_arena.deinit();
+        const privacy = @import("privacy_read.zig");
+        const policy = try privacy.capture(self, privacy_arena.allocator());
+        if (policy != null and policy.?.prepared.policy.mode != .monitor) {
+            if (internal_keys.isInternalUserKey(key)) {
+                const safe = try privacy.projectArtifact(privacy_arena.allocator(), policy.?, store_key, &txn);
+                return try alloc.dupe(u8, safe);
+            }
+            const safe = privacy.project(privacy_arena.allocator(), policy.?, key, raw, &txn) catch |err| {
+                if (privacy.pending(err)) return null;
+                return err;
+            };
+            return try alloc.dupe(u8, safe);
+        }
         if (internal_keys.mediaWindowIndex(store_key)) |index| return try @import("../../chunking/chunk.zig").mediaWindowPayloadAlloc(alloc, raw, index);
         return try self.core.index_manager.materializeStoredValueAlloc(alloc, store_key, raw);
     }
@@ -48317,8 +48720,40 @@ fn loadStoredSearchDocumentsMany(
         .pinned = if (schema_view) |*view| view else null,
     };
     defer schema_plans.deinit();
+    var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+    defer privacy_arena.deinit();
+    const privacy = @import("privacy_read.zig");
+    const policy = try privacy.capture(self, privacy_arena.allocator());
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
+        if (policy != null and policy.?.prepared.policy.mode != .monitor) {
+            var row_backing = inference_work.ReclaimingInvocationAllocator.init(alloc);
+            var row_arena = std.heap.ArenaAllocator.init(row_backing.allocator());
+            defer row_arena.deinit();
+            const row = row_arena.allocator();
+            const id = keys[item.original_index];
+            const safe = (if (internal_keys.isInternalUserKey(id))
+                privacy.projectArtifact(row, policy.?, item.store_key, &txn)
+            else
+                privacy.project(row, policy.?, id, value, &txn)) catch |err| {
+                if (privacy.pending(err)) continue;
+                return err;
+            };
+            // Authenticate the complete document, then retain only the selected
+            // output. Unselected bodies and validation DOMs expire per row.
+            loaded[item.original_index] = if (direct_fields) |fields|
+                try db_query_projection.projectLookupStoredBytesWithOutput(row, alloc, id, safe, .{ .fields = fields, .include_all_fields = false }, .{
+                    .ctx = self,
+                    .load_chunks = loadChunkFieldValueCallback,
+                    .load_embeddings = loadEmbeddingFieldValueCallback,
+                    .open_embeddings = openEmbeddingStreamCallback,
+                    .load_embeddings_compact = loadEmbeddingFieldsCallback,
+                    .load_artifacts = loadArtifactFieldValueCallback,
+                })
+            else
+                try alloc.dupe(u8, safe);
+            continue;
+        }
         loaded[item.original_index] = try schema_plans.materialize(
             item.store_key,
             value,
@@ -49659,6 +50094,47 @@ const jsonObjectOptionalBool = document_child_range_manifest.jsonObjectOptionalB
 const documentArtifactChildRangesFromJsonAlloc = document_child_range_manifest.documentArtifactChildRangesFromJsonAlloc;
 const documentArtifactChildRangesFromManifestJsonAlloc = document_child_range_manifest.documentArtifactChildRangesFromManifestJsonAlloc;
 const freeDocumentArtifactChildRanges = document_child_range_manifest.freeDocumentArtifactChildRanges;
+
+/// Inspection entry for an asset whose producer stores its output directly
+/// rather than a document-artifact manifest. Only identity, content type and
+/// fingerprint are summarized; the stored output is the raw `manifest_json`
+/// detail. The producer state is a binary digest of the source and producer
+/// config, so it is reported hex-encoded as `source_fingerprint` instead of as
+/// `state_json`. Takes ownership of `content`, `state` and `content_type`,
+/// freeing them on error.
+fn producedAssetManifestAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    content: []u8,
+    state: ?[]u8,
+    content_type: []u8,
+) !types.DocumentArtifactManifest {
+    errdefer alloc.free(content);
+    errdefer alloc.free(content_type);
+    defer if (state) |bytes| alloc.free(bytes);
+
+    const source_fingerprint: []u8 = if (state) |bytes| try std.fmt.allocPrint(alloc, "{x}", .{bytes}) else "";
+    errdefer if (source_fingerprint.len > 0) alloc.free(source_fingerprint);
+    const artifact_id = try artifact_ids.artifactPublicIdAlloc(alloc, .{
+        .document_id = @constCast(doc_key),
+        .name = @constCast(artifact_name),
+        .kind = .asset,
+    });
+    errdefer alloc.free(artifact_id);
+    const owned_doc_key = try alloc.dupe(u8, doc_key);
+    errdefer alloc.free(owned_doc_key);
+    const owned_artifact_name = try alloc.dupe(u8, artifact_name);
+
+    return .{
+        .document_id = owned_doc_key,
+        .artifact_name = owned_artifact_name,
+        .artifact_id = artifact_id,
+        .manifest_json = content,
+        .source_fingerprint = source_fingerprint,
+        .content_type = content_type,
+    };
+}
 
 fn documentArtifactManifestFromJsonAlloc(
     alloc: Allocator,
@@ -51802,7 +52278,7 @@ fn patternNodeFilterEvaluator(ctx: ?*anyopaque, node: graph_node_identity.Ref, f
 
 fn matchesPatternNodeFilter(active: *DB.PatternNodeFilterContext, key: []const u8, filter: graph_pattern_mod.NodeFilter) !bool {
     if (filter.filter_query_json == null) return true;
-    const stored = (try active.db.get(active.db.alloc, key)) orelse return false;
+    const stored = (try active.db.loadStoredSearchDocumentProbe(active.db.alloc, key)) orelse return false;
     defer active.db.alloc.free(stored);
     const prepared = try active.cache.getOrPrepare(filter.filter_query_json.?);
     return try prepared.matchesStored(active.db.alloc, key, stored);
@@ -53124,7 +53600,7 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
         };
         var guard: Guard = .{ .required = required };
         _ = try ctx.store.putBatchWithPromotionsReplayAndBuiltWrite(ctx.io, &.{}, &.{}, &.{}, .{ .sequence = sequence, .payload = payload }, null, .{ .ptr = &guard, .validate = Guard.validate });
-    } else try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence);
+    } else try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence, batch.generated_enrichment_refs);
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
     defer deferred_replication_gates.releaseTransition();
@@ -53261,7 +53737,7 @@ fn appendReplicatedDerivedEffectContext(ctx: *const BatchExecutionContext, chang
     return sequence;
 }
 
-fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionContext, payload: []const u8, sequence: u64) !void {
+fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionContext, payload: []const u8, sequence: u64, requests: []const enrichment_types.GeneratedEnrichmentRef) !void {
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer writes.deinit(ctx.alloc);
     var owned_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -53282,6 +53758,22 @@ fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionCont
         &owned_keys,
         &owned_values,
     );
+    const retry = @import("../../privacy/retry.zig");
+    const floor = retry.encode(sequence);
+    for (requests) |request| {
+        if (request.kind != .asset or !@import("../../privacy/document.zig").isArtifactName(request.artifact_name)) continue;
+        var state_key: std.ArrayListUnmanaged(u8) = .empty;
+        defer state_key.deinit(ctx.alloc);
+        try internal_keys.appendDocumentPrefix(&state_key, ctx.alloc, request.doc_key);
+        try state_key.append(ctx.alloc, internal_keys.asset_state_kind);
+        try internal_keys.appendEncodedComponent(&state_key, ctx.alloc, request.artifact_name);
+        const selected = try retry.key(ctx.alloc, state_key.items);
+        owned_keys.append(ctx.alloc, selected) catch |err| {
+            ctx.alloc.free(selected);
+            return err;
+        };
+        try writes.append(ctx.alloc, .{ .key = selected, .value = &floor });
+    }
     try ctx.store.putBatchWithReplay(
         ctx.io,
         writes.items,
@@ -54510,7 +55002,7 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     applied_batch.sequence = sequence;
     try lockApplyForPortableRuntimeContext(&batch_ctx);
     defer batch_ctx.apply_mutex.unlockExclusive();
-    try applyDerivedBatchContext(&batch_ctx, applied_batch);
+    try applyDerivedBatchInlineAssumeApply(&batch_ctx, applied_batch);
     return sequence;
 }
 
@@ -54812,7 +55304,7 @@ fn appendResolutionRecordWithProjection(
     applied_batch.sequence = sequence;
     try lockApplyForPortableRuntimeContext(&batch_ctx);
     defer batch_ctx.apply_mutex.unlockExclusive();
-    try applyDerivedBatchContext(&batch_ctx, applied_batch);
+    try applyDerivedBatchInlineAssumeApply(&batch_ctx, applied_batch);
     return sequence;
 }
 
@@ -55505,7 +55997,7 @@ fn appendGeneratedBatchFromEnrichment(
     applied_batch.sequence = sequence;
     try lockApplyForPortableRuntimeContext(&batch_ctx);
     defer batch_ctx.apply_mutex.unlockExclusive();
-    try applyDerivedBatchContext(&batch_ctx, applied_batch);
+    try applyDerivedBatchInlineAssumeApply(&batch_ctx, applied_batch);
     return .{ .sequence = sequence, .promoted_artifact_bytes = promoted_artifact_bytes };
 }
 
@@ -55672,6 +56164,12 @@ fn applyDerivedBatch(self: *DB, batch: derived_types.DerivedBatch) !void {
 const applyDerivedBatchProfiled = local_mutation.applyDerivedBatchProfiled;
 
 const applyDerivedBatchTargetsProfiled = local_mutation.applyDerivedBatchTargetsProfiled;
+
+fn applyDerivedBatchInlineAssumeApply(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !void {
+    var owned = ctx.*;
+    owned.apply_exclusive_held = true;
+    try applyDerivedBatchContext(&owned, batch);
+}
 
 fn applyDerivedBatchContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !void {
     try applyDerivedBatchContextProfiled(ctx, batch, null);
@@ -85624,6 +86122,88 @@ test "db public extraction budget rejection publishes a failure manifest" {
     try std.testing.expectEqualStrings("failed", manifest.merge_status);
     try std.testing.expectEqualStrings("DocumentExtractionWorkingSetTooLarge", manifest.last_error_code.?);
     try std.testing.expectEqual(@as(usize, 0), manifest.unit_count);
+}
+
+test "db artifact manifest list frees an unparseable asset value once" {
+    // An asset value read as a document-artifact manifest (no enrichment
+    // config names a direct-output producer) that does not parse must fail
+    // the request with the parse error. The parser owns and frees the value
+    // and its state row when it rejects them; the list must not free them
+    // again.
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{
+        .start_optional_runtime_workers = false,
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "summary");
+    defer alloc.free(asset_key);
+    try db.core.store.put(asset_key, "generated summary text");
+    const state_key = try assetStateKeyAlloc(alloc, "doc", "summary");
+    defer alloc.free(state_key);
+    try db.core.store.put(state_key, "{\"generation\":1}");
+
+    try std.testing.expectError(error.SyntaxError, db.listDocumentArtifactManifests(alloc, "doc"));
+    try std.testing.expectError(error.SyntaxError, db.getDocumentArtifactManifest(alloc, "doc", "summary"));
+}
+
+test "db artifact manifest list reports malformed document extraction manifests" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{
+        .start_optional_runtime_workers = false,
+        .start_index_workers = false,
+    });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "units");
+    defer alloc.free(asset_key);
+    try db.core.store.put(asset_key, "truncated {");
+
+    try std.testing.expectError(error.SyntaxError, db.listDocumentArtifactManifests(alloc, "doc"));
+    try std.testing.expectError(error.SyntaxError, db.getDocumentArtifactManifest(alloc, "doc", "units"));
+}
+
+test "db artifact manifest list and get inspect generator asset output" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, path_tmp.path(), .{
+        .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer() },
+    });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "summary",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+    });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"hello\"}" }}, .sync_level = .enrichments });
+    try std.testing.expectEqual(@as(usize, 1), fake.generator_calls);
+
+    var list = try db.listDocumentArtifactManifests(alloc, "doc");
+    defer list.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), list.artifacts.len);
+    const listed = list.artifacts[0];
+    try std.testing.expectEqualStrings("summary", listed.artifact_name);
+    try std.testing.expect(std.mem.startsWith(u8, listed.artifact_id, "af1:asset:"));
+    try std.testing.expectEqualStrings("text/plain", listed.content_type);
+    try std.testing.expectEqualStrings("generator:hello", listed.manifest_json);
+    try std.testing.expectEqual(@as(usize, 64), listed.source_fingerprint.len);
+    try std.testing.expect(listed.state_json == null);
+
+    var single = (try db.getDocumentArtifactManifest(alloc, "doc", "summary")) orelse return error.TestUnexpectedResult;
+    defer single.deinit(alloc);
+    try std.testing.expectEqualStrings(listed.artifact_id, single.artifact_id);
+    try std.testing.expectEqualStrings("generator:hello", single.manifest_json);
+    try std.testing.expectEqualStrings(listed.source_fingerprint, single.source_fingerprint);
 }
 
 test "db public artifact reprocess accepts durable work despite unrelated provider retries" {
@@ -135071,6 +135651,9 @@ test "db scan releases its snapshot promptly on cancellation and deadline" {
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
+    // Nonempty shard bounds own allocations. Error unwinding after the scan
+    // releases the apply lock must free each bound exactly once.
+    try db.updateRange(.{ .start = "doc:", .end = "doc;" });
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"v\":1}" }} });
 
     var cancelled = std.atomic.Value(bool).init(true);
@@ -135304,6 +135887,12 @@ const StoredLogicalSources = struct {
 };
 fn openStoredLogicalSourcesCallback(ctx: ?*anyopaque, a: Allocator) anyerror!?db_query_search.LogicalSourceReader {
     const db: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    var privacy_arena = std.heap.ArenaAllocator.init(a);
+    defer privacy_arena.deinit();
+    const policy = try @import("privacy_read.zig").capture(db, privacy_arena.allocator());
+    // Byte-range projection certificates describe original primary bytes.
+    // Protected logical values must use the receipt-bound whole-source path.
+    if (policy != null and policy.?.prepared.policy.mode != .monitor) return null;
     if (getenv("ANTFLY_BENCH_VALUE_SOURCE_FULL_READ")) |v| if (std.mem.eql(u8, v, "1")) return null;
     // Ordinal rows retain their existing schema-versioned decoding path.
     var view = db.core.acquireSchemaView();
@@ -139219,11 +139808,14 @@ test "db graph endpoint cleanup pages are replicated bounded and restartable" {
     defer directory.cleanup();
     var follower_directory = try TestDirectory.init("endpoint-cleanup-follower");
     defer follower_directory.cleanup();
-    var follower = try DB.open(alloc, std.mem.span(follower_directory.path().ptr), .{});
+    // This fixture drives ordered pages and derived drains explicitly. A
+    // background owner must not contend with its one-shot replicated applies.
+    const options: OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false };
+    var follower = try DB.open(alloc, std.mem.span(follower_directory.path().ptr), options);
     defer follower.close();
     try follower.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
     {
-        var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+        var db = try DB.open(alloc, std.mem.span(directory.path().ptr), options);
         defer db.close();
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -139265,7 +139857,7 @@ test "db graph endpoint cleanup pages are replicated bounded and restartable" {
         try std.testing.expectEqual(remaining.len, unchanged.len);
     }
     {
-        var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+        var db = try DB.open(alloc, std.mem.span(directory.path().ptr), options);
         defer db.close();
         try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
         var second_page = (try db.prepareGraphEndpointCleanupBatch(alloc)).?;
@@ -144847,6 +145439,111 @@ test "inline resolver replacement isolates serving graph consumers and releases 
     }
 }
 
+test "privacy ID scans retain bounded request memory with large original documents" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("privacy-id-scan-memory");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    const padding = try a.alloc(u8, 1024 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'p');
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .body = "small selected field", .padding = padding }, .{});
+    defer a.free(raw);
+    for (0..12) |i| {
+        const id = try std.fmt.allocPrint(a, "doc-{d:0>2}", .{i});
+        defer a.free(id);
+        try db.batch(.{ .writes = &.{.{ .key = id, .value = raw }}, .sync_level = .write });
+    }
+    var tracker = std.testing.FailingAllocator.init(a, .{});
+    var request_arena = std.heap.ArenaAllocator.init(tracker.allocator());
+    defer request_arena.deinit();
+    const Visitor = struct {
+        a: Allocator,
+        tracker: *std.testing.FailingAllocator,
+        expected_hash: u64,
+        count: usize = 0,
+        output: std.ArrayList(u8) = .empty,
+        fn visit(ptr: ?*anyopaque, row: types.ScanVisitEntry) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try std.testing.expect(row.document_json == null and row.document_stream == null);
+            try std.testing.expectEqual(self.expected_hash, row.hash);
+            // Interleave retained output with storage scratch, as NDJSON does.
+            try self.output.appendSlice(self.a, row.id);
+            try std.testing.expect(self.tracker.allocated_bytes - self.tracker.freed_bytes < 256 * 1024);
+            self.count += 1;
+        }
+    };
+    var visitor = Visitor{ .a = request_arena.allocator(), .tracker = &tracker, .expected_hash = std.hash.Wyhash.hash(0, raw) };
+    try db.scanVisit(request_arena.allocator(), "", "", .{ .privacy_original = true, .include_documents = false }, .{ .context = &visitor, .visit = Visitor.visit });
+    try std.testing.expectEqual(@as(usize, 12), visitor.count);
+    // Exercise the production discovery collector, not just its scan primitive.
+    // The page owns identifiers/references only, independent of source size.
+    var page = try db.collectPrivacyDiscovery(request_arena.allocator(), @import("../../privacy/document.zig").artifact_name, .{ .limit = 1000 });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 12), page.references.items.len);
+    try std.testing.expect(!page.more);
+    try std.testing.expect(tracker.allocated_bytes - tracker.freed_bytes < 256 * 1024);
+    for (page.references.items, 0..) |ref, i| {
+        const expected = try std.fmt.allocPrint(a, "doc-{d:0>2}", .{i});
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, ref.doc_key);
+        try std.testing.expectEqualStrings(@import("../../privacy/document.zig").artifact_name, ref.artifact_name);
+    }
+}
+
+test "privacy discovery bounds reference bytes and row count while advancing oversized IDs" {
+    const a = std.testing.allocator;
+    const name = @import("../../privacy/document.zig").artifact_name;
+    var page = try DB.PrivacyDiscoveryPage.init(a, name, 3);
+    defer page.deinit();
+    page.byte_limit = page.bytes + 2 * name.len + 4;
+    try std.testing.expect(try page.append("abc"));
+    try std.testing.expect(!try page.append("def"));
+    try std.testing.expect(page.more);
+    try std.testing.expectEqual(@as(usize, 1), page.references.items.len);
+    try std.testing.expectEqualStrings("abc", page.references.items[0].doc_key);
+
+    var oversized = try DB.PrivacyDiscoveryPage.init(a, name, 1000);
+    defer oversized.deinit();
+    oversized.byte_limit = 1;
+    try std.testing.expect(!try oversized.append("one-oversized-id"));
+    try std.testing.expect(oversized.more);
+    try std.testing.expectEqual(@as(usize, 1), oversized.references.items.len);
+
+    var rows = try DB.PrivacyDiscoveryPage.init(a, name, 1);
+    defer rows.deinit();
+    try std.testing.expect(!try rows.append("one"));
+    try std.testing.expect(rows.more);
+    try std.testing.expectEqual(@as(usize, 1), rows.references.items.len);
+    try std.testing.expectError(error.InvalidPrivacyScan, DB.PrivacyDiscoveryPage.init(a, name, 1001));
+}
+
+test "privacy discovery resumes after empty document IDs without skipping NUL IDs" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("privacy-empty-id-discovery");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    const ids = [_][]const u8{ "", "\x00", "after" };
+    for (ids) |id| try db.batch(.{ .writes = &.{.{ .key = id, .value = "{\"ordinal\":1}" }}, .sync_level = .write });
+    for (ids, 0..) |id, index| {
+        var page = try db.collectPrivacyDiscovery(a, @import("../../privacy/document.zig").artifact_name, .{
+            .from_key = if (index == 0) "" else ids[index - 1],
+            .resume_from_key = index != 0,
+            .limit = 1,
+        });
+        defer page.deinit();
+        try std.testing.expect(page.more);
+        try std.testing.expectEqual(@as(usize, 1), page.references.items.len);
+        try std.testing.expectEqualStrings(id, page.references.items[0].doc_key);
+    }
+    var eof = try db.collectPrivacyDiscovery(a, @import("../../privacy/document.zig").artifact_name, .{ .from_key = ids[ids.len - 1], .resume_from_key = true, .limit = 1 });
+    defer eof.deinit();
+    try std.testing.expect(!eof.more);
+    try std.testing.expectEqual(@as(usize, 0), eof.references.items.len);
+}
+
 test "public graph metric borrowed wire document scan producers preserve projection and cancellation" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("db-stream-projection");
@@ -147054,6 +147751,200 @@ test "db document quality policy reprocess retires text and vectors across reope
     }
 }
 
+test "privacy local completed source replay rearms missing consumer receipts without a replacement generation" {
+    const a = std.testing.allocator;
+    var dir = try TestDirectory.init("db");
+    defer dir.cleanup();
+    var db = try DB.open(a, std.mem.span(dir.path().ptr), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .enable_without_producers = true },
+    });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "copied", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    const left = types.IndexConfig{ .name = "left", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"copied\"}]}" };
+    const right = types.IndexConfig{ .name = "right", .kind = .full_text, .config_json = left.config_json };
+    try db.addIndex(left);
+    try db.addIndex(right);
+    try db.batch(.{ .writes = &.{ .{ .key = "doc", .value = "{\"body\":\"silver\"}" }, .{ .key = "other", .value = "{\"body\":\"gold\"}" } }, .sync_level = .full_index });
+    const id = try db.createGenerationRepairIntentAtTarget(a, left, .replay_artifact_unavailable, 0, 0, null, null, .complete, .initial_build);
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(a, left.name, "copied", plan.plan());
+    plan.release();
+    defer a.free(scope);
+    const generation = db.core.index_manager.coverageGenerationForIndex(left.name).?;
+    const marker = try internal_keys.derivedCoverageOutcomeKeyAlloc(a, scope, generation, "doc");
+    defer a.free(marker);
+    const receipt = try @import("artifact_producer_readiness.zig").localReceiptRevisionKeyAlloc(a, marker);
+    defer a.free(receipt);
+    const counter = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(a, scope, generation, "produced");
+    defer a.free(counter);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(marker);
+        try txn.delete(receipt);
+        var bytes: [8]u8 = undefined;
+        try txn.put(counter, internal_keys.encodeDerivedCoverageOutcomeCount(&bytes, 1));
+        try txn.commit();
+    }
+    const aggregate_marker = try internal_keys.derivedCoverageOutcomeKeyAlloc(a, left.name, generation, "doc");
+    defer a.free(aggregate_marker);
+    const aggregate_produced = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(a, left.name, generation, "produced");
+    defer a.free(aggregate_produced);
+    const aggregate_failed = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(a, left.name, generation, "terminal_failed");
+    defer a.free(aggregate_failed);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        var bytes: [8]u8 = undefined;
+        try txn.put(aggregate_marker, "terminal_failed");
+        try txn.put(aggregate_produced, internal_keys.encodeDerivedCoverageOutcomeCount(&bytes, 1));
+        try txn.put(aggregate_failed, internal_keys.encodeDerivedCoverageOutcomeCount(&bytes, 1));
+        try txn.commit();
+    }
+    try std.testing.expect(!try db.generatedCoverageReplayNeeded(a));
+    try std.testing.expectEqual(@as(usize, 0), try db.ensureGeneratedCoverageRecoveryIntents(a));
+    {
+        var entry = try db.loadIndexRepairEntryById(a, id);
+        defer entry.deinit(a);
+        try std.testing.expectEqual(index_repair_state.SourceReplayState.complete, entry.intent.source_replay_state);
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        var bytes: [8]u8 = undefined;
+        try txn.put(aggregate_marker, "produced");
+        try txn.put(aggregate_produced, internal_keys.encodeDerivedCoverageOutcomeCount(&bytes, 2));
+        try txn.put(aggregate_failed, internal_keys.encodeDerivedCoverageOutcomeCount(&bytes, 0));
+        try txn.commit();
+    }
+    try std.testing.expect(!try db.generatedCoverageRecoveryOwnedByInitialBuild(a));
+    try std.testing.expectEqual(@as(usize, 1), try db.ensureGeneratedCoverageRecoveryIntents(a));
+    {
+        var entry = try db.loadIndexRepairEntryById(a, id);
+        defer entry.deinit(a);
+        try std.testing.expectEqual(index_repair_state.SourceReplayState.pending, entry.intent.source_replay_state);
+        try std.testing.expect(entry.intent.candidate_relative_path == null);
+    }
+    try drainManagedAdmissionSourceReplayForTest(&db, a, id);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    var final_plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer final_plan.release();
+    try std.testing.expect(try db.privacyLocalIndexSourcesComplete(a, &read, left.name, left.kind, final_plan.plan()));
+    try std.testing.expect(try db.privacyLocalIndexSourcesComplete(a, &read, right.name, right.kind, final_plan.plan()));
+    try std.testing.expectEqual(generation, db.core.index_manager.coverageGenerationForIndex(left.name).?);
+}
+
+test "privacy ordered apply preflight defers contended readers and preserves replay receipts" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("privacy-ordered-preflight");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const entry: OrderedApplyReceipt = .{ .term = 1, .index = 1 };
+    {
+        db.core.lockApplyShared();
+        defer db.core.unlockApplyShared();
+        try std.testing.expectError(error.WriterLocked, db.orderedMutationAlreadyApplied(entry));
+        try std.testing.expectError(error.WriterLocked, db.tryLockApplyForPortableRuntime());
+        try std.testing.expectError(error.WriterLocked, db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "doc", .value = "{}" }} }, entry, true));
+    }
+    try std.testing.expect(!try db.orderedMutationAlreadyApplied(entry));
+    try db.recordOrderedApplyReceipt(entry);
+    {
+        db.core.lockApplyExclusive();
+        defer db.core.unlockApplyExclusive();
+        try std.testing.expectError(error.WriterLocked, db.orderedMutationAlreadyApplied(entry));
+    }
+    try std.testing.expect(try db.orderedMutationAlreadyApplied(entry));
+    try std.testing.expect(!try db.orderedMutationAlreadyApplied(.{ .term = 1, .index = 2 }));
+}
+
+test "privacy readiness metadata writes share primary admission and release on commit and abort" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("privacy-readiness-admission");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    var store: DB.ProducerReadinessStore = .{ .db = &db };
+    {
+        db.core.lockApplyShared();
+        defer db.core.unlockApplyShared();
+        try std.testing.expectError(error.WriterLocked, store.beginWriteTxn());
+    }
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try std.testing.expectError(error.WriterLocked, db.orderedMutationAlreadyApplied(.{ .term = 1, .index = 1 }));
+        try write.put("readiness-admission", "committed");
+        try write.commit();
+    }
+    {
+        var write = try store.beginWriteTxn();
+        try std.testing.expect(!db.core.tryLockApplyShared());
+        try write.put("readiness-admission", "aborted");
+        write.abort();
+    }
+    try std.testing.expect(db.core.tryLockApplyExclusive());
+    db.core.unlockApplyExclusive();
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualStrings("committed", try read.get("readiness-admission"));
+}
+
+test "privacy readiness upgrade retires legacy summaries in bounded large-identity pages" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("privacy-readiness-upgrade");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    var store: DB.ProducerReadinessStore = .{ .db = &db };
+    const prefix = "\x00\x00__artifact_publication__:producer-readiness:";
+    const old_registry = prefix ++ "registry";
+    const new_registry = prefix ++ "v2:registry";
+    const document = try a.alloc(u8, 1_100_000);
+    defer a.free(document);
+    @memset(document, 'x');
+    const scope: [80]u8 = @splat(1);
+    const first = try std.mem.concat(a, u8, &.{ prefix ++ "pending:", &scope, document });
+    defer a.free(first);
+    const second = try std.mem.concat(a, u8, &.{ first, "z" });
+    defer a.free(second);
+    const counter = try std.mem.concat(a, u8, &.{ prefix ++ "count:", &scope });
+    defer a.free(counter);
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try write.put(old_registry, "superseded");
+        try write.put(new_registry, "current");
+        try write.put(first, &@as([8]u8, @splat(0)));
+        try write.put(second, &@as([8]u8, @splat(0)));
+        try write.put(counter, &@as([8]u8, @splat(0)));
+        try write.commit();
+    }
+    const readiness = @import("artifact_producer_readiness.zig");
+    {
+        db.core.lockApplyShared();
+        defer db.core.unlockApplyShared();
+        try std.testing.expectError(error.WriterLocked, readiness.collectLegacyPage(a, &store));
+    }
+    try readiness.collectLegacyPage(a, &store);
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(first));
+        _ = try read.get(second);
+        _ = try read.get(counter);
+        try std.testing.expectEqualStrings("current", try read.get(new_registry));
+    }
+    for (0..3) |_| try readiness.collectLegacyPage(a, &store);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    for ([_][]const u8{ old_registry, first, second, counter }) |key| try std.testing.expectError(error.NotFound, read.get(key));
+    try std.testing.expectEqualStrings("current", try read.get(new_registry));
+}
+
 test "db scoped retry workset processes healthy batches across restart before a server deadline" {
     const a = std.testing.allocator;
     const Mock = struct {
@@ -147226,4 +148117,227 @@ test "db scoped retry workset never parks committed earlier chunk requests" {
     defer queue.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), gated.successful_requests.load(.acquire));
     try std.testing.expect(!queue.hasDocument("ZG9jOmE="));
+}
+
+test "privacy primed roots preserve durable retry deadlines and healthy consumers" {
+    const a = std.testing.allocator;
+    const Mock = struct {
+        bad_calls: usize = 0,
+        healthy_calls: usize = 0,
+        recover: bool = false,
+        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return error.UnexpectedSingleInvocation;
+        }
+        fn controlled(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request, _: asset_producer_mod.InvocationContext) ![]u8 {
+            return produce(ptr, alloc, request);
+        }
+        fn reported(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer_mod.Request, _: asset_producer_mod.InvocationContext) !asset_producer_mod.ProducedBatch {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const items = try alloc.alloc(asset_producer_mod.ProducedItem, requests.len);
+            for (requests, items) |request, *item| {
+                const bad = std.mem.eql(u8, request.source_text, "bad");
+                if (request.producer_type == .generator) {
+                    if (bad) self.bad_calls += 1 else self.healthy_calls += 1;
+                }
+                item.* = .{
+                    .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number },
+                    .result = if (bad and !self.recover) .{ .item_error = .{ .cause = error.EmbedRateLimited, .retryable = true, .retry_after_ms = 3_600_000 } } else .{ .value = try std.json.Stringify.valueAlloc(alloc, .{ .value = request.source_text }, .{}) },
+                };
+            }
+            return .{ .items = items, .execution = inference_work.ExecutionReport.compatibility(requests.len) };
+        }
+        fn interface(self: *@This()) asset_producer_mod.Producer {
+            return .{ .ptr = self, .vtable = &.{ .produce = produce, .produce_with_context = controlled, .produce_batch_reported_with_context = reported, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } };
+        }
+    };
+    var mock = Mock{};
+    var clock: @import("antfly_platform").clock.ManualClock = .{};
+    clock.setRealtimeNs(1_000 * std.time.ns_per_ms);
+    var tmp = try TestDirectory.init("privacy-priming-retry-review");
+    defer tmp.cleanup();
+    const options = OpenOptions{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "privacy-review", .asset_producer = mock.interface(), .clock = clock.clock(), .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 4 } };
+    var db = try DB.open(a, tmp.path(), options);
+    var opened = true;
+    defer if (opened) db.close();
+    try db.addEnrichment(.{ .name = "_privacy_document", .kind = .asset, .field = "body", .content_type = "application/json", .producer_json = "{\"type\":\"generator\",\"config\":{\"generator\":{\"provider\":\"antfly\",\"model\":\"test-generator\"},\"_antfly_privacy\":{\"mode\":\"monitor\",\"fields\":[\"body\"]}}}" });
+    try db.addEnrichment(.{ .name = "consumer", .kind = .asset, .source_artifact_name = "_privacy_document", .content_type = "application/json", .producer_json = "{\"type\":\"copy\"}" });
+    try db.batch(.{ .writes = &.{.{ .key = "bad", .value = "{\"body\":\"bad\"}" }}, .sync_level = .write });
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
+    try std.testing.expectEqual(@as(usize, 1), mock.bad_calls);
+    const deadline = db.enrichment_runtime.?.next_retry_at_ms;
+    try std.testing.expect(deadline >= 3_601_000 and deadline <= 3_601_250);
+    db.close();
+    opened = false;
+    clock.advanceMs(30_000);
+    db = try DB.open(a, tmp.path(), options);
+    opened = true;
+    try db.batch(.{ .writes = &.{.{ .key = "good", .value = "{\"body\":\"healthy\"}" }}, .sync_level = .write });
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
+    try std.testing.expectEqual(@as(usize, 1), mock.bad_calls);
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "good", "asset", "consumer");
+    defer a.free(key);
+    const value = try db.core.store.get(a, key);
+    defer a.free(value);
+    try std.testing.expect(std.mem.indexOf(u8, value, "healthy") != null);
+    try std.testing.expectEqual(@as(usize, 1), mock.healthy_calls);
+    try std.testing.expectEqual(deadline, db.enrichment_runtime.?.next_retry_at_ms);
+    mock.recover = true;
+    clock.advanceMs(3_600_000);
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    try std.testing.expectEqual(@as(usize, 2), mock.bad_calls);
+    try std.testing.expectEqual(@as(usize, 1), mock.healthy_calls);
+}
+
+test "privacy discovery regenerates completed artifacts whose local publication witness was not restored" {
+    const a = std.testing.allocator;
+    const privacy = @import("../../privacy/document.zig");
+    const local = @import("../../privacy/local_publication.zig");
+    const Mock = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn check(_: *anyopaque) !void {}
+        fn detect(_: *anyopaque, _: Allocator, _: privacy.contract.Producer, _: []const u8) ![]u8 {
+            return error.UnexpectedInference;
+        }
+        fn produce(ptr: *anyopaque, out: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return privacy.produce(out, request.config_json, request.source_text, .{ .ptr = ptr, .produce = detect, .check = check });
+        }
+        fn interface(self: *@This()) asset_producer_mod.Producer {
+            return .{ .ptr = self, .vtable = &.{ .produce = produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } };
+        }
+    };
+    var mock: Mock = .{};
+    var directory = try TestDirectory.init("privacy-restored-publication");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = mock.interface() } });
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const policy = privacy.contract.Policy{ .mode = .monitor, .fields = &.{"absent"} };
+    const resolved = try privacy.resolve(arena.allocator(), policy, true);
+    const producer_json = try std.json.Stringify.valueAlloc(arena.allocator(), .{ .type = "extractor", .config = resolved.config }, .{});
+    try db.addEnrichment(.{ .name = privacy.artifact_name, .kind = .asset, .field = privacy.source_field, .content_type = "application/json", .producer_json = producer_json });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"ordinal\":1}" }}, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    try std.testing.expectEqual(@as(usize, 1), mock.calls.load(.acquire));
+    _ = try db.reprocessGeneratedEnrichmentFromStoredDocs(a, null);
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    try std.testing.expectEqual(@as(usize, 1), mock.calls.load(.acquire));
+    const artifact = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", privacy.artifact_name);
+    defer a.free(artifact);
+    const witness = try local.key(a, artifact);
+    defer a.free(witness);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(witness);
+        try txn.commit();
+    }
+    _ = try db.reprocessGeneratedEnrichmentFromStoredDocs(a, null);
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    try std.testing.expectEqual(@as(usize, 2), mock.calls.load(.acquire));
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try local.require(a, &read, artifact, try policy.identity(a), "{\"ordinal\":1}", try read.get(artifact));
+}
+
+/// Produces real privacy receipts without a model: these fixtures deliberately
+/// select an absent field. Keep the ordinary publication/skip-state pipeline.
+const PrivacyAbsentFieldProducer = struct {
+    fn check(_: *anyopaque) !void {}
+    fn detect(_: *anyopaque, _: Allocator, _: @import("../../privacy/contract.zig").Producer, _: []const u8) ![]u8 {
+        return error.UnexpectedInference;
+    }
+    fn produce(ptr: *anyopaque, out: Allocator, request: asset_producer_mod.Request) ![]u8 {
+        return @import("../../privacy/document.zig").produce(out, request.config_json, request.source_text, .{ .ptr = ptr, .produce = detect, .check = check });
+    }
+    fn interface(self: *@This()) asset_producer_mod.Producer {
+        return .{ .ptr = self, .vtable = &.{ .produce = produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } };
+    }
+};
+
+fn addPrivacyAbsentFieldProducer(a: Allocator, db: *DB, description: []const u8) !void {
+    const privacy = @import("../../privacy/document.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const policy = privacy.contract.Policy{ .mode = .redact_for_search_and_ai, .fields = &.{"absent"}, .category_groups = &.{}, .categories = &.{.{ .name = "email", .description = description }} };
+    const resolved = try privacy.resolve(scratch, policy, true);
+    const producer_json = try std.json.Stringify.valueAlloc(scratch, .{ .type = "extractor", .config = resolved.config }, .{});
+    const name = try privacy.protectedArtifactName(scratch, try policy.identity(scratch));
+    try db.addEnrichment(.{ .name = name, .kind = .asset, .field = privacy.source_field, .content_type = "application/json", .producer_json = producer_json });
+}
+
+test "privacy delayed SQL reader retains one prepared binding across row and page lifetimes" {
+    const a = std.testing.allocator;
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var directory = try TestDirectory.init("privacy-sql-policy-binding");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface() } });
+    defer db.close();
+    try db.setSchemaJson(a, "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"ordinal\":{\"type\":\"integer\"}},\"additionalProperties\":true}}}}");
+    const description = try a.alloc(u8, 128 * 1024);
+    defer a.free(description);
+    @memset(description, 'x');
+    try addPrivacyAbsentFieldProducer(a, &db, description);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"ordinal\":1}" }}, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    var lease = try db.beginQueryReadLease();
+    defer lease.release();
+    var budget = inference_work.BoundedInvocationAllocator.init(a, 16 * 1024 * 1024);
+    {
+        var reader = try lease.documentRows(budget.allocator(), 1);
+        defer reader.deinit();
+        // Capturing another copy of the policy cannot fit this allowance.
+        // Row hydration must reuse its immutable lease-owned binding.
+        budget.max_live_bytes = budget.live_bytes + 192 * 1024;
+        for (0..32) |_| {
+            const rows = try reader.lookupProjectedBatch(&.{"doc"}, &.{"ordinal"}, 256 * 1024);
+            try std.testing.expectEqual(@as(usize, 1), rows.consumed);
+            try std.testing.expectEqualStrings("{\"ordinal\":1}", rows.values[0].bytes);
+            reader.releasePage();
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+}
+
+test "privacy protected hit hydration bounds row scratch and retains only selected output" {
+    const a = std.testing.allocator;
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var directory = try TestDirectory.init("privacy-projection-working-memory");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface() } });
+    defer db.close();
+    try addPrivacyAbsentFieldProducer(a, &db, "");
+    const padding = try a.alloc(u8, 128 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'x');
+    const source = try std.json.Stringify.valueAlloc(a, .{ .ordinal = 1, .ignored = padding }, .{});
+    defer a.free(source);
+    var keys: [20][]const u8 = undefined;
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| a.free(key);
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.allocPrint(a, "doc-{d}", .{i});
+        initialized += 1;
+        try db.batch(.{ .writes = &.{.{ .key = key.*, .value = source }}, .sync_level = .write });
+        try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    }
+    var single_peak: usize = 0;
+    for ([_]usize{ 1, keys.len }) |count| {
+        // Include the ordinary store batch read, but leave room for only one
+        // row's validation workspace, independently of the hit count.
+        var budget = inference_work.BoundedInvocationAllocator.init(a, 8 * 1024 * 1024);
+        {
+            const values = try loadStoredSearchDocumentsMany(&db, budget.allocator(), keys[0..count], &.{"ordinal"});
+            defer freeOptionalOwnedBytes(budget.allocator(), values);
+            for (values) |value| try std.testing.expectEqualStrings("{\"ordinal\":1}", value.?);
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        if (count == 1) single_peak = budget.peak_live_bytes else {
+            try std.testing.expect(budget.peak_live_bytes < single_peak + 4 * 1024 * 1024);
+        }
+        std.debug.print("\nPrivacy projected hydration rows={d} peak_bytes={d}\n", .{ count, budget.peak_live_bytes });
+    }
 }

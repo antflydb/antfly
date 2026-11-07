@@ -28,44 +28,34 @@ const AssetResolver = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     canonical_root: []u8,
+    published: @import("../registry/published_artifacts.zig").PublishedArtifacts,
 
     fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
         model_path: []const u8,
     ) !AssetResolver {
-        return .{
-            .allocator = allocator,
-            .io = io,
-            .canonical_root = try realPathAlloc(
-                allocator,
-                io,
-                model_path,
-            ),
-        };
+        const canonical_root = try realPathAlloc(allocator, io, model_path);
+        errdefer allocator.free(canonical_root);
+        return .{ .allocator = allocator, .io = io, .canonical_root = canonical_root, .published = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, io, model_path, null) };
     }
 
     pub fn deinit(self: *AssetResolver) void {
+        self.published.deinit();
         self.allocator.free(self.canonical_root);
         self.* = undefined;
     }
 
-    fn resolve(self: *const AssetResolver, relative: []const u8) ![]u8 {
+    fn resolve(self: *AssetResolver, relative: []const u8) ![]u8 {
         if (!metadata_mod.isSafeRelativeAssetPath(relative))
             return error.InvalidMetadata;
-        const joined = try std.fs.path.join(
-            self.allocator,
-            &.{ self.canonical_root, relative },
-        );
-        defer self.allocator.free(joined);
-        const canonical = try realPathAlloc(
-            self.allocator,
-            self.io,
-            joined,
-        );
+        const selected = if (std.mem.endsWith(u8, relative, ".onnx")) self.published.resolveModel(relative) else self.published.resolve(relative);
+        const canonical = (selected catch |err| switch (err) {
+            error.ModelArtifactOutsideRoot => return error.ModelAssetOutsideRoot,
+            else => return err,
+        }) orelse return error.FileNotFound;
         errdefer self.allocator.free(canonical);
-        if (!pathIsWithinRoot(self.canonical_root, canonical))
-            return error.ModelAssetOutsideRoot;
+        try self.published.verifyFile(relative);
         return canonical;
     }
 };
@@ -115,16 +105,22 @@ pub const LoadedMultiStageReader = struct {
         control: ?InferenceExecutionControl,
     ) !LoadedMultiStageReader {
         if (control) |active| try active.check();
+        const runtime_io = session_manager.io orelse return error.MissingIoRuntime;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, runtime_io, model_path);
+        defer publication_lease.deinit(runtime_io);
+        if (control) |active| try active.check();
         var metadata = try metadata_mod.loadFromDir(allocator, model_path);
         defer metadata.deinit();
         if (!metadata_mod.isMultiStage(&metadata)) return error.InvalidMetadata;
-        const runtime_io = session_manager.io orelse return error.MissingIoRuntime;
         var asset_resolver = try AssetResolver.init(
             allocator,
             runtime_io,
             model_path,
         );
         defer asset_resolver.deinit();
+        if (control) |active| if (active.model_selection) |selected| {
+            if (!selected.matches(model_path) or !std.meta.eql(selected.publication, asset_resolver.published.publication)) return error.ModelArtifactsChanging;
+        };
         const component_paths = try collectComponentPaths(
             allocator,
             &asset_resolver,
@@ -135,12 +131,19 @@ pub const LoadedMultiStageReader = struct {
             allocator.free(component_paths);
         }
 
+        // Authenticate graph-owned external tensors before importer/session
+        // construction. Directory containment alone does not prove membership.
+        for (component_paths) |path| {
+            if (!std.mem.endsWith(u8, path, ".onnx")) continue;
+            try asset_resolver.published.verifyOnnx(path);
+        }
         var component_loader = try model_manager.componentLoaderForPathsWithContract(
             model_path,
             session_manager.preferred_backends,
             component_paths,
             .multistage_ocr,
         );
+        component_loader = component_loader.withArtifacts(&asset_resolver.published);
         var preflight = try PreflightAssets.load(
             allocator,
             &asset_resolver,
@@ -152,7 +155,7 @@ pub const LoadedMultiStageReader = struct {
         var first_err: ?anyerror = null;
         for (component_loader.preferredBackends()) |backend| {
             var backend_loader = try component_loader.restrictToBackend(backend);
-            return loadFromDirWithSessionManager(
+            var result = loadFromDirWithSessionManager(
                 allocator,
                 model_path,
                 &asset_resolver,
@@ -170,6 +173,9 @@ pub const LoadedMultiStageReader = struct {
                 std.log.err("multistage reader backend {s} failed for {s}: {s}", .{ @tagName(backend), model_path, @errorName(err) });
                 continue;
             };
+            errdefer result.deinit();
+            try asset_resolver.published.verify();
+            return result;
         }
 
         return first_err orelse error.NoBackendAvailable;
@@ -177,7 +183,7 @@ pub const LoadedMultiStageReader = struct {
 
     fn collectComponentPaths(
         allocator: std.mem.Allocator,
-        asset_resolver: *const AssetResolver,
+        asset_resolver: *AssetResolver,
         metadata: *const metadata_mod.MultiStageMetadata,
     ) ![]const []const u8 {
         var paths = std.ArrayListUnmanaged([]const u8).empty;
@@ -217,7 +223,7 @@ pub const LoadedMultiStageReader = struct {
     fn loadFromDirWithSessionManager(
         allocator: std.mem.Allocator,
         model_path: []const u8,
-        asset_resolver: *const AssetResolver,
+        asset_resolver: *AssetResolver,
         metadata: *const metadata_mod.MultiStageMetadata,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
         preflight: *PreflightAssets,
@@ -417,7 +423,7 @@ const PreflightAssets = struct {
 
     fn load(
         allocator: std.mem.Allocator,
-        asset_resolver: *const AssetResolver,
+        asset_resolver: *AssetResolver,
         metadata: *const metadata_mod.MultiStageMetadata,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
     ) !PreflightAssets {
@@ -485,7 +491,7 @@ const PreflightAssets = struct {
 
 fn validateStageProcessorPath(
     allocator: std.mem.Allocator,
-    asset_resolver: *const AssetResolver,
+    asset_resolver: *AssetResolver,
     stage: *const metadata_mod.StageMetadata,
 ) !void {
     const processor_dir = stage.processor_dir orelse return;
@@ -528,7 +534,7 @@ fn loadPostProcessor(stage: metadata_mod.StageMetadata) !multistage_ocr.Detectio
 
 fn loadStagePreprocessConfig(
     allocator: std.mem.Allocator,
-    asset_resolver: *const AssetResolver,
+    asset_resolver: *AssetResolver,
     metadata: *const metadata_mod.MultiStageMetadata,
     stage: *const metadata_mod.StageMetadata,
     session: backends.Session,

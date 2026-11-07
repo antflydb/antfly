@@ -2028,7 +2028,7 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
 
 fn cudaVideoRequest(clip: @import("../ops/cuda/video.zig").EmbeddingInspection, input_bytes: usize, options: Options) !@import("../backends/session.zig").RunRequest {
     if (clip.frames == 0 or clip.frames > 32 or clip.width == 0 or clip.height == 0 or clip.width > 4096 or clip.height > 4096) return error.InvalidVideoGeometry;
-    const g = projector.embeddingGemma2VideoGeometry(clip.width, clip.height);
+    const g = projector.embeddingGemma2VideoGeometry(clip.display_width, clip.display_height);
     const sequence = clip.frames * (g.tokens + 2) + 2;
     if (sequence > options.max_tokens) return error.EmbeddingInputTooLong;
     const pixels = @as(usize, clip.width) * clip.height;

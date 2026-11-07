@@ -933,7 +933,7 @@ pub const HashJoin = struct {
             if (self.owner.disk) |*file| while (self.cursor) |index| {
                 const decoded = try self.owner.readProbeKey(file, index);
                 self.cursor = if (decoded.next == @import("spill.zig").none) null else @intCast(decoded.next);
-                self.owner.probes += 1;
+                if (!self.owner.shared) self.owner.probes += 1;
                 if (decoded.row.keys.len != self.keys.len) return error.InvalidSqlSpill;
                 var equal = true;
                 for (decoded.row.keys, self.keys) |left, right| if (left.sql_null or right.sql_null or (try scalar.compareDatums(left, right)) != .eq) {
@@ -946,7 +946,7 @@ pub const HashJoin = struct {
             while (self.cursor) |index| {
                 const entry = &self.owner.entries.items[index];
                 self.cursor = entry.next;
-                self.owner.probes += 1;
+                if (!self.owner.shared) self.owner.probes += 1;
                 if (try self.owner.key_columns.equal(self.owner.backing, index, self.keys, false)) return .{ .index = index, .owner = self.owner };
             }
             return null;
@@ -965,6 +965,7 @@ pub const HashJoin = struct {
     key_count: ?usize = null,
     probes: u64 = 0,
     sealed: bool = false,
+    shared: bool = false,
 
     disk: ?@import("spill.zig").File = null,
     disk_heads: Buckets = .{},
@@ -1483,7 +1484,7 @@ pub const HashJoin = struct {
         if (key_hash) |hashed| self.heads.putAssumeCapacity(hashed, index);
     }
     pub fn probe(self: *HashJoin, keys: []const Datum) !Probe {
-        self.sealed = true;
+        if (!self.shared) self.sealed = true;
         if (self.key_count != null and self.key_count.? != keys.len) return error.InvalidSqlBackendResponse;
         if (self.disk != null) {
             const bucket = if (try keyHash(keys)) |hashed| try self.disk_heads.get(hashed) else @import("spill.zig").none;
@@ -1495,7 +1496,7 @@ pub const HashJoin = struct {
     /// each key column together and keep per-lane NULL semantics. Returned
     /// probes borrow their batch keys until all lanes have been consumed.
     pub fn probeBatch(self: *HashJoin, a: Allocator, keys: []const []const Datum) ![]Probe {
-        self.sealed = true;
+        if (!self.shared) self.sealed = true;
         const probes = try a.alloc(Probe, keys.len);
         errdefer a.free(probes);
         const hashes = try @import("batch_hash.zig").rows(a, keys, false);
@@ -1521,7 +1522,7 @@ pub const HashJoin = struct {
                     if (probe_.first != null) continue;
                     const index = probe_.cursor orelse continue;
                     probe_.cursor = self.entries.items[index].next;
-                    self.probes += 1;
+                    if (!self.shared) self.probes += 1;
                     if (try self.key_columns.equal(self.backing, index, probe_.keys, false)) {
                         probe_.first = .{ .index = index, .owner = self };
                     } else if (probe_.cursor != null) pending = true;
@@ -1584,8 +1585,23 @@ pub const HashJoin = struct {
             begin += cohort.len;
         }
     }
+    /// Publish an in-memory index for concurrent readers. Match tracking stays
+    /// with the consumer; shared probes never mutate index counters or flags.
+    pub fn freezeShared(self: *HashJoin) void {
+        std.debug.assert(self.disk == null);
+        self.sealed = true;
+        self.shared = true;
+        self.value_columns.freezeShared();
+        self.key_columns.freezeShared();
+    }
+    /// Borrow immutable in-memory build keys.
+    pub fn buildKeys(self: *const HashJoin) @import("execution_batch.zig").Batch {
+        std.debug.assert(self.disk == null);
+        return .{ .retained = .{ .store = &self.key_columns, .count = self.row_count } };
+    }
     /// Mark only after the complete ON residual accepts this candidate.
     pub fn markMatched(self: *HashJoin, index: usize) !void {
+        if (self.shared) return error.InvalidSqlBackendResponse;
         if (self.disk) |*file| {
             try file.match(index);
             return;

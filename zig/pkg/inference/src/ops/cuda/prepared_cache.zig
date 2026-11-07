@@ -276,7 +276,11 @@ pub const VideoRecipe = struct {
     grid_y: usize,
     pub fn validate(self: *const VideoRecipe) !void {
         _ = try self.sequence.bytes();
-        if (self.samples == 0 or self.samples > 32 or self.unique_frames == 0 or self.unique_frames > self.samples or self.resize.width != self.sequence.width or self.resize.height != self.sequence.height or !self.resize.resident or self.grid_x == 0 or self.grid_y == 0) return error.InvalidPreparedVideoRecipe;
+        // RGB preprocessing rotates the raster by quarter turns. SAR affects
+        // target geometry, but never changes this owned source pixel extent.
+        const raster_matches = (self.resize.width == self.sequence.width and self.resize.height == self.sequence.height) or
+            (self.resize.width == self.sequence.height and self.resize.height == self.sequence.width);
+        if (self.samples == 0 or self.samples > 32 or self.unique_frames == 0 or self.unique_frames > self.samples or !raster_matches or !self.resize.resident or self.grid_x == 0 or self.grid_y == 0) return error.InvalidPreparedVideoRecipe;
     }
 };
 
@@ -1765,4 +1769,25 @@ test "audio depthwise shared source layout accepts original transpose cases and 
     try std.testing.expectError(error.InvalidTensorShape, AudioRecipe.validateDepthwiseSource(&.{5120}, 5, 1024, true));
     var key: [256]u8 = undefined;
     try std.testing.expectError(error.InvalidPreparedAudioRecipe, AudioRecipe.depthwiseWeightName(&key, 12));
+}
+
+test "prepared video raster accepts only raw or quarter turn geometry independently of display resize" {
+    var recipe: VideoRecipe = .{
+        .sequence = .{ .width = 160, .height = 96, .coded_width = 160, .coded_height = 96, .surfaces = 4, .codec = 8, .display_left = 0, .display_top = 0, .matrix = 1, .full_range = 0 },
+        .samples = 1,
+        .unique_frames = 1,
+        .resize = .{ .width = 160, .height = 96, .target_width = 320, .target_height = 96, .resident = true },
+        .grid_x = 20,
+        .grid_y = 6,
+    };
+    try recipe.validate();
+    recipe.resize.width = 96;
+    recipe.resize.height = 160;
+    try recipe.validate();
+    // Equal pixel counts and display/SAR widths are insufficient provenance.
+    for ([_][2]u32{ .{ 192, 80 }, .{ 320, 96 }, .{ 160, 160 }, .{ 0, 160 } }) |extent| {
+        recipe.resize.width = extent[0];
+        recipe.resize.height = extent[1];
+        try std.testing.expectError(error.InvalidPreparedVideoRecipe, recipe.validate());
+    }
 }

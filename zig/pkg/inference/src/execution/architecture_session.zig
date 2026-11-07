@@ -376,7 +376,13 @@ const HostPreparation = host_weights.HostPreparation;
 fn openHostSession(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride, preparation: HostPreparation) !Session {
     var loaded_model = try model_definition.LoadedModel.open(allocator, model_path);
     defer loaded_model.deinit();
-    return prepareLoadedHostSession(allocator, model_path, &loaded_model, override, preparation);
+    return prepareLoadedHostSession(allocator, loaded_model.manifest.source_root orelse model_path, &loaded_model, override, preparation);
+}
+
+fn openHostSessionFromManifest(allocator: std.mem.Allocator, model_path: []const u8, manifest: *const manifest_mod.ModelManifest) !Session {
+    var loaded_model = try model_definition.LoadedModel.fromManifest(allocator, model_path, manifest);
+    defer loaded_model.deinit();
+    return prepareLoadedHostSession(allocator, loaded_model.manifest.source_root orelse model_path, &loaded_model, null, .{});
 }
 
 /// Consumes the loaded source's weights, retaining its metadata until return.
@@ -570,6 +576,7 @@ pub fn createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(
         config,
         load_context,
         a4b_request,
+        null,
     );
 }
 
@@ -589,7 +596,7 @@ pub fn createMetalSessionWithTaskOverrideAndKernelJitAndLoadContext(
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
 ) !Session {
-    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal, config, load_context, null);
+    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal, config, load_context, null, null);
 }
 
 pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
@@ -601,14 +608,14 @@ pub const GlinerCudaPrecision = cuda_weights.GlinerCudaPrecision;
 /// Explicit precision for qualification and model owners. Automatic selection
 /// remains FP32 until a measured artifact/profile is added to release policy.
 pub fn createGlinerCudaSessionWithPrecision(allocator: std.mem.Allocator, model_path: []const u8, precision: GlinerCudaPrecision) !Session {
-    return createCudaSessionWithRequiredProfile(allocator, model_path, null, .{}, .dynamic, null, null, precision);
+    return createCudaSessionWithRequiredProfile(allocator, model_path, null, .{}, .dynamic, null, null, precision, null);
 }
 
 /// Managed loads retain the release gate even when an explicit precision is
 /// requested. The diagnostic constructor above measures candidates without
 /// promoting them to serving policy.
 pub fn createCudaSessionWithGlinerPrecision(allocator: std.mem.Allocator, model_path: []const u8, config: kernel_jit.Config, load_context: kernel_jit.LoadContext, precision: GlinerCudaPrecision) !Session {
-    if (precision == .fp16 or precision == .bf16) return error.UnqualifiedGlinerCudaPrecision;
+    try requireQualifiedGlinerCudaPrecision(precision, false);
     return createGlinerCudaSessionWithLoadPolicy(allocator, model_path, config, load_context, precision);
 }
 
@@ -622,8 +629,8 @@ pub fn createCudaSessionWithGlinerPrecisionForTest(allocator: std.mem.Allocator,
 fn createGlinerCudaSessionWithLoadPolicy(allocator: std.mem.Allocator, model_path: []const u8, config: kernel_jit.Config, load_context: kernel_jit.LoadContext, precision: GlinerCudaPrecision) !Session {
     var manifest = try manifest_mod.loadListingFromDir(allocator, model_path);
     defer manifest.deinit();
-    if (manifest.gliner_architecture != .boundary and manifest.gliner_classification_head != .label_marker_mlp) return error.UnsupportedGlinerCudaPrecision;
-    return createCudaSessionWithRequiredProfile(allocator, model_path, null, config, load_context, null, null, precision);
+    try requireGlinerCudaPrecisionManifest(&manifest);
+    return createCudaSessionWithRequiredProfile(allocator, model_path, null, config, load_context, null, null, precision, null);
 }
 
 test "GLiNER CUDA managed reduced precision remains release gated" {
@@ -709,6 +716,7 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
         a4b_request,
         null,
         .fp32,
+        null,
     );
 }
 
@@ -728,6 +736,7 @@ pub fn createGemma4CudaTrainingSession(
         null,
         .gemma4_training,
         .fp32,
+        null,
     );
 }
 
@@ -740,9 +749,10 @@ fn createCudaSessionWithRequiredProfile(
     a4b_request: ?backend_contracts.A4bInferenceRequest,
     required_profile_override: ?CudaCapabilityProfile,
     gliner_precision: GlinerCudaPrecision,
+    selected_manifest: ?*const manifest_mod.ModelManifest,
 ) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
-    var prepared = try cuda_weights.prepare(allocator, model_path, override, config, load_context, a4b_request, required_profile_override, gliner_precision);
+    var prepared = try cuda_weights.prepare(allocator, model_path, override, config, load_context, a4b_request, required_profile_override, gliner_precision, selected_manifest);
     defer prepared.deinit();
     const impl = try allocator.create(ArchSession);
     impl.* = .{
@@ -994,8 +1004,9 @@ fn createGpuHostedSessionWithTaskOverride(
     kernel_jit_config: kernel_jit.Config,
     kernel_jit_load_context: kernel_jit.LoadContext,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
+    selected_manifest: ?*const manifest_mod.ModelManifest,
 ) !Session {
-    var prepared = try device_weights.prepare(allocator, model_path, override, backend_type, kernel_jit_config, kernel_jit_load_context, a4b_request);
+    var prepared = try device_weights.prepare(allocator, model_path, override, backend_type, kernel_jit_config, kernel_jit_load_context, a4b_request, selected_manifest);
     defer prepared.deinit();
     if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     const impl = try allocator.create(ArchSession);
@@ -1562,12 +1573,21 @@ pub fn widenBudgetLimitsForModelPath(
         else => return limits,
     }
 
-    const direct_quant_enabled = directQuantEnabled();
-    const quant_mode = gpuHostedQuantExecutionMode(direct_quant_enabled);
-
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
     defer mf.deinit();
+    return widenBudgetLimitsForManifest(allocator, model_path, mf, limits, backend_type);
+}
 
+pub fn widenBudgetLimitsForManifest(allocator: std.mem.Allocator, requested_model_path: []const u8, mf: manifest_mod.ModelManifest, limits: runtime.tier.memory.Limits, backend_type: BackendType) !runtime.tier.memory.Limits {
+    const model_path = mf.source_root orelse requested_model_path;
+    if (!backend_type.usesGpuHostedSession()) return limits;
+    switch (backend_type) {
+        .metal => if (!build_options.enable_metal) return limits,
+        .cuda => if (!build_options.enable_cuda) return limits,
+        else => return limits,
+    }
+    const direct_quant_enabled = directQuantEnabled();
+    const quant_mode = gpuHostedQuantExecutionMode(direct_quant_enabled);
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
 
     const arch_config = try detectArchitecture(allocator, model_path, mf);
@@ -10823,15 +10843,19 @@ const IncrementalAggregateGateFixture = struct {
         const start = @intFromPtr(aggregate);
         return address >= start and address - start < size;
     }
-    fn tokenizer(_: *anyopaque, _: []const u8) !@import("../models/managed_tokenizer.zig").Managed {
+    fn tokenizer(_: *anyopaque, _: []const u8, _: ?*const @import("../registry/published_artifacts.zig").PublishedArtifacts) !@import("../models/managed_tokenizer.zig").Managed {
         return .{ .tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(std.testing.allocator, tokenizer_json) };
     }
-    fn session(_: *anyopaque, _: []const u8, _: []const BackendType, _: ?*@import("../backends/imported_onnx_session.zig").SharedBackendContext, control: ?InferenceExecutionControl) !@import("../models/session_loader.zig").ManagedSession {
+    fn session(_: *anyopaque, _: []const u8, _: []const BackendType, _: ?*@import("../backends/imported_onnx_session.zig").SharedBackendContext, control: ?InferenceExecutionControl, selected: @import("../registry/model_selection.zig").ResolvedModel, artifacts: ?*@import("../registry/published_artifacts.zig").PublishedArtifacts) !@import("../models/session_loader.zig").ManagedSession {
         if (control) |active| try active.check();
+        try selected.verify(std.testing.allocator, std.testing.io);
+        try std.testing.expect(selected.publication == null);
+        if (artifacts) |snapshot| try std.testing.expectEqualStrings(selected.path, snapshot.root);
         return .{ .session = try IncrementalFixture.session(std.testing.allocator) };
     }
-    fn plan(raw: *anyopaque, _: []const u8, _: []const BackendType, paths: []const []const u8) !@import("../models/component_loader.zig").ComponentLoader {
-        var loader = @import("../models/component_loader.zig").ComponentLoader{ .services = .{ .allocator = std.testing.allocator, .context = raw, .load_session_fn = session, .load_tokenizer_fn = tokenizer } };
+    fn plan(raw: *anyopaque, root: []const u8, _: []const BackendType, paths: []const []const u8) !@import("../models/component_loader.zig").ComponentLoader {
+        var loader = @import("../models/component_loader.zig").ComponentLoader{ .services = .{ .allocator = std.testing.allocator, .io = std.testing.io, .context = raw, .load_session_fn = session, .load_tokenizer_fn = tokenizer } };
+        try loader.bindOwner(root, null);
         loader.allowed_backends[0] = .native;
         loader.allowed_backend_count = 1;
         for (paths) |path| try loader.addComponentPath(path);
@@ -20400,4 +20424,48 @@ test "Native Whisper wrong initial declaration declines before ingress while ini
     try std.testing.expectEqualSlices(f32, expected, actual);
     try std.testing.expectEqual(generation, initial.frame.?.host_input_generation);
     try std.testing.expectEqual(before, initial.frame.?.stats.dispatches);
+}
+
+fn requireQualifiedGlinerCudaPrecision(precision: GlinerCudaPrecision, allow_unqualified: bool) !void {
+    if ((precision == .fp16 or precision == .bf16) and !(@import("builtin").is_test and allow_unqualified)) return error.UnqualifiedGlinerCudaPrecision;
+}
+
+fn requireGlinerCudaPrecisionManifest(manifest: *const manifest_mod.ModelManifest) !void {
+    if (manifest.gliner_architecture != .boundary and manifest.gliner_classification_head != .label_marker_mlp) return error.UnsupportedGlinerCudaPrecision;
+}
+
+pub fn createSessionFromManifest(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    manifest: *const manifest_mod.ModelManifest,
+    backend: BackendType,
+    jit: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+    a4b: ?backend_contracts.A4bInferenceRequest,
+    precision: ?GlinerCudaPrecision,
+    allow_unqualified_precision: bool,
+) !Session {
+    return switch (backend) {
+        .native => openHostSessionFromManifest(allocator, model_path, manifest),
+        .metal => createGpuHostedSessionWithTaskOverride(allocator, model_path, null, .metal, jit, load_context, a4b, manifest),
+        .cuda => blk: {
+            if (precision) |value| {
+                try requireQualifiedGlinerCudaPrecision(value, allow_unqualified_precision);
+                try requireGlinerCudaPrecisionManifest(manifest);
+            }
+            break :blk createCudaSessionWithRequiredProfile(allocator, model_path, null, jit, load_context, a4b, null, precision orelse .fp32, manifest);
+        },
+        else => error.UnsupportedBackend,
+    };
+}
+
+pub const usesJinaRetrievalAdapter = host_weights.usesJinaRetrievalAdapter;
+pub const validateJinaRetrievalAdapter = host_weights.validateJinaRetrievalAdapter;
+
+test "GLiNER CUDA bound source retains reduced precision release gates" {
+    const manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    for ([_]GlinerCudaPrecision{ .fp16, .bf16 }) |precision| {
+        try std.testing.expectError(error.UnqualifiedGlinerCudaPrecision, createSessionFromManifest(std.testing.allocator, "/never-opened", &manifest, .cuda, .{}, .dynamic, null, precision, false));
+        try std.testing.expectError(error.UnsupportedGlinerCudaPrecision, createSessionFromManifest(std.testing.allocator, "/never-opened", &manifest, .cuda, .{}, .dynamic, null, precision, true));
+    }
 }

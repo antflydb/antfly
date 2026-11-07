@@ -1583,7 +1583,7 @@ pub const RetryConfig = struct {
     }
 };
 
-/// Image, audio, or video named by a source record's `content.resource`. Accepted only on the Antfly gateway's generate and chat routes, which fetch the pinned version under `remote_content.security` and replace this part with inline media, so the source URL never reaches a model vendor. Fetching requires a nonempty `allowed_hosts`. The expanded request is limited to 16 MiB. Models that do not support the media type reject the request.
+/// Image, audio, or video named by a source record's `content.resource`. Accepted only on the Antfly gateway's generate and chat routes, which fetch the pinned version under `remote_content.security` and replace this part with inline media, so the source URL never reaches a model vendor. Fetching requires a nonempty `allowed_hosts`. Images are inlined within a 16 MiB expanded request. Audio and video travel as binary attachments, up to 256 MiB per request and `max_download_size_bytes`. Hosted providers receive them inline and may reject large requests. Models that do not support the media type reject the request.
 pub const SourceContentPart = struct {
     type: []const u8,
     source: std.json.Value,

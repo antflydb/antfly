@@ -308,12 +308,18 @@ pub const ProjectedVideo = struct {
 
 /// Decode one bounded MP4 clip and project each selected frame directly from
 /// CUDA memory. Only timestamp/count metadata is retained on the host.
-pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, bytes: []const u8) !ProjectedVideo {
+pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, bytes: []const u8, grow_automatic_scratch: bool) !ProjectedVideo {
     if (comptime !@import("build_options").enable_cuda or @import("builtin").os.tag != .linux) return error.UnsupportedVideoBackend;
     if (cb.kind() != .cuda or !cb.supportsCopyRows2D() or cb.vtable.sliceRows2D == null) return error.UnsupportedVideoBackend;
     const video = @import("../ops/cuda/video.zig");
     const cuda = @import("../ops/cuda/cuda_compute.zig");
     const compute: *cuda.CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    compute.ctx.video_cache_budget.grow_automatic_scratch = grow_automatic_scratch;
+    // Surfaces held over the cap would refuse the next run, so don't retain them.
+    defer {
+        compute.ctx.video_cache_budget.grow_automatic_scratch = false;
+        if (compute.ctx.video_cache_budget.exceedsScratchCap()) _ = compute.ctx.evictVideoDecoder() catch 0;
+    }
     var weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector);
     defer weights.deinit();
     var cfg = try parseConfig(&projector.gguf.parsed);
@@ -337,7 +343,8 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
         }
         fn consume(user_data: *anyopaque, frame: video.Frame) !void {
             const self: *@This() = @ptrCast(@alignCast(user_data));
-            const g = targetGeometry(self.cfg, frame.width, frame.height);
+            const display = try frame.displaySize();
+            const g = targetGeometry(self.cfg, display[0], display[1]);
             const patches = try self.preprocess.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
             defer self.cb.free(patches);
             const projected = try encodeResidentPatches(self.cb, self.allocator, self.weights, self.cfg, patches, g);
@@ -547,7 +554,9 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
         }
         fn consume(raw: *anyopaque, frame: video.Frame) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            const g = embeddingGemma2VideoGeometryFull(frame.width, frame.height);
+            const display = try frame.displaySize();
+            const raster = frame.rasterSize();
+            const g = targetGeometry(self.cfg, display[0], display[1]);
             const repeated_rows = std.math.mul(usize, frame.repetitions, g.tokenCount()) catch return error.EmbeddingInputTooLong;
             if (frame.repetitions == 0 or frame.repetitions > 32 - self.scheduled or self.scheduled_rows + repeated_rows + (self.scheduled + frame.repetitions) * 2 + 2 > self.max_tokens) return error.EmbeddingInputTooLong;
             if (self.geometry) |previous| if (embeddingGemma2GeometryKey(previous) != embeddingGemma2GeometryKey(g)) try self.flush();
@@ -558,7 +567,7 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
             // Only RGB conversion borrows NVDEC pixels. Everything after this
             // event reads owned storage, allowing decode/vision overlap.
             try c.ctx.recordEvent(self.staging_event);
-            const patches = try c.preprocessEmbeddingGemma2ResidentRgb(rgb, frame.width, frame.height, @intCast(g.width), @intCast(g.height));
+            const patches = try c.preprocessEmbeddingGemma2ResidentRgb(rgb, raster[0], raster[1], @intCast(g.width), @intCast(g.height));
             defer self.cb.free(patches);
             const dim = self.cfg.patch_size * self.cfg.patch_size * 3;
             const weight = try projectorLinearWeightCt(self.cb, self.allocator, self.weights, "v.patch_embd.weight", dim, self.cfg.vision_hidden);
@@ -832,11 +841,11 @@ fn embeddingGemma2VideoGeometryFull(width: u32, height: u32) Geometry {
 }
 /// Same immutable geometry and selected-frame accounting as actual consume.
 pub fn embeddingGemma2VideoCacheRecipe(probe: @import("../ops/cuda/video.zig").EmbeddingProbe, max_tokens: usize) !@import("../ops/cuda/prepared_cache.zig").VideoRecipe {
-    const g = embeddingGemma2VideoGeometryFull(probe.sequence.width, probe.sequence.height);
+    const g = embeddingGemma2VideoGeometryFull(if (probe.display_width != 0) probe.display_width else probe.sequence.width, if (probe.display_height != 0) probe.display_height else probe.sequence.height);
     const rows = try std.math.mul(usize, probe.samples, g.tokenCount());
     const markers = try std.math.mul(usize, probe.samples, 2);
     if (try std.math.add(usize, try std.math.add(usize, rows, markers), 2) > max_tokens) return error.EmbeddingInputTooLong;
-    const result: @import("../ops/cuda/prepared_cache.zig").VideoRecipe = .{ .sequence = probe.sequence, .samples = probe.samples, .unique_frames = probe.unique_frames, .resize = .{ .width = probe.sequence.width, .height = probe.sequence.height, .target_width = @intCast(g.width), .target_height = @intCast(g.height), .resident = true }, .grid_x = g.grid_x, .grid_y = g.grid_y };
+    const result: @import("../ops/cuda/prepared_cache.zig").VideoRecipe = .{ .sequence = probe.sequence, .samples = probe.samples, .unique_frames = probe.unique_frames, .resize = .{ .width = if (probe.raster_width != 0) probe.raster_width else probe.sequence.width, .height = if (probe.raster_height != 0) probe.raster_height else probe.sequence.height, .target_width = @intCast(g.width), .target_height = @intCast(g.height), .resident = true }, .grid_x = g.grid_x, .grid_y = g.grid_y };
     try result.validate();
     return result;
 }
@@ -7605,7 +7614,7 @@ test "gemma4 video CUDA projects resident frames and matches native patch projec
         guarded_vtable.toFloat32 = rejectGemma4VisionReadback;
         const guarded = ComputeBackend{ .ptr = cb.ptr, .vtable = &guarded_vtable };
         const before = cb.trainingRuntimeStats();
-        var video = try encodeProjectedVideoResident(&guarded, a, projector, @embedFile("../testdata/video/closed.mp4"));
+        var video = try encodeProjectedVideoResident(&guarded, a, projector, @embedFile("../testdata/video/closed.mp4"), false);
         defer video.deinit();
         try std.testing.expectEqual(before.d2h_bytes, cb.trainingRuntimeStats().d2h_bytes);
         try std.testing.expect(video.stats.selected_frames > 0);

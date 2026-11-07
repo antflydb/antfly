@@ -224,7 +224,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const batch_contract_tests = b.addTest(.{
         .name = "storage-batch-contract-tests",
         .root_module = batch_contract_mod,
-        .filters = selectTestFilters(b, &.{ "result collectors", "bounded dense legacy providers", "parallel dense inference preserves order", "ordered artifact inventory chunk vector callback publishes and retires without reinference after acceptance" }),
+        .filters = selectTestFilters(b, &.{ "result collectors", "bounded dense legacy providers", "parallel dense inference preserves order", "ordered artifact inventory chunk vector", "privacy ordered artifact tombstone", "privacy base vectors", "privacy local source audit", "privacy base vector source updates", "privacy publication callback", "privacy independent roots", "privacy ID scans", "privacy discovery", "public graph metric borrowed wire document scan" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("storage-batch-contract-test", "Verify collector OOM ownership and bounded provider batches without HTTP discovery")
@@ -2279,6 +2279,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-api-test", "Run mounted API lake and SQL integration tests").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, lake_api_tests, lake_api_filters).step);
+    const distributed_sql_api_filters = &.{"distributed SQL API"};
+    const distributed_sql_api_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = distributed_sql_api_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("distributed-sql-api-test", "Verify distributed SQL worker RPC authorization")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, distributed_sql_api_tests, distributed_sql_api_filters).step);
     const relational_index_http_tests = b.addTest(.{
         .name = "relational-index-http-tests",
         .root_module = api_http_runtime_test_mod,
@@ -3159,6 +3167,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
+    const distributed_sql_filters = &.{ "distributed SQL", "internal service strict" };
+    const distributed_sql_tests = b.addTest(.{
+        .root_module = lake_integration_mod,
+        .filters = distributed_sql_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("distributed-sql-test", "Verify distributed lake SQL semantics, RPC, ownership and recovery")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, distributed_sql_tests, distributed_sql_filters).step);
+
     const lake_vacuum_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_vacuum_test_root.zig"),
         .target = target,
@@ -5294,6 +5311,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"system catalog standalone relation coordinator"},
     });
     b.step("antfly-standalone-pgwire-ddl-test", "Run standalone relation publication and guarded DDL tests").dependOn(&addFilteredTestRunArtifact(b, standalone_ddl_tests).step);
+    const standalone_privacy_binding_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"privacy standalone compact bindings refresh on policy publication and survive progress"},
+    });
+    b.step("antfly-standalone-privacy-binding-test", "Verify compact privacy bindings across standalone publication and progress").dependOn(&addFilteredTestRunArtifact(b, standalone_privacy_binding_tests).step);
+    const standalone_cors_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"standalone CORS"},
+    });
+    b.step("antfly-standalone-cors-test", "Verify public CORS defaults and explicit operator overrides").dependOn(&addFilteredTestRunArtifact(b, standalone_cors_tests).step);
     const standalone_cdc_tests = b.addTest(.{
         .root_module = system_catalog_standalone_test_mod,
         .filters = &.{"standalone cdc"},
@@ -5328,6 +5355,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = lib_standalone_runtime_test_mod,
         .filters = selectTestFilters(b, &.{
             "standalone runtime module compiles",
+            "privacy standalone progress retains routing and join planning generations",
+            "privacy standalone compact bindings refresh on policy publication and survive progress",
             "standalone metadata admission observes cancellation",
             "standalone.runtime.test.system catalog",
             "catalog.domain.",
@@ -5649,6 +5678,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // These sources became shared modules; imported modules do not contribute
     // tests to the facade root. Keep their contracts in the aggregate gate.
     const shared_inference_contract_step = b.step("antfly-inference-contract-test", "Run shared inference work and provider contracts");
+    const redirect_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/provider_redirect_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    redirect_test_mod.addImport("httpx", antfly_imports.httpx);
+    redirect_test_mod.addImport("google", antfly_imports.google);
+    redirect_test_mod.addImport("inference_types", antfly_imports.inference_types);
+    redirect_test_mod.addImport("openai", antfly_imports.inference_openai);
+    redirect_test_mod.addImport("local", antfly_imports.inference_local);
+    redirect_test_mod.addImport("vertex", antfly_imports.inference_vertex);
+    redirect_test_mod.addImport("bedrock", antfly_imports.inference_bedrock);
+    redirect_test_mod.addImport("list_models", antfly_imports.inference_list_models);
+    redirect_test_mod.addImport("capabilities", antfly_imports.inference_remote_capabilities);
+    const redirect_tests = b.addTest(.{ .root_module = redirect_test_mod });
+    const run_redirect_tests = b.addRunArtifact(redirect_tests);
+    b.step("antfly-provider-redirect-test", "Verify inference and discovery never forward credentials or input through redirects")
+        .dependOn(&run_redirect_tests.step);
+    shared_inference_contract_step.dependOn(&run_redirect_tests.step);
+    unit_test_step.dependOn(&run_redirect_tests.step);
+
     inline for (.{ antfly_imports.cache_budget, antfly_imports.inference_types, antfly_imports.inference_work, antfly_imports.inference_local, antfly_imports.inference_vertex }) |mod| {
         const tests = b.addTest(.{ .root_module = mod });
         const run = b.addRunArtifact(tests);

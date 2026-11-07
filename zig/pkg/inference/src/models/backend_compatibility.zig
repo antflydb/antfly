@@ -21,6 +21,7 @@ const BackendType = backends.BackendType;
 const GgufInspectionReport = host_weights.GgufInspectionReport;
 const UnsupportedTensorTypeCount = host_weights.UnsupportedTensorTypeCount;
 const tensorTypeSupported = host_weights.tensorTypeSupported;
+const session_factory = @import("../architectures/session_factory.zig");
 const std = @import("std");
 const build_options = @import("build_options");
 const backends = @import("../backends/backends.zig");
@@ -52,6 +53,7 @@ pub fn artifactCandidateForBackend(
     backend: backends.BackendType,
 ) ?ArtifactCandidateKind {
     if (backend == .pjrt) return null;
+    if (backend == .wasm) return if (man.onnx_path != null) .onnx else null;
     if (man.nativeWeightArtifactKind()) |artifact| {
         return switch (artifact) {
             .gguf => .gguf,
@@ -297,7 +299,7 @@ pub fn validateNativeCompanionsForBackend(
         };
         companion_count += 1;
     }
-    if (candidate == .gguf) {
+    if (candidate == .gguf and man.isSplitGlinerBundle()) {
         if (man.gliner_head_gguf_path) |path| {
             companions[companion_count] = .{ .path = path, .kind = .gguf };
             companion_count += 1;
@@ -471,14 +473,14 @@ pub fn compatibilitySummaryForBackend(
     // Reject other routes before inspectAlloc re-hashes multi-gigabyte files.
     const cuda_qwen3vl_generation = backend == .cuda and
         man.isQwen3VlGenerationSafetensorsBundle();
-    if (man.isQwen3VlBundle() and backend != .metal and !cuda_qwen3vl_generation) {
+    if (candidate != .onnx and man.isQwen3VlBundle() and backend != .metal and !cuda_qwen3vl_generation) {
         return .{
             .level = .incompatible,
             .code = .unsupported_backend,
             .message = "the split Qwen3-VL decoder/projector route requires Metal; the integrated safetensors generation route also supports CUDA",
         };
     }
-    if (man.embedding_style == .qwen3_embedding and
+    if (candidate == .gguf and man.embedding_style == .qwen3_embedding and
         man.usesGgufWeights() and
         !qwen3EmbeddingSupportsBackend(backend))
     {
@@ -494,6 +496,10 @@ pub fn compatibilitySummaryForBackend(
     // accidentally inheriting an unrelated optional GGUF's classification.
     var candidate_manifest = man.*;
     if (candidate != .gguf) candidate_manifest.gguf_path = null;
+    if (candidate == .onnx) {
+        candidate_manifest.safetensors_path = null;
+        candidate_manifest.safetensors_index_path = null;
+    }
     var inspection = try model_compatibility.inspectAlloc(allocator, &candidate_manifest);
     defer inspection.deinit(allocator);
     const assessment = model_compatibility.assessInspection(&candidate_manifest, inspection);
@@ -560,6 +566,10 @@ pub fn compatibilitySummaryForBackend(
             };
         };
     }
+    if (candidate != .onnx) session_factory.validateJinaRetrievalAdapter(allocator, man.*, backend) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{ .level = .incompatible, .code = .artifact_unreadable, .message = "the selected Jina retrieval adapter is incomplete, invalid, or unreadable" };
+    };
     if (try validateNativeCompanionsForBackend(
         allocator,
         man,
@@ -582,7 +592,10 @@ pub fn compatibilitySummaryForBackend(
     const first_onnx_path: usize = if (candidate == .onnx) 0 else 1;
     for (onnx_paths[first_onnx_path..], first_onnx_path..) |maybe_path, path_index| {
         const path = maybe_path orelse continue;
-        if (!std.mem.endsWith(u8, path, ".onnx")) continue;
+        const primary = path_index == 0;
+        if (!primary and !std.mem.endsWith(u8, path, ".onnx")) continue;
+        const logical_path = if (primary) man.onnx_logical_path else null;
+        const base = if (logical_path) |logical| std.fs.path.dirname(logical) else null;
         var duplicate = false;
         for (onnx_paths[first_onnx_path..path_index]) |previous| {
             if (previous) |existing| {
@@ -594,10 +607,7 @@ pub fn compatibilitySummaryForBackend(
         }
         if (duplicate) continue;
 
-        var artifacts = backends.imported_onnx_session.inspectArtifactSet(
-            allocator,
-            path,
-        ) catch |err| {
+        var artifacts = backends.imported_onnx_session.inspectArtifactSetWithBase(allocator, path, base) catch |err| {
             if (err == error.OutOfMemory) return err;
             return .{
                 .level = .incompatible,
@@ -607,10 +617,7 @@ pub fn compatibilitySummaryForBackend(
         };
         artifacts.deinit();
 
-        backends.imported_onnx_session.inspectGraphCompatibility(
-            allocator,
-            path,
-        ) catch |err| {
+        backends.imported_onnx_session.inspectGraphCompatibilityWithContext(allocator, path, base, logical_path) catch |err| {
             if (err == error.OutOfMemory) return err;
             return .{
                 .level = .incompatible,
@@ -814,6 +821,8 @@ pub fn addNativeComponentDependencies(
             "gliner_config.json",
             "added_tokens.json",
             "1_SpladePooling/config.json",
+            "adapters/retrieval/adapter_config.json",
+            "adapters/retrieval/adapter_model.safetensors",
         };
         for (manifest_dependencies) |relative_path| {
             const dependency = try std.fs.path.join(
@@ -832,6 +841,8 @@ pub fn addNativeComponentDependencies(
         native_manifest.safetensors_index_path,
         native_manifest.gliner_head_gguf_path,
         native_manifest.gliner_head_safetensors_path,
+        native_manifest.jina_adapter_config_path,
+        native_manifest.jina_adapter_weights_path,
     };
     for (native_paths) |maybe_native_path| {
         if (maybe_native_path) |native_path| try result.addDependency(native_path);
