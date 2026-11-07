@@ -29032,10 +29032,35 @@ pub const IndexManager = struct {
     /// path) whenever this returns `false`; see
     /// `graphEdgeWriteEligibleForInlinePublication`'s own doc comment for
     /// why `false` must never be read as "skip the write outright".
+    ///
+    /// `entry.index.generationRepairPending()` is a defensive check, not
+    /// one this change's own crash_consistency_test.zig tests ever
+    /// actually observed firing (nor does `lite-write-amplification`'s
+    /// 128-write "dense" diagnostic, which never sees its own measured
+    /// commit count move off exactly 1.0 despite never warming up its
+    /// index with an unmeasured first write either): an exhaustive-
+    /// coverage dense search (`search_effort: 1.0`, or any query
+    /// `search_types.requiresExhaustiveCoverage` marks as needing the
+    /// complete-snapshot policy) can fail closed with
+    /// `error.IncompletePublishedSnapshot`/`error.IndexRebuilding`
+    /// (`hbc_index.zig`'s `scoreLeafMemberIds`/`CompleteCoverageTracker.
+    /// observe`) right after the very FIRST write ever made into a fresh
+    /// dense index -- a pre-existing bootstrap quirk this change's own
+    /// tests worked around with an unmeasured warm-up write rather than
+    /// chasing, since it reproduces identically whether that first write
+    /// took the inline path or the slow one (see
+    /// `crash_consistency_test.zig`'s "WS4-for-dense" test's own comment).
+    /// Checking the flag here costs nothing and is the only EXISTING,
+    /// authoritative signal for "this index's native posting checkpoint
+    /// needs (re)building" (the same one `db.zig`'s own startup rebuild
+    /// planning scan reads), so it stays as a cheap, correct safety net
+    /// for whatever future case does set it, even though it is not the
+    /// explanation for the bootstrap quirk above.
     pub fn denseEmbeddingWriteEligibleForInlinePublication(self: *const IndexManager, entry: *const DenseIndex, write: derived_types.DerivedDenseEmbeddingWrite) bool {
         if (!entry.external or entry.chunk_name != null or entry.embedding_names.len != 0) return false;
         if (write.vector.len == 0 or write.parent_doc_key != null) return false;
         if (entry.index.experimentalPostingWalAuthoritative()) return false;
+        if (entry.index.generationRepairPending()) return false;
         return self.keyInRange(write.doc_key);
     }
 
