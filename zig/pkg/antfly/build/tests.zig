@@ -3464,10 +3464,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
+    const time_series_filters = selectTestFilters(b, &.{"time series"});
     const time_series_tests = b.addTest(.{
         .name = "time-series-tests",
         .root_module = antfly_test_mod,
-        .filters = &.{"time series"},
+        .filters = time_series_filters,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     // Native macOS ReleaseFast peaks at 7.49 GB with DB visibility coverage.
@@ -3486,11 +3487,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const time_series_runtime_tests = b.addTest(.{
         .name = "time-series-runtime-tests",
         .root_module = api_http_runtime_test_mod,
-        .filters = &.{"time series"},
+        .filters = time_series_filters,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     time_series_runtime_tests.step.max_rss = 5 * 1024 * 1024 * 1024;
-    b.step("time-series-runtime-test", "Verify temporal predicate proof, owner fanout and fallback contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, time_series_runtime_tests, &.{"time series"}).step);
+    b.step("time-series-runtime-test", "Verify temporal predicate proof, owner fanout and fallback contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, time_series_runtime_tests, time_series_filters).step);
 
     const lib_storage_test_step = b.step("antfly-storage-test", "Run local and server storage tests");
     const graph_ttl_migration_tests = b.addTest(.{
