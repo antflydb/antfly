@@ -313,7 +313,7 @@ test "compact dense extent predicate preserves original Native plane rules acros
     const native = @import("../ops/native_compute.zig");
     const backend = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &native.vtable_impl };
     const expected = ml.graph.Shape.init(.f32, &.{ 2, 4 });
-    const base = ownership.Plane{ .descriptor = contracts.TensorDesc.init(expected, .host_f32), .role = .primary, .backing = .{ .kind = .host, .base = 4096 }, .logical_bytes = 32, .readable_bytes = 32 };
+    const base = ownership.Plane{ .descriptor = contracts.TensorDesc.init(expected, .host_f32), .role = .primary, .backing = .{ .kind = .host, .base = 4096 }, .byte_offset = 0, .logical_bytes = 32, .readable_bytes = 32 };
     var original = base;
     original.descriptor.current_backend = .native;
     for (0..13) |kind| {
