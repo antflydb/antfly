@@ -36,6 +36,12 @@ const CompleteScoreSink = @import("../backend_types.zig").CompleteScoreSink;
 const ReadIdentity = struct { canonical: u64, namespace: []const u8 };
 const Allocator = std.mem.Allocator;
 
+/// TEMPORARY debugging aid for the prefix-ordered-durability investigation
+/// (docs/design/lite-performance/lite-single-commit-write-path.md §3.2a).
+/// Off by default; a test flips it on to trace commit/publish/recovery
+/// decisions. Remove once the investigation concludes.
+pub var debug_trace = false;
+
 test "lite index prefix comparison scales past 4096 records and detects mutations" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -12705,7 +12711,35 @@ pub const NativeFile = struct {
     /// snapshot unconditionally (a no-op if nothing flushed since `sp`), and
     /// additionally replays the undo log against `writes.maps` when the
     /// `TransactionWrites` instance from `sp` is still the live one.
+    /// Restores `sp.checkpoint`'s root pointers, undoing this member's
+    /// writes at the pointer level. Exactly like `discardTransactionTail`
+    /// (see its own doc comment for the full mechanism): any page this
+    /// member *reused* (a recycled, pre-existing id below `sp.checkpoint`'s
+    /// `page_count`, not a fresh tail page) may have had fresh content
+    /// write-through-cached under that id by `PageWriteBatch.flushCount`
+    /// before this rollback runs. `sp.checkpoint` no longer references it,
+    /// but nothing else evicts the cache entry, so it stays live under that
+    /// page id for whichever later allocation (another member of this same
+    /// group, this group's own eventual durable publish, or a wholly
+    /// unrelated future transaction) reuses the same id next -- which it
+    /// will, deterministically, since the free list this member drew from
+    /// is otherwise untouched. `self.manifest_builder.entries` already
+    /// tracks every page any commit in the current since-last-durable
+    /// window wrote (appended or reused): evicting cache for the ones below
+    /// this savepoint's own boundary is always safe (their on-disk bytes,
+    /// where still live, are untouched by this pointer-level rollback) and
+    /// closes the same gap one savepoint earlier than a full transaction
+    /// abort would need to.
+    fn evictCacheForPagesReusedSince(self: *NativeFile, boundary_page_count: u64) void {
+        if (!manifest_commits_enabled) return;
+        var it = self.manifest_builder.entries.keyIterator();
+        while (it.next()) |page_id| {
+            if (page_id.* < boundary_page_count) self.page_cache.remove(self.allocator, page_id.*);
+        }
+    }
+
     pub fn rollbackTransactionSavepoint(self: *NativeFile, sp: TransactionSavepoint) void {
+        self.evictCacheForPagesReusedSince(sp.checkpoint.page_count);
         defer self.header.checkpoints[self.header.active_checkpoint] = sp.checkpoint;
         const writes = self.transaction_writes orelse return;
         if (self.transaction_writes_generation != sp.writes_generation) return; // already superseded by the checkpoint restore above.
@@ -12763,9 +12797,18 @@ pub const NativeFile = struct {
         self.namespace_directory_delta_depth = 0;
     }
 
+    /// Rolls back a failed/aborted transaction. `page_cache.discardFrom`
+    /// only evicts pages `>= first_page` (the newly appended tail, which
+    /// `setLength` below also physically truncates away) -- it
+    /// deliberately preserves everything below that boundary as belonging
+    /// to the restored checkpoint (`self.header`, already reset to
+    /// `previous` by every caller before this runs). `evictCacheForPagesReusedSince`
+    /// (see its own doc comment) closes the gap that leaves for a page this
+    /// failed attempt *reused* rather than appended.
     fn discardTransactionTail(self: *NativeFile) void {
         const first_page = self.activeCheckpoint().page_count;
         self.page_cache.discardFrom(self.allocator, first_page);
+        self.evictCacheForPagesReusedSince(first_page);
         const size = first_page * @as(u64, self.header.page_size);
         self.file.setLength(self.runtimeIo(), size) catch {
             self.checkpoint_publication_uncertain = true;
@@ -12848,8 +12891,16 @@ pub const NativeFile = struct {
         const deferred_publication = !durable and !self.no_sync and !self.externally_locked;
         self.allow_manifest_reservation = !deferred_publication and manifest_commits_enabled;
         defer self.allow_manifest_reservation = false;
+        if (comptime builtin.is_test) if (debug_trace) std.debug.print(
+            "commit: thread={d} durable={} deferred_pub={} prev_active={d} prev_seq={d} durable_header_pending={} reuse_frontier={d}\n",
+            .{ std.Thread.getCurrentId(), durable, deferred_publication, previous.active_checkpoint, previous.checkpoints[previous.active_checkpoint].commit_sequence, self.durable_header != null, self.reuseFrontier() },
+        );
         try self.flushTransactionWrites();
         var next = self.activeCheckpoint();
+        if (comptime builtin.is_test) if (debug_trace) std.debug.print(
+            "  next: doc_root={d} cat_root={d} idx_root={d} page_count={d}\n",
+            .{ next.document_root_page, next.catalog_root_page, next.document_index_root_page, next.page_count },
+        );
         const changed = next.commit_sequence != previous.checkpoints[previous.active_checkpoint].commit_sequence;
         if (changed and !deferred_publication and self.allocator_certificate_on_commit and
             self.header.indexed_reclamation and self.free_pages_verified and self.durable_header == null and
@@ -12861,6 +12912,10 @@ pub const NativeFile = struct {
         self.header = previous;
         self.transaction_header = null;
         errdefer {
+            if (comptime builtin.is_test) if (debug_trace) std.debug.print(
+                "  commitTransactionWithDurability errdefer fired: checkpoint_publication_uncertain={} (will discard tail={})\n",
+                .{ self.checkpoint_publication_uncertain, !self.checkpoint_publication_uncertain },
+            );
             if (!self.checkpoint_publication_uncertain) {
                 self.discardTransactionTail();
                 // A clean (not `OutcomeUnknown`) failure past this point --
@@ -12901,6 +12956,7 @@ pub const NativeFile = struct {
         }
         if (changed) {
             const manifest_prepared = if (manifest_commits_enabled) try self.tryBuildCommitManifest(&next) else false;
+            if (comptime builtin.is_test) if (debug_trace) std.debug.print("  manifest_prepared={} (presync path next)\n", .{manifest_prepared});
             if (!manifest_prepared) try self.syncIfRequired(hooks);
             try self.publishCheckpoint(next, manifest_prepared, hooks);
         } else try self.sync();
@@ -12983,6 +13039,7 @@ pub const NativeFile = struct {
         };
         if (builder.overflowed) return false;
         const count = builder.entries.count();
+        if (comptime builtin.is_test) if (debug_trace) std.debug.print("tryBuildCommitManifest: entries={d} overflowed={} reused_pages={d}\n", .{ count, builder.overflowed, builder.reused_pages.count() });
         if (count == 0 or count > max_single_sync_pages) return false;
         const entries = try self.allocator.alloc(ManifestEntry, count);
         defer self.allocator.free(entries);
@@ -12992,10 +13049,21 @@ pub const NativeFile = struct {
             entries[i] = .{ .page_id = kv.key_ptr.*, .crc = kv.value_ptr.* };
             i += 1;
         }
+        if (comptime builtin.is_test) if (debug_trace) {
+            std.debug.print("  manifest entries pages:", .{});
+            for (entries) |e| std.debug.print(" {d}", .{e.page_id});
+            std.debug.print("\n  manifest reused pages:", .{});
+            var rit = builder.reused_pages.iterator();
+            while (rit.next()) |kv| std.debug.print(" {d}", .{kv.key_ptr.*});
+            std.debug.print("\n", .{});
+        };
         const payload = encodeManifestPayloadAlloc(self.allocator, entries, &builder.reused_pages, manifest_page_id) catch |err| switch (err) {
             // Not actually one contiguous appended run: fall back exactly
             // like "too big to fit one page", never a hard error.
-            error.InvalidNativeManifestRange => return false,
+            error.InvalidNativeManifestRange => {
+                if (comptime builtin.is_test) if (debug_trace) std.debug.print("  tryBuildCommitManifest: InvalidNativeManifestRange, falling back to presync\n", .{});
+                return false;
+            },
             else => return err,
         };
         defer self.allocator.free(payload);
@@ -13059,11 +13127,19 @@ pub const NativeFile = struct {
         const previous_tip = self.headerFingerprint();
         defer if (self.reader_coordinator) |coordinator| coordinator.published(publication_inode.?, previous_tip, self.headerFingerprint(), self.checkpoint_publication_uncertain);
         defer self.notifyPublication();
+        if (comptime builtin.is_test) if (debug_trace) std.debug.print(
+            "publishCheckpoint: proposed_seq={d} presynced={} manifest_page={d} manifest_count={d} had_durable_header={} header_active={d}\n",
+            .{ checkpoint.commit_sequence, checkpoint.presynced, checkpoint.manifest_page, checkpoint.manifest_page_count, self.durable_header != null, self.header.active_checkpoint },
+        );
         if (self.durable_header) |durable| {
             self.header = durable;
             self.durable_header = null;
         }
         const next_slot: u8 = if (self.header.active_checkpoint == 0) 1 else 0;
+        if (comptime builtin.is_test) if (debug_trace) std.debug.print(
+            "publishCheckpoint: writing slot={d} seq={d} page_count={d} other_slot_seq={d}\n",
+            .{ next_slot, checkpoint.commit_sequence, checkpoint.page_count, self.header.checkpoints[self.header.active_checkpoint].commit_sequence },
+        );
 
         // The whole slot -- roots, logical generations, and the manifest
         // descriptor -- is one page, written and CRC'd as a single unit.
@@ -13165,10 +13241,13 @@ pub const NativeFile = struct {
                     .nsec = @intCast(delay_ns % std.time.ns_per_s),
                 }, null);
             }
-            if (self.durability_policy) |policy|
-                try antfly_platform.filesystem.syncData(self.file.handle, policy)
+            if (comptime builtin.is_test) if (debug_trace) std.debug.print("  syncIfRequired: pre-publish presync sync call starting (thread={d})\n", .{std.Thread.getCurrentId()});
+            const sync_result = if (self.durability_policy) |policy|
+                antfly_platform.filesystem.syncData(self.file.handle, policy)
             else
-                try self.file.sync(self.runtimeIo());
+                self.file.sync(self.runtimeIo());
+            if (comptime builtin.is_test) if (debug_trace) std.debug.print("  syncIfRequired: pre-publish presync sync call result={s}\n", .{if (sync_result) |_| "ok" else |e| @errorName(e)});
+            try sync_result;
             if (builtin.is_test) _ = self.test_sync_calls.fetchAdd(1, .monotonic);
         }
     }
@@ -14354,7 +14433,11 @@ fn verifyManifest(file: std.Io.File, io: std.Io, slot: CheckpointSlot, page_size
         var crc_buf: [4]u8 = undefined;
         const got = file.readPositionalAll(io, &crc_buf, page_id * @as(u64, page_size) + page_crc_offset) catch return false;
         if (got != 4) return false;
-        if (std.mem.readInt(u32, &crc_buf, .little) != expected_crc) return false;
+        const actual_crc = std.mem.readInt(u32, &crc_buf, .little);
+        if (actual_crc != expected_crc) {
+            if (comptime builtin.is_test) if (debug_trace) std.debug.print("verifyManifest: appended page={d} crc mismatch expected={x} actual={x}\n", .{ page_id, expected_crc, actual_crc });
+            return false;
+        }
         page_id += 1;
     }
     var offset: usize = manifest_header_size + @as(usize, appended_count) * 4;
@@ -14366,7 +14449,11 @@ fn verifyManifest(file: std.Io.File, io: std.Io, slot: CheckpointSlot, page_size
         var crc_buf: [4]u8 = undefined;
         const got = file.readPositionalAll(io, &crc_buf, reused_page_id * @as(u64, page_size) + page_crc_offset) catch return false;
         if (got != 4) return false;
-        if (std.mem.readInt(u32, &crc_buf, .little) != expected_crc) return false;
+        const actual_crc = std.mem.readInt(u32, &crc_buf, .little);
+        if (actual_crc != expected_crc) {
+            if (comptime builtin.is_test) if (debug_trace) std.debug.print("verifyManifest: reused page={d} crc mismatch expected={x} actual={x}\n", .{ reused_page_id, expected_crc, actual_crc });
+            return false;
+        }
     }
     return true;
 }
@@ -14413,12 +14500,18 @@ fn recoverActiveCheckpoint(
         candidates += 1;
     }
     if (candidates == 0) return error.InvalidNativeCheckpoint;
+    if (comptime builtin.is_test) if (debug_trace) for (order[0..candidates], 0..) |index, rank| {
+        std.debug.print("recover: candidate rank={d} slot={d} seq={d} presynced={} manifest_page={d} page_count={d}\n", .{ rank, index, header.checkpoints[index].commit_sequence, header.checkpoints[index].presynced, header.checkpoints[index].manifest_page, header.checkpoints[index].page_count });
+    };
     for (order[0..candidates], 0..) |index, rank| {
         const slot = header.checkpoints[index];
-        if (!verifyManifest(file, io, slot, header.page_size)) continue;
+        const verified = verifyManifest(file, io, slot, header.page_size);
+        if (comptime builtin.is_test) if (debug_trace) std.debug.print("recover: verify slot={d} seq={d} -> {}\n", .{ index, slot.commit_sequence, verified });
+        if (!verified) continue;
         if (rank == 0) return .{ .index = index };
         if (!allow_truncate) return .{ .index = index };
         const truncated_size = try checkpointPrefixSize(slot, header.page_size);
+        if (comptime builtin.is_test) if (debug_trace) std.debug.print("recover: FALLBACK to slot={d} seq={d}, truncating to {d}\n", .{ index, slot.commit_sequence, truncated_size });
         try file.setLength(io, truncated_size);
         return .{ .index = index, .truncated_to = truncated_size };
     }

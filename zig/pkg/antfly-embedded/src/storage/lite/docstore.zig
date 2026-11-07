@@ -3398,22 +3398,36 @@ pub const Store = struct {
     /// would take the deferred-publication path and never actually fsync.
     fn driveMutationCoordinator(self: *Store, force_durable: bool) void {
         const io = self.file.runtime();
+        var zig_debug_iteration: usize = 0;
         while (true) {
+            zig_debug_iteration += 1;
             self.commit_mutex.lockUncancelable(io);
             const batch = self.drainMutationBatchLocked();
             const head = batch.head orelse {
                 self.commit_draining = false;
                 self.commit_ready.broadcast(io);
                 self.commit_mutex.unlock(io);
+                if (comptime @import("builtin").is_test) if (native.debug_trace) std.debug.print(
+                    "driveMutationCoordinator: iter={d} empty, leaving\n",
+                    .{zig_debug_iteration},
+                );
                 break;
             };
             self.commit_mutex.unlock(io);
+            if (comptime @import("builtin").is_test) if (native.debug_trace) std.debug.print(
+                "driveMutationCoordinator: iter={d} head={*} size={d} force_durable={}\n",
+                .{ zig_debug_iteration, head, batch.size, force_durable },
+            );
 
             if (@import("builtin").is_test) {
                 _ = self.test_groups_total.fetchAdd(1, .monotonic);
                 _ = self.test_group_members_total.fetchAdd(batch.size, .monotonic);
             }
             const result = self.applyMutationGroup(head, force_durable);
+            if (comptime @import("builtin").is_test) if (native.debug_trace) std.debug.print(
+                "driveMutationCoordinator: iter={d} head={*} result={s}\n",
+                .{ zig_debug_iteration, head, if (result) |_| "ok" else |e| @errorName(e) },
+            );
 
             self.commit_mutex.lockUncancelable(io);
             var current: ?*MutationRequest = head;

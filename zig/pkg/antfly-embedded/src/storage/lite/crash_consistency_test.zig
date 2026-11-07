@@ -2307,12 +2307,13 @@ fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const 
     });
     defer index_manager.setBenchmarkTextMergePolicyOverride(null);
 
-    for (ride_along_steps) |step| {
+    for (ride_along_steps, 0..) |step, step_index| {
         const json = try std.fmt.allocPrint(allocator, "{{\"body\":\"{s} churn alpha beta gamma\"}}", .{step.after});
         defer allocator.free(json);
         try checkpoints.append(allocator, .{
             .expectations = &.{.{ .key = step.key, .before = step.before, .after = step.after, .searchable_after = step.after }},
         });
+        if (native.debug_trace) std.debug.print(">>> step={d} key={s} after={s}\n", .{ step_index, step.key, step.after });
         try handle.db.batch(.{ .writes = &.{.{ .key = step.key, .value = json }}, .sync_level = .full_index });
 
         // Mirrors production: a WS5 retirement turn driven explicitly here
@@ -2320,7 +2321,10 @@ fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const 
         // it from the ack path) interleaved with sustained full_index
         // writes and the segment merges they trigger. No checkpoint: a
         // retirement turn touches no document key.
-        if (step.retire_after) try runRetirementTurn(allocator, &handle);
+        if (step.retire_after) {
+            if (native.debug_trace) std.debug.print(">>> retire after step={d}\n", .{step_index});
+            try runRetirementTurn(allocator, &handle);
+        }
     }
 }
 
@@ -2335,6 +2339,45 @@ test "crash sweep: sustained full_index writes survive a crash during ride-along
     }, .{});
     defer report.deinit();
     try reportFailures(&report);
+}
+
+// TEMPORARY: two-phase instrumentation-only reproduction for root-cause
+// investigation. Remove once the fix lands.
+//
+// Phase 1 (trace off): run the full quick sweep to discover every failing
+// (barrier, when, power_loss) triple cheaply.
+// Phase 2 (trace on): re-run only those failing triples, one at a time,
+// with full native/docstore debug tracing, so the trace output stays
+// readable instead of drowning in every passing barrier's own log.
+test "debug trace: find and replay failures" {
+    const allocator = std.testing.allocator;
+    const scenario = Scenario{
+        .name = "sustained-full-index-ride-along",
+        .run = runSustainedFullIndexRideAlongUnderCrash,
+        .via_db = true,
+        .search_index = "body_text",
+        .search_field = "body",
+        .retirement = true,
+    };
+
+    var discovery = try runCrashSweep(allocator, scenario, .{});
+    defer discovery.deinit();
+    std.debug.print(">>> discovery: {d} failures out of {d} runs ({d} total barriers)\n", .{ discovery.failures.items.len, discovery.runs, discovery.total_barriers });
+    for (discovery.failures.items) |f| {
+        std.debug.print(">>> failing triple: barrier={d} kind={s} when={s} power_loss={s}\n", .{ f.barrier.sequence, @tagName(f.barrier.kind), @tagName(f.when), @tagName(f.power_loss) });
+    }
+
+    const to_replay = @min(discovery.failures.items.len, 2);
+    for (discovery.failures.items[0..to_replay]) |f| {
+        std.debug.print(">>>>>> REPLAY barrier={d} when={s} power_loss={s} >>>>>>\n", .{ f.barrier.sequence, @tagName(f.when), @tagName(f.power_loss) });
+        native.debug_trace = true;
+        defer native.debug_trace = false;
+        var report = SweepReport{ .allocator = allocator };
+        defer report.deinit();
+        try runOneCrash(allocator, scenario, f.barrier.sequence, f.when, f.power_loss, &report);
+        native.debug_trace = false;
+        std.debug.print(">>>>>> REPLAY DONE barrier={d}: {s} >>>>>>\n", .{ f.barrier.sequence, if (report.ok()) "passed this time" else "reproduced" });
+    }
 }
 
 // Deliberately no `.exhaustive` variant: this scenario's own writes already
