@@ -11,11 +11,13 @@ actor HistoryProbe {
   var destinations: [HistoryDestination] = []
   var uploads: [String] = []
   var blocked = true
+  var wasCanceled = false
   var pending: [CheckedContinuation<Void, Never>] = []
   func upload(_ entry: HistoryEntry, to destination: HistoryDestination) async {
     destinations.append(destination)
     uploads.append(entry.id)
     if blocked { await withCheckedContinuation { pending.append($0) } }
+    wasCanceled = Task.isCancelled
   }
   func release() {
     blocked = false
@@ -305,4 +307,25 @@ private final class HistoryDeleteProtocol: URLProtocol, @unchecked Sendable {
     [HistoryEntry].self,
     from: Data(contentsOf: directory.appendingPathComponent("history.json")))
   #expect(saved.first?.destination == original)
+}
+
+@Test(.timeLimit(.minutes(1)))
+func deletionBarrierWaitsForDispatchedUploadInsteadOfCancelingItsResponse() async throws {
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let probe = HistoryProbe()
+  let queue = try HistoryOutbox(
+    directory: directory.appendingPathComponent("outbox"),
+    upload: { await probe.upload($0, to: $1) })
+  try await queue.enqueue(
+    historyEntry(),
+    destination: HistoryDestination(server: "https://example.com", table: "dictation"))
+  while await probe.uploads.isEmpty { await Task.yield() }
+  let barrier = Task { await queue.pause() }
+  while await !queue.status().paused { await Task.yield() }
+  await probe.release()
+  let token = await barrier.value
+  #expect(await probe.wasCanceled == false)
+  #expect(await queue.status().pending == 0)
+  await queue.resume(token)
 }

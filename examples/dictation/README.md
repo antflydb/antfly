@@ -233,7 +233,8 @@ History and audio retention are off by default:
 - The table's full-text index searches final transcript text. Search results are
   shown as the server's JSON response, including document IDs and sources.
 - Clear local history removes the local cache. Delete local history and matching
-  Antfly documents pauses uploads, cancels all matching pending jobs, and deletes
+  Antfly documents pauses uploads, waits for dispatched writes to finish, cancels
+  all matching pending jobs, and deletes
   the cached entries at their original server/table destinations before resuming.
   A remote deletion failure keeps local entries available for retry, but canceled
   uploads cannot restart automatically. Manual uploads also preserve destinations.

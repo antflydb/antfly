@@ -18,6 +18,7 @@ public actor HistoryOutbox {
   public struct Status: Sendable {
     public var pending: Int
     public var error: String?
+    public var paused: Bool
   }
   public typealias Upload = @Sendable (HistoryEntry, HistoryDestination) async throws -> Void
   private struct Job: Codable, Sendable {
@@ -33,6 +34,7 @@ public actor HistoryOutbox {
   private var retainedBytes: Int
   private var jobSizes: [String: Int]
   private var worker: Task<Void, Never>?
+  private var uploading = false
   private var enabled: Bool
   private var holds: Set<UUID> = []
   private var paused: Bool { !enabled || !holds.isEmpty }
@@ -93,7 +95,7 @@ public actor HistoryOutbox {
     retainedBytes = bytes
     jobSizes = sizes
   }
-  public func status() -> Status { Status(pending: jobs.count, error: lastError) }
+  public func status() -> Status { Status(pending: jobs.count, error: lastError, paused: paused) }
   /// Pending jobs are authoritative for archives created before destinations
   /// were stored with entries. A transcript may have more than one queued copy.
   public func destinations(for ids: Set<String>) -> [String: Set<HistoryDestination>] {
@@ -150,7 +152,10 @@ public actor HistoryOutbox {
     let token = UUID()
     holds.insert(token)
     let active = worker
-    active?.cancel()
+    // Cancel retry sleeps, but let a dispatched write receive its response.
+    // Canceling URLSession only stops the client wait: the server could still
+    // commit that upload after a subsequent delete.
+    if !uploading { active?.cancel() }
     await active?.value
     await notify()
     return token
@@ -204,7 +209,9 @@ public actor HistoryOutbox {
     }
     while !paused && !Task.isCancelled, let job = jobs.first {
       do {
+        uploading = true
         try await upload(job.entry, job.destination)
+        uploading = false
         try Task.checkCancellation()
         try FileManager.default.removeItem(at: path(job))
         jobs.removeFirst()
@@ -213,6 +220,7 @@ public actor HistoryOutbox {
         lastError = nil
         await notify()
       } catch {
+        uploading = false
         if paused || Task.isCancelled { return }
         failures = min(failures + 1, 7)
         lastError = error.localizedDescription
