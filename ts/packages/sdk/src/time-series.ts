@@ -97,7 +97,7 @@ function rangeFilter(range: SeriesRange) {
         inclusive_start: true,
         inclusive_end: false,
       },
-      ...Object.entries(range.dimensions ?? {}).map(([field, term]) => ({ field, term })),
+      ...Object.entries(range.dimensions ?? {}).map(([field, equals]) => ({ field, equals })),
     ],
   };
 }

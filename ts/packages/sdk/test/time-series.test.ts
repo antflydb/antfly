@@ -22,7 +22,7 @@ const options = {
 
 describe("time-series query contracts", () => {
   it("builds half-open ranges, composite series and bounded empty buckets", () => {
-    const query = seriesQuery(options);
+    const query = seriesQuery({ ...options, dimensions: { device_id: "sensor" } });
     expect(query.filter_query).toEqual({
       conjuncts: [
         {
@@ -32,6 +32,7 @@ describe("time-series query contracts", () => {
           inclusive_start: true,
           inclusive_end: false,
         },
+        { field: "device_id", equals: "sensor" },
       ],
     });
     expect(query.aggregations?.series.sub_aggregations?.points).toMatchObject({

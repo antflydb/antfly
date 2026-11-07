@@ -9,8 +9,10 @@ def test_series_query_preserves_nanosecond_bounds_and_half_open_range():
         start="2026-11-06T00:00:00.000000001Z",
         end="2026-11-06T00:00:00.000000002Z",
         measurement="value",
+        dimensions={"device_id": "sensor"},
     )
     assert query["filter_query"]["conjuncts"][0]["inclusive_end"] is False
+    assert query["filter_query"]["conjuncts"][1] == {"field": "device_id", "equals": "sensor"}
     assert query["aggregations"]["points"]["date_bounds"]["start"].endswith("000000001Z")
 
 

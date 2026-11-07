@@ -60,7 +60,7 @@ func NewSeriesQuery(options SeriesQueryOptions) (*QueryRequest, error) {
 	}
 	clauses := []any{map[string]any{"field": options.Timestamp, "start": start, "end": end, "inclusive_start": true, "inclusive_end": false}}
 	for field, value := range options.Dimensions {
-		clauses = append(clauses, map[string]any{"field": field, "term": value})
+		clauses = append(clauses, map[string]any{"field": field, "equals": value})
 	}
 	wire := map[string]any{"table": options.Table, "limit": 0, "filter_query": map[string]any{"conjuncts": clauses}, "aggregations": aggregations}
 	data, err := json.Marshal(wire)

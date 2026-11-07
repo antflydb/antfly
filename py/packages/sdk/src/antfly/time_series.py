@@ -80,7 +80,7 @@ def series_query(
         "filter_query": {
             "conjuncts": [
                 {"field": timestamp, "start": start, "end": end, "inclusive_start": True, "inclusive_end": False},
-                *({"field": key, "term": value} for key, value in (dimensions or {}).items()),
+                *({"field": key, "equals": value} for key, value in (dimensions or {}).items()),
             ]
         },
         "aggregations": aggregates,

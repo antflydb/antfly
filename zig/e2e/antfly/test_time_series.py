@@ -171,7 +171,7 @@ def test_time_series_fixed_buckets_and_algebraic_corrections(stateful_api, shard
             "profile": True,
             "filter_query": {
                 "conjuncts": [
-                    {"field": "device_id", "term": "sensor"},
+                    {"field": "device_id", "equals": "sensor"},
                     {
                         "field": "observed_at",
                         "start": "2026-11-06T12:00:00Z",

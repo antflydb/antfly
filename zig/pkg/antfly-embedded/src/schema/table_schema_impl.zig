@@ -2845,7 +2845,8 @@ fn validateParsedTtlSchema(schema: TableSchema) !void {
             const valid_type = if (schema.storage_mode == .relational)
                 std.mem.eql(u8, field_type, "datetime")
             else
-                std.mem.eql(u8, field_type, "datetime") or std.mem.eql(u8, field_type, "numeric");
+                std.mem.eql(u8, field_type, "datetime") or std.mem.eql(u8, field_type, "numeric") or
+                    (std.mem.eql(u8, field_type, "string") and property.format != null and std.mem.eql(u8, property.format.?, "date-time"));
             if (!valid_type) {
                 return error.InvalidSchemaUpdateRequest;
             }
@@ -7810,4 +7811,16 @@ test "validate generic json schema rejects integer mismatch" {
             \\{"count":2.5}
         ),
     );
+}
+
+test "time series retention accepts standard date-time strings and rejects untyped strings" {
+    const a = std.testing.allocator;
+    var schema = try parseSchema(a,
+        \\{"ttl":{"field":"observed_at","duration":"7d"},"default_type":"reading","document_schemas":{"reading":{"schema":{"type":"object","properties":{"observed_at":{"type":"string","format":"date-time","x-antfly-field":{"type":"date","sortable":true}}}}}}}
+    );
+    defer schema.deinit(a);
+    try validateWritesAgainstSchema(a, schema, &.{.{ .value = "{\"observed_at\":\"2026-11-06T12:00:00Z\"}" }});
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(a,
+        \\{"ttl":{"field":"observed_at","duration":"7d"},"document_schemas":{"reading":{"schema":{"type":"object","properties":{"observed_at":{"type":"string"}}}}}}
+    ));
 }

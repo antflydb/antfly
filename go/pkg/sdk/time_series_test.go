@@ -24,7 +24,7 @@ import (
 
 func TestSeriesQueryPreservesTemporalContract(t *testing.T) {
 	start := time.Date(2026, 11, 6, 12, 0, 0, 1, time.UTC)
-	request, err := NewSeriesQuery(SeriesQueryOptions{Table: "readings", Timestamp: "observed_at", Measurement: "temperature", Start: start, End: start.Add(time.Hour), Every: 5 * time.Minute, GroupBy: []string{"device_id"}})
+	request, err := NewSeriesQuery(SeriesQueryOptions{Table: "readings", Timestamp: "observed_at", Measurement: "temperature", Start: start, End: start.Add(time.Hour), Every: 5 * time.Minute, GroupBy: []string{"device_id"}, Dimensions: map[string]string{"device_id": "sensor"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func TestSeriesQueryPreservesTemporalContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, part := range []string{"300000000000ns", "2026-11-06T12:00:00.000000001Z", "date_bounds", "inclusive_end", "sub_aggregations"} {
+	for _, part := range []string{"300000000000ns", "2026-11-06T12:00:00.000000001Z", "date_bounds", "inclusive_end", "sub_aggregations", `"equals":"sensor"`} {
 		if !strings.Contains(string(data), part) {
 			t.Fatalf("missing %q: %s", part, data)
 		}
