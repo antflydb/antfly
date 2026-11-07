@@ -38,6 +38,7 @@ pub const Plan = struct {
     incarnation: u128,
     schema: ?@import("schema_registry.zig").SchemaView = null,
     rows: std.StringHashMapUnmanaged(Entry) = .empty,
+    relational: ?@import("owned_relational_rows.zig").OwnedRows = null,
     value_authorities: @import("../document_mutation_revision.zig").PreparedValues = .{},
     text: std.ArrayListUnmanaged(Text) = .empty,
     text_delete_keys: []const []const u8 = &.{},
@@ -60,10 +61,26 @@ pub const Plan = struct {
     /// Called under the short catalog lifetime fence. No borrowed DB pointer
     /// or primary snapshot survives this capture.
     pub fn capture(a: Allocator, database: anytype) !?Plan {
+        return captureWithRelational(a, database, false);
+    }
+
+    pub fn captureIncludingRelational(a: Allocator, database: anytype) !?Plan {
+        return captureWithRelational(a, database, true);
+    }
+
+    fn captureWithRelational(a: Allocator, database: anytype, comptime allow_relational: bool) !?Plan {
         var schema = database.core.acquireSchemaView();
         defer if (schema) |*view| view.release();
-        if (schema) |view| if (view.storageMode() == .relational) return null;
-        const catalog = try database.core.index_manager.acquireWritePlanSnapshot();
+        const relational = if (schema) |view| view.storageMode() == .relational else false;
+        if (relational and !allow_relational) return null;
+        // Split shadows can require additional live source validation. Keep
+        // their authoritative pipeline until that work has an owned witness.
+        if (relational and database.core.shard_manager.getSplitState() != null) return null;
+        var catalog = try database.core.index_manager.acquireWritePlanSnapshot();
+        if (relational and catalog.plan().generated_templates.len != 0) {
+            catalog.release();
+            return null;
+        }
         return .{
             .alloc = a,
             .inputs = std.heap.ArenaAllocator.init(a),
@@ -71,6 +88,7 @@ pub const Plan = struct {
             .schema = if (schema) |view| view.clone() else null,
             .namespace = database.core.identity_namespace,
             .incarnation = database.root_incarnation,
+            .relational = if (relational) @import("owned_relational_rows.zig").OwnedRows.init(a) else null,
         };
     }
 
@@ -99,6 +117,7 @@ pub const Plan = struct {
         if (self.transform_inputs) |*inputs| inputs.deinit();
         self.alloc.free(self.transform_base_keys);
         if (self.effect_request) |*request| request.deinit();
+        if (self.relational) |*relational| relational.deinit();
         self.catalog.release();
         if (self.schema) |*schema| schema.release();
         self.inputs.deinit();
@@ -106,6 +125,14 @@ pub const Plan = struct {
     }
 
     pub fn prepare(self: *Plan, request: types.BatchRequest) !void {
+        return self.prepareWithIo(request, null);
+    }
+
+    pub fn prepareWithIo(self: *Plan, request: types.BatchRequest, io: ?std.Io) !void {
+        if (self.relational) |*relational| {
+            try relational.prepare(io, self.schema.?, self.catalog.plan().*, request);
+            return;
+        }
         if (request.transforms.len != 0 and !self.transform_capture_declined) {
             if (self.effect_request != null) return;
             if (request.writes.len > 8192 or request.deletes.len > 8192 or request.transforms.len > 8192) return;
@@ -481,7 +508,7 @@ pub const Plan = struct {
         if (!std.meta.eql(self.namespace, database.core.identity_namespace) or self.incarnation != database.root_incarnation) return error.TableNotFound;
         var schema = database.core.acquireSchemaView();
         defer if (schema) |*view| view.release();
-        if (schema) |view| if (view.storageMode() == .relational) return false;
+        if (schema) |view| if (view.storageMode() == .relational and self.relational == null) return false;
         if ((self.schema == null) != (schema == null)) return false;
         if (self.schema) |captured| {
             const actual = schema.?;
@@ -491,6 +518,13 @@ pub const Plan = struct {
         defer current.release();
         const expected = self.catalog.plan().artifact_catalogs orelse return false;
         return current.plan().matchesArtifactInventory(expected);
+    }
+
+    pub fn takeRelationalRows(self: *Plan, writes: []const types.BatchWrite, current: @import("schema_registry.zig").SchemaView, out: []?mapper.PreparedRelationalWrite) !bool {
+        const relational = if (self.relational) |*owned| owned else return false;
+        if (!try relational.take(writes, self.schema.?, current, out)) return false;
+        self.needs_reprepare = true;
+        return true;
     }
 
     /// Exact stored postimage, including catalog-selected vector stripping.

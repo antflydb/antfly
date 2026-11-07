@@ -1210,6 +1210,12 @@ const relationalPreparationWorkers = local_mutation.relationalPreparationWorkers
 
 const prepareRelationalRows = local_mutation.prepareRelationalRows;
 
+/// CPU-only request preparation over retained immutable schema/catalog views.
+/// There is deliberately no DB receiver or provider/read callback in this port.
+pub fn prepareOwnedRelationalRows(guard: *execution_resources.PreparedRowAllocator, io: ?std.Io, writes: []const types.BatchWrite, view: @import("schema_registry.zig").SchemaView, plan: index_manager_mod.IndexManager.WritePlanSnapshot, timestamp_ns: u64, rows: []?mapper.PreparedRelationalWrite) !void {
+    return prepareRelationalRows(guard, io, null, writes, view.validator(), view.tableSchema().*, view.physicalLayout(), plan, true, timestamp_ns, rows, null, null, false);
+}
+
 const BatchExecutionOptions = execution_resources.BatchExecutionOptions;
 
 pub const OrderedApplyReceipt = execution_resources.OrderedApplyReceipt;
@@ -1463,7 +1469,7 @@ fn logReplayCatchUpProfile(index_ref: index_manager_mod.ManagedIndexRef, applied
 }
 
 fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
-    std.log.info("antfly_bench_foreground_preparation writes={d} prepared_documents_consumed={d} unprepared_document_rows={d}", .{ req.writes.len, profile.prepared_documents_consumed, profile.unprepared_document_rows });
+    std.log.info("antfly_bench_foreground_preparation writes={d} prepared_documents_consumed={d} unprepared_document_rows={d} owned_relational_rows_consumed={d}", .{ req.writes.len, profile.prepared_documents_consumed, profile.unprepared_document_rows, profile.owned_relational_rows_consumed });
     std.log.info(
         "antfly_bench_row_pipeline writes={d} prepared_rows={d} logical_bytes={d} encoded_bytes={d} prepare_ms={d} apply_lock_wait_ms={d} apply_lock_held_ms={d}",
         .{

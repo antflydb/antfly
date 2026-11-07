@@ -645,7 +645,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const prepare_start_ns = monotonicTimeNs();
                     preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
                     prepared_write_plan_generation = preparation.write_plan.?.generation();
-                    try prepareRelationalRows(
+                    const took_owned_rows = if (opts.prepared_documents) |owned| blk: {
+                        if (opts.durable_rows != null or opts.restore_timestamps != null or opts.restore_staging != null or opts.preserve_logical_values) break :blk false;
+                        if (!try owned.matches(struct { core: @TypeOf(S.ownerField(self, "core").*), root_incarnation: u128 }{ .core = S.ownerField(self, "core").*, .root_incarnation = S.ownerField(self, "root_incarnation").* })) break :blk false;
+                        break :blk try owned.takeRelationalRows(effective_req.writes, view, rows);
+                    } else false;
+                    if (took_owned_rows) {
+                        for (rows) |*row| if (row.*) |*prepared| if (prepared.extracted.prepared_write_plan_generation != 0) {
+                            prepared.extracted.prepared_write_plan_generation = prepared_write_plan_generation.?;
+                        };
+                        if (profile) |active_profile| active_profile.owned_relational_rows_consumed += @intCast(rows.len);
+                    }
+                    if (!took_owned_rows) try prepareRelationalRows(
                         prepared_row_allocator,
                         S.ownerField(self, "backend_runtime").*.io(),
                         self,

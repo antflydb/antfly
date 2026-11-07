@@ -749,6 +749,7 @@ pub const BatchProfile = struct {
     unprepared_document_rows: u64 = 0,
     relational_prepare_ns: u64 = 0,
     relational_rows_prepared: u64 = 0,
+    owned_relational_rows_consumed: u64 = 0,
     relational_logical_bytes: u64 = 0,
     relational_encoded_bytes: u64 = 0,
     extract_vector_field_names_ns: u64 = 0,

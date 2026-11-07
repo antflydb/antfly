@@ -580,3 +580,22 @@ The local operation-count diagnostic confirmed the source-selection mechanism:
 128 indexed writes went from 95 source turns to one. Its intermediate artifact
 path still rebuilt runtimes and yielded repeatedly; that diagnostic is evidence
 for separating physical service, not final end-to-end performance qualification.
+
+## Owned relational postimages
+
+Autocommit relational INSERT/UPDATE can capture immutable schema and write-plan
+views, release file admission, and run the existing defaults/generated/CHECK,
+extraction and row-packing pipeline through a CPU-only port with no DB receiver.
+The resulting row authority is single-use. Commit checks the namespace and
+incarnation, complete schema and catalog contents, physical-layout equivalence,
+and exact key/value/JSON-null provenance before consuming it. A numeric schema
+version alone cannot authorize transfer between independent registries.
+
+Transferred regions retain their allocator receiver through commit cleanup;
+primary/index effects and predicates still use the ordinary atomic mutation
+pipeline. SQL's request allocator accounts for retained preparation. Active
+sessions, coordinated constraints, generated-provider templates and split-shadow
+work retain their authoritative paths. Normalization/RETURNING currently has a
+separate preparation phase; sharing its row authority is further work. The
+[Debug receipt](owned-relational-rows-debug.json) records ownership/fault tests
+and SDK validation, without claiming final performance qualification.

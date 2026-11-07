@@ -1177,13 +1177,31 @@ pub fn Adapter(comptime native: type) type {
                 if (prepared.?.tables.len != 1 or !std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) return error.UnsupportedSqlExecution;
                 return self.commitCoordinated(prepared.?.tables[0]);
             }
+            // Final SQL postimages (including conflict-update results) are now
+            // known. Capture immutable row/schema authority, prepare outside
+            // file admission, then consume it only for these exact bytes/nulls.
+            const RowPlan = @import("../storage/db/prepared_document_batch.zig").Plan;
+            var owned_rows: ?RowPlan = null;
+            defer if (owned_rows) |*plan| plan.deinit();
+            if (table.storage_mode == .relational) if (adapter_owner.preparation_handoff) |handoff| {
+                owned_rows = try RowPlan.captureIncludingRelational(alloc, self.db);
+                if (owned_rows) |*plan| {
+                    try handoff.release_admission(handoff.ptr, table.physical_name);
+                    const preparation = plan.prepareWithIo(request, @import("handles.zig").handleLockIo());
+                    const root = try handoff.reacquire_admission(handoff.ptr);
+                    adapter_owner.handle = root;
+                    adapter_owner.db = root.database();
+                    selected_adapter = try adapter_owner.selected(table.physical_name);
+                    try preparation;
+                }
+            };
             // Classify by the batch's own state, not by error name: whether the
             // primary write became durable, and whether its publication was
             // left uncertain (reported as an unknown outcome).
             var primary_committed = false;
             // Named tables commit to their own database, which holds the marker.
             const receipt_table: ?[]const u8 = if (self.handle != null) self.table_name else null;
-            @import("db.zig").trackedBatch(self.db, request, &primary_committed, receipt_table) catch |err| {
+            @import("db.zig").trackedBatchWithPreparedDocuments(self.db, request, &primary_committed, receipt_table, if (owned_rows) |*plan| plan else null) catch |err| {
                 // A confirmed primary write wins: later uncertainty in derived
                 // or control publication leaves it committed, not unknown.
                 if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;

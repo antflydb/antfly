@@ -1360,7 +1360,7 @@ pub fn trackedBatch(database: *db_mod.DB, req: db_mod.types.BatchRequest, primar
     return trackedBatchWithPreparedDocuments(database, req, primary_committed, table_name, null);
 }
 
-fn trackedBatchWithPreparedDocuments(database: *db_mod.DB, req: db_mod.types.BatchRequest, primary_committed: *bool, table_name: ?[]const u8, prepared: ?*@import("../storage/db/prepared_document_batch.zig").Plan) anyerror!void {
+pub fn trackedBatchWithPreparedDocuments(database: *db_mod.DB, req: db_mod.types.BatchRequest, primary_committed: *bool, table_name: ?[]const u8, prepared: ?*@import("../storage/db/prepared_document_batch.zig").Plan) anyerror!void {
     const receipts = @import("outcome_receipts.zig");
     const writer = receipts.activeWriter() orelse return database.batchTrackedWithPreparedDocuments(req, primary_committed, null, prepared);
     const named = if (table_name) |name| (if (std.mem.eql(u8, name, "default")) null else name) else null;
@@ -10941,6 +10941,85 @@ test "issue1015 concurrent Lite handles sustain primary writes and full-text cat
     spawned = 0;
     defer for (workers[0..joined]) |worker| alloc.free(worker.path);
     for (workers[0..joined]) |worker| if (worker.failure) |err| return err;
+}
+
+test "capi owned relational postimages transfer once across equivalent layouts and commit exact null provenance" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("owned-relational-postimages");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{directory.path()});
+    defer a.free(path);
+    const wrapper = try @import("lite_connection.zig").open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 5000 }, true);
+    const id = try publishHandle(wrapper);
+    defer antfly_db_close(id);
+    var output: capi.Buffer = .{};
+    defer antfly_buffer_free(&output);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(id, .fromSlice("{\"statement\":\"CREATE TABLE owned_rows (n BIGINT CHECK (n > 0), j JSON)\"}"), &output));
+    antfly_buffer_free(&output);
+    const RowPlan = @import("../storage/db/prepared_document_batch.zig").Plan;
+    const mapper = @import("../storage/db/document_mapper.zig");
+    const schema_registry = @import("../storage/db/schema_registry.zig");
+    const writes = [_]db_mod.types.BatchWrite{
+        .{ .key = "one", .value = "{\"n\":7,\"j\":null}", .json_null_fields = &.{"j"} },
+        .{ .key = "two", .value = "{\"n\":8,\"j\":null}" },
+    };
+    for ([_]bool{ false, true }) |commit| {
+        var plan: RowPlan = capture: {
+            const guard = enterHandle(id, .write).?;
+            defer guard.leave();
+            try std.testing.expect(guard.entry_error == null);
+            const database = try @import("tables.zig").get(guard.handle, "owned_rows");
+            break :capture (try RowPlan.captureIncludingRelational(a, database)).?;
+        };
+        defer plan.deinit();
+        const request: db_mod.types.BatchRequest = .{ .writes = &writes, .schema_version = plan.schema.?.version(), .relational_schema_version = plan.schema.?.version() };
+        try plan.prepareWithIo(request, handleLockIo());
+        try std.testing.expect(plan.relational.?.matchesWrites(&writes));
+        var wrong_nulls = writes;
+        wrong_nulls[0].json_null_fields = &.{};
+        try std.testing.expect(!plan.relational.?.matchesWrites(&wrong_nulls));
+        var wrong_value = writes;
+        wrong_value[0].value = "{\"n\":9,\"j\":null}";
+        try std.testing.expect(!plan.relational.?.matchesWrites(&wrong_value));
+        if (!commit) {
+            const Fault = struct {
+                fn run(backing: Allocator, schema: schema_registry.SchemaView, catalog: @import("../storage/db/catalog/index_manager.zig").IndexManager.WritePlanSnapshot, input: db_mod.types.BatchRequest) !void {
+                    var owned = @import("../storage/db/owned_relational_rows.zig").OwnedRows.init(backing);
+                    defer owned.deinit();
+                    try owned.prepare(null, schema, catalog, input);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(a, Fault.run, .{ plan.schema.?, plan.catalog.plan().*, request });
+            var equivalent: schema_registry.SchemaView = .{ .epoch = try schema_registry.Epoch.createCloned(a, plan.schema.?.tableSchema().*) };
+            defer equivalent.release();
+            try std.testing.expect(equivalent.epoch != plan.schema.?.epoch);
+            var transferred: [2]?mapper.PreparedRelationalWrite = @splat(null);
+            defer for (&transferred) |*row| if (row.*) |*value| value.deinit(a);
+            try std.testing.expect(try plan.takeRelationalRows(&writes, equivalent, &transferred));
+            for (transferred) |row| _ = try row.?.typedView(equivalent.tableSchema().*, equivalent.physicalLayout());
+            try std.testing.expect(!plan.relational.?.matchesWrites(&writes));
+        } else {
+            const guard = enterHandle(id, .write).?;
+            defer guard.leave();
+            try std.testing.expect(guard.entry_error == null);
+            const database = try @import("tables.zig").get(guard.handle, "owned_rows");
+            var committed = false;
+            try trackedBatchWithPreparedDocuments(database, request, &committed, "owned_rows", &plan);
+            try std.testing.expect(committed);
+            try std.testing.expect(plan.needs_reprepare);
+            for (plan.relational.?.rows) |row| try std.testing.expect(row == null);
+            try std.testing.expect((try guard.handle.owned_lite_backend.?.native_docstore.?.file.check()).valid);
+        }
+    }
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(id, .fromSlice("{\"statement\":\"SELECT _id, j IS NULL FROM owned_rows ORDER BY _id\"}"), &output));
+    const result = try std.json.parseFromSlice(std.json.Value, a, output.ptr.?[0..output.len], .{});
+    defer result.deinit();
+    const rows = result.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(false, rows[0].array.items[1].bool);
+    try std.testing.expectEqual(true, rows[1].array.items[1].bool);
 }
 
 test "capi SQL owned normalization releases admission and rejects metadata changes before commit" {
