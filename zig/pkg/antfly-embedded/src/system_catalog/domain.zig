@@ -26,12 +26,13 @@ pub const max_name_bytes = 128;
 pub const max_command_bytes = 3 * 1024 * 1024;
 pub const RoutineHeader = @import("routines.zig").Header;
 pub const scope_retirement = @import("scope_retirement.zig");
+pub const extensions = @import("extensions.zig");
 pub const object_annotations = @import("object_annotations.zig");
 pub const object_definitions = @import("object_definitions.zig");
 pub const object_annotation_store = @import("object_annotation_store.zig");
 pub const ServiceOwner = @import("../common/service_ownership.zig").Owner;
 pub const RelationPersistence = @import("../common/relation_persistence.zig");
-pub const Kind = enum { database, namespace, tablespace, table, query_source, view, sequence, routine, cast, named_type, role };
+pub const Kind = enum { database, namespace, tablespace, table, query_source, view, sequence, routine, cast, named_type, role, extension };
 
 /// One parent directory policy for admission, listing and ancestor retirement.
 /// New catalog kinds must choose a scope here instead of silently escaping
@@ -40,7 +41,7 @@ pub const ParentScope = enum { global, database, namespace };
 pub fn parentScope(kind: Kind) ParentScope {
     return switch (kind) {
         .database, .tablespace, .query_source, .role => .global,
-        .namespace, .cast => .database,
+        .namespace, .cast, .extension => .database,
         .table, .view, .sequence, .routine, .named_type => .namespace,
     };
 }
@@ -494,6 +495,12 @@ pub const StateIndex = struct {
                 defer alloc.free(signature);
                 if (record.value.id != r.id or !std.mem.eql(u8, signature, r.signature.?)) return error.InvalidCatalogRecord;
             }
+            if (r.kind == .extension) {
+                if (r.storage_name.len != 0 or r.tablespace_id != 0 or r.native_service != null or !std.mem.eql(u8, r.location_json, "null")) return error.InvalidCatalogRecord;
+                var scratch: std.heap.ArenaAllocator = .init(alloc);
+                defer scratch.deinit();
+                _ = try extensions.Record.decode(scratch.allocator(), r);
+            }
             if (r.kind == .named_type) {
                 if (r.storage_name.len != 0 or r.tablespace_id != 0 or r.native_service != null or !std.mem.eql(u8, r.location_json, "null")) return error.InvalidCatalogRecord;
                 var record = try @import("named_types.zig").Record.decode(alloc, r.source_json);
@@ -543,6 +550,43 @@ pub const StateIndex = struct {
             owner.validate() catch return error.InvalidCatalogRecord;
             if (r.kind != .namespace or r.native_service != null or r.sql_owner != null or
                 !std.mem.eql(u8, r.name, try owner.namespace(&buffer))) return error.InvalidCatalogRecord;
+        };
+        var extension_members: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer extension_members.deinit(alloc);
+        var extension_counts: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+        defer extension_counts.deinit(alloc);
+        var extension_visits: std.AutoHashMapUnmanaged(u64, extensions.Visit) = .empty;
+        defer extension_visits.deinit(alloc);
+        for (state.resources) |r| if (r.kind == .extension) {
+            var scratch: std.heap.ArenaAllocator = .init(alloc);
+            defer scratch.deinit();
+            const record = try extensions.Record.decode(scratch.allocator(), r);
+            const count = try extension_counts.getOrPut(alloc, record.database_id);
+            if (!count.found_existing) count.value_ptr.* = 0;
+            count.value_ptr.* += 1;
+            if (count.value_ptr.* > extensions.max_installed) return error.InvalidCatalogRecord;
+            try extensions.requireAcyclic(alloc, &self, record.id, &extension_visits, 0);
+            if (self.byId(.database, record.database_id) == null) return error.InvalidCatalogRecord;
+            const namespace = self.byId(.namespace, record.namespace_id) orelse return error.InvalidCatalogRecord;
+            if (namespace.parent_id != record.database_id) return error.InvalidCatalogRecord;
+            for (record.members) |member| {
+                if ((try extension_members.getOrPut(alloc, member.id)).found_existing) return error.InvalidCatalogRecord;
+                const object = self.byId(.routine, member.id) orelse return error.InvalidCatalogRecord;
+                if (object.parent_id != record.namespace_id or !std.mem.eql(u8, object.name, member.name) or !std.mem.eql(u8, object.signature orelse return error.InvalidCatalogRecord, member.signature)) return error.InvalidCatalogRecord;
+                const callable = try @import("routines.zig").Record.decode(scratch.allocator(), object.source_json);
+                const binding = callable.value.definition.wasm orelse return error.InvalidCatalogRecord;
+                if (!extensions.sameOwner(record.owner, callable.value.definition.owner) or callable.value.generation != member.generation or !std.mem.eql(u8, binding.package_name, record.package_name) or !std.mem.eql(u8, binding.package_version, record.package_version) or !std.mem.eql(u8, &binding.package_digest, &record.package_digest)) return error.InvalidCatalogRecord;
+            }
+            for (record.dependencies) |dependency| {
+                const required = self.byId(.extension, dependency.id) orelse return error.InvalidCatalogRecord;
+                if (required.parent_id != record.database_id or !std.mem.eql(u8, required.name, dependency.name)) return error.InvalidCatalogRecord;
+            }
+        };
+        for (state.resources) |r| if (r.kind == .routine) {
+            var scratch: std.heap.ArenaAllocator = .init(alloc);
+            defer scratch.deinit();
+            const callable = try @import("routines.zig").Record.decode(scratch.allocator(), r.source_json);
+            if (callable.value.definition.wasm != null and !extension_members.contains(r.id)) return error.InvalidCatalogRecord;
         };
         for (state.resources) |r| if (r.kind == .cast) {
             if (self.byId(.database, r.parent_id) == null) return error.InvalidCatalogRecord;
@@ -1038,6 +1082,7 @@ pub fn planWithTopologyAndSqlOids(alloc: std.mem.Allocator, reader: anytype, nex
         try owner.validate();
         if (request.kind != .table or request.action != .create or owner.kind == .public) return error.InvalidCatalogMutation;
     }
+    if (request.kind == .extension) return error.CatalogRoutineAdmissionRequired;
     if (request.kind == .routine or request.kind == .cast or request.kind == .named_type) return error.CatalogRoutineAdmissionRequired;
     if (request.kind == .view) return error.CatalogViewAdmissionRequired;
     if (request.kind == .sequence) return error.CatalogSequenceAdmissionRequired;
@@ -1144,7 +1189,7 @@ pub fn planWithTopologyAndSqlOids(alloc: std.mem.Allocator, reader: anytype, nex
                 } else {
                     switch (existing.kind) {
                         .database => {
-                            if ((try reader.children(.cast, existing.id, 1)).len != 0) return error.DatabaseNotEmpty;
+                            if ((try reader.children(.extension, existing.id, 1)).len != 0 or (try reader.children(.cast, existing.id, 1)).len != 0) return error.DatabaseNotEmpty;
                             const namespaces = try reader.children(.namespace, existing.id, 0);
                             for (namespaces) |namespace| {
                                 if ((try reader.children(.table, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
@@ -1162,7 +1207,7 @@ pub fn planWithTopologyAndSqlOids(alloc: std.mem.Allocator, reader: anytype, nex
                         },
                         .tablespace => if (try reader.tablespaceInUse(existing.id)) return error.TablespaceInUse,
                         .query_source => {},
-                        .view, .sequence, .routine, .cast, .named_type, .role => unreachable,
+                        .view, .sequence, .routine, .cast, .named_type, .role, .extension => unreachable,
                         .table => {
                             if (!dropping_table) return error.CatalogTableTopologyRequired;
                             if (request.table_id != existing.id or !std.mem.eql(u8, request.storage_name, existing.storage_name)) return error.CatalogGenerationChanged;
@@ -1780,7 +1825,7 @@ pub const Read = struct {
 /// Values borrow the index; the caller owns only the returned slice.
 pub fn projectRead(alloc: std.mem.Allocator, index: *const StateIndex, request: Read) ![]Resource {
     if (namespaceRelation(request.kind)) return error.InvalidCatalogMutation;
-    const parent = if (request.kind == .namespace) (index.find(.database, 0, request.database) orelse return error.DatabaseNotFound).id else 0;
+    const parent = if (parentScope(request.kind) == .database) (index.find(.database, 0, request.database) orelse return error.DatabaseNotFound).id else 0;
     var out: std.ArrayListUnmanaged(Resource) = .empty;
     errdefer out.deinit(alloc);
     if (request.name) |name| {

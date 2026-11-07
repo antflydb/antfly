@@ -3313,6 +3313,52 @@ const Parser = struct {
         return ddl;
     }
 
+    fn extensionVersion(self: *Parser) Error![]const u8 {
+        if (self.peek(.string)) {
+            const literal = try self.value();
+            if (literal.string.len == 0) return self.fail(error.SqlInvalidParameterValue, "extension version must not be empty");
+            return literal.string;
+        }
+        return self.identifier();
+    }
+
+    fn extensionDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action")) Error!ast.CatalogDdl {
+        var ddl: ast.CatalogDdl = .{ .kind = .extension, .action = action, .name = undefined, .extension_options = .{} };
+        if (action == .create or action == .drop) {
+            ddl.conditional = self.keyword(.@"if");
+            if (ddl.conditional) {
+                if (action == .create) try self.expectKeyword(.not);
+                try self.expectKeyword(.exists);
+            }
+        }
+        // PostgreSQL extension names are database-wide, never schema-qualified.
+        ddl.name = .{ .table = try self.identifier() };
+        if (action == .drop) {
+            ddl.cascade = self.ddlWord("CASCADE");
+            if (!ddl.cascade) _ = self.ddlWord("RESTRICT");
+            return ddl;
+        }
+        if (action == .alter_schema) {
+            if (!self.keyword(.update)) return self.fail(error.UnsupportedSqlShape, "ALTER EXTENSION requires UPDATE");
+            if (self.keyword(.to)) ddl.extension_options.?.version = try self.extensionVersion();
+            return ddl;
+        }
+        _ = self.keyword(.with);
+        while (true) {
+            if (self.keyword(.schema)) {
+                if (ddl.extension_options.?.schema != null) return self.fail(error.InvalidSqlSyntax, "duplicate extension SCHEMA option");
+                ddl.extension_options.?.schema = try self.identifier();
+            } else if (self.ddlWord("VERSION")) {
+                if (ddl.extension_options.?.version != null) return self.fail(error.InvalidSqlSyntax, "duplicate extension VERSION option");
+                ddl.extension_options.?.version = try self.extensionVersion();
+            } else if (self.ddlWord("CASCADE")) {
+                if (ddl.cascade) return self.fail(error.InvalidSqlSyntax, "duplicate extension CASCADE option");
+                ddl.cascade = true;
+            } else break;
+        }
+        return ddl;
+    }
+
     fn catalogDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action")) Error!ast.CatalogDdl {
         const kind: @FieldType(ast.CatalogDdl, "kind") = if (self.keyword(.database)) .database else if (self.keyword(.schema)) .namespace else if (self.keyword(.tablespace)) .tablespace else if (self.keyword(.table)) .table else return self.fail(error.UnsupportedSqlShape, "expected a table, database, schema, or tablespace");
         var conditional = false;
@@ -4939,7 +4985,7 @@ const Parser = struct {
             const constraint_name = if (constraint_comment) try self.identifier() else null;
             if (constraint_comment) try self.expectKeyword(.on);
             const index_comment = !constraint_comment and self.keyword(.index);
-            const kind: @FieldType(ast.CatalogDdl, "kind") = if (constraint_comment) .table else if (index_comment) .index else if (column_comment or self.keyword(.table)) .table else if (self.keyword(.schema)) .namespace else if (self.keyword(.database)) .database else if (domain_comment or self.ddlWord("TYPE")) .named_type else return self.fail(error.UnsupportedSqlShape, "this comment target requires catalog annotation support");
+            const kind: @FieldType(ast.CatalogDdl, "kind") = if (constraint_comment) .table else if (index_comment) .index else if (column_comment or self.keyword(.table)) .table else if (self.keyword(.schema)) .namespace else if (self.keyword(.database)) .database else if (domain_comment or self.ddlWord("TYPE")) .named_type else if (self.ddlWord("EXTENSION")) .extension else return self.fail(error.UnsupportedSqlShape, "this comment target requires catalog annotation support");
             var comment_column: ?[]const u8 = null;
             const target = if (column_comment) column_target: {
                 var parts: [4][]const u8 = undefined;
@@ -4963,6 +5009,7 @@ const Parser = struct {
             return .{ .catalog_ddl = .{ .kind = kind, .action = .comment, .name = target, .comment_value = if (text == .string) text.string else null, .comment_column = comment_column, .comment_object = if (constraint_name) |label| .{ .kind = .constraint, .name = label } else if (index_comment) .{ .kind = .index, .name = target.table } else null, .named_type_kind = if (domain_comment) .domain else .enumeration } };
         }
         if (self.keyword(.create)) {
+            if (self.ddlWord("EXTENSION")) return .{ .catalog_ddl = try self.extensionDdl(.create) };
             if (self.ddlWord("ROLE")) return .{ .catalog_ddl = try self.roleDdl(false) };
             if (self.ddlWord("TYPE")) return .{ .catalog_ddl = try self.enumDdl(.create) };
             if (self.ddlWord("DOMAIN")) return .{ .catalog_ddl = try self.domainDdl(.create) };
@@ -5017,6 +5064,7 @@ const Parser = struct {
             return .{ .catalog_ddl = (try self.populationDdl(.refresh_materialized_view, .permanent)).ddl() };
         }
         if (self.keyword(.drop)) {
+            if (self.ddlWord("EXTENSION")) return .{ .catalog_ddl = try self.extensionDdl(.drop) };
             if (self.ddlWord("TRIGGER")) return .{ .catalog_ddl = try self.triggerDdl(false, false) };
             if (self.ddlWord("ROLE")) return .{ .catalog_ddl = try self.roleDdl(true) };
             if (self.ddlWord("TYPE")) return .{ .catalog_ddl = try self.enumDdl(.drop) };
@@ -5045,6 +5093,7 @@ const Parser = struct {
             return .{ .drop_table = .{ .table = table, .if_exists = if_exists, .cascade = cascade } };
         }
         if (self.keyword(.alter)) {
+            if (self.ddlWord("EXTENSION")) return .{ .catalog_ddl = try self.extensionDdl(.alter_schema) };
             if (self.ddlWord("DEFAULT")) {
                 if (!self.ddlWord("PRIVILEGES")) return self.fail(error.InvalidSqlSyntax, "ALTER DEFAULT requires PRIVILEGES");
                 return .{ .catalog_ddl = try self.defaultPrivilegesDdl() };
@@ -7488,5 +7537,38 @@ test "compiler trigger WHEN text roundtrips PostgreSQL compact comparison and UP
         defer predicate.deinit();
         try std.testing.expectEqual(.lt, predicate.expression.binary.op);
         try std.testing.expectEqualStrings("new\x00n", predicate.expression.binary.left.column);
+    }
+}
+
+test "compiler extension lifecycle retains database identity schema version and dependency intent" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0148", "sql-0754", "sql-0755", "sql-0756", "sql-0757", "sql-0758", "sql-0759", "sql-0760", "sql-0761", "sql-0762", "sql-0763" }) |id| {
+        var compiled = try compile(a, (try corpus.get(id)).sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(.extension, compiled.statement.catalog_ddl.kind);
+        try std.testing.expect(compiled.statement.catalog_ddl.name.namespace == null);
+    }
+    var create = try compile(a, "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\" WITH SCHEMA tools VERSION '1.0.0' CASCADE", .{});
+    defer create.deinit();
+    const ddl = create.statement.catalog_ddl;
+    try std.testing.expect(ddl.conditional and ddl.cascade);
+    try std.testing.expectEqualStrings("uuid-ossp", ddl.name.table);
+    try std.testing.expectEqualStrings("tools", ddl.extension_options.?.schema.?);
+    try std.testing.expectEqualStrings("1.0.0", ddl.extension_options.?.version.?);
+    var update = try compile(a, "ALTER EXTENSION sample UPDATE TO '2.0'", .{});
+    defer update.deinit();
+    try std.testing.expectEqualStrings("2.0", update.statement.catalog_ddl.extension_options.?.version.?);
+    for ([_][]const u8{
+        "CREATE EXTENSION public.sample",            "ALTER EXTENSION sample UPDATE TO ''",
+        "CREATE EXTENSION sample SCHEMA a SCHEMA b", "CREATE EXTENSION sample VERSION '1' VERSION '2'",
+        "CREATE EXTENSION sample CASCADE CASCADE",   "COMMENT ON EXTENSION public.sample IS 'bad'",
+    }) |invalid| {
+        if (compile(a, invalid, .{})) |value_| {
+            var value = value_;
+            value.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
     }
 }

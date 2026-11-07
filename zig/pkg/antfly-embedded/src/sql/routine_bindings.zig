@@ -25,6 +25,12 @@ pub const Resolved = struct {
     arguments: []const scalar.Type,
     output: scalar.Type,
     program: *const scalar.Program,
+    /// Prepared locally from a catalog-owned immutable package binding. No
+    /// parser/catalog/artifact resolver is callable from the row evaluator.
+    native_call: ?struct {
+        ptr: *anyopaque,
+        invoke: *const fn (*anyopaque, std.mem.Allocator, []const scalar.Datum, scalar.EvalLimits) anyerror!scalar.Datum,
+    } = null,
     strict: bool = false,
     volatility: scalar.Volatility = .@"volatile",
 };

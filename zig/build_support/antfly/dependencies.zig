@@ -325,6 +325,20 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // consistent failure/leak attribution, this keeps compile-only anonymous
     // reachability anchors out of runtime selection.
     const run_sql_tests = addFilteredTestRunArtifact(b, sql_tests);
+    const package_callable_filters: []const []const u8 = &.{ "SQL package native callbacks retain strict lazy typed execution and preparation-only lookup", "SQL WASM catalog bindings require immutable package digests and closed scalar declarations" };
+    const package_callable_tests = b.addTest(.{ .name = "sql-package-callable-tests", .root_module = sql_test_mod, .filters = package_callable_filters });
+    package_callable_tests.step.max_rss = @as(usize, if (target.result.os.tag == .macos) 6 else 3) * 1024 * 1024 * 1024;
+    const package_callable_run = addFilteredTestRunArtifact(b, package_callable_tests);
+    package_callable_run.addArg("--require-no-skips");
+    const package_callable_inventory = b.addRunArtifact(package_callable_tests);
+    package_callable_inventory.addArg("--list-tests");
+    const package_callable_audit = b.addSystemCommand(&.{"python3"});
+    package_callable_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for (package_callable_filters) |required| package_callable_audit.addArgs(&.{ "--filter", required });
+    package_callable_audit.addArg("--inventory");
+    package_callable_audit.addFileArg2(package_callable_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    package_callable_run.step.dependOn(&package_callable_audit.step);
+    b.step("sql-package-callable-test", "Verify strict lazy typed package callback and immutable WASM binding contracts").dependOn(&package_callable_run.step);
     const advisory_effect_tests = b.addTest(.{
         .name = "sql-advisory-effect-tests",
         .root_module = sql_test_mod,
@@ -530,6 +544,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = b.graph.host,
         .optimize = optimize,
     });
+    openapi_split_test_mod.addAnonymousImport("sql_routine_records_source.zig", .{ .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/routines.zig") });
+    openapi_split_test_mod.addAnonymousImport("extension_client_types.zig", .{ .root_source_file = b.path("pkg/antfly-client/src/openapi/generated/antfly_client_openapi/types.zig") });
     openapi_split_test_mod.addImport("antfly_public_openapi", openapi_check_modules.public);
     openapi_split_test_mod.addImport("antfly_public_server_openapi", openapi_check_modules.public_server);
     openapi_split_test_mod.addImport("antfly_metadata_openapi", openapi_check_modules.metadata);

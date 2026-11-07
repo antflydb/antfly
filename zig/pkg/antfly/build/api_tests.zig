@@ -2297,11 +2297,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_owner_lifecycle_test_mod.addImport("usermgr_storage", sql_owner_usermgr_storage);
     const graph_trigger_public_filters: []const []const u8 = &.{ "mounted PostgreSQL original trigger attachment replacement and retirement preserve default statement semantics across native cold restart", "mounted PostgreSQL original ordinary trigger supersessions preserve events predicates arguments and cold activation", "mounted ordinary single owner graph transforms remain available without trigger state or preparation grants across cold restart", "mounted raw trigger transforms FK cascades and graph effects share RLS constraints one atomic decision and cold no refire", "mounted coordinated graph rows use genuine trigger absence RLS atomicity lost replies and cold prepared image replay", "mounted default dynamic document graph transactions coalesce once enforce credential filters and recover exact cold images", "mounted trigger logical relation identity survives TRUNCATE cold restart and fresh same-name CREATE gets a new identity", "mounted SQL original canonical MATCH", "mounted SQL graph joined hits" };
     const native_explicit_pk_filters: []const []const u8 = &.{ "mounted native explicit primary key command stages unique admission after real activation and preserves rollback and cold commit", "SQL relation lifetime native frozen lock delivery reaches the receiving owner before ABORT fallback" };
+    const extension_original_filters: []const []const u8 = &.{ "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart", "SQL WASM statement shares actual immutable modules across exports and retains one bounded reservation", "SQL WASM typed callable JSON preserves null exact numbers arrays temporal and range domains", "wasmtime SQL statement retains verified compiled pure module and rejects artifact import and type substitutions" };
     // Compile the expensive linked-control owner once; each gate selects its
     // own runtime campaign and independently requires no skips.
     const sql_owner_lifecycle_tests = b.addTest(.{
         .root_module = sql_owner_lifecycle_test_mod,
-        .filters = compileFiltersWithAnchors(b, std.mem.concat(b.allocator, []const u8, &.{ graph_trigger_public_filters, native_explicit_pk_filters }) catch @panic("OOM"), selectTestFilters(b, &.{
+        .filters = compileFiltersWithAnchors(b, std.mem.concat(b.allocator, []const u8, &.{ graph_trigger_public_filters, native_explicit_pk_filters, extension_original_filters }) catch @panic("OOM"), selectTestFilters(b, &.{
             "mounted SQL LIKE declaration copies retain grants constraints isolation and cold owners",
             "mounted SQL LIKE full ownership lifetime retires borrowed defaults and fresh identities through cold owners",
             "mounted SQL original prepared transactions retain multi-owner intents across complete cold restart",
@@ -2520,10 +2521,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "system catalog relation namespace transaction standby independently adopts publications resumes after restart and rejects forged effects",
         })),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
-        // The merged document/SQL Debug owner peaked at 17,207,689,216
-        // bytes locally. Reserve at least 25% headroom for macOS Debug;
+        // The SQL/WASM Debug owner peaked at 22,713,909,248 bytes locally.
+        // Reserve at least 25% headroom for macOS Debug compilation;
         // release/Linux bounds retain their independently measured profiles.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 21 else 12) else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 27 else 12) else 7) * 1024 * 1024 * 1024,
     });
     const notification_journal_tests = b.addTest(.{
         .root_module = options.api_http_runtime_test_mod,
@@ -2596,6 +2597,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     trigger_originals_run.addArg("--require-no-skips");
     trigger_originals_run.step.dependOn(&public_graph_audit.step);
     b.step("antfly-api-sql-trigger-originals-test", "Verify original trigger creation, replacement, retirement and cold statement semantics").dependOn(&trigger_originals_run.step);
+
+    const extension_originals_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, extension_original_filters);
+    extension_originals_run.addArg("--require-no-skips");
+    const extension_originals_audit = b.addSystemCommand(&.{"python3"});
+    extension_originals_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for (extension_original_filters) |required| extension_originals_audit.addArgs(&.{ "--filter", required });
+    extension_originals_audit.addArg("--inventory");
+    extension_originals_audit.addFileArg2(public_native_inventory_file, .{ .make_absolute = true });
+    extension_originals_run.step.dependOn(&extension_originals_audit.step);
+    b.step("antfly-api-sql-extension-originals-test", "Verify configured WASM extension lifecycle originals and native atomic outcomes").dependOn(&extension_originals_run.step);
 
     const sql_notification_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original notifications", "pgwire notifications" });
     sql_notification_run.addArg("--require-no-skips");
@@ -3301,6 +3312,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "restore job ownership failures remain retryable",
             "restore retry wakeup admission failure cannot escape as execution failure",
             "staged restore published metadata wins cancellation only after every owner opens",
+            "staged restore native target progress bypasses unrelated catalog reconciliation across cold retry",
             "staged restore worker publishes a dependency complete mixed native cohort",
             "staged restore worker query population",
             "staged restore worker rebuilds a dependency complete mixed portable cohort",
@@ -3323,7 +3335,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-sql-population-recovery-test", "Run query-produced relation job admission, recovery and native publication regressions").dependOn(&addFilteredTestRunArtifact(b, sql_population_recovery_tests).step);
     const staged_restore_driver_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
-        .filters = &.{ "busy staged restore owner retains its pinned attempt", "restore cutover lost begin reply waits for the same fence to drain", "staged restore published metadata wins cancellation only after every owner opens", "staged restore worker publishes a dependency complete mixed native cohort", "staged restore worker query population", "staged restore worker rebuilds a dependency complete mixed portable cohort", "staged restore worker recovers lost acknowledgements across owner restart matrix", "staged restore worker preserves generated mixed cohorts across HTTP owner faults", "staged table restore worker uses shared dependency complete cohort", "staged restore worker preserves migration mappings and indexes after restart", "staged restore worker measures bounded LSM native and portable work" },
+        .filters = &.{ "busy staged restore owner retains its pinned attempt", "restore cutover lost begin reply waits for the same fence to drain", "staged restore published metadata wins cancellation only after every owner opens", "staged restore native target progress bypasses unrelated catalog reconciliation across cold retry", "staged restore worker publishes a dependency complete mixed native cohort", "staged restore worker query population", "staged restore worker rebuilds a dependency complete mixed portable cohort", "staged restore worker recovers lost acknowledgements across owner restart matrix", "staged restore worker preserves generated mixed cohorts across HTTP owner faults", "staged table restore worker uses shared dependency complete cohort", "staged restore worker preserves migration mappings and indexes after restart", "staged restore worker measures bounded LSM native and portable work" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-staged-restore-driver-test", "Run bounded staged restore publication and cancellation driver regressions").dependOn(&addFilteredTestRunArtifact(b, staged_restore_driver_tests).step);

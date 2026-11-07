@@ -98,6 +98,9 @@ pub fn prepare(a: A, record: records.Record, resolver: ?@import("routine_binding
     }
     if (record.kind != .function) return error.SqlWrongObjectType;
     if (record.definition.returns_trigger) return error.SqlTriggerContextRequired;
+    // A package artifact must be prepared by the statement-owned runtime.
+    // Storage/remote body parsers cannot reconstruct executable host pointers.
+    if (record.definition.wasm != null or record.definition.language == .wasm) return error.UnsupportedSqlShape;
     var parsed = try @import("compiler.zig").compile(a, record.definition.body, .{ .max_bytes = records.max_body_bytes });
     defer parsed.deinit();
     if (parsed.statement != .select) return error.SqlInvalidFunctionDefinition;

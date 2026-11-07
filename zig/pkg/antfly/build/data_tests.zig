@@ -151,6 +151,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "remote metadata snapshot refresh cannot renew a borrowed head or hide schema publication",
         "remote metadata source installs fenced snapshot without comparing epoch domains",
         "remote metadata source rejects fenced snapshot across mutation invalidation",
+        "remote metadata source SQL control snapshots own retained promotion outcomes",
         "remote metadata source treats superseded concurrent fenced snapshot as success",
         "remote metadata source retries fenced snapshot generations until success",
         "remote metadata source bounds repeated fenced snapshot generations",

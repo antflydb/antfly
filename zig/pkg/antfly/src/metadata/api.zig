@@ -283,6 +283,7 @@ pub const AdminSnapshot = struct {
     replication_source_statuses: []table_manager.ReplicationSourceStatusRecord = &.{},
     replication_source_action_hints: []ReplicationSourceActionHint = &.{},
     extension_packages: []extension_domain.PackageManifest = &.{},
+    sql_extension_controls: []extension_domain.sql_package.PackageControl = &.{},
     installed_extensions: []extension_domain.InstalledExtension = &.{},
     extension_members: []extension_domain.ExtensionMember = &.{},
     extension_dependencies: []extension_domain.ExtensionDependency = &.{},
@@ -970,6 +971,9 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
     if (@hasDecl(SourceDeclType, "listProjectedExtensionPackages")) {
         snapshot.extension_packages = try source.listProjectedExtensionPackages(alloc);
     }
+    if (@hasDecl(SourceDeclType, "listProjectedSqlExtensionControls")) {
+        snapshot.sql_extension_controls = try source.listProjectedSqlExtensionControls(alloc);
+    }
     if (@hasDecl(SourceDeclType, "listProjectedInstalledExtensions")) {
         snapshot.installed_extensions = try source.listProjectedInstalledExtensions(alloc);
     }
@@ -1037,6 +1041,9 @@ pub fn freeSnapshot(alloc: std.mem.Allocator, source: anytype, snapshot: *AdminS
     }
     if (@hasDecl(SourceDeclType, "freeProjectedExtensionPackages") and snapshot.extension_packages.len > 0) {
         source.freeProjectedExtensionPackages(alloc, snapshot.extension_packages);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedSqlExtensionControls") and snapshot.sql_extension_controls.len > 0) {
+        source.freeProjectedSqlExtensionControls(alloc, snapshot.sql_extension_controls);
     }
     if (@hasDecl(SourceDeclType, "freeProjectedInstalledExtensions") and snapshot.installed_extensions.len > 0) {
         source.freeProjectedInstalledExtensions(alloc, snapshot.installed_extensions);

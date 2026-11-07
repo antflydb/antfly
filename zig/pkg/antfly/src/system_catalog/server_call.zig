@@ -254,6 +254,9 @@ pub const Call = union(enum) {
     sql_native_index_prepare: @import("native_indexes.zig").Preparation,
     sql_native_index_mutate: @import("native_indexes.zig").Mutation,
     sql_native_index_outcome: @import("native_indexes.zig").OutcomeRequest,
+    sql_extension_snapshot: @import("sql_extensions.zig").SnapshotRequest,
+    sql_extension_mutate: @import("sql_extensions.zig").Mutation,
+    sql_extension_outcome: @import("sql_extensions.zig").OutcomeRequest,
     sql_routine_mutate: @import("routines.zig").Mutation,
     sql_routine_outcome: @import("routines.zig").OutcomeRequest,
     /// Private body-bound operations, never public SQL-supplied admissions.
@@ -377,7 +380,7 @@ pub const Call = union(enum) {
             .mutate => |request| request.mutation.action == .comment or request.mutation.sql_owner != null or request.mutation.sql_temporary_owner != null,
             .query_population_job, .query_population_prepare, .schema_validation_prepare, .schema_validation_status, .scope_retirement_prepare, .scope_retirement_submit, .scope_retirement_observation, .scope_retirement_work, .scope_retirement_manifest, .table_retirement_prepare, .table_retirement_submit, .table_retirement_receipt, .table_retirement_queue, .table_retirement_effects, .table_retirement_owner_work => true,
             .schema_validation_submit => |bytes| @import("../metadata/schema_validation_ledger.zig").requiresAdmissionAuthority(bytes),
-            .sql_index_annotations, .sql_lock_read, .sql_lock_mutate, .sql_lock_outcome, .sql_prepared_read, .sql_prepared_mutate, .sql_prepared_outcome, .sql_authorization_read, .sql_authorization_mutate, .sql_authorization_outcome, .sql_type_snapshot, .sql_type_bindings, .sql_type_mutate, .sql_type_outcome, .sql_cast_snapshot, .sql_cast_mutate, .sql_cast_outcome, .sql_catalog_prepare, .sql_catalog_mutate, .sql_catalog_outcome, .sql_native_index_prepare, .sql_native_index_mutate, .sql_native_index_outcome, .sql_trigger_snapshot, .sql_routine_snapshot, .sql_routine_mutate, .sql_routine_outcome, .sql_column_sequence_handoffs, .sql_sequence_prepare, .sql_sequence_counter_mutate, .sql_sequence_counter_outcome, .sql_view_mutate, .sql_sequence_snapshot, .sql_sequence_admission_head, .sql_sequence_mutate, .sql_sequence_outcome, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin, .native_memory_create => true,
+            .sql_extension_snapshot, .sql_extension_mutate, .sql_extension_outcome, .sql_index_annotations, .sql_lock_read, .sql_lock_mutate, .sql_lock_outcome, .sql_prepared_read, .sql_prepared_mutate, .sql_prepared_outcome, .sql_authorization_read, .sql_authorization_mutate, .sql_authorization_outcome, .sql_type_snapshot, .sql_type_bindings, .sql_type_mutate, .sql_type_outcome, .sql_cast_snapshot, .sql_cast_mutate, .sql_cast_outcome, .sql_catalog_prepare, .sql_catalog_mutate, .sql_catalog_outcome, .sql_native_index_prepare, .sql_native_index_mutate, .sql_native_index_outcome, .sql_trigger_snapshot, .sql_routine_snapshot, .sql_routine_mutate, .sql_routine_outcome, .sql_column_sequence_handoffs, .sql_sequence_prepare, .sql_sequence_counter_mutate, .sql_sequence_counter_outcome, .sql_view_mutate, .sql_sequence_snapshot, .sql_sequence_admission_head, .sql_sequence_mutate, .sql_sequence_outcome, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin, .native_memory_create => true,
             .sql_completion_reference_mutate, .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -457,7 +460,7 @@ pub const Call = union(enum) {
     }
 
     pub fn isMutation(self: @This()) bool {
-        if (self == .sql_graph_preparation_read or self == .sql_graph_preparation_outcome) return false;
+        if (self == .sql_graph_preparation_read or self == .sql_graph_preparation_outcome or self == .sql_extension_snapshot or self == .sql_extension_outcome) return false;
         if (self == .sql_graph_preparation_admit) return true;
         // The owner narrows visibility and requires a body-bound read grant;
         // capturing a cohort never mutates the catalog or its topology.
@@ -978,4 +981,15 @@ test "privacy table record transport is a service read without mutation authorit
     const read: Call = .{ .table_record_read = "private" };
     try std.testing.expect(!read.isMutation());
     try std.testing.expect(!read.requiresAdministrativeGrant());
+}
+
+test "SQL extension preparation and exact outcome observation do not bind a later mutation fence" {
+    const snapshot: Call = .{ .sql_extension_snapshot = .{ .database = "default", .name = "sample", .namespace = "public" } };
+    const outcome: Call = .{ .sql_extension_outcome = .{ .admission = .{ .nonce = @splat(1), .head = 0 }, .incarnation = @splat(2), .database = "default", .database_id = 1, .name = "sample", .digest = @splat(3), .operation = .create } };
+    try std.testing.expect(!snapshot.isMutation());
+    try std.testing.expect(!outcome.isMutation());
+    try std.testing.expect(snapshot.requiresAdministrativeGrant());
+    try std.testing.expect(outcome.requiresAdministrativeGrant());
+    try std.testing.expectEqualDeep(snapshot, try snapshot.withCommandFence(null));
+    try std.testing.expectEqualDeep(outcome, try outcome.requireCommandFence(null));
 }

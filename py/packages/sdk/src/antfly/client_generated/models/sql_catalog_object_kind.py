@@ -6,6 +6,7 @@ class SQLCatalogObjectKind(StrEnum):
     AUTHORIZATION = "authorization"
     CAST = "cast"
     DATABASE = "database"
+    EXTENSION = "extension"
     FUNCTION = "function"
     INDEX = "index"
     NAMESPACE = "namespace"

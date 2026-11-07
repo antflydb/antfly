@@ -1694,8 +1694,8 @@ fn runPopulationPublicMode(comptime Driver: type, case_id: []const u8, document:
         defer read_context.deinit();
         var selected = try handler.executeSQL(&read_context);
         defer selected.deinit();
-        if (selected.status.code != (if (with_data) @as(u16, 200) else 400)) std.debug.print("materialized read {s} status={d}: {s}\n", .{ case_id, selected.status.code, selected.body orelse "" });
-        try std.testing.expectEqual(@as(u16, if (with_data) 200 else 400), selected.status.code);
+        if (selected.status.code != (if (with_data) @as(u16, 200) else 409)) std.debug.print("materialized read {s} status={d}: {s}\n", .{ case_id, selected.status.code, selected.body orelse "" });
+        try std.testing.expectEqual(@as(u16, if (with_data) 200 else 409), selected.status.code);
         const value = try std.json.parseFromSliceLeaky(std.json.Value, a, selected.body.?, .{});
         if (with_data) {
             const actual_rows = value.object.get("rows").?.array.items;
@@ -1706,7 +1706,11 @@ fn runPopulationPublicMode(comptime Driver: type, case_id: []const u8, document:
                     if (wanted == .null) try std.testing.expect(cell == .null) else try std.testing.expectEqualStrings(wanted.string, cell.string);
                 }
             }
-        } else try std.testing.expectEqualStrings("55000", value.object.get("code").?.string);
+        } else {
+            try std.testing.expectEqualStrings("55000", value.object.get("code").?.string);
+            try std.testing.expect(!value.object.get("retryable").?.bool);
+            try std.testing.expectEqualStrings("idle", value.object.get("transaction_status").?.string);
+        }
 
         const diagnostics = for (oracle.materialized_diagnostics) |entry| {
             if (entry.populated == with_data) break entry;
@@ -1722,7 +1726,7 @@ fn runPopulationPublicMode(comptime Driver: type, case_id: []const u8, document:
             var rejected = try handler.executeSQL(&rejected_context);
             defer rejected.deinit();
             const diagnostic = try std.json.parseFromSliceLeaky(std.json.Value, a, rejected.body.?, .{});
-            try std.testing.expectEqual(@as(u16, if (std.mem.eql(u8, probe.code.?, "0A000")) 501 else 400), rejected.status.code);
+            try std.testing.expectEqual(@as(u16, if (std.mem.eql(u8, probe.code.?, "0A000")) 501 else if (std.mem.eql(u8, probe.code.?, "55000")) 409 else 400), rejected.status.code);
             try std.testing.expectEqualStrings(probe.code.?, diagnostic.object.get("code").?.string);
         }
         const txn = try fixture.dbs[0].beginTransaction(999);
@@ -1814,9 +1818,11 @@ fn runPopulationPublicMode(comptime Driver: type, case_id: []const u8, document:
             defer empty_context.deinit();
             var empty_read = try handler.executeSQL(&empty_context);
             defer empty_read.deinit();
-            try std.testing.expectEqual(@as(u16, 400), empty_read.status.code);
+            try std.testing.expectEqual(@as(u16, 409), empty_read.status.code);
             const diagnostic = try std.json.parseFromSliceLeaky(std.json.Value, a, empty_read.body.?, .{});
             try std.testing.expectEqualStrings("55000", diagnostic.object.get("code").?.string);
+            try std.testing.expect(!diagnostic.object.get("retryable").?.bool);
+            try std.testing.expectEqualStrings("idle", diagnostic.object.get("transaction_status").?.string);
         }
 
         // Execute the unchanged DROP originals (0358/0359), retaining the

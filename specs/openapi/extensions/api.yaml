@@ -231,6 +231,140 @@ components:
       required:
         - scopes_supported
 
+    SQLPackageScalarType:
+      type: string
+      description: Exact native SQL callable scalar domains, preserving integer widths and temporal/range identities.
+      enum: [text, uuid, int16, int32, int64, float32, float64, boolean, jsonb, numeric, date, time, time_tz, timestamp, timestamp_tz, interval, numrange, daterange, tsrange, tstzrange]
+
+    SQLPackageVolatility:
+      type: string
+      enum: [immutable, stable, volatile]
+
+    SQLPackageType:
+      type: object
+      additionalProperties: false
+      properties:
+        scalar:
+          $ref: "#/components/schemas/SQLPackageScalarType"
+        array:
+          type: boolean
+          default: false
+          description: Arrays support text, uuid, int16, int32, int64, float32, float64, boolean, jsonb and numeric. Other scalar domains require false.
+      required: [scalar]
+
+    SQLPackageArgument:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          nullable: true
+          minLength: 1
+          maxLength: 128
+        type:
+          $ref: "#/components/schemas/SQLPackageType"
+      required: [type]
+
+    SQLPackageExport:
+      type: object
+      additionalProperties: false
+      description: A pure scalar SQL function implemented by the declared immutable core WASM runtime; no host capabilities or native-library fallback.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        runtime:
+          $ref: "#/components/schemas/ExtensionIdentifier"
+        export_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Tool selector passed to antfly_extension_call_tool.
+        arguments:
+          type: array
+          maxItems: 100
+          default: []
+          items:
+            $ref: "#/components/schemas/SQLPackageArgument"
+        result:
+          $ref: "#/components/schemas/SQLPackageType"
+        strict:
+          type: boolean
+          default: false
+        volatility:
+          $ref: "#/components/schemas/SQLPackageVolatility"
+          default: volatile
+      required: [name, runtime, export_name, result]
+
+    SQLPackageControl:
+      type: object
+      additionalProperties: false
+      description: Database-scoped SQL installation over the existing owned package registry. Requires embedded_db scope, SHA256-bound core WASM artifacts, no other install objects/shapes and no host capabilities. Familiar package names imply no upstream extension payload.
+      properties:
+        default_version:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Initial package-level default intent used only when the first SQL version is registered. Later defaults are explicit digest-bound operator promotions; version names are opaque.
+        schema:
+          type: string
+          nullable: true
+          minLength: 1
+          maxLength: 128
+          description: Optional fixed installation namespace; requires relocatable false.
+        exports:
+          type: array
+          minItems: 1
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/SQLPackageExport"
+        updates_from:
+          type: array
+          maxItems: 256
+          uniqueItems: true
+          default: []
+          description: Predecessor versions supported by this version's declarative typed-export transition, separate from REST update scripts.
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+      required: [default_version, exports]
+
+    SQLPackageDefaultControl:
+      type: object
+      additionalProperties: false
+      description: Current global SQL default selection. Retained promotion receipts remain private to durable metadata and checkpoints.
+      properties:
+        name:
+          $ref: "#/components/schemas/ExtensionIdentifier"
+        identity:
+          type: array
+          minItems: 32
+          maxItems: 32
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+        generation:
+          type: integer
+          minimum: 1
+        default_version:
+          type: string
+          minLength: 1
+          maxLength: 128
+        default_digest:
+          type: array
+          nullable: true
+          minItems: 32
+          maxItems: 32
+          description: Null while the initial declared target has not been registered. Explicit promotions always bind an immutable SHA256 target digest.
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+      required: [name, identity, generation, default_version, default_digest]
+
     PackageManifest:
       type: object
       properties:
@@ -271,6 +405,8 @@ components:
             $ref: "#/components/schemas/PackageArtifact"
         install:
           $ref: "#/components/schemas/InstallManifest"
+        sql:
+          $ref: "#/components/schemas/SQLPackageControl"
         updates:
           type: array
           items:
@@ -450,6 +586,31 @@ paths:
                 $ref: "#/components/schemas/PackageManifest"
         "404":
           description: Package not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtensionError"
+
+  /extensions/v1/packages/{name}/sql-control:
+    get:
+      tags: ["Packages"]
+      operationId: getExtensionSqlPackageControl
+      summary: Get the explicit global SQL package default.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ExtensionIdentifier"
+      responses:
+        "200":
+          description: Current SQL default selection, without private promotion receipts.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SQLPackageDefaultControl"
+        "404":
+          description: SQL package control not found.
           content:
             application/json:
               schema:

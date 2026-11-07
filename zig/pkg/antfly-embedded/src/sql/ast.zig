@@ -528,7 +528,7 @@ pub const NativeIndex = struct {
 };
 
 pub const CatalogDdl = struct {
-    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure, operator, aggregate, cast, named_type },
+    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure, operator, aggregate, cast, named_type, extension },
     action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, setting_default, comment, alter_sequence, populate, maintenance },
     name: Name,
     new_name: ?[]const u8 = null,
@@ -552,6 +552,8 @@ pub const CatalogDdl = struct {
     comment_value: ?[]const u8 = null,
     comment_column: ?[]const u8 = null,
     comment_object: ?@import("../system_catalog/object_annotations.zig").Key = null,
+    /// Database-scoped package identity; schema selects the contained objects.
+    extension_options: ?struct { schema: ?[]const u8 = null, version: ?[]const u8 = null } = null,
     sequence_options: ?SequenceOptions = null,
     sequence_targets: []const Name = &.{},
     population: ?RelationPopulation = null,

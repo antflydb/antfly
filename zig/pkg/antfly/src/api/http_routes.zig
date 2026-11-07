@@ -1102,6 +1102,15 @@ pub const Routes = struct {
         return .{ .name = name };
     }
 
+    pub fn matchExtensionSqlControl(path: []const u8) ?ExtensionPackage {
+        const suffix = "/sql-control";
+        if (path.len <= extensions_v1_packages_prefix.len + suffix.len or
+            !std.mem.startsWith(u8, path, extensions_v1_packages_prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+        const name = path[extensions_v1_packages_prefix.len .. path.len - suffix.len];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .name = name };
+    }
+
     pub fn matchExtensionPackageVersion(path: []const u8) ?ExtensionPackageVersion {
         if (!std.mem.startsWith(u8, path, extensions_v1_packages_prefix)) return null;
         const rest = path[extensions_v1_packages_prefix.len..];
@@ -1748,6 +1757,11 @@ test "public api routes compile" {
     const extension_package = Routes.matchExtensionPackage("/extensions/v1/packages/memoryaf").?;
     try std.testing.expectEqualStrings("memoryaf", extension_package.name);
     try std.testing.expect(Routes.matchExtensionPackage("/extensions/v1/packages/memoryaf/versions/1.0.0") == null);
+    const control = Routes.matchExtensionSqlControl("/extensions/v1/packages/memoryaf/sql-control").?;
+    try std.testing.expectEqualStrings("memoryaf", control.name);
+    try std.testing.expect(Routes.matchExtensionSqlControl("/extensions/v1/packages//sql-control") == null);
+    try std.testing.expect(Routes.matchExtensionSqlControl("/extensions/v1/packages/sql-control") == null);
+    try std.testing.expect(Routes.matchExtensionSqlControl("/extensions/v1/packages/memoryaf/versions/sql-control") == null);
     const extension_package_version = Routes.matchExtensionPackageVersion("/extensions/v1/packages/memoryaf/versions/1.0.0").?;
     try std.testing.expectEqualStrings("memoryaf", extension_package_version.name);
     try std.testing.expectEqualStrings("1.0.0", extension_package_version.version);

@@ -1407,8 +1407,10 @@ pub fn create(b: *std.Build) ?Artifacts {
         &b.top_level_steps.get("inference-test").?.step,
         &b.top_level_steps.get("inference-finetune-test").?.step,
     });
-    const unit_gate = b.step("unit-test", "Run and audit all four unit ownership gates");
-    for ([_][]const u8{ "lib-test", "antfly-unit-test", "inference-test", "inference-finetune-test", "unit-test-inventory" }) |name|
+    const unit_gate = b.step("unit-test", "Run unit ownership gates and mandatory SQL extension contracts");
+    // Keep the exact audited extension owners in this same build DAG. Cache
+    // release below must see their shared compiler/linker/runtime consumers.
+    for ([_][]const u8{ "lib-test", "antfly-unit-test", "inference-test", "inference-finetune-test", "unit-test-inventory", "antfly-api-sql-extension-originals-test", "antfly-metadata-sql-extension-test", "sql-package-callable-test" }) |name|
         unit_gate.dependOn(&b.top_level_steps.get(name).?.step);
     if (strip) @import("pkg/antfly/build/runtime.zig").stripBuildGraph(b);
     @import("pkg/antfly/build/linked_tests.zig").finalizeNativeLinks(b);

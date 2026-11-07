@@ -2447,6 +2447,13 @@ from .sql_notification import SQLNotification
 from .sql_notification_page import SQLNotificationPage
 from .sql_notification_poll_request import SQLNotificationPollRequest
 from .sql_numeric_modifier import SQLNumericModifier
+from .sql_package_argument import SQLPackageArgument
+from .sql_package_control import SQLPackageControl
+from .sql_package_default_control import SQLPackageDefaultControl
+from .sql_package_export import SQLPackageExport
+from .sql_package_scalar_type import SQLPackageScalarType
+from .sql_package_type import SQLPackageType
+from .sql_package_volatility import SQLPackageVolatility
 from .sql_parameter_descriptor import SQLParameterDescriptor
 from .sql_prepare_request import SQLPrepareRequest
 from .sql_prepared_execution_request import SQLPreparedExecutionRequest
@@ -4901,6 +4908,13 @@ __all__ = (
     "SQLNotificationPage",
     "SQLNotificationPollRequest",
     "SQLNumericModifier",
+    "SQLPackageArgument",
+    "SQLPackageControl",
+    "SQLPackageDefaultControl",
+    "SQLPackageExport",
+    "SQLPackageScalarType",
+    "SQLPackageType",
+    "SQLPackageVolatility",
     "SQLParameterDescriptor",
     "SQLPreparedExecutionRequest",
     "SQLPreparedResponse",

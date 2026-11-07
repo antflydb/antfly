@@ -1633,6 +1633,10 @@ pub const Program = struct {
     pub fn invokeRoutine(routine: *const @import("routine_bindings.zig").Resolved, alloc: Allocator, arguments: []const Datum, limits: EvalLimits) !Datum {
         if (arguments.len != routine.arguments.len) return error.InvalidSqlProgram;
         if (routine.strict) for (arguments) |argument| if (argument.sql_null) return .{};
+        if (routine.native_call) |call| {
+            if (limits.checkpoint) |check| try check(limits.checkpoint_context);
+            return call.invoke(call.ptr, alloc, arguments, limits);
+        }
         var context: Evaluator = .{ .program = routine.program, .alloc = alloc, .cells = arguments, .parameters = &.{}, .typed_parameters = arguments, .limits = limits };
         context.bytes = if (limits.effect_bytes) |bytes| bytes.* else 0;
         defer if (limits.effect_bytes) |bytes| {
@@ -5842,6 +5846,12 @@ const Evaluator = struct {
                         null_argument = null_argument or value.sql_null;
                     }
                     if (routine.strict and null_argument) break :blk .{};
+                    if (routine.native_call) |native_call| {
+                        if (self.limits.checkpoint) |check| try check(self.limits.checkpoint_context);
+                        const result = try native_call.invoke(native_call.ptr, self.alloc, arguments, self.limits);
+                        _ = try self.validateJson(result.value, 0);
+                        break :blk result;
+                    }
                     var callee = self.*;
                     callee.program = routine.program;
                     callee.cells = arguments;
@@ -10887,4 +10897,55 @@ test "SQL derived column reads share invocation work and byte admission with the
     try std.testing.expect(budget.output_bytes > 0);
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.readColumnValue(sa, value, descriptor, .identity, limits));
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(sa, &.{}, &.{}, limits));
+}
+
+test "SQL package native callbacks retain strict lazy typed execution and preparation-only lookup" {
+    const a = std.testing.allocator;
+    var body = try @import("compiler.zig").compileScalar(a, "NULL::bigint", .{});
+    defer body.deinit();
+    var shape = try bind(a, body.expression, &.{}, &.{}, .{});
+    defer shape.deinit();
+    const State = struct {
+        calls: usize = 0,
+        resolves: usize = 0,
+        routine: *@import("routine_bindings.zig").Resolved,
+        fn invoke(raw: *anyopaque, _: Allocator, args: []const Datum, _: EvalLimits) !Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (args.len != 1 or args[0].sql_null or args[0].value != .integer) return error.SqlTypeMismatch;
+            return .json(.{ .integer = args[0].value.integer + 1 });
+        }
+        fn resolve(raw: *anyopaque, _: Allocator, name: []const u8, _: []const @import("routine_bindings.zig").Argument) !*const @import("routine_bindings.zig").Resolved {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.resolves += 1;
+            if (!std.mem.eql(u8, name, "package_increment")) return error.SqlUndefinedFunction;
+            return self.routine;
+        }
+        fn canceled(_: ?*anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    var routine: @import("routine_bindings.zig").Resolved = .{ .id = 7, .generation = 1, .arguments = &.{.{ .kind = .integer, .element_type = .int64 }}, .output = .{ .kind = .integer, .element_type = .int64 }, .program = &shape, .strict = true };
+    var state: State = .{ .routine = &routine };
+    routine.native_call = .{ .ptr = &state, .invoke = State.invoke };
+    const queries = [_]struct { sql: []const u8, expected: ?i64, calls: usize }{
+        .{ .sql = "package_increment(5)", .expected = 6, .calls = 1 },
+        .{ .sql = "package_increment(NULL)", .expected = null, .calls = 0 },
+        .{ .sql = "CASE WHEN false THEN package_increment(5) ELSE 9 END", .expected = 9, .calls = 0 },
+    };
+    for (queries) |query| {
+        var compiled = try @import("compiler.zig").compileScalar(a, query.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{}, &.{}, .{ .routines = .{ .ptr = &state, .resolve = State.resolve } });
+        defer program.deinit();
+        const before = state.calls;
+        const resolves = state.resolves;
+        const value = try program.evaluate(a, &.{}, &.{}, .{});
+        if (query.expected) |expected| try std.testing.expectEqual(expected, value.value.integer) else try std.testing.expect(value.sql_null);
+        try std.testing.expectEqual(before + query.calls, state.calls);
+        try std.testing.expectEqual(resolves, state.resolves);
+    }
+    const before = state.calls;
+    try std.testing.expectError(error.Canceled, Program.invokeRoutine(&routine, a, &.{.json(.{ .integer = 1 })}, .{ .checkpoint = State.canceled }));
+    try std.testing.expectEqual(before, state.calls);
 }

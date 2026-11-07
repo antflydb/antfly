@@ -117,6 +117,17 @@ pub const Admission = struct {
     }
 };
 pub const Rejection = enum {
+    SqlDuplicateExtension,
+    SqlUndefinedExtension,
+    SqlExtensionUnavailable,
+    SqlExtensionVersionUnavailable,
+    SqlExtensionUpdatePathUnavailable,
+    SqlRequiredExtensionNotInstalled,
+    SqlDependentExtensionObject,
+    SqlExtensionDependencyCycle,
+    SqlExtensionOwnedObject,
+    SqlExtensionSchemaMismatch,
+    InvalidSqlExtensionRecord,
     CatalogAuthorizationAdmissionRequired,
     CatalogIdExhausted,
     CatalogRoutineAdmissionRequired,

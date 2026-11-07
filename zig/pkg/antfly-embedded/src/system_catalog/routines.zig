@@ -74,11 +74,37 @@ pub const AggregateDefinition = struct {
     }
 };
 pub const FunctionUse = struct { reference: FunctionReference, arguments: []const Type, result: Type };
+/// Immutable package-owned scalar export. Only extension installation may
+/// author this binding; a SQL body cannot manufacture runtime authority.
+pub const WasmBinding = struct {
+    package_name: []const u8,
+    package_version: []const u8,
+    package_digest: [32]u8,
+    artifact: []const u8,
+    artifact_digest: [32]u8,
+    runtime_name: []const u8,
+    entrypoint: []const u8,
+    export_name: []const u8,
+    pub fn validate(self: @This()) !void {
+        for ([_][]const u8{ self.package_name, self.package_version, self.runtime_name, self.export_name }) |name| {
+            if (name.len == 0 or name.len > 255 or std.mem.indexOfScalar(u8, name, 0) != null or !std.unicode.utf8ValidateSlice(name)) return error.InvalidSqlRoutineRecord;
+        }
+        if (std.mem.allEqual(u8, &self.package_digest, 0) or std.mem.allEqual(u8, &self.artifact_digest, 0) or
+            !std.mem.eql(u8, self.entrypoint, "antfly_extension_call_tool") or self.artifact.len == 0 or self.artifact.len > 4096 or self.artifact[0] == '/') return error.InvalidSqlRoutineRecord;
+        var parts = std.mem.splitScalar(u8, self.artifact, '/');
+        while (parts.next()) |part| {
+            if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.InvalidSqlRoutineRecord;
+            for (part) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.')) return error.InvalidSqlRoutineRecord;
+        }
+    }
+};
+
 pub const Definition = struct {
     arguments: []const Argument,
     result: ?Type = null,
     returns_trigger: bool = false,
-    language: enum { sql, plpgsql } = .sql,
+    language: enum { sql, plpgsql, wasm } = .sql,
+    wasm: ?WasmBinding = null,
     body: []const u8,
     function_reference: ?FunctionReference = null,
     aggregate: ?AggregateDefinition = null,
@@ -86,8 +112,12 @@ pub const Definition = struct {
     volatility: Volatility = .@"volatile",
     owner: @import("owners.zig").Owner,
     pub fn validate(self: Definition) !void {
-        if (self.arguments.len > max_arguments or (self.body.len == 0 and self.function_reference == null) or self.body.len > max_body_bytes or
+        if (self.arguments.len > max_arguments or (self.body.len == 0 and self.function_reference == null and self.wasm == null) or self.body.len > max_body_bytes or
             !std.unicode.utf8ValidateSlice(self.body) or std.mem.indexOfScalar(u8, self.body, 0) != null) return error.InvalidSqlRoutineRecord;
+        if (self.wasm) |binding| {
+            try binding.validate();
+            if (self.language != .wasm or self.body.len != 0 or self.returns_trigger or self.result == null or self.function_reference != null or self.aggregate != null) return error.InvalidSqlRoutineRecord;
+        } else if (self.language == .wasm) return error.InvalidSqlRoutineRecord;
         if (self.returns_trigger and (self.result != null or self.arguments.len != 0 or self.language != .plpgsql or self.function_reference != null or self.aggregate != null)) return error.InvalidSqlRoutineRecord;
         if (self.function_reference) |reference| try reference.validate();
         if (self.aggregate) |aggregate| try aggregate.validate();
@@ -108,7 +138,7 @@ pub const Definition = struct {
         }
     }
     pub fn nativeJsonSkipField(self: Definition, comptime field: []const u8) bool {
-        return std.mem.eql(u8, field, "returns_trigger") and !self.returns_trigger;
+        return (std.mem.eql(u8, field, "returns_trigger") and !self.returns_trigger) or (std.mem.eql(u8, field, "wasm") and self.wasm == null);
     }
     pub fn jsonStringify(self: Definition, writer: anytype) !void {
         try writer.beginObject();
@@ -152,8 +182,8 @@ pub const Record = struct {
         if (self.version != 2 or self.id == 0 or self.generation == 0) return error.InvalidSqlRoutineRecord;
         try self.definition.validate();
         switch (self.kind) {
-            .function => if (self.definition.aggregate != null or self.definition.function_reference != null or (self.definition.result == null and !self.definition.returns_trigger) or (self.definition.language != .sql and !self.definition.returns_trigger)) return error.InvalidSqlRoutineRecord,
-            .procedure => if (self.definition.returns_trigger or self.definition.aggregate != null or self.definition.function_reference != null or self.definition.result != null or self.definition.strict or self.definition.volatility != .@"volatile") return error.InvalidSqlRoutineRecord,
+            .function => if (self.definition.aggregate != null or self.definition.function_reference != null or (self.definition.result == null and !self.definition.returns_trigger) or (self.definition.language != .sql and self.definition.language != .wasm and !self.definition.returns_trigger)) return error.InvalidSqlRoutineRecord,
+            .procedure => if (self.definition.wasm != null or self.definition.returns_trigger or self.definition.aggregate != null or self.definition.function_reference != null or self.definition.result != null or self.definition.strict or self.definition.volatility != .@"volatile") return error.InvalidSqlRoutineRecord,
             .operator => if (self.definition.aggregate != null or self.definition.function_reference == null or self.definition.body.len != 0 or self.definition.result == null or self.definition.arguments.len != 2 or self.definition.language != .sql or self.definition.strict) return error.InvalidSqlRoutineRecord,
             .aggregate => {
                 if (self.definition.aggregate == null or self.definition.function_reference == null or self.definition.body.len != 0 or self.definition.result == null or self.definition.arguments.len == 0 or self.definition.arguments.len >= max_arguments or self.definition.language != .sql or self.definition.strict) return error.InvalidSqlRoutineRecord;
@@ -401,4 +431,28 @@ test "SQL routine overload selection uses PostgreSQL exact preferred and unknown
     const text = headers ++ [_]Header{.{ .id = 5, .signature = "text" }};
     try std.testing.expectEqual(@as(u64, 5), (try choose(a, &text, &.{.{ .unknown_literal = true }})).?.id);
     try std.testing.expectError(error.SqlAmbiguousFunction, choose(a, headers[0..2], &.{.{ .unknown_literal = true }}));
+}
+
+test "SQL WASM catalog bindings require immutable package digests and closed scalar declarations" {
+    const binding: WasmBinding = .{ .package_name = "test", .package_version = "1", .package_digest = @splat(1), .artifact = "lib/scalar.wasm", .artifact_digest = @splat(2), .runtime_name = "pure", .entrypoint = "antfly_extension_call_tool", .export_name = "increment" };
+    const valid: Definition = .{ .arguments = &.{}, .result = .{ .scalar = .int64 }, .language = .wasm, .wasm = binding, .body = "", .owner = .auth_disabled };
+    try valid.validate();
+    var bad = valid;
+    bad.wasm = null;
+    try std.testing.expectError(error.InvalidSqlRoutineRecord, bad.validate());
+    bad = valid;
+    bad.body = "SELECT 1";
+    try std.testing.expectError(error.InvalidSqlRoutineRecord, bad.validate());
+    bad = valid;
+    bad.wasm.?.artifact_digest = @splat(0);
+    try std.testing.expectError(error.InvalidSqlRoutineRecord, bad.validate());
+    bad = valid;
+    bad.wasm.?.artifact = "../outside.wasm";
+    try std.testing.expectError(error.InvalidSqlRoutineRecord, bad.validate());
+    bad = valid;
+    bad.wasm.?.entrypoint = "host-write";
+    try std.testing.expectError(error.InvalidSqlRoutineRecord, bad.validate());
+    bad = valid;
+    bad.returns_trigger = true;
+    try std.testing.expectError(error.InvalidSqlRoutineRecord, bad.validate());
 }

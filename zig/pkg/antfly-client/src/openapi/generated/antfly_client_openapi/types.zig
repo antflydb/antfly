@@ -43153,6 +43153,7 @@ pub const PackageManifest = struct {
     dependencies: ?[]const PackageDependency = null,
     artifacts: ?[]const PackageArtifact = null,
     install: InstallManifest,
+    sql: ?SQLPackageControl = null,
     updates: ?[]const UpdateManifestRef = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -43171,6 +43172,7 @@ pub const PackageManifest = struct {
         .{ "dependencies", "dependencies", true },
         .{ "artifacts", "artifacts", true },
         .{ "install", "install", false },
+        .{ "sql", "sql", true },
         .{ "updates", "updates", true },
     };
 
@@ -43228,6 +43230,10 @@ pub const PackageManifest = struct {
         }
         try jw.objectField("install");
         try jw.write(self.install);
+        if (self.sql) |value| {
+            try jw.objectField("sql");
+            try jw.write(value);
+        }
         if (self.updates) |value| {
             try jw.objectField("updates");
             try jw.write(value);
@@ -54074,6 +54080,7 @@ pub const SQLCatalogObjectKind = enum {
     tablespace,
     query_source,
     view,
+    extension,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -54092,6 +54099,7 @@ pub const SQLCatalogObjectKind = enum {
             .tablespace => "tablespace",
             .query_source => "query_source",
             .view => "view",
+            .extension => "extension",
         };
         try jw.write(s);
     }
@@ -54117,6 +54125,7 @@ pub const SQLCatalogObjectKind = enum {
             .{ "tablespace", .tablespace },
             .{ "query_source", .query_source },
             .{ "view", .view },
+            .{ "extension", .extension },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -54927,6 +54936,317 @@ pub const SQLNotificationPollRequest = struct {
 pub const SQLNumericModifier = struct {
     precision: i64,
     scale: i64,
+};
+
+pub const SQLPackageArgument = struct {
+    name: OpenApiOptionalNullable([]const u8) = .absent,
+    type: SQLPackageType,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        switch (self.name) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("name");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("name");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
+};
+
+/// Database-scoped SQL installation over the existing owned package registry. Requires embedded_db scope, SHA256-bound core WASM artifacts, no other install objects/shapes and no host capabilities. Familiar package names imply no upstream extension payload.
+pub const SQLPackageControl = struct {
+    /// Initial package-level default intent used only when the first SQL version is registered. Later defaults are explicit digest-bound operator promotions; version names are opaque.
+    default_version: []const u8,
+    /// Optional fixed installation namespace; requires relocatable false.
+    schema: OpenApiOptionalNullable([]const u8) = .absent,
+    exports: []const SQLPackageExport,
+    /// Predecessor versions supported by this version's declarative typed-export transition, separate from REST update scripts.
+    updates_from: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "default_version", "default_version", false },
+        .{ "schema", "schema", false },
+        .{ "exports", "exports", false },
+        .{ "updates_from", "updates_from", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("default_version");
+        try jw.write(self.default_version);
+        switch (self.schema) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("schema");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("schema");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("exports");
+        try jw.write(self.exports);
+        if (self.updates_from) |value| {
+            try jw.objectField("updates_from");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Current global SQL default selection. Retained promotion receipts remain private to durable metadata and checkpoints.
+pub const SQLPackageDefaultControl = struct {
+    name: ExtensionIdentifier,
+    identity: []const i64,
+    generation: i64,
+    default_version: []const u8,
+    /// Null while the initial declared target has not been registered. Explicit promotions always bind an immutable SHA256 target digest.
+    default_digest: ?[]const i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "identity", "identity", false },
+        .{ "generation", "generation", false },
+        .{ "default_version", "default_version", false },
+        .{ "default_digest", "default_digest", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        try jw.objectField("generation");
+        try jw.write(self.generation);
+        try jw.objectField("default_version");
+        try jw.write(self.default_version);
+        try jw.objectField("default_digest");
+        try jw.write(self.default_digest);
+        try jw.endObject();
+    }
+};
+
+/// A pure scalar SQL function implemented by the declared immutable core WASM runtime; no host capabilities or native-library fallback.
+pub const SQLPackageExport = struct {
+    name: []const u8,
+    runtime: ExtensionIdentifier,
+    /// Tool selector passed to antfly_extension_call_tool.
+    export_name: []const u8,
+    arguments: ?[]const SQLPackageArgument = null,
+    result: SQLPackageType,
+    strict: ?bool = null,
+    volatility: ?SQLPackageVolatility = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "runtime", "runtime", false },
+        .{ "export_name", "export_name", false },
+        .{ "arguments", "arguments", true },
+        .{ "result", "result", false },
+        .{ "strict", "strict", true },
+        .{ "volatility", "volatility", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("runtime");
+        try jw.write(self.runtime);
+        try jw.objectField("export_name");
+        try jw.write(self.export_name);
+        if (self.arguments) |value| {
+            try jw.objectField("arguments");
+            try jw.write(value);
+        }
+        try jw.objectField("result");
+        try jw.write(self.result);
+        if (self.strict) |value| {
+            try jw.objectField("strict");
+            try jw.write(value);
+        }
+        if (self.volatility) |value| {
+            try jw.objectField("volatility");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Exact native SQL callable scalar domains, preserving integer widths and temporal/range identities.
+pub const SQLPackageScalarType = enum {
+    text,
+    uuid,
+    int16,
+    int32,
+    int64,
+    float32,
+    float64,
+    boolean,
+    jsonb,
+    numeric,
+    date,
+    time,
+    time_tz,
+    timestamp,
+    timestamp_tz,
+    interval,
+    numrange,
+    daterange,
+    tsrange,
+    tstzrange,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .uuid => "uuid",
+            .int16 => "int16",
+            .int32 => "int32",
+            .int64 => "int64",
+            .float32 => "float32",
+            .float64 => "float64",
+            .boolean => "boolean",
+            .jsonb => "jsonb",
+            .numeric => "numeric",
+            .date => "date",
+            .time => "time",
+            .time_tz => "time_tz",
+            .timestamp => "timestamp",
+            .timestamp_tz => "timestamp_tz",
+            .interval => "interval",
+            .numrange => "numrange",
+            .daterange => "daterange",
+            .tsrange => "tsrange",
+            .tstzrange => "tstzrange",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "uuid", .uuid },
+            .{ "int16", .int16 },
+            .{ "int32", .int32 },
+            .{ "int64", .int64 },
+            .{ "float32", .float32 },
+            .{ "float64", .float64 },
+            .{ "boolean", .boolean },
+            .{ "jsonb", .jsonb },
+            .{ "numeric", .numeric },
+            .{ "date", .date },
+            .{ "time", .time },
+            .{ "time_tz", .time_tz },
+            .{ "timestamp", .timestamp },
+            .{ "timestamp_tz", .timestamp_tz },
+            .{ "interval", .interval },
+            .{ "numrange", .numrange },
+            .{ "daterange", .daterange },
+            .{ "tsrange", .tsrange },
+            .{ "tstzrange", .tstzrange },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const SQLPackageType = struct {
+    scalar: SQLPackageScalarType,
+    /// Arrays support text, uuid, int16, int32, int64, float32, float64, boolean, jsonb and numeric. Other scalar domains require false.
+    array: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "scalar", "scalar", false },
+        .{ "array", "array", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("scalar");
+        try jw.write(self.scalar);
+        if (self.array) |value| {
+            try jw.objectField("array");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const SQLPackageVolatility = enum {
+    immutable,
+    stable,
+    @"volatile",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .immutable => "immutable",
+            .stable => "stable",
+            .@"volatile" => "volatile",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "immutable", .immutable },
+            .{ "stable", .stable },
+            .{ "volatile", .@"volatile" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint. Bytea arguments are PostgreSQL bytea input strings; use hex text (a backslash followed by x and hexadecimal octets) for arbitrary binary data. SQL NULL remains a null cell.

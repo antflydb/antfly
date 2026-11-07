@@ -834,6 +834,7 @@ const LocalStandaloneMetadata = struct {
         tables: []const antfly.metadata.TableRecord = &.{},
         ranges: []const antfly.metadata.RangeRecord = &.{},
         extension_packages: []const antfly.extensions.PackageManifest = &.{},
+        sql_extension_controls: []const antfly.extensions.sql_package.PackageControl = &.{},
         installed_extensions: []const antfly.extensions.InstalledExtension = &.{},
         extension_members: []const antfly.extensions.ExtensionMember = &.{},
         extension_dependencies: []const antfly.extensions.ExtensionDependency = &.{},
@@ -2003,6 +2004,8 @@ const LocalStandaloneMetadata = struct {
         errdefer self.manager.freeRanges(self.alloc, ranges);
         const extension_packages = try self.extension_catalog.listPackages(self.alloc);
         errdefer self.extension_catalog.freePackages(self.alloc, extension_packages);
+        const sql_extension_controls = try self.extension_catalog.listSqlControls(self.alloc);
+        errdefer self.extension_catalog.freeSqlControls(self.alloc, sql_extension_controls);
         const installed_extensions = try self.extension_catalog.listInstalled(self.alloc);
         errdefer self.extension_catalog.freeInstalled(self.alloc, installed_extensions);
         const extension_members = try self.extension_catalog.listMembers(self.alloc);
@@ -2064,6 +2067,7 @@ const LocalStandaloneMetadata = struct {
             .stores = stores,
             .placement_intents = placement_intents,
             .extension_packages = extension_packages,
+            .sql_extension_controls = sql_extension_controls,
             .installed_extensions = installed_extensions,
             .extension_members = extension_members,
             .extension_dependencies = extension_dependencies,
@@ -2378,6 +2382,7 @@ const LocalStandaloneMetadata = struct {
         self.alloc.free(snapshot.stores);
         self.alloc.free(snapshot.placement_intents);
         self.extension_catalog.freePackages(self.alloc, snapshot.extension_packages);
+        self.extension_catalog.freeSqlControls(self.alloc, snapshot.sql_extension_controls);
         self.extension_catalog.freeInstalled(self.alloc, snapshot.installed_extensions);
         self.extension_catalog.freeMembers(self.alloc, snapshot.extension_members);
         self.extension_catalog.freeDependencies(self.alloc, snapshot.extension_dependencies);
@@ -3959,6 +3964,7 @@ const LocalStandaloneMetadata = struct {
                     .ranges = ranges,
                     .system_catalog = self.systemCatalogState(),
                     .extension_packages = self.extension_catalog.packages.items,
+                    .sql_extension_controls = self.extension_catalog.sql_controls.items,
                     .installed_extensions = self.extension_catalog.installed.items,
                     .extension_members = self.extension_catalog.members.items,
                     .extension_dependencies = self.extension_catalog.dependencies.items,
@@ -4321,6 +4327,36 @@ const LocalStandaloneMetadata = struct {
                 if (!context.setting_admin) return error.Forbidden;
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
                 return store.sqlTriggerSnapshot(alloc, group_ids.main_metadata_group_id, request, context);
+            },
+            .sql_extension_snapshot => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlExtensionSnapshot(alloc, group_ids.main_metadata_group_id, request, context);
+            },
+            .sql_extension_outcome => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlExtensionOutcome(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .sql_extension_mutate => |request| {
+                const routines = @import("../system_catalog/sql_extensions.zig");
+                if (!context.setting_admin) return error.Forbidden;
+                try request.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
+                const command = routines.command(request);
+                if (store.prepareSystemCatalogResult(alloc, group_ids.main_metadata_group_id, command)) |preview| {
+                    alloc.free(preview);
+                } else |err| {
+                    if (routines.Outcome.fromError(err) == null) return err;
+                }
+                const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+                defer alloc.free(bytes);
+                if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+                try context.ensureActive();
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_system_catalog = bytes }) catch return error.MetadataMutationOutcomeUnknown;
+                self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                return store.sqlExtensionOutcome(alloc, group_ids.main_metadata_group_id, try routines.observation(alloc, request)) catch error.MetadataMutationOutcomeUnknown;
             },
             .sql_routine_snapshot => |request| {
                 if (!context.setting_admin) return error.Forbidden;
@@ -5930,20 +5966,27 @@ const LocalStandaloneMetadata = struct {
             self.extension_catalog.members.items,
             self.extension_catalog.dependencies.items,
         );
+        try catalog.loadSqlControls(self.extension_catalog.sql_controls.items);
         return catalog;
     }
 
     fn syncExtensionPackageStore(self: *LocalStandaloneMetadata, io: std.Io, root_path: []const u8) !usize {
         const entries = try antfly.extensions.scanPackageStoreAlloc(self.alloc, io, root_path);
         defer antfly.extensions.freePackageStoreEntries(self.alloc, entries);
+        const promotions = try antfly.extensions.scanSqlControlPromotionsAlloc(self.alloc, io, root_path);
+        defer antfly.extensions.freeSqlControlPromotions(self.alloc, promotions);
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        var mutation = if (entries.len > 0) try self.beginCatalogMutationLocked() else null;
+        var mutation = if (entries.len > 0 or promotions.len > 0) try self.beginCatalogMutationLocked() else null;
         defer if (mutation) |*active| active.deinit(self);
         if (mutation) |*active| try active.extensions(self);
         for (entries) |entry| try self.extension_catalog.registerPackage(entry.manifest);
-        if (entries.len > 0) {
+        // This is the existing operator-owned package-store sync, not a SQL
+        // database administrator path. One native catalog mutation preserves
+        // the promoted pointer and its retained nonce receipts together.
+        for (promotions) |request| try self.extension_catalog.promoteSqlDefault(request);
+        if (entries.len > 0 or promotions.len > 0) {
             self.epoch +|= 1;
             try mutation.?.commit(self);
         }
@@ -6179,6 +6222,7 @@ const LocalStandaloneMetadata = struct {
         const loaded = try self.manager.replaceProjectedTopology(tables.items, ranges.items);
         if (loaded.skipped_orphan_ranges != 0) return error.InvalidCatalogRecord;
         try self.extension_catalog.loadProjectedRows(extensions.extension_packages, extensions.installed_extensions, extensions.extension_members, extensions.extension_dependencies);
+        try self.extension_catalog.loadSqlControls(extensions.sql_extension_controls);
         self.system_catalog_state = try system_catalog.MutableState.clone(self.alloc, .{
             .revision = head.value.revision,
             .next_id = head.value.next_id,
@@ -6249,6 +6293,7 @@ const LocalStandaloneMetadata = struct {
             parsed.value.extension_members,
             parsed.value.extension_dependencies,
         );
+        try self.extension_catalog.loadSqlControls(parsed.value.sql_extension_controls);
         const state = try system_catalog.MutableState.clone(self.alloc, parsed.value.system_catalog);
         if (self.system_catalog_state) |*old| old.deinit();
         self.system_catalog_state = state;
@@ -6542,6 +6587,7 @@ const LocalStandaloneMetadata = struct {
     fn auxiliaryCatalogAlloc(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator) ![]u8 {
         return std.json.Stringify.valueAlloc(alloc, PersistedCatalog{
             .extension_packages = self.extension_catalog.packages.items,
+            .sql_extension_controls = self.extension_catalog.sql_controls.items,
             .installed_extensions = self.extension_catalog.installed.items,
             .extension_members = self.extension_catalog.members.items,
             .extension_dependencies = self.extension_catalog.dependencies.items,
@@ -6700,6 +6746,7 @@ const LocalStandaloneMetadata = struct {
         }
         if (!self.catalog_rows_initialized or mutation.previous_extensions != null) try putCatalogRow(self.alloc, &txn, .{ .extensions = .{
             .extension_packages = self.extension_catalog.packages.items,
+            .sql_extension_controls = self.extension_catalog.sql_controls.items,
             .installed_extensions = self.extension_catalog.installed.items,
             .extension_members = self.extension_catalog.members.items,
             .extension_dependencies = self.extension_catalog.dependencies.items,

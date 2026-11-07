@@ -31,6 +31,7 @@ export const sqlCatalogObjectKinds = [
   "tablespace",
   "query_source",
   "view",
+  "extension",
 ] as const;
 
 export const sqlCatalogOperationKinds = ["create", "alter", "rename", "drop"] as const;

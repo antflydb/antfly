@@ -290,6 +290,7 @@ pub const SystemCatalogCommand = struct {
     sql_relation: ?@import("../../system_catalog/relations.zig").Prepared = null,
     sql_catalog_admission: ?@import("../../system_catalog/catalog_mutations.zig").Admission = null,
     sql_native_index: ?@import("../../system_catalog/native_indexes.zig").Mutation = null,
+    sql_extension: ?@import("../../system_catalog/sql_extensions.zig").Mutation = null,
     sql_routine: ?@import("../../system_catalog/routines.zig").Mutation = null,
     sql_type: ?@import("../../system_catalog/named_types.zig").Mutation = null,
     sql_authorization: ?@import("../../system_catalog/authorization.zig").Mutation = null,
@@ -309,7 +310,7 @@ pub const SystemCatalogCommand = struct {
             if (self.version == creation_sources_version) return error.InvalidCatalogMutation;
             return;
         }
-        if (self.version != creation_sources_version or self.mutation.kind != .table or self.mutation.action != .create or self.topology == null or self.topology.? != .create or self.placement_update != null or self.sql_view != null or self.sql_sequence != null or self.sql_routine != null or self.sql_type != null or self.sql_cast != null or self.sql_authorization != null or self.sql_native_index != null) return error.InvalidCatalogMutation;
+        if (self.version != creation_sources_version or self.mutation.kind != .table or self.mutation.action != .create or self.topology == null or self.topology.? != .create or self.placement_update != null or self.sql_view != null or self.sql_sequence != null or self.sql_extension != null or self.sql_routine != null or self.sql_type != null or self.sql_cast != null or self.sql_authorization != null or self.sql_native_index != null) return error.InvalidCatalogMutation;
     }
 
     pub fn jsonStringify(self: SystemCatalogCommand, writer: anytype) !void {
@@ -322,6 +323,7 @@ pub const SystemCatalogCommand = struct {
         if (self.sql_authorization != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_authorization = self.sql_authorization });
         if (self.sql_type != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_type = self.sql_type });
         if (self.sql_cast != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_cast = self.sql_cast });
+        if (self.sql_extension != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_extension = self.sql_extension });
         if (self.sql_routine != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_routine = self.sql_routine });
         if (self.column_sequences.len != 0) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view, .sql_sequence = self.sql_sequence, .column_sequences = self.column_sequences });
         if (self.sql_sequence != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view, .sql_sequence = self.sql_sequence });
@@ -377,6 +379,8 @@ pub const TriggerPolicySchemaPreparation = struct {
 };
 
 pub const CatalogProjectionRequest = union(enum) {
+    sql_extension_snapshot: @import("../../system_catalog/sql_extensions.zig").SnapshotRequest,
+    sql_extension_outcome: @import("../../system_catalog/sql_extensions.zig").OutcomeRequest,
     read_store: struct { store_id: u64, reports: bool },
     read_store_group_facts: u64,
     read_store_report_targets: struct { store_id: u64, group_ids: []const u64, full: bool, include_runtime: bool },

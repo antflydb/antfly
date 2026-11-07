@@ -73,6 +73,7 @@ pub const Owner = struct {
     declaration_cuts: std.StringHashMapUnmanaged(routines.Snapshot) = .empty,
     settings: ?local.sql_setting_catalog.View = null,
     depth: usize = 0,
+    wasm_modules: std.ArrayListUnmanaged(*WasmModule) = .empty,
     /// Preparation-only observation of the actual pinned callable declarations.
     /// The observer cannot resolve or execute anything at the row receiver.
     capture_observer: ?struct { ptr: *anyopaque, observe: *const fn (*anyopaque, routines.Snapshot, routines.Snapshot.Found, ?[]const u8) anyerror!void } = null,
@@ -92,6 +93,7 @@ pub const Owner = struct {
     }
     pub fn deinit(self: *Owner) void {
         const control = self.control;
+        self.deinitWasmModules();
         if (self.settings) |*settings| settings.deinit();
         self.arena.deinit();
         self.memory.deinit();
@@ -246,7 +248,7 @@ pub const Owner = struct {
         self.depth += 1;
         defer self.depth -= 1;
         try self.captureSettings(a);
-        const ready = try native.prepare(a, found.record, self.resolverFor(dynamic), if (self.settings) |*settings| settings else null);
+        const ready = try self.prepareBody(found.record, dynamic);
         try self.bodies.put(a, identity, ready);
         return ready;
     }
@@ -334,6 +336,117 @@ pub const Owner = struct {
     fn lookup(self: *Owner, name: []const u8, arguments: []const native.bindings.Argument, dynamic: bool) !*const native.bindings.Resolved {
         return self.lookupKind(name, arguments, .function, dynamic);
     }
+    const WasmModule = struct {
+        runtime: @import("../extensions/wasmtime_runtime.zig").PreparedSql,
+        reservation: local.storage_resource_manager.Reservation,
+        binding: routines.records.WasmBinding,
+        fn matches(self: *const @This(), binding: routines.records.WasmBinding) bool {
+            return std.mem.eql(u8, &self.binding.package_digest, &binding.package_digest) and
+                std.mem.eql(u8, &self.binding.artifact_digest, &binding.artifact_digest) and
+                std.mem.eql(u8, self.binding.runtime_name, binding.runtime_name) and
+                std.mem.eql(u8, self.binding.entrypoint, binding.entrypoint);
+        }
+    };
+    const WasmCall = struct {
+        module: *WasmModule,
+        export_name: []const u8,
+        arguments: []const routines.records.Argument,
+        output: routines.records.Type,
+        const Value = struct { sql_null: bool = false, text: ?[]const u8 = null };
+        const Input = struct { type: routines.records.Type, sql_null: bool, text: ?[]const u8 };
+        fn invoke(raw: *anyopaque, a: A, args: []const local.sql_scalar.Datum, limits: local.sql_scalar.EvalLimits) !local.sql_scalar.Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (args.len != self.arguments.len) return error.InvalidSqlProgram;
+            if (limits.checkpoint) |check| try check(limits.checkpoint_context);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const temp = scratch.allocator();
+            const inputs = try temp.alloc(Input, args.len);
+            for (args, self.arguments, inputs) |datum, declared, *input| {
+                const descriptor = native.runtimeType(declared.type);
+                const admitted = try local.sql_describe.coerceDatumTyped(temp, datum, descriptor);
+                const value = try local.sql_scalar.assignText(temp, admitted, descriptor.element_type, limits);
+                if (!value.sql_null and value.value != .string) return error.SqlTypeMismatch;
+                input.* = .{ .type = declared.type, .sql_null = value.sql_null, .text = if (value.sql_null) null else value.value.string };
+            }
+            const request = try std.json.Stringify.valueAlloc(temp, .{ .version = @as(u16, 1), .arguments = inputs, .result = self.output }, .{});
+            if (request.len > limits.input_bytes) return error.SqlProgramLimitExceeded;
+            const reply = try self.module.runtime.invokeExport(temp, self.export_name, request);
+            if (limits.checkpoint) |check| try check(limits.checkpoint_context);
+            if (reply.len > limits.output_bytes) return error.SqlProgramLimitExceeded;
+            return decodeResult(a, self.output, reply, limits);
+        }
+        fn decodeResult(a: A, output: routines.records.Type, reply: []const u8, limits: local.sql_scalar.EvalLimits) !local.sql_scalar.Datum {
+            if (reply.len > limits.output_bytes or reply.len > @import("../extensions/wasmtime_runtime.zig").PreparedSql.max_json_bytes) return error.SqlProgramLimitExceeded;
+            var parsed = std.json.parseFromSlice(Value, a, reply, .{}) catch |err| return switch (err) {
+                error.OutOfMemory => err,
+                else => error.SqlTypeMismatch,
+            };
+            defer parsed.deinit();
+            if (parsed.value.sql_null) {
+                if (parsed.value.text != null) return error.SqlTypeMismatch;
+                return .{};
+            }
+            const text = parsed.value.text orelse return error.SqlTypeMismatch;
+            var frame = try local.sql_parameter_frame.Frame.prepare(a, &.{native.runtimeType(output)}, &.{.{ .text = text }}, .{ .bytes = @min(limits.output_bytes, @import("../extensions/wasmtime_runtime.zig").PreparedSql.max_json_bytes) });
+            defer frame.deinit();
+            return local.sql_operators.cloneDatum(a, frame.values[0]);
+        }
+    };
+
+    fn deinitWasmModules(self: *Owner) void {
+        for (self.wasm_modules.items) |module| {
+            module.runtime.deinit();
+            module.reservation.release();
+            self.control.destroy(module);
+        }
+        self.wasm_modules.deinit(self.control);
+    }
+    fn prepareWasmModule(self: *Owner, binding: routines.records.WasmBinding) !*WasmModule {
+        try binding.validate();
+        return for (self.wasm_modules.items) |ready| {
+            if (ready.matches(binding)) break ready;
+        } else new_module: {
+            if (self.wasm_modules.items.len >= 4) return error.SqlProgramLimitExceeded;
+            const io = self.root.server.sharedApiIo() orelse return error.BackendRuntimeIoUnavailable;
+            const prepared = try self.control.create(WasmModule);
+            errdefer self.control.destroy(prepared);
+            const manager = self.root.server.shared_resource_manager orelse &self.root.server.local_resource_manager;
+            const policy = @import("../extensions/wasmtime_runtime.zig").PreparedSql;
+            var reservation = try manager.reserve(.sql_execution_working_set, policy.sql_memory_bytes);
+            errdefer reservation.release();
+            prepared.* = .{ .binding = binding, .reservation = reservation, .runtime = try policy.prepare(self.memory.allocator, binding, .{ .io = io, .package_store_root = self.root.server.cfg.extension_package_store_dir, .fuel = policy.sql_fuel, .max_memory_bytes = @intCast(policy.sql_memory_bytes) }) };
+            errdefer prepared.runtime.deinit();
+            // Multiplier one preserves ordinary host/slice hard limits. This
+            // is measured retained-code admission, never an oversized waiver.
+            const retained = try prepared.runtime.retainedBytes();
+            try reservation.growBoundedOversized(retained - policy.sql_memory_bytes, 1);
+            prepared.reservation = reservation;
+            try self.wasm_modules.append(self.control, prepared);
+            break :new_module prepared;
+        };
+    }
+    fn prepareBody(self: *Owner, record: routines.records.Record, dynamic: bool) !*const native.bindings.Resolved {
+        const a = self.arena.allocator();
+        const binding = record.definition.wasm orelse return native.prepare(a, record, self.resolverFor(dynamic), if (self.settings) |*settings| settings else null);
+        try record.validate();
+        const module = try self.prepareWasmModule(binding);
+        const call = try a.create(WasmCall);
+        call.* = .{ .module = module, .export_name = binding.export_name, .arguments = record.definition.arguments, .output = record.definition.result.? };
+        // Pure typed metadata remains usable by ordinary binder/effect
+        // accounting. The package callback is mandatory for execution; no
+        // storage/remote parser can manufacture this statement-owned pointer.
+        var shape = record;
+        shape.definition.language = .sql;
+        shape.definition.wasm = null;
+        shape.definition.body = "SELECT NULL";
+        const typed = try native.prepare(a, shape, self.resolverFor(dynamic), if (self.settings) |*settings| settings else null);
+        const resolved = try a.create(native.bindings.Resolved);
+        resolved.* = typed.*;
+        resolved.native_call = .{ .ptr = call, .invoke = WasmCall.invoke };
+        return resolved;
+    }
+
     fn lookupKind(self: *Owner, name: []const u8, arguments: []const native.bindings.Argument, kind: routines.records.Kind, dynamic: bool) !*const native.bindings.Resolved {
         const a = self.arena.allocator();
         try self.root.context.ensureActive();
@@ -349,7 +462,7 @@ pub const Owner = struct {
             return ready;
         }
         try self.captureSettings(a);
-        const ready = try native.prepare(a, record, self.resolverFor(dynamic), if (self.settings) |*settings| settings else null);
+        const ready = try self.prepareBody(record, dynamic);
         try self.bodies.put(a, identity, ready);
         try self.names.put(a, key, ready);
         return ready;
@@ -399,4 +512,98 @@ pub fn persistedResolver(root: *execution.Adapter) native.bindings.Resolver {
             return adapter.routine_owner.?.lookupCast(source, target, context, false, false);
         }
     }.reject };
+}
+
+test "SQL WASM typed callable JSON preserves null exact numbers arrays temporal and range domains" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { type: routines.records.Type, text: []const u8 }{
+        .{ .type = .{ .scalar = .text }, .text = "typed\nstring" },
+        .{ .type = .{ .scalar = .numeric }, .text = "9007199254740993.1200" },
+        .{ .type = .{ .scalar = .date }, .text = "2024-02-29" },
+        .{ .type = .{ .scalar = .timestamp_tz }, .text = "2024-01-01 12:30:00+00" },
+        .{ .type = .{ .scalar = .numrange }, .text = "[1.25,9007199254740993)" },
+        .{ .type = .{ .scalar = .int64, .array = true }, .text = "[-1:1]={1,NULL,9007199254740993}" },
+        .{ .type = .{ .scalar = .jsonb }, .text = "null" },
+    };
+    for (cases) |case| {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const temp = scratch.allocator();
+        var frame = try local.sql_parameter_frame.Frame.prepare(a, &.{native.runtimeType(case.type)}, &.{.{ .text = case.text }}, .{});
+        defer frame.deinit();
+        const encoded = try local.sql_scalar.assignText(temp, frame.values[0], native.runtimeType(case.type).element_type, .{});
+        const reply = try std.json.Stringify.valueAlloc(temp, Owner.WasmCall.Value{ .text = encoded.value.string }, .{});
+        const result = try Owner.WasmCall.decodeResult(temp, case.type, reply, .{});
+        try std.testing.expectEqual(std.math.Order.eq, try local.sql_scalar.compareDatums(frame.values[0], result));
+        try std.testing.expect(!result.sql_null);
+    }
+    try std.testing.expect((try Owner.WasmCall.decodeResult(a, .{ .scalar = .jsonb }, "{\"sql_null\":true}", .{})).sql_null);
+    try std.testing.expectError(error.SqlTypeMismatch, Owner.WasmCall.decodeResult(a, .{ .scalar = .int64 }, "{\"sql_null\":true,\"text\":\"7\"}", .{}));
+    try std.testing.expectError(error.SqlTypeMismatch, Owner.WasmCall.decodeResult(a, .{ .scalar = .int64 }, "{}", .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Owner.WasmCall.decodeResult(a, .{ .scalar = .text }, "{\"text\":\"large\"}", .{ .output_bytes = 1 }));
+}
+
+test "SQL WASM statement shares actual immutable modules across exports and retains one bounded reservation" {
+    const a = std.testing.allocator;
+    const runtime = @import("../extensions/wasmtime_runtime.zig");
+    const resources = local.storage_resource_manager;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const bytes = try runtime.test_support.markerModule(a, 1);
+    defer a.free(bytes);
+    const package_digest: [32]u8 = @splat(7);
+    const hex = std.fmt.bytesToHex(package_digest, .lower);
+    const directory = try std.fmt.allocPrint(a, "sha256/{s}", .{hex});
+    defer a.free(directory);
+    const path = try std.fmt.allocPrint(a, "{s}/marker.wasm", .{directory});
+    defer a.free(path);
+    try tmp.dir.createDirPath(std.testing.io, directory);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = bytes });
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    var binding: routines.records.WasmBinding = .{ .package_name = "test", .package_version = "1", .package_digest = package_digest, .artifact = "marker.wasm", .artifact_digest = digest, .runtime_name = "pure", .entrypoint = "antfly_extension_call_tool", .export_name = "first" };
+    var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 16 * 1024 * 1024 } });
+    defer manager.deinit(a);
+    // Exercise only the actual module admission helper. The fixture supplies
+    // its documented I/O/budget inputs, with no metadata/provider substitute.
+    var server: http.ApiHttpServer = undefined;
+    server.cfg.imported_runtime_io = .{ .api = std.testing.io };
+    server.cfg.extension_package_store_dir = root;
+    server.shared_resource_manager = &manager;
+    var adapter: execution.Adapter = undefined;
+    adapter.server = &server;
+    {
+        var owner: Owner = undefined;
+        owner.control = a;
+        owner.root = &adapter;
+        owner.memory = .{ .allocator = a, .ptr = undefined, .release = undefined };
+        owner.wasm_modules = .empty;
+        defer owner.deinitWasmModules();
+        const first = try owner.prepareWasmModule(binding);
+        const charged = try first.runtime.retainedBytes();
+        try std.testing.expect(first.runtime.compiled_image_bytes > 0);
+        try std.testing.expectEqual(runtime.PreparedSql.sql_memory_bytes + @as(u64, @intCast(bytes.len)) + first.runtime.compiled_image_bytes, charged);
+        try std.testing.expectEqual(@as(usize, 1), owner.wasm_modules.items.len);
+        try std.testing.expectEqual(charged, manager.sliceStats(.sql_execution_working_set).used_bytes);
+        try tmp.dir.deleteFile(std.testing.io, path);
+        binding.export_name = "second";
+        const second = try owner.prepareWasmModule(binding);
+        try std.testing.expect(first == second);
+        try std.testing.expectEqual(@as(usize, 1), owner.wasm_modules.items.len);
+        for ([_][]const u8{ "first", "second" }) |name| {
+            const reply = try second.runtime.invokeExport(a, name, "{\"arguments\":[{\"text\":\"5\"}]}");
+            defer a.free(reply);
+            try std.testing.expectEqualStrings("{\"sql_null\":false,\"text\":\"6\"}", reply);
+        }
+        try std.testing.expectEqual(charged, manager.sliceStats(.sql_execution_working_set).used_bytes);
+        // Different immutable content cannot borrow the first module or its
+        // credit. Admission fails before any unavailable artifact is opened.
+        binding.artifact_digest[0] ^= 1;
+        try std.testing.expectError(error.ResourceBudgetExceeded, owner.prepareWasmModule(binding));
+        try std.testing.expectEqual(@as(usize, 1), owner.wasm_modules.items.len);
+        try std.testing.expectEqual(charged, manager.sliceStats(.sql_execution_working_set).used_bytes);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.sql_execution_working_set).used_bytes);
 }

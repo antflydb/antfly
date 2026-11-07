@@ -6642,7 +6642,25 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (binding.has_user_data or binding.has_transaction_state) return error.RestoreSourceProofMissing;
         const pin = try persistence.PhysicalPin.fromBinding(binding);
         if (captured.signing.native_pin == null or !captured.signing.native_pin.?.eql(pin) or
-            !binding.descriptor.eql(descriptor.sql_persistence.?) or !std.mem.eql(u8, &binding.native_instance, &captured.boot.instance)) return error.SqlRelationOwnerChanged;
+            !binding.descriptor.eql(descriptor.sql_persistence.?) or !std.mem.eql(u8, &binding.native_instance, &captured.boot.instance))
+        {
+            if (comptime @import("builtin").mode == .debug) {
+                const Trace = struct {
+                    var count: std.atomic.Value(u8) = .init(0);
+                };
+                var observed = Trace.count.load(.monotonic);
+                const report = while (observed < 4) {
+                    observed = Trace.count.cmpxchgWeak(observed, observed + 1, .monotonic, .monotonic) orelse break true;
+                } else false;
+                if (report) std.debug.print("native restore acceptance actual_image_mismatch pin_present={} pin_equal={} descriptor_equal={} instance_equal={}\n", .{
+                    captured.signing.native_pin != null,
+                    if (captured.signing.native_pin) |expected_pin| expected_pin.eql(pin) else false,
+                    binding.descriptor.eql(descriptor.sql_persistence.?),
+                    std.mem.eql(u8, &binding.native_instance, &captured.boot.instance),
+                });
+            }
+            return error.SqlRelationOwnerChanged;
+        }
         var result: contract.Acceptance = .{
             .metadata_group_id = captured.metadata_group_id,
             .group_id = group,

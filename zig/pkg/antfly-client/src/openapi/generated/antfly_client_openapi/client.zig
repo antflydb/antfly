@@ -5686,6 +5686,17 @@ pub const Client = struct {
         return ApiResponse(types.PackageManifest).fromResponse(self.allocator, &resp);
     }
 
+    /// Get the explicit global SQL package default.
+    /// GET /extensions/v1/packages/{name}/sql-control
+    pub fn getExtensionSqlPackageControl(self: *@This(), name: []const u8) !ApiResponse(types.SQLPackageDefaultControl) {
+        const encoded_name = try httpx.PercentEncoding.encode(self.allocator, name);
+        defer self.allocator.free(encoded_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/packages/{s}/sql-control", .{ self.base_url, encoded_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.SQLPackageDefaultControl).fromResponse(self.allocator, &resp);
+    }
+
     /// Get a specific immutable package version.
     /// GET /extensions/v1/packages/{name}/versions/{version}
     pub fn getExtensionPackageVersion(self: *@This(), name: []const u8, version: []const u8) !ApiResponse(types.PackageManifest) {

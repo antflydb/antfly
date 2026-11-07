@@ -142,7 +142,7 @@ pub const Dependency = struct {
         switch (self.kind) {
             .table => {},
             .view => if (self.action == .rewrite) return error.InvalidScopeRetirement,
-            .sequence => if (self.action != .retire) return error.InvalidScopeRetirement,
+            .sequence, .extension => if (self.action != .retire) return error.InvalidScopeRetirement,
             .named_type => if (self.action != .hold) return error.InvalidScopeRetirement,
             .routine, .cast => if (self.action == .rewrite) return error.InvalidScopeRetirement,
             else => return error.InvalidScopeRetirement,

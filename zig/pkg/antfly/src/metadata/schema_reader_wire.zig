@@ -150,6 +150,10 @@ pub fn requiresSqlTriggerFunction(bytes: []const u8) bool {
     return requiresSqlRoutine(bytes) and requiresMarker(bytes, "returns_trigger");
 }
 
+pub fn requiresSqlExtension(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_extension");
+}
+
 pub fn requiresSqlRoutine(bytes: []const u8) bool {
     return requiresMarker(bytes, "sql_routine");
 }
@@ -650,4 +654,9 @@ test "SQL TRUNCATE preparation sender recognizes required source attachments wit
     try std.testing.expect(!requiresSqlTruncatePreparation(reset_job, affected));
     try std.testing.expect(!requiresSqlTruncatePreparation(sql_job, plain));
     try std.testing.expect(!requiresSqlTruncatePreparation("{\"source_kind\":\"query_population\"}", affected));
+}
+
+test "SQL extension decoder marker ignores source text and recognizes escaped keys" {
+    for ([_][]const u8{ "{}", "{\"source_json\":\"sql_extension\"}", "{\"sql_extension\":null}" }) |bytes| try std.testing.expect(!requiresSqlExtension(bytes));
+    for ([_][]const u8{ "{\"sql_extension\":{}}", "{\"sql_extens\\u0069on\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlExtension(bytes));
 }

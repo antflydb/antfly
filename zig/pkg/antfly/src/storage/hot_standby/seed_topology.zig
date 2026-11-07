@@ -59,6 +59,7 @@ pub const LogicalCatalog = struct {
     tables: []const topology_records.TableRecord,
     ranges: []const topology_records.RangeRecord,
     extension_packages: []const extensions.PackageManifest = &.{},
+    sql_extension_controls: []const extensions.sql_package.PackageControl = &.{},
     installed_extensions: []const extensions.InstalledExtension = &.{},
     extension_members: []const extensions.ExtensionMember = &.{},
     extension_dependencies: []const extensions.ExtensionDependency = &.{},
@@ -75,6 +76,7 @@ pub const LogicalCatalog = struct {
             .tables = source.tables,
             .ranges = source.ranges,
             .extension_packages = source.extension_packages,
+            .sql_extension_controls = source.sql_extension_controls,
             .installed_extensions = source.installed_extensions,
             .extension_members = source.extension_members,
             .extension_dependencies = source.extension_dependencies,
@@ -191,6 +193,11 @@ pub fn validate(
         topology.catalog.extension_members,
         topology.catalog.extension_dependencies,
     );
+    try extension_catalog.loadSqlControls(topology.catalog.sql_extension_controls);
+    for (topology.catalog.sql_extension_controls, 0..) |control, index| {
+        if (index > 0 and !std.mem.lessThan(u8, topology.catalog.sql_extension_controls[index - 1].name, control.name))
+            return error.NonCanonicalSeedTopology;
+    }
     for (topology.catalog.extension_packages, 0..) |package, index| {
         package.validate() catch return error.InvalidExtensionSeedCatalog;
         if (index > 0) {

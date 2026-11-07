@@ -6305,6 +6305,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/extensions/v1/packages/{name}/sql-control": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get the explicit global SQL package default. */
+        get: operations["getExtensionSqlPackageControl"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/extensions/v1/packages/{name}/versions/{version}": {
         parameters: {
             query?: never;
@@ -7838,7 +7855,7 @@ export interface components {
          * @description Catalog object affected by an exact recoverable operation.
          * @enum {string}
          */
-        SQLCatalogObjectKind: "sequence" | "function" | "procedure" | "operator" | "aggregate" | "cast" | "type" | "authorization" | "table" | "index" | "database" | "namespace" | "tablespace" | "query_source" | "view";
+        SQLCatalogObjectKind: "sequence" | "function" | "procedure" | "operator" | "aggregate" | "cast" | "type" | "authorization" | "table" | "index" | "database" | "namespace" | "tablespace" | "query_source" | "view" | "extension";
         /** @enum {string} */
         SQLCatalogOperationKind: "create" | "alter" | "rename" | "drop";
         /**
@@ -26257,6 +26274,61 @@ export interface components {
             /** @default {} */
             config_schema_json?: string;
         };
+        /**
+         * @description Exact native SQL callable scalar domains, preserving integer widths and temporal/range identities.
+         * @enum {string}
+         */
+        SQLPackageScalarType: "text" | "uuid" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "jsonb" | "numeric" | "date" | "time" | "time_tz" | "timestamp" | "timestamp_tz" | "interval" | "numrange" | "daterange" | "tsrange" | "tstzrange";
+        /** @enum {string} */
+        SQLPackageVolatility: "immutable" | "stable" | "volatile";
+        SQLPackageType: {
+            scalar: components["schemas"]["SQLPackageScalarType"];
+            /**
+             * @description Arrays support text, uuid, int16, int32, int64, float32, float64, boolean, jsonb and numeric. Other scalar domains require false.
+             * @default false
+             */
+            array?: boolean;
+        };
+        SQLPackageArgument: {
+            name?: string | null;
+            type: components["schemas"]["SQLPackageType"];
+        };
+        /** @description A pure scalar SQL function implemented by the declared immutable core WASM runtime; no host capabilities or native-library fallback. */
+        SQLPackageExport: {
+            name: string;
+            runtime: components["schemas"]["ExtensionIdentifier"];
+            /** @description Tool selector passed to antfly_extension_call_tool. */
+            export_name: string;
+            /** @default [] */
+            arguments?: components["schemas"]["SQLPackageArgument"][];
+            result: components["schemas"]["SQLPackageType"];
+            /** @default false */
+            strict?: boolean;
+            /** @default volatile */
+            volatility?: components["schemas"]["SQLPackageVolatility"];
+        };
+        /** @description Database-scoped SQL installation over the existing owned package registry. Requires embedded_db scope, SHA256-bound core WASM artifacts, no other install objects/shapes and no host capabilities. Familiar package names imply no upstream extension payload. */
+        SQLPackageControl: {
+            /** @description Initial package-level default intent used only when the first SQL version is registered. Later defaults are explicit digest-bound operator promotions; version names are opaque. */
+            default_version: string;
+            /** @description Optional fixed installation namespace; requires relocatable false. */
+            schema?: string | null;
+            exports: components["schemas"]["SQLPackageExport"][];
+            /**
+             * @description Predecessor versions supported by this version's declarative typed-export transition, separate from REST update scripts.
+             * @default []
+             */
+            updates_from?: string[];
+        };
+        /** @description Current global SQL default selection. Retained promotion receipts remain private to durable metadata and checkpoints. */
+        SQLPackageDefaultControl: {
+            name: components["schemas"]["ExtensionIdentifier"];
+            identity: number[];
+            generation: number;
+            default_version: string;
+            /** @description Null while the initial declared target has not been registered. Explicit promotions always bind an immutable SHA256 target digest. */
+            default_digest: number[] | null;
+        };
         PackageManifest: {
             /** @enum {string} */
             manifest_api_version: "extensions/v1";
@@ -26275,6 +26347,7 @@ export interface components {
             dependencies?: components["schemas"]["PackageDependency"][];
             artifacts?: components["schemas"]["PackageArtifact"][];
             install: components["schemas"]["InstallManifest"];
+            sql?: components["schemas"]["SQLPackageControl"];
             updates?: components["schemas"]["UpdateManifestRef"][];
         };
         InstalledExtension: {
@@ -46560,6 +46633,37 @@ export interface operations {
                 };
             };
             /** @description Package not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtensionError"];
+                };
+            };
+        };
+    };
+    getExtensionSqlPackageControl: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current SQL default selection, without private promotion receipts. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLPackageDefaultControl"];
+                };
+            };
+            /** @description SQL package control not found. */
             404: {
                 headers: {
                     [name: string]: unknown;

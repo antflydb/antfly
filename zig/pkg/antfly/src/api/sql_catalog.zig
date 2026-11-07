@@ -1180,6 +1180,12 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     if (input == .populate) return @import("sql_population.zig").execute(server, identity, context, database, namespace, allocators, input.populate, path);
     const alloc = allocators.result;
     try context.ensureActive();
+    if (input == .catalog_ddl and input.catalog_ddl.kind == .extension) {
+        var actor = identity;
+        var adapter: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = &actor, .context = context, .database = database, .namespace = namespace, .ddl_search_path = path };
+        defer adapter.releaseExecutionOwners();
+        return @import("sql_extension_ddl.zig").execute(&adapter, allocators, input.catalog_ddl);
+    }
     if (input == .catalog_ddl and (input.catalog_ddl.action == .maintenance or input.catalog_ddl.kind == .function or input.catalog_ddl.kind == .procedure or input.catalog_ddl.kind == .operator or input.catalog_ddl.kind == .aggregate or input.catalog_ddl.kind == .cast or input.catalog_ddl.kind == .named_type)) {
         var actor = identity;
         var adapter: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = &actor, .context = context, .database = database, .namespace = namespace, .ddl_search_path = path };
@@ -1226,7 +1232,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     try target.validate();
     const kind: domain.Kind = switch (input) {
         .catalog_ddl => |ddl| switch (ddl.kind) {
-            .index, .view, .role, .sequence, .function, .procedure, .operator, .aggregate, .cast, .named_type => unreachable,
+            .index, .view, .role, .sequence, .function, .procedure, .operator, .aggregate, .cast, .named_type, .extension => unreachable,
             inline else => |tag| @field(domain.Kind, @tagName(tag)),
         },
         .policy_ddl, .populate => unreachable,
@@ -1422,6 +1428,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             .namespace => error.SqlDuplicateNamespace,
             .tablespace => error.SqlDuplicateTablespace,
             .role => error.SqlDuplicateRole,
+            .extension => error.SqlDuplicateExtension,
             .table, .query_source, .view, .sequence, .routine, .cast, .named_type => err,
         };
         if (err == error.CatalogNotFound) return switch (kind) {
@@ -1429,6 +1436,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             .namespace => error.NamespaceNotFound,
             .tablespace => error.TablespaceNotFound,
             .role => error.SqlRoleNotFound,
+            .extension => error.SqlUndefinedExtension,
             .table, .query_source, .view, .sequence, .routine, .cast, .named_type => err,
         };
         return err;

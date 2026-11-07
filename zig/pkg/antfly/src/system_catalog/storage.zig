@@ -1339,7 +1339,56 @@ pub fn validateFunctionUses(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, g
     }
 }
 
+fn sqlExtensionMemberKeyAlloc(a: std.mem.Allocator, group: u64, routine_id: u64) ![]u8 {
+    return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:sql_extension_member:{d}", .{ group, routine_id });
+}
+pub fn sqlExtensionMemberOwner(backing: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, routine_id: u64) !?u64 {
+    var region: std.heap.ArenaAllocator = .init(backing);
+    defer region.deinit();
+    const a = region.allocator();
+    const key = try sqlExtensionMemberKeyAlloc(a, group, routine_id);
+    defer a.free(key);
+    const bytes = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (bytes.len != 8) return error.InvalidSqlExtensionRecord;
+    const id = std.mem.readInt(u64, bytes[0..8], .big);
+    if (id == 0) return error.InvalidSqlExtensionRecord;
+    const extension = (try getById(a, txn, group, .extension, id)) orelse return error.InvalidSqlExtensionRecord;
+    const record = try @import("sql_extensions.zig").Record.decode(a, extension.value);
+    for (record.members) |member| if (member.id == routine_id) return id;
+    return error.InvalidSqlExtensionRecord;
+}
+fn sqlExtensionReferences(backing: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, resource: domain.Resource, adding: bool) !void {
+    if (resource.kind != .extension) return;
+    var region: std.heap.ArenaAllocator = .init(backing);
+    defer region.deinit();
+    const a = region.allocator();
+    const record = try @import("sql_extensions.zig").Record.decode(a, resource);
+    for (record.members) |member| {
+        const key = try sqlExtensionMemberKeyAlloc(a, group, member.id);
+        defer a.free(key);
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, record.id, .big);
+        const previous = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (adding) {
+            if (previous) |bytes| if (!std.mem.eql(u8, bytes, &encoded)) return error.SqlExtensionOwnedObject;
+            try txn.put(key, &encoded);
+        } else {
+            if (previous) |bytes| {
+                if (!std.mem.eql(u8, bytes, &encoded)) return error.InvalidSqlExtensionRecord;
+                try txn.delete(key);
+            }
+        }
+    }
+}
+
 fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
+    try sqlExtensionReferences(alloc, txn, group_id, r, true);
     try r.validateLogicalRelationId();
     if (r.sql_relation_id) |logical| {
         try domain.requireRelationOid(logical);
@@ -1426,6 +1475,7 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     }
 }
 fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
+    try sqlExtensionReferences(alloc, txn, group_id, r, false);
     if (r.sql_relation_id) |logical| {
         const key = try logicalRelationKeyAlloc(alloc, group_id, logical);
         defer alloc.free(key);
@@ -1634,7 +1684,47 @@ fn writeMeta(alloc: std.mem.Allocator, txn: anytype, group_id: u64, previous: Me
 }
 
 /// Pure admission: all source/target scope leases precede the first write.
+fn requireSqlExtensionDelta(backing: std.mem.Allocator, txn: anytype, group: u64, delta: domain.Delta) !void {
+    var region: std.heap.ArenaAllocator = .init(backing);
+    defer region.deinit();
+    const a = region.allocator();
+    for (delta.removes) |resource| {
+        if (resource.kind != .routine) continue;
+        const owner = (try sqlExtensionMemberOwner(a, txn, group, resource.id)) orelse continue;
+        const authorized = for (delta.removes) |extension| {
+            if (extension.kind == .extension and extension.id == owner) break true;
+        } else for (delta.upserts) |extension| {
+            if (extension.kind == .extension and extension.id == owner) break true;
+        } else false;
+        if (!authorized) return error.SqlExtensionOwnedObject;
+    }
+    for (delta.upserts) |resource| {
+        if (resource.kind != .routine) continue;
+        const callable = (try routines.Record.decode(a, resource.source_json)).value;
+        const owner = try sqlExtensionMemberOwner(a, txn, group, resource.id);
+        if (owner != null) {
+            // COMMENT changes presentation only and cannot rebind membership.
+            const prior = (try getById(a, txn, group, .routine, resource.id)) orelse return error.InvalidSqlExtensionRecord;
+            if (prior.value.parent_id == resource.parent_id and std.mem.eql(u8, prior.value.name, resource.name) and std.mem.eql(u8, prior.value.source_json, resource.source_json) and std.mem.eql(u8, prior.value.signature orelse "", resource.signature orelse "")) continue;
+        } else if (callable.definition.wasm == null) continue;
+        var member_found = false;
+        for (delta.upserts) |extension| {
+            if (extension.kind != .extension) continue;
+            if (owner) |id| if (id != extension.id) continue;
+            const record = try @import("sql_extensions.zig").Record.decode(a, extension);
+            for (record.members) |member| if (member.id == resource.id and member.generation == callable.generation) {
+                const binding = callable.definition.wasm orelse return error.SqlExtensionOwnedObject;
+                if (resource.parent_id != record.namespace_id or !std.mem.eql(u8, member.name, resource.name) or !std.mem.eql(u8, member.signature, resource.signature orelse "") or !std.mem.eql(u8, binding.package_name, record.package_name) or !std.mem.eql(u8, binding.package_version, record.package_version) or !std.mem.eql(u8, &binding.package_digest, &record.package_digest)) return error.InvalidSqlExtensionRecord;
+                member_found = true;
+                break;
+            };
+        }
+        if (!member_found) return error.SqlExtensionOwnedObject;
+    }
+}
+
 pub fn requireScopeDeltaWritable(alloc: std.mem.Allocator, txn: anytype, group_id: u64, delta: domain.Delta) !void {
+    try requireSqlExtensionDelta(alloc, txn, group_id, delta);
     const meta = try readMeta(alloc, txn, group_id);
     {
         // View returns borrowed Resource values whose parsed backing belongs

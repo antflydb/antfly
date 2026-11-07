@@ -9859,6 +9859,13 @@ pub const ApiHttpServer = struct {
         if (std.mem.eql(u8, path, routes.Routes.extensions_v1_packages)) {
             return try contextualJsonResponse(self.alloc, 200, snapshot.extension_packages);
         }
+        if (routes.Routes.matchExtensionSqlControl(path)) |selected| {
+            for (snapshot.sql_extension_controls) |control| {
+                if (std.mem.eql(u8, control.name, selected.name))
+                    return contextualJsonResponse(self.alloc, 200, control.publicProjection());
+            }
+            return contextualJsonErrorResponse(self.alloc, 404, "SQL extension control not found");
+        }
         if (routes.Routes.matchExtensionPackageVersion(path)) |package_version| {
             const package = findExtensionPackageVersion(&snapshot, package_version.name, package_version.version) orelse {
                 return try contextualJsonErrorResponse(self.alloc, 404, "not found");
@@ -20471,15 +20478,23 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    // Select preparation scheduling only; the canonical metadata/owner checks
+    // below still authorize every effect.
+    fn scopedNativeRestore(plan: @import("../metadata/restore_staging.zig").Plan) bool {
+        if (plan.targets.len == 0 or plan.preparing_sources or plan.type_retirement != null) return false;
+        for (plan.targets) |target| {
+            if (target.table.sql_persistence == null or target.ranges.len != 1 or
+                target.source_artifacts.len != 0 or target.rewrite != null or target.materialized_view != null or
+                (!target.empty_generation and target.population == null)) return false;
+        }
+        return true;
+    }
+
     /// One scheduling slice of the EXISTING restore job. Native row pages,
     /// global constraint activation, publication, and cancellation all retain
     /// the same durable staging incarnation across execution retries.
     fn driveStagedRestore(self: *ApiHttpServer, restore: RestoreCancellation, staging_attempt: u64, initial: []const u8, table_names: []const []const u8) anyerror![]u8 {
         var zig017_return_error: ?anyerror = null;
-        if (self.cfg.deployment_mode == .standalone) _ = (self.source.runRound() catch |zig017_err| {
-            zig017_return_error = zig017_err;
-            return zig017_err;
-        });
         const stages = @import("../metadata/restore_staging.zig");
         const owners = @import("restore_owner.zig");
         var job = (std.json.parseFromSlice(stages.Job, self.alloc, initial, .{ .allocate = .alloc_always }) catch |zig017_err| {
@@ -20487,6 +20502,14 @@ pub const ApiHttpServer = struct {
             return zig017_err;
         });
         defer job.deinit();
+        // Native empty/population targets carry exact private bootstraps and
+        // initialize through their Data receiver. An unrelated public owner
+        // must not block this job through catalog-wide reconciliation.
+        const scoped_native = scopedNativeRestore(job.value.plan);
+        if (scoped_native) try job.value.plan.validate(self.alloc);
+        if (!scoped_native and self.cfg.deployment_mode == .standalone) {
+            _ = try self.source.runRound();
+        }
         const is_rewrite = for (job.value.plan.targets) |target| {
             if (target.rewrite != null) break true;
         } else false;
@@ -27265,6 +27288,112 @@ test "staged restore published metadata wins cancellation only after every owner
     try std.testing.expectEqual(.published, final.value.staging_resolution);
     for (fixture.calls[0..128]) |count| try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls[128]);
+}
+
+test "staged restore native target progress bypasses unrelated catalog reconciliation across cold retry" {
+    const a = std.testing.allocator;
+    const stages = @import("../metadata/restore_staging.zig");
+    const owners = @import("restore_owner.zig");
+    const Fixture = struct {
+        rounds: usize = 0,
+        deliveries: usize = 0,
+        scope: [32]u8 = @splat(0),
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn round(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.rounds += 1;
+            // An unrelated old public image has no current executing owner.
+            return error.SqlRelationOwnerChanged;
+        }
+        fn receipt(_: *anyopaque, _: std.mem.Allocator, _: [16]u8, _: stages.State, _: u64, _: api_operation.RequestContext) !?[]u8 {
+            return null;
+        }
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, name: []const u8, group: u64, request: owners.Request, context: api_operation.RequestContext) !owners.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            try std.testing.expectEqualStrings("native-scoped", name);
+            try std.testing.expectEqual(@as(u64, 72), group);
+            try std.testing.expectEqual(.install_native_empty, request.action);
+            try std.testing.expectEqualSlices(u8, &self.scope, &request.scope.digest());
+            try std.testing.expect(request.native_empty_install != null);
+            self.deliveries += 1;
+            // Lost owner reply: never manufacture a physical receipt. The
+            // next slice must use this same captured scope and install digest.
+            return error.Timeout;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/scoped-restore", .{tmp.sub_path});
+    defer a.free(path);
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(a, .{
+        .deployment_mode = .standalone,
+        .restore_owner = .{ .ptr = &fixture, .execute_fn = Fixture.execute },
+    }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .run_round = Fixture.round, .get_restore_staging_receipt = Fixture.receipt } }, null, null);
+    defer server.deinit();
+    server.restore_job_store.deinit();
+    server.restore_job_store = restore_jobs.Store.initWithIo(a, std.testing.io);
+    const opened = try a.create(restore_jobs.OpenedStore);
+    opened.* = try restore_jobs.OpenedStore.open(a, path);
+    try server.restore_job_store.attach(opened);
+    const queued = try server.restore_job_store.start(a, .{ .scope = .cluster, .backup_id = "snapshot", .location = "s3://archive/snapshot", .connection = "archive", .idempotency_namespace = "principal:admin:cluster" });
+    defer a.free(queued);
+    var admitted = try std.json.parseFromSlice(restore_jobs.JobState, a, queued, .{});
+    defer admitted.deinit();
+    const running = (try server.restore_job_store.begin(a, admitted.value.job_id)).?;
+    defer a.free(running);
+    var worker = try std.json.parseFromSlice(restore_jobs.JobState, a, running, .{});
+    defer worker.deinit();
+    const pinned = try server.restore_job_store.ensureStagingAttempt(a, worker.value.job_id, worker.value.attempt_id);
+    a.free(pinned);
+    const native: @import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor = .{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(3), .data_generation = 1 };
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 71, .name = "native-scoped", .schema_json = "{}", .sql_persistence = native };
+    const range: metadata_table_manager.RangeRecord = .{ .table_id = 71, .group_id = 72, .range_id = 72, .doc_identity_shard_id = 72, .doc_identity_range_id = 72, .start_key = "" };
+    const target: stages.Target = .{ .source_table_id = 7, .table = table, .ranges = &.{range}, .empty_generation = true, .schema_only_snapshot = .{ .manifest_digest = @splat(4), .schema_digest = try stages.runtimeSchemaDigestForTable(a, "{}"), .source_table_id = 7 } };
+    const plan: stages.Plan = .{ .id = try stages.idForAttempt(worker.value.job_id, worker.value.attempt_id), .cohort_digest = @splat(6), .targets = &.{target} };
+    try plan.validate(a);
+    const digest = try plan.digest(a);
+    fixture.scope = (try stages.ownerScope(a, plan, digest, target, range)).digest();
+    const job: stages.Job = .{ .plan = plan, .plan_digest = digest, .state = .activating, .revision = 7 };
+    const encoded = try std.json.Stringify.valueAlloc(a, job, .{});
+    defer a.free(encoded);
+    const restore: ApiHttpServer.RestoreCancellation = .{ .job_id = worker.value.job_id, .attempt_id = worker.value.attempt_id };
+    try std.testing.expectError(error.Timeout, server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{table.name}));
+    try std.testing.expectEqual(@as(usize, 1), fixture.deliveries);
+    try std.testing.expectEqual(@as(usize, 0), fixture.rounds);
+    server.restore_job_store.deinit();
+    server.restore_job_store = restore_jobs.Store.initWithIo(a, std.testing.io);
+    const reopened = try a.create(restore_jobs.OpenedStore);
+    reopened.* = try restore_jobs.OpenedStore.open(a, path);
+    try server.restore_job_store.attach(reopened);
+    const rerunning = (try server.restore_job_store.begin(a, worker.value.job_id)).?;
+    defer a.free(rerunning);
+    var resumed = try std.json.parseFromSlice(restore_jobs.JobState, a, rerunning, .{});
+    defer resumed.deinit();
+    try std.testing.expect(resumed.value.attempt_id > worker.value.attempt_id);
+    try std.testing.expectEqual(worker.value.attempt_id, resumed.value.staging_attempt_id);
+    const retry: ApiHttpServer.RestoreCancellation = .{ .job_id = resumed.value.job_id, .attempt_id = resumed.value.attempt_id };
+
+    try std.testing.expectError(error.Timeout, server.driveStagedRestore(retry, resumed.value.staging_attempt_id, encoded, &.{table.name}));
+    try std.testing.expectEqual(@as(usize, 2), fixture.deliveries);
+    try std.testing.expectEqual(@as(usize, 0), fixture.rounds);
+    // Document/mixed/artifact jobs retain their original global preparation.
+    var ordinary_target = target;
+    ordinary_target.table.sql_persistence = null;
+    ordinary_target.empty_generation = false;
+    ordinary_target.schema_only_snapshot = null;
+    ordinary_target.source_artifacts = &.{.{ .target_group_id = 72, .source_namespace = .{ .table_id = 7, .shard_id = 42, .range_id = 42 }, .format = .native, .snapshot_path = "snapshot/42", .artifact_size_bytes = 1, .artifact_sha256 = @splat(8) }};
+    const ordinary_plan: stages.Plan = .{ .id = plan.id, .cohort_digest = plan.cohort_digest, .targets = &.{ordinary_target} };
+    try ordinary_plan.validate(a);
+    const ordinary: stages.Job = .{ .plan = ordinary_plan, .plan_digest = try ordinary_plan.digest(a), .state = .activating, .revision = 7 };
+    const ordinary_bytes = try std.json.Stringify.valueAlloc(a, ordinary, .{});
+    defer a.free(ordinary_bytes);
+    try std.testing.expectError(error.SqlRelationOwnerChanged, server.driveStagedRestore(retry, resumed.value.staging_attempt_id, ordinary_bytes, &.{table.name}));
+    try std.testing.expectEqual(@as(usize, 1), fixture.rounds);
+    try std.testing.expectEqual(@as(usize, 2), fixture.deliveries);
 }
 
 test "restore admission unknown response preserves recovery without claiming acceptance" {
@@ -35760,9 +35889,10 @@ test "api http public sort capability gate fails closed for uncovered observed d
 
 test "api http server serves extension catalog reads" {
     const FakeSource = struct {
-        fn iface(_: *@This()) StatusSource {
+        controls: [1]extension_domain.sql_package.PackageControl,
+        fn iface(self: *@This()) StatusSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .status = status,
                     .admin_snapshot = adminSnapshot,
@@ -35781,7 +35911,8 @@ test "api http server serves extension catalog reads" {
             };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{
                 .status = .{ .metadata_group_id = 77, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
@@ -35798,6 +35929,7 @@ test "api http server serves extension catalog reads" {
                         .objects = &.{.{ .kind = .mcp_tool, .name = "recall" }},
                     },
                 }})[0..]),
+                .sql_extension_controls = self.controls[0..],
                 .installed_extensions = @constCast((&[_]extension_domain.InstalledExtension{.{
                     .name = "memoryaf",
                     .package_name = "memoryaf",
@@ -35829,7 +35961,10 @@ test "api http server serves extension catalog reads" {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    var source = FakeSource{};
+    const promotion: extension_domain.sql_package.Promotion = .{ .name = "memoryaf", .identity = extension_domain.sql_package.controlIdentity("memoryaf"), .expected_generation = 1, .version = "1.0.0", .package_digest = @splat(9), .nonce = @splat(7) };
+    const receipts = [_]extension_domain.sql_package.PromotionReceipt{.{ .nonce = promotion.nonce, .request_digest = try promotion.digest(std.testing.allocator), .generation = 2, .version = promotion.version, .package_digest = promotion.package_digest }};
+    var source = FakeSource{ .controls = .{.{ .name = promotion.name, .identity = promotion.identity, .generation = 2, .default_version = promotion.version, .default_digest = promotion.package_digest, .promotions = &receipts }} };
+    try source.controls[0].validate();
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
     defer server.deinit();
 
@@ -35847,6 +35982,23 @@ test "api http server serves extension catalog reads" {
     var package = try std.json.parseFromSlice(extension_domain.PackageManifest, std.testing.allocator, package_resp.body, .{ .ignore_unknown_fields = true });
     defer package.deinit();
     try std.testing.expectEqualStrings("sha256:abc", package.value.digest);
+
+    var control_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/extensions/v1/packages/memoryaf/sql-control" });
+    defer control_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), control_resp.status);
+    var control = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, control_resp.body, .{});
+    defer control.deinit();
+    try std.testing.expectEqual(@as(usize, 5), control.value.object.count());
+    try std.testing.expectEqualStrings("memoryaf", control.value.object.get("name").?.string);
+    try std.testing.expectEqual(@as(i64, 2), control.value.object.get("generation").?.integer);
+    try std.testing.expect(!control.value.object.contains("promotions"));
+    try std.testing.expect(std.mem.indexOf(u8, control_resp.body, "request_digest") == null);
+    var missing_control = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/extensions/v1/packages/missing/sql-control" });
+    defer missing_control.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), missing_control.status);
+    var mutate_control = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = "/extensions/v1/packages/memoryaf/sql-control", .body = "{}" });
+    defer mutate_control.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), mutate_control.status);
 
     var installed_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf" });
     defer installed_resp.deinit(std.testing.allocator);

@@ -97,6 +97,7 @@ pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl:
         declared = .{ .arguments = arguments, .result = if (final) |function| function.record.definition.result else state, .body = "", .owner = try @import("sql_view_ddl.zig").currentOwner(root.identity.*, root.server.cfg.auth_enabled), .function_reference = transition.reference, .aggregate = .{ .state = state, .initial = intent.initial, .final = if (final) |function| function.reference else null } };
     }
     if (declared) |definition| {
+        if (definition.wasm != null or definition.language == .wasm) return error.InvalidCatalogMutation;
         if (prior != null and !(if (ddl.routine) |intent| intent.replace else if (ddl.aggregate_definition) |intent| intent.replace else false)) return error.SqlDuplicateFunction;
         if (prior) |before| if (before.kind != routine_kind) return error.SqlWrongObjectType;
         if (prior) |before| {

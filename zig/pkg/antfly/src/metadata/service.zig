@@ -3680,6 +3680,9 @@ test "relation mutation admission projects naming capability without materializi
 }
 
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .promote_sql_extension_default) return metadata_topology_protocol.sql_extension_version;
+    if (command == .upsert_extension_package and command.upsert_extension_package.sql != null) return metadata_topology_protocol.sql_extension_version;
+    if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlExtension(command.apply_system_catalog)) return metadata_topology_protocol.sql_extension_version;
     if (command == .create_restore_job_with_staging) {
         const request = command.create_restore_job_with_staging;
         if (@import("schema_reader_wire.zig").requiresSqlTruncatePreparation(request.value, request.plan_json)) return metadata_topology_protocol.sql_truncate_preparation_version;
@@ -4470,14 +4473,21 @@ fn relationSourceDecoderFloor(service: anytype) !u16 {
 /// Existing restore/rewrite plans keep their original admission contract.
 pub fn ensureQueryPopulationDecoderWithContext(service: anytype, bytes: []const u8, context: api_operation.RequestContext) !void {
     try context.ensureActive();
-    if (@import("schema_reader_wire.zig").requiresTypeRetirement(bytes))
-        try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_type_retirement_version)
-    else if (@import("schema_reader_wire.zig").requiresMaterializedRefresh(bytes))
-        try ensureMaterializedRefreshCapabilityWithContext(service, context)
-    else if (@import("schema_reader_wire.zig").requiresMaterializedView(bytes))
-        try ensureMaterializedViewCapabilityWithContext(service, context)
-    else if (@import("schema_reader_wire.zig").requiresPopulation(bytes))
-        try ensureQueryPopulationCapabilityWithContext(service, context);
+    const wire = @import("schema_reader_wire.zig");
+    var required: u16 = if (wire.requiresTypeRetirement(bytes))
+        metadata_topology_protocol.sql_type_retirement_version
+    else if (wire.requiresMaterializedRefresh(bytes))
+        metadata_topology_protocol.sql_materialized_refresh_version
+    else if (wire.requiresMaterializedView(bytes))
+        metadata_topology_protocol.sql_materialized_view_version
+    else if (wire.requiresPopulation(bytes))
+        metadata_topology_protocol.sql_population_version
+    else
+        0;
+    // CTAS/SELECT INTO reserve logical relation OIDs in the same immutable
+    // Job. Readiness alone does not install the apply-side decoder barrier.
+    if (wire.requiresLogicalRelations(bytes)) required = @max(required, metadata_topology_protocol.sql_table_triggers_version);
+    if (required != 0) try ensureDurableDecoderActivation(service, context, required);
 }
 
 pub fn ensureSqlCatalogCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
@@ -4518,6 +4528,10 @@ pub fn ensureSqlNativeIndexNamespaceCapabilityWithContext(service: anytype, cont
 
 pub fn ensureSqlTriggerFunctionCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
     try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_trigger_function_version);
+}
+
+pub fn ensureSqlExtensionCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_extension_version);
 }
 
 pub fn ensureSqlRoutineCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
@@ -8237,13 +8251,49 @@ pub const MetadataService = struct {
     }
 
     pub fn upsertExtensionPackage(self: *MetadataService, record: extension_domain.PackageManifest) !void {
-        try self.proposeTransitionCommand(.{ .upsert_extension_package = record });
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        try store.prepareExtensionPackageRegistration(arena.allocator(), self.metadata_group_id, record);
+        if (record.sql == null) return self.proposeTransitionCommand(.{ .upsert_extension_package = record });
+        try ensureSqlExtensionCapabilityWithContext(self, .{});
+        const receipt = try self.proposeTransitionCommandWithReceipt(.{ .upsert_extension_package = record });
+        try self.waitForTransitionApplied(receipt);
+        // A competing immutable registration may have won before this entry.
+        try store.prepareExtensionPackageRegistration(arena.allocator(), self.metadata_group_id, record);
+    }
+
+    /// Global operator entry point, deliberately absent from database SQL Call.
+    pub fn promoteSqlExtensionDefault(self: *MetadataService, a: std.mem.Allocator, request: extension_domain.sql_package.Promotion) !extension_domain.sql_package.PromotionReceipt {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const predicted = try store.prepareSqlExtensionDefault(scratch, self.metadata_group_id, request);
+        try ensureSqlExtensionCapabilityWithContext(self, .{});
+        const applied = try self.proposeTransitionCommandWithReceipt(.{ .promote_sql_extension_default = request });
+        try self.waitForTransitionApplied(applied);
+        const control = (try store.getSqlExtensionControl(scratch, self.metadata_group_id, request.name)) orelse return error.SqlExtensionUnavailable;
+        const digest = try request.digest(scratch);
+        for (control.promotions) |receipt| if (std.mem.eql(u8, &receipt.nonce, &request.nonce)) {
+            if (!std.mem.eql(u8, &receipt.request_digest, &digest)) return error.SqlExtensionPromotionNonceConflict;
+            var owned = receipt;
+            owned.version = try a.dupe(u8, receipt.version);
+            return owned;
+        };
+        return extension_domain.sql_package.missingPromotionOutcome(control.promotions.len, if (control.promotions.len > 0) control.promotions[0].generation else 0, predicted.generation);
     }
 
     pub fn syncExtensionPackageStore(self: *MetadataService, io: std.Io, root_path: []const u8) !usize {
         const entries = try extension_domain.scanPackageStoreAlloc(self.alloc, io, root_path);
         defer extension_domain.freePackageStoreEntries(self.alloc, entries);
         for (entries) |entry| try self.upsertExtensionPackage(entry.manifest);
+        const promotions = try extension_domain.scanSqlControlPromotionsAlloc(self.alloc, io, root_path);
+        defer extension_domain.freeSqlControlPromotions(self.alloc, promotions);
+        for (promotions) |request| {
+            const receipt = try self.promoteSqlExtensionDefault(self.alloc, request);
+            self.alloc.free(receipt.version);
+        }
         return entries.len;
     }
 
@@ -8812,6 +8862,15 @@ pub const MetadataService = struct {
     pub fn freeProjectedReplicationSourceStatuses(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.ReplicationSourceStatusRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeReplicationSourceStatuses(alloc, records);
+    }
+
+    pub fn listProjectedSqlExtensionControls(self: *MetadataService, alloc: std.mem.Allocator) ![]extension_domain.sql_package.PackageControl {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return store.listSqlExtensionControls(alloc, self.metadata_group_id);
+    }
+    pub fn freeProjectedSqlExtensionControls(self: *MetadataService, alloc: std.mem.Allocator, records: []extension_domain.sql_package.PackageControl) void {
+        const store = self.projectedStore() orelse return;
+        store.freeSqlExtensionControls(alloc, records);
     }
 
     pub fn listProjectedExtensionPackages(self: *MetadataService, alloc: std.mem.Allocator) ![]extension_domain.PackageManifest {
@@ -11890,13 +11949,49 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn upsertExtensionPackage(self: *MetadataHttpService, record: extension_domain.PackageManifest) !void {
-        try self.proposeTransitionCommand(.{ .upsert_extension_package = record });
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        try store.prepareExtensionPackageRegistration(arena.allocator(), self.metadata_group_id, record);
+        if (record.sql == null) return self.proposeTransitionCommand(.{ .upsert_extension_package = record });
+        try ensureSqlExtensionCapabilityWithContext(self, .{});
+        const receipt = try self.proposeTransitionCommandWithReceipt(.{ .upsert_extension_package = record });
+        try self.waitForTransitionApplied(receipt);
+        // A competing immutable registration may have won before this entry.
+        try store.prepareExtensionPackageRegistration(arena.allocator(), self.metadata_group_id, record);
+    }
+
+    /// Global operator entry point, deliberately absent from database SQL Call.
+    pub fn promoteSqlExtensionDefault(self: *MetadataHttpService, a: std.mem.Allocator, request: extension_domain.sql_package.Promotion) !extension_domain.sql_package.PromotionReceipt {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const predicted = try store.prepareSqlExtensionDefault(scratch, self.metadata_group_id, request);
+        try ensureSqlExtensionCapabilityWithContext(self, .{});
+        const applied = try self.proposeTransitionCommandWithReceipt(.{ .promote_sql_extension_default = request });
+        try self.waitForTransitionApplied(applied);
+        const control = (try store.getSqlExtensionControl(scratch, self.metadata_group_id, request.name)) orelse return error.SqlExtensionUnavailable;
+        const digest = try request.digest(scratch);
+        for (control.promotions) |receipt| if (std.mem.eql(u8, &receipt.nonce, &request.nonce)) {
+            if (!std.mem.eql(u8, &receipt.request_digest, &digest)) return error.SqlExtensionPromotionNonceConflict;
+            var owned = receipt;
+            owned.version = try a.dupe(u8, receipt.version);
+            return owned;
+        };
+        return extension_domain.sql_package.missingPromotionOutcome(control.promotions.len, if (control.promotions.len > 0) control.promotions[0].generation else 0, predicted.generation);
     }
 
     pub fn syncExtensionPackageStore(self: *MetadataHttpService, io: std.Io, root_path: []const u8) !usize {
         const entries = try extension_domain.scanPackageStoreAlloc(self.alloc, io, root_path);
         defer extension_domain.freePackageStoreEntries(self.alloc, entries);
         for (entries) |entry| try self.upsertExtensionPackage(entry.manifest);
+        const promotions = try extension_domain.scanSqlControlPromotionsAlloc(self.alloc, io, root_path);
+        defer extension_domain.freeSqlControlPromotions(self.alloc, promotions);
+        for (promotions) |request| {
+            const receipt = try self.promoteSqlExtensionDefault(self.alloc, request);
+            self.alloc.free(receipt.version);
+        }
         return entries.len;
     }
 
@@ -12924,6 +13019,7 @@ pub const MetadataHttpService = struct {
             snapshot.split_transitions = try cloneProjectedSplitTransitionsOwned(self.alloc, core.split_transitions);
             snapshot.merge_transitions = try cloneProjectedMergeTransitionsOwned(self.alloc, core.merge_transitions);
             snapshot.extension_packages = try store.listExtensionPackages(self.alloc, self.metadata_group_id);
+            snapshot.sql_extension_controls = try store.listSqlExtensionControls(self.alloc, self.metadata_group_id);
             snapshot.installed_extensions = try store.listInstalledExtensions(self.alloc, self.metadata_group_id);
             snapshot.extension_members = try store.listExtensionMembers(self.alloc, self.metadata_group_id);
             snapshot.extension_dependencies = try store.listExtensionDependencies(self.alloc, self.metadata_group_id);
@@ -13550,6 +13646,15 @@ pub const MetadataHttpService = struct {
     pub fn freeProjectedShuffleJoinLeases(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.ShuffleJoinLeaseRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeShuffleJoinLeases(alloc, records);
+    }
+
+    pub fn listProjectedSqlExtensionControls(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]extension_domain.sql_package.PackageControl {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return store.listSqlExtensionControls(alloc, self.metadata_group_id);
+    }
+    pub fn freeProjectedSqlExtensionControls(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []extension_domain.sql_package.PackageControl) void {
+        const store = self.projectedStore() orelse return;
+        store.freeSqlExtensionControls(alloc, records);
     }
 
     pub fn listProjectedExtensionPackages(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]extension_domain.PackageManifest {
@@ -24895,4 +25000,15 @@ test "SQL TRUNCATE preparation metadata177 precedes ordinary restore selectors" 
     try std.testing.expectEqual(metadata_topology_protocol.sql_truncate_preparation_version, transitionRequiredCoordinatedDecoderVersion(.{ .create_restore_job_with_staging = .{ .key = "job", .value = sql_job, .plan_json = plan } }));
     const reset_job = "{\"source_kind\":\"empty_generation\",\"idempotency_namespace\":\"native-unlogged-recovery\"}";
     try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(.{ .create_restore_job_with_staging = .{ .key = "job", .value = reset_job, .plan_json = plan } }) < metadata_topology_protocol.sql_truncate_preparation_version);
+}
+
+test "SQL extension catalog decoder gate protects raw commands and package controls" {
+    const required = metadata_topology_protocol.sql_extension_version;
+    try std.testing.expectEqual(required, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"sql_extension\":{}}" }));
+    try std.testing.expectEqual(required, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"sql_extens\\u0069on\":{}}" }));
+    const package: extension_domain.PackageManifest = .{ .name = "x", .version = "1", .digest = "fixture", .install = .{ .scopes_supported = &.{.embedded_db} }, .sql = .{ .default_version = "1", .exports = &.{} } };
+    try std.testing.expectEqual(required, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_extension_package = package }));
+    var unchanged = package;
+    unchanged.sql = null;
+    try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .upsert_extension_package = unchanged }));
 }

@@ -459,7 +459,7 @@ pub fn aliasPrincipal(name: []const u8) !?Principal {
 pub fn resourceOwner(a: A, resource: anytype) !?Principal {
     if (resource.sql_owner) |owner| return owner;
     switch (resource.kind) {
-        .view, .routine, .named_type, .cast => {},
+        .view, .routine, .named_type, .cast, .extension => {},
         else => return null,
     }
     if (resource.source_json.len == 0 or std.mem.eql(u8, resource.source_json, "null")) return null;

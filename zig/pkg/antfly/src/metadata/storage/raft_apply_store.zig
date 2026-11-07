@@ -26,6 +26,7 @@ const sql_type_layouts = @import("antfly_local_sources").sql_catalog.named_layou
 const sql_casts = @import("../../system_catalog/casts.zig");
 const sql_catalog_mutations = @import("../../system_catalog/catalog_mutations.zig");
 const sql_native_indexes = @import("../../system_catalog/native_indexes.zig");
+const sql_extensions = @import("../../system_catalog/sql_extensions.zig");
 const sql_routines = @import("../../system_catalog/routines.zig");
 const sql_sequences = @import("../../system_catalog/sequence_catalog.zig");
 const sequence_leases = @import("../../system_catalog/sequence_leases.zig");
@@ -13594,6 +13595,7 @@ pub const TransitionCommand = union(enum) {
         expected_request_id: u128,
     },
     upsert_extension_package: extension_domain.PackageManifest,
+    promote_sql_extension_default: extension_domain.sql_package.Promotion,
     remove_extension_package: struct {
         name: []const u8,
         version: []const u8,
@@ -13701,6 +13703,10 @@ pub const TransitionCommand = union(enum) {
                 );
             },
             .upsert_extension_package => |*record| record.deinitOwned(alloc),
+            .promote_sql_extension_default => |record| {
+                alloc.free(record.name);
+                alloc.free(record.version);
+            },
             .remove_extension_package => |record| {
                 alloc.free(record.name);
                 alloc.free(record.version);
@@ -18654,6 +18660,7 @@ pub const RaftApplyStore = struct {
     const standalone_catalog_key = "\x00\x00__metadata__:standalone_catalog";
     const StandaloneCatalogAuxiliary = struct {
         extension_packages: []extension_domain.PackageManifest = &.{},
+        sql_extension_controls: []extension_domain.sql_package.PackageControl = &.{},
         installed_extensions: []extension_domain.InstalledExtension = &.{},
         extension_members: []extension_domain.ExtensionMember = &.{},
         extension_dependencies: []extension_domain.ExtensionDependency = &.{},
@@ -19496,6 +19503,7 @@ pub const RaftApplyStore = struct {
             // and are fetched by exact table/generation/phase on install.
             .policy_install_snapshots = &.{},
             .extension_packages = auxiliary.extension_packages,
+            .sql_extension_controls = auxiliary.sql_extension_controls,
             .installed_extensions = auxiliary.installed_extensions,
             .extension_members = auxiliary.extension_members,
             .extension_dependencies = auxiliary.extension_dependencies,
@@ -20188,7 +20196,12 @@ pub const RaftApplyStore = struct {
             try system_catalog_storage.importState(self.alloc, &txn, group_id, state);
             try relation_reconciliation.advanceTrackedSource(&txn, group_id);
         }
-        if (update.auxiliary_json) |auxiliary| try txn.put(standalone_catalog_key, auxiliary);
+        if (update.auxiliary_json) |auxiliary| {
+            var parsed = try std.json.parseFromSlice(StandaloneCatalogAuxiliary, self.alloc, auxiliary, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            try (extension_domain.sql_package.Registry{ .packages = parsed.value.extension_packages, .controls = parsed.value.sql_extension_controls }).validateControls();
+            try txn.put(standalone_catalog_key, auxiliary);
+        }
         if (bootstrap and update.auxiliary_json == null) return error.InvalidStandaloneCatalog;
         if (relation_writer) {
             try self.publishCapturedRelationsTxn(&txn, group_id, &relation_journal);
@@ -20956,6 +20969,7 @@ pub const RaftApplyStore = struct {
             .tables = if (checkpoint == null) try self.exportResolverTablesTxn(a, txn, group_id) else try self.listTablesTxn(a, txn, group_id),
             .ranges = try self.listRangesTxnUntil(a, txn, group_id, null, null),
             .extension_packages = if (auxiliary) |value| value.extension_packages else try catalogRowsTxn(extension_domain.PackageManifest, a, txn, group_id, extensionPackagePrefixForGroup, decodeExtensionPackageRecord),
+            .sql_extension_controls = if (auxiliary) |value| value.sql_extension_controls else try sqlExtensionControlsTxn(a, txn, group_id),
             .installed_extensions = if (auxiliary) |value| value.installed_extensions else try catalogRowsTxn(extension_domain.InstalledExtension, a, txn, group_id, installedExtensionPrefixForGroup, decodeInstalledExtensionRecord),
             .extension_members = if (auxiliary) |value| value.extension_members else try catalogRowsTxn(extension_domain.ExtensionMember, a, txn, group_id, extensionMemberPrefixForGroup, decodeExtensionMemberRecord),
             .extension_dependencies = if (auxiliary) |value| value.extension_dependencies else try catalogRowsTxn(extension_domain.ExtensionDependency, a, txn, group_id, extensionDependencyPrefixForGroup, decodeExtensionDependencyRecord),
@@ -29478,6 +29492,7 @@ pub const RaftApplyStore = struct {
     /// Validate and serialize the exact admitted projection before proposing.
     fn validateSqlOwnerEnvelope(command: SystemCatalogCommand) !void {
         try command.validateCreationSources();
+        if (command.sql_extension != null and (command.sql_catalog_admission != null or command.sql_relation != null or command.sql_native_index != null or command.sql_authorization != null or command.sql_type != null or command.sql_cast != null or command.sql_routine != null or command.sql_sequence != null or command.sql_view != null or command.topology != null or command.placement_update != null or command.constraint_name_admission != null or command.column_sequences.len != 0)) return error.InvalidCatalogMutation;
         if (command.sql_catalog_admission != null or command.sql_relation != null) try sql_catalog_mutations.validate(command);
         if (command.sql_native_index != null and (command.sql_routine != null or command.sql_type != null or command.sql_cast != null or command.sql_authorization != null or command.sql_view != null or command.sql_sequence != null or command.column_sequences.len != 0 or command.creation_sources.len != 0 or command.creation_comment_sources.len != 0 or command.creation_object_comments.len != 0)) return error.InvalidCatalogMutation;
 
@@ -29531,6 +29546,11 @@ pub const RaftApplyStore = struct {
             var region = std.heap.ArenaAllocator.init(alloc);
             defer region.deinit();
             return std.json.Stringify.valueAlloc(alloc, try self.prepareSqlCastCatalogTxn(region.allocator(), &txn, group_id, command), .{});
+        }
+        if (command.sql_extension != null) {
+            var extension_region: std.heap.ArenaAllocator = .init(alloc);
+            defer extension_region.deinit();
+            return std.json.Stringify.valueAlloc(alloc, try self.prepareSqlExtensionCatalogTxn(extension_region.allocator(), &txn, group_id, command), .{});
         }
         if (command.sql_routine != null) {
             var region: std.heap.ArenaAllocator = .init(alloc);
@@ -30188,6 +30208,13 @@ pub const RaftApplyStore = struct {
         }
         if (command.sql_cast != null) {
             self.applySqlCastOutcomeTxn(txn, group_id, command) catch |err| switch (err) {
+                error.CatalogGenerationChanged, error.TableTopologyProtocolUpgradeRequired, error.SequenceAdmissionExpired, error.SequenceAdmissionConflict, error.CatalogRevisionExhausted => return,
+                else => return err,
+            };
+            return;
+        }
+        if (command.sql_extension != null) {
+            self.applySqlExtensionOutcomeTxn(txn, group_id, command) catch |err| switch (err) {
                 error.CatalogGenerationChanged, error.TableTopologyProtocolUpgradeRequired, error.SequenceAdmissionExpired, error.SequenceAdmissionConflict, error.CatalogRevisionExhausted => return,
                 else => return err,
             };
@@ -31312,7 +31339,205 @@ pub const RaftApplyStore = struct {
         return try decodeReplicationSourceStatusRecord(alloc, encoded);
     }
 
+    pub fn prepareSqlExtensionDefault(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, request: extension_domain.sql_package.Promotion) !extension_domain.sql_package.PromotionReceipt {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        try rejectStandalonePackageMutationTxn(&txn, group);
+        var buffer: [256]u8 = undefined;
+        const bytes = try stagingGet(&txn, try sqlExtensionControlKeyForGroup(&buffer, group, request.name)) orelse return error.SqlExtensionUnavailable;
+        const current = try std.json.parseFromSliceLeaky(extension_domain.sql_package.PackageControl, a, bytes, .{ .allocate = .alloc_always });
+        const registry: extension_domain.sql_package.Registry = .{ .packages = try sqlExtensionPackagesTxn(a, &txn, group) };
+        if (try extension_domain.sql_package.promoteControl(a, registry, current, request)) |next| return next.promotions[next.promotions.len - 1];
+        for (current.promotions) |receipt| if (std.mem.eql(u8, &receipt.nonce, &request.nonce)) return receipt;
+        unreachable;
+    }
+    pub fn prepareExtensionPackageRegistration(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, record: extension_domain.PackageManifest) !void {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        try rejectStandalonePackageMutationTxn(&txn, group);
+        var buffer: [256]u8 = undefined;
+        if (try stagingGet(&txn, try extensionPackageKeyForGroup(&buffer, group, record.name, record.version))) |bytes| {
+            const previous = try std.json.parseFromSliceLeaky(extension_domain.PackageManifest, a, bytes, .{});
+            if (previous.sql != null or record.sql != null) {
+                if (previous.sql == null or record.sql == null) return error.InvalidSqlExtensionPackageMutation;
+                const before = try std.json.Stringify.valueAlloc(a, previous, .{});
+                const after = try std.json.Stringify.valueAlloc(a, record, .{});
+                if (!std.mem.eql(u8, before, after)) return error.InvalidSqlExtensionPackageMutation;
+                return;
+            }
+        }
+        if (record.sql == null) return;
+        try record.validate();
+        const inventory = try sqlExtensionPackagesTxn(a, &txn, group);
+        if (inventory.len >= extension_domain.sql_package.max_versions) return error.SqlProgramLimitExceeded;
+        var bytes_used = (try std.json.Stringify.valueAlloc(a, record, .{})).len;
+        for (inventory) |prior| {
+            bytes_used = std.math.add(usize, bytes_used, (try std.json.Stringify.valueAlloc(a, prior, .{})).len) catch return error.SqlProgramLimitExceeded;
+        }
+        if (bytes_used > system_catalog.max_command_bytes) return error.SqlProgramLimitExceeded;
+        for (inventory) |prior| {
+            if (!std.mem.eql(u8, prior.name, record.name)) continue;
+            if (prior.trusted != record.trusted or prior.relocatable != record.relocatable or !optionalSqlControlSchemaEqual(prior.sql.?.schema, record.sql.?.schema)) return error.InconsistentSqlExtensionControl;
+        }
+    }
+
+    fn sqlExtensionAuxiliaryControlsTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64) !?[]const extension_domain.sql_package.PackageControl {
+        if (group != group_ids.main_metadata_group_id) return null;
+        const bytes = try stagingGet(txn, standalone_catalog_key) orelse return null;
+        const Projection = struct { sql_extension_controls: []const extension_domain.sql_package.PackageControl = &.{} };
+        const projection = try std.json.parseFromSliceLeaky(Projection, a, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+        if (projection.sql_extension_controls.len > extension_domain.sql_package.max_versions) return error.SqlProgramLimitExceeded;
+        return projection.sql_extension_controls;
+    }
+    fn rejectStandalonePackageMutationTxn(txn: *docstore.DocStore.Txn, group: u64) !void {
+        // The standalone manager owns the complete auxiliary CAS. A physical
+        // package write here would be a shadow authority invisible to SQL.
+        if (group == group_ids.main_metadata_group_id and try stagingGet(txn, standalone_catalog_key) != null) return error.UnsupportedOperation;
+    }
+    pub fn listSqlExtensionControls(self: *RaftApplyStore, a: std.mem.Allocator, group: u64) ![]extension_domain.sql_package.PackageControl {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const controls = if (try sqlExtensionAuxiliaryControlsTxn(scratch, &txn, group)) |auxiliary| auxiliary else try sqlExtensionControlsTxn(scratch, &txn, group);
+        const out = try a.alloc(extension_domain.sql_package.PackageControl, controls.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*control| control.deinitOwned(a);
+            a.free(out);
+        }
+        for (controls, 0..) |control, i| {
+            try control.validate();
+            out[i] = try control.cloneOwned(a);
+            initialized += 1;
+        }
+        return out;
+    }
+    pub fn freeSqlExtensionControls(_: *RaftApplyStore, a: std.mem.Allocator, controls: []extension_domain.sql_package.PackageControl) void {
+        for (controls) |*control| control.deinitOwned(a);
+        if (controls.len > 0) a.free(controls);
+    }
+    pub fn getSqlExtensionControl(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, name: []const u8) !?extension_domain.sql_package.PackageControl {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        if (try sqlExtensionAuxiliaryControlsTxn(arena.allocator(), &txn, group)) |controls| {
+            for (controls) |control| if (std.mem.eql(u8, control.name, name)) {
+                try control.validate();
+                return try control.cloneOwned(a);
+            };
+            return null;
+        }
+        var buffer: [256]u8 = undefined;
+        const encoded = try stagingGet(&txn, try sqlExtensionControlKeyForGroup(&buffer, group, name)) orelse return null;
+        return try decodeSqlExtensionControlRecord(a, encoded);
+    }
+    fn sqlExtensionControlsTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64) ![]extension_domain.sql_package.PackageControl {
+        return catalogRowsTxn(extension_domain.sql_package.PackageControl, a, txn, group, sqlExtensionControlPrefixForGroup, decodeSqlExtensionControlRecord);
+    }
+    fn writeSqlExtensionControlTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, control: extension_domain.sql_package.PackageControl) !void {
+        try control.validate();
+        const bytes = try std.json.Stringify.valueAlloc(self.alloc, control, .{});
+        defer self.alloc.free(bytes);
+        var buffer: [256]u8 = undefined;
+        const key = try sqlExtensionControlKeyForGroup(&buffer, group, control.name);
+        try txn.put(key, bytes);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group, .key = key });
+    }
+    fn registerSqlExtensionPackageTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, record: extension_domain.PackageManifest, key: []const u8) !bool {
+        rejectStandalonePackageMutationTxn(txn, group) catch |err| switch (err) {
+            error.UnsupportedOperation => return false,
+            else => return err,
+        };
+        const package = extension_domain.sql_package;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const previous = if (try stagingGet(txn, key)) |bytes| try std.json.parseFromSliceLeaky(extension_domain.PackageManifest, a, bytes, .{ .allocate = .alloc_always }) else null;
+        if (record.sql == null and (previous == null or previous.?.sql == null)) return true;
+        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_extension_version);
+        try record.validate();
+        if (previous) |prior| {
+            if (prior.sql == null or record.sql == null) return error.InvalidSqlExtensionPackageMutation;
+            const before = try std.json.Stringify.valueAlloc(a, prior, .{});
+            const after = try std.json.Stringify.valueAlloc(a, record, .{});
+            if (!std.mem.eql(u8, before, after)) return error.InvalidSqlExtensionPackageMutation;
+            return false; // Replaying discovery cannot promote an old default.
+        }
+        const inventory = try sqlExtensionPackagesTxn(a, txn, group);
+        if (inventory.len >= package.max_versions) return error.SqlProgramLimitExceeded;
+        var bytes_used = (try std.json.Stringify.valueAlloc(a, record, .{})).len;
+        for (inventory) |prior| {
+            bytes_used = std.math.add(usize, bytes_used, (try std.json.Stringify.valueAlloc(a, prior, .{})).len) catch return error.SqlProgramLimitExceeded;
+        }
+        if (bytes_used > system_catalog.max_command_bytes) return error.SqlProgramLimitExceeded;
+        for (inventory) |prior| {
+            if (!std.mem.eql(u8, prior.name, record.name)) continue;
+            if (prior.trusted != record.trusted or prior.relocatable != record.relocatable or !optionalSqlControlSchemaEqual(prior.sql.?.schema, record.sql.?.schema)) return error.InconsistentSqlExtensionControl;
+        }
+        var buffer: [256]u8 = undefined;
+        const control_key = try sqlExtensionControlKeyForGroup(&buffer, group, record.name);
+        const old_control = try stagingGet(txn, control_key);
+        var control: package.PackageControl = if (old_control) |bytes| try std.json.parseFromSliceLeaky(package.PackageControl, a, bytes, .{ .allocate = .alloc_always }) else .{ .name = record.name, .identity = package.controlIdentity(record.name), .generation = 1, .default_version = record.sql.?.default_version };
+        try control.validate();
+        if (control.default_digest == null) {
+            var target: ?extension_domain.PackageManifest = null;
+            if (std.mem.eql(u8, control.default_version, record.version)) target = record;
+            for (inventory) |candidate| if (std.mem.eql(u8, control.name, candidate.name) and std.mem.eql(u8, control.default_version, candidate.version)) {
+                target = candidate;
+                break;
+            };
+            if (target) |available| {
+                control.default_digest = try package.digest(available.digest);
+                if (old_control != null) control.generation = std.math.add(u64, control.generation, 1) catch return error.SqlProgramLimitExceeded;
+            }
+        }
+        try self.writeSqlExtensionControlTxn(txn, group, control);
+        return true;
+    }
+    fn promoteSqlExtensionDefaultTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, request: extension_domain.sql_package.Promotion) !void {
+        rejectStandalonePackageMutationTxn(txn, group) catch |err| switch (err) {
+            error.UnsupportedOperation => return,
+            else => return err,
+        };
+        const package = extension_domain.sql_package;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_extension_version);
+        var buffer: [256]u8 = undefined;
+        const bytes = try stagingGet(txn, try sqlExtensionControlKeyForGroup(&buffer, group, request.name)) orelse return;
+        const current = try std.json.parseFromSliceLeaky(package.PackageControl, a, bytes, .{ .allocate = .alloc_always });
+        const registry: package.Registry = .{ .packages = try sqlExtensionPackagesTxn(a, txn, group) };
+        const next = package.promoteControl(a, registry, current, request) catch |err| switch (err) {
+            error.InvalidSqlExtensionControl, error.SqlExtensionControlConflict, error.SqlExtensionPromotionNonceConflict, error.SqlExtensionVersionUnavailable, error.InvalidPackageDigest, error.SqlExtensionUnavailable => return,
+            else => return err,
+        };
+        if (next) |control| try self.writeSqlExtensionControlTxn(txn, group, control);
+    }
+
     pub fn listExtensionPackages(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]extension_domain.PackageManifest {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        if (group_id == group_ids.main_metadata_group_id) if (try stagingGet(&txn, standalone_catalog_key)) |bytes| {
+            const Projection = struct { extension_packages: []const extension_domain.PackageManifest = &.{} };
+            var parsed = try std.json.parseFromSlice(Projection, alloc, bytes, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const out = try alloc.alloc(extension_domain.PackageManifest, parsed.value.extension_packages.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |*record| record.deinitOwned(alloc);
+                alloc.free(out);
+            }
+            for (parsed.value.extension_packages, 0..) |record, i| {
+                try record.validate();
+                out[i] = try extension_domain.clonePackageManifestAlloc(alloc, record);
+                initialized += 1;
+            }
+            return out;
+        };
         var prefix_buf: [128]u8 = undefined;
         const prefix = try extensionPackagePrefixForGroup(&prefix_buf, group_id);
         const kvs = try self.store.scanPrefix(alloc, prefix);
@@ -34167,6 +34392,7 @@ pub const RaftApplyStore = struct {
         restore_progress,
         replication_source_status,
         extension_package,
+        sql_extension_control,
         installed_extension,
         extension_member,
         extension_dependency,
@@ -34278,6 +34504,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .restore_progress, .key = .{ .prefix = restoreProgressPrefixForGroup } },
         .{ .projection = .replication_source_status, .key = .{ .prefix = replicationSourceStatusPrefixForGroup } },
         .{ .projection = .extension_package, .key = .{ .prefix = extensionPackagePrefixForGroup } },
+        .{ .projection = .sql_extension_control, .key = .{ .prefix = sqlExtensionControlPrefixForGroup } },
         .{ .projection = .installed_extension, .key = .{ .prefix = installedExtensionPrefixForGroup } },
         .{ .projection = .extension_member, .key = .{ .prefix = extensionMemberPrefixForGroup } },
         .{ .projection = .extension_dependency, .key = .{ .prefix = extensionDependencyPrefixForGroup } },
@@ -34422,7 +34649,9 @@ pub const RaftApplyStore = struct {
             .compare_and_set_backup_cohort => metadataSnapshotProjectionBit(.backup_cohort) | metadataSnapshotProjectionBit(.backup_cohort_progress) | metadataSnapshotProjectionBit(.backup_cohort_lock),
             .upsert_reallocation_request, .remove_reallocation_request => metadataSnapshotProjectionBit(.reallocation_request) |
                 metadataSnapshotProjectionBit(.reallocation_request_pending),
-            .upsert_extension_package, .remove_extension_package => metadataSnapshotProjectionBit(.extension_package),
+            .upsert_extension_package => metadataSnapshotProjectionBit(.extension_package) | metadataSnapshotProjectionBit(.sql_extension_control),
+            .remove_extension_package => metadataSnapshotProjectionBit(.extension_package),
+            .promote_sql_extension_default => metadataSnapshotProjectionBit(.sql_extension_control),
             .upsert_installed_extension, .remove_installed_extension => metadataSnapshotProjectionBit(.installed_extension),
             .upsert_extension_member, .remove_extension_member => metadataSnapshotProjectionBit(.extension_member) | metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_extension_dependency, .remove_extension_dependency => metadataSnapshotProjectionBit(.extension_dependency),
@@ -38291,14 +38520,29 @@ pub const RaftApplyStore = struct {
             .upsert_extension_package => |record| {
                 var key_buf: [256]u8 = undefined;
                 const key = try extensionPackageKeyForGroup(&key_buf, group_id, record.name, record.version);
+                const accepted = self.registerSqlExtensionPackageTxn(txn, group_id, record, key) catch |err| switch (err) {
+                    error.InvalidSqlExtensionPackageMutation, error.InconsistentSqlExtensionControl, error.SqlProgramLimitExceeded => return,
+                    else => return err,
+                };
+                if (!accepted) return;
                 const value = try encodeExtensionPackageRecord(self.alloc, record);
                 defer self.alloc.free(value);
                 try txn.put(key, value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
             },
+            .promote_sql_extension_default => |request| try self.promoteSqlExtensionDefaultTxn(txn, group_id, request),
             .remove_extension_package => |record| {
+                rejectStandalonePackageMutationTxn(txn, group_id) catch |err| switch (err) {
+                    error.UnsupportedOperation => return,
+                    else => return err,
+                };
                 var key_buf: [256]u8 = undefined;
                 const key = try extensionPackageKeyForGroup(&key_buf, group_id, record.name, record.version);
+                if (try stagingGet(txn, key)) |bytes| {
+                    var parsed = try std.json.parseFromSlice(extension_domain.PackageManifest, self.alloc, bytes, .{});
+                    defer parsed.deinit();
+                    if (parsed.value.sql != null) return;
+                }
                 txn.delete(key) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
@@ -46230,9 +46474,164 @@ pub const RaftApplyStore = struct {
         return std.json.Stringify.valueAlloc(a, try outcomes.lookup(a, request.admission, try sql_native_indexes.boundDigest(a, request)), .{});
     }
 
+    fn sqlExtensionPackagesTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64) ![]const extension_domain.PackageManifest {
+        var buffer: [128]u8 = undefined;
+        const prefix = try extensionPackagePrefixForGroup(&buffer, group);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var result: std.ArrayList(extension_domain.PackageManifest) = .empty;
+        var remaining: usize = system_catalog.max_command_bytes;
+        var row = try cursor.seekAtOrAfter(prefix);
+        while (row) |item| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, item.key, prefix)) break;
+            if (item.value.len > remaining) return error.SqlProgramLimitExceeded;
+            remaining -= item.value.len;
+            const package = try std.json.parseFromSliceLeaky(extension_domain.PackageManifest, a, item.value, .{ .allocate = .alloc_always });
+            if (package.sql == null) continue;
+            if (result.items.len == extension_domain.sql_package.max_versions) return error.SqlProgramLimitExceeded;
+            try package.validate();
+            try result.append(a, package);
+        }
+        const registry: extension_domain.sql_package.Registry = .{ .packages = result.items };
+        try registry.validate();
+        return result.items;
+    }
+
+    /// The standalone manager's auxiliary is its durable package authority;
+    /// distributed metadata owns physical package rows. Capture either source
+    /// from this same read transaction, never mix their defaults or receipts.
+    fn sqlExtensionRegistryTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64) !extension_domain.sql_package.Registry {
+        if (group == group_ids.main_metadata_group_id) if (try stagingGet(txn, standalone_catalog_key)) |bytes| {
+            const RegistryProjection = struct {
+                extension_packages: []const extension_domain.PackageManifest = &.{},
+                sql_extension_controls: []const extension_domain.sql_package.PackageControl = &.{},
+            };
+            const auxiliary = try std.json.parseFromSliceLeaky(RegistryProjection, a, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+            var packages: std.ArrayList(extension_domain.PackageManifest) = .empty;
+            var remaining: usize = system_catalog.max_command_bytes;
+            for (auxiliary.extension_packages) |package| {
+                if (package.sql == null) continue;
+                const size = (try std.json.Stringify.valueAlloc(a, package, .{})).len;
+                if (size > remaining or packages.items.len == extension_domain.sql_package.max_versions) return error.SqlProgramLimitExceeded;
+                remaining -= size;
+                try packages.append(a, package);
+            }
+            const registry: extension_domain.sql_package.Registry = .{ .packages = packages.items, .controls = auxiliary.sql_extension_controls };
+            try registry.validateControls();
+            return registry;
+        };
+        const registry: extension_domain.sql_package.Registry = .{ .packages = try sqlExtensionPackagesTxn(a, txn, group), .controls = try sqlExtensionControlsTxn(a, txn, group) };
+        try registry.validateControls();
+        return registry;
+    }
+    pub fn sqlExtensionSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: sql_extensions.SnapshotRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        try context.ensureActive();
+        try request.validate();
+        var region: std.heap.ArenaAllocator = .init(alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        _ = try self.standbyRelationActivationTxn(&txn, group, topology_protocol.sql_extension_version);
+        const meta = try system_catalog_storage.readMeta(a, &txn, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = meta };
+        const database = (try view.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound;
+        const namespace = try view.namespaceFor(request.database, request.namespace);
+        const previous = try view.lookup(.extension, database.id, request.name);
+        const installed_resources = try view.childrenBounded(.extension, database.id, sql_extensions.max_installed, 2 * 1024 * 1024);
+        const installed_extensions = try a.alloc(sql_extensions.Dependency, installed_resources.len);
+        for (installed_resources, installed_extensions) |resource, *entry| entry.* = .{ .id = resource.id, .name = resource.name };
+        const incarnation = try catalogIncarnationTxn(&txn, group);
+        const retained: sql_extensions.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
+        const registry = try sqlExtensionRegistryTxn(a, &txn, group);
+        const compact_controls = try a.alloc(extension_domain.sql_package.PackageControl, registry.controls.len);
+        for (registry.controls, 0..) |control, i| {
+            compact_controls[i] = control;
+            compact_controls[i].promotions = &.{};
+        }
+        const result: sql_extensions.Snapshot = .{ .revision = meta.revision, .head = try retained.head(a), .incarnation = incarnation, .database_id = database.id, .namespace_id = namespace.id, .installed = if (previous) |resource| .{ .record = try sql_extensions.Record.decode(a, resource), .description = resource.description } else null, .packages = registry.packages, .controls = compact_controls, .installed_extensions = installed_extensions };
+        try result.validate(request);
+        try context.ensureActive();
+        return std.json.Stringify.valueAlloc(alloc, result, .{});
+    }
+
+    fn validateSqlExtensionCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !void {
+        const request = command.sql_extension orelse return error.InvalidCatalogMutation;
+        try request.validate();
+        if (command.version != 9 or command.expected_revision != 0 or command.sql_catalog_admission != null or command.sql_relation != null or command.sql_native_index != null or command.sql_authorization != null or command.sql_type != null or command.sql_cast != null or command.sql_routine != null or command.sql_sequence != null or command.sql_view != null or command.topology != null or command.placement_update != null or command.constraint_name_admission != null or command.column_sequences.len != 0 or command.creation_sources.len != 0 or command.creation_comment_sources.len != 0 or command.creation_object_comments.len != 0 or command.mutation.kind != .extension or command.mutation.action != sql_extensions.commandAction(request) or !std.mem.eql(u8, command.mutation.database, request.database) or !std.mem.eql(u8, command.mutation.name, request.name) or !std.mem.eql(u8, command.mutation.namespace, system_catalog.default_namespace_name) or command.mutation.new_name != null or command.mutation.tablespace != null or command.mutation.native_service != null or command.mutation.description != null or command.mutation.table_id != 0 or command.mutation.storage_name.len != 0 or !std.mem.eql(u8, command.mutation.source_json, "null") or !std.mem.eql(u8, command.mutation.location_json, "null")) return error.InvalidCatalogMutation;
+        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_extension_version);
+        if (!std.mem.eql(u8, &try catalogIncarnationTxn(txn, group), &request.incarnation)) return error.CatalogGenerationChanged;
+    }
+
+    fn applySqlExtensionCatalogTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: sql_extensions.Mutation, apply: bool) !sql_extensions.Result {
+        const meta = try system_catalog_storage.readMeta(a, txn, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = meta };
+        const registry = try sqlExtensionRegistryTxn(a, txn, group);
+        const planned = try sql_extensions.plan(a, view, registry, request);
+        try system_catalog_storage.requireScopeDeltaWritable(a, txn, group, planned.delta);
+        if (apply and !planned.result.no_op) {
+            const bytes = try std.json.Stringify.valueAlloc(a, sql_extensions.command(request), .{});
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            // Semantic-looking failures after a native effect must abort the
+            // transaction, never become a retained rejection or ignorable CAS.
+            system_catalog_storage.applyDelta(a, txn, group, planned.delta, meta, digest) catch return error.SqlExtensionEffectFailure;
+            if (builtin.is_test) if (self.sql_catalog_post_effect_error != null) {
+                self.sql_catalog_post_effect_error = null;
+                return error.SqlExtensionEffectFailure;
+            };
+        }
+        return planned.result;
+    }
+
+    fn prepareSqlExtensionCatalogTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !sql_extensions.Outcome {
+        try self.validateSqlExtensionCommandTxn(txn, group, command);
+        const request = command.sql_extension.?;
+        const retained: sql_extensions.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = txn, .group = group, .incarnation = request.incarnation };
+        return switch (try retained.prepare(a, request.admission, try sql_extensions.boundDigest(a, try sql_extensions.observation(a, request)))) {
+            .replay => |outcome| outcome,
+            .append => blk: {
+                const planned = self.applySqlExtensionCatalogTxn(a, txn, group, request, false);
+                break :blk if (planned) |result| .{ .success = result } else |err| sql_extensions.Outcome.fromError(err) orelse return err;
+            },
+        };
+    }
+
+    fn applySqlExtensionOutcomeTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !void {
+        try self.validateSqlExtensionCommandTxn(txn, group, command);
+        const request = command.sql_extension.?;
+        var region: std.heap.ArenaAllocator = .init(self.alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        const retained: sql_extensions.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = txn, .group = group, .incarnation = request.incarnation };
+        const digest = try sql_extensions.boundDigest(a, try sql_extensions.observation(a, request));
+        switch (try retained.prepare(a, request.admission, digest)) {
+            .replay => return,
+            .append => |ordinal| {
+                const preview = self.applySqlExtensionCatalogTxn(a, txn, group, request, false);
+                const outcome: sql_extensions.Outcome = if (preview) |_| .{ .success = try self.applySqlExtensionCatalogTxn(a, txn, group, request, true) } else |err| sql_extensions.Outcome.fromError(err) orelse return err;
+                try retained.append(a, ordinal, request.admission, digest, outcome);
+            },
+        }
+    }
+
+    pub fn sqlExtensionOutcome(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, request: sql_extensions.OutcomeRequest) ![]u8 {
+        try request.validate();
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        if (!std.mem.eql(u8, &try catalogIncarnationTxn(&txn, group), &request.incarnation)) return a.dupe(u8, "null");
+        const meta = try system_catalog_storage.readMeta(a, &txn, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = meta };
+        const database = (try view.lookup(.database, 0, request.database)) orelse return a.dupe(u8, "null");
+        if (database.id != request.database_id) return a.dupe(u8, "null");
+        const retained: sql_extensions.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = request.incarnation };
+        return std.json.Stringify.valueAlloc(a, try retained.lookup(a, request.admission, try sql_extensions.boundDigest(a, request)), .{});
+    }
+
     fn validateSqlRoutineCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !void {
         const request = command.sql_routine orelse return error.InvalidCatalogMutation;
         try request.validate();
+        if (request.operation == .publish and (request.operation.publish.definition.wasm != null or request.operation.publish.definition.language == .wasm)) return error.InvalidCatalogMutation;
         if (command.sql_type != null or command.sql_cast != null or command.version != 4 or command.expected_revision != 0 or command.sql_view != null or command.sql_sequence != null or command.column_sequences.len != 0 or
             command.topology != null or command.placement_update != null or command.constraint_name_admission != null or command.mutation.kind != .routine or
             command.mutation.action != sql_routines.commandAction(request) or
@@ -46263,6 +46662,7 @@ pub const RaftApplyStore = struct {
         const storage_signature = try sql_routines.storageSignature(a, kind, signature);
         const previous = try system_catalog_storage.findFunction(a, txn, group, namespace.id, request.target.table, storage_signature);
         const prior = if (previous) |resource| (try sql_routines.records.Record.decode(a, resource.value.source_json)).value else null;
+        if (prior) |record| if (request.operation != .comment and try system_catalog_storage.sqlExtensionMemberOwner(a, txn, group, record.id) != null) return error.SqlExtensionOwnedObject;
         var next: ?sql_routines.records.Record = null;
         var description: ?[]const u8 = if (previous) |resource| resource.value.description else null;
         var next_id = meta.next_id;
@@ -49939,6 +50339,7 @@ const TransitionTag = enum(u8) {
     register_store = 30,
     finalize_node_shutdown = 31,
     upsert_extension_package = 32,
+    promote_sql_extension_default = 99,
     remove_extension_package = 33,
     upsert_installed_extension = 34,
     remove_installed_extension = 35,
@@ -50431,6 +50832,10 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .remove_reallocation_request => |record| {
             try out.append(alloc, @backingInt(TransitionTag.remove_reallocation_request));
             try appendInt(alloc, &out, u128, record.expected_request_id);
+        },
+        .promote_sql_extension_default => |record| {
+            try out.append(alloc, @backingInt(TransitionTag.promote_sql_extension_default));
+            try appendJsonRecord(alloc, &out, record);
         },
         .upsert_extension_package => |record| {
             try out.append(alloc, @backingInt(TransitionTag.upsert_extension_package));
@@ -51055,6 +51460,7 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 .expected_request_id = try readInt(encoded, &pos, u128),
             },
         },
+        .promote_sql_extension_default => .{ .promote_sql_extension_default = try readJsonRecord(extension_domain.sql_package.Promotion, alloc, encoded, &pos) },
         .upsert_extension_package => .{
             .upsert_extension_package = try readJsonRecord(extension_domain.PackageManifest, alloc, encoded, &pos),
         },
@@ -56721,6 +57127,10 @@ fn verifyRelationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
 }
 
 fn verifyRelationCheckpointTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn) !void {
+    verifySqlExtensionControlsCheckpointTxn(alloc, txn) catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled, error.SnapshotBuildCancelled => return err,
+        else => return error.InvalidMetadataHACheckpoint,
+    };
     verifyRelationCheckpointGroupsTxn(alloc, txn) catch |err| switch (err) {
         error.InvalidCatalogRecord, error.InvalidCatalogName, error.InvalidMetadataIncarnation, error.CatalogSourceUntracked, error.NotFound, error.CatalogAlreadyExists, error.CatalogCommandTooLarge => return error.InvalidMetadataHACheckpoint,
         else => return err,
@@ -77951,5 +78361,56 @@ test "SQL native image published restore proof binds full current metadata acros
         const again = try std.json.parseFromSliceLeaky(sql_relation_boots.Observation, a, replay, .{});
         try again.published_restore.?.requireFor(selected);
         try std.testing.expectEqual(@as(u64, 9), again.published_restore.?.revision);
+    }
+}
+
+fn sqlExtensionControlPrefixForGroup(buf: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:sql_extension_control:{d}:", .{group});
+}
+fn sqlExtensionControlKeyForGroup(buf: []u8, group: u64, name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:sql_extension_control:{d}:{s}", .{ group, name });
+}
+fn decodeSqlExtensionControlRecord(a: std.mem.Allocator, bytes: []const u8) !extension_domain.sql_package.PackageControl {
+    var parsed = try std.json.parseFromSlice(extension_domain.sql_package.PackageControl, a, bytes, .{});
+    defer parsed.deinit();
+    try parsed.value.validate();
+    return parsed.value.cloneOwned(a);
+}
+fn optionalSqlControlSchemaEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn verifySqlExtensionControlsCheckpointTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var groups: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    const prefixes = .{ "\x00\x00__metadata__:sql_extension_control:", "\x00\x00__metadata__:metadata_extension_package:" };
+    inline for (prefixes) |prefix| {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(prefix);
+        while (row) |item| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, item.key, prefix)) break;
+            const suffix = item.key[prefix.len..];
+            const delimiter = std.mem.indexOfScalar(u8, suffix, ':') orelse return error.InvalidCatalogRecord;
+            const group = std.fmt.parseInt(u64, suffix[0..delimiter], 10) catch return error.InvalidCatalogRecord;
+            try groups.put(a, group, {});
+            if (std.mem.eql(u8, prefix, prefixes[0])) {
+                const control = try decodeSqlExtensionControlRecord(a, item.value);
+                try control.validate();
+                var key: [256]u8 = undefined;
+                if (!std.mem.eql(u8, item.key, try sqlExtensionControlKeyForGroup(&key, group, control.name))) return error.InvalidCatalogRecord;
+            }
+        }
+    }
+    var iterator = groups.keyIterator();
+    while (iterator.next()) |group| {
+        try (extension_domain.sql_package.Registry{ .packages = try RaftApplyStore.sqlExtensionPackagesTxn(a, txn, group.*), .controls = try RaftApplyStore.sqlExtensionControlsTxn(a, txn, group.*) }).validateControls();
+    }
+    if (try RaftApplyStore.stagingGet(txn, RaftApplyStore.standalone_catalog_key)) |bytes| {
+        const auxiliary = try std.json.parseFromSliceLeaky(RaftApplyStore.StandaloneCatalogAuxiliary, a, bytes, .{ .ignore_unknown_fields = true });
+        try (extension_domain.sql_package.Registry{ .packages = auxiliary.extension_packages, .controls = auxiliary.sql_extension_controls }).validateControls();
     }
 }

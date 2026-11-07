@@ -251,6 +251,49 @@ pub fn mutateSqlNativeIndex(svc: anytype, alloc: std.mem.Allocator, context: ope
     return outcome;
 }
 
+pub fn mutateSqlExtension(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("sql_extensions.zig").Mutation) ![]u8 {
+    const routines = @import("sql_extensions.zig");
+    if (!context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    try @import("../metadata/service.zig").ensureSqlExtensionCapabilityWithContext(svc, context);
+    const required = protocol.sql_extension_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required);
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const command = routines.command(request);
+    if (store.prepareSystemCatalogResult(alloc, svc.metadata_group_id, command)) |preview| {
+        alloc.free(preview);
+    } else |err| {
+        // Accepted semantic failures need the same retained nonce outcome as
+        // success. Only invalid envelopes/capability/IO failures stop admission.
+        if (routines.Outcome.fromError(err) == null) return err;
+    }
+    const observation = try routines.observation(alloc, request);
+    const previous = try store.sqlExtensionOutcome(alloc, svc.metadata_group_id, observation);
+    defer alloc.free(previous);
+    if (!std.mem.eql(u8, previous, "null")) return alloc.dupe(u8, previous);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    try context.ensureActive();
+    svc.lockCatalogMutation();
+    var locked = true;
+    defer if (locked) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_system_catalog = bytes });
+    svc.unlockCatalogMutation();
+    locked = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const outcome = store.sqlExtensionOutcome(alloc, svc.metadata_group_id, observation) catch return error.MetadataMutationOutcomeUnknown;
+    if (std.mem.eql(u8, outcome, "null")) {
+        alloc.free(outcome);
+        return error.MetadataMutationOutcomeUnknown;
+    }
+    return outcome;
+}
+
 pub fn mutateSqlRoutine(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("routines.zig").Mutation) ![]u8 {
     const routines = @import("routines.zig");
     if (!context.setting_admin) return error.Forbidden;
@@ -3046,6 +3089,24 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.sqlNativeIndexOutcome(alloc, svc.metadata_group_id, request);
+        },
+        .sql_extension_mutate => |request| mutateSqlExtension(svc, alloc, context, request),
+        .sql_extension_snapshot => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try @import("../metadata/service.zig").ensureSqlExtensionCapabilityWithContext(svc, context);
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlExtensionSnapshot(alloc, svc.metadata_group_id, request, context);
+        },
+        .sql_extension_outcome => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlExtensionOutcome(alloc, svc.metadata_group_id, request);
         },
         .sql_routine_mutate => |request| mutateSqlRoutine(svc, alloc, context, request),
         .sql_graph_preparation_read => |request| blk: {

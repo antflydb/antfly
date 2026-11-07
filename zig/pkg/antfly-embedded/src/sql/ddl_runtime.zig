@@ -85,7 +85,7 @@ fn commandTag(statement: ast.Statement) ![]const u8 {
             .setting_default => if (ddl.kind == .database) "ALTER DATABASE" else "ALTER ROLE",
             .alter_sequence => "ALTER SEQUENCE",
             .truncate => "TRUNCATE TABLE",
-            .alter_schema => if (ddl.kind == .named_type) (if (ddl.named_type_kind == .domain) "ALTER DOMAIN" else "ALTER TYPE") else switch (ddl.schema_change orelse return error.InvalidSqlSyntax) {
+            .alter_schema => if (ddl.kind == .extension) "ALTER EXTENSION" else if (ddl.kind == .named_type) (if (ddl.named_type_kind == .domain) "ALTER DOMAIN" else "ALTER TYPE") else switch (ddl.schema_change orelse return error.InvalidSqlSyntax) {
                 .create_index => "CREATE INDEX",
                 .drop_index => "DROP INDEX",
                 else => "ALTER TABLE",
@@ -103,6 +103,7 @@ fn commandTag(statement: ast.Statement) ![]const u8 {
                 .operator => "CREATE OPERATOR",
                 .aggregate => "CREATE AGGREGATE",
                 .cast => "CREATE CAST",
+                .extension => "CREATE EXTENSION",
                 .named_type => if (ddl.named_type_kind == .domain) "CREATE DOMAIN" else "CREATE TYPE",
                 .table => return error.InvalidSqlSyntax,
             },
@@ -119,6 +120,7 @@ fn commandTag(statement: ast.Statement) ![]const u8 {
                 .operator => "DROP OPERATOR",
                 .aggregate => "DROP AGGREGATE",
                 .cast => "DROP CAST",
+                .extension => "DROP EXTENSION",
                 .named_type => if (ddl.named_type_kind == .domain) "DROP DOMAIN" else "DROP TYPE",
                 .table => return error.InvalidSqlSyntax,
             },
@@ -136,6 +138,7 @@ fn commandTag(statement: ast.Statement) ![]const u8 {
                 .operator => "ALTER OPERATOR",
                 .aggregate => "ALTER AGGREGATE",
                 .cast => "ALTER CAST",
+                .extension => "ALTER EXTENSION",
                 .named_type => if (ddl.named_type_kind == .domain) "ALTER DOMAIN" else "ALTER TYPE",
             },
         },
@@ -1903,4 +1906,19 @@ test "SQL trigger DDL malformed response shape rejects before checkpoint or back
     compiled.statement.catalog_ddl.trigger = null;
     try std.testing.expectError(error.InvalidSqlSyntax, execute(.{ .result = a, .scratch = a }, backend, compiled.statement));
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
+}
+
+test "SQL extension response classification precedes every backend effect" {
+    const a = std.testing.allocator;
+    for ([_]struct { sql: []const u8, tag: []const u8 }{
+        .{ .sql = "CREATE EXTENSION postgis VERSION '3.4.0'", .tag = "CREATE EXTENSION" },
+        .{ .sql = "ALTER EXTENSION postgis UPDATE TO '3.5.0'", .tag = "ALTER EXTENSION" },
+        .{ .sql = "ALTER EXTENSION postgis UPDATE", .tag = "ALTER EXTENSION" },
+        .{ .sql = "DROP EXTENSION IF EXISTS postgis CASCADE", .tag = "DROP EXTENSION" },
+        .{ .sql = "COMMENT ON EXTENSION vector IS 'search'", .tag = "COMMENT" },
+    }) |example| {
+        var compiled = try @import("compiler.zig").compile(a, example.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqualStrings(example.tag, try commandTag(compiled.statement));
+    }
 }

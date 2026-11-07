@@ -1018,3 +1018,333 @@ test "wasmtime v45 C handle layouts retain nested struct padding" {
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(WasmtimeComponentFunc, "private2"));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(WasmtimeExtern));
 }
+
+/// One statement owns one compiled pure core module and its instance. The
+/// linker has no definitions: WASI, database, AI, clock and notification imports
+/// are never wired into SQL evaluation. All I/O/hash/compile work is admission.
+pub const PreparedSql = struct {
+    const Binding = @import("antfly_local_sources").sql_catalog.routines.records.WasmBinding;
+    lib: WasmtimeLib,
+    engine: *wasm_engine_t,
+    module: *wasmtime_module_t,
+    artifact_bytes: u64,
+    compiled_image_bytes: u64,
+    store: *wasmtime_store_t,
+    context: *wasmtime_context_t,
+    memory: WasmtimeMemory,
+    allocate: WasmtimeFunc,
+    call: WasmtimeFunc,
+    free: WasmtimeFunc,
+    tool: []u8,
+    allocator: std.mem.Allocator,
+    options: InvokeOptions,
+    mutex: std.Io.Mutex = .init,
+    pub const max_json_bytes = 1024 * 1024;
+    pub const sql_fuel: u64 = 5_000_000;
+    pub const sql_memory_bytes: u64 = 8 * 1024 * 1024;
+    pub const max_artifact_bytes: u64 = 8 * 1024 * 1024;
+
+    /// The opaque compiler's transient allocations are not a hard bounded
+    /// arena. Retained code image, guest allowance and artifact credit are
+    /// measured/charged before the module enters a statement's live cache.
+    pub fn retainedBytes(self: *const PreparedSql) !u64 {
+        const with_artifact = std.math.add(u64, @intCast(self.options.max_memory_bytes), self.artifact_bytes) catch return error.ResourceBudgetExceeded;
+        return std.math.add(u64, with_artifact, self.compiled_image_bytes) catch error.ResourceBudgetExceeded;
+    }
+
+    pub fn prepare(a: std.mem.Allocator, binding: Binding, options: InvokeOptions) !PreparedSql {
+        try binding.validate();
+        if (options.host_imports.ptr != null or options.host_imports.db_query != null or options.host_imports.db_write != null or options.host_imports.ai_embed != null or
+            options.fuel == 0 or options.fuel > 50_000_000 or options.max_memory_bytes <= 0 or options.max_memory_bytes > 64 * 1024 * 1024) return error.InvalidSqlRoutineRecord;
+        const root = options.package_store_root orelse getenv(package_store_env) orelse return error.WasmtimePackageStoreUnavailable;
+        const hex = std.fmt.bytesToHex(binding.package_digest, .lower);
+        const path = try std.fs.path.join(a, &.{ root, "sha256", &hex, binding.artifact });
+        defer a.free(path);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(options.io, path, a, .limited(max_artifact_bytes)) catch |err| return switch (err) {
+            error.FileNotFound => error.WasmtimeArtifactNotFound,
+            else => err,
+        };
+        defer a.free(bytes);
+        try verifyArtifact(bytes, binding.artifact_digest);
+        var lib = try WasmtimeLib.open();
+        errdefer lib.close();
+        const config = lib.wasm_config_new() orelse return error.WasmtimeUnavailable;
+        lib.wasmtime_config_parallel_compilation_set(config, false);
+        lib.wasmtime_config_wasm_component_model_set(config, false);
+        lib.wasmtime_config_consume_fuel_set(config, true);
+        const engine = lib.wasm_engine_new_with_config(config) orelse return error.WasmtimeUnavailable;
+        errdefer lib.wasm_engine_delete(engine);
+        var module: ?*wasmtime_module_t = null;
+        if (lib.wasmtime_module_new(engine, bytes.ptr, bytes.len, &module)) |err| {
+            lib.wasmtime_error_delete(err);
+            return error.WasmtimeCompileFailed;
+        }
+        errdefer lib.wasmtime_module_delete(module);
+        const image_range = try lookup(&lib.dynlib, "wasmtime_module_image_range", *const fn (*const wasmtime_module_t, *?*anyopaque, *?*anyopaque) callconv(.c) void);
+        var image_start: ?*anyopaque = null;
+        var image_end: ?*anyopaque = null;
+        image_range(module orelse return error.WasmtimeUnavailable, &image_start, &image_end);
+        const image_begin = @intFromPtr(image_start);
+        const image_limit = @intFromPtr(image_end);
+        if (image_limit < image_begin) return error.WasmtimeUnavailable;
+        const image_bytes = image_limit - image_begin;
+        const store = lib.wasmtime_store_new(engine, null, null) orelse return error.WasmtimeUnavailable;
+        errdefer lib.wasmtime_store_delete(store);
+        lib.wasmtime_store_limiter(store, options.max_memory_bytes, 1000, 1, 1, 1);
+        const context = lib.wasmtime_store_context(store) orelse return error.WasmtimeUnavailable;
+        if (lib.wasmtime_context_set_fuel(context, options.fuel)) |err| {
+            lib.wasmtime_error_delete(err);
+            return error.WasmtimeCallFailed;
+        }
+        const linker = lib.wasmtime_linker_new(engine) orelse return error.WasmtimeUnavailable;
+        defer lib.wasmtime_linker_delete(linker);
+        // Do not define unknown imports as traps: even an unused imported host
+        // capability makes this SQL artifact inadmissible.
+        var instance: WasmtimeInstance = .{};
+        var trap: ?*wasm_trap_t = null;
+        if (lib.wasmtime_linker_instantiate(linker, context, module, &instance, &trap)) |err| {
+            lib.wasmtime_error_delete(err);
+            if (trap) |value| lib.wasm_trap_delete(value);
+            return error.WasmtimeInstantiateFailed;
+        }
+        if (trap) |value| {
+            lib.wasm_trap_delete(value);
+            return error.WasmtimeTrap;
+        }
+        const allocate = try lib.exportFunc(context, &instance, "antfly_extension_alloc");
+        const call = try lib.exportFunc(context, &instance, binding.entrypoint);
+        const free = try lib.exportFunc(context, &instance, "antfly_extension_free_buffer");
+        try requireSignature(&lib, context, allocate, &.{
+            0,
+        }, &.{0});
+        try requireSignature(&lib, context, call, &.{ 0, 0, 0, 0 }, &.{1});
+        try requireSignature(&lib, context, free, &.{ 0, 0 }, &.{});
+        const memory = try lib.exportMemory(context, &instance, "memory");
+        const tool = try a.dupe(u8, binding.export_name);
+        return .{ .lib = lib, .engine = engine, .module = module.?, .artifact_bytes = @intCast(bytes.len), .compiled_image_bytes = @intCast(image_bytes), .store = store, .context = context, .memory = memory, .allocate = allocate, .call = call, .free = free, .tool = tool, .allocator = a, .options = options };
+    }
+    pub fn deinit(self: *PreparedSql) void {
+        self.lib.wasmtime_store_delete(self.store);
+        self.lib.wasmtime_module_delete(self.module);
+        self.lib.wasm_engine_delete(self.engine);
+        self.lib.close();
+        self.allocator.free(self.tool);
+        self.* = undefined;
+    }
+    pub fn invoke(self: *PreparedSql, a: std.mem.Allocator, json: []const u8) ![]u8 {
+        return self.invokeExport(a, self.tool, json);
+    }
+    pub fn invokeExport(self: *PreparedSql, a: std.mem.Allocator, export_name: []const u8, json: []const u8) ![]u8 {
+        if (export_name.len == 0 or export_name.len > 255) return error.InvalidSqlRoutineRecord;
+        if (json.len > max_json_bytes) return error.SqlProgramLimitExceeded;
+        try self.mutex.lock(self.options.io);
+        defer self.mutex.unlock(self.options.io);
+        if (self.lib.wasmtime_context_set_fuel(self.context, self.options.fuel)) |err| {
+            self.lib.wasmtime_error_delete(err);
+            return error.WasmtimeCallFailed;
+        }
+        const tool = try self.lib.writeGuestBytes(self.context, self.memory, self.allocate, export_name);
+        defer self.lib.callVoid2(self.context, self.free, @intCast(tool), @intCast(export_name.len)) catch {};
+        const request = try self.lib.writeGuestBytes(self.context, self.memory, self.allocate, json);
+        defer self.lib.callVoid2(self.context, self.free, @intCast(request), @intCast(json.len)) catch {};
+        var args = [_]WasmtimeValRaw{ .{ .i32 = @intCast(tool) }, .{ .i32 = @intCast(export_name.len) }, .{ .i32 = @intCast(request) }, .{ .i32 = @intCast(json.len) } };
+        var trap: ?*wasm_trap_t = null;
+        if (self.lib.wasmtime_func_call_unchecked(self.context, &self.call, &args, args.len, &trap)) |err| {
+            self.lib.wasmtime_error_delete(err);
+            if (trap) |value| self.lib.wasm_trap_delete(value);
+            return error.WasmtimeCallFailed;
+        }
+        if (trap) |value| {
+            self.lib.wasm_trap_delete(value);
+            return error.WasmtimeTrap;
+        }
+        const packed_buffer: u64 = @bitCast(args[0].i64);
+        const ptr: usize = @intCast(packed_buffer & 0xffffffff);
+        const len: usize = @intCast(packed_buffer >> 32);
+        defer self.lib.callVoid2(self.context, self.free, @intCast(ptr), @intCast(len)) catch {};
+        if (len > max_json_bytes) return error.SqlProgramLimitExceeded;
+        return self.lib.readGuestBytesAlloc(a, self.context, self.memory, ptr, len);
+    }
+    fn verifyArtifact(bytes: []const u8, expected: [32]u8) !void {
+        var actual: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+        if (!std.mem.eql(u8, &actual, &expected)) return error.InvalidPackageDigest;
+        if (bytes.len < core_magic.len or !std.mem.eql(u8, bytes[0..core_magic.len], &core_magic)) return error.WasmtimeUnsupportedArtifact;
+    }
+    // Validate the exact C ABI before any unchecked engine call. wasm_valkind_t
+    // uses i32=0/i64=1; descriptor vectors are borrowed from the owned functype.
+    fn requireSignature(lib: *WasmtimeLib, context: *wasmtime_context_t, function: WasmtimeFunc, params: []const u8, results: []const u8) !void {
+        const FunctionType = opaque {};
+        const ValueType = opaque {};
+        const Vector = extern struct { size: usize, data: [*]*ValueType };
+        const get = try lookup(&lib.dynlib, "wasmtime_func_type", *const fn (*wasmtime_context_t, *const WasmtimeFunc) callconv(.c) ?*FunctionType);
+        const destroy = try lookup(&lib.dynlib, "wasm_functype_delete", *const fn (*FunctionType) callconv(.c) void);
+        const parameters = try lookup(&lib.dynlib, "wasm_functype_params", *const fn (*const FunctionType) callconv(.c) *const Vector);
+        const outputs = try lookup(&lib.dynlib, "wasm_functype_results", *const fn (*const FunctionType) callconv(.c) *const Vector);
+        const kind = try lookup(&lib.dynlib, "wasm_valtype_kind", *const fn (*const ValueType) callconv(.c) u8);
+        const declaration = get(context, &function) orelse return error.WasmtimeMissingExport;
+        defer destroy(declaration);
+        const inputs = parameters(declaration);
+        const returns = outputs(declaration);
+        if (inputs.size != params.len or returns.size != results.len) return error.InvalidSqlRoutineRecord;
+        for (params, 0..) |expected, i| if (kind(inputs.data[i]) != expected) return error.InvalidSqlRoutineRecord;
+        for (results, 0..) |expected, i| if (kind(returns.data[i]) != expected) return error.InvalidSqlRoutineRecord;
+    }
+};
+
+fn sqlTestWasm(a: std.mem.Allocator, wat: []const u8) ![]u8 {
+    var lib = try WasmtimeLib.open();
+    defer lib.close();
+    const convert = try lookup(&lib.dynlib, "wasmtime_wat2wasm", *const fn ([*]const u8, usize, *WasmName) callconv(.c) ?*wasmtime_error_t);
+    const release = try lookup(&lib.dynlib, "wasm_byte_vec_delete", *const fn (*WasmName) callconv(.c) void);
+    var bytes: WasmName = .{};
+    if (convert(wat.ptr, wat.len, &bytes)) |err| {
+        lib.wasmtime_error_delete(err);
+        return error.WasmtimeCompileFailed;
+    }
+    defer release(&bytes);
+    return a.dupe(u8, bytes.data[0..bytes.size]);
+}
+
+const sql_test_wat =
+    \\(module
+    \\  (memory (export "memory") 1 128)
+    \\  (func (export "antfly_extension_alloc") (param i32) (result i32) i32.const 4096)
+    \\  (func (export "antfly_extension_free_buffer") (param i32 i32))
+    \\  (func (export "antfly_extension_call_tool") (param i32 i32 i32 i32) (result i64)
+    \\    i64.const 124554051584)
+    \\  (data (i32.const 0) "{\22sql_null\22:false,\22text\22:\227\22}"))
+;
+
+test "wasmtime SQL statement retains verified compiled pure module and rejects artifact import and type substitutions" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const bytes = try sqlTestWasm(a, sql_test_wat);
+    defer a.free(bytes);
+    var artifact_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &artifact_digest, .{});
+    const package_digest: [32]u8 = @splat(7);
+    const hex = std.fmt.bytesToHex(package_digest, .lower);
+    const relative = try std.fmt.allocPrint(a, "sha256/{s}/scalar.wasm", .{hex});
+    defer a.free(relative);
+    const directory = try std.fmt.allocPrint(a, "sha256/{s}", .{hex});
+    defer a.free(directory);
+    try tmp.dir.createDirPath(std.testing.io, directory);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = relative, .data = bytes });
+    const binding: PreparedSql.Binding = .{ .package_name = "test", .package_version = "1.0", .package_digest = package_digest, .artifact = "scalar.wasm", .artifact_digest = artifact_digest, .runtime_name = "pure", .entrypoint = "antfly_extension_call_tool", .export_name = "answer" };
+    const options: InvokeOptions = .{ .io = std.testing.io, .package_store_root = root, .fuel = 10000, .max_memory_bytes = 65536 };
+    var prepared = try PreparedSql.prepare(a, binding, options);
+    defer prepared.deinit();
+    // Preparation owns the compiled code and instance. Removing the artifact
+    // proves row execution performs neither package I/O nor module compilation.
+    try tmp.dir.deleteFile(std.testing.io, relative);
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..1000) |_| {
+        const reply = try prepared.invoke(a, "{}");
+        defer a.free(reply);
+        try std.testing.expectEqualStrings("{\"sql_null\":false,\"text\":\"7\"}", reply);
+    }
+    const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started;
+    std.debug.print("SQL WASM benchmark rows=1000 prepared_modules=1 elapsed_ns={}\n", .{elapsed});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = relative, .data = bytes });
+    var wrong = binding;
+    wrong.artifact_digest[0] ^= 1;
+    try std.testing.expectError(error.InvalidPackageDigest, PreparedSql.prepare(a, wrong, options));
+    wrong = binding;
+    wrong.entrypoint = "arbitrary-export";
+    try std.testing.expectError(error.InvalidSqlRoutineRecord, PreparedSql.prepare(a, wrong, options));
+    const imported = try sqlTestWasm(a, "(module (import \"host\" \"effect\" (func)))");
+    defer a.free(imported);
+    std.crypto.hash.sha2.Sha256.hash(imported, &wrong.artifact_digest, .{});
+    wrong.entrypoint = binding.entrypoint;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = relative, .data = imported });
+    try std.testing.expectError(error.WasmtimeInstantiateFailed, PreparedSql.prepare(a, wrong, options));
+    const bad_signature = try sqlTestWasm(a,
+        \\(module (memory (export "memory") 1)
+        \\ (func (export "antfly_extension_alloc") (param i32) (result i32) i32.const 0)
+        \\ (func (export "antfly_extension_free_buffer") (param i32 i32))
+        \\ (func (export "antfly_extension_call_tool") (param i32) (result i32) i32.const 0))
+    );
+    defer a.free(bad_signature);
+    std.crypto.hash.sha2.Sha256.hash(bad_signature, &wrong.artifact_digest, .{});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = relative, .data = bad_signature });
+    try std.testing.expectError(error.InvalidSqlRoutineRecord, PreparedSql.prepare(a, wrong, options));
+    const endless = try sqlTestWasm(a,
+        \\(module (memory (export "memory") 1)
+        \\ (func (export "antfly_extension_alloc") (param i32) (result i32) i32.const 4096)
+        \\ (func (export "antfly_extension_free_buffer") (param i32 i32))
+        \\ (func (export "antfly_extension_call_tool") (param i32 i32 i32 i32) (result i64)
+        \\  (loop $forever br $forever) i64.const 0))
+    );
+    defer a.free(endless);
+    std.crypto.hash.sha2.Sha256.hash(endless, &wrong.artifact_digest, .{});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = relative, .data = endless });
+    var bounded = try PreparedSql.prepare(a, wrong, options);
+    defer bounded.deinit();
+    try std.testing.expectError(error.WasmtimeTrap, bounded.invoke(a, "{}"));
+    const excessive_memory = try sqlTestWasm(a, "(module (memory (export \"memory\") 2))");
+    defer a.free(excessive_memory);
+    std.crypto.hash.sha2.Sha256.hash(excessive_memory, &wrong.artifact_digest, .{});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = relative, .data = excessive_memory });
+    try std.testing.expectError(error.WasmtimeInstantiateFailed, PreparedSql.prepare(a, wrong, options));
+}
+
+/// Genuine core-WASM fixture generator, available only to owning test roots.
+pub const test_support = if (@import("builtin").is_test) struct {
+    pub fn markerModule(a: std.mem.Allocator, marker: i64) ![]u8 {
+        const value = try std.fmt.allocPrint(a, "{d}", .{marker});
+        defer a.free(value);
+        const wat = try std.mem.replaceOwned(u8, a, marker_wat, "@MARKER@", value);
+        defer a.free(wat);
+        return sqlTestWasm(a, wat);
+    }
+} else struct {};
+const marker_wat =
+    \\(module
+    \\ (memory (export "memory") 1 128)
+    \\ (global $heap (mut i32) (i32.const 4096))
+    \\ (func (export "antfly_extension_alloc") (param $n i32) (result i32)
+    \\  (local $p i32)
+    \\  global.get $heap local.tee $p local.get $n i32.add i32.const 7 i32.add i32.const -8 i32.and global.set $heap
+    \\  local.get $p)
+    \\ (func (export "antfly_extension_free_buffer") (param i32 i32) i32.const 4096 global.set $heap)
+    \\ (func (export "antfly_extension_call_tool") (param i32 i32) (param $request i32) (param $len i32) (result i64)
+    \\  (local $p i32) (local $end i32) (local $negative i32) (local $c i32) (local $v i64) (local $digit i64) (local $out i32) (local $count i32)
+    \\  local.get $request local.set $p
+    \\  local.get $request local.get $len i32.add local.set $end
+    \\  block $found loop $seek
+    \\   local.get $p i32.const 8 i32.add local.get $end i32.gt_u if unreachable end
+    \\   local.get $p i64.load align=1 i64.const 2466321629570233378 i64.eq br_if $found
+    \\   local.get $p i32.const 1 i32.add local.set $p br $seek
+    \\  end end
+    \\  local.get $p i32.const 8 i32.add local.set $p
+    \\  local.get $p i32.load8_u i32.const 45 i32.eq
+    \\  if i32.const 1 local.set $negative local.get $p i32.const 1 i32.add local.set $p end
+    \\  block $parsed loop $digits
+    \\   local.get $p local.get $end i32.ge_u if unreachable end
+    \\   local.get $p i32.load8_u local.tee $c i32.const 34 i32.eq br_if $parsed
+    \\   local.get $c i32.const 48 i32.lt_u local.get $c i32.const 57 i32.gt_u i32.or if unreachable end
+    \\   local.get $v i64.const 10 i64.mul local.get $c i32.const 48 i32.sub i64.extend_i32_u i64.add local.set $v
+    \\   local.get $p i32.const 1 i32.add local.set $p br $digits
+    \\  end end
+    \\  local.get $negative if i64.const 0 local.get $v i64.sub local.set $v end
+    \\  local.get $v i64.const @MARKER@ i64.add local.set $v
+    \\  i32.const 0 local.set $negative
+    \\  local.get $v i64.const 0 i64.lt_s if i32.const 1 local.set $negative i64.const 0 local.get $v i64.sub local.set $v end
+    \\  i32.const 256 local.set $out
+    \\  loop $format
+    \\   local.get $out i32.const 1 i32.sub local.tee $out
+    \\   local.get $v i64.const 10 i64.rem_u i32.wrap_i64 i32.const 48 i32.add i32.store8
+    \\   local.get $v i64.const 10 i64.div_u local.tee $v i64.eqz i32.eqz br_if $format
+    \\  end
+    \\  local.get $negative if local.get $out i32.const 1 i32.sub local.tee $out i32.const 45 i32.store8 end
+    \\  i32.const 256 local.get $out i32.sub local.set $count
+    \\  i32.const 26 local.get $out local.get $count memory.copy
+    \\  i32.const 26 local.get $count i32.add i32.const 34 i32.store8
+    \\  i32.const 27 local.get $count i32.add i32.const 125 i32.store8
+    \\  i32.const 28 local.get $count i32.add i64.extend_i32_u i64.const 32 i64.shl)
+    \\ (data (i32.const 0) "{\22sql_null\22:false,\22text\22:\22"))
+;

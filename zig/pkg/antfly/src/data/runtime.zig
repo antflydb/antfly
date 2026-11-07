@@ -6992,6 +6992,11 @@ pub const DataServer = struct {
         defer a.free(bytes);
         var page = try std.json.parseFromSlice(work.Page, a, bytes, .{});
         defer page.deinit();
+        // This is a scheduling cursor, not a durable recovery receipt. A
+        // pending image must not monopolize every ready-host quantum and
+        // prevent later images from publishing the facts it depends on.
+        // Failed work is revisited on the next bounded directory sweep.
+        if (boot.phase == .ready) self.native_relation_ready_after = page.value.next;
         if (boot.phase == .recovering) self.native_relation_scan_after = if (page.value.next) |next| next else boot.recovery_after;
         for (page.value.entries) |candidate| {
             const entry = candidate.table;
@@ -7052,7 +7057,6 @@ pub const DataServer = struct {
             }
         }
         if (boot.phase == .ready) {
-            self.native_relation_ready_after = page.value.next;
             return page.value.entries.len != 0;
         }
         if (!safe_prefix) return true;
@@ -9904,6 +9908,12 @@ pub const DataServer = struct {
                 const name_order = std.mem.order(u8, left.name, right.name);
                 if (name_order != .eq) return name_order == .lt;
                 return std.mem.order(u8, left.version, right.version) == .lt;
+            }
+        }.lessThan);
+
+        std.mem.sort(antfly.extensions.sql_package.PackageControl, metadata_snapshot.sql_extension_controls, {}, struct {
+            fn lessThan(_: void, left: antfly.extensions.sql_package.PackageControl, right: antfly.extensions.sql_package.PackageControl) bool {
+                return std.mem.lessThan(u8, left.name, right.name);
             }
         }.lessThan);
 
@@ -14844,6 +14854,32 @@ pub const DataServer = struct {
         };
         descriptor.restore_cancel_recovery = progress.state == .canceling or progress.state == .canceled;
         if (input.native_execution) |hint| if (descriptor.sql_persistence == null or !descriptor.sql_persistence.?.eql(hint)) return error.SqlRelationOwnerChanged;
+        var initialized_descriptor: ?antfly.public_api.ProvisionedKernelOwnerSource.OwnedRestoreDescriptor = null;
+        defer if (initialized_descriptor) |*value| value.deinit(alloc);
+        if (descriptor.sql_persistence != null and local_term == null and progress.state != .published and
+            (input.scope.empty_generation or input.scope.population != null) and
+            input.action != .publish and input.action != .cancel and !descriptor.restore_cancel_recovery)
+        {
+            // A cached owner is not authority to initialize. The normal native
+            // receiver already captured a fresh descriptor; recover it here
+            // when the standalone path entered without that capture.
+            if (captured_descriptor == null) {
+                initialized_descriptor = try recoverRestoreDescriptor(self, alloc, group_id, table_name, input.scope.digest(), input.scope.plan_id, restoreOwnerDescriptorUse(input.action), context);
+                descriptor = initialized_descriptor.?.descriptor;
+                if (descriptor.restore_cancel_recovery) return error.RestoreStagingProgressChanged;
+                const current = (try self.status_source.getRestoreStagingProgress(alloc, input.scope.plan_id, context)) orelse return error.RestoreStagingScopeChanged;
+                if (current.state != progress.state or current.revision != progress.revision) return error.RestoreStagingProgressChanged;
+            }
+            const native = descriptor.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+            if (input.native_execution) |hint| if (!native.eql(hint)) return error.SqlRelationOwnerChanged;
+            const identity = try self.schemaRecoveryIdentity();
+            const creation: @import("../metadata/sql_relation_attestation.zig").CreationScope = .{ .plan_id = input.scope.plan_id, .plan_digest = input.scope.plan_digest };
+            const observed = try self.write_source.catalog.sqlRelationBinding(alloc, .{ .node = native.owner_node_id, .binding_table = descriptor.identity.table_id, .creation_scope = creation }, context.deadline_ns);
+            const boot = try nativeInitializationBoot(observed, descriptor.native_reset_source != null);
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.write_source.replica_root_dir, group_id });
+            defer alloc.free(path);
+            try self.initializeNativeDescriptor(alloc, identity.metadata_group_id, boot, group_id, table_name, path, descriptor, creation, context);
+        }
         const Proposal = struct {
             server: *DataServer,
             alloc: std.mem.Allocator,
@@ -14868,7 +14904,10 @@ pub const DataServer = struct {
             const runtime = try self.ensureBackendRuntime();
             const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
             const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir);
-            result.native_empty_acceptance = try owner.attestNativeRestoreAcceptance(alloc, group_id, table_name, descriptor, input, result.native_empty_commit orelse return error.RestoreValidationPending, root, options, context);
+            result.native_empty_acceptance = owner.attestNativeRestoreAcceptance(alloc, group_id, table_name, descriptor, input, result.native_empty_commit orelse return error.RestoreValidationPending, root, options, context) catch |err| {
+                reportRestoreOwnerFailure("acceptance", group_id, input, progress.state, err);
+                return err;
+            };
         }
         return result;
     }
@@ -32704,6 +32743,7 @@ fn cloneAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: antfly.metadata_a
     owned.replication_source_statuses = try cloneReplicationSourceStatusesOwned(alloc, snapshot.replication_source_statuses);
     owned.replication_source_action_hints = try cloneReplicationSourceActionHintsOwned(alloc, snapshot.replication_source_action_hints);
     owned.extension_packages = try cloneExtensionPackagesOwned(alloc, snapshot.extension_packages);
+    owned.sql_extension_controls = try cloneSqlExtensionControlsOwned(alloc, snapshot.sql_extension_controls);
     owned.installed_extensions = try cloneInstalledExtensionsOwned(alloc, snapshot.installed_extensions);
     owned.extension_members = try cloneExtensionMembersOwned(alloc, snapshot.extension_members);
     owned.extension_dependencies = try cloneExtensionDependenciesOwned(alloc, snapshot.extension_dependencies);
@@ -34269,6 +34309,11 @@ fn freeAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: *antfly.metadata_a
         owned.deinitOwned(alloc);
     }
     if (snapshot.extension_packages.len > 0) alloc.free(snapshot.extension_packages);
+    for (snapshot.sql_extension_controls) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (snapshot.sql_extension_controls.len > 0) alloc.free(snapshot.sql_extension_controls);
     for (snapshot.installed_extensions) |record| {
         var owned = record;
         owned.deinitOwned(alloc);
@@ -34628,6 +34673,24 @@ fn cloneExtensionPackagesOwned(
     }
     for (records, 0..) |record, i| {
         out[i] = try antfly.extensions.clonePackageManifestAlloc(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneSqlExtensionControlsOwned(
+    alloc: std.mem.Allocator,
+    records: []const antfly.extensions.sql_package.PackageControl,
+) ![]antfly.extensions.sql_package.PackageControl {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.extensions.sql_package.PackageControl, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*record| record.deinitOwned(alloc);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try record.cloneOwned(alloc);
         initialized += 1;
     }
     return out;
@@ -51172,6 +51235,45 @@ fn consumerTests() type {
             try std.testing.expect(source.metadata_group_id == null);
             try std.testing.expect(source.metadata_incarnation == null);
             try std.testing.expectEqual(@as(u64, 1), source.snapshot_fence_generation);
+        }
+
+        test "remote metadata source SQL control snapshots own retained promotion outcomes" {
+            const a = std.testing.allocator;
+            const controls = antfly.extensions.sql_package;
+            const request: controls.Promotion = .{ .name = "vector", .identity = controls.controlIdentity("vector"), .expected_generation = 1, .version = "2.0.0", .package_digest = @splat(9), .nonce = @splat(7) };
+            const request_digest = try request.digest(a);
+            var original = try (controls.PackageControl{
+                .name = "vector",
+                .identity = controls.controlIdentity("vector"),
+                .generation = 2,
+                .default_version = "2.0.0",
+                .default_digest = @splat(9),
+                .promotions = &.{.{ .nonce = @splat(7), .request_digest = request_digest, .generation = 2, .version = "2.0.0", .package_digest = @splat(9) }},
+            }).cloneOwned(a);
+            var original_live = true;
+            defer if (original_live) original.deinitOwned(a);
+            try original.validate();
+            var owned = try cloneAdminSnapshotOwned(a, .{
+                .status = .{ .metadata_group_id = 9, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+                .sql_extension_controls = @constCast(&.{original}),
+            });
+            defer freeAdminSnapshotOwned(a, &owned);
+            try std.testing.expect(owned.sql_extension_controls[0].name.ptr != original.name.ptr);
+            try std.testing.expect(owned.sql_extension_controls[0].promotions.ptr != original.promotions.ptr);
+            original.deinitOwned(a);
+            original_live = false;
+            const retained = owned.sql_extension_controls[0];
+            try retained.validate();
+            try std.testing.expectEqualStrings("vector", retained.name);
+            try std.testing.expectEqualStrings("2.0.0", retained.promotions[0].version);
+            try std.testing.expectEqual(@as([16]u8, @splat(7)), retained.promotions[0].nonce);
+            try std.testing.expectEqual(request_digest, retained.promotions[0].request_digest);
         }
 
         test "remote metadata source treats superseded concurrent fenced snapshot as success" {

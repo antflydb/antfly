@@ -75,6 +75,7 @@ pub const Export = struct {
     /// programs during restore. An in-flight publication is not exportable.
     policy_install_snapshots: []const @import("antfly_local_sources").system_catalog_policies.InstallSnapshot = &.{},
     extension_packages: []extensions.PackageManifest = &.{},
+    sql_extension_controls: []extensions.sql_package.PackageControl = &.{},
     installed_extensions: []extensions.InstalledExtension = &.{},
     extension_members: []extensions.ExtensionMember = &.{},
     extension_dependencies: []extensions.ExtensionDependency = &.{},

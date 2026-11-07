@@ -17,6 +17,9 @@ const storage = @import("metadata/storage/mod.zig");
 
 test {
     _ = storage.raft_apply_store;
+    _ = @import("metadata/sql_extension_store_test.zig");
+    _ = @import("metadata/sql_extension_control_test.zig");
+    _ = @import("metadata/sql_extension_auxiliary_test.zig");
     _ = @import("system_catalog/foreign_key_dependencies.zig");
     _ = @import("system_catalog/logical_relation_allocations.zig");
     _ = @import("metadata/trigger_catalog.zig");

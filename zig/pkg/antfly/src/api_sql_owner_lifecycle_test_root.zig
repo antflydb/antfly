@@ -79,6 +79,9 @@ test {
     _ = @import("api/sql_ordinary_catalog_test.zig");
     _ = @import("api/sql_preparation_authority_test.zig");
     _ = @import("api/sql_trigger_integration_test.zig");
+    _ = @import("api/sql_extension_integration_test.zig");
+    _ = @import("api/sql_routine_execution.zig");
+    _ = @import("extensions/wasmtime_runtime.zig");
     _ = @import("api/sql_trigger_restore_integration_test.zig");
     _ = @import("api/sql_graph_vote.zig");
     _ = @import("api/sql_graph_execution.zig");
