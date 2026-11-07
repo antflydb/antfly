@@ -1,0 +1,97 @@
+{
+  "scope": "Confirmed capacity-restoration wakeup defect and local Debug validation. The prior optimized end-to-end qualification failed; a corrected optimized run remains required.",
+  "parent_runtime_commit": "64e17251de5ac86f7a2fb8d50c7492193d5d8a5e",
+  "Debug_library_sha256": "ba3c9b3641c0bf09408021ca417c8b771bf47c0346f458834a13bbbf0000bd70",
+  "failed_optimized_qualification": {
+    "library_sha256": "0f4f59cc3c06b098f575fbf366985a0d134ddbcadda1fa035557dff64a68ee51",
+    "completed_inputs": 11,
+    "successful_inputs": 10,
+    "failed_input_zero_based": 10,
+    "censored": false,
+    "error": "ANTFLY_BUSY: LiteReplayBacklogExceeded",
+    "maintenance_page_failure_logs": 0,
+    "read_only_integrity_passed": true,
+    "replay_bytes": 16757414,
+    "replay_byte_limit": 16777216,
+    "replay_records": 812,
+    "replay_record_limit": 4096,
+    "lagging_mixed_namespace": {
+      "text_applied_sequence": 120,
+      "text_target_sequence": 529,
+      "fragment_sequence": 123,
+      "fragment_next_item": 455,
+      "fragment_total_items": 1024,
+      "active_text_segments": 64,
+      "graph_applied_and_target_sequence": 531
+    },
+    "later_qualification_phases_ran": false
+  },
+  "confirmed_mechanism": "A source capacity yield advances no coverage or fragment cursor, so the ordinary progress observer cannot requeue it. Successful merge publication restored headroom but did not explicitly wake the pending source. A cold namespace could wait behind hot siblings until another catalog audit, retaining file-wide replay credits.",
+  "change": "After an applied merge, enqueue the exact namespace/incarnation when replay or startup debt remains, and preserve its pending source state. Queue notification is bounded, allocation-free and deduplicated. It does not advance coverage, return physical credits, change timeouts or replay user mutations.",
+  "deterministic_regression": {
+    "name": "capi native replay capacity yield starts a merge before any result is pending",
+    "control": "Clear incidental runnable tickets immediately before the ready merge is published; require an explicit source wake and eventual replay/visibility afterward.",
+    "before": {
+      "passed": 0,
+      "failed": 1,
+      "leaked": 0
+    },
+    "after": {
+      "passed": 1,
+      "failed": 0,
+      "leaked": 0
+    }
+  },
+  "validation": {
+    "full_C_API_target": {
+      "passed": true,
+      "embedded_passed": 381,
+      "embedded_skipped": 3,
+      "core_owner_passed": 87,
+      "failed": 0,
+      "leaked": 0,
+      "unexpected_logged_errors": 0,
+      "includes_resolver_replay": true
+    },
+    "SDK_SQL_catalog_outcomes_concurrency_crash": {
+      "passed": 209,
+      "failed": 0,
+      "seconds": 55.18
+    },
+    "ABI_exports": 138,
+    "C_executable_and_shared_library_linkage_passed": true,
+    "retained_native_gate": {
+      "passed": 847,
+      "skipped_benchmarks": 5,
+      "failed": 0,
+      "leaked": 0,
+      "native_sources_unchanged": true
+    }
+  },
+  "local_cold_background_diagnostic": {
+    "scope": "Debug, compiler/SDK overlap, native inference backend; no foreground writes or explicit drain; not a matched throughput comparison or a substitute for optimized qualification.",
+    "sample_seconds": 26.383135165990097,
+    "initial_replay_bytes": 9379664,
+    "final_replay_bytes": 9252672,
+    "initial_replay_records": 557,
+    "final_replay_records": 543,
+    "source_turns": 22,
+    "priority_turns": 25,
+    "applied_merges": 4,
+    "page_failures": 0,
+    "source_errors": 0
+  },
+  "limits": [
+    "The missing wake is reproduced independently; this does not establish that it explains every remaining end-to-end cost.",
+    "All 15 unchanged inputs completed in a separate local optimized diagnostic with metrics, but different host conditions and tracing do not override the failed final-host qualification."
+  ],
+  "remaining": [
+    "Corrected-candidate optimized unchanged importer and retained payload parity.",
+    "Original-importer concurrency, active-write constant/changing-text soaks, and large-graph qualification.",
+    "Manual historical timing and payload-accounting assessment.",
+    "Externally owned aggregate CI and full factory."
+  ],
+  "reference_builds_or_executions": false,
+  "database_archives_created": false,
+  "original_importer_unchanged": true
+}

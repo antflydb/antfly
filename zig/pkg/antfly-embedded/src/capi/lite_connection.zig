@@ -3899,6 +3899,17 @@ pub const Owner = struct {
             }
             const lookup_pending = if (self.pending_text_merge) |pending| pending.lookup_needed else false;
             if (completed_merge or (merge_error != null and !retain_refusal)) retired_merge = self.takePendingTextMergeAssumeLocked();
+            if (retired_merge) |finished| if (finished.applied and
+                (namespace_pending or schedule.database_pending or schedule.startup_replay_pending))
+            {
+                // A capacity yield advanced neither coverage nor a fragment,
+                // so it earned no source ticket. Publishing the merge makes
+                // that source runnable again. Waiting for a catalog audit here
+                // strands its retained file-wide credits behind hot siblings.
+                schedule.database_pending = true;
+                self.runnable_sources.notify(io, .{ .table_id = publication.identity.table_id, .incarnation = publication.incarnation });
+                self.maintenance_pending = true;
+            };
             schedule.artifact_pending = true;
             schedule.next_artifact_ns = std.Io.Clock.awake.now(io).nanoseconds + if (lookup_pending) @as(i96, 0) else 100 * std.time.ns_per_ms;
             database.borrowed_group_source_state = null;
@@ -11694,9 +11705,37 @@ test "capi native replay capacity yield starts a merge before any result is pend
     try std.testing.expect(owner.pending_text_merge == null);
     try fixture.writeReplaySource(.{ .writes = &.{.{ .key = "capacity-replay-source", .value = "{\"text\":\"source after capacity is restored\"}" }}, .sync_level = .write });
     const failures_before = owner.publication_stats.maintenance_failures.source;
+    const ColdSource = struct {
+        owner: *Owner,
+        cleared: bool = false,
+        fn beforeCapture(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const pending = self.owner.pending_text_merge orelse return;
+            if (!pending.ready) return;
+            // A reopened/cold namespace has no new foreground notification.
+            // Its capacity refusal made no replay progress to requeue either.
+            // Remove unrelated hints before the ready publication so only an
+            // explicit capacity-restored wake can resume this source.
+            while (self.owner.runnable_sources.pending(h.handleLockIo()))
+                _ = self.owner.runnable_sources.choose(h.handleLockIo());
+            self.cleared = true;
+        }
+    };
+    var cold: ColdSource = .{ .owner = owner };
+    owner.test_before_maintenance_capture = .{ .ptr = &cold, .notify = ColdSource.beforeCapture };
+    defer owner.test_before_maintenance_capture = null;
     for (0..512) |_| {
         _ = try owner.maintenanceTurn();
-        if (owner.publication_stats.text_merge_jobs_applied != 0 and owner.publication_stats.replay_index_groups != 0) break;
+        if (owner.publication_stats.text_merge_jobs_applied != 0) break;
+        try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+    }
+    owner.test_before_maintenance_capture = null;
+    if (!cold.cleared) return error.TestColdSourceQueueWasNotCleared;
+    if (owner.publication_stats.text_merge_jobs_applied == 0) return error.TestColdSourceMergeDidNotPublish;
+    if (!owner.runnable_sources.pending(h.handleLockIo())) return error.TestCapacityRestoredWithoutSourceWake;
+    for (0..512) |_| {
+        _ = try owner.maintenanceTurn();
+        if (owner.publication_stats.replay_index_groups != 0) break;
         try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expect(owner.publication_stats.replay_capacity_yields != 0);

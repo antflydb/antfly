@@ -1,7 +1,8 @@
 # Native commit proofs
 
-Revision 15 keeps the paged COW engine and introduces one-sync publication for
-bounded, synced native transactions. It does not remove the older safe protocol.
+The protocol introduced in revision 15 keeps the paged COW engine and enables
+one-sync publication for bounded, synced native transactions. It retains the
+older safe protocol for transactions that cannot establish the required proofs.
 
 ## Publication
 
@@ -61,8 +62,10 @@ The active frame has one allocator ownership claim. A replacing publication
 retires that claim as metadata. Continuation pages and optional codec parent links
 have explicit ownership and bounded metadata reclamation. Logical-only readers
 do not pin this metadata; full inspection snapshots retain the metadata horizon.
-Maintenance uses the older safe protocol, retires an inherited active proof and
-does not create another one, so idle collection can settle.
+Unverified maintenance uses the older safe protocol and retires an inherited
+active proof without creating another. Verified maintenance can use the bounded
+postimage protocol described below; eligibility and retention still depend on
+its exact allocator capability, rather than merely being maintenance work.
 
 An unpublished copied or compacted generation drops its active proof through the
 allocator, duplicates its resulting complete proof-free slot, then changes its

@@ -116,6 +116,14 @@ it does not classify capacity as a stale-source failure and skip that service.
 A ready merge takes priority over another source attempt. Capacity yields do not
 mark the captured source target serviced or imply that replay has completed.
 
+A successful merge that restores producer capacity explicitly requeues its exact
+namespace and incarnation when replay debt remains. A capacity refusal advances
+neither a whole-record watermark nor a fragment cursor, so source-progress
+notifications cannot supply that wake. Depending on a later catalog audit can
+strand retained file-wide credits behind unrelated hot namespaces. Merge
+completion changes scheduling eligibility; it does not advance coverage or refund
+credits before the required physical records are deleted.
+
 Source preparation reads an independently retained immutable cut. It does not
 require an allocator proof for that obsolete cut to match a moving writer tip.
 The admitted publisher rebases and authenticates the current allocator before
@@ -239,6 +247,15 @@ hook now joins the owned outside-admission completion path, including cleanup's
 accepted replay cut. The [publication visibility Debug receipt](publication-visibility-debug.json)
 records local reproductions, operation counts and correctness checks. These
 local diagnostics do not establish optimized importer or contended throughput.
+
+The next final-host run passed namespace, SQL and matched synchronous-write
+checks, then hit replay admission Busy on the eleventh importer input. Read-only
+integrity passed; one mixed-index namespace retained a full text-capacity window
+and most of the file-wide replay budget. The
+[capacity-restoration receipt](replay-capacity-resume-debug.json) records an
+independently reproduced missing source wake after successful merge publication,
+its fix and the local gates. Corrected-candidate end-to-end qualification remains
+required; local completion on a different host does not override that failure.
 
 Component receipts: [native namespaces](direct-native-namespaces-debug.json),
 [owned publication](owned-native-publication-debug.json),
