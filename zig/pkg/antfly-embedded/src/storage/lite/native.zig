@@ -135,6 +135,14 @@ test "bug2: an indexed-reclamation Lite file at a relative path creates no files
 
     std.debug.print("BUG2-DIAG: about to create, cwd should be tmp={s}\n", .{tmp_dir_path});
     const bare_name = "bug2-repro.aflite";
+    // This test is the one legitimate, deliberate exercise of
+    // `Namespace.open`'s cwd fallback (see that function's own debug
+    // assertion): cwd is pinned above, on purpose, specifically so a bare
+    // path resolves predictably. Every other caller that reaches that
+    // fallback is depending on cwd by accident, which the assertion exists
+    // to catch; suppress it only for this one call.
+    @import("reader_epochs.zig").debug_assert_allow_cwd_fallback = true;
+    defer @import("reader_epochs.zig").debug_assert_allow_cwd_fallback = false;
     {
         var file = try NativeFile.createWithIo(a, io, bare_name, .{ .indexed_reclamation = true, .no_sync = true, .exclusive = true });
         defer file.close();
@@ -1119,7 +1127,14 @@ test "lite allocator v4 overwrite reuses pages across reopen" {
         try file.putDocument("doc", value);
         try file.putCatalogRecord("catalog", value);
     }
-    try std.testing.expect(file.activeCheckpoint().page_count < before + 32);
+    // Each of these 160 bare commits reserves its own fresh manifest page
+    // (`reserveBareCommitManifestPage` -- always a fresh id, never a reused
+    // one, by design: see `PageAllocator.allocateFresh`), on top of the
+    // pre-WS1(b) growth this bound already allowed for. Retirement reclaims
+    // those pages for later reuse, bounded per commit, so growth is still
+    // bounded, not unbounded -- just within a wider margin that accounts
+    // for up to one extra page per commit in this window.
+    try std.testing.expect(file.activeCheckpoint().page_count < before + 32 + 160);
     const got = (try file.getDocumentAlloc(a, "doc")).?;
     defer a.free(got);
     try std.testing.expectEqualSlices(u8, value, got);
@@ -1567,6 +1582,47 @@ test "lite coordinator publication cancellation never performs fallible notifica
     defer a.free(value);
     try std.testing.expectEqualStrings("before", value);
     try std.testing.expect((try file.check()).valid);
+}
+
+// `checkpoint_publication_uncertain` means "a publication failed in a way
+// that may have left disk ahead of header", never merely "a publication is
+// in flight" -- see that field's doc comment. `publication_in_flight` is
+// the separate signal for the latter: true for the whole span of one
+// `publishCheckpoint` call past its point of no return, regardless of
+// outcome, so a concurrent reader that only needs "wait for this to
+// finish" never mistakes an ordinary in-flight commit for one needing
+// reconciliation. This checks the field's lifecycle around both outcomes
+// from the same thread (never stuck `true` after a call returns, either
+// way); a cross-thread check that a concurrent reader observes it mid-sync
+// without tripping reconciliation needs the as-yet-unmerged lock-release
+// path (`sync_lock_hooks`) this fix prepares for to actually let anything
+// run concurrently with the sync in the first place.
+test "lite publication_in_flight never outlives a publishCheckpoint call, on either outcome" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "publication-in-flight.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer file.close();
+    try std.testing.expect(!file.publication_in_flight);
+    try std.testing.expect(!file.checkpoint_publication_uncertain);
+
+    try file.putDocument("doc", "durable");
+    try std.testing.expect(!file.publication_in_flight);
+    try std.testing.expect(!file.checkpoint_publication_uncertain);
+
+    // An injected failure during that same window still latches
+    // `checkpoint_publication_uncertain` and still reconciles, exactly as
+    // before this change -- only the proactive, before-the-fact set is
+    // gone. `publication_in_flight` clears regardless of outcome.
+    file.test_fail_checkpoint_publication = error.InputOutput;
+    try std.testing.expectError(error.OutcomeUnknown, file.putDocument("doc", "durable again"));
+    try std.testing.expect(!file.publication_in_flight);
+    try std.testing.expect(file.checkpoint_publication_uncertain);
+    try file.reconcilePublicationUncertainty();
+    try std.testing.expect(!file.checkpoint_publication_uncertain);
 }
 
 test "lite allocator v4 long keys shared values incremental deletion and vacuum" {
@@ -5021,6 +5077,26 @@ pub const NativeFile = struct {
     reader_window_depth: usize = 0,
     reader_window_lock: ?std.Io.File = null,
     epoch_window: ?@import("reader_epochs.zig").Frontier = null,
+    /// Reader-epoch namespace directory, opened once and kept across many
+    /// commits instead of being resolved/opened/closed from scratch on every
+    /// one (see docs/design/lite-performance/throughput-profile.md
+    /// §4.1/§5.1 -- this used to be the single largest foreground cost on a
+    /// primary-only single writer, ~46% of sampled time, more than the
+    /// commit's own fsync+pwrite+pread). Invalidated and reopened whenever
+    /// `header.reader_epoch_namespace` no longer matches
+    /// `reader_namespace_binding` (covers every rebind site, e.g.
+    /// `bindPrivateEpochNamespace`/`adoptIndexPublicationHeader`, without
+    /// needing to patch each one) and closed in `close`.
+    reader_namespace: ?@import("reader_epochs.zig").CachedNamespace = null,
+    reader_namespace_binding: [32]u8 = @splat(0),
+    /// `reader_epochs.directoryFingerprint` captured immediately after the
+    /// scan that produced `reader_frontier_cache`, while still holding that
+    /// commit's exclusive data-file lock. The next commit compares its own
+    /// (also lock-held) fingerprint against this before deciding a full
+    /// `reader_epochs.scanCached` is needed; see that function's own comment
+    /// for why an unchanged fingerprint makes the cached frontier stale-safe.
+    reader_namespace_fingerprint: ?i96 = null,
+    reader_frontier_cache: @import("reader_epochs.zig").Frontier = .{},
     minimum_metadata_reader_sequence: ?u64 = null,
     reader_window_previous_metadata_frontier: ?u64 = null,
     reader_window_previous_frontier: ?u64 = null,
@@ -5087,16 +5163,35 @@ pub const NativeFile = struct {
     /// backend embedded Lite normally opens with), since this bypasses the
     /// vtable (and its cancellation support) entirely.
     durability_policy: ?antfly_platform.filesystem.DurabilityPolicy = null,
-    // An error after slot publication may leave disk ahead of header. Do not
-    // elide a subsequent write based on the old in-memory checkpoint then.
+    // A publication that fails after it may have started writing the slot
+    // may leave disk ahead of header -- this means exactly that: a
+    // publication *failed* in a way that leaves the relationship between
+    // disk and this in-memory header unknown. It is set only in
+    // `publishCheckpoint`'s own failure path (and by an injected test
+    // fault), never proactively before an attempt: an ordinary, still
+    // in-flight publish that hasn't failed is not "uncertain", and must
+    // not be treated as needing reconciliation by a concurrent observer of
+    // this same NativeFile (see `publication_in_flight` for that case).
+    // Do not elide a subsequent write based on the old in-memory checkpoint
+    // while this is set.
     checkpoint_publication_uncertain: bool = false,
+    /// True for the entire span of one `publishCheckpoint` call past its
+    /// point of no return (the slot write/sync attempt), regardless of how
+    /// it ends -- success, a reconciled failure, or a latched one. Concurrent
+    /// code (e.g. a maintenance pass, an owner refresh) that only needs to
+    /// know "a publish is in progress, wait for it" belongs on this flag,
+    /// never on `checkpoint_publication_uncertain`: that one means failure,
+    /// this one means "in flight", and conflating them is exactly what let
+    /// a benign in-flight commit be mistaken for one needing reconciliation.
+    publication_in_flight: bool = false,
     /// The checkpoint `publishCheckpoint` was writing into `uncertain_slot`
     /// when the I/O that set `checkpoint_publication_uncertain` failed.
     /// `reconcilePublicationUncertainty` compares this against what is
     /// actually on disk to resolve the latch in-process, without a
-    /// close+reopen. Both are set together, immediately before the risky
-    /// write, and cleared together whenever the latch clears (on success in
-    /// `publishCheckpoint`, or by reconciliation).
+    /// close+reopen. Captured before the risky write (unconditionally, same
+    /// as `publication_in_flight`) so it is available the moment a failure
+    /// does set the latch, and cleared together with it whenever the latch
+    /// clears (on success in `publishCheckpoint`, or by reconciliation).
     uncertain_checkpoint: ?CheckpointSlot = null,
     uncertain_slot: ?u8 = null,
     /// Optional hooks a caller installs (and clears) around exactly one
@@ -5444,6 +5539,8 @@ pub const NativeFile = struct {
         self.manifest_builder.deinit(self.allocator);
         const io = self.runtimeIo();
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
+        if (self.reader_namespace) |cached| cached.close(self.allocator, io);
+        self.reader_namespace = null;
         self.page_cache.deinit(self.allocator);
         self.invalidateLedger();
         if (self.writer_lock_file) |lock_file| {
@@ -5959,8 +6056,61 @@ pub const NativeFile = struct {
         const lock = try acquireDataRewriteLock(self.runtime(), self.path);
         errdefer lock.file.close(self.runtime());
         if (self.activeCheckpoint().free_map_root_page != 0 and (try lock.file.stat(self.runtime())).inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentSourceChanged;
-        if (self.header.indexed_reclamation) self.epoch_window = try @import("reader_epochs.zig").scan(self.allocator, self.runtime(), self.path, self.header.reader_epoch_namespace, (try self.file.stat(self.runtime())).inode);
+        if (self.header.indexed_reclamation) self.epoch_window = try self.scanReaderEpochsCached();
         return lock;
+    }
+
+    /// `reader_namespace`, opened once and reopened whenever it can no
+    /// longer be trusted: either `header.reader_epoch_namespace` changed
+    /// since it was cached (a rebind, e.g. `bindPrivateEpochNamespace`), or
+    /// `reader_epochs.parentUnchanged` shows the data file's parent
+    /// directory is no longer the one this cache resolved -- an external
+    /// rename/replace of that parent (a backup/restore or vacuum dance can
+    /// do this) can leave the cached directory/guard handles still valid by
+    /// inode while no longer being where a *fresh* registration would land,
+    /// so a stale cache must not go on being trusted just because its
+    /// handles still happen to work. Both checks are cheap (an in-memory
+    /// compare and one `statFile` syscall); no syscalls at all are needed
+    /// beyond that when the cache already matches.
+    fn ensureReaderNamespaceCache(self: *NativeFile) !@import("reader_epochs.zig").CachedNamespace {
+        const epochs = @import("reader_epochs.zig");
+        const io = self.runtime();
+        if (self.reader_namespace) |cached| {
+            if (std.mem.eql(u8, &self.reader_namespace_binding, &self.header.reader_epoch_namespace) and
+                epochs.parentUnchanged(io, self.path, cached)) return cached;
+            cached.close(self.allocator, io);
+            self.reader_namespace = null;
+            self.reader_namespace_fingerprint = null;
+        }
+        const cached = try epochs.openCached(self.allocator, io, self.path, self.header.reader_epoch_namespace);
+        self.allocator_work.reader_namespace_opens +|= 1;
+        self.reader_namespace = cached;
+        self.reader_namespace_binding = self.header.reader_epoch_namespace;
+        self.reader_namespace_fingerprint = null;
+        return cached;
+    }
+
+    /// The reuse frontier for this commit, amortizing `reader_epochs.zig`'s
+    /// namespace open/scan across commits instead of paying its full cost on
+    /// every one. Caller already holds the exclusive data-file lock
+    /// (`acquireDataRewriteLock`, above) -- that lock is what makes trusting
+    /// an unchanged `directoryFingerprint` safe without rescanning; see that
+    /// function's own comment for the full argument. The first call (or any
+    /// call after a rebind) always pays for one real
+    /// `reader_epochs.scanCached`; every call after that is a single
+    /// `fstat`-equivalent as long as no reader has joined or left since.
+    fn scanReaderEpochsCached(self: *NativeFile) !@import("reader_epochs.zig").Frontier {
+        const epochs = @import("reader_epochs.zig");
+        const io = self.runtime();
+        const cached = try self.ensureReaderNamespaceCache();
+        const fp = try epochs.directoryFingerprint(io, cached);
+        if (self.reader_namespace_fingerprint) |previous| if (previous == fp) return self.reader_frontier_cache;
+        const inode = (try self.file.stat(io)).inode;
+        const frontier = try epochs.scanCached(io, cached, inode);
+        self.allocator_work.reader_namespace_full_scans +|= 1;
+        self.reader_frontier_cache = frontier;
+        self.reader_namespace_fingerprint = try epochs.directoryFingerprint(io, cached);
+        return frontier;
     }
     fn beginReaderWindow(self: *NativeFile) !bool {
         const coordinator = self.reader_coordinator orelse return false;
@@ -6990,6 +7140,7 @@ pub const NativeFile = struct {
         const previous = self.activeCheckpoint();
         var page_allocator = try self.pageAllocatorFromFreeMap(previous);
         defer page_allocator.deinit();
+        errdefer self.resetBareCommitManifestWindow();
 
         const page_id = try page_allocator.allocate();
         try page_allocator.writePage(page_id, .data, contents);
@@ -7000,10 +7151,9 @@ pub const NativeFile = struct {
         next.page_count = page_allocator.next_page_id;
 
         try page_allocator.flush();
+        try self.reserveBareCommitManifestPage(&page_allocator);
         try self.persistAllocator(&page_allocator, &next);
-        try self.syncIfRequired();
-
-        try self.publishCheckpoint(next, false);
+        try self.publishBareCommit(&page_allocator, &next);
         return page_id;
     }
 
@@ -7191,6 +7341,7 @@ pub const NativeFile = struct {
         var local_pages: PageAllocator = undefined;
         if (!self.stagingTransaction()) local_pages = try self.pageAllocatorFromFreeMap(previous);
         defer if (!self.stagingTransaction()) local_pages.deinit();
+        errdefer if (!self.stagingTransaction()) self.resetBareCommitManifestWindow();
         const pages = if (self.stagingTransaction()) &(try self.transactionWrites()).pages else &local_pages;
         var builder = ExtentAppender{ .file = self, .pages = pages, .tail = undefined, .batch = .{ .file = self, .options = options } };
         defer builder.deinit();
@@ -7229,9 +7380,9 @@ pub const NativeFile = struct {
         next.free_map_root_page = try pages.allocate();
         next.page_count = pages.next_page_id;
         try pages.flush();
+        try self.reserveBareCommitManifestPage(pages);
         try self.persistAllocator(pages, &next);
-        try self.syncIfRequired();
-        try self.publishCheckpoint(next, false);
+        try self.publishBareCommit(pages, &next);
     }
 
     pub fn appendIndexCatalogRecord(self: *NativeFile, key: []const u8, suffix: []const u8) !void {
@@ -7383,6 +7534,7 @@ pub const NativeFile = struct {
         var local_pages: PageAllocator = undefined;
         if (self.transaction_pages == null) local_pages = try self.pageAllocatorFromFreeMap(previous);
         defer if (self.transaction_pages == null) local_pages.deinit();
+        errdefer if (self.transaction_pages == null) self.resetBareCommitManifestWindow();
         const page_allocator = self.transaction_pages orelse &local_pages;
         page_allocator.pack_records = self.header.packed_records and (mutations.len > 1 or self.transaction_pages != null);
         var editor = IndexEditor.init(self, previous, roots.index);
@@ -7423,11 +7575,12 @@ pub const NativeFile = struct {
 
         if (self.transaction_pages == null) {
             try page_allocator.flush();
+            try self.reserveBareCommitManifestPage(page_allocator);
             try self.persistAllocator(page_allocator, &next);
-            try self.syncIfRequired();
+            try self.publishBareCommit(page_allocator, &next);
+        } else {
+            try self.publishCheckpoint(next, false);
         }
-
-        try self.publishCheckpoint(next, false);
     }
 
     fn transactionCatalogEntry(self: *NativeFile, root: CatalogRoot, key: []const u8, scratch: *[65536]u8) !?CatalogEntry {
@@ -7565,6 +7718,7 @@ pub const NativeFile = struct {
         var next_root_page = roots.history;
         var page_allocator = try self.pageAllocatorFromFreeMap(previous);
         defer page_allocator.deinit();
+        errdefer self.resetBareCommitManifestWindow();
         var key_index = roots.index;
 
         var external_value_root_page: u64 = 0;
@@ -7608,10 +7762,9 @@ pub const NativeFile = struct {
         next.page_count = page_allocator.next_page_id;
 
         try page_allocator.flush();
+        try self.reserveBareCommitManifestPage(&page_allocator);
         try self.persistAllocator(&page_allocator, &next);
-        try self.syncIfRequired();
-
-        try self.publishCheckpoint(next, false);
+        try self.publishBareCommit(&page_allocator, &next);
     }
 
     fn renameCatalogRecordForRoot(self: *NativeFile, root: CatalogRoot, old_key: []const u8, new_key: []const u8) !void {
@@ -7638,6 +7791,7 @@ pub const NativeFile = struct {
         var next_root_page = roots.history;
         var page_allocator = try self.pageAllocatorFromFreeMap(previous);
         defer page_allocator.deinit();
+        errdefer self.resetBareCommitManifestWindow();
         var editor = IndexEditor.init(self, previous, roots.index);
         editor.accounting_pages = &page_allocator;
         defer editor.deinit();
@@ -7687,10 +7841,9 @@ pub const NativeFile = struct {
         next.page_count = page_allocator.next_page_id;
 
         try page_allocator.flush();
+        try self.reserveBareCommitManifestPage(&page_allocator);
         try self.persistAllocator(&page_allocator, &next);
-        try self.syncIfRequired();
-
-        try self.publishCheckpoint(next, false);
+        try self.publishBareCommit(&page_allocator, &next);
     }
 
     pub fn getCatalogRecordAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
@@ -8726,6 +8879,7 @@ pub const NativeFile = struct {
         var local_pages: PageAllocator = undefined;
         if (self.transaction_pages == null) local_pages = try self.pageAllocatorFromFreeMap(previous);
         defer if (self.transaction_pages == null) local_pages.deinit();
+        errdefer if (self.transaction_pages == null) self.resetBareCommitManifestWindow();
         const page_allocator = self.transaction_pages orelse &local_pages;
         page_allocator.pack_records = self.header.packed_records and (mutations.len > 1 or self.transaction_pages != null);
         // Release the document editor before building the namespace index.
@@ -8847,11 +9001,12 @@ pub const NativeFile = struct {
 
         if (self.transaction_pages == null) {
             try page_allocator.flush();
+            try self.reserveBareCommitManifestPage(page_allocator);
             try self.persistAllocator(page_allocator, &next);
-            try self.syncIfRequired();
+            try self.publishBareCommit(page_allocator, &next);
+        } else {
+            try self.publishCheckpoint(next, false);
         }
-
-        try self.publishCheckpoint(next, false);
         if (directory.indexed) {
             deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
             self.namespace_directory_cache = .empty;
@@ -8917,6 +9072,7 @@ pub const NativeFile = struct {
         var local: PageAllocator = undefined;
         if (self.transaction_pages == null) local = try self.pageAllocatorFromFreeMap(previous);
         defer if (self.transaction_pages == null) local.deinit();
+        errdefer if (self.transaction_pages == null) self.resetBareCommitManifestWindow();
         const pages = self.transaction_pages orelse &local;
         pages.pack_records = true;
         var editor = IndexEditor.init(self, previous, previous.document_index_root_page);
@@ -8944,10 +9100,12 @@ pub const NativeFile = struct {
         next.page_count = pages.next_page_id;
         if (self.transaction_pages == null) {
             next.free_map_root_page = try pages.allocate();
+            try self.reserveBareCommitManifestPage(pages);
             try self.persistAllocator(pages, &next);
-            try self.syncIfRequired();
+            try self.publishBareCommit(pages, &next);
+        } else {
+            try self.publishCheckpoint(next, false);
         }
-        try self.publishCheckpoint(next, false);
     }
 
     fn decodeKey(payload: []const u8) ![]const u8 {
@@ -10691,6 +10849,11 @@ pub const NativeFile = struct {
             }
             var destination = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(dest_path), .file = out_file, .header = self.header, .no_sync = false, .page_cache_enabled = .init(false) };
             defer destination.page_cache.deinit(self.allocator);
+            // See `copyExternalValue`'s matching comment: `destination` never
+            // closes, so its manifest tracking state (populated by the
+            // `writePage`/`writeSlotPage` calls below) must be freed
+            // explicitly.
+            defer destination.manifest_builder.deinit(self.allocator);
             try destination.bindPrivateEpochNamespace(dest_path);
             // The raw copy above just took whatever bytes were physically at
             // both slot pages at copy time, which (this handle's own
@@ -11466,12 +11629,29 @@ pub const NativeFile = struct {
                 _ = try self.validateIndexedAllocator(checkpoint, state, self.allocator_cancel_token);
                 self.free_pages_verified = true;
             }
-            const coordinated = try self.beginReaderWindow();
+            // Nothing for the reuse-lock machinery to gain this commit: no
+            // page is already free to hand out (`state.free_pages == 0`) and
+            // no retirement backlog exists to promote (all three heaps
+            // empty, so `drainRetirement` below would immediately break out
+            // of every one of its loops regardless of the frontier it had).
+            // Skip the whole cross-process reuse-lock acquisition --
+            // `acquireDataRewriteLock` plus the reader-epoch scan -- for a
+            // purely additive (append-only) commit; a later commit that
+            // actually retires something (free_pages or any heap becomes
+            // non-empty) stops skipping on its own, so this can never starve
+            // retirement. Never skip while a window from an *outer*,
+            // already-open nested call is live (`reader_window_depth != 0`):
+            // that window is already open for free, so there is no cost to
+            // avoid and no reason to bypass it.
+            const has_retirement_backlog = state.free_pages != 0 or state.heap.count() != 0 or
+                state.metadata_heap.count() != 0 or state.chains_heap.count() != 0;
+            const skip_reuse_lock = !has_retirement_backlog and self.reader_window_depth == 0;
+            const coordinated = if (skip_reuse_lock) false else try self.beginReaderWindow();
             errdefer if (coordinated) self.endReaderWindow();
-            const lock = if (!coordinated) self.acquireEpochReuseLock() catch |err| switch (err) {
+            const lock = if (skip_reuse_lock or coordinated) null else self.acquireEpochReuseLock() catch |err| switch (err) {
                 error.WouldBlock => null,
                 else => return err,
-            } else null;
+            };
             errdefer if (lock) |held| {
                 held.file.close(self.runtimeIo());
                 self.epoch_window = null;
@@ -12172,6 +12352,17 @@ pub const NativeFile = struct {
                 self.allocator.free(old.value);
             }
         } else {
+            // `getOrPut` already wrote `owned.key` into `slot.key_ptr` for a
+            // new entry (its own contract: "if (!found_existing) gop.key_ptr.*
+            // = key"), but `slot.value_ptr` is still whatever garbage backed
+            // that slot -- this function doesn't fill it in until the very
+            // end. If the undo-log append below fails, unwind through the
+            // two `errdefer`s above frees `owned.key`/`owned.value`, which
+            // would otherwise leave this half-initialized slot in the map
+            // with a dangling key and an uninitialized value. Remove it
+            // before that happens; `owned.key` is still valid here since
+            // `errdefer`s run in reverse registration order.
+            errdefer _ = map.remove(owned.key);
             writes.count += 1;
             if (recording) {
                 const undo_key = try self.allocator.dupe(u8, owned.key);
@@ -12517,6 +12708,61 @@ pub const NativeFile = struct {
         return self.commitTransactionWithDurability(true);
     }
 
+    /// Reset accumulated manifest tracking when a bare (no caller-owned
+    /// transaction) commit fails before it publishes. A transactional
+    /// commit's failure is covered by `commitTransactionWithDurability`'s
+    /// own `errdefer` (see its comment: dropping entries from this and any
+    /// earlier non-durable attempt in the same since-last-durable window is
+    /// always safe, since the next durable commit just falls back to
+    /// presynced). A bare commit has no such errdefer and no
+    /// `abortTransaction` call to lean on -- there is no transaction to
+    /// abort -- so without this, a page noted (`PageWriteBatch.flushCount`'s
+    /// hook) before a later step in the same bare commit fails would sit in
+    /// `self.manifest_builder` until some *unrelated* later commit durably
+    /// publishes and resets it, at best wasting memory and at worst (a
+    /// `reserved_page` left set) silently steering that unrelated commit
+    /// away from building a manifest of its own.
+    fn resetBareCommitManifestWindow(self: *NativeFile) void {
+        if (manifest_commits_enabled) {
+            self.manifest_builder.deinit(self.allocator);
+            self.manifest_builder = .{};
+        }
+    }
+
+    /// Reserve a manifest page for a bare (no caller-owned transaction)
+    /// commit, right before it calls `persistAllocator` -- the same place
+    /// `flushTransactionWrites` reserves its own (see that call site's
+    /// comment for why this must run before `persistAllocator` finalizes
+    /// `page_count`, and why the reservation is always a fresh page id,
+    /// never a reused one). Every hand-rolled bare-commit tail below calls
+    /// this instead of going straight to a presynced publish, so a small
+    /// bare commit gets the same shot at the one-sync manifest path a
+    /// transactional commit does.
+    fn reserveBareCommitManifestPage(self: *NativeFile, pages: *PageAllocator) !void {
+        if (manifest_commits_enabled and !self.no_sync and
+            !self.manifest_builder.overflowed and self.manifest_builder.reserved_page == null)
+        {
+            self.manifest_builder.reserved_page = try pages.allocateFresh();
+        }
+    }
+
+    /// The single manifest-build-and-publish tail every durable commit
+    /// reaches, bare or transactional: note any pages this commit pulled
+    /// from the free list (`PageWriteBatch.flushCount`'s hook already noted
+    /// every page actually written, regardless of caller), try to build a
+    /// manifest covering everything written since the last durable
+    /// checkpoint, then publish -- one `syncData` when the manifest fits,
+    /// the historical presynced two-sync fallback otherwise.
+    /// `commitTransactionWithDurability` reaches the equivalent tail via
+    /// `flushTransactionWrites` for transactional commits, so this is the
+    /// one place manifest/presynced publication logic lives either way.
+    fn publishBareCommit(self: *NativeFile, pages: *PageAllocator, next: *CheckpointSlot) !void {
+        if (manifest_commits_enabled) try self.manifest_builder.noteReused(self.allocator, &pages.reused);
+        const manifest_prepared = if (manifest_commits_enabled) try self.tryBuildCommitManifest(next) else false;
+        if (!manifest_prepared) try self.syncIfRequired();
+        try self.publishCheckpoint(next.*, manifest_prepared);
+    }
+
     pub fn commitTransactionWithDurability(self: *NativeFile, durable: bool) !void {
         defer self.artifact_lease_transaction = false;
         defer self.allocator_certificate_staged = false;
@@ -12761,15 +13007,23 @@ pub const NativeFile = struct {
         encodeCheckpointSlotPage(slot_page, checkpoint);
 
         const io = self.runtimeIo();
-        self.checkpoint_publication_uncertain = true;
-        // Ground truth for `reconcilePublicationUncertainty`: which slot and
-        // which proposed checkpoint were in flight when the latch set. Both
-        // clear together with the latch, below and in that method.
+        // Ground truth for `reconcilePublicationUncertainty` if the write
+        // below fails: which slot and which proposed checkpoint were in
+        // flight. Captured before the write unconditionally, but capturing
+        // it is not itself "uncertain" -- see `checkpoint_publication_uncertain`'s
+        // doc comment for why that flag is set only in the failure path
+        // below, never proactively here.
         self.uncertain_checkpoint = checkpoint;
         self.uncertain_slot = next_slot;
-        // From here until the flag clears, a failure leaves the commit's
-        // durability unknown: report exactly that, not a raw I/O error a
-        // caller might retry as if nothing had been written.
+        // A publish is "in flight" for this entire window regardless of how
+        // it ends; concurrent code that only needs "wait for this to
+        // finish" (never "reconcile") belongs on this flag, not on
+        // `checkpoint_publication_uncertain`. See that field's doc comment.
+        self.publication_in_flight = true;
+        defer self.publication_in_flight = false;
+        // From here until a failure sets the latch below, a failure leaves
+        // the commit's durability unknown: report exactly that, not a raw
+        // I/O error a caller might retry as if nothing had been written.
         (blk: {
             if (comptime builtin.is_test) if (self.test_fail_checkpoint_publication) |err| {
                 self.test_fail_checkpoint_publication = null;
@@ -12781,7 +13035,10 @@ pub const NativeFile = struct {
         }) catch {
             // Cancellation included: once slot I/O may have started, the
             // commit can already be durable, so "cancelled" would wrongly
-            // read as "not applied".
+            // read as "not applied". Only now -- a publication that
+            // actually failed, possibly leaving disk ahead of header --
+            // does `checkpoint_publication_uncertain` become true.
+            self.checkpoint_publication_uncertain = true;
             return error.OutcomeUnknown;
         };
 
@@ -14743,17 +15000,18 @@ test "lite native recovery falls back past a torn higher-sequence slot" {
 }
 
 // WS1(b) required tests, restored (and extended) now that
-// manifest_commits_enabled is true. Bare `file.putDocument`/
-// `putDocumentBatch` calls with no open transaction never reach
-// commitTransactionWithDurability at all -- indexed_reclamation files
-// route them through putIndexedDocumentBatch's own hand-rolled
-// publishCheckpoint(next, false) (always presynced, pre-dating and
-// independent of this feature; see "lite native durable commit costs
-// two syncs after dropping the active_checkpoint hint" above, which
-// still correctly asserts 2 there). Every test below wraps its writes
-// in an explicit beginTransaction/commitTransaction pair so `putDocument`
-// takes the staged-transaction path instead and actually exercises
-// flushTransactionWrites/tryBuildCommitManifest.
+// manifest_commits_enabled is true. A bare `file.putDocument`/
+// `putDocumentBatch` call (no open transaction) used to route
+// indexed_reclamation files through `putIndexedDocumentBatch`'s own
+// hand-rolled `publishCheckpoint(next, false)` -- always presynced, never
+// a manifest. It now calls `reserveBareCommitManifestPage` /
+// `publishBareCommit` at the same spot, the bare-commit equivalent of
+// `flushTransactionWrites`'s own reservation and
+// `commitTransactionWithDurability`'s own `tryBuildCommitManifest`/publish
+// tail (see "lite native durable commit costs one sync after dropping the
+// active_checkpoint hint" above). Every test below still wraps its writes
+// in an explicit beginTransaction/commitTransaction pair to exercise that
+// transactional path directly, rather than the bare path's own.
 
 test "lite native small durable commit builds a manifest and costs one sync" {
     const allocator = std.testing.allocator;
@@ -15196,10 +15454,15 @@ test "lite native file appends page and publishes checkpoint" {
         var file = try NativeFile.create(allocator, path);
         defer file.close();
 
+        // `allocatePage` is a bare (no caller-owned transaction) commit, so
+        // it now reserves a manifest page for its own single-fsync publish
+        // (see `reserveBareCommitManifestPage`) -- one more page than the
+        // data page plus free map alone: `+3`, not the pre-WS1(b) `+2`.
+        // `allocatePage`'s other callers below inherit the same `+3`.
         const page_id = try file.allocatePage("hello native page");
         try std.testing.expectEqual(reserved_header_pages, page_id);
         try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
-        try std.testing.expectEqual(reserved_header_pages + 2, file.activeCheckpoint().page_count);
+        try std.testing.expectEqual(reserved_header_pages + 3, file.activeCheckpoint().page_count);
         try std.testing.expectEqual(reserved_header_pages + 1, file.activeCheckpoint().free_map_root_page);
 
         const page = try file.readPagePayloadAlloc(allocator, page_id);
@@ -15210,7 +15473,7 @@ test "lite native file appends page and publishes checkpoint" {
     const report = try inspect(allocator, std.testing.io, path);
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(@as(u64, 1), report.commit_sequence);
-    try std.testing.expectEqual(reserved_header_pages + 2, report.page_count);
+    try std.testing.expectEqual(reserved_header_pages + 3, report.page_count);
 }
 
 test "lite native file reopens allocated pages" {
@@ -15231,7 +15494,7 @@ test "lite native file reopens allocated pages" {
     var reopened = try NativeFile.open(allocator, path, true);
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
-    try std.testing.expectEqual(reserved_header_pages + 2, reopened.activeCheckpoint().page_count);
+    try std.testing.expectEqual(reserved_header_pages + 3, reopened.activeCheckpoint().page_count);
     const page = try reopened.readPagePayloadAlloc(allocator, reserved_header_pages);
     defer allocator.free(page);
     try std.testing.expectEqualStrings("persisted", page);
@@ -15289,7 +15552,7 @@ test "lite native file publishes checkpoint without rewriting static header" {
     try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
 }
 
-test "lite native durable commit costs two syncs after dropping the active_checkpoint hint" {
+test "lite native durable commit costs one sync after dropping the active_checkpoint hint" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -15300,11 +15563,17 @@ test "lite native durable commit costs two syncs after dropping the active_check
     defer file.close();
     const before = file.test_sync_calls.load(.monotonic);
     try file.putDocument("doc", "durable");
-    // One sync for the data pages (flushTransactionWrites/syncIfRequired in
-    // commitTransactionWithDurability), one for the inactive recovery slot
-    // (publishCheckpoint). The active_checkpoint hint byte is no longer
-    // written or synced, so this is 2, not the historical 3.
-    try std.testing.expectEqual(@as(u64, 2), file.test_sync_calls.load(.monotonic) - before);
+    // A bare `putDocument` (no caller-owned transaction) used to route
+    // through `putIndexedDocumentBatch`'s own hand-rolled, always-presynced
+    // publish -- 2 syncs. It now reserves and builds a commit manifest for
+    // this small commit too (`reserveBareCommitManifestPage` /
+    // `publishBareCommit`), so the single `syncIfRequired` inside
+    // `publishCheckpoint` is the only barrier left: 1 sync, not 2.
+    try std.testing.expectEqual(@as(u64, 1), file.test_sync_calls.load(.monotonic) - before);
+
+    const slot = file.activeCheckpoint();
+    try std.testing.expect(!slot.presynced);
+    try std.testing.expect(slot.manifest_page != 0);
 }
 
 test "lite native durability_policy durable commit survives reopen" {
@@ -15321,7 +15590,9 @@ test "lite native durability_policy durable commit survives reopen" {
             file.setDurabilityPolicy(policy);
             const before = file.test_sync_calls.load(.monotonic);
             try file.putDocument("doc", "durable via syncData");
-            try std.testing.expectEqual(@as(u64, 2), file.test_sync_calls.load(.monotonic) - before);
+            // Same single-sync manifest commit as above: bare putDocument
+            // now reaches the one-sync path, not the historical 2.
+            try std.testing.expectEqual(@as(u64, 1), file.test_sync_calls.load(.monotonic) - before);
             try std.testing.expect((try file.check()).valid);
         }
         var reopened = try NativeFile.open(allocator, path, true);
@@ -15396,8 +15667,8 @@ test "lite native file permits concurrent readers" {
     var reader_b = try NativeFile.open(allocator, path, true);
     defer reader_b.close();
 
-    try std.testing.expectEqual(reserved_header_pages + 2, reader_a.activeCheckpoint().page_count);
-    try std.testing.expectEqual(reserved_header_pages + 2, reader_b.activeCheckpoint().page_count);
+    try std.testing.expectEqual(reserved_header_pages + 3, reader_a.activeCheckpoint().page_count);
+    try std.testing.expectEqual(reserved_header_pages + 3, reader_b.activeCheckpoint().page_count);
 }
 
 test "lite native file active writer permits readers but blocks second writer" {
@@ -15417,7 +15688,7 @@ test "lite native file active writer permits readers but blocks second writer" {
 
     var reader = try NativeFile.open(allocator, path, true);
     defer reader.close();
-    try std.testing.expectEqual(reserved_header_pages + 2, reader.activeCheckpoint().page_count);
+    try std.testing.expectEqual(reserved_header_pages + 3, reader.activeCheckpoint().page_count);
 
     const report = try inspect(allocator, std.testing.io, path);
     try std.testing.expect(report.valid);
@@ -15818,8 +16089,10 @@ test "lite native hot commits remain append only until explicit vacuum" {
 
     // Commits carry forward already-known free pages but never perform a
     // whole-file reachability walk. Explicit vacuum is the bounded place where
-    // obsolete history is reclaimed.
-    try std.testing.expectEqual(before_size + 4 * default_page_size, after_size);
+    // obsolete history is reclaimed. One of those pages is now the bare
+    // commit's own reserved manifest page (`reserveBareCommitManifestPage`):
+    // 5 pages, not the pre-WS1(b) 4.
+    try std.testing.expectEqual(before_size + 5 * default_page_size, after_size);
     const report = try file.check();
     try std.testing.expect(report.valid);
 
@@ -15938,7 +16211,9 @@ test "lite native document store spills large values into value pages" {
         defer file.close();
         const value_pages = std.math.divCeil(usize, large.len, file.maxValuePagePayloadBytes()) catch unreachable;
         try file.putDocument("doc:large", large);
-        try std.testing.expectEqual(@as(u64, @intCast(reserved_header_pages + 4 + value_pages)), file.activeCheckpoint().page_count);
+        // +1 over the pre-WS1(b) count for the bare commit's own reserved
+        // manifest page (`reserveBareCommitManifestPage`).
+        try std.testing.expectEqual(@as(u64, @intCast(reserved_header_pages + 5 + value_pages)), file.activeCheckpoint().page_count);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -16060,7 +16335,9 @@ test "lite native document batch publishes one checkpoint" {
             .{ .key = "doc:c", .is_delete = true },
         });
         try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
-        try std.testing.expectEqual(reserved_header_pages + 4, file.activeCheckpoint().page_count);
+        // +1 over the pre-WS1(b) count for the bare commit's own reserved
+        // manifest page (`reserveBareCommitManifestPage`).
+        try std.testing.expectEqual(reserved_header_pages + 5, file.activeCheckpoint().page_count);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -16249,10 +16526,14 @@ test "lite native check validates committed root chains" {
     try std.testing.expectEqual(@as(u64, 2), report.record_count);
     try std.testing.expectEqual(@as(u64, 2), report.live_file_count);
     try std.testing.expect(report.live_bytes > 0);
-    try std.testing.expectEqual(@as(u64, default_page_size * 11), report.file_size);
+    // +2 over the pre-WS1(b) file_size for the two bare commits' own
+    // reserved manifest pages (`reserveBareCommitManifestPage`) -- neither
+    // reachable from the live document/catalog chains `compact_size`
+    // follows, so both land in `reclaimable_bytes` instead.
+    try std.testing.expectEqual(@as(u64, default_page_size * 13), report.file_size);
     try std.testing.expectEqual(@as(u64, default_page_size * 10), report.compact_size);
     try std.testing.expectEqual(@as(u64, 0), report.tail_bytes);
-    try std.testing.expectEqual(@as(u64, default_page_size), report.reclaimable_bytes);
+    try std.testing.expectEqual(@as(u64, default_page_size * 3), report.reclaimable_bytes);
 }
 
 test "lite native check validates committed index catalog root chain" {
@@ -16282,9 +16563,12 @@ test "lite native check validates committed index catalog root chain" {
     try std.testing.expectEqual(@as(u64, 3), report.record_count);
     try std.testing.expectEqual(@as(u64, 3), report.live_file_count);
     try std.testing.expect(report.live_bytes > 0);
-    try std.testing.expectEqual(@as(u64, default_page_size * 15), report.file_size);
+    // +3 over the pre-WS1(b) file_size for the three bare commits' own
+    // reserved manifest pages (`reserveBareCommitManifestPage`); all three
+    // land in `reclaimable_bytes`, same reasoning as the test above.
+    try std.testing.expectEqual(@as(u64, default_page_size * 18), report.file_size);
     try std.testing.expectEqual(@as(u64, default_page_size * 13), report.compact_size);
-    try std.testing.expectEqual(@as(u64, default_page_size * 2), report.reclaimable_bytes);
+    try std.testing.expectEqual(@as(u64, default_page_size * 5), report.reclaimable_bytes);
 
     const index_file = (try file.getIndexCatalogRecordAlloc(allocator, "index/files/hbc/postings.bin")).?;
     defer allocator.free(index_file);
@@ -16817,16 +17101,28 @@ test "lite native free map cannot reclaim previous checkpoint pages" {
         try std.testing.expectEqualStrings("invalid_free_map", report.issue.?);
     }
 
-    // The free-map-vs-fallback-checkpoint cross-check only needs to run once
-    // per open handle: this process's own commits can only ever reuse pages
-    // that a previously verified free map already declared free, so
-    // re-scanning every checkpoint slot's full reachable set on every single
-    // mutation would make ingest quadratic in the number of commits.
-    // Corruption written out of band (as above) is instead caught the next
-    // time the file is opened and its free map is trusted again.
+    // WS1(b): "v2" above was a small bare commit, so it built a manifest
+    // covering every page it wrote, including the free-map page corrupted
+    // above. On reopen, `recoverActiveCheckpoint` verifies that manifest
+    // against current disk content before adopting the active slot: the
+    // corrupted free-map page's CRC no longer matches, so recovery rejects
+    // "v2"'s checkpoint outright and falls back to the previous,
+    // uncorrupted one ("v1"), truncating the file to its prefix -- the
+    // same "torn slot falls back to the previous checkpoint" path a crash
+    // mid-commit takes. The corruption is caught at open now, earlier than
+    // the deferred `validateFreePagesSafeForCheckpointSlots` safety net
+    // this test originally exercised for a presynced (non-manifest) commit.
     var reopened = try NativeFile.open(allocator, path, false);
     defer reopened.close();
-    try std.testing.expectError(error.InvalidNativeFreeMap, reopened.putDocument("doc:1", "v3"));
+    {
+        const recovered = (try reopened.getDocumentAlloc(allocator, "doc:1")).?;
+        defer allocator.free(recovered);
+        try std.testing.expectEqualStrings("v1", recovered);
+    }
+    try reopened.putDocument("doc:1", "v3");
+    const value = (try reopened.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("v3", value);
 }
 
 test "lite native check reports corrupted committed document page" {
@@ -23153,6 +23449,83 @@ test "lite reader epoch aliases long filenames retain epoch reuse" {
     const captured = (try reader.getDocumentAlloc(a, "doc")).?;
     defer a.free(captured);
     try std.testing.expectEqualSlices(u8, &value, captured);
+}
+
+test "lite reader epoch namespace cache stays stale-safe when a reader registers between commits" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cache-race.aflite");
+    defer a.free(path);
+    // No reader_coordinator on the writer: its only protection against the
+    // reader opened below is the cross-process reader_epochs.zig namespace,
+    // not any in-process Coordinator state a shared coordinator would give
+    // it -- this is the "reader in another process" scenario the cache's
+    // fingerprint fast path has to stay safe against.
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    var value: [8192]u8 = @splat('a');
+    // Build retirement backlog (repeatedly overwriting the same key) so the
+    // writer's reuse-lock path actually runs and caches its namespace while
+    // nobody is registered yet.
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    const opens_before_reader = writer.allocator_work.reader_namespace_opens;
+    try std.testing.expect(opens_before_reader >= 1);
+
+    var reader_coordinator = ReaderCoordinator.init(a, io);
+    defer reader_coordinator.deinit();
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = &reader_coordinator });
+    defer reader.close();
+    try std.testing.expect(reader.reader_fence.?.epoch != null);
+
+    // Nothing rebinds or moves the writer's parent here, so it keeps
+    // reusing the very same cached namespace handle (no new
+    // `reader_epochs.openCached`) -- what must change is that its next
+    // scan notices the new registration through the directory fingerprint
+    // and falls back to a real scan picking it up, rather than trusting a
+    // "nobody registered" view cached from before the reader ever existed.
+    value[0] = 'b';
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    try std.testing.expectEqual(opens_before_reader, writer.allocator_work.reader_namespace_opens);
+    const captured = (try reader.getDocumentAlloc(a, "doc")).?;
+    defer a.free(captured);
+    try std.testing.expectEqual(@as(u8, 'a'), captured[0]);
+}
+
+test "lite reader epoch namespace cache keeps full scans at O(1) across many commits and registered readers" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cache-o1.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    var value: [8192]u8 = @splat('a');
+    try writer.putDocument("doc", &value);
+
+    // Register several independent readers directly against the on-disk
+    // namespace, exactly as separate reader processes would (bypassing any
+    // in-process Coordinator sharing).
+    const epochs = @import("reader_epochs.zig");
+    const inode = (try writer.file.stat(writer.runtime())).inode;
+    var leases: [6]epochs.Lease = undefined;
+    var registered: usize = 0;
+    defer for (leases[0..registered]) |lease| lease.close(a, writer.runtime());
+    for (0..leases.len) |i| {
+        leases[i] = try epochs.register(a, writer.runtime(), path, writer.header.reader_epoch_namespace, inode, writer.activeCheckpoint().commit_sequence, false);
+        registered += 1;
+    }
+
+    for (0..40) |_| try writer.putDocument("doc", &value);
+    // One lifetime open (nothing rebinds or moves the parent), and a small,
+    // bounded number of real scans -- never one per commit (40) and never
+    // scaling with the registered-reader count (6): the fingerprint fast
+    // path must absorb the overwhelming majority of these 40 commits.
+    try std.testing.expectEqual(@as(u64, 1), writer.allocator_work.reader_namespace_opens);
+    try std.testing.expect(writer.allocator_work.reader_namespace_full_scans >= 1);
+    try std.testing.expect(writer.allocator_work.reader_namespace_full_scans < 10);
 }
 
 test "lite reader registration path lease close retains only escaped snapshot protection" {

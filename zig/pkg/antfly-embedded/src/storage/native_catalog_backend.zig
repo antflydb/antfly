@@ -41,6 +41,14 @@ const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const ordered = @import("mem_ordered.zig");
+// Diagnostic-only (test-build-gated); see write_amplification_trace.zig.
+// Pushed here, once, so every `.native_catalog`-backed consumer --
+// `persistent.zig`'s text index today, `sparse/sparse.zig`'s sparse index
+// as of WS4-for-vectors -- gets the same `.main_txn_commit` attribution
+// without its own call site. Safe to nest under a caller's own
+// `wal_trace.scope(.main_txn_commit)` (e.g. `persistent.zig`'s `MainTxn.
+// commit`): pushing the same tag twice is a no-op past the first push.
+const wal_trace = @import("write_amplification_trace.zig");
 
 /// One key's value in a namespace, as loaded from the durable sink.
 /// `namespace == null` means the unnamed/default namespace.
@@ -222,15 +230,145 @@ pub const Backend = struct {
         return try NamespaceTxn.open(self, false);
     }
 
+    /// `options.durability == .ride_along` (see `backend_types.BatchOptions`
+    /// and the design doc's §3.2a) marks the resulting transaction's
+    /// eventual commit as background work: visible to this backend's own
+    /// readers right away, but never forcing its own durable sync -- see
+    /// `NamespaceTxn.setDurable`. Every other field of `options` is
+    /// currently a no-op here, same as before this method inspected it.
     pub fn beginBatchWithOptions(self: *Backend, options: backend_types.BatchOptions) !NamespaceTxn {
-        _ = options;
         if (self.open_options.read_only) return error.ReadOnly;
-        return try NamespaceTxn.open(self, false);
+        var txn = try NamespaceTxn.open(self, false);
+        if (options.durability == .ride_along) txn.setDurable(false);
+        return txn;
     }
 
     pub fn runtimeNamespaceStore(self: *Backend, allocator: Allocator) !backend_erased.NamespaceStore {
         return try backend_erased.namespaceStoreFrom(allocator, self, backend_types.Namespace, identityNamespace);
     }
+
+    /// A single-namespace, flat (non-namespace-per-call) view of this
+    /// backend, for callers that want a plain `backend_erased.Store`/
+    /// `Batch` instead of the namespace-per-call `NamespaceStore` above:
+    /// `sparse/sparse.zig`'s `SparseIndex` and dense's HBC backend (one
+    /// fixed namespace), and `graph/graph.zig`'s `openEdgeStore` (the
+    /// unnamed namespace -- forward/reverse adjacency is an entirely flat
+    /// keyspace, one `Backend`/scope per store). Mirrors `mem_backend.zig`'s
+    /// and `lsm_backend.zig`'s own `runtimeStore`/`BoundStore` shape; unlike
+    /// `lsm_backend.zig`'s, this one needs no LSM-specific probe/current-scan/
+    /// replay-lane specializations, since this backend has none of those.
+    /// Composes `NamespaceTxn` rather than re-deriving its commit/clone-swap
+    /// logic.
+    pub fn runtimeStore(self: *Backend, allocator: Allocator, namespace: backend_types.Namespace) !backend_erased.Store {
+        return try backend_erased.storeFrom(allocator, BoundStore{ .backend = self, .namespace = namespace });
+    }
+
+    /// Like `runtimeStore(...).beginWrite()`, but returns the concrete
+    /// (unerased) write handle instead of `backend_erased.WriteTxn`. For a
+    /// caller that needs to inspect this transaction's own staged
+    /// `Mutation` list before it commits (an inline publication building a
+    /// small, bounded mutation set to fold into an externally-owned native
+    /// transaction -- see `graph/graph.zig`'s `prepareInlineEdgePublication`,
+    /// mirroring `persistent.zig`'s `prepareInlineSegmentPublication`),
+    /// `backend_erased.Batch`'s vtable has no such accessor, so this bypasses
+    /// erasure entirely. The caller must `abort()` (never `commit()`) once
+    /// it has harvested what it needs -- this never talks to `sink`.
+    pub fn boundWrite(self: *Backend, namespace: backend_types.Namespace) !BoundTxn {
+        return .{ .inner = try NamespaceTxn.open(self, false), .namespace = namespace };
+    }
+
+    const BoundStore = struct {
+        backend: *Backend,
+        namespace: backend_types.Namespace,
+
+        pub fn writeSerialization(self: *@This()) backend_erased.WriteSerialization {
+            return .{ .gate = &self.backend.serialized_write_mutex };
+        }
+
+        pub fn capabilities(self: *@This()) backend_types.Capabilities {
+            return self.backend.capabilities();
+        }
+
+        pub fn beginRead(self: *@This()) !BoundTxn {
+            return .{ .inner = try NamespaceTxn.open(self.backend, true), .namespace = self.namespace };
+        }
+
+        pub fn beginWrite(self: *@This()) !BoundTxn {
+            if (self.backend.open_options.read_only) return error.ReadOnly;
+            return .{ .inner = try NamespaceTxn.open(self.backend, false), .namespace = self.namespace };
+        }
+
+        pub fn beginBatch(self: *@This()) !BoundTxn {
+            return try self.beginWrite();
+        }
+
+        /// WS7/§3.2a: `.ride_along` marks this batch's eventual commit as
+        /// background work that must never force its own durability
+        /// barrier -- see `NamespaceTxn.setDurable`'s doc comment. Mirrors
+        /// `persistent.zig`'s direct `txn.setDurableHint(false)` call, but
+        /// applied before this handle is erased into `backend_erased.Batch`
+        /// (which has no generic durability-hint vtable slot today).
+        pub fn beginBatchWithOptions(self: *@This(), options: backend_types.BatchOptions) !BoundTxn {
+            var txn = try self.beginWrite();
+            if (options.durability == .ride_along) txn.setDurable(false);
+            return txn;
+        }
+    };
+
+    /// Namespace-bound write/read handle, composing `NamespaceTxn`. Backs
+    /// `BoundStore`'s `backend_erased.Store`/`Batch` erasure.
+    const BoundTxn = struct {
+        inner: NamespaceTxn,
+        namespace: backend_types.Namespace,
+
+        pub fn abort(self: *@This()) void {
+            self.inner.abort();
+        }
+
+        pub fn commit(self: *@This()) !void {
+            try self.inner.commit();
+        }
+
+        /// See `NamespaceTxn.setDurable`'s WS2/§3.2a ride-along note.
+        pub fn setDurable(self: *@This(), durable: bool) void {
+            self.inner.setDurable(durable);
+        }
+
+        // `anyerror`, not an inferred set: `graph/graph.zig`'s
+        // `prepareInlineEdgePublication` calls generic helpers
+        // (`readU64OrZero` and friends) directly against this concrete
+        // type, bypassing `backend_erased` erasure (whose own vtable
+        // function pointers are always `anyerror`-typed, which is why nothing
+        // else going through this file hits this). Those helpers' `catch
+        // |err| switch (err) { error.NotFound => ..., else => return err }`
+        // shape needs a widened set, or `NamespaceTxn.get`'s true inferred
+        // set (exactly `error{NotFound}`) makes the `else` prong
+        // unreachable -- a compile error, not just a style nit.
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            return try self.inner.get(self.namespace, key);
+        }
+
+        pub fn put(self: *@This(), key: []const u8, value: []const u8) anyerror!void {
+            try self.inner.put(self.namespace, key, value);
+        }
+
+        pub fn delete(self: *@This(), key: []const u8) anyerror!void {
+            try self.inner.delete(self.namespace, key);
+        }
+
+        pub fn openCursor(self: *@This()) !Cursor {
+            return try self.inner.openCursor(self.namespace);
+        }
+
+        /// This transaction's staged mutations so far, in call order --
+        /// valid only until the next `put`/`delete`/`abort`/`commit` call
+        /// (the arena backing their bytes is `self.inner`'s own). A
+        /// `boundWrite` caller harvesting these to fold into an externally
+        /// owned commit must deep-copy before calling `abort()`.
+        pub fn pendingMutations(self: *const @This()) []const Mutation {
+            return self.inner.pending.items;
+        }
+    };
 
     /// WS4 phase 2: bring this backend's in-memory read mirror in sync with
     /// `mutations` that an EXTERNAL native transaction already committed
@@ -372,7 +510,10 @@ pub const Backend = struct {
             // this backend's own readers see them right away) but does not
             // force a sync; see `setDurable`.
             if (self.pending.items.len != 0) {
+                const trace_scope = wal_trace.scope(.main_txn_commit);
+                defer trace_scope.end();
                 try self.backend.sink.submit(self.backend.sink.ptr, self.backend.scope, self.pending.items, self.durable);
+                wal_trace.recordCommit();
             }
 
             lockBackend(self.backend);
@@ -827,4 +968,158 @@ test "native catalog backend applyExternallyCommittedMutations syncs the read mi
     defer read_final.abort();
     try std.testing.expectError(error.NotFound, read_final.get(.{ .name = "meta" }, "active-segment/1"));
     try std.testing.expectEqualStrings("bytes-1", try read_final.get(.{ .name = "segments" }, "seg:1"));
+}
+
+test "native catalog backend runtimeStore gives a flat (non-namespaced) erased Store" {
+    // graph/graph.zig's `openEdgeStore` uses this, not `runtimeNamespaceStore`:
+    // forward/reverse adjacency is a flat keyspace, one `Backend`/scope per
+    // store, with no namespace indirection.
+    const a = std.testing.allocator;
+    var test_sink = TestSink{ .allocator = a };
+    defer test_sink.deinit();
+
+    var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "graph:g:forward" });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+
+    try std.testing.expect(runtime.capabilities().cursors);
+
+    {
+        var batch = try runtime.beginBatch();
+        try batch.put("edge:a->b", "1.0");
+        try batch.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), test_sink.submit_calls);
+
+    var read = try runtime.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("1.0", try read.get("edge:a->b"));
+}
+
+test "native catalog backend runtimeStore binds one namespace, isolated from other namespaces" {
+    // `runtimeStore` is what a vector-index caller (sparse's SparseIndex,
+    // and dense's HBC backend) uses instead of `runtimeNamespaceStore`: a
+    // single namespace baked into the returned `backend_erased.Store`, same
+    // shape as `mem_backend.zig`/`lsm_backend.zig`'s own `runtimeStore`.
+    const a = std.testing.allocator;
+    var test_sink = TestSink{ .allocator = a };
+    defer test_sink.deinit();
+
+    var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "sparse-idx1" });
+    defer backend.close();
+
+    var store = try backend.runtimeStore(a, .{ .name = "postings" });
+    defer store.deinit();
+
+    {
+        var txn = try store.beginWrite();
+        try txn.put("term:a", "doc-1");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), test_sink.submit_calls);
+
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("doc-1", try read.get("term:a"));
+    }
+
+    // A write through this namespace-bound store must not leak into a
+    // sibling namespace's keyspace -- `NamespaceTxn` already scopes by
+    // namespace, but `runtimeStore`'s whole point is to bind that scope
+    // once instead of trusting every call site to pass it correctly.
+    var other_namespace = try backend.runtimeNamespaceStore(a);
+    defer other_namespace.deinit();
+    var other_read = try other_namespace.beginRead();
+    defer other_read.abort();
+    try std.testing.expectError(error.NotFound, other_read.get(.{ .name = "meta" }, "term:a"));
+    try std.testing.expectEqualStrings("doc-1", try other_read.get(.{ .name = "postings" }, "term:a"));
+}
+
+test "native catalog backend boundWrite exposes pending mutations before commit, for an external fold-in" {
+    // The shape `graph/graph.zig`'s `prepareInlineEdgePublication` depends
+    // on: build up a transaction's puts, harvest its `pendingMutations()`
+    // (deep-copying before `abort()`, since the arena backing them dies
+    // with the transaction), and never call `commit()` -- this `Sink` must
+    // see zero submits for the harvested mutations to be foldable into a
+    // different, externally-owned native transaction instead.
+    const a = std.testing.allocator;
+    var test_sink = TestSink{ .allocator = a };
+    defer test_sink.deinit();
+
+    var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "graph:g:reverse" });
+    defer backend.close();
+
+    var txn = try backend.boundWrite(.{});
+    try txn.put("edge:b<-a", "1.0");
+    try txn.put("meta:edge_count", "1");
+
+    const pending = txn.pendingMutations();
+    try std.testing.expectEqual(@as(usize, 2), pending.len);
+    try std.testing.expectEqualStrings("edge:b<-a", pending[0].key);
+    try std.testing.expectEqualStrings("1.0", pending[0].value);
+    try std.testing.expectEqualStrings("meta:edge_count", pending[1].key);
+
+    txn.abort();
+    try std.testing.expectEqual(@as(usize, 0), test_sink.submit_calls);
+    try std.testing.expectEqual(@as(usize, 0), test_sink.entries.items.len);
+}
+
+test "native catalog backend runtimeStore beginBatchWithOptions rides along without its own durable submit" {
+    const a = std.testing.allocator;
+    var test_sink = TestSink{ .allocator = a };
+    defer test_sink.deinit();
+
+    var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "sparse-idx1" });
+    defer backend.close();
+
+    var store = try backend.runtimeStore(a, .{ .name = "postings" });
+    defer store.deinit();
+
+    {
+        var batch = try store.beginBatchWithOptions(.{ .durability = .ride_along });
+        try batch.put("merge-result", "ride-along");
+        try batch.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), test_sink.submit_calls);
+    try std.testing.expectEqual(@as(usize, 0), test_sink.durable_submit_calls);
+    try std.testing.expectEqual(@as(usize, 1), test_sink.non_durable_submit_calls);
+
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("ride-along", try read.get("merge-result"));
+    }
+
+    // The plain (default-durability) path through the same Store is
+    // unaffected: omitting `.ride_along` keeps paying a durable submit.
+    {
+        var batch = try store.beginBatchWithOptions(.{});
+        try batch.put("ack-result", "foreground");
+        try batch.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), test_sink.durable_submit_calls);
+}
+
+test "native catalog backend beginBatchWithOptions on the NamespaceStore surface also rides along" {
+    // Same coverage as the runtimeStore test above, but through
+    // `Backend.beginBatchWithOptions` directly -- the surface
+    // `runtimeNamespaceStore`'s erased `NamespaceBatch` wraps. Regression
+    // guard for this method's `.ride_along` handling (it used to discard
+    // `options` entirely).
+    const a = std.testing.allocator;
+    var test_sink = TestSink{ .allocator = a };
+    defer test_sink.deinit();
+
+    var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "idx1" });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .durability = .ride_along });
+        try txn.put(.{ .name = "meta" }, "merge-result", "ride-along");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), test_sink.durable_submit_calls);
+    try std.testing.expectEqual(@as(usize, 1), test_sink.non_durable_submit_calls);
 }

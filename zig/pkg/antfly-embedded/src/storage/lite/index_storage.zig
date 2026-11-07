@@ -1040,18 +1040,19 @@ test "lite native index storage handles large files rename and delete tree" {
     const append_suffix = " native append keeps old pages streaming";
     const before_append_page_count = docs.file.activeCheckpoint().page_count;
     try storage.appendFileAbsolute(allocator, "/dense/a/blob", append_suffix, true);
-    try std.testing.expectEqual(before_append_page_count + 6, docs.file.activeCheckpoint().page_count);
+    // +1 over the count this test originally asserted, for this bare
+    // commit's own reserved manifest page (`reserveBareCommitManifestPage`).
+    try std.testing.expectEqual(before_append_page_count + 7, docs.file.activeCheckpoint().page_count);
     try std.testing.expectEqual(@as(u64, @intCast(large.len + append_suffix.len)), try storage.fileSize("/dense/a/blob"));
 
     const before_rename_page_count = docs.file.activeCheckpoint().page_count;
     try storage.renameAbsolute("/dense/a/blob", "/dense/a/blob2");
     // Two packed records share one page, plus tree node, descriptor and free
     // map, plus one commit-manifest reservation for this durable commit's
-    // own fresh since-last-durable window, plus one more page the rename's
-    // own catalog edit crosses while skipping past that reservation
-    // (`PageAllocator.allocateFresh`'s floor never retrofits a lower
-    // allocation after the fact; it only ever pushes a later one forward).
-    try std.testing.expectEqual(before_rename_page_count + 6, docs.file.activeCheckpoint().page_count);
+    // own fresh since-last-durable window (`reserveBareCommitManifestPage`,
+    // via `PageAllocator.allocateFresh` -- always a fresh id, never a reused
+    // one).
+    try std.testing.expectEqual(before_rename_page_count + 5, docs.file.activeCheckpoint().page_count);
     try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/dense/a/blob", 8));
     const after_rename_check = try docs.file.check();
     try std.testing.expect(after_rename_check.valid);

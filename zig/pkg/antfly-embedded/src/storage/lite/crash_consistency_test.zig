@@ -69,6 +69,7 @@ const backend = @import("backend.zig");
 const connection = @import("connection.zig");
 const docstore = @import("docstore.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+const index_manager = @import("../db/catalog/index_manager.zig");
 
 pub const When = sim_io.When;
 pub const PowerLoss = sim_io.PowerLoss;
@@ -206,6 +207,7 @@ pub fn runCrashSweep(allocator: Allocator, scenario: Scenario, opts: SweepOption
 
         const sim = try sim_io.SimIo.init(allocator, std.testing.io);
         defer sim.deinit();
+        sim.setRunLabel(scenario.name);
         var checkpoints = std.ArrayListUnmanaged(Checkpoint).empty;
         defer checkpoints.deinit(allocator);
         try scenario.run(allocator, path, sim.io(), &checkpoints);
@@ -239,7 +241,14 @@ fn runOneCrash(allocator: Allocator, scenario: Scenario, barrier_seq: u64, when:
     defer allocator.free(path);
 
     const sim = try sim_io.SimIo.init(allocator, std.testing.io);
-    defer sim.deinit();
+    const label = try std.fmt.allocPrint(allocator, "{s} barrier={d} when={s} power_loss={s}", .{ scenario.name, barrier_seq, @tagName(when), @tagName(power_loss) });
+    // `label` must outlive every use of `sim.run_label`, including the one
+    // inside `sim.deinit()` itself -- free it only after `deinit` runs.
+    defer {
+        sim.deinit();
+        allocator.free(label);
+    }
+    sim.setRunLabel(label);
     sim.setCrashPlan(.{ .at_barrier = barrier_seq, .when = when, .power_loss = power_loss });
 
     var checkpoints = std.ArrayListUnmanaged(Checkpoint).empty;
@@ -661,6 +670,18 @@ fn checkInFlightResolutionDb(in_flight: Checkpoint, handle: *DbHandle, allocator
 /// draining background work between attempts, and only treats it as a
 /// finding if the index never finishes catching up within a generous bound.
 fn assertSearchable(handle: *DbHandle, allocator: Allocator, search_index: []const u8, search_field: []const u8, key: []const u8, text: []const u8) !void {
+    const platform_time = @import("antfly_platform").time;
+    // A fixed retry count conflates "stuck" with "a real host under enough
+    // concurrent load that each recovery pass's own I/O keeps hitting fresh
+    // transient errors" -- recovery can legitimately still be making
+    // progress (a different injected-free error each attempt, not the same
+    // one repeating) well past any small fixed count on a busy shared
+    // machine. Bound by wall-clock time instead so a crash sweep run under
+    // sustained load does not fail just because it needed more than N
+    // iterations; `attempt` is kept only for diagnostics. A real stuck
+    // recovery (the same unresolved condition forever) still eventually
+    // exhausts this deadline and fails exactly as before.
+    const deadline_ns = platform_time.monotonicNs() +| (30 * std.time.ns_per_s);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         var result = handle.db.search(allocator, .{
@@ -668,7 +689,7 @@ fn assertSearchable(handle: *DbHandle, allocator: Allocator, search_index: []con
             .full_text = .{ .match = .{ .field = search_field, .text = text } },
             .limit = 10,
         }) catch |err| {
-            if (err == error.IndexRebuilding and attempt < 50) {
+            if (err == error.IndexRebuilding and platform_time.monotonicNs() < deadline_ns) {
                 // `runUntilIdle` alone is what a sweep barrier count needs
                 // to stay deterministic (see `openDbWithIo`), but settling
                 // a text index after reopen may need the fuller recipe
@@ -1229,6 +1250,72 @@ test "crash sweep: full text recovers from one transient io fault with no crash"
     }
 }
 
+// Bug repro: a commit that fails *after staging* (an injected, persistent
+// `error.InputOutput` on the write op below -- `IoFaultPlan.repeat = true`
+// never clears it) must not leak the retained/artifact_inputs/
+// document_revisions captures `storage/docstore.zig`'s `DocStore.Txn.commit`
+// / `Batch.commitStaged` / `StagedBatch.wait` stage into the batch before
+// the native write itself runs. The real bug: `DocStore.StagedDocBatch.wait`
+// (the wrapper `mutation_commit.zig`'s `batchInternalPreparedOwned` actually
+// calls) unconditionally `defer`-destroyed its heap-boxed `*Batch` without
+// ever calling `abort()` on it first when `inner.wait()` failed, so those
+// captures' backing allocations (document_mutation_revision.zig's `touch`,
+// in particular) became unreachable the moment that memory was freed --
+// a leak the crash sweep's `SafeAllocator` catches directly. Separately,
+// also bound `close()` on its own thread with a deadline: a short
+// `test_visibility_wait_timeout_ms` combined with a persistent fault drives
+// the same derived-worker recoverable-retry path `ee89ce70b5` added, and a
+// regression there must fail loudly instead of hanging the whole suite.
+test "crash sweep: commit failing after staging under a persistent io fault does not leak or hang close" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    const sim = try sim_io.SimIo.init(allocator, std.testing.io);
+    defer sim.deinit();
+
+    var handle = try openDbWithIo(allocator, path, sim.io(), true);
+    var handle_open = true;
+    defer if (handle_open) handle.close();
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+
+    // Never clears: every subsequent write-kind op faults, including this
+    // next write's own primary commit (not only the derived worker's
+    // catch-up) -- exactly "a commit fails after staging" as described.
+    sim.setIoFaultPlan(.{ .at_op = 0, .kind = .write, .err = error.InputOutput, .repeat = true });
+    db_mod.test_visibility_wait_timeout_ms = 1;
+    defer db_mod.test_visibility_wait_timeout_ms = null;
+
+    handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text }) catch |err| switch (err) {
+        error.CommitVisibilityNotSatisfied, error.InputOutput => {},
+        else => return err,
+    };
+
+    const Closer = struct {
+        handle: *DbHandle,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.handle.close();
+            self.done.store(true, .release);
+        }
+    };
+    var closer: Closer = .{ .handle = &handle };
+    const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    const platform_time = @import("antfly_platform").time;
+    const deadline_ns = platform_time.monotonicNs() +| (20 * std.time.ns_per_s);
+    while (!closer.done.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline_ns) {
+            thread.detach();
+            return error.ShutdownHangDetected;
+        }
+        std.Thread.yield() catch {};
+    }
+    thread.join();
+    handle_open = false;
+}
+
 fn reportFailures(report: *const SweepReport) !void {
     if (report.ok()) return;
     for (report.failures.items) |f| {
@@ -1239,3 +1326,308 @@ fn reportFailures(report: *const SweepReport) !void {
     }
     return error.CrashConsistencyFailuresFound;
 }
+
+// ---------------------------------------------------------------------
+// Sustained full_index visibility regression
+// (docs/design/lite-performance/throughput-profile.md §6: a sustained
+// single-writer `sync_level: full_index` run eventually acknowledges a
+// write whose content never becomes searchable, even after reopen +
+// run_until_idle()). No crash is injected here -- this is not a crash-
+// consistency gap, it is a plain correctness gap under sustained load.
+// ---------------------------------------------------------------------
+
+/// Strict synchronous-visibility check: unlike `assertSearchable` (which
+/// tolerates `error.IndexRebuilding` while a background catch-up finishes
+/// after a crash-sweep reopen), a `sync_level: full_index` batch() must
+/// already have made `key` searchable for `marker` by the time it returns
+/// -- no retry, no backoff. A failure here means the ack lied.
+fn expectSearchableNow(handle: *DbHandle, allocator: Allocator, search_index: []const u8, search_field: []const u8, key: []const u8, marker: usize) !void {
+    var text_buf: [32]u8 = undefined;
+    const text = try std.fmt.bufPrint(&text_buf, "marker{d}", .{marker});
+    var result = try handle.db.search(allocator, .{
+        .index_name = search_index,
+        .full_text = .{ .match = .{ .field = search_field, .text = text } },
+        .limit = 10,
+    });
+    defer result.deinit();
+    for (result.hits) |hit| {
+        if (std.mem.eql(u8, hit.id, key)) return;
+    }
+    std.debug.print(
+        "sustained full_index visibility: acknowledged document not searchable key={s} marker={s} hits={d}\n",
+        .{ key, text, result.hits.len },
+    );
+    return error.SustainedFullIndexWriteNotVisible;
+}
+
+// docs/design/lite-performance/throughput-profile.md §6 repro, made
+// deterministic and fast: a small key set absorbs repeated overwrites (so
+// segment merge/compaction and journal retirement both run many times
+// over the course of the run, same as the production repro's 128-key
+// wraparound did over ~7,500 writes), and a lowered merge-policy override
+// (`max_segments_per_tier`) reaches that same merge/retirement machinery
+// in a few thousand writes instead of ~7,500.
+//
+// Every write uses `sync_level: full_index`, whose contract is: the
+// acknowledged write is searchable with no further catch-up needed. This
+// test checks that contract at a sample of writes along the way (every
+// write would make a Debug run too slow) and, more importantly, for every
+// key's *final* write after a full close + reopen + run_until_idle() --
+// exactly the point the production repro's verification failed at.
+test "sustained full_index single writer keeps every acknowledged write searchable after reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    index_manager.setBenchmarkTextMergePolicyOverride(.{
+        .max_segments_per_tier = 3,
+        .max_segment_size = 5 * 1024 * 1024 * 1024,
+        .floor_segment_size = 0,
+    });
+    defer index_manager.setBenchmarkTextMergePolicyOverride(null);
+
+    const key_count = 4;
+    const total_writes = 4000;
+
+    var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+    defer handle.close();
+
+    var latest_marker: [key_count]usize = @splat(0);
+    var key_buf: [32]u8 = undefined;
+    var value_buf: [256]u8 = undefined;
+
+    var i: usize = 0;
+    while (i < total_writes) : (i += 1) {
+        const slot = i % key_count;
+        const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{slot});
+        const value = try std.fmt.bufPrint(&value_buf, "{{\"body\":\"marker{d} churn alpha beta gamma delta\"}}", .{i});
+        try handle.db.batch(.{ .writes = &.{.{ .key = key, .value = value }}, .sync_level = .full_index });
+        latest_marker[slot] = i;
+
+        if (i % 97 == 0 or i + 1 == total_writes) {
+            try expectSearchableNow(&handle, allocator, "body_text", "body", key, i);
+        }
+
+        // In production this runs automatically, once per maintenance tick,
+        // from the Owner/pool layer this low-level DB harness bypasses
+        // (capi/lite_connection.zig around `store.serviceRetirement`, demand-
+        // gated on the watermark `DocStore.requestRetirement` raises on every
+        // ack). Drive it explicitly here so this test still exercises WS5
+        // retirement running concurrently with sustained full_index writes
+        // and segment merges, the combination the production repro needed.
+        if (i % 29 == 0) try runRetirementTurn(allocator, &handle);
+    }
+
+    handle.close();
+    handle = try openDbWithIo(allocator, path, std.testing.io, false);
+    try handle.db.runUntilIdle();
+
+    for (0..key_count) |slot| {
+        var reopen_key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&reopen_key_buf, "doc-{d}", .{slot});
+        try expectSearchableNow(&handle, allocator, "body_text", "body", key, latest_marker[slot]);
+    }
+}
+
+// docs/design/lite-performance/throughput-profile.md §6 root cause, isolated
+// at the lowest level: a ride-along commit
+// (`NativeFile.commitTransactionWithDurability(false)`, the primitive
+// behind a background text-segment merge's catalog update
+// (`persistent.zig`'s `replaceSegmentsWithReservedIdOwned`,
+// `txn.setDurable(false)`), a WS5 retirement turn
+// (`DocStore.serviceRetirement` -> `commitRideAlong`), and a deferred
+// progress-v2 record (`apply_state.contributeProgressDeferred`)) stages and
+// physically writes its pages (`flushTransactionWrites` runs regardless of
+// `durable`), but deliberately withholds publishing a new checkpoint slot
+// (`commitTransactionWithDurability`'s `deferred_publication` branch: "Keep
+// the last durable checkpoint slots intact until an explicit durability
+// barrier"). Reopening from disk always resolves to the last *published*
+// checkpoint, so that write is invisible after a reopen -- not only after a
+// crash, but after a perfectly ordinary close, unless something publishes
+// it first: either a later durable commit on the same file (how ride-along
+// normally "becomes durable for free", per `Store.commitRideAlong`'s doc
+// comment), or an explicit durability barrier (`NativeFile.sync()`, which
+// `Store.syncIndexContents()` exposes). `capi/lite_connection.zig`'s
+// `Owner.deinit()` is the one real place that was missing that barrier: it
+// closed its own still-current, still-authoritative generation through the
+// `lease_snapshot`/`DB.closeImmutableSnapshot()` path meant for a
+// generation already superseded by a newer one (which never needs its own
+// pending work published, since a newer durable generation already exists),
+// silently discarding whatever was still riding along -- the fix added
+// there (`Store.syncIndexContents()` before close) is exactly the missing
+// barrier this test demonstrates is necessary.
+test "a ride-along commit needs an explicit durability barrier before close, or it is lost" {
+    const allocator = std.testing.allocator;
+
+    // Scenario A: close with no barrier after the ride-along commit. The
+    // commit itself returned success (this is the acknowledged-but-lost
+    // shape of the bug, not a crash scenario), but it never becomes
+    // recoverable.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/no-barrier.aflite", .{tmp.sub_path});
+        defer allocator.free(path);
+
+        var file = try native.NativeFile.createWithIo(allocator, std.testing.io, path, .{});
+        try file.putDocument("seed", "seed-value");
+        try file.beginTransaction();
+        try file.putDocument("ride-along-doc", "ride-along-value");
+        try file.commitTransactionWithDurability(false);
+        try std.testing.expect(file.durable_header != null);
+        file.close();
+
+        var reopened = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{});
+        defer reopened.close();
+        const seed = try reopened.getDocumentAlloc(allocator, "seed");
+        defer if (seed) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualStrings("seed-value", seed orelse return error.TestExpectedEqual);
+        const lost = try reopened.getDocumentAlloc(allocator, "ride-along-doc");
+        defer if (lost) |bytes| allocator.free(bytes);
+        try std.testing.expect(lost == null);
+    }
+
+    // Scenario B: the identical ride-along commit, but with an explicit
+    // `file.sync()` -- what `Store.syncIndexContents()` and the
+    // `Owner.deinit()` fix call -- before close. Recovered after reopen.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/with-barrier.aflite", .{tmp.sub_path});
+        defer allocator.free(path);
+
+        var file = try native.NativeFile.createWithIo(allocator, std.testing.io, path, .{});
+        try file.putDocument("seed", "seed-value");
+        try file.beginTransaction();
+        try file.putDocument("ride-along-doc", "ride-along-value");
+        try file.commitTransactionWithDurability(false);
+        try std.testing.expect(file.durable_header != null);
+        try file.sync();
+        try std.testing.expect(file.durable_header == null);
+        file.close();
+
+        var reopened = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{});
+        defer reopened.close();
+        const recovered = try reopened.getDocumentAlloc(allocator, "ride-along-doc");
+        defer if (recovered) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualStrings("ride-along-value", recovered orelse return error.TestExpectedEqual);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Crash-during-ride-along regression (prefix-ordered durability)
+//
+// The close-time fix above (`Owner.deinit()` now calls
+// `Store.syncIndexContents()` before closing its own generation) only
+// protects a *graceful* close: a ride-along commit's pages are flushed
+// (`flushTransactionWrites` runs regardless of `durable`) but its
+// checkpoint publication is deliberately deferred, so a plain close with
+// no later durability barrier silently drops it. That fix says nothing
+// about a real crash mid-stream. The open question the fix's own author
+// raised: can a ride-along segment merge, WS5 retirement turn, or
+// deferred progress-v2 record make the *last durably-published*
+// checkpoint itself unreachable or inconsistent after a crash -- e.g. a
+// merge's page reuse overwriting pages the durable segment set still
+// points at, or a retirement deleting journal entries durable progress
+// still needs? That would be a real prefix-order violation: losing
+// already-acknowledged, already-durable data, not merely losing the
+// not-yet-durable ride-along work (which is expected and fine).
+//
+// This scenario reuses "sustained full_index single writer..."'s own
+// recipe above (a tiny key set under repeated overwrite, a lowered
+// merge-policy override, and interleaved WS5 retirement turns) kept small
+// enough for `runCrashSweep` to enumerate and replay every barrier it
+// crosses -- including barriers immediately following a ride-along
+// commit's own staged writes -- under `power_loss = .drop_unsynced`
+// (the only mode that actually drops unsynced bytes; see
+// `crash_sim_io.zig`'s `PowerLoss` doc comment). No graceful `close()`
+// ever runs on the crashed replay path: `scenario.run` returns the
+// injected error before reaching its own `defer handle.close()`'s normal
+// fall-through effects on disk (see `DbHandle.close`'s doc comment -- the
+// backend/DB teardown that *does* still run is best-effort cleanup of
+// in-memory state, not a new durability barrier).
+const ride_along_key_count = 3;
+const ride_along_round_count = 3;
+const RideAlongStep = struct {
+    key: []const u8,
+    before: ?[]const u8,
+    after: []const u8,
+    retire_after: bool,
+};
+const ride_along_steps: [ride_along_key_count * ride_along_round_count]RideAlongStep = blk: {
+    var steps: [ride_along_key_count * ride_along_round_count]RideAlongStep = undefined;
+    var i: usize = 0;
+    for (0..ride_along_round_count) |round| {
+        for (0..ride_along_key_count) |slot| {
+            steps[i] = .{
+                .key = std.fmt.comptimePrint("doc-{d}", .{slot}),
+                .before = if (round == 0) null else std.fmt.comptimePrint("marker{d}", .{i - ride_along_key_count}),
+                .after = std.fmt.comptimePrint("marker{d}", .{i}),
+                // Roughly every third write, matching the non-crash
+                // regression's `i % 29 == 0` cadence scaled down to this
+                // scenario's much smaller write count -- frequent enough
+                // that a WS5 retirement turn's own commit is itself a
+                // barrier candidate throughout the sweep, not just at the
+                // very end.
+                .retire_after = (i % 3) == 2,
+            };
+            i += 1;
+        }
+    }
+    break :blk steps;
+};
+
+fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    var handle = try openDbWithIo(allocator, path, io, true);
+    defer handle.close();
+
+    // Reaches the same merge/retirement machinery the production repro
+    // needed ~7,500 writes for in a handful of writes instead -- see the
+    // non-crash regression above for the full rationale.
+    index_manager.setBenchmarkTextMergePolicyOverride(.{
+        .max_segments_per_tier = 2,
+        .max_segment_size = 5 * 1024 * 1024 * 1024,
+        .floor_segment_size = 0,
+    });
+    defer index_manager.setBenchmarkTextMergePolicyOverride(null);
+
+    for (ride_along_steps) |step| {
+        const json = try std.fmt.allocPrint(allocator, "{{\"body\":\"{s} churn alpha beta gamma\"}}", .{step.after});
+        defer allocator.free(json);
+        try checkpoints.append(allocator, .{
+            .expectations = &.{.{ .key = step.key, .before = step.before, .after = step.after, .searchable_after = step.after }},
+        });
+        try handle.db.batch(.{ .writes = &.{.{ .key = step.key, .value = json }}, .sync_level = .full_index });
+
+        // Mirrors production: a WS5 retirement turn driven explicitly here
+        // (this harness bypasses the Owner/pool layer that normally drives
+        // it from the ack path) interleaved with sustained full_index
+        // writes and the segment merges they trigger. No checkpoint: a
+        // retirement turn touches no document key.
+        if (step.retire_after) try runRetirementTurn(allocator, &handle);
+    }
+}
+
+test "crash sweep: sustained full_index writes survive a crash during ride-along merge and retirement" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "sustained-full-index-ride-along",
+        .run = runSustainedFullIndexRideAlongUnderCrash,
+        .via_db = true,
+        .search_index = "body_text",
+        .search_field = "body",
+        .retirement = true,
+    }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+// Deliberately no `.exhaustive` variant: this scenario's own writes already
+// cross several native commits each (primary + full-text + occasional
+// merge/retirement ride-along), so an exhaustive sweep's every-barrier
+// replay is combinatorially far more expensive here than for the simpler
+// primary/full-text scenarios above. `quick` mode's sampled barriers
+// (including, by construction, points right after a ride-along commit --
+// see `RideAlongStep.retire_after`) already cover this scenario's own
+// specific risk.
