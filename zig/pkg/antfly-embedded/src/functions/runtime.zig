@@ -3437,3 +3437,102 @@ test "decision provider guarded cascade batches retain raw agreement and veto ev
     }
     try std.testing.expectEqualStrings("different", values[1].object.get("answers").?.array.items[0].object.get("choice").?.string);
 }
+
+test "decision provider generated upstream cascades survive actual proxy normalization" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    const Fixture = struct {
+        mode: []const u8,
+        fn response(alloc: std.mem.Allocator, model: []const u8, is_generated: bool, p: f64, selected: []const u8, verdict: bool) !decisions.Json {
+            return std.json.parseFromSliceLeaky(decisions.Json, alloc, try std.fmt.allocPrint(alloc,
+                \\{{"model":"{s}","answers":[{{"name":"same","type":"choice","decision_method":"{s}","choice":"{s}","probabilities":[{{"value":"same","probability":{d}}},{{"value":"different","probability":{d}}}]{s}}}],"usage":{{"input_tokens":{d},"output_tokens":0}}}}
+            , .{ model, if (is_generated) "generated" else "typed", selected, p, 1 - p, if (is_generated) try std.fmt.allocPrint(alloc, ",\"probability_source\":\"{s}\",\"raw_structured_answer\":\"{s}\"", .{ if (verdict) "verdict" else "token_logprobs", selected }) else "", @as(usize, if (is_generated) 10 else 5) }), .{});
+        }
+        fn run(ptr: *anyopaque, alloc: std.mem.Allocator, index: usize, _: decisions.cascade_contract.Stage, indices: []const usize) anyerror!decisions.cascade_contract.StageResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const values = try alloc.alloc(?decisions.Json, indices.len);
+            const failures = try alloc.alloc(?anyerror, indices.len);
+            @memset(failures, null);
+            for (values, failures) |*value, *failure| {
+                if (index == 1 and std.mem.eql(u8, self.mode, "unverified")) {
+                    value.* = null;
+                    failure.* = error.ProviderUnavailable;
+                    continue;
+                }
+                const different = std.mem.eql(u8, self.mode, "sampled") or (index == 0 and std.mem.eql(u8, self.mode, "veto"));
+                const verdict = index == 1 and std.mem.eql(u8, self.mode, "verdict");
+                value.* = try response(alloc, if (index == 0) "remote-fast" else "remote-strong", true, if (verdict) 1 else if (index == 0 and different) 0.4 else 0.97, if (different) "different" else "same", verdict);
+            }
+            return .{ .values = values, .failures = failures };
+        }
+        fn decide(_: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?managed.RequestContext) ![]u8 {
+            const request = try std.json.parseFromSliceLeaky(decisions.Json, alloc, body, .{});
+            const model = request.object.get("model").?.string;
+            if (!std.mem.eql(u8, model, "remote")) return std.json.Stringify.valueAlloc(alloc, try response(alloc, model, false, 0.97, "same", false), .{});
+            var self = @This(){ .mode = request.object.get("input").?.string };
+            const definition = try decisions.cascade_contract.compile(alloc, try std.json.parseFromSliceLeaky(decisions.Json, alloc, try std.fmt.allocPrint(alloc,
+                \\{{"stages":[{{"name":"fast","decider":{{"decision_method":"generated","generator":{{"model":"remote-fast"}}}}}},{{"name":"strong","decider":{{"decision_method":"generated","generator":{{"model":"remote-strong"}}{s}}},"require_agreement":true,"on_failure":"keep_previous","when":{{"question":"same","choice":"same","probability_between":[0.3,1]}}}}]}}
+            , .{if (std.mem.eql(u8, self.mode, "verdict")) ",\"probabilities\":\"verdict_only\"" else ""}), .{}));
+            const out = try decisions.cascade_contract.execute(alloc, &definition, "remote", 1, .{ .ptr = &self, .run = run });
+            var value = out.values[0].?;
+            _ = try decisions.cascade_contract.validateTrace(&definition, value);
+            if (std.mem.eql(u8, self.mode, "plain")) _ = value.object.swapRemove("cascade");
+            if (std.mem.eql(u8, self.mode, "malformed")) try value.object.getPtr("answers").?.array.items[0].object.put(alloc, "raw_structured_answer", .{ .string = "not-the-vote" });
+            return std.json.Stringify.valueAlloc(alloc, value, .{});
+        }
+    };
+    for ([_]bool{ false, true }) |guard| {
+        var registry = try registry_mod.Registry.parseFromSlice(a, try std.fmt.allocPrint(scratch,
+            \\{{"deciders":{{"proxy":{{"model":"remote"}},"outer":{{"decision_method":"cascade","cascade":{{"stages":[{{"name":"fast","decider":{{"model":"fast"}}}},{{"name":"proxy","decider":{{"model":"remote"}},"require_agreement":{},"on_failure":"keep_previous","when":{{"question":"same","choice":"same","probability_between":[0.3,1]}}}},{{"name":"after","decider":{{"model":"after"}},"when":{{"question":"same","choice":"same","probability_between":[0.3,1]}}}}]}}}},"first":{{"decision_method":"cascade","cascade":{{"stages":[{{"name":"proxy","decider":{{"model":"remote"}}}},{{"name":"after","decider":{{"model":"after"}},"when":{{"question":"same","choice":"same","probability_between":[0.3,1]}}}}]}}}}}}}}
+        , .{guard}));
+        defer registry.deinit();
+        var token: u8 = 0;
+        var runtime = Runtime{ .registry = &registry, .http = &client, .io = std.testing.io, .antfly_provider = .{ .ptr = &token, .owns_invocation_admission = true, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Fixture.decide } };
+        defer runtime.deinit();
+        const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+            \\{"same":{"type":"choice","instructions":"Same?","criteria":{"same":"Same","different":"Different"}}}
+        , .{});
+        for ([_][]const u8{ "proxy", "outer", "first" }) |name| {
+            const modes = [_][]const u8{ "agree", "veto", "unverified", "sampled", "verdict", "plain", "malformed" };
+            var requests: [modes.len]decisions.Request = undefined;
+            for (&requests, modes) |*request, mode| request.* = .{ .decider = name, .questions = questions, .input = .{ .text = mode } };
+            const result = try runtime.evaluatePartial(scratch, &requests);
+            for (result.values, result.failures, modes) |value, failure, mode| {
+                const outer = std.mem.eql(u8, name, "outer");
+                const malformed = std.mem.eql(u8, mode, "malformed");
+                if (malformed and !outer) {
+                    try std.testing.expect(value == null);
+                    try std.testing.expectEqual(error.InvalidDecisionOutput, failure.?);
+                    continue;
+                }
+                try std.testing.expect(failure == null);
+                const response = value.?;
+                const blocked = std.mem.eql(u8, mode, "veto") or std.mem.eql(u8, mode, "unverified") or (outer and guard and (malformed or std.mem.eql(u8, mode, "sampled")));
+                try std.testing.expectEqual(blocked, try decisions.cascade_contract.agreementBlocked(response));
+                if (std.mem.eql(u8, name, "proxy")) {
+                    try std.testing.expectEqualStrings("generated", response.object.get("answers").?.array.items[0].object.get("decision_method").?.string);
+                    continue;
+                }
+                const definition = &(try registry.getCascade(name)).definition;
+                _ = try decisions.cascade_contract.validateTrace(definition, response);
+                const trace = response.object.get("cascade").?.object.get("stages").?.array.items;
+                const stopped = blocked or malformed;
+                try std.testing.expectEqual(@as(usize, if (outer) (if (stopped) 2 else 3) else (if (stopped) 1 else 2)), trace.len);
+                const remote_stage = trace[if (outer) @as(usize, 1) else 0].object;
+                if (malformed) {
+                    try std.testing.expect(remote_stage.contains("error"));
+                } else {
+                    try std.testing.expect(!remote_stage.contains("error"));
+                    try std.testing.expectEqualStrings("generated", remote_stage.get("answers").?.array.items[0].object.get("decision_method").?.string);
+                    if (std.mem.eql(u8, mode, "sampled")) try std.testing.expectEqualStrings("different", remote_stage.get("answers").?.array.items[0].object.get("choice").?.string);
+                }
+                const remote_tokens: i64 = if (std.mem.eql(u8, mode, "unverified")) 10 else 20;
+                try std.testing.expectEqual(remote_tokens + @as(i64, if (outer) 5 else 0) + @as(i64, if (stopped) 0 else 5), response.object.get("usage").?.object.get("input_tokens").?.integer);
+            }
+        }
+    }
+}

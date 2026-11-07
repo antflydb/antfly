@@ -307,6 +307,15 @@ comparison is `unverified` when its upstream abstains; the aggregate retains the
 upstream veto. Resolver policies honor this abstention even when they use a
 plain typed proxy and `on_failure: mint`.
 
+For `provider: antfly`, the default `typed` method selects the Decisions
+transport. A remote named decider may return typed or generated answers,
+including a sampled choice that differs from its distribution's argmax. Proxy
+consumers validate each answer's reported method and probability evidence before
+honoring agreement. Generated token probabilities and categorical verdicts keep
+their original meaning; embedding-similarity responses still require explicit
+configuration. A stage receipt records its configured execution method; each
+answer retains the method that actually produced it.
+
 Generated choice votes retain the sampled structured answer, which need not be
 the highest-probability alternative. Resolver thresholds apply to that selected
 vote; probability mass on another choice cannot accept or reject the pair.

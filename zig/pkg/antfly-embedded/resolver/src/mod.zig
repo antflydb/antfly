@@ -4608,7 +4608,7 @@ test "REVIEW generated adjudication thresholds follow sampled votes and validate
     try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(a, verdict_config.value, wrong_verdict));
 }
 
-test "REVIEW typed upstream cascade abstention survives mint policy and offline replay" {
+test "REVIEW upstream Decisions methods preserve abstention through mint and offline replay" {
     const a = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -4617,34 +4617,105 @@ test "REVIEW typed upstream cascade abstention survives mint policy and offline 
         \\{"decider":{"provider":"antfly","model":"deciders/upstream","url":"http://upstream.example/ai/v1"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"on_failure":"mint"}
     );
     defer config.deinit();
-    for ([_][]const u8{ "disagreed", "unverified", "agreed" }) |status| {
-        var response = try std.json.parseFromSliceLeaky(std.json.Value, scratch, adjudication_test_response, .{});
-        const trace = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try std.fmt.allocPrint(scratch,
+    for ([_]enum { typed, generated, verdict, sampled }{ .typed, .generated, .verdict, .sampled }) |mode| {
+        for ([_][]const u8{ "disagreed", "unverified", "agreed", "absent" }) |status| {
+            var response = try std.json.parseFromSliceLeaky(std.json.Value, scratch, adjudication_test_response, .{});
+            const answer = &response.object.getPtr("answers").?.array.items[0];
+            if (mode != .typed) {
+                try answer.object.put(scratch, "decision_method", .{ .string = "generated" });
+                try answer.object.put(scratch, "probability_source", .{ .string = if (mode == .verdict) "verdict" else "token_logprobs" });
+                try answer.object.put(scratch, "raw_structured_answer", .{ .string = if (mode == .sampled) "different" else "same" });
+                if (mode == .sampled) try answer.object.put(scratch, "choice", .{ .string = "different" });
+                if (mode == .verdict) {
+                    const probabilities = answer.object.getPtr("probabilities").?.array.items;
+                    try probabilities[0].object.put(scratch, "probability", .{ .integer = 1 });
+                    try probabilities[1].object.put(scratch, "probability", .{ .integer = 0 });
+                }
+            }
+            const trace = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try std.fmt.allocPrint(scratch,
+                \\{{"agreement_status":"{s}"{s}}}
+            , .{ status, if (std.mem.eql(u8, status, "disagreed")) ",\"agreed\":false,\"disagreed_questions\":[\"same\"]" else if (std.mem.eql(u8, status, "agreed")) ",\"agreed\":true" else "" }), .{});
+            const absent = std.mem.eql(u8, status, "absent");
+            if (!absent) try response.object.put(scratch, "cascade", trace);
+            const blocked = (!absent and !std.mem.eql(u8, status, "agreed")) or mode == .sampled;
+            try testing.expectEqual(if (blocked) adjudication.Status.abstained else adjudication.Status.accepted, try adjudication.classify(scratch, config.value, response));
+            var resolver = try Resolver.parse(a,
+                \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+            );
+            defer resolver.deinit();
+            var fixture: AdjudicationFixture = .{ .response = try std.json.Stringify.valueAlloc(scratch, response, .{}) };
+            var map: MapStore = .{ .alloc = a };
+            defer map.deinit();
+            try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+            var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .work_retention = .none };
+            _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+            const bytes = (try map.store().get(a, "resolution")).?;
+            defer a.free(bytes);
+            var parsed = try parseResolution(a, bytes);
+            defer parsed.deinit();
+            try testing.expectEqual(if (blocked) Decision.review else Decision.match, parsed.entities[0].decision);
+            try testing.expectEqual(if (blocked) adjudication.Status.abstained else adjudication.Status.accepted, parsed.entities[0].adjudication.?.status);
+            stage.adjudicator = null;
+            _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+            try testing.expectEqual(@as(usize, 1), fixture.calls);
+            if (!absent) {
+                try response.object.getPtr("cascade").?.object.put(scratch, "agreed", .{ .bool = !std.mem.eql(u8, status, "agreed") });
+                try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
+                _ = response.object.swapRemove("cascade");
+            }
+            if (mode != .typed) {
+                // A valid veto cannot excuse invalid raw evidence or broaden other
+                // providers' trained-only result contract.
+                try answer.object.put(scratch, "raw_structured_answer", .{ .string = "not-the-vote" });
+                try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
+                try answer.object.put(scratch, "raw_structured_answer", answer.object.get("choice").?);
+                if (mode != .verdict) {
+                    try answer.object.put(scratch, "probability_source", .{ .string = "verdict" });
+                    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
+                }
+                var trained = config.value;
+                trained.decider = try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"provider\":\"jev\",\"model\":\"trained\"}", .{});
+                try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, trained, response));
+            }
+        }
+    }
+}
+
+test "REVIEW frozen cascades validate proxied generated stages without per-result plans" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw =
+        \\{"decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"provider":"jev","model":"fast"}},{"name":"strong","decider":{"provider":"antfly","model":"remote"},"require_agreement":true,"when":{"question":"same","choice":"same","probability_between":[0.3,1]}}]}},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"on_failure":"mint"}
+    ;
+    const config = try adjudication.Config.parse(a, raw);
+    defer config.deinit();
+    var fixed = std.heap.FixedBufferAllocator.init(try a.alloc(u8, 2 * 1024 * 1024));
+    var classifier = try adjudication.Classifier.init(fixed.allocator(), config.value);
+    defer classifier.deinit();
+    for ([_][]const u8{ "agreed", "disagreed", "unverified", "absent" }) |upstream_status| {
+        const response = try std.json.parseFromSliceLeaky(std.json.Value, a, try adjudicationCascadeResponse(a, config.value), .{});
+        const cascade = response.object.getPtr("cascade").?;
+        const stage = &cascade.object.getPtr("stages").?.array.items[1];
+        try stage.object.put(a, "decision_method", .{ .string = "typed" });
+        const blocked = std.mem.eql(u8, upstream_status, "disagreed") or std.mem.eql(u8, upstream_status, "unverified");
+        const summary = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.fmt.allocPrint(a,
             \\{{"agreement_status":"{s}"{s}}}
-        , .{ status, if (std.mem.eql(u8, status, "disagreed")) ",\"agreed\":false,\"disagreed_questions\":[\"same\"]" else if (std.mem.eql(u8, status, "agreed")) ",\"agreed\":true" else "" }), .{});
-        try response.object.put(scratch, "cascade", trace);
-        const blocked = !std.mem.eql(u8, status, "agreed");
-        try testing.expectEqual(if (blocked) adjudication.Status.abstained else adjudication.Status.accepted, try adjudication.classify(scratch, config.value, response));
-        var resolver = try Resolver.parse(a,
-            \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
-        );
-        defer resolver.deinit();
-        var fixture: AdjudicationFixture = .{ .response = try std.json.Stringify.valueAlloc(scratch, response, .{}) };
-        var map: MapStore = .{ .alloc = a };
-        defer map.deinit();
-        try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
-        var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .work_retention = .none };
-        _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
-        const bytes = (try map.store().get(a, "resolution")).?;
-        defer a.free(bytes);
-        var parsed = try parseResolution(a, bytes);
-        defer parsed.deinit();
-        try testing.expectEqual(if (blocked) Decision.review else Decision.match, parsed.entities[0].decision);
-        try testing.expectEqual(if (blocked) adjudication.Status.abstained else adjudication.Status.accepted, parsed.entities[0].adjudication.?.status);
-        stage.adjudicator = null;
-        _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
-        try testing.expectEqual(@as(usize, 1), fixture.calls);
-        try response.object.getPtr("cascade").?.object.put(scratch, "agreed", .{ .bool = blocked });
-        try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
+        , .{ upstream_status, if (std.mem.eql(u8, upstream_status, "disagreed")) ",\"agreed\":false,\"disagreed_questions\":[\"same\"]" else if (std.mem.eql(u8, upstream_status, "agreed")) ",\"agreed\":true" else "" }), .{});
+        if (!std.mem.eql(u8, upstream_status, "absent")) try stage.object.put(a, "upstream_agreement", summary);
+        try stage.object.put(a, "agreement_status", .{ .string = if (blocked) "unverified" else "agreed" });
+        if (!blocked) try stage.object.put(a, "agreed", .{ .bool = true });
+        for (summary.object.keys(), summary.object.values()) |key, value| if (blocked) try cascade.object.put(a, key, value);
+        if (!blocked) {
+            try cascade.object.put(a, "agreement_status", .{ .string = "agreed" });
+            try cascade.object.put(a, "agreed", .{ .bool = true });
+        }
+        const used = fixed.end_index;
+        for (0..256) |_| try testing.expectEqual(if (blocked) adjudication.Status.abstained else adjudication.Status.accepted, try classifier.classify(response));
+        try testing.expectEqual(used, fixed.end_index);
+        // Local trace assertions and raw generated evidence remain mandatory.
+        const answer = &response.object.getPtr("answers").?.array.items[0];
+        try answer.object.put(a, "raw_structured_answer", .{ .string = "different" });
+        try testing.expectError(error.InvalidAdjudicationOutput, classifier.classify(response));
     }
 }

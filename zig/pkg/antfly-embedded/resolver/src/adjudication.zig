@@ -366,7 +366,7 @@ fn answeringDecider(config: Config, response: std.json.Value, definition: ?*cons
     return stages[index].object.get("decider").?;
 }
 
-/// Only a well-formed, typed, normalized choice distribution can change identity.
+/// Only well-formed normalized decision evidence can change identity.
 pub fn classify(a: std.mem.Allocator, config: Config, response: std.json.Value) !Status {
     if (config.cascadeStages().len == 0) return classifyResponse(config, response, null);
     var classifier = try Classifier.init(a, config);
@@ -389,14 +389,23 @@ fn classifyResponse(config: Config, response: std.json.Value, definition: ?*cons
     // A cascade answer is checked against the stage that produced it.
     const answering = try answeringDecider(config, response, definition);
     const expected_method = answering.object.get("decision_method") orelse std.json.Value{ .string = "typed" };
-    if (expected_method != .string or !std.mem.eql(u8, method.string, expected_method.string)) return error.InvalidAdjudicationOutput;
+    const provider = answering.object.get("provider") orelse std.json.Value{ .string = "antfly" };
+    // `typed` selects the Decisions transport. A remote named decider may
+    // return generated evidence, including from inside a local frozen cascade.
+    const proxy = expected_method == .string and std.mem.eql(u8, expected_method.string, "typed") and provider == .string and std.mem.eql(u8, provider.string, "antfly");
+    if (expected_method != .string or (!proxy and !std.mem.eql(u8, method.string, expected_method.string))) return error.InvalidAdjudicationOutput;
     const generated = std.mem.eql(u8, method.string, "generated");
     var verdict_only = false;
     if (generated) {
         const source = answer.object.get("probability_source") orelse return error.InvalidAdjudicationOutput;
-        const policy = answering.object.get("probabilities") orelse std.json.Value{ .string = "token_logprobs" };
-        verdict_only = policy == .string and std.mem.eql(u8, policy.string, "verdict_only");
-        if (source != .string or !std.mem.eql(u8, source.string, if (verdict_only) "verdict" else "token_logprobs")) return error.InvalidAdjudicationOutput;
+        if (proxy) {
+            if (source != .string or (!std.mem.eql(u8, source.string, "verdict") and !std.mem.eql(u8, source.string, "token_logprobs"))) return error.InvalidAdjudicationOutput;
+            verdict_only = std.mem.eql(u8, source.string, "verdict");
+        } else {
+            const policy = answering.object.get("probabilities") orelse std.json.Value{ .string = "token_logprobs" };
+            verdict_only = policy == .string and std.mem.eql(u8, policy.string, "verdict_only");
+            if (source != .string or !std.mem.eql(u8, source.string, if (verdict_only) "verdict" else "token_logprobs")) return error.InvalidAdjudicationOutput;
+        }
         if (!answer.object.contains("raw_structured_answer")) return error.InvalidAdjudicationOutput;
     }
     const probabilities = answer.object.get("probabilities") orelse return error.InvalidAdjudicationOutput;
