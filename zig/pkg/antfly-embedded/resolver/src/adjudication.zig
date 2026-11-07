@@ -444,7 +444,7 @@ fn classifyResponse(config: Config, response: std.json.Value, definition: ?*cons
     // Typed choices are derived from their distribution. Generated choices are
     // sampled decoder output and can legitimately have a lower probability.
     if (@abs(total - 1) > 0.001 or (!generated and selected_p != maximum)) return error.InvalidAdjudicationOutput;
-    if (definition != null and try @import("antfly_decisions").cascade.agreementBlocked(response)) return .abstained;
+    if (@import("antfly_decisions").cascade.agreementBlocked(response) catch return error.InvalidAdjudicationOutput) return .abstained;
     if (std.mem.eql(u8, selected.string, config.accept.choice) and accepted >= config.accept.min_probability and accepted > 0.5) return .accepted;
     if (config.reject) |reject| if (std.mem.eql(u8, selected.string, reject.choice) and rejected >= reject.min_probability and rejected > 0.5) return .rejected;
     return .abstained;

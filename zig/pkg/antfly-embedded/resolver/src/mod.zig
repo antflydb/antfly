@@ -4607,3 +4607,44 @@ test "REVIEW generated adjudication thresholds follow sampled votes and validate
     , .{});
     try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(a, verdict_config.value, wrong_verdict));
 }
+
+test "REVIEW typed upstream cascade abstention survives mint policy and offline replay" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const config = try adjudication.Config.parse(a,
+        \\{"decider":{"provider":"antfly","model":"deciders/upstream","url":"http://upstream.example/ai/v1"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"on_failure":"mint"}
+    );
+    defer config.deinit();
+    for ([_][]const u8{ "disagreed", "unverified", "agreed" }) |status| {
+        var response = try std.json.parseFromSliceLeaky(std.json.Value, scratch, adjudication_test_response, .{});
+        const trace = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try std.fmt.allocPrint(scratch,
+            \\{{"agreement_status":"{s}"{s}}}
+        , .{ status, if (std.mem.eql(u8, status, "disagreed")) ",\"agreed\":false,\"disagreed_questions\":[\"same\"]" else if (std.mem.eql(u8, status, "agreed")) ",\"agreed\":true" else "" }), .{});
+        try response.object.put(scratch, "cascade", trace);
+        const blocked = !std.mem.eql(u8, status, "agreed");
+        try testing.expectEqual(if (blocked) adjudication.Status.abstained else adjudication.Status.accepted, try adjudication.classify(scratch, config.value, response));
+        var resolver = try Resolver.parse(a,
+            \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+        );
+        defer resolver.deinit();
+        var fixture: AdjudicationFixture = .{ .response = try std.json.Stringify.valueAlloc(scratch, response, .{}) };
+        var map: MapStore = .{ .alloc = a };
+        defer map.deinit();
+        try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+        var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .work_retention = .none };
+        _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+        const bytes = (try map.store().get(a, "resolution")).?;
+        defer a.free(bytes);
+        var parsed = try parseResolution(a, bytes);
+        defer parsed.deinit();
+        try testing.expectEqual(if (blocked) Decision.review else Decision.match, parsed.entities[0].decision);
+        try testing.expectEqual(if (blocked) adjudication.Status.abstained else adjudication.Status.accepted, parsed.entities[0].adjudication.?.status);
+        stage.adjudicator = null;
+        _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+        try testing.expectEqual(@as(usize, 1), fixture.calls);
+        try response.object.getPtr("cascade").?.object.put(scratch, "agreed", .{ .bool = blocked });
+        try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
+    }
+}

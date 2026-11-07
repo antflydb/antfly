@@ -54,3 +54,26 @@ def test_cascade_agreement_trace_preserves_false_and_unverified_presence():
         if state == "disagreed":
             wire["disagreed_questions"] = ["same"]
         assert DecisionCascadeTrace.from_dict(wire).to_dict() == wire
+
+
+def test_upstream_agreement_summary_round_trip_preserves_abstention():
+    from antfly.client_generated.models import DecisionCascadeStageTrace
+
+    for state in ("agreed", "disagreed", "unverified"):
+        summary = {
+            "agreement_status": state,
+            "decider": "remote",
+            "definition_sha256": "b" * 64,
+            "answered_by": "strong",
+        }
+        if state != "unverified":
+            summary["agreed"] = state == "agreed"
+        if state == "disagreed":
+            summary["disagreed_questions"] = ["same"]
+        wire = {
+            "name": "proxy",
+            "decision_method": "typed",
+            "escalated": False,
+            "upstream_agreement": summary,
+        }
+        assert DecisionCascadeStageTrace.from_dict(wire).to_dict() == wire

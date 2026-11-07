@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.decision_cascade_stage_trace_provenance import DecisionCascadeStageTraceProvenance
+    from ..models.decision_cascade_upstream_agreement import DecisionCascadeUpstreamAgreement
     from ..models.decision_usage import DecisionUsage
     from ..models.embedding_choice_answer import EmbeddingChoiceAnswer
     from ..models.embedding_multi_choice_answer import EmbeddingMultiChoiceAnswer
@@ -33,9 +34,13 @@ class DecisionCascadeStageTrace:
         name (str):
         decision_method (DecisionCascadeStageTraceDecisionMethod):
         escalated (bool): Whether this answer fell inside the next stage's band, sending the input on.
+        upstream_agreement (DecisionCascadeUpstreamAgreement | Unset): Bounded agreement summary reported by the stage's
+            upstream provider. This preserves upstream abstention without recursively embedding its trace; the upstream
+            definition is not locally verified. A disagreed or unverified upstream stops the input, including at the first
+            or an unguarded stage.
         agreement_status (DecisionCascadeAgreementStatus | Unset): A required comparison agreed, disagreed, or could not
-            run because its stage failed with keep_previous. Disagreed and unverified outcomes abstain without discarding
-            model answers or usage.
+            run because its stage failed with keep_previous or its upstream abstained. Disagreed and unverified outcomes
+            abstain without discarding model answers or usage.
         agreed (bool | Unset): Derived comparison result. Present only for agreed or disagreed checks; absent when no
             check ran or verification was unavailable.
         disagreed_questions (list[str] | Unset): Sorted question names that disagreed. Present only when
@@ -55,6 +60,7 @@ class DecisionCascadeStageTrace:
     name: str
     decision_method: DecisionCascadeStageTraceDecisionMethod
     escalated: bool
+    upstream_agreement: DecisionCascadeUpstreamAgreement | Unset = UNSET
     agreement_status: DecisionCascadeAgreementStatus | Unset = UNSET
     agreed: bool | Unset = UNSET
     disagreed_questions: list[str] | Unset = UNSET
@@ -93,6 +99,10 @@ class DecisionCascadeStageTrace:
         decision_method = self.decision_method.value
 
         escalated = self.escalated
+
+        upstream_agreement: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.upstream_agreement, Unset):
+            upstream_agreement = self.upstream_agreement.to_dict()
 
         agreement_status: str | Unset = UNSET
         if not isinstance(self.agreement_status, Unset):
@@ -153,6 +163,8 @@ class DecisionCascadeStageTrace:
                 "escalated": escalated,
             }
         )
+        if upstream_agreement is not UNSET:
+            field_dict["upstream_agreement"] = upstream_agreement
         if agreement_status is not UNSET:
             field_dict["agreement_status"] = agreement_status
         if agreed is not UNSET:
@@ -177,6 +189,7 @@ class DecisionCascadeStageTrace:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.decision_cascade_stage_trace_provenance import DecisionCascadeStageTraceProvenance
+        from ..models.decision_cascade_upstream_agreement import DecisionCascadeUpstreamAgreement
         from ..models.decision_usage import DecisionUsage
         from ..models.embedding_choice_answer import EmbeddingChoiceAnswer
         from ..models.embedding_multi_choice_answer import EmbeddingMultiChoiceAnswer
@@ -194,6 +207,13 @@ class DecisionCascadeStageTrace:
         decision_method = DecisionCascadeStageTraceDecisionMethod(d.pop("decision_method"))
 
         escalated = d.pop("escalated")
+
+        _upstream_agreement = d.pop("upstream_agreement", UNSET)
+        upstream_agreement: DecisionCascadeUpstreamAgreement | Unset
+        if isinstance(_upstream_agreement, Unset):
+            upstream_agreement = UNSET
+        else:
+            upstream_agreement = DecisionCascadeUpstreamAgreement.from_dict(_upstream_agreement)
 
         _agreement_status = d.pop("agreement_status", UNSET)
         agreement_status: DecisionCascadeAgreementStatus | Unset
@@ -336,6 +356,7 @@ class DecisionCascadeStageTrace:
             name=name,
             decision_method=decision_method,
             escalated=escalated,
+            upstream_agreement=upstream_agreement,
             agreement_status=agreement_status,
             agreed=agreed,
             disagreed_questions=disagreed_questions,

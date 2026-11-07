@@ -27,8 +27,8 @@ class DecisionCascadeTrace:
             answered_by (str): Name of the stage whose answer is final.
             stages (list[DecisionCascadeStageTrace]):
             agreement_status (DecisionCascadeAgreementStatus | Unset): A required comparison agreed, disagreed, or could not
-                run because its stage failed with keep_previous. Disagreed and unverified outcomes abstain without discarding
-                model answers or usage.
+                run because its stage failed with keep_previous or its upstream abstained. Disagreed and unverified outcomes
+                abstain without discarding model answers or usage.
             agreed (bool | Unset): Derived comparison result. Present only for agreed or disagreed checks; absent when no
                 check ran or verification was unavailable.
             disagreed_questions (list[str] | Unset): Sorted question names that disagreed. Present only when

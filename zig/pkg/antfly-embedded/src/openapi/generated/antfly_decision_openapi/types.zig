@@ -573,7 +573,7 @@ pub const DecisionBatchItem = struct {
     }
 };
 
-/// A required comparison agreed, disagreed, or could not run because its stage failed with keep_previous. Disagreed and unverified outcomes abstain without discarding model answers or usage.
+/// A required comparison agreed, disagreed, or could not run because its stage failed with keep_previous or its upstream abstained. Disagreed and unverified outcomes abstain without discarding model answers or usage.
 pub const DecisionCascadeAgreementStatus = enum {
     agreed,
     disagreed,
@@ -603,6 +603,7 @@ pub const DecisionCascadeAgreementStatus = enum {
 };
 
 pub const DecisionCascadeStageTrace = struct {
+    upstream_agreement: ?DecisionCascadeUpstreamAgreement = null,
     agreement_status: ?DecisionCascadeAgreementStatus = null,
     /// Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable.
     agreed: ?bool = null,
@@ -625,6 +626,7 @@ pub const DecisionCascadeStageTrace = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "upstream_agreement", "upstream_agreement", true },
         .{ "agreement_status", "agreement_status", true },
         .{ "agreed", "agreed", true },
         .{ "disagreed_questions", "disagreed_questions", true },
@@ -649,6 +651,10 @@ pub const DecisionCascadeStageTrace = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.upstream_agreement) |value| {
+            try jw.objectField("upstream_agreement");
+            try jw.write(value);
+        }
         if (self.agreement_status) |value| {
             try jw.objectField("agreement_status");
             try jw.write(value);
@@ -751,6 +757,63 @@ pub const DecisionCascadeTrace = struct {
         try jw.write(self.answered_by);
         try jw.objectField("stages");
         try jw.write(self.stages);
+        try jw.endObject();
+    }
+};
+
+/// Bounded agreement summary reported by the stage's upstream provider. This preserves upstream abstention without recursively embedding its trace; the upstream definition is not locally verified. A disagreed or unverified upstream stops the input, including at the first or an unguarded stage.
+pub const DecisionCascadeUpstreamAgreement = struct {
+    agreement_status: DecisionCascadeAgreementStatus,
+    /// True for agreed, false for disagreed, absent for unverified.
+    agreed: ?bool = null,
+    /// Sorted names from this stage's answers; required only for disagreed.
+    disagreed_questions: ?[]const []const u8 = null,
+    decider: ?[]const u8 = null,
+    definition_sha256: ?[]const u8 = null,
+    answered_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "agreement_status", "agreement_status", false },
+        .{ "agreed", "agreed", true },
+        .{ "disagreed_questions", "disagreed_questions", true },
+        .{ "decider", "decider", true },
+        .{ "definition_sha256", "definition_sha256", true },
+        .{ "answered_by", "answered_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("agreement_status");
+        try jw.write(self.agreement_status);
+        if (self.agreed) |value| {
+            try jw.objectField("agreed");
+            try jw.write(value);
+        }
+        if (self.disagreed_questions) |value| {
+            try jw.objectField("disagreed_questions");
+            try jw.write(value);
+        }
+        if (self.decider) |value| {
+            try jw.objectField("decider");
+            try jw.write(value);
+        }
+        if (self.definition_sha256) |value| {
+            try jw.objectField("definition_sha256");
+            try jw.write(value);
+        }
+        if (self.answered_by) |value| {
+            try jw.objectField("answered_by");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

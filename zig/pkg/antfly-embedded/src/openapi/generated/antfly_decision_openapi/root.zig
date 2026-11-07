@@ -13,6 +13,7 @@ pub const DecisionBatchItem = types.DecisionBatchItem;
 pub const DecisionCascadeAgreementStatus = types.DecisionCascadeAgreementStatus;
 pub const DecisionCascadeStageTrace = types.DecisionCascadeStageTrace;
 pub const DecisionCascadeTrace = types.DecisionCascadeTrace;
+pub const DecisionCascadeUpstreamAgreement = types.DecisionCascadeUpstreamAgreement;
 pub const DecisionChoice = types.DecisionChoice;
 pub const DecisionChoiceProbability = types.DecisionChoiceProbability;
 pub const DecisionEvidence = types.DecisionEvidence;

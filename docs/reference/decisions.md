@@ -294,8 +294,18 @@ Guarded stage traces and the aggregate trace contain `agreement_status`:
 completed comparisons, and sorted `disagreed_questions` appears only for
 disagreement. A guarded stage failing with `keep_previous` retains the earlier
 answer but reports `unverified` and abstains. No agreement fields appear when
-no guard ran. A successful check remains recorded if a later unguarded stage
-runs; guard every later stage whose answer must also be confirmed.
+neither a local nor an upstream check ran. A successful check remains recorded
+if a later unguarded stage runs; guard every later stage whose answer must also
+be confirmed.
+
+An upstream cascade's `disagreed` or `unverified` result also stops an outer
+cascade, including at its first or an unguarded stage. Stage receipts preserve a
+bounded `upstream_agreement` summary with its reported status, disagreement
+question names, and available cascade identity. They do not recursively embed
+upstream traces or claim to verify the upstream definition. A local required
+comparison is `unverified` when its upstream abstains; the aggregate retains the
+upstream veto. Resolver policies honor this abstention even when they use a
+plain typed proxy and `on_failure: mint`.
 
 Generated choice votes retain the sampled structured answer, which need not be
 the highest-probability alternative. Resolver thresholds apply to that selected

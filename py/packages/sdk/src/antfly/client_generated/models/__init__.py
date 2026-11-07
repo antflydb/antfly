@@ -303,6 +303,7 @@ from .decision_cascade_stage_trace import DecisionCascadeStageTrace
 from .decision_cascade_stage_trace_decision_method import DecisionCascadeStageTraceDecisionMethod
 from .decision_cascade_stage_trace_provenance import DecisionCascadeStageTraceProvenance
 from .decision_cascade_trace import DecisionCascadeTrace
+from .decision_cascade_upstream_agreement import DecisionCascadeUpstreamAgreement
 from .decision_choice import DecisionChoice
 from .decision_choice_probability import DecisionChoiceProbability
 from .decision_evidence_image import DecisionEvidenceImage
@@ -2945,6 +2946,7 @@ __all__ = (
     "DecisionCascadeStageTraceDecisionMethod",
     "DecisionCascadeStageTraceProvenance",
     "DecisionCascadeTrace",
+    "DecisionCascadeUpstreamAgreement",
     "DecisionChoice",
     "DecisionChoiceProbability",
     "DecisionEvidenceImage",

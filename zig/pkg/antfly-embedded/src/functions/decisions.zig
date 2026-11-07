@@ -530,7 +530,9 @@ pub fn normalizeResponseWithConfig(a: std.mem.Allocator, questions: Json, source
 
 pub fn normalizeResponseWithCapabilities(a: std.mem.Allocator, questions: Json, source: Json, caps: Capabilities) !Json {
     const private = try contract.internalResponse(a, source);
-    return contract.publicResponse(a, try normalizeLegacy(a, questions, private, caps));
+    const normalized = try contract.publicResponse(a, try normalizeLegacy(a, questions, private, caps));
+    _ = try cascade_contract.responseAgreement(normalized);
+    return normalized;
 }
 fn normalizeLegacy(a: std.mem.Allocator, questions: Json, source: Json, caps: Capabilities) !Json {
     const bytes = try std.json.Stringify.valueAlloc(a, source, .{});
@@ -1071,4 +1073,27 @@ test "decision provider generated normalization retains sampled choices below th
     , .{});
     const normalized = try normalizeResponseWithCapabilities(a, questions, source, .{ .generated = true, .max_levels = 64 });
     try std.testing.expectEqualStrings("different", normalized.object.get("answers").?.array.items[0].object.get("choice").?.string);
+}
+
+test "decision functions typed proxy normalization preserves upstream abstention and rejects malformed gates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const questions = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"answer":{"type":"choice","instructions":"Same?","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    for ([_][]const u8{ "disagreed", "unverified" }) |status| {
+        var source = try std.json.parseFromSliceLeaky(Json, a,
+            \\{"model":"proxy","answers":[{"name":"answer","type":"choice","decision_method":"typed","choice":"same","probabilities":[{"value":"same","probability":0.97},{"value":"different","probability":0.03}]}],"usage":{"input_tokens":20,"output_tokens":2}}
+        , .{});
+        const metadata = try std.json.parseFromSliceLeaky(Json, a, try std.fmt.allocPrint(a,
+            \\{{"agreement_status":"{s}"{s}}}
+        , .{ status, if (std.mem.eql(u8, status, "disagreed")) ",\"agreed\":false,\"disagreed_questions\":[\"answer\"]" else "" }), .{});
+        try source.object.put(a, "cascade", metadata);
+        const normalized = try normalizeResponse(a, questions, source);
+        try std.testing.expect((try selectResult(.ai_choice, normalized)) == .null);
+        try std.testing.expectEqualStrings(status, (try selectResult(.ai_decide, normalized)).object.get("cascade").?.object.get("agreement_status").?.string);
+        try source.object.getPtr("cascade").?.object.put(a, "agreed", .{ .bool = true });
+        try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponse(a, questions, source));
+    }
 }

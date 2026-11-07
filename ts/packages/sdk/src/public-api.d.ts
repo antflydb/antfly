@@ -30796,10 +30796,21 @@ export interface components {
         };
         InferenceDecideAnswer: components["schemas"]["GeneratedChoiceAnswer"] | components["schemas"]["GeneratedMultiChoiceAnswer"] | components["schemas"]["GeneratedPredicateAnswer"] | components["schemas"]["GeneratedScoreAnswer"] | components["schemas"]["TrainedChoiceAnswer"] | components["schemas"]["TrainedScoreAnswer"] | components["schemas"]["TrainedPredicateAnswer"] | components["schemas"]["EmbeddingChoiceAnswer"] | components["schemas"]["EmbeddingMultiChoiceAnswer"];
         /**
-         * @description A required comparison agreed, disagreed, or could not run because its stage failed with keep_previous. Disagreed and unverified outcomes abstain without discarding model answers or usage.
+         * @description A required comparison agreed, disagreed, or could not run because its stage failed with keep_previous or its upstream abstained. Disagreed and unverified outcomes abstain without discarding model answers or usage.
          * @enum {string}
          */
         DecisionCascadeAgreementStatus: "agreed" | "disagreed" | "unverified";
+        /** @description Bounded agreement summary reported by the stage's upstream provider. This preserves upstream abstention without recursively embedding its trace; the upstream definition is not locally verified. A disagreed or unverified upstream stops the input, including at the first or an unguarded stage. */
+        DecisionCascadeUpstreamAgreement: {
+            agreement_status: components["schemas"]["DecisionCascadeAgreementStatus"];
+            /** @description True for agreed, false for disagreed, absent for unverified. */
+            agreed?: boolean;
+            /** @description Sorted names from this stage's answers; required only for disagreed. */
+            disagreed_questions?: string[];
+            decider?: string;
+            definition_sha256?: string;
+            answered_by?: string;
+        };
         DecisionUsage: {
             /** @description True for estimated usage, including apportioned shared generated-batch costs and embedding-based estimates. Generated cascades divide shared totals evenly, assigning integer remainders in input order; their request aggregate remains measured. */
             estimated?: boolean;
@@ -30809,6 +30820,7 @@ export interface components {
             output_tokens: number;
         };
         DecisionCascadeStageTrace: {
+            upstream_agreement?: components["schemas"]["DecisionCascadeUpstreamAgreement"];
             agreement_status?: components["schemas"]["DecisionCascadeAgreementStatus"];
             /** @description Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable. */
             agreed?: boolean;

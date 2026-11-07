@@ -849,7 +849,7 @@ components:
     DecisionCascadeAgreementStatus:
       type: string
       enum: [agreed, disagreed, unverified]
-      description: A required comparison agreed, disagreed, or could not run because its stage failed with keep_previous. Disagreed and unverified outcomes abstain without discarding model answers or usage.
+      description: A required comparison agreed, disagreed, or could not run because its stage failed with keep_previous or its upstream abstained. Disagreed and unverified outcomes abstain without discarding model answers or usage.
     DecisionCascadeTrace:
       type: object
       additionalProperties: false
@@ -885,11 +885,41 @@ components:
           maxItems: 4
           items:
             $ref: '#/components/schemas/DecisionCascadeStageTrace'
+    DecisionCascadeUpstreamAgreement:
+      type: object
+      additionalProperties: false
+      required: [agreement_status]
+      description: Bounded agreement summary reported by the stage's upstream provider. This preserves upstream abstention without recursively embedding its trace; the upstream definition is not locally verified. A disagreed or unverified upstream stops the input, including at the first or an unguarded stage.
+      properties:
+        agreement_status:
+          $ref: '#/components/schemas/DecisionCascadeAgreementStatus'
+        agreed:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: True for agreed, false for disagreed, absent for unverified.
+        disagreed_questions:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: {type: string, minLength: 1}
+          description: Sorted names from this stage's answers; required only for disagreed.
+        decider:
+          type: string
+          minLength: 1
+        definition_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        answered_by:
+          type: string
+          minLength: 1
     DecisionCascadeStageTrace:
       type: object
       additionalProperties: false
       required: [name, decision_method, escalated]
       properties:
+        upstream_agreement:
+          $ref: '#/components/schemas/DecisionCascadeUpstreamAgreement'
         agreement_status:
           $ref: '#/components/schemas/DecisionCascadeAgreementStatus'
         agreed:
