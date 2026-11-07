@@ -1651,6 +1651,7 @@ pub const Owner = struct {
         replay_attempts: u64 = 0,
         replay_refused: u64 = 0,
         maintenance_errors: u64 = 0,
+        maintenance_page_errors: u64 = 0,
         maintenance_failures: struct {
             capture: u64 = 0,
             source: u64 = 0,
@@ -2571,6 +2572,16 @@ pub const Owner = struct {
 
     fn noteMaintenanceFailure(self: *Owner, err: anyerror, table_id: u64, phase: MaintenanceFailurePhase) void {
         self.publication_stats.maintenance_errors +|= 1;
+        switch (err) {
+            error.UnexpectedNativePageKind, error.InvalidNativePageKind, error.InvalidNativePageMagic, error.InvalidNativePageLength, error.NativePageChecksumMismatch, error.InvalidNativeValueChain, error.InvalidNativePageChain, error.TruncatedNativePage, error.TruncatedNativeValuePage, error.TruncatedNativeFile, error.InvalidPageId => {
+                self.publication_stats.maintenance_page_errors +|= 1;
+                // Later successful work must not hide a failed storage-page
+                // read. This bounded diagnostic remains visible without the
+                // per-operation benchmark tracing switch.
+                std.log.warn("antfly_native_maintenance_page_failure phase={s} error={s}", .{ @tagName(phase), @errorName(err) });
+            },
+            else => {},
+        }
         switch (phase) {
             inline else => |kind| @field(self.publication_stats.maintenance_failures, @tagName(kind)) +|= 1,
         }
@@ -3802,7 +3813,6 @@ pub const Owner = struct {
                 };
             }
         }
-        defer store.primary_reads_require_admission = false;
         const foreground_header = foreground.owned_lite_backend.?.native_docstore.?.file.header;
         const maintenance_entry_header = store.file.header;
         if (run_source) if (database.enrichment_runtime) |runtime| {
@@ -3952,6 +3962,11 @@ pub const Owner = struct {
             // admissions while one artifact job advances outside the gate.
             store.index_reads_require_admission = true;
             defer store.index_reads_require_admission = false;
+            // Control maintenance also uses primary point probes. Its source
+            // epoch is gone, so rebase and pin their current checkpoint before
+            // looking up repair summaries or other control records.
+            store.primary_reads_require_admission = true;
+            defer store.primary_reads_require_admission = false;
             // Revalidate the current catalog and consumer fences while holding
             // path admission through a bounded journal-retirement transaction.
             const retirement_more = if (serving_physical_serviced) serving_retirement_more else blk: {
@@ -8325,6 +8340,8 @@ test "capi native artifact maintenance releases primary history before merging" 
         root: ?*h.Handle = null,
         calls: usize = 0,
         reused: bool = false,
+        peer_sequence: u64 = 0,
+        failure: ?anyerror = null,
         fn capture(ptr: *anyopaque, root: *h.Handle) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.root = root;
@@ -8332,6 +8349,12 @@ test "capi native artifact maintenance releases primary history before merging" 
         }
         fn merge(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.check() catch |err| {
+                self.failure = err;
+                return err;
+            };
+        }
+        fn check(self: *@This()) !void {
             self.calls += 1;
             const root = self.root.?;
             const publication = root.maintenance_publication.?;
@@ -8368,10 +8391,23 @@ test "capi native artifact maintenance releases primary history before merging" 
                 }
                 self.reused = (try peer.allocatorStats()).?.reused_pages > before;
                 try std.testing.expect(self.reused);
+                self.peer_sequence = peer.activeCheckpoint().commit_sequence;
                 try std.testing.expect((try peer.check()).valid);
             }
-            // A catalog read after peer reuse must first rebase under a short
-            // admission, without touching the unretained old catalog pages.
+            // Control reads after the source epoch ends must open on the
+            // freshly admitted primary checkpoint, not an unretained old cut.
+            // Read before the explicit catalog admission below: that admission
+            // must not accidentally hide a missing fence on primary reads.
+            {
+                var primary = try store.beginRead();
+                defer primary.abort();
+                if (primary.checkpoint.commit_sequence < self.peer_sequence) std.debug.print("artifact primary checkpoint observed={d} required_at_least={d}\n", .{ primary.checkpoint.commit_sequence, self.peer_sequence });
+                try std.testing.expect(primary.checkpoint.commit_sequence >= self.peer_sequence);
+                const current = try primary.get("artifact-phase-peer");
+                try std.testing.expectEqual(@as(usize, 8192), current.len);
+                try std.testing.expectEqual(@as(u64, 127), std.mem.readInt(u64, current[0..8], .little));
+            }
+            // Index-catalog access uses the same fresh publication fence.
             try Owner.enterMaintenanceWriter(root, .index_read);
             Owner.leaveMaintenanceWriter(root);
         }
@@ -8385,6 +8421,7 @@ test "capi native artifact maintenance releases primary history before merging" 
         _ = try owner.maintenanceTurn();
         if (probe.calls != 0) break;
     }
+    if (probe.failure) |err| return err;
     try std.testing.expect(probe.calls != 0);
     try std.testing.expect(probe.reused);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.read));
@@ -11676,4 +11713,23 @@ test "capi native foreground text shares the replay segment capacity" {
     }
     try std.testing.expectEqual(@as(u64, 8), owner.current.?.db.core.store.lastReplaySequence(0));
     try std.testing.expect((try owner.current.?.owned_lite_backend.?.native_docstore.?.file.check()).valid);
+}
+
+test "capi native maintenance keeps page failures distinct from cooperative yields" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("maintenance-page-failure-count", 5000, .batch);
+    defer fixture.deinit();
+    var lease = try fixture.connection.acquire();
+    defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    defer lease.close();
+    const owner = fixture.connection.owner;
+    const before = owner.publication_stats.maintenance_page_errors;
+    owner.noteMaintenanceFailure(error.EnrichmentWaitCanceled, 0, .artifacts);
+    try std.testing.expectEqual(before, owner.publication_stats.maintenance_page_errors);
+    owner.noteMaintenanceFailure(error.UnexpectedNativePageKind, 0, .artifacts);
+    try std.testing.expectEqual(before + 1, owner.publication_stats.maintenance_page_errors);
+    owner.noteMaintenanceFailure(error.NativePageChecksumMismatch, 0, .source);
+    owner.noteMaintenanceFailure(error.EnrichmentSourceChanged, 0, .artifacts);
+    try std.testing.expectEqual(before + 2, owner.publication_stats.maintenance_page_errors);
+    try std.testing.expectEqualStrings("EnrichmentSourceChanged", owner.publication_stats.last_maintenance_failure.?);
 }

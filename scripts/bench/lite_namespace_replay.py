@@ -73,6 +73,17 @@ def counters(db):
     return db.pending_work_stats().get("background_publications", {})
 
 
+def maintenance_page_errors(*snapshots):
+    # Keep absolute owner totals: a setup failure or a later cooperative yield
+    # must not disappear because the measured delta is zero or its cause changed.
+    known = [
+        value
+        for snapshot in snapshots
+        if isinstance(value := snapshot.get("maintenance_page_errors"), int)
+    ]
+    return max(known) if known else None
+
+
 def ensure_text_index(db):
     # Native tables can already own the default full-text index. Avoid
     # accidentally benchmarking duplicate indexing of the same source.
@@ -515,13 +526,16 @@ def worker(args):
             counters_before=before,
             counters_after=after,
             counter_deltas=delta(before, after),
+            maintenance_page_errors=maintenance_page_errors(before, after),
             **measured_usage,
         )
         # Save diagnostics even if drain hangs and the parent watchdog fires.
         (case / "measurement.json").write_text(json.dumps(row, indent=2) + "\n")
         if args.measurement_only:
             row.update(
-                status="active_visibility_failed"
+                status="maintenance_page_failure"
+                if (row["maintenance_page_errors"] or 0) > 0
+                else "active_visibility_failed"
                 if (args.active_seconds and not row["active_progress"]["passed"])
                 or (
                     args.resolver_backfill
@@ -599,6 +613,9 @@ def worker(args):
                 raise RuntimeError("search canary missing")
         if not root.check()["valid"]:
             raise RuntimeError("integrity failed")
+        row["maintenance_page_errors"] = maintenance_page_errors(
+            before, after, counters(root)
+        )
         row["verification_seconds"] = time.monotonic() - verify
     with af.open_readonly(path) as root, root.open_table(args.active_table) as db:
         for key, expected in acknowledged.items():
@@ -611,6 +628,8 @@ def worker(args):
         args.resolver_backfill and not row["resolver_backfill_progress"]["passed"]
     ):
         status = "active_visibility_failed"
+    if (row["maintenance_page_errors"] or 0) > 0:
+        status = "maintenance_page_failure"
     row.update(status=status, verified=True, qualification=False)
     (case / "result.json").write_text(json.dumps(row, indent=2) + "\n")
     print(json.dumps(row), flush=True)

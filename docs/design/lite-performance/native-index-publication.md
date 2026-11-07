@@ -119,6 +119,14 @@ invalidate that shortcut. Immutable source/layout caches have explicit entry,
 byte, range and lifetime bounds and exact inode/value identity checks. They do
 not retain a mutable DB actor as though it were immutable.
 
+Artifact control work opens short current primary reads after the replay epoch
+ends. It must join current admission before pinning those checkpoints; registering
+a reader after its old pages were reused cannot retroactively protect that cut.
+Source computation still retains its independently captured immutable epoch.
+Unexpected page failures are counted separately from cooperative yields and remain
+visible without per-operation tracing. Qualification rejects them even if later
+integrity checks succeed.
+
 Physical service has independent deadlines and bounded retirement batches. It
 can reclaim eligible storage while writers remain active, rather than depending
 on a quiet period. Reader frontiers and artifact leases protect exact resources;
@@ -189,7 +197,10 @@ end-to-end throughput. Final optimized qualification must run on the corrected
 candidate before the PR is ready.
 
 The [capacity handoff receipt](replay-capacity-debug.json) records the regressions,
-full Debug gates and diagnostic limits.
+full Debug gates and diagnostic limits. The
+[artifact primary-admission receipt](artifact-primary-admission-debug.json)
+records a reproduced stale checkpoint during repair-summary lookup, the corrected
+phase boundary, thirty repeated setup checks and the updated C API/SDK gates.
 
 Component receipts: [native namespaces](direct-native-namespaces-debug.json),
 [owned publication](owned-native-publication-debug.json),

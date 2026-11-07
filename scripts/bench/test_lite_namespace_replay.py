@@ -51,6 +51,15 @@ class ProgressSamplingTests(unittest.TestCase):
         self.assertEqual(db.calls, 1)
 
 
+class MaintenancePageFailureTests(unittest.TestCase):
+    def test_setup_failure_survives_zero_measurement_delta_and_missing_fields(self):
+        before = {"maintenance_page_errors": 1}
+        after = {"maintenance_page_errors": 1}
+        self.assertEqual(bench.delta(before, after)["maintenance_page_errors"], 0)
+        self.assertEqual(bench.maintenance_page_errors(before, after, {}), 1)
+        self.assertIsNone(bench.maintenance_page_errors({}))
+
+
 class CounterDeltaTests(unittest.TestCase):
     def test_attributes_nested_writer_holds_without_subtracting_maxima(self):
         before = {
