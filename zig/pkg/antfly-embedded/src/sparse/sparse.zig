@@ -3554,7 +3554,11 @@ pub const SparseIndex = struct {
         return key;
     }
     fn reserveCompactionId(self: *SparseIndex) !u64 {
-        var txn = try self.beginBatchTxn(.{});
+        // WS4-for-vectors/§3.2a: background compaction bookkeeping, redone
+        // from `recoverCompactionIntents`'s own durable-intent scan on a
+        // crash -- see `publishSegmentCompactionTask`'s identical note on
+        // its own final publish commit.
+        var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
         errdefer txn.abort();
         const id = self.next_segment_id;
         self.next_segment_id = try std.math.add(u64, id, 1);
@@ -3584,7 +3588,10 @@ pub const SparseIndex = struct {
         read.abort();
         if (!posting_live) {
             while (true) {
-                var txn = try self.beginBatchTxn(.{});
+                // WS4-for-vectors/§3.2a: reclamation -- a freed page is only
+                // reusable at the durable epoch, so this never needs its own
+                // sync (see the design doc's ride-along table).
+                var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
                 errdefer txn.abort();
                 const more = try posting_pages.reclaimDirectoryPage(&txn, id);
                 try txn.commit();
@@ -3594,7 +3601,8 @@ pub const SparseIndex = struct {
         for ([_]u8{ 0x0d, 0x11, key_segment_incarnation, key_docmap_incarnation, 0x13 }) |tag| {
             if (if (tag == key_docmap_incarnation or tag == 0x13) map_live else posting_live) continue;
             while (true) {
-                var txn = try self.beginBatchTxn(.{});
+                // Same reclamation reasoning as above.
+                var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
                 var batch_open = true;
                 defer if (batch_open) txn.abort();
                 var keys: [128][17]u8 = undefined;
@@ -3629,7 +3637,9 @@ pub const SparseIndex = struct {
         if (!map_live) try clearCompactionIntent(self, id);
     }
     fn clearCompactionIntent(self: anytype, id: u64) !void {
-        var txn = try self.beginBatchTxn(.{});
+        // WS4-for-vectors/§3.2a: background intent cleanup, same reasoning
+        // as `reserveCompactionId`'s own intent write.
+        var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
         errdefer txn.abort();
         txn.delete(&pendingKey(id)) catch |err| switch (err) {
             error.NotFound => {},
@@ -3655,7 +3665,11 @@ pub const SparseIndex = struct {
         while (next != null) {
             if (gate) |g| try g.enter(g.ptr);
             defer if (gate) |g| g.leave(g.ptr);
-            var updates = try self.beginBatchTxn(.{});
+            // WS4-for-vectors/§3.2a: catch-up progress for a legacy locator
+            // page -- idempotent and redone from the still-live doc-map
+            // segment on a crash (the `active`/`root` check above returns
+            // early otherwise), so this never needs its own sync.
+            var updates = try self.beginBatchTxn(.{ .durability = .ride_along });
             var updates_open = true;
             defer if (updates_open) updates.abort();
             const active = updates.get(docMapSegmentKey(&root_key, id)) catch |err| switch (err) {
@@ -3727,12 +3741,17 @@ pub const SparseIndex = struct {
             try clearCompactionIntent(self, id);
         }
     }
+    // WS4-for-vectors/§3.2a: every staged write in this function is
+    // background compaction output that is not referenced by anything until
+    // `publishSegmentCompactionTask`'s own ride-along active-set commit
+    // below makes it live, so none of these intermediate commits needs its
+    // own sync either.
     fn stageCompaction(self: anytype, id: u64, result: *SegmentCompactionResult) !void {
         if (result.pages) |run| {
             const view = try run.sealedView();
             var offset: u64 = 0;
             while (offset < view.length) {
-                var txn = try self.beginBatchTxn(.{});
+                var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
                 errdefer txn.abort();
                 var batch_bytes: usize = 0;
                 while (offset < view.length and batch_bytes < 4 * 1024 * 1024) {
@@ -3768,7 +3787,7 @@ pub const SparseIndex = struct {
                     const relative = std.mem.readInt(u64, entries[at + 8 ..][0..8], .little);
                     std.mem.writeInt(u64, entries[at + 8 ..][0..8], try std.math.add(u64, header_len, relative), .little);
                 }
-                var txn = try self.beginBatchTxn(.{});
+                var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
                 errdefer txn.abort();
                 try posting_pages.putDirectoryPage(&txn, id, root, entries[0..len]);
                 try txn.commit();
@@ -3781,7 +3800,7 @@ pub const SparseIndex = struct {
             var previous: ?u64 = null;
             var done = false;
             while (!done) {
-                var txn = try self.beginBatchTxn(.{});
+                var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
                 errdefer txn.abort();
                 var bytes: usize = 0;
                 while (bytes < 4 * 1024 * 1024) {
@@ -3803,7 +3822,7 @@ pub const SparseIndex = struct {
         if (result.proofs) |proofs| {
             var offset: usize = 0;
             while (offset < proofs.count()) {
-                var txn = try self.beginBatchTxn(.{});
+                var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
                 errdefer txn.abort();
                 const end = @min(offset + 1024, proofs.count());
                 for (offset..end) |i| {
@@ -3996,7 +4015,11 @@ pub const SparseIndex = struct {
                 // long-key copy before allocation. No corpus-sized reservation.
                 if (self_.index.resource_manager) |manager|
                     try manager.adjustUsage(.sparse_apply_working_set, &self_.admitted, try std.math.add(u64, self_.admitted, try std.math.add(u64, try std.math.mul(u64, bytes, 2), 128)));
-                if (self_.txn == null) self_.txn = try self_.index.beginBatchTxn(.{});
+                // WS4-for-vectors/§3.2a: lazy legacy-locator backfill -- the
+                // function doc above already establishes this is safe to
+                // lose and redo (the completion proof is written only once
+                // every page backfilled, below).
+                if (self_.txn == null) self_.txn = try self_.index.beginBatchTxn(.{ .durability = .ride_along });
                 _ = try publishDocMapLocator(self_.index.alloc, &self_.txn.?, self_.segment, self_.root, entry);
                 self_.count += 1;
                 self_.bytes += bytes;
@@ -4022,7 +4045,10 @@ pub const SparseIndex = struct {
             next = try cursor.next();
         }
         try backfill.flush();
-        var proof = try self.beginBatchTxn(.{});
+        // Losing this proof on a crash just means the (idempotent) backfill
+        // scan above runs again next time; see the function doc's "partial
+        // metadata is never trusted" note.
+        var proof = try self.beginBatchTxn(.{ .durability = .ride_along });
         errdefer proof.abort();
         try proof.put(metaKey(meta_complete_locators), &.{2});
         try proof.commit();
