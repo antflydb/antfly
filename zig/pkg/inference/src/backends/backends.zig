@@ -460,7 +460,7 @@ pub const SessionManager = struct {
 
             const session = switch (backend) {
                 .metal => if (imported_onnx)
-                    self.createImportedOnnxSession(effective_model_path, .metal, shared_backend_ctx, external_base, logical_path) catch |err| {
+                    self.createImportedOnnxSession(effective_model_path, .metal, shared_backend_ctx, external_base, logical_path, source.external_reader) catch |err| {
                         std.log.err("imported onnx metal session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
@@ -476,7 +476,7 @@ pub const SessionManager = struct {
                 else
                     continue,
                 .cuda => if (imported_onnx)
-                    self.createImportedOnnxSession(effective_model_path, .cuda, shared_backend_ctx, external_base, logical_path) catch |err| {
+                    self.createImportedOnnxSession(effective_model_path, .cuda, shared_backend_ctx, external_base, logical_path, source.external_reader) catch |err| {
                         std.log.err("imported onnx CUDA session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
@@ -491,7 +491,7 @@ pub const SessionManager = struct {
                 else
                     continue,
                 .native => if (imported_onnx)
-                    self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx, external_base, logical_path) catch |err| {
+                    self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx, external_base, logical_path, source.external_reader) catch |err| {
                         if (err == error.OutOfMemory) return err;
                         std.log.err("imported onnx native session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
@@ -505,7 +505,7 @@ pub const SessionManager = struct {
                         continue;
                     },
                 .wasm => if (imported_onnx)
-                    self.createImportedOnnxSession(effective_model_path, .wasm, shared_backend_ctx, external_base, logical_path) catch |err| {
+                    self.createImportedOnnxSession(effective_model_path, .wasm, shared_backend_ctx, external_base, logical_path, source.external_reader) catch |err| {
                         std.log.err("imported onnx wasm session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
@@ -600,9 +600,11 @@ pub const SessionManager = struct {
         shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext,
         external_base_dir: ?[]const u8,
         logical_path: []const u8,
+        external_reader: ?@import("onnx_graph").tensor.ExternalDataReader,
     ) !Session {
         return imported_onnx_session.createSessionWithOptions(self.allocator, model_path, backend, .{
             .external_base_dir = external_base_dir,
+            .external_reader = external_reader,
             .logical_path = logical_path,
             .graph_runtime_strategy = self.graph_runtime_strategy,
             .shared_backend_ctx = shared_backend_ctx,

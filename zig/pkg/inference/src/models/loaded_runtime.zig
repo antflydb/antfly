@@ -430,6 +430,9 @@ pub fn chunkPlanningPaths(manifest: manifest_mod.ModelManifest, out: *[9][]const
     return out[0..count];
 }
 
+/// Content revalidation may observe identical assets in a new directory.
+/// Cold adoption fences the original root separately; resident planning checks
+/// this digest before refreshing its captured file stamps.
 pub fn chunkPlanningSnapshotWithControl(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest, fallback: [32]u8, control: InferenceExecutionControl) !ChunkPlanningSnapshot {
     try control.check();
     var storage: [9][]const u8 = undefined;
@@ -706,6 +709,33 @@ pub const Runtime = struct {
         }
     }
 
+    const PrimaryConstruction = struct {
+        io: std.Io,
+        publication: @import("../registry/publication_lease.zig").Lease,
+        artifacts: PublishedArtifacts,
+        fn deinit(self: *@This()) void {
+            self.artifacts.deinit();
+            self.publication.deinit(self.io);
+        }
+    };
+    /// Final source/root validation belongs to the actual constructed runtime.
+    /// Failure keeps the proof for the single runtime rollback owner.
+    pub fn finishPrimaryConstruction(self: *LoadedModel) !void {
+        if (self.pending_primary) |*proof| {
+            if (self.manifest.source_root) |bound_root| try self.manifest.verifyBoundRoot(proof.io, bound_root);
+            try proof.artifacts.verify();
+            proof.deinit();
+            self.pending_primary = null;
+        }
+    }
+    fn discardPrimaryConstruction(self: *LoadedModel) void {
+        if (self.pending_primary) |*proof| {
+            proof.deinit();
+            self.pending_primary = null;
+        }
+    }
+
+    pending_primary: ?PrimaryConstruction = null,
     managed_publication: ?[32]u8 = null,
     runtime_id: RuntimeId = 0,
     residency_mode: RuntimeResidencyMode = .backend_managed,
@@ -1658,6 +1688,9 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *LoadedModel) void {
+        // Provider/worker teardown precedes release of an unadopted source
+        // fence; a failed final publication cannot strand either owner.
+        defer self.discardPrimaryConstruction();
         std.debug.assert(self.native_reader_stream.context == null and self.native_reader_stream.users == 0);
         if (self.embedding_prototype_cache) |cache| self.allocator.destroy(cache);
         if (self.embedding_prototype_cache_lease) |*lease| lease.release();
@@ -1959,7 +1992,19 @@ pub const PrimaryPreparation = struct {
 
 /// A synchronous model load consumes its own runtime snapshot. Borrowed backend
 /// preference/profile slices never escape into the published model owner.
+/// Direct consumers adopt immediately; manager publication keeps the same
+/// source fence through prewarm and its final cancellation/publication checks.
 pub fn loadPrimary(allocator: std.mem.Allocator, model_dir: []const u8, source_sessions: *const backends.SessionManager, preparation: PrimaryPreparation, control: ?InferenceExecutionControl) !*Runtime {
+    const model = try preparePrimary(allocator, model_dir, source_sessions, preparation, control);
+    errdefer {
+        model.deinit();
+        allocator.destroy(model);
+    }
+    try model.finishPrimaryConstruction();
+    return model;
+}
+
+pub fn preparePrimary(allocator: std.mem.Allocator, model_dir: []const u8, source_sessions: *const backends.SessionManager, preparation: PrimaryPreparation, control: ?InferenceExecutionControl) !*Runtime {
     var session_snapshot = source_sessions.*;
     const sm = &session_snapshot;
 
@@ -1967,7 +2012,8 @@ pub fn loadPrimary(allocator: std.mem.Allocator, model_dir: []const u8, source_s
 
     const io = sm.io orelse std.Options.debug_io;
     var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, io, model_dir);
-    defer publication_lease.deinit(io);
+    var publication_owned = true;
+    defer if (publication_owned) publication_lease.deinit(io);
     const managed_publication = try managed_receipt.publicationGeneration(allocator, io, model_dir);
     // Load manifest
     var man = try manifest_mod.loadFromDir(allocator, model_dir);
@@ -2017,7 +2063,8 @@ pub fn loadPrimary(allocator: std.mem.Allocator, model_dir: []const u8, source_s
         break :native_generation native_kv_identity.fileGeneration(std.Io.Dir.cwd(), sm.io orelse std.Options.debug_io, &files.entries) catch null;
     };
     var tokenizer_artifacts = try PublishedArtifacts.init(allocator, io, model_dir, .{ .publication = managed_publication });
-    defer tokenizer_artifacts.deinit();
+    var artifacts_owned = true;
+    defer if (artifacts_owned) tokenizer_artifacts.deinit();
     tokenizer_artifacts.verification_cache = preparation.host.session_loading.verification_cache;
     const resolution_file_revision = try resolutionModelRevision(allocator, sm.io orelse std.Options.debug_io, man);
     const resolution_revision = try modelIdentityWithArtifacts(allocator, io, model_dir, man, &tokenizer_artifacts);
@@ -2098,7 +2145,6 @@ pub fn loadPrimary(allocator: std.mem.Allocator, model_dir: []const u8, source_s
     else
         null;
     errdefer if (managed_prompt) |*prompt| prompt.deinit();
-    try tokenizer_artifacts.verify();
     const assets = Assets{
         .whisper_prompt = .{ .prepared = managed_prompt },
         .manifest = man,
@@ -2125,7 +2171,11 @@ pub fn loadPrimary(allocator: std.mem.Allocator, model_dir: []const u8, source_s
     sp_tok = null;
     tokenizer_resource_lease = null;
     qualified_profile_bundle = null;
-    return Runtime.fromOwnedAssets(allocator, assets, control);
+    const model = try Runtime.fromOwnedAssets(allocator, assets, control);
+    model.pending_primary = .{ .io = io, .publication = publication_lease, .artifacts = tokenizer_artifacts };
+    publication_owned = false;
+    artifacts_owned = false;
+    return model;
 }
 
 fn writeRuntimeConstructionFixture(directory: std.Io.Dir) !void {
@@ -2207,6 +2257,7 @@ pub const ChunkPlanningAssets = struct {
         return self.sp_tok.?.tokenizer();
     }
     pub fn verify(self: *@This()) !void {
+        if (self.manifest.source_root) |root| try self.manifest.verifyBoundRoot(self.io, root);
         if (self.identity_signature) |expected| {
             const actual = try @import("../models/embedding_gemma2_identity.zig").signature(self.allocator, self.io, self.model_dir, self.manifest.safetensors_path.?);
             if (!std.mem.eql(u8, &actual, &expected)) return error.ModelArtifactsChanging;
@@ -2257,6 +2308,10 @@ pub fn loadPlanningAssets(allocator: std.mem.Allocator, model_dir: []const u8, i
     var artifacts = try PublishedArtifacts.init(allocator, io, model_dir, .{ .publication = man.managed_publication });
     defer artifacts.deinit();
     artifacts.verification_cache = preparation.verification_cache;
+    var proof = session_loader.ComponentConstruction.borrowingUnderLease(io, &artifacts);
+    defer proof.deinit();
+    var bound = try session_loader.BoundModelSource.init(&proof, model_dir, @import("model_source.zig").ModelSource.kindForPath(model_dir), &man, null);
+    defer bound.deinit();
     const revision = try modelIdentityWithArtifacts(allocator, preparation.identity_io orelse return error.MissingIoRuntime, model_dir, man, &artifacts);
     const planning = try chunkPlanningSnapshotWithControl(allocator, io, man, revision, control);
     const kind = try tokenizer_loader.tokenizerKindWithArtifacts(man, &artifacts, tokenizer_loader.tokenizerGemmaCompat(man, model_dir));
@@ -2285,9 +2340,10 @@ pub fn loadPlanningAssets(allocator: std.mem.Allocator, model_dir: []const u8, i
     else
         std.fmt.bytesToHex(revision, .lower);
     if (lease) |*active| try active.retain(plan.resident);
-    try artifacts.verify();
     try control.check();
-    return .{ .model_dir = model_dir, .identity_signature = if (man.embedding_style == .embedding_gemma2) try @import("../models/embedding_gemma2_identity.zig").signature(allocator, io, model_dir, man.safetensors_path.?) else null, .allocator = allocator, .manifest = man, .hf_tok = hf, .sp_tok = sp, .lease = lease, .revision = revision, .identity = identity, .planning = planning, .io = io };
+    const identity_signature = if (man.embedding_style == .embedding_gemma2) try @import("../models/embedding_gemma2_identity.zig").signature(allocator, io, model_dir, man.safetensors_path.?) else null;
+    try bound.finish(&proof);
+    return .{ .model_dir = model_dir, .identity_signature = identity_signature, .allocator = allocator, .manifest = man, .hf_tok = hf, .sp_tok = sp, .lease = lease, .revision = revision, .identity = identity, .planning = planning, .io = io };
 }
 
 test "metadata planning owns tokenizer and identity without constructing the requested backend" {

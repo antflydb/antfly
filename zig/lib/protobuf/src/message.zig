@@ -840,6 +840,8 @@ fn deinitRepeatedLists(comptime T: type, allocator: Allocator, lists: *RepeatedL
     inline for (T._pb_field_map) |fd| {
         const FieldListT = @FieldType(RepeatedLists(T), fd.name);
         if (FieldListT != void) {
+            // Completed children still belong to this accumulator until
+            // finalizeRepeatedLists transfers them to the output message.
             if (fd.encoding == .repeated_submessage) {
                 const Elem = childElem(@FieldType(T, fd.name));
                 for (@field(lists.*, fd.name).items) |*item| deinit(Elem, allocator, item);
@@ -1881,4 +1883,35 @@ fn nestedRepeatedAllocationFailureCase(allocator: Allocator) !void {
 test "nested repeated messages retire every owned child across all allocation failures" {
     try nestedRepeatedAllocationFailureCase(testing.allocator);
     try testing.checkAllAllocationFailures(testing.allocator, nestedRepeatedAllocationFailureCase, .{});
+}
+
+const AllocationChild = struct {
+    values: []i64 = &.{},
+    pub const _pb_field_map = [_]FieldDesc{
+        .{ .field_num = 1, .name = "values", .encoding = .repeated_varint },
+    };
+};
+const AllocationParent = struct {
+    children: []AllocationChild = &.{},
+    later: [][]const u8 = &.{},
+    pub const _pb_field_map = [_]FieldDesc{
+        .{ .field_num = 1, .name = "children", .encoding = .repeated_submessage },
+        .{ .field_num = 2, .name = "later", .encoding = .lazy_repeated_submessage },
+    };
+};
+fn decodeAllocationScenario(a: Allocator, bytes: []const u8) !void {
+    var result = try decode(AllocationParent, a, bytes);
+    defer deinit(AllocationParent, a, &result);
+    try testing.expectEqual(@as(usize, 2), result.children.len);
+    try testing.expectEqualSlices(i64, &.{ 1, 2 }, result.children[0].values);
+}
+
+test "repeated submessage allocation failures free completed accumulator children" {
+    var values = [_]i64{ 1, 2 };
+    var children = [_]AllocationChild{ .{ .values = &values }, .{ .values = &values } };
+    var later = [_][]const u8{"borrowed"};
+    const bytes = try encode(AllocationParent, testing.allocator, &.{ .children = &children, .later = &later });
+    defer testing.allocator.free(bytes);
+    try testing.checkAllAllocationFailures(testing.allocator, decodeAllocationScenario, .{bytes});
+    try testing.expectError(error.EndOfStream, decode(AllocationParent, testing.allocator, bytes[0 .. bytes.len - 1]));
 }

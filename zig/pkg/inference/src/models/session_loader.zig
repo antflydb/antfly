@@ -302,7 +302,7 @@ pub fn loadPreferredWithArtifacts(
         if (managed_admission) {
             const admission_result = if (source.kind == .onnx) graph_plan: {
                 if (onnx_admission_bytes == null) {
-                    var artifacts = backends.imported_onnx_session.inspectArtifactSetWithBase(allocator, source.path, source.external_base_dir) catch |err| {
+                    var artifacts = backends.imported_onnx_session.inspectArtifactSetWithReader(allocator, source.path, source.external_base_dir, source.external_reader) catch |err| {
                         rememberPreferredLoadError(&first_err, err);
                         continue;
                     };
@@ -762,8 +762,10 @@ pub const BoundModelSource = struct {
     kind: ModelSource.Kind,
     logical_path: []const u8,
     external_base_dir: ?[]u8 = null,
+    external_reader: ?@import("onnx_graph").tensor.ExternalDataReader = null,
     owned_manifest: ?manifest_mod.ModelManifest = null,
     borrowed_manifest: ?*const manifest_mod.ModelManifest = null,
+    direct_onnx_manifest: ?manifest_mod.ModelManifest = null,
     directory_manifest: ?BoundDirectoryManifest = null,
     native_manifest: ?BoundDirectoryManifest = null,
     native_adapter_manifest: ?BoundDirectoryManifest = null,
@@ -775,10 +777,32 @@ pub const BoundModelSource = struct {
 
     pub fn init(proof: *ComponentConstruction, requested: []const u8, kind: ModelSource.Kind, manifest: ?*const manifest_mod.ModelManifest, external_base: ?[]const u8) !BoundModelSource {
         const artifacts = proof.artifacts();
-        var result = BoundModelSource{ .allocator = artifacts.allocator, .path = try artifacts.constructionPath(requested), .kind = kind, .logical_path = if (kind == .onnx and manifest != null) manifest.?.onnx_logical_path orelse requested else requested, .borrowed_manifest = manifest };
+        var result = BoundModelSource{ .allocator = artifacts.allocator, .path = try artifacts.constructionPath(requested), .kind = kind, .external_reader = artifacts.onnxReader(), .logical_path = if (kind == .onnx and manifest != null) manifest.?.onnx_logical_path orelse manifest.?.onnx_path orelse requested else requested, .borrowed_manifest = manifest };
         errdefer result.deinit();
         if (kind == .onnx) {
-            result.external_base_dir = try artifacts.constructionPath(external_base orelse std.fs.path.dirname(requested) orelse ".");
+            if (manifest) |selected| {
+                if (selected.source_root) |root| {
+                    try selected.verifyBoundRoot(proof.io, root);
+                    try artifacts.bindDirectoryScope(root);
+                }
+                if (selected.onnx_path) |path| {
+                    const physical = try artifacts.constructionPath(path);
+                    defer result.allocator.free(physical);
+                    if (!std.mem.eql(u8, physical, result.path)) return error.ModelArtifactsChanging;
+                }
+            }
+            // A supplied snapshot selects the graph's dependency namespace as
+            // well as its physical file. Another alias of that file cannot
+            // silently substitute a different set of external tensors.
+            result.external_base_dir = try artifacts.constructionPath(external_base orelse std.fs.path.dirname(result.logical_path) orelse ".");
+            if (manifest) |selected| {
+                if (external_base != null and (selected.onnx_logical_path != null or selected.onnx_path != null)) {
+                    const snapshot_base = try artifacts.constructionPath(std.fs.path.dirname(result.logical_path) orelse ".");
+                    defer result.allocator.free(snapshot_base);
+                    if (!std.mem.eql(u8, snapshot_base, result.external_base_dir.?)) return error.ModelArtifactsChanging;
+                }
+                result.direct_onnx_manifest = manifestForGraph(selected.*, result.path, result.logical_path);
+            }
         } else {
             if (kind == .directory) {
                 result.borrowed_manifest = null;
@@ -799,7 +823,7 @@ pub const BoundModelSource = struct {
         return result;
     }
     pub fn view(self: *const BoundModelSource) ModelSource {
-        return .{ .path = self.path, .kind = self.kind, .logical_path = self.logical_path, .external_base_dir = self.external_base_dir, .manifest = if (self.directory_manifest) |*directory| &directory.manifest else self.borrowed_manifest orelse if (self.owned_manifest) |*manifest| manifest else null };
+        return .{ .path = self.path, .kind = self.kind, .logical_path = self.logical_path, .external_base_dir = self.external_base_dir, .external_reader = self.external_reader, .manifest = if (self.direct_onnx_manifest) |*graph| graph else if (self.directory_manifest) |*directory| &directory.manifest else self.borrowed_manifest orelse if (self.owned_manifest) |*manifest| manifest else null };
     }
     /// Resolve the backend's actual source once and reuse it for proof,
     /// preflight, admission, and construction, including subsequent retries.
@@ -824,21 +848,11 @@ pub const BoundModelSource = struct {
                     errdefer self.allocator.free(path);
                     const logical = man.onnx_logical_path orelse selected;
                     const base = try proof.artifacts().constructionPath(std.fs.path.dirname(logical) orelse ".");
-                    var graph_manifest = man.*;
-                    graph_manifest.onnx_path = path;
-                    graph_manifest.gguf_path = null;
-                    graph_manifest.safetensors_path = null;
-                    graph_manifest.safetensors_index_path = null;
-                    graph_manifest.gguf_projector_path = null;
-                    graph_manifest.gliner_head_gguf_path = null;
-                    graph_manifest.gliner_head_safetensors_path = null;
-                    graph_manifest.jina_adapter_config_path = null;
-                    graph_manifest.jina_adapter_weights_path = null;
-                    graph_manifest.jina_adapter_selection_captured = true;
+                    const graph_manifest = manifestForGraph(man.*, path, logical);
                     self.onnx_binding = .{ .path = path, .external_base_dir = base, .manifest = graph_manifest };
                 }
                 const graph = &self.onnx_binding.?;
-                return .{ .path = graph.path, .kind = .onnx, .manifest = &graph.manifest, .logical_path = man.onnx_logical_path orelse selected, .external_base_dir = graph.external_base_dir };
+                return .{ .path = graph.path, .kind = .onnx, .manifest = &graph.manifest, .logical_path = man.onnx_logical_path orelse selected, .external_base_dir = graph.external_base_dir, .external_reader = self.external_reader };
             }
             if (backend == .wasm) return null;
             return self.view();
@@ -847,6 +861,22 @@ pub const BoundModelSource = struct {
         var source = self.view();
         source.manifest = try self.nativeManifestForBackend(proof, backend);
         return source;
+    }
+
+    fn manifestForGraph(man: manifest_mod.ModelManifest, path: []const u8, logical: []const u8) manifest_mod.ModelManifest {
+        var graph = man;
+        graph.onnx_path = path;
+        graph.onnx_logical_path = logical;
+        graph.gguf_path = null;
+        graph.safetensors_path = null;
+        graph.safetensors_index_path = null;
+        graph.gguf_projector_path = null;
+        graph.gliner_head_gguf_path = null;
+        graph.gliner_head_safetensors_path = null;
+        graph.jina_adapter_config_path = null;
+        graph.jina_adapter_weights_path = null;
+        graph.jina_adapter_selection_captured = true;
+        return graph;
     }
 
     pub fn nativeManifestForBackend(self: *BoundModelSource, proof: *ComponentConstruction, backend: backends.BackendType) !*const manifest_mod.ModelManifest {

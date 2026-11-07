@@ -127,6 +127,7 @@ pub fn mappedSliceOffset(full: []const u8, slice: []const u8) ?usize {
 pub const MmapRegion = struct {
     data: []align(std.heap.page_size_min) u8,
     fd: std.posix.fd_t,
+    owns_fd: bool = true,
     /// Whether deinit should evict clean pages from the kernel page cache.
     /// Model stores default to the historical memory-conservative behavior;
     /// CUDA full-residency admission can explicitly retain the cache so a
@@ -156,6 +157,17 @@ pub const MmapRegion = struct {
 
         const mapped = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
         return .{ .data = mapped, .fd = fd };
+    }
+
+    /// Map an acquisition-owned descriptor without reopening a pathname.
+    /// The caller retains the file until the borrowed mapping is unmapped.
+    pub fn initFromFile(file: std.Io.File, max_bytes: usize) !MmapRegion {
+        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
+        const size = try fileSizeFromFd(file.handle);
+        if (size == 0) return error.EmptyFile;
+        if (size > max_bytes) return error.FileTooLarge;
+        const mapped = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
+        return .{ .data = mapped, .fd = file.handle, .owns_fd = false, .discard_on_deinit = false };
     }
 
     /// Hint sequential access for the first `len` bytes (the header region).
@@ -246,7 +258,7 @@ pub const MmapRegion = struct {
                 c.POSIX_FADV_DONTNEED,
             );
         }
-        closeFd(fd);
+        if (self.owns_fd) closeFd(fd);
         self.* = undefined;
     }
 };
@@ -924,4 +936,20 @@ pub fn writeF32LeFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8
         std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @bitCast(value), .little);
     }
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+}
+
+test "retained ONNX borrowed graph mappings leave acquisition handles open" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "graph", .data = "graph bytes" });
+    const file = try tmp.dir.openFile(io, "graph", .{});
+    defer file.close(io);
+    var mapping = try MmapRegion.initFromFile(file, 1024);
+    try std.testing.expectEqualStrings("graph bytes", mapping.data);
+    mapping.deinit();
+    var bytes: [11]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, bytes.len), try file.readPositionalAll(io, &bytes, 0));
+    try std.testing.expectEqualStrings("graph bytes", &bytes);
+    try std.testing.expectError(error.FileTooLarge, MmapRegion.initFromFile(file, 3));
 }

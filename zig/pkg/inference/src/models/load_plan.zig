@@ -209,10 +209,11 @@ pub const ComponentArtifactEstimate = union(enum) {
 
     pub fn init(allocator: std.mem.Allocator, source: ModelSource) !ComponentArtifactEstimate {
         if (source.kind == .onnx) {
-            var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithBase(
+            var artifacts = try backends.imported_onnx_session.inspectArtifactSetWithReader(
                 allocator,
                 source.path,
                 source.external_base_dir,
+                source.external_reader,
             );
             defer artifacts.deinit();
             return .{ .onnx = artifacts.encoded_bytes };

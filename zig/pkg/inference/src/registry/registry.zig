@@ -148,6 +148,8 @@ test "friendly alias refs parse as public model refs" {
             try std.testing.expectEqualStrings("safetensors", selection.variant);
             try std.testing.expect(selection.revision != null);
             try std.testing.expect(immutableHubRevision(selection.revision.?));
+            const expected_revision = if (std.mem.eql(u8, entry.alias, "lightonocr3-0.8b")) lightonocr3.revision else if (std.mem.eql(u8, entry.alias, "lightonocr3-4b")) lightonocr3.revision_4b else return error.UnexpectedLightOnAlias;
+            try std.testing.expectEqualStrings(expected_revision, selection.revision.?);
         } else {
             try std.testing.expectEqualStrings("gguf", ref.variant);
         }
