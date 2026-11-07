@@ -3121,34 +3121,36 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     deletes: []const []const u8,
                     replay: ?docstore_mod.DocStore.ReplayAppend,
                     options: backend_types.BatchOptions,
+                    prepared_values: ?*const @import("../document_mutation_revision.zig").PreparedValues,
                     authored: ?@import("../commit_participant.zig").Participant,
                     fn commit(raw: *anyopaque, participant: @import("../native_publication.zig").Participant) !void {
                         const primary: *@This() = @ptrCast(@alignCast(raw));
-                        try primary.store.putBatchWithPublications(primary.io, primary.writes, primary.deletes, primary.replay, primary.options, primary.authored, participant);
+                        try primary.store.putBatchWithPreparedPublications(primary.io, primary.writes, primary.deletes, primary.replay, primary.options, primary.authored, participant, primary.prepared_values);
                     }
                 };
-                var primary_options = store_batch_options;
-                if (prepared_documents_current) primary_options.prepared_document_values = &opts.prepared_documents.?.value_authorities;
                 var foreground_primary: ForegroundPrimary = .{
                     .store = S.ownerField(self, "core").*.store,
                     .io = S.ownerField(self, "backend_runtime").*.io(),
                     .writes = write_buffers.store_writes.items,
                     .deletes = write_buffers.delete_keys.items,
                     .replay = replay_append,
-                    .options = primary_options,
+                    .options = store_batch_options,
+                    .prepared_values = if (prepared_documents_current) &opts.prepared_documents.?.value_authorities else null,
                     .authored = if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
                 };
                 const foreground_committed = if (prepared_documents_current and append_derived_replay)
                     try opts.prepared_documents.?.commitForegroundText(S.ownerField(self, "core").*.index_manager, sequence, effective_req, S.ownerField(self, "core").*.store, write_buffers.identity_writes.items, .{ .ptr = &foreground_primary, .commit_fn = ForegroundPrimary.commit })
                 else
                     false;
-                if (!foreground_committed) try S.ownerField(self, "core").*.store.putBatchWithReplayAndParticipant(
+                if (!foreground_committed) try S.ownerField(self, "core").*.store.putBatchWithPreparedPublications(
                     foreground_primary.io,
                     foreground_primary.writes,
                     foreground_primary.deletes,
                     foreground_primary.replay,
                     foreground_primary.options,
                     foreground_primary.authored,
+                    null,
+                    foreground_primary.prepared_values,
                 );
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };

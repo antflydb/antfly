@@ -6,7 +6,8 @@
     "A request-local contention budget spans catalog captures and every detached artifact staging turn; active computation and IO remain outside that waiting budget.",
     "Owned document plans prebuild exact stored postimages, including direct vector-field stripping, SHA256 content proofs and projection/source certificates before writer admission.",
     "Synchronous DocStore batches borrow prebuilt authorities only for matching physical document identity, kind and exact bytes; mismatches retain authoritative computation.",
-    "Borrowed proofs remain request-owned through commit/abort, preserving actual per-transaction mutation revision assignment."
+    "Borrowed proofs remain request-owned through commit/abort, preserving actual per-transaction mutation revision assignment.",
+    "Prepared content proofs enter DocStore through a direct synchronous typed capability; request-owned pointers never cross the erased storage backend ABI."
   ],
   "validation": [
     {
@@ -25,8 +26,8 @@
       ]
     },
     {
-      "report": "owned-content-batch2.json",
-      "log": "owned-content-batch2.log",
+      "report": "owned-content-batch3.json",
+      "log": "owned-content-batch3.log",
       "passed": 12,
       "skipped": 0,
       "failed": 0,

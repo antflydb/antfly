@@ -2115,7 +2115,6 @@ pub const DocStore = struct {
             .columnar_owner = self,
             .runtime = try self.runtime_store.beginBatchWithOptions(options),
             .unordered_bulk_append_puts = options.mode == .bulk_ingest and self.runtime_store.capabilities().unordered_bulk_append_puts,
-            .document_revisions = .{ .prepared_values = options.prepared_document_values },
         };
     }
 
@@ -2378,7 +2377,7 @@ pub const DocStore = struct {
         replay: ?ReplayAppend,
         options: backend_types.BatchOptions,
     ) !void {
-        return self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, null, null);
+        return self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, null, null, null);
     }
 
     fn putBatchWithReplayOnceAndParticipant(
@@ -2389,6 +2388,7 @@ pub const DocStore = struct {
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
         native_participant: ?@import("native_publication.zig").Participant,
+        prepared_values: ?*const @import("document_mutation_revision.zig").PreparedValues,
     ) !void {
         const has_owner_job = blk: {
             for (writes) |write| if (internal_keys.isGraphOwnerReplayJobKey(write.key)) break :blk true;
@@ -2400,6 +2400,7 @@ pub const DocStore = struct {
         // so bulk ingestion never needs a foreground whole-store backfill.
         var batch = try self.beginWriteBatchWithOptions(options);
         errdefer batch.abort();
+        batch.document_revisions.prepared_values = prepared_values;
         if (participant) |observer| try batch.setCommitParticipant(observer);
         if (native_participant) |observer| try batch.setNativePublication(observer);
         var txn = batch.asTxn();
@@ -2474,9 +2475,25 @@ pub const DocStore = struct {
         participant: ?@import("commit_participant.zig").Participant,
         native_participant: ?@import("native_publication.zig").Participant,
     ) !void {
+        return self.putBatchWithPreparedPublications(io, writes, deletes, replay, options, participant, native_participant, null);
+    }
+
+    /// The caller owns immutable content proofs until this synchronous call
+    /// returns. These never cross an erased backend/engine ABI boundary.
+    pub fn putBatchWithPreparedPublications(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        native_participant: ?@import("native_publication.zig").Participant,
+        prepared_values: ?*const @import("document_mutation_revision.zig").PreparedValues,
+    ) !void {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
-            self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, participant, native_participant) catch |err| switch (err) {
+            self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, participant, native_participant, prepared_values) catch |err| switch (err) {
                 error.WriterLocked => {
                     if (attempt >= writer_locked_retry_count) return err;
                     backoffWriterLockRetry(io);
