@@ -114,6 +114,9 @@ pub const ScopedUploadVisitor = struct {
     continuation: ?[]const u8 = null,
     /// Remove deterministic local staging files while visiting fenced records.
     cleanup_staging: bool = false,
+    /// Reclaim an empty local attempt and its advisory journal after the
+    /// complete fenced attempt has been visited. Remote providers ignore this.
+    reclaim_retired_inventory: bool = false,
     checkpoint: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     after_suffix: ?[]const u8 = null,
     fencing_floor: u64 = 0,

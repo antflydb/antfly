@@ -6694,6 +6694,7 @@ pub const ApiHttpServer = struct {
             .work = if (options) |v| v.max_marked else config.lake_indexes.artifact_gc.max_marked,
             .deadline_ns = @min(request.deadline_ns orelse std.math.maxInt(u64), platform_time.monotonicNs() +| 5 * std.time.ns_per_s),
             .cancellation = request.cancellation,
+            .sweep_interval_ms = config.lake_indexes.artifact_gc.interval_ms,
         };
     }
     fn collectExpiredLakeQueryArtifacts(self: *ApiHttpServer, a: std.mem.Allocator, store: *@import("lake_index_store.zig").Store, table: u64, now: u64, request: api_operation.RequestContext) !void {
@@ -6790,6 +6791,7 @@ pub const ApiHttpServer = struct {
                     try authority.apply(item.table_id, .{ .retain_query_store = .{ .binding = binding, .until_ms = binding.query_until_ms } });
                 }
             }
+            budget.retire_after_ms = if (now > binding.query_until_ms) binding.query_until_ms else 0;
             const page_result: @import("lake_query_gc.zig").Result = if (binding.query_until_ms == 0)
                 .{}
             else if (binding.query_gc_phase == 5 and item.state.namespace != null)
@@ -6798,7 +6800,12 @@ pub const ApiHttpServer = struct {
                 @import("lake_query_gc.zig").collect(a, &store, item.table_id, binding.query_gc_phase % 5, now, &budget);
             self.observeLakeQueryCollection(page_result);
             if (binding.query_until_ms != 0) {
-                const release = now > binding.query_until_ms and !page_result.more and !page_result.retained and !page_result.failed;
+                var release = now > binding.query_until_ms and !page_result.more and !page_result.retained and !page_result.failed;
+                if (release) @import("lake_query_gc.zig").retireCompleted(a, &store, item.table_id, &budget) catch |err| {
+                    release = false;
+                    if (err != error.QueryGcBudgetExhausted and err != error.DeadlineExceeded and err != error.Canceled and err != error.Cancelled)
+                        std.log.warn("query cleanup checkpoint retirement deferred table_id={d} err={s}", .{ item.table_id, @errorName(err) });
+                };
                 if (release or page_result.more or page_result.failed or binding.query_gc_receipt == null) {
                     var receipt: [16]u8 = undefined;
                     try self.embedding_provider_runtime.io.randomSecure(&receipt);

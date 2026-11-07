@@ -33,6 +33,13 @@ pub const Budget = struct {
     work: usize,
     deadline_ns: u64,
     cancellation: Cancellation = .none,
+    sweep_interval_ms: u64 = 30_000,
+    // Once the durable writer horizon has passed, absent empty categories
+    // must stay absent so bounded checkpoint retirement can finish.
+    retire_after_ms: u64 = 0,
+    fn retiring(self: *const Budget) bool {
+        return self.retire_after_ms != 0;
+    }
     pub fn check(self: *const Budget) !void {
         try self.cancellation.check();
         if (clock.monotonicNs() >= self.deadline_ns) return error.DeadlineExceeded;
@@ -87,15 +94,10 @@ pub fn collect(a: A, store: *Store, table: u64, phase: u8, now: u64, budget: *Bu
     for (0..5) |offset| {
         const category = (@as(usize, phase) + offset) % 5;
         const page = (switch (category) {
-            0 => collectScopes(a, store, table, @import("lake_sql_retained_cut.zig").domain(table, @import("native_retained_cut.zig").storeIdentity(a, store.locator) catch {
+            0...2 => collectScopes(a, store, table, scopeDomain(a, store, table, category) catch {
                 result.failed = true;
                 continue;
-            }), now, budget),
-            1 => collectScopes(a, store, table, @import("lake_retained_cut.zig").domain(table, if (table == 0) @import("native_retained_cut.zig").storeIdentity(a, store.locator) catch {
-                result.failed = true;
-                continue;
-            } else store.identity), now, budget),
-            2 => collectScopes(a, store, table, @import("lake_recent_vectors.zig").scopeDomain(table, store.identity), now, budget),
+            }, now, budget),
             3 => collectRecords(a, store, table, "recent-search", now, budget),
             4 => collectRecords(a, store, table, "row-enrichment", now, budget),
             else => unreachable,
@@ -114,11 +116,53 @@ pub fn collect(a: A, store: *Store, table: u64, phase: u8, now: u64, budget: *Bu
     }
     return result;
 }
+fn scopeDomain(a: A, store: *Store, table: u64, category: usize) ![32]u8 {
+    return switch (category) {
+        0 => @import("lake_sql_retained_cut.zig").domain(table, try @import("native_retained_cut.zig").storeIdentity(a, store.locator)),
+        1 => @import("lake_retained_cut.zig").domain(table, if (table == 0) try @import("native_retained_cut.zig").storeIdentity(a, store.locator) else store.identity),
+        2 => @import("lake_recent_vectors.zig").scopeDomain(table, store.identity),
+        else => unreachable,
+    };
+}
+
+/// Remove only completed, unretained checkpoints before consuming the store's
+/// durable ownership witness. A short budget resumes this idempotent cleanup
+/// next turn; a concurrently advanced checkpoint retains ownership instead.
+pub fn retireCompleted(a: A, store: *Store, table: u64, budget: *Budget) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var client = store.opened.client;
+    for (0..5) |category| {
+        const name = if (category < 3)
+            try std.fmt.allocPrint(scratch, "scope-{s}", .{std.fmt.bytesToHex(&(try scopeDomain(scratch, store, table, category)), .lower)})
+        else if (category == 3) "recent-search" else "row-enrichment";
+        const key = try std.fmt.allocPrint(scratch, "{s}{s}expiring-gc/{d}/{s}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", table, name });
+        var previous = readObject(client, store.opened.bucket, key, 16384, budget) catch |err| switch (err) {
+            error.FileNotFound, error.NotFound, error.ObjectNotFound => continue,
+            else => return err,
+        };
+        defer previous.deinit(client.allocator);
+        const Completion = struct { retained: bool, resume_after_ms: ?u64 = null, completed_at_ms: ?u64 = null };
+        const progress = std.json.parseFromSliceLeaky(Completion, scratch, previous.body, .{ .ignore_unknown_fields = true }) catch return error.QueryGcRetainedProgress;
+        if (progress.retained or progress.resume_after_ms == null or (progress.completed_at_ms orelse 0) < budget.retire_after_ms) return error.QueryGcRetainedProgress;
+        try budget.visit();
+        try budget.remove();
+        client.compareAndDelete(store.opened.bucket, key, previous.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = .{ .ptr = budget, .is_cancelled_fn = Budget.canceled } }) catch |err| switch (err) {
+            error.FileNotFound, error.NotFound, error.ObjectNotFound => {},
+            error.PreconditionFailed => return error.QueryGcRetainedProgress,
+            else => return err,
+        };
+    }
+}
+
 const ScopeProgress = struct {
     version: u16 = 1,
     after_suffix: ?[]const u8 = null,
     continuation: ?[]const u8 = null,
     retained: bool = false,
+    resume_after_ms: ?u64 = null,
+    completed_at_ms: ?u64 = null,
 };
 const ScopePage = struct { result: Result, progress: ScopeProgress };
 
@@ -164,6 +208,8 @@ fn scanScopes(a: A, target: *artifacts.ArtifactStore, domain: [32]u8, previous: 
         .ptr = &visitor,
         .visit = Visitor.visit,
         .checkpoint = Visitor.checkpoint,
+        .cleanup_staging = true,
+        .reclaim_retired_inventory = true,
         .continuation = previous.continuation,
         .after_suffix = previous.after_suffix,
         .fencing_cutoff = now -| 30_000,
@@ -193,22 +239,24 @@ fn collectScopes(a: A, store: *Store, table: u64, domain: [32]u8, now: u64, budg
         else => return err,
     };
     defer if (previous) |*value| value.deinit(client.allocator);
-    var progress: ScopeProgress = if (previous) |value| std.json.parseFromSliceLeaky(ScopeProgress, scratch, value.body, .{}) catch .{} else .{};
+    var progress: ScopeProgress = if (previous) |value| std.json.parseFromSliceLeaky(ScopeProgress, scratch, value.body, .{ .ignore_unknown_fields = true }) catch .{} else .{};
     if (progress.version != 1 or (if (progress.after_suffix) |suffix| suffix.len != 97 else false)) progress = .{};
+    if (progress.resume_after_ms) |retry_after| {
+        if (retry_after > now and retry_after <= now +| budget.sweep_interval_ms and (!budget.retiring() or (progress.completed_at_ms orelse 0) >= budget.retire_after_ms)) return .{ .retained = progress.retained };
+        progress = .{};
+    }
     var target = store.artifactStore();
     var page = try scanScopes(scratch, &target, domain, progress, now, budget);
     budget.deadline_ns = deadline;
     if (!page.result.more) {
-        // A finished sweep starts at the beginning next time. The writer's
-        // durable horizon protects future-expiry objects; no live-prefix
-        // probe or corpus-wide listing is needed to release ownership safely.
-        if (previous) |value| client.compareAndDelete(store.opened.bucket, key, value.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = .{ .ptr = budget, .is_cancelled_fn = Budget.canceled } }) catch |err| switch (err) {
-            error.FileNotFound, error.NotFound, error.ObjectNotFound => {},
-            error.PreconditionFailed => page.result.more = true,
-            else => return err,
-        };
-    } else if (page.result.progressed) {
-        const bytes = try std.json.Stringify.valueAlloc(scratch, page.progress, .{});
+        // A completed category rests while other categories drain. Persist
+        // retained evidence too, so another process cannot consume ownership
+        // while this category is waiting for its next ordinary sweep.
+        page.progress = .{ .retained = page.result.retained, .resume_after_ms = now +| budget.sweep_interval_ms, .completed_at_ms = now };
+    }
+    if (budget.retiring() and previous == null and !page.result.more and !page.result.progressed and !page.result.retained) return page.result;
+    if (!page.result.more or page.result.progressed) {
+        const bytes = try std.json.Stringify.valueAlloc(scratch, page.progress, .{ .emit_null_optional_fields = false });
         if (bytes.len > 16384) return error.InvalidArtifactEnumerationContinuation;
         var written = client.compareAndPut(store.opened.bucket, key, bytes, if (previous) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = .{ .ptr = budget, .is_cancelled_fn = Budget.canceled } }) catch |err| switch (err) {
             error.PreconditionFailed, error.ObjectAlreadyExists => return .{ .more = true, .retained = true },
@@ -218,7 +266,7 @@ fn collectScopes(a: A, store: *Store, table: u64, domain: [32]u8, now: u64, budg
     }
     return page.result;
 }
-const Progress = struct { version: u16 = 2, cursor: ?[]const u8 = null, after_key: ?[]const u8 = null, retained: bool = false };
+const Progress = struct { version: u16 = 2, cursor: ?[]const u8 = null, after_key: ?[]const u8 = null, retained: bool = false, resume_after_ms: ?u64 = null, completed_at_ms: ?u64 = null };
 fn readObject(source: anytype, bucket: []const u8, key: []const u8, limit: usize, budget: *Budget) !@import("objectstore").GetResult {
     var client = source;
     try budget.check();
@@ -257,8 +305,12 @@ pub fn collectRecords(a: A, store: *Store, table: u64, kind: []const u8, now: u6
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    var progress: Progress = if (previous) |v| std.json.parseFromSliceLeaky(Progress, scratch, v.body, .{}) catch .{} else .{};
+    var progress: Progress = if (previous) |v| std.json.parseFromSliceLeaky(Progress, scratch, v.body, .{ .ignore_unknown_fields = true }) catch .{} else .{};
     if (progress.version != 2 or (progress.cursor != null and progress.after_key != null) or (if (progress.after_key) |key| !std.mem.startsWith(u8, key, prefix) or key.len > 4096 else false)) progress = .{};
+    if (progress.resume_after_ms) |retry_after| {
+        if (retry_after > now and retry_after <= now +| budget.sweep_interval_ms and (!budget.retiring() or (progress.completed_at_ms orelse 0) >= budget.retire_after_ms)) return .{ .retained = progress.retained };
+        progress = .{};
+    }
     var page = try client.listObjects(store.opened.bucket, .{ .prefix = prefix, .max_keys = 128, .continuation_token = progress.cursor, .start_after = progress.after_key, .cancellation = .{ .ptr = budget, .is_cancelled_fn = Budget.canceled } });
     defer page.deinit(client.allocator);
     var result: Result = .{ .retained = progress.retained };
@@ -287,9 +339,9 @@ pub fn collectRecords(a: A, store: *Store, table: u64, kind: []const u8, now: u6
     budget.deadline_ns = deadline;
     result.progressed = processed != 0;
     result.more = processed != page.entries.len or page.next_continuation_token != null;
-    const saved: Progress = .{ .cursor = if (processed == page.entries.len) page.next_continuation_token else null, .after_key = if (processed == page.entries.len) null else last, .retained = if (result.more) result.retained else false };
-    if (previous == null and page.entries.len == 0) return result;
-    const bytes = try std.json.Stringify.valueAlloc(a, saved, .{});
+    const saved: Progress = .{ .cursor = if (processed == page.entries.len) page.next_continuation_token else null, .after_key = if (processed == page.entries.len) null else last, .retained = result.retained, .resume_after_ms = if (result.more) null else now +| budget.sweep_interval_ms, .completed_at_ms = if (result.more) null else now };
+    if (budget.retiring() and previous == null and page.entries.len == 0) return result;
+    const bytes = try std.json.Stringify.valueAlloc(a, saved, .{ .emit_null_optional_fields = false });
     defer a.free(bytes);
     if (previous) |v| if (std.mem.eql(u8, bytes, v.body)) return result;
     // This bounded progress write is part of the same deadline. A failed CAS
@@ -430,22 +482,44 @@ test "external lake query cleanup resumes past protected objects after restart w
     for (fake.removed) |removed| try std.testing.expect(removed);
 }
 
-test "external lake query cleanup persists filesystem journal cursors across reopened stores" {
+test "external lake query cleanup persists journals and reclaims interrupted fenced attempts" {
     const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
     var directory = try local.common_test_directory.TestDirectory.init("query-gc-journal-restart");
     defer directory.cleanup();
     var config = try local.common_config.Config.parseFromSlice(a, "{}");
     defer config.deinit();
     const domain: [32]u8 = @splat(7);
+    var expired_paths: [2][]const u8 = undefined;
+    var inventory_paths: [2][]const u8 = undefined;
+    var active_paths: [2][]const u8 = undefined;
     {
         var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
         defer store.deinit();
         var target = store.artifactStore();
-        const scope = try artifacts.UploadScope.forPublication(domain, 1, std.testing.io);
-        for (0..20) |i| {
-            var text: [16]u8 = undefined;
-            var value = try target.putScoped(scope, try std.fmt.bufPrint(&text, "{d}", .{i}), .none);
-            value.deinit(a);
+        for ([_]u64{ 1, 2, 200000 }, 0..) |expiry, group| {
+            const scope = try artifacts.UploadScope.forPublication(domain, expiry, std.testing.io);
+            const inventory = &store.implementation.local_inventory.?;
+            const payload_dir = try std.fs.path.join(scratch, &.{ inventory.root_dir, "graph", &std.fmt.bytesToHex(&domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
+            if (group < 2) {
+                expired_paths[group] = payload_dir;
+                inventory_paths[group] = try std.fs.path.join(scratch, &.{ inventory.inventory_root, &std.fmt.bytesToHex(&domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
+            }
+            for (0..if (group == 0) @as(usize, 20) else 1) |i| {
+                var text: [16]u8 = undefined;
+                var value = try target.putScoped(scope, try std.fmt.bufPrint(&text, "{d}", .{i}), .none);
+                defer value.deinit(a);
+                if (i == 0) {
+                    const suffix = try artifacts.storageSuffixAlloc(scratch, value.artifact_id);
+                    const payload = try std.fs.path.join(scratch, &.{ inventory.root_dir, suffix });
+                    const pending = try std.fmt.allocPrint(scratch, "{s}.pending-v2", .{payload});
+                    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = pending, .data = "interrupted upload" });
+                    if (group == 1) try target.delete(value.artifact_id);
+                    if (group == 2) active_paths = .{ payload, pending };
+                }
+            }
         }
     }
     var journal_reads: u64 = 0;
@@ -463,5 +537,118 @@ test "external lake query cleanup persists filesystem journal cursors across reo
         }
     }
     try std.testing.expect(complete);
-    try std.testing.expect(journal_reads >= 20 and journal_reads <= 21);
+    try std.testing.expectEqual(@as(u64, 21), journal_reads);
+    for (expired_paths) |path| try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
+    for (inventory_paths) |path| try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
+    for (active_paths) |path| try std.Io.Dir.cwd().access(std.testing.io, path, .{});
+    // Both a fast continuation and a fresh ordinary sweep after restart must
+    // avoid reading historical journals, while future uploads remain intact.
+    for ([_]u64{ 100001, 130001 }) |now| {
+        var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+        defer store.deinit();
+        var budget: Budget = .{ .deletes = 128, .reads = 4096, .work = 128, .deadline_ns = clock.monotonicNs() + std.time.ns_per_s };
+        const result = try collectScopes(a, &store, 7, domain, now, &budget);
+        try std.testing.expect(!result.more and !result.retained and !result.failed);
+        try std.testing.expectEqual(@as(usize, 0), store.implementation.local_inventory.?.journal_records_read.load(.monotonic));
+        for (active_paths) |path| try std.Io.Dir.cwd().access(std.testing.io, path, .{});
+    }
+}
+
+test "external lake query cleanup completed categories rest durably while neighbors drain" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("query-gc-category-rounds");
+    defer directory.cleanup();
+    var config = try local.common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    {
+        var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+        defer store.deinit();
+        var client = store.opened.client;
+        for ([_][]const u8{ "recent-search", "row-enrichment" }, [_]usize{ 17, 33 }) |kind, count| {
+            for (0..count) |i| {
+                const key = try std.fmt.allocPrint(a, "{s}{s}{s}/7/{d:0>4}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", kind, i });
+                defer a.free(key);
+                var saved = try client.putObject(store.opened.bucket, key, "{\"expires_ms\":200000}", .{});
+                saved.deinit(client.allocator);
+            }
+        }
+    }
+    var inspected: usize = 0;
+    for (0..3) |turn| {
+        var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+        defer store.deinit();
+        var budget: Budget = .{ .deletes = 4096, .reads = 1024 * 1024, .work = 4096, .deadline_ns = clock.monotonicNs() + std.time.ns_per_s, .sweep_interval_ms = 1234 };
+        const result = collect(a, &store, 7, 0, 100000, &budget);
+        inspected += 4096 - budget.work;
+        try std.testing.expectEqual(turn != 2, result.more);
+        try std.testing.expect(result.progressed and result.retained and !result.failed);
+    }
+    try std.testing.expectEqual(@as(usize, 50), inspected);
+    // Rest survives process reconstruction and honors the configured interval.
+    for ([_]u64{ 100001, 101233 }) |now| {
+        var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+        defer store.deinit();
+        var budget: Budget = .{ .deletes = 4096, .reads = 1024 * 1024, .work = 4096, .deadline_ns = clock.monotonicNs() + std.time.ns_per_s, .sweep_interval_ms = 1234 };
+        const result = collect(a, &store, 7, 0, now, &budget);
+        try std.testing.expect(!result.more and !result.progressed and result.retained and !result.failed);
+        try std.testing.expectEqual(@as(usize, 4096), budget.work);
+    }
+    // A later sweep must retry held records and reclaim them once expired.
+    var deleted: usize = 0;
+    for (0..3) |turn| {
+        var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+        defer store.deinit();
+        var budget: Budget = .{ .deletes = 4096, .reads = 1024 * 1024, .work = 4096, .deadline_ns = clock.monotonicNs() + std.time.ns_per_s, .sweep_interval_ms = 1234 };
+        const result = collect(a, &store, 7, 0, 231000, &budget);
+        deleted += 4096 - budget.deletes;
+        try std.testing.expectEqual(turn != 2, result.more);
+        try std.testing.expect(!result.retained and !result.failed);
+    }
+    try std.testing.expectEqual(@as(usize, 50), deleted);
+    var retired = false;
+    for (0..6) |_| {
+        var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+        defer store.deinit();
+        var budget: Budget = .{ .deletes = 1, .reads = 16384, .work = 1, .deadline_ns = clock.monotonicNs() + std.time.ns_per_s, .sweep_interval_ms = 1234, .retire_after_ms = 200000 };
+        const result = collect(a, &store, 7, 0, 231001, &budget);
+        try std.testing.expect(!result.more and !result.retained and !result.failed);
+        retireCompleted(a, &store, 7, &budget) catch |err| {
+            if (err != error.QueryGcBudgetExhausted) return err;
+            continue;
+        };
+        retired = true;
+        break;
+    }
+    try std.testing.expect(retired);
+    var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+    defer store.deinit();
+    const prefix = try std.fmt.allocPrint(a, "{s}{s}expiring-gc/7/", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/" });
+    defer a.free(prefix);
+    var remaining = try store.opened.client.listObjects(store.opened.bucket, .{ .prefix = prefix, .max_keys = 16 });
+    defer remaining.deinit(store.opened.client.allocator);
+    try std.testing.expectEqual(@as(usize, 0), remaining.entries.len);
+}
+
+test "external lake query cleanup release requires a sweep after the writer horizon" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("query-gc-horizon-sweep");
+    defer directory.cleanup();
+    var config = try local.common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+    defer store.deinit();
+    const domain: [32]u8 = @splat(31);
+    const scope = try artifacts.UploadScope.forPublication(domain, 110000, std.testing.io);
+    var target = store.artifactStore();
+    var value = try target.putScoped(scope, "future at first sweep", .none);
+    defer value.deinit(a);
+    var first_budget: Budget = .{ .deletes = 128, .reads = 16384, .work = 128, .deadline_ns = clock.monotonicNs() + std.time.ns_per_s, .sweep_interval_ms = 90000 };
+    const first = try collectScopes(a, &store, 7, domain, 100000, &first_budget);
+    try std.testing.expect(!first.more and !first.retained);
+    var budget: Budget = .{ .deletes = 128, .reads = 16384, .work = 128, .deadline_ns = clock.monotonicNs() + std.time.ns_per_s, .sweep_interval_ms = 90000, .retire_after_ms = 120000 };
+    // The old completion is still inside its interval, but predates the
+    // writer horizon. It cannot prove that these now-expired uploads are gone.
+    const result = try collectScopes(a, &store, 7, domain, 150001, &budget);
+    try std.testing.expect(result.progressed and !result.more and !result.retained and !result.failed);
+    try std.testing.expectError(error.FileNotFound, target.getAlloc(value.artifact_id));
 }
