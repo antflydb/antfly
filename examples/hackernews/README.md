@@ -1168,3 +1168,67 @@ acceptance remain deployment gates.
 For continuous writable Iceberg changes, publication visibility, catalog-history
 growth and concurrent vacuum, see [Continuous writable-lake qualification](CONTINUOUS_LAKE.md).
 This is a separate bounded workload from the static archive search timings.
+
+
+The composed query path now reuses pinned text/scalar lake readers within each
+request, adapts bounded overlay batches to suppression, and materializes durable
+cut capabilities only when returning a continuation. Replacement keys
+still use indexed probes, and public cursors retain their restart-safe protocol.
+See [remote serving performance](../../docs/operations/hackernews/remote-serving-performance.md#composed-reader-lifetime-and-immutable-hn-tables)
+for the lifetime/fencing contract, live immutable-table migration, measurements
+and remaining release qualification.
+
+
+### Native owner serving cuts (candidate)
+
+For deployments where Antfly owns the complete write path, the candidate adds
+`lake_indexes.serving_cuts.enabled: true`. Enable it only after every writer,
+maintenance worker and reader runs the compatible release. Activation records
+native ownership and conditionally claims both the managed Iceberg catalog and
+WAL heads. This is a durable protocol transition: switching the option off does
+not remove ownership or permit older writers. Shared REST catalogs and mutable
+prefix inventories retain their existing strict remote checks.
+
+The historical table must use an immutable `*.parquet-manifest.json` inventory;
+`object_mutability: immutable` on a prefix alone does not seal membership. The
+current table uses managed Iceberg with immutable files. Accepted WAL positions,
+publication generations and retained image references live in native metadata.
+Queries issue signed `lake3:` and `source3:` capabilities to images built during
+publication/write acceptance, avoiding query-time cursor uploads for these cuts.
+If remote commitment succeeds but native acknowledgment is unconfirmed, the
+changes API returns `state: unknown` without a read receipt. The producer keeps
+its exact pending transaction and checkpoint for retry; it advances only after
+an explicit accepted response with a WAL position.
+
+A node still fetches immutable blocks on cache misses. Background warming is
+bounded and optional, uses the same verified memory/disk caches as foreground
+reads, and does not copy the whole archive or establish authority. Retention
+protects each prepared image and its publication reader for the complete cursor
+horizon. Existing generation, metadata and WAL bounds continue to apply and
+can impose explicit backpressure at high publication rates.
+
+This candidate requires qualification before deployment. Do not interpret the
+older reader-sharing measurements as measurements of owner serving cuts.
+
+
+To prepare a sealed archive from an existing `archive_inventory.py` result:
+
+```sh
+uv run --project examples/hackernews python examples/hackernews/seal_archive.py \
+  --inventory /absolute/path/archive-inventory.json \
+  --source-id hn-archive \
+  --output /absolute/path/manifest-output
+```
+
+The source ID must exactly match the historical table's `base_source.table_id`.
+The command prints the immutable manifest URI. Add `--upload` to verify the
+pinned live inventory and create its metadata objects under the existing archive
+prefix. Register the historical table against that URI with immutable objects;
+the current table remains a separate managed Iceberg source. Changing an
+existing prefix binding to a manifest requires a new verified publication.
+
+`cloud_plan.py native --owned-serving --archive-prefix archive/_snapshots/.../NAME.parquet-manifest.json`
+prepares separate historical/current object-table definitions and a
+`native-serving-config.json` engine configuration fragment. Rendering does not
+apply it or change the pinned Cloud runtime. Enable that fragment only on the
+compatible released engine, after reviewing the writer-credential contract.

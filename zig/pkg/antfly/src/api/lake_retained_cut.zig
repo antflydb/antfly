@@ -69,7 +69,7 @@ fn domain(table: u64, store: catalog.Digest) catalog.Digest {
 }
 const generations = @import("lake_generation_envelope.zig");
 const Token = @import("antfly_cancellation").CancellationToken;
-const StateRef = generations.Envelope;
+pub const StateRef = generations.Envelope;
 pub const Cache = @import("lake_metadata_memo.zig").Memo(StateRef);
 const payload_ttl_ms = 24 * std.time.ms_per_hour;
 const State = struct {
@@ -121,9 +121,35 @@ pub fn saveCached(a: A, store: *stores.ArtifactStore, store_identity: catalog.Di
     return generations.encode(a, prefix, .{ .artifact_id = @constCast(ref.id), .checksum = @constCast(try stores.sha256ChecksumFromArtifactId(ref.id)), .byte_len = ref.bytes, .provider_version = ref.generation });
 }
 fn saveReference(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, io: std.Io, descriptor: Descriptor, cancellation: Token, cache: ?*Cache) !StateRef {
-    try cancellation.check();
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
     if (descriptor.expires_ms <= now or descriptor.expires_ms > now +| max_ttl_ms) return error.DeadlineExceeded;
+    const state_ref = try savePayloadReference(a, store, store_identity, io, descriptor, cancellation, cache);
+    const cache_scope = store.cacheScope(store_identity);
+    const envelope: LeaseEnvelope = .{ .expires_ms = descriptor.expires_ms, .table_id = descriptor.table_id, .object_generation = descriptor.object_generation, .desired = descriptor.desired, .reader_token = descriptor.reader_token, .state = state_ref };
+    const lease_key = leaseKey(cache_scope, envelope);
+    if (cache) |memo| if (try memo.get(a, lease_key, now)) |ref| {
+        try validateStateRef(ref, domain(descriptor.table_id, store_identity), descriptor.expires_ms);
+        try cancellation.check();
+        return ref;
+    };
+    const flight = if (cache) |memo| try memo.claim(lease_key, io, cancellation) else null;
+    defer if (flight) |held| held.deinit();
+    if (cache) |memo| if (try memo.get(a, lease_key, now)) |ref| {
+        try validateStateRef(ref, domain(descriptor.table_id, store_identity), descriptor.expires_ms);
+        try cancellation.check();
+        return ref;
+    };
+    const scope = try stores.UploadScope.forPublication(domain(descriptor.table_id, store_identity), descriptor.expires_ms, io);
+    const ref = try upload(a, store, scope, envelope, cancellation);
+    if (cache) |memo| memo.put(lease_key, ref, descriptor.expires_ms);
+    return ref;
+}
+/// Publication/ACK path only. The image is reusable across cursor issuances;
+/// native leases, not a query-time envelope, protect its independent horizon.
+pub fn savePayloadReference(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, io: std.Io, descriptor: Descriptor, cancellation: Token, cache: ?*Cache) !StateRef {
+    try cancellation.check();
+    const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+    if (descriptor.expires_ms <= now or descriptor.expires_ms > now +| (2 * max_ttl_ms + 120_000)) return error.DeadlineExceeded;
     const cache_scope = store.cacheScope(store_identity);
     const key = stateKey(descriptor, cache_scope);
     const state_ref = (if (cache) |memo| try memo.get(a, key, descriptor.expires_ms) else null) orelse built: {
@@ -200,23 +226,14 @@ fn saveReference(a: A, store: *stores.ArtifactStore, store_identity: catalog.Dig
     };
     try cancellation.check();
     try validateStateRef(state_ref, domain(descriptor.table_id, store_identity), descriptor.expires_ms);
-    const envelope: LeaseEnvelope = .{ .expires_ms = descriptor.expires_ms, .table_id = descriptor.table_id, .object_generation = descriptor.object_generation, .desired = descriptor.desired, .reader_token = descriptor.reader_token, .state = state_ref };
-    const lease_key = leaseKey(cache_scope, envelope);
-    if (cache) |memo| if (try memo.get(a, lease_key, now)) |ref| {
-        try validateStateRef(ref, domain(descriptor.table_id, store_identity), descriptor.expires_ms);
-        try cancellation.check();
-        return ref;
-    };
-    const flight = if (cache) |memo| try memo.claim(lease_key, io, cancellation) else null;
-    defer if (flight) |held| held.deinit();
-    if (cache) |memo| if (try memo.get(a, lease_key, now)) |ref| {
-        try validateStateRef(ref, domain(descriptor.table_id, store_identity), descriptor.expires_ms);
-        try cancellation.check();
-        return ref;
-    };
-    const scope = try stores.UploadScope.forPublication(domain(descriptor.table_id, store_identity), descriptor.expires_ms, io);
-    const ref = try upload(a, store, scope, envelope, cancellation);
-    if (cache) |memo| memo.put(lease_key, ref, descriptor.expires_ms);
+    return state_ref;
+}
+pub fn saveManifestReference(a: A, store: *stores.ArtifactStore, identity: catalog.Digest, table_id: u64, io: std.Io, bytes: []const u8, expiry: u64, cancellation: Token, cache: *Cache) !StateRef {
+    const key = @import("lake_wal_image.zig").digest(.{ .format = "owned-source-manifest-v1", .store = store.cacheScope(identity), .table_id = table_id, .bytes = bytes });
+    if (try cache.get(a, key, expiry)) |ref| return ref;
+    const scope = try stores.UploadScope.forPublication(domain(table_id, identity), @max(expiry, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms +| payload_ttl_ms), io);
+    const ref = try uploadBytes(a, store, scope, bytes, cancellation);
+    cache.put(key, ref, scope.fencingToken());
     return ref;
 }
 fn validateStateRef(ref: StateRef, expected_domain: [32]u8, expiry: u64) !void {
@@ -491,6 +508,43 @@ pub fn load(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, 
 }
 pub fn loadCached(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, token: []const u8, table: local.common_topology_records.TableRecord, now: u64, cancellation: Token, cache: *local.serverless_query_lake_decoded_cache.Cache, context: local.serverless_query_lake_read_context.Context) !Pinned {
     return loadImpl(a, store, store_identity, token, table, now, cancellation, cache, context, null);
+}
+pub fn ownedResident(store: *stores.ArtifactStore, identity: catalog.Digest, table: local.common_topology_records.TableRecord, cut: @import("../metadata/lake_source_admission.zig").Cut, cache: *local.serverless_query_lake_decoded_cache.Cache) bool {
+    const ref: StateRef = .{ .id = cut.state.id, .bytes = cut.state.bytes, .generation = if (cut.state.generation) |value| @constCast(value) else null };
+    const key = @import("lake_wal_image.zig").digest(.{ .format = "retained-decoded-state-v1", .store = identity, .cache_scope = store.cacheScope(identity), .table = table.table_id, .incarnation = table.object_storage_generation, .ref = ref });
+    const lease = cache.lookup(key) orelse return false;
+    lease.release();
+    return true;
+}
+/// Reference is authenticated by the native owner or a verified lake3 token.
+/// Decoded items contain data only; request cancellation never enters residency.
+pub fn loadOwned(_: A, store: *stores.ArtifactStore, identity: catalog.Digest, table: local.common_topology_records.TableRecord, cut: @import("../metadata/lake_source_admission.zig").Cut, now: u64, cancellation: Token, cache: *local.serverless_query_lake_decoded_cache.Cache, groups: *local.serverless_query_lake_decoded_cache.Cache, context: local.serverless_query_lake_read_context.Context) !Pinned {
+    try cut.validate();
+    if (cut.expires_ms <= now or !std.mem.eql(u8, &cut.store, &identity) or !std.mem.eql(u8, &cut.desired, &catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
+    const ref: StateRef = .{ .id = cut.state.id, .bytes = cut.state.bytes, .generation = if (cut.state.generation) |value| @constCast(value) else null };
+    const expected_domain = domain(table.table_id, identity);
+    try validateStateRef(ref, expected_domain, cut.expires_ms);
+    const key = @import("lake_wal_image.zig").digest(.{ .format = "retained-decoded-state-v1", .store = identity, .cache_scope = store.cacheScope(identity), .table = table.table_id, .incarnation = table.object_storage_generation, .ref = ref });
+    var loader: StateLoader = .{ .store = store.*, .ref = ref, .domain = expected_domain, .expiry = cut.expires_ms, .cancellation = cancellation, .groups = groups, .context = context };
+    const held = cache.acquire(key, 64 * 1024 * 1024, context, .{ .ptr = &loader, .load = StateLoader.decode }) catch |err| switch (err) {
+        error.OutOfMemory, error.SqlMemoryLimitExceeded => private: {
+            try context.ensureActive();
+            const pin = try cache.create(256 * 1024 * 1024);
+            errdefer pin.release();
+            try StateLoader.decode(&loader, pin.item);
+            break :private pin;
+        },
+        else => return err,
+    };
+    errdefer held.release();
+    const decoded: *const Decoded = @ptrCast(@alignCast(held.item.payload.extension));
+    const state = decoded.state;
+    if (state.publication.generation != cut.generation or state.pending.lsn != cut.wal_lsn or state.pending.base_lsn != cut.base_lsn or state.published_only) return error.CatalogGenerationChanged;
+    for (state.change_parts) |part| try validateStateRef(part, expected_domain, cut.expires_ms);
+    try state.publication.validate();
+    try cancellation.check();
+    try context.ensureActive();
+    return .{ .descriptor = .{ .expires_ms = cut.expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = cut.desired, .reader_token = cut.reader_token, .publication = state.publication, .pending = state.pending, .catalog_metadata = state.catalog_metadata, .published_only = false, .recent = state.recent, .recent_cloud = state.recent_cloud, .recent_runs = state.recent_runs }, .overlay = decoded.overlay, .lease = held };
 }
 pub fn loadWithGroups(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, token: []const u8, table: local.common_topology_records.TableRecord, now: u64, cancellation: Token, cache: *local.serverless_query_lake_decoded_cache.Cache, groups: *local.serverless_query_lake_decoded_cache.Cache, context: local.serverless_query_lake_read_context.Context) !Pinned {
     return loadImpl(a, store, store_identity, token, table, now, cancellation, cache, context, groups);

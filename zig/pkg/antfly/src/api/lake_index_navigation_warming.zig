@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bounded startup planning warmup. Only immutable navigation enters shared
-//! caches; reader capabilities, posting data and source rows remain query-owned.
+//! Bounded startup warming. Authenticated immutable navigation and search blocks
+//! enter process-accounted caches; reader capabilities remain query-owned.
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const artifacts = @import("lake_index_aggregate_artifact.zig");
@@ -25,7 +25,7 @@ const A = std.mem.Allocator;
 const Token = @import("antfly_cancellation").CancellationToken;
 pub const max_pages = 64;
 const page_workspace = 4 * 1024 * 1024;
-pub const Navigation = struct { domain: [32]u8, ref: tree.Ref };
+pub const Navigation = struct { domain: [32]u8, ref: tree.Ref, text_segments: bool = false, depth: u8 = 0 };
 pub const Stats = struct { attempts: u64 = 0, failures: u64 = 0, pages: u64 = 0, nanoseconds: u64 = 0 };
 pub const Cache = struct {
     attempts: std.atomic.Value(u64) = .init(0),
@@ -96,6 +96,23 @@ pub const Cache = struct {
         self.next = (self.next + 1) % self.keys.len;
     }
 };
+const WorkingSet = struct {
+    remaining_bytes: std.atomic.Value(usize) = .init(16 * 1024 * 1024),
+    remaining_segments: std.atomic.Value(usize) = .init(16),
+    fn reserve(self: *WorkingSet) bool {
+        var count = self.remaining_segments.load(.acquire);
+        while (count != 0) {
+            count = self.remaining_segments.cmpxchgWeak(count, count - 1, .acq_rel, .acquire) orelse break;
+        }
+        if (count == 0) return false;
+        const bytes: usize = 1024 * 1024;
+        var remaining = self.remaining_bytes.load(.acquire);
+        while (remaining >= bytes) {
+            remaining = self.remaining_bytes.cmpxchgWeak(remaining, remaining - bytes, .acq_rel, .acquire) orelse return true;
+        }
+        return false;
+    }
+};
 const PageWarm = struct {
     navigation: Navigation,
     store: stores.ArtifactStore,
@@ -103,18 +120,28 @@ const PageWarm = struct {
     token: Token,
     children: [8]?Navigation = @splat(null),
     count: usize = 0,
+    working_set: *WorkingSet,
+    scratch: A = undefined,
     pub fn child(self: *PageWarm, ref: tree.Ref) !void {
-        // Warm at most one additional interior level. A large fan-out cannot
+        // Warm at most three additional levels. A large fan-out cannot
         // turn a startup hint into a scan of the archive or all leaf pages.
-        if (ref.height == 0 or self.count == self.children.len) return;
-        self.children[self.count] = .{ .domain = self.navigation.domain, .ref = ref };
+        if (self.navigation.depth == 3 or self.count == self.children.len) return;
+        self.children[self.count] = .{ .domain = self.navigation.domain, .ref = ref, .text_segments = self.navigation.text_segments, .depth = self.navigation.depth + 1 };
         self.count += 1;
     }
-    pub fn record(_: *PageWarm, _: []const u8, _: []const u8) !void {}
+    pub fn record(self: *PageWarm, _: []const u8, value: []const u8) !void {
+        if (!self.navigation.text_segments or !self.working_set.reserve()) return;
+        var arena = std.heap.ArenaAllocator.init(self.scratch);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const descriptor = try std.json.parseFromSliceLeaky(struct { route: @import("lake_index_native_text.zig").SegmentRouting }, a, value, .{ .ignore_unknown_fields = true });
+        _ = try @import("lake_index_seekable_text.zig").warmBounded(a, .{ .store = self.store, .cache = self.cached, .context = self.cached.context, .cancellation = self.token }, descriptor.route.ref, 1024 * 1024);
+    }
 
     fn run(self: *PageWarm) anyerror!void {
         try self.cached.context.ensureActive();
         var memory: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = page_workspace };
+        self.scratch = memory.allocator();
         var reads: u64 = tree.max_page_bytes;
         var writes: u64 = 0;
         var pages: page_store.PageStore = .{ .domain = self.navigation.domain, .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .read_cache = @import("lake_index_navigation_pages.zig").cacheBinding(&self.cached) };
@@ -122,15 +149,32 @@ const PageWarm = struct {
         try self.cached.context.ensureActive();
     }
 };
-/// Four admitted I/O lanes, at most 64 authenticated pages and two interior
-/// levels. Every worker joins before its operation-local reader lease ends.
+const Guard = struct {
+    authority: @import("lake_index_reader_lease.zig").Authority,
+    table: u64,
+    generation: u64,
+    epoch: ?u64,
+    fn check(self: Guard) !void {
+        var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.processAllocator(std.heap.page_allocator));
+        defer arena.deinit();
+        const state = try self.authority.readState(arena.allocator(), self.table);
+        if (state.dropped or state.current != self.generation) return error.Canceled;
+        if (self.epoch) |epoch| if (state.source_owner == null or state.source_owner.?.epoch != epoch) return error.Canceled;
+    }
+};
+/// Four admitted I/O lanes, at most 64 authenticated pages and three child
+/// levels, plus 16 segments/16 MiB of immutable working blocks. Every worker joins before its operation-local reader lease ends.
 pub fn warmRoots(store: stores.ArtifactStore, cached: artifacts.CachedRead, roots: []const Navigation, token: Token) !usize {
+    return warmRootsGuarded(store, cached, roots, token, null);
+}
+fn warmRootsGuarded(store: stores.ArtifactStore, cached: artifacts.CachedRead, roots: []const Navigation, token: Token, guard: ?Guard) !usize {
+    var working_set: WorkingSet = .{};
     var pending: [max_pages]Navigation = undefined;
     var count: usize = @min(roots.len, pending.len);
     @memcpy(pending[0..count], roots[0..count]);
-    const initial = count;
     var position: usize = 0;
     while (position < count) {
+        if (guard) |fence| try fence.check();
         try cached.context.ensureActive();
         try token.check();
         const width = @min(4, count - position);
@@ -140,16 +184,21 @@ pub fn warmRoots(store: stores.ArtifactStore, cached: artifacts.CachedRead, root
             owned.cancel(io) catch {};
         };
         for (work[0..width], 0..) |*item, slot| {
-            item.* = .{ .navigation = pending[position + slot], .store = store, .cached = cached, .token = token };
+            item.* = .{ .navigation = pending[position + slot], .store = store, .cached = cached, .token = token, .working_set = &working_set };
             if (cached.context.io) |io| tasks[slot] = local.sql_parallel_scheduler.global().submitIo(io, page_workspace, PageWarm.run, .{item});
-            if (tasks[slot] == null) try item.run();
+            if (tasks[slot] == null) {
+                // Saturated I/O admission must yield to foreground queries.
+                // The deferred task drain and retry history retain safe bounds.
+                if (cached.context.io != null) return error.NavigationWarmupInProgress;
+                try item.run();
+            }
         }
         for (tasks[0..width], 0..) |task, slot| if (task) |value| {
             var owned = value;
             tasks[slot] = null;
             try owned.await(cached.context.io.?);
         };
-        for (work[0..width], position..) |item, index| if (index < initial) {
+        for (work[0..width]) |item| {
             for (item.children[0..item.count]) |child| {
                 if (count == pending.len) break;
                 const candidate = child.?;
@@ -161,7 +210,7 @@ pub fn warmRoots(store: stores.ArtifactStore, cached: artifacts.CachedRead, root
                     count += 1;
                 }
             }
-        };
+        }
         position += width;
     }
     return position;
@@ -170,6 +219,11 @@ pub fn warmPublication(a: A, server: *@import("http_server.zig").ApiHttpServer, 
     return warmPublicationWithin(a, server, table, .{});
 }
 pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local.common_topology_records.TableRecord, caller: local.api_operation.RequestContext) !void {
+    // Serving-cut recovery is required even when speculative page warming is off.
+    @import("lake_index_text_query.zig").refreshOwnedCut(a, server, table, caller) catch |err| switch (err) {
+        error.IndexRebuilding, error.ExternalLakeIndexNotPublished, error.ExternalLakeIndexUnavailable, error.ExternalLakeIndexSourceChanged, error.ExternalLakeSnapshotMismatch, error.LakeTableNotFound => {},
+        else => return err,
+    };
     if (server.cfg.node_config) |config| if (!config.lake_indexes.navigation_warming.enabled) return;
     // Initialization may reconcile before lifecycle callbacks are installed.
     // Do not memoize that absence as a completed warmup for this generation.
@@ -254,11 +308,13 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
         const sa = arena.allocator();
         var domain: [32]u8 = undefined;
         var selected: [11]?tree.Ref = @splat(null);
+        var warm_text_segments = false;
         if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == @import("lake_index_native_text.zig").metadata_version) {
             const metadata = try @import("lake_index_decoded_metadata.zig").acquire(@import("lake_index_native_text.zig").Directory, cached, store.artifactStore(), declaration.artifact, token, @import("lake_index_native_text.zig").loadDirectory);
             defer metadata.release();
             const root = metadata.value.root;
             domain = root.domain;
+            warm_text_segments = root.seekable;
             selected = .{ root.term_statistics, root.term_directory.branches, root.term_directory.leaves, root.directories.routing, root.directories.ordered, root.directories.segments, root.directories.files, root.serving_routes, root.segment_files, root.source_routes, root.tie_bounds };
         } else if (declaration.artifact.kind == .ordered_row_index) {
             const root = try @import("lake_index_ordered_rows.zig").loadRootLazy(sa, store.artifactStore(), declaration.artifact, token, cached);
@@ -266,14 +322,15 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
             selected[0..4].* = .{ root.page, root.reverse, root.ties, root.predicates };
             if (root.file_dictionary) |dictionary| selected[4..7].* = .{ dictionary.slots, dictionary.names, dictionary.public };
         } else continue;
-        for (selected) |ref| if (ref) |page| {
+        for (selected, 0..) |ref, selected_index| if (ref) |page| {
             if (count == roots.len) break;
-            roots[count] = .{ .domain = domain, .ref = page };
+            roots[count] = .{ .domain = domain, .ref = page, .text_segments = warm_text_segments and selected_index == 5 };
             count += 1;
         };
         if (count == roots.len) break;
     }
-    const pages = try warmRoots(store.artifactStore(), cached, roots[0..count], token);
+    const native_state = try authority.readState(a, table.table_id);
+    const pages = try warmRootsGuarded(store.artifactStore(), cached, roots[0..count], token, .{ .authority = authority, .table = table.table_id, .generation = publication.generation, .epoch = if (native_state.source_owner) |owner| owner.epoch else null });
     _ = server.lake_navigation_warming.pages.fetchAdd(pages, .monotonic);
     completed = true;
 }

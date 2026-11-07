@@ -465,3 +465,158 @@ query stores retain cumulative limits on both cold reads and warm cache hits.
 The regression covers raw and decoded dispatch, exhausted prior allowances,
 single and batched reads, and cancellation. All 20 focused Debug navigation,
 publication and coalesced-I/O tests passed without failures or leaks.
+
+## Composed reader lifetime and immutable HN tables
+
+A composed text/scalar request owns a bounded scope of up to 16 prepared lake
+readers, with a 64 MiB preparation budget. Refills and overlay key probes reuse
+the exact source cut first returned by that leaf. Each leaf still resolves and
+authorizes its table; reuse fences incarnation, object generation, index recipe,
+visibility, receipt watermark, expiry, cancellation and the reader/snapshot lease.
+Readers are request-local, never shared across principals or unrelated requests.
+An explicit `full_text_index` selector uses the same shared text reader even
+though the parser represents it as one named component. Vector and
+multi-component execution keep their existing preparation path.
+
+The prepared store must be constructed at its final address before publication
+selection: cloud-generation bindings retain a pointer to its inline object-store
+implementation, including during cleanup. Moving an already bound store leaves
+that pointer dangling. Mutable overlay wrappers belong to individual executions;
+retained overlays may build their physical suppression mask in a leaf's scratch
+arena, so the shared prepared reader must never retain that mask after the leaf
+returns. WAL-cache pins retain their separately owned masks as before.
+
+Overlay windows grow with observed suppression, up to the existing 128-row
+physical batch limit. Unfiltered indexed probes still cover every replacement
+key, including matching buffered rows, tombstones and newer nonmatching rows.
+Skipping probes based only on matching buffered hits would let duplicate newer
+keys outside that ranked window evade validation. These changes preserve source
+ranks and continuation positions.
+
+Internal refills use request-local cut references. Only a returned continuation
+materializes durable leaf capabilities and its composed cursor. Counts and
+complete result sets need no retained cursor uploads. Public cursors retain the
+existing `source2:`/`lake2:` protocol and expiry; a restart must reopen the same
+published source and accepted WAL cut. This reduces redundant setup and needless
+retention writes; it does not remove mandatory fresh authority checks or the
+writes needed for an actual restart-safe continuation.
+
+On November 7 UTC, the managed rc.10 HN qualification instance's public bindings
+were migrated to explicit `object_mutability: immutable`. The archive retains
+its frozen Parquet input; the current writer uses a fresh Iceberg warehouse
+prefix and new file URIs. All five original CDC transactions were replayed with
+their original source epoch, checkpoints and batch IDs. Exact retries returned
+the original WAL positions. Full row comparisons verified 175 archive rows and
+117 current rows; the saved source and existing scoped read key were preserved.
+Four combined cursor pages returned all 72 distinct `database` matches. The old
+bindings remain as `hn_archive_mutable_20261107` and
+`hn_current_mutable_20261107`; their files were not deleted. The producer remains
+at checkpoint 5 with its native state and backup retained.
+
+This is qualification data, not the full HN archive. Migration alone did not
+remove the composed metadata overhead. Managed end-to-end medians in a small
+before/after diagnostic were:
+
+| View | Before (3 samples) | After (5 samples) |
+| --- | ---: | ---: |
+| History | 245 ms | 359 ms |
+| Recent | 853 ms | 831 ms |
+| All | 2,592 ms | 2,369 ms |
+
+After samples used a 1.2-second inter-request delay. An earlier unpaced All
+request returned HTTP 500; the runtime recorded `RateLimited` from GCS, and the
+immediate recheck succeeded. Keep that failure separate from successful latency
+samples. Different pacing, small samples, fresh publications and an unchanged
+rc.10 runtime make this an operational check, not a causal engine speedup or a
+production latency qualification. The new reader-sharing code needs its own
+release and managed benchmark.
+
+The local regression in `zig/e2e/antfly/test_composed_lake_readers.py` uses real
+Parquet, managed Iceberg CDC, a newer nonmatching row and a tombstone. It requires
+two source/publication preparations despite multiple composed leaves, exact
+counts and duplicate-free pagination after later accepted writes and a process
+restart. Fresh requests must see the new ACK while the first cursor keeps its
+original cut. Released
+rc.10 performs seven source/publication preparations on that same fixture.
+
+The fixture keeps a later CDC batch pending by revoking only warehouse write
+access before acceptance. WAL admission remains writable. It resumes both the
+original published cut and the later nonempty WAL cut after restart, checks the
+exact distinct IDs, and checks reuse across several resumed leaf calls. Its GCS
+variant requires explicit qualification bucket/prefix/token-file settings and
+verifies that both retained publications contain cloud-generation maps. The
+credential is resolved through a secret reference; it is absent from the config.
+
+The GCS correctness fixture spaces API requests by 1.2 seconds without retrying
+failed queries. Cloud Storage documents a [one-write-per-second limit for the
+same object name](https://docs.cloud.google.com/storage/quotas#objects). An
+unpaced rc.10 baseline failed during resumed pagination with `RateLimited` and
+HTTP 500; the paced baseline passed. The log does not identify the throttled
+object or prove which quota caused it. Preserve that failed run and qualify
+unpaced throughput separately. Request latency excludes the pacing delay.
+
+Set `ANTFLY_E2E_COMPOSED_PROFILE_ROUNDS=5` for opt-in measurements of the first
+query after restart and five warm queries, including sampled server RSS and CPU.
+These use the fixture's small corpus, retain durable/OS caches, and must run
+without competing compilers. They supplement correctness checks; they do not
+qualify full-archive performance or a regional managed deployment.
+
+### Candidate qualification, November 7 UTC
+
+The native ARM64 ReleaseSafe candidate at `dd2d98ce38` (documentation head
+`a1ee317fa6`) built successfully. Its binary SHA-256 is
+`03f068d1935b2f0ac040740af56f5685f4b302e578bc708d5c1cd664cf22c424`.
+Twenty fresh focused regressions passed with zero failures/leaks and direct exit
+0. All four HTTP cases passed: explicit/inferred text-index selection, each with
+local and real GCS artifacts. Every case measured **two preparations for seven
+fresh leaf calls**, and **two for three calls** on the resumed pending-WAL page.
+Both retained cuts returned their exact distinct IDs after writes and restart;
+GCS cases verified both publication generation maps and nonempty retained WAL
+change parts. The budget-exhaustion regression retained no readers or charge.
+
+The HTTP corpus has 100 historical rows and 31 initial current rows. GCS holds
+native artifacts and the WAL; Parquet and the managed Iceberg warehouse remain
+local. Measurements below use five warm requests after one restart query,
+retaining durable/OS caches. GCS requests have a 1.2-second inter-request delay,
+excluded from latency. RSS is the sampled server maximum during those requests.
+
+| Artifacts | Text index | Restart query | Warm median | Sampled peak RSS |
+| --- | --- | ---: | ---: | ---: |
+| Local | Explicit | 28.23 ms | 15.26 ms | 127.75 MiB |
+| Local | Inferred | 31.84 ms | 13.82 ms | 129.16 MiB |
+| GCS | Explicit | 2,086.51 ms | 1,157.51 ms | 184.95 MiB |
+| GCS | Inferred | 2,001.11 ms | 1,157.24 ms | 185.80 MiB |
+
+A separate local matrix passed both stored-source and Parquet-hydration cells
+with 10,000 unique real HN comments across two Snappy Parquet files (4,935,176
+bytes). Inputs came from bounded `tabledata.list` reads of
+`bigquery-public-data.hacker_news.full`, normalized with the example's serving
+row conversion. No BigQuery query/export jobs were created. These unordered
+pages are not a random sample: story/title/score diversity and external comment
+ancestors are unqualified. The files were written by PyArrow, not BigQuery.
+Input SHA-256 values are
+`b34eb0bc2acd66944170158ef9a5492f0781060ee00070692c8850835ce35b3f`
+and `e34f09a1dd84b0e21ab4f0ab7c2f346ed4654da11a9a416003a423ea2ab5e39b`.
+
+| Local archive mode | Cold search | Warm median | Warm maximum | Restart | Child peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Stored source | 25.16 ms | 8.75 ms | 14.52 ms | 19.85 ms | 302.31 MiB |
+| Parquet hydration | 27.46 ms | 5.19 ms | 8.65 ms | 20.79 ms | 221.03 MiB |
+
+This matrix uses a 4 GiB process budget, five warm samples, navigation warming
+disabled and the serving cache cleared after publication. OS caches are not
+flushed, and setup includes SQL count. Child RSS is the maximum over the entire
+run, including publication and restarts, rather than query-only memory. Both
+cells verified highlights, metadata filters against residual execution, exact
+filters and score/pagination stability after restart. With 128 native current
+rows, union warm medians were 48.58/48.56 ms and saved-overlay medians were
+54.06/53.54 ms for stored-source/hydration respectively. These current rows use
+native storage, unlike the managed Iceberg HTTP regression above.
+
+All measurements are from a shared developer host, with no competing builds
+from this task during timings. Other host activity, small sample counts and
+different fixture/build settings prevent a causal comparison with earlier
+rc.10 measurements or a full-archive claim. The roughly 1.16-second GCS warm
+result still includes remote admission and continuation work; the proposed
+authoritative owner cuts, precomputed cursor references and broader warming
+remain planned work, not measured improvements in this candidate.

@@ -40,6 +40,9 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         if (err == error.NavigationWarmupInProgress) return &.{};
         try request.ensureActive();
     };
+    if (try @import("lake_source_owner.zig").lookup(sa, server, table, request)) |owner| {
+        if (!owner.enabled or owner.current == null) return &.{};
+    }
     const normalized = try request.platformDeadline();
     var context: local.serverless_query_lake_read_context.Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
     var sql_table = try server.sql_schema_cache.resolve(server.embedding_provider_runtime.io, sa, table.schema_json, table.table_id, table.name);

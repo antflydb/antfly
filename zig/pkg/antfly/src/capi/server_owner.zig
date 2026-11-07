@@ -1844,6 +1844,11 @@ pub fn metadataApplyStoreProjection(
             defer alloc.free(value);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
+        .lake_source_owner => blk: {
+            const value = handle.store.getLakeSourceOwner(alloc, request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer alloc.free(value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .lake_index_lifecycle_work => blk: {
             const value = handle.store.lakeIndexLifecycleWork(alloc, request.group_id, if (request.arg1 != 0) request.arg0 else null) catch |err| break :blk storageOwnerStatusFromError(err);
             defer alloc.free(value);

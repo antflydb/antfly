@@ -642,7 +642,7 @@ pub const ServingSource = struct {
                 });
                 const manifest_api = @import("lake_parquet_manifest.zig");
                 const manifest_uri = base orelse binding.source_uri;
-                const bytes = try @import("lake_iceberg_snapshot.zig").readFullObjectAlloc(alloc, &client, null, manifest_uri, .iceberg_metadata, null, 1024 * 1024);
+                const bytes = if (options.retained_manifest) |manifest| try alloc.dupe(u8, manifest) else try @import("lake_iceberg_snapshot.zig").readFullObjectAlloc(alloc, &client, null, manifest_uri, .iceberg_metadata, null, 1024 * 1024);
                 defer alloc.free(bytes);
                 var snapshot: @import("lake_iceberg_snapshot.zig").SnapshotWithDeletePlan = undefined;
                 if (cache) |shared| {
@@ -1252,6 +1252,10 @@ pub const ServingSource = struct {
     pub fn credentialIdentity(self: *ServingSource, binding: @import("../external_source/catalog_binding.zig").Binding) ![32]u8 {
         try self.validateBinding(binding);
         return bindingIdentity(self.alloc, self.store, binding);
+    }
+    pub fn sealedManifestBytes(self: *const ServingSource) ?[]const u8 {
+        if (self.deferred_snapshot) |frozen| if (@import("lake_parquet_manifest.zig").isManifest(frozen.uri)) return frozen.metadata;
+        return null;
     }
     pub fn attachCache(self: *ServingSource, cache: *@import("lake_serving_cache.zig").Cache, binding: @import("../external_source/catalog_binding.zig").Binding, context: @import("lake_read_context.zig").Context) !void {
         const reader = try self.alloc.create(@import("lake_serving_cache.zig").Reader);
