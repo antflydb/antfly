@@ -81,9 +81,9 @@ pub const resolver_projection_work_reader_version: u32 = 14;
 pub const resolver_projection_delta_reader_version: u32 = 15;
 pub const resolver_static_profiles_reader_version: u32 = 19;
 pub const resolver_pin_index_reader_version: u32 = 29;
-/// Adjudication policies whose decider is a cascade of typed/generated stages.
-pub const adjudication_cascade_reader_version: u32 = 30;
-pub const supported_reader_version: u32 = adjudication_cascade_reader_version;
+/// Durable decision producers and adjudication policies with cascade deciders.
+pub const decider_cascade_reader_version: u32 = 30;
+pub const supported_reader_version: u32 = decider_cascade_reader_version;
 
 const reader_version_encodings = blk: {
     @setEvalBranchQuota(10000);
@@ -131,7 +131,7 @@ pub fn catalogEncoding(a: Allocator, data: []const u8) !CatalogEncoding {
                 defer config.deinit();
                 if (config.value == .object) if (config.value.object.get("decider")) |decider| if (decider == .object) if (decider.object.get("decision_method")) |method| {
                     if (method == .string and std.mem.eql(u8, method.string, "generated")) required = @max(required, generated_producers_reader_version);
-                    if (method == .string and std.mem.eql(u8, method.string, "cascade")) required = @max(required, adjudication_cascade_reader_version);
+                    if (method == .string and std.mem.eql(u8, method.string, "cascade")) required = @max(required, decider_cascade_reader_version);
                 };
             }
         }
@@ -1390,7 +1390,7 @@ test "resolver adjudication catalogs fence old readers from cascade deciders and
     try parsed.value.validate();
     const catalog = try serializeCatalog(a, &.{parsed.value});
     defer a.free(catalog);
-    try std.testing.expectEqual(adjudication_cascade_reader_version, try catalogReaderVersion(a, catalog));
+    try std.testing.expectEqual(decider_cascade_reader_version, try catalogReaderVersion(a, catalog));
     const public = try parsed.value.publicValue(arena.allocator());
     const public_json = try std.json.Stringify.valueAlloc(a, public, .{});
     defer a.free(public_json);

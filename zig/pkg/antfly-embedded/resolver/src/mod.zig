@@ -2431,8 +2431,15 @@ pub const ResolutionStage = struct {
     }
 
     fn adjudicateReviews(self: ResolutionStage, a: std.mem.Allocator, config: adjudication.Config, resolution: *Resolution, mentions: []const ExtractedEntity, lists: [][]const Candidate, reused: []const ?ResolvedEntity, execution_hash: []const u8, model_revision: ?[32]u8) !void {
-        const specification = try config.producerSpecification(a);
-        const specification_hash = if (model_revision) |revision| try fingerprintHex(a, .{ try config.semantic(a), revision }) else try fingerprintHex(a, try config.semantic(a));
+        var classifier = try adjudication.Classifier.init(a, config);
+        defer classifier.deinit();
+        const specification = classifier.specification_json;
+        const semantic_config = try config.semantic(a);
+        const specification_hash = if (model_revision) |revision| try fingerprintHex(a, .{ semantic_config, revision }) else try fingerprintHex(a, semantic_config);
+        // All items share a frozen policy. Hash its large instructions only
+        // once per distinct executed revision set, not once per result.
+        var revision_specifications: std.AutoHashMapUnmanaged([32]u8, []const u8) = .empty;
+        defer revision_specifications.deinit(a);
         const Prepared = struct {
             index: usize,
             candidate: Candidate,
@@ -2583,7 +2590,7 @@ pub const ResolutionStage = struct {
                         continue;
                     },
                 };
-                evidence.status = adjudication.classify(a, config, response) catch |err| {
+                evidence.status = classifier.classify(response) catch |err| {
                     evidence.failure = @errorName(err);
                     continue;
                 };
@@ -2592,7 +2599,9 @@ pub const ResolutionStage = struct {
                     var unused: adjudication.Config.RevisionCache = @splat(.{});
                     if (try config.cascadeRevision(a, response, null, &unused)) |revision| {
                         evidence.execution_hash = try fingerprintHex(a, .{ execution_hash, revision });
-                        evidence.specification_hash = try fingerprintHex(a, .{ try config.semantic(a), revision });
+                        const entry = try revision_specifications.getOrPut(a, revision);
+                        if (!entry.found_existing) entry.value_ptr.* = try fingerprintHex(a, .{ semantic_config, revision });
+                        evidence.specification_hash = entry.value_ptr.*;
                     }
                 }
             }
@@ -4370,4 +4379,39 @@ test "REVIEW adjudication cascade receipts discover only executed dependencies a
     const fallback_calls = fixture.base.calls;
     _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
     try testing.expectEqual(fallback_calls, fixture.base.calls);
+}
+
+test "REVIEW adjudication prepared cascade classification allocates no per-result plans" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = try adjudication.Config.parse(a, adjudication_cascade_config);
+    defer parsed.deinit();
+    const config = parsed.value;
+    const prompt = try a.alloc(u8, 60000);
+    @memset(prompt, 'x');
+    try config.decider.object.getPtr("cascade").?.object.getPtr("stages").?.array.items[1].object.getPtr("decider").?.object.put(a, "instructions", .{ .string = prompt });
+    const response = try std.json.parseFromSliceLeaky(std.json.Value, a, try adjudicationCascadeResponse(a, config), .{});
+    const AllocationFailure = struct {
+        fn run(alloc: std.mem.Allocator, policy: adjudication.Config, value: std.json.Value) !void {
+            var prepared = try adjudication.Classifier.init(alloc, policy);
+            defer prepared.deinit();
+            try testing.expectEqual(adjudication.Status.accepted, try prepared.classify(value));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, AllocationFailure.run, .{ config, response });
+    // A finite allocator exposes any accidental retention of per-item plans.
+    const storage = try a.alloc(u8, 2 * 1024 * 1024);
+    var fixed = std.heap.FixedBufferAllocator.init(storage);
+    var classifier = try adjudication.Classifier.init(fixed.allocator(), config);
+    defer classifier.deinit();
+    const used = fixed.end_index;
+    const started = @import("antfly_platform").time.monotonicNs();
+    for (0..256) |_| try testing.expectEqual(adjudication.Status.accepted, try classifier.classify(response));
+    try testing.expectEqual(used, fixed.end_index);
+    std.debug.print("CASCADE_CLASSIFY rows=256 prompt=60000 per_result_plan_bytes=0 elapsed_ms={d}\n", .{(@import("antfly_platform").time.monotonicNs() - started) / std.time.ns_per_ms});
+    // Prepared classification still verifies the executed, bounded identity.
+    const trace = response.object.getPtr("cascade").?;
+    try trace.object.put(a, "definition_sha256", .{ .string = "stale" });
+    try testing.expectError(error.InvalidAdjudicationOutput, classifier.classify(response));
 }

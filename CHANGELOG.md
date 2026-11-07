@@ -23,8 +23,10 @@ All notable changes to Antfly will be documented in this file.
   REVIEW adjudication. Responses and adjudication receipts carry a per-stage
   trace. Definitions compile once; optional native stages discover models under
   the cascade deadline and failure policy. Shared generated-batch usage is
-  apportioned across inputs and marked as estimated. Resolver catalogs that
-  use a cascade require reader epoch 30.
+  apportioned across inputs and marked as estimated; retained typed failures
+  preserve measured usage. Resolver batches reuse one compiled classification
+  plan. Resolver catalogs and decision enrichment producers that use a cascade
+  require reader epoch 30.
 
 - **`@antfly/design-system` license** — first-party code in the package is now
   Apache-2.0, matching the rest of the repository. shadcn/ui-derived code keeps

@@ -3215,3 +3215,10 @@ ordinary pin-maintenance scans match an identical qualified control namespace.
 Tests check processed byte counters against native row censuses, mutations on
 both sides of the cursor, header-only edits, legacy-work retirement, untracked
 cut restart and portable-row validation.
+
+Cascade adjudication prepares the resolver-bounded producer specification and
+compiled trace validator once per resolution batch. Classifying each response
+validates every executed stage without allocating or rebuilding the plan;
+revision-dependent specification hashes are reused within the batch. Both
+cascade adjudication and cascade decision enrichments fence readers below
+epoch 30, including grouped enrichment producers.

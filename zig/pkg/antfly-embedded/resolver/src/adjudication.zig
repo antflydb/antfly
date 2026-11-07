@@ -317,35 +317,61 @@ pub const Executor = struct {
     get_description: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8) anyerror!?[]u8 = null,
 };
 
-/// Plain deciders answer for themselves. A cascade response must carry its
-/// stage trace, and the answering stage must be one the policy configured,
-/// with the trace ending on that stage's answer.
-fn answeringDecider(a: std.mem.Allocator, config: Config, response: std.json.Value) anyerror!std.json.Value {
+/// Prepared policy for a resolution batch. Owns its lowered specification
+/// and compiled definition; the source policy must outlive this classifier.
+pub const Classifier = struct {
+    arena: std.heap.ArenaAllocator,
+    config: Config,
+    specification_json: []const u8,
+    definition: ?@import("antfly_decisions").cascade.Definition,
+
+    pub fn init(backing: std.mem.Allocator, config: Config) !Classifier {
+        var arena = std.heap.ArenaAllocator.init(backing);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const specification = try config.producerSpecification(a);
+        const definition = if (config.cascadeStages().len > 0) blk: {
+            const lowered = try std.json.parseFromSliceLeaky(std.json.Value, a, specification, .{});
+            break :blk try @import("antfly_decisions").cascade.compile(a, lowered.object.get("decider").?.object.get("cascade").?);
+        } else null;
+        return .{ .arena = arena, .config = config, .specification_json = specification, .definition = definition };
+    }
+
+    pub fn deinit(self: *Classifier) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn classify(self: *const Classifier, response: std.json.Value) !Status {
+        return classifyResponse(self.config, response, if (self.definition) |*definition| definition else null);
+    }
+};
+
+fn answeringDecider(config: Config, response: std.json.Value, definition: ?*const @import("antfly_decisions").cascade.Definition) anyerror!std.json.Value {
     const stages = config.cascadeStages();
     if (stages.len == 0) return config.decider;
-    // Resolver-specific batch bounds are part of the executed definition.
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const scratch = arena.allocator();
-    const lowered = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try config.producerSpecification(scratch), .{});
-    const cascade = @import("antfly_decisions").cascade;
-    const definition = cascade.compile(scratch, lowered.object.get("decider").?.object.get("cascade").?) catch |err|
-        return if (err == error.OutOfMemory) err else error.InvalidAdjudicationOutput;
-    const index = cascade.validateTrace(&definition, response) catch return error.InvalidAdjudicationOutput;
-    // Independently validate every successful stage's distribution. A trace
-    // cannot smuggle an invalid intermediate answer into durable evidence.
+    const compiled = definition orelse return error.InvalidAdjudicationOutput;
+    const index = @import("antfly_decisions").cascade.validateTrace(compiled, response) catch return error.InvalidAdjudicationOutput;
+    // Independently validate every successful stage's distribution.
     const executed = response.object.get("cascade").?.object.get("stages").?.array.items;
     for (executed, stages[0..executed.len]) |entry, stage| {
         if (!entry.object.contains("answers")) continue;
         var stage_config = config;
         stage_config.decider = stage.object.get("decider").?;
-        _ = try classify(scratch, stage_config, entry);
+        _ = try classifyResponse(stage_config, entry, null);
     }
     return stages[index].object.get("decider").?;
 }
 
 /// Only a well-formed, typed, normalized choice distribution can change identity.
 pub fn classify(a: std.mem.Allocator, config: Config, response: std.json.Value) !Status {
+    if (config.cascadeStages().len == 0) return classifyResponse(config, response, null);
+    var classifier = try Classifier.init(a, config);
+    defer classifier.deinit();
+    return classifier.classify(response);
+}
+
+fn classifyResponse(config: Config, response: std.json.Value, definition: ?*const @import("antfly_decisions").cascade.Definition) !Status {
     if (response != .object) return error.InvalidAdjudicationOutput;
     const model = response.object.get("model") orelse return error.InvalidAdjudicationOutput;
     if (model != .string or model.string.len == 0) return error.InvalidAdjudicationOutput;
@@ -358,7 +384,7 @@ pub fn classify(a: std.mem.Allocator, config: Config, response: std.json.Value) 
     const method = answer.object.get("decision_method") orelse return error.InvalidAdjudicationOutput;
     if (name != .string or !std.mem.eql(u8, name.string, config.question.name) or kind != .string or !std.mem.eql(u8, kind.string, "choice") or method != .string or (!std.mem.eql(u8, method.string, "typed") and !std.mem.eql(u8, method.string, "generated"))) return error.InvalidAdjudicationOutput;
     // A cascade answer is checked against the stage that produced it.
-    const answering = try answeringDecider(a, config, response);
+    const answering = try answeringDecider(config, response, definition);
     const expected_method = answering.object.get("decision_method") orelse std.json.Value{ .string = "typed" };
     if (expected_method != .string or !std.mem.eql(u8, method.string, expected_method.string)) return error.InvalidAdjudicationOutput;
     var verdict_only = false;
