@@ -311,19 +311,25 @@ pub const Handle = struct {
                 // §3.3). Dense's HBC metadata/node/postings KV namespaces are
                 // implemented the same way (storage/hbc_backend.zig's
                 // `OpenedBackend.native_catalog`, reviewed per-site across
-                // hbc_adapter.zig's ~20 switches over `env_owner`) and
-                // compiles, but is NOT activated below pending a clean
-                // (uncontended-machine) rerun of the write-amplification
-                // harness: a contended run during this change surfaced
-                // `UnexpectedNativePageKind` on the unrelated `full_text`
-                // mode (no dense index at all) with dense flipped on, which
-                // did not reproduce with dense back on `.lsm` -- see this
-                // handback's bug-3/open-risk section. `dense_main_native_
-                // catalog_sink` is still wired below so reactivating is a
-                // one-line flip once that is cleared.
+                // hbc_adapter.zig's ~20 switches over `env_owner`): measured
+                // at 11.4 syncs/update alone and after an unrelated full-text
+                // mode in the same process (down from 33-36 on `.lsm`), and
+                // across the full primary/indexed/graph/dense/sparse/dense-
+                // 8-writer single-process mode lineup
+                // (write_amplification_bench_test.zig's "diagnostic" tests).
+                // One run of that full lineup hit `error.
+                // UnexpectedNativePageKind` on close of an unrelated,
+                // dense-free full_text Fixture two Fixtures earlier in the
+                // same process; it did not reproduce on immediate retry
+                // (same binary, same machine) or in either smaller
+                // diagnostic, so it reads as the pre-existing close-time
+                // flake the native.zig owner is separately chasing (see this
+                // handback's bug-3/open-risk section), not a dense-specific
+                // regression -- but it is still an open, not-yet-explained
+                // intermittent finding worth tracking.
                 opts.index_backends.text_main_backend = .native_catalog;
                 opts.index_backends.text_main_native_catalog_sink = self.native_catalog_sink.?.sink();
-                opts.index_backends.dense_storage_backend = .lsm;
+                opts.index_backends.dense_storage_backend = .native_catalog;
                 opts.index_backends.dense_main_native_catalog_sink = self.native_catalog_sink.?.sink();
                 opts.index_backends.sparse_backend = .native_catalog;
                 opts.index_backends.sparse_main_native_catalog_sink = self.native_catalog_sink.?.sink();
@@ -405,7 +411,7 @@ pub const Handle = struct {
         // every other namespace sharing this same Sink.
         opts.index_backends.text_main_backend = .native_catalog;
         opts.index_backends.text_main_native_catalog_sink = self.native_catalog_sink.?.sink();
-        opts.index_backends.dense_storage_backend = .lsm;
+        opts.index_backends.dense_storage_backend = .native_catalog;
         opts.index_backends.dense_main_native_catalog_sink = self.native_catalog_sink.?.sink();
         // See the root-namespace configureDbOpenOptions above: sparse and
         // graph are native-catalog-backed here too, same shared sink, scope
@@ -1221,10 +1227,10 @@ test "lite backend native engine creates and checks aflite file" {
     // this asserted `.lsm` even after sparse_backend was landed as
     // `.native_catalog` (the real value configureDbOpenOptions sets above),
     // so this regression test was not actually covering sparse's real
-    // configured value. Dense stays asserted `.lsm` here too: its own
-    // `.native_catalog` wiring compiles but is not activated yet (see the
-    // comment above this function's `dense_storage_backend` assignment).
-    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.dense_storage_backend), .lsm), db_opts.index_backends.dense_storage_backend);
+    // configured value. Dense now asserts `.native_catalog` too, now that
+    // it is activated (see the comment above this function's
+    // `dense_storage_backend` assignment).
+    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.dense_storage_backend), .native_catalog), db_opts.index_backends.dense_storage_backend);
     try std.testing.expect(db_opts.index_backends.dense_main_native_catalog_sink != null);
     try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.sparse_backend), .native_catalog), db_opts.index_backends.sparse_backend);
     try std.testing.expect(db_opts.index_backends.sparse_main_native_catalog_sink != null);
