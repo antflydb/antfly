@@ -2230,6 +2230,119 @@ test "a ride-along commit needs an explicit durability barrier before close, or 
     }
 }
 
+// WS "other write-path surfaces" (TTL, outboxes): the same durability-
+// barrier shape as the ride-along test directly above, but with the exact
+// key/value encodings `durable_outbox_store.clearPublished` (background
+// replication-outbox trimming) and `db.zig`'s `pruneStaleGraphTtlCandidateContext`
+// (background graph-TTL due-record cleanup) now write through
+// `beginWriteBatchWithOptions(.{ .durability = .ride_along })` /
+// `putBatchWithReplayWithOptions(..., .{ .durability = .ride_along })`
+// (lite-single-commit-write-path.md §3.2a). Both are pure bookkeeping: an
+// outbox row surviving a crash is simply re-published (idempotent,
+// at-least-once); a stale due-record surviving a crash is simply re-pruned
+// on the next sweep. Neither may force its own fsync, and losing either in
+// a crash must never corrupt the file or the other key written in the same
+// native transaction (`seed`, standing in for the primary row that always
+// accompanies this bookkeeping in production).
+test "TTL/outbox ride-along bookkeeping needs an explicit durability barrier before close, or the clear/prune is lost" {
+    const allocator = std.testing.allocator;
+    const outbox_mod = @import("../db/durable_outbox.zig");
+    const graph_ttl_mod = @import("../db/graph_edge_ttl_expiration.zig");
+    const internal_keys = @import("../internal_keys.zig");
+
+    const outbox_key = outbox_mod.replication_batch_outbox_key;
+    const outbox_value = try outbox_mod.encodeDurableReplicationOutboxAlloc(allocator, 7, "pending-batch-payload");
+    defer allocator.free(outbox_value);
+
+    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(allocator, "doc:a", "g", "links", "doc:b");
+    defer allocator.free(artifact_key);
+    const due_key = try graph_ttl_mod.directIndexKeyAlloc(allocator, 123, artifact_key);
+    defer allocator.free(due_key);
+    const due_value = try graph_ttl_mod.encodeDirectAlloc(allocator, .{
+        .index_name = "g",
+        .generation = 7,
+        .artifact_key = artifact_key,
+        .deadline_ns = 123,
+        .artifact_digest = @splat(5),
+    });
+    defer allocator.free(due_value);
+
+    // Scenario A: delete both bookkeeping rows with a ride-along (non-
+    // durable) commit, then close with NO later durability barrier. The
+    // deletes are structurally acknowledged (the call returned success)
+    // but, per §3.2a, not yet durable -- exactly the shape this whole
+    // conversion relies on being safe to lose.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/ttl-outbox-no-barrier.aflite", .{tmp.sub_path});
+        defer allocator.free(path);
+
+        var file = try native.NativeFile.createWithIo(allocator, std.testing.io, path, .{});
+        try file.putDocument("seed", "seed-value");
+        try file.putDocument(outbox_key, outbox_value);
+        try file.putDocument(due_key, due_value);
+
+        try file.beginTransaction();
+        try file.deleteDocument(outbox_key);
+        try file.deleteDocument(due_key);
+        try file.commitTransactionWithDurability(false, null);
+        try std.testing.expect(file.durable_header != null);
+        file.close();
+
+        var reopened = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{});
+        defer reopened.close();
+        const seed = try reopened.getDocumentAlloc(allocator, "seed");
+        defer if (seed) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualStrings("seed-value", seed orelse return error.TestExpectedEqual);
+
+        const outbox_row = try reopened.getDocumentAlloc(allocator, outbox_key);
+        defer if (outbox_row) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualSlices(u8, outbox_value, outbox_row orelse return error.TestExpectedEqual);
+
+        const due_row = try reopened.getDocumentAlloc(allocator, due_key);
+        defer if (due_row) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualSlices(u8, due_value, due_row orelse return error.TestExpectedEqual);
+    }
+
+    // Scenario B: the identical ride-along deletes, but with an explicit
+    // `file.sync()` barrier before close -- both rows are durably cleared.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/ttl-outbox-with-barrier.aflite", .{tmp.sub_path});
+        defer allocator.free(path);
+
+        var file = try native.NativeFile.createWithIo(allocator, std.testing.io, path, .{});
+        try file.putDocument("seed", "seed-value");
+        try file.putDocument(outbox_key, outbox_value);
+        try file.putDocument(due_key, due_value);
+
+        try file.beginTransaction();
+        try file.deleteDocument(outbox_key);
+        try file.deleteDocument(due_key);
+        try file.commitTransactionWithDurability(false, null);
+        try std.testing.expect(file.durable_header != null);
+        try file.sync();
+        try std.testing.expect(file.durable_header == null);
+        file.close();
+
+        var reopened = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{});
+        defer reopened.close();
+        const seed = try reopened.getDocumentAlloc(allocator, "seed");
+        defer if (seed) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualStrings("seed-value", seed orelse return error.TestExpectedEqual);
+
+        const outbox_row = try reopened.getDocumentAlloc(allocator, outbox_key);
+        defer if (outbox_row) |bytes| allocator.free(bytes);
+        try std.testing.expect(outbox_row == null);
+
+        const due_row = try reopened.getDocumentAlloc(allocator, due_key);
+        defer if (due_row) |bytes| allocator.free(bytes);
+        try std.testing.expect(due_row == null);
+    }
+}
+
 // ---------------------------------------------------------------------
 // Crash-during-ride-along regression (prefix-ordered durability)
 //
