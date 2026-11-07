@@ -115,6 +115,12 @@ const Capture = struct {
 /// `selected` holds unique packet indexes in any order.
 pub fn decodeTo(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []const usize, options: Options, sink: Sink) !Receipt {
     if (builtin.os.tag != .macos) return error.UnsupportedVideoBackend;
+    const original_track = reader.track;
+    const normalized = try config_info.normalizeReader(a, reader);
+    defer {
+        reader.track = original_track;
+        if (normalized) |bytes| a.free(bytes);
+    }
     try reader.input.control.check();
     if (reader.track.codec != .hevc or !hasParameterSets(reader.track.codec_config)) return error.UnsupportedVideoProfile;
     if (selected.len == 0 or selected.len > options.max_frames) return error.ResourceLimitExceeded;

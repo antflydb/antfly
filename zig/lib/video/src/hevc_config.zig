@@ -35,8 +35,9 @@ fn specified(value: ?u8) ?u8 {
     return if (code == 2) null else code;
 }
 
-/// The first SPS in the record. Null when parameter sets are only in-band; a record
-/// that declares an SPS this parser refuses is an error, not an SDR default.
+/// Metadata from the resolved record's first (active) SPS. Call normalizeReader
+/// before interpreting a multi-SPS track; array order alone is not activation.
+/// Null when no SPS exists; a refused SPS is an error, never an SDR default.
 pub fn parse(a: std.mem.Allocator, config: []const u8) !?Signal {
     const record = try nal.parseConfigurationRecord(config);
     var arrays = record.arrays();
@@ -116,15 +117,30 @@ pub fn hasParameterSets(config: []const u8) bool {
     return sps and pps;
 }
 
-/// Own the normalized configuration alongside any reader copies borrowing it.
-/// Only hev1 reads a sample; ordinary hvc1/AVC/AV1 inspection stays metadata-only.
+/// Resolve the picture's PPS->SPS chain and validate the clip's static policy.
+/// The optional owned record must outlive all reader copies borrowing its track.
 pub fn normalizeReader(a: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
-    if (reader.track.codec != .hevc or !reader.track.inband_parameter_sets or reader.packets.len == 0) return null;
-    var first = try reader.readPacket(0);
-    defer first.deinit();
-    const config = try fromInbandControlled(a, reader.track.codec_config, first.bytes, reader.track.nal_length_bytes, reader.input.control);
-    if (config) |bytes| reader.track.codec_config = bytes;
-    return config;
+    return @import("hevc_inspection.zig").resolveReader(a, reader);
+}
+
+/// Put the active SPS first for consumers of the resolved record. Preserve all
+/// other identities for switches that keep the same geometry and color policy.
+pub fn prioritizeSps(a: std.mem.Allocator, config: []const u8, active: u4, control: media.source.Control) !?[]u8 {
+    const record = try nal.parseConfigurationRecord(config);
+    var sets: SetTable = .{};
+    var arrays = record.arrays();
+    while (try arrays.next()) |array| {
+        if (array.nal_unit_type < 32 or array.nal_unit_type > 34) continue;
+        var nals = array.nals;
+        while (try nals.next()) |unit| _ = try sets.put(a, array.nal_unit_type, unit, control);
+    }
+    if (sets.units[1][active] == null) return error.MissingVideoParameterSet;
+    const unique = @as(usize, sets.count(0)) + sets.count(1) + sets.count(2);
+    if (sets.ids[1][0] == active and sets.parsed == unique) return null;
+    const where = std.mem.indexOfScalar(u8, sets.ids[1][0..sets.count(1)], active).?;
+    std.mem.copyBackwards(u8, sets.ids[1][1 .. where + 1], sets.ids[1][0..where]);
+    sets.ids[1][0] = active;
+    return try serialize(a, config, &sets);
 }
 
 /// Merge first-sample parameter sets with hvcC, including partially populated or
@@ -140,13 +156,9 @@ pub fn fromInbandControlled(a: std.mem.Allocator, config: []const u8, sample: []
     const record = try nal.parseConfigurationRecord(config);
     if (record.length_size != length_bytes) return error.MalformedVideoConfig;
     var sets: SetTable = .{};
-    var retained_arrays: u16 = 0;
     var arrays = record.arrays();
     while (try arrays.next()) |array| {
-        if (array.nal_unit_type < 32 or array.nal_unit_type > 34) {
-            retained_arrays += 1;
-            continue;
-        }
+        if (array.nal_unit_type < 32 or array.nal_unit_type > 34) continue;
         var nals = array.nals;
         while (try nals.next()) |unit| _ = try sets.put(a, array.nal_unit_type, unit, control);
     }
@@ -160,9 +172,19 @@ pub fn fromInbandControlled(a: std.mem.Allocator, config: []const u8, sample: []
         if (kind <= 34) changed = (try sets.put(a, kind, unit, control)) or changed;
     }
     if (!changed or sets.count(1) == 0 or sets.count(2) == 0) return null;
+    return try serialize(a, config, &sets);
+}
+
+fn serialize(a: std.mem.Allocator, config: []const u8, sets: *const SetTable) ![]u8 {
+    const record = try nal.parseConfigurationRecord(config);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     try out.appendSlice(a, config[0..22]);
+    var retained_arrays: u16 = 0;
+    var arrays = record.arrays();
+    while (try arrays.next()) |array| {
+        if (array.nal_unit_type < 32 or array.nal_unit_type > 34) retained_arrays += 1;
+    }
     var total_arrays = retained_arrays;
     for (0..3) |kind| total_arrays += @intFromBool(sets.count(kind) != 0);
     try out.append(a, std.math.cast(u8, total_arrays) orelse return error.MalformedVideoConfig);

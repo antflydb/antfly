@@ -1357,3 +1357,12 @@ probe with its effective parameter bootstrap. Failed append detaches the already
 admitted collector capacity to preserve the published metadata prefix without
 allocating rollback storage. Cohort teardown signals every producer before
 joining any member, so a queued preparation cannot strand a shared decoder lease.
+
+HEVC display/color metadata is resolved from each picture's PPS→SPS activation,
+not hvcC array order. Inspection reads sample zero plus bounded NAL-header probes;
+subsequent VCL payloads are skipped. The resolved reader carries a validation
+marker so preparation and cache planning reuse that work. Known parameter-set
+identities may switch when coded/display geometry, depth, SAR and color policy
+agree. Later parameter-set redefinitions or incompatible policy switches return
+`UnsupportedDynamicVideoConfig` before any frame is published; sparse VideoToolbox
+restarts currently use the initial configuration.

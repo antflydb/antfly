@@ -51,6 +51,12 @@ __device__ float rgb(const unsigned char *p, unsigned pitch, unsigned h,
     const unsigned char *uv = p + pitch*h + (y/2)*pitch + (x/2)*2*step;
     float u = luma_or_chroma(uv, high)-128.0f, v = luma_or_chroma(uv + step, high)-128.0f;
     if (!full) { yy=(yy-16.0f)*(255.0f/219.0f); u*=255.0f/224.0f; v*=255.0f/224.0f; }
+    else if (high) {
+        // A full-range ten-bit maximum is 1023, not 1020. Keep centered
+        // chroma on the same scale as luma before RGB and HDR gamut conversion.
+        const float scale = 1020.0f / 1023.0f;
+        yy *= scale; u *= scale; v *= scale;
+    }
     float kr = matrix == 1 ? 0.2126f : matrix == 9 ? 0.2627f : 0.299f;
     float kb = matrix == 1 ? 0.0722f : matrix == 9 ? 0.0593f : 0.114f;
     float kg = 1.0f-kr-kb;

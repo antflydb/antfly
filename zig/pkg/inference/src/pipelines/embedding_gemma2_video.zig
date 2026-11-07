@@ -170,6 +170,7 @@ pub const Inspection = struct {
     configuration: Configuration,
     reader: media.mp4.Reader = undefined,
     packet_input: ?PacketInput = null,
+    borrowed_hevc_config: ?[]u8 = null,
     webm_reader: media.webm.Reader = undefined,
     webm_index: ?video.webm_pictures.Index = null,
     webm: bool = false,
@@ -211,6 +212,7 @@ pub const Inspection = struct {
             if (borrowed) |reader| {
                 self.reader = reader.*;
                 self.reader.input = &self.source;
+                self.borrowed_hevc_config = try normalizeHevc(a, &self.reader);
             } else {
                 self.packet_input = try PacketInput.init(a, &self.source, bytes);
                 self.reader = self.packet_input.?.reader;
@@ -233,6 +235,7 @@ pub const Inspection = struct {
         if (self.owns_webm_index) self.webm_index.?.deinit();
         if (self.owns_webm_reader) self.webm_reader.deinit();
         if (self.packet_input) |*input| input.deinit();
+        if (self.borrowed_hevc_config) |bytes| a.free(bytes);
         std.debug.assert(self.bounded.live == 0);
         std.debug.assert(std.meta.eql(self.pool.snapshot(), media.admission.Resources{}));
         self.backing.destroy(self);
@@ -828,6 +831,15 @@ fn usesWebmLane(a: std.mem.Allocator, bytes: []const u8) bool {
 fn openWebmLane(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8) !media.webm.Reader {
     return if (isWebm(bytes)) media.webm.Reader.init(a, source, .{}) else video.mp4_coded.openWebm(a, source);
 }
+fn normalizeHevc(a: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
+    return video.hevc_config.normalizeReader(a, reader) catch |err| switch (err) {
+        // This parser and both output routes share the 4:2:0 Main/Main10
+        // envelope. Preserve the codec-unavailable identity for unsupported
+        // HEVC profiles, including CPU-only hosts and CUDA fallback.
+        error.UnsupportedVideoProfile => return error.HevcDecoderUnavailable,
+        else => return err,
+    };
+}
 // Own normalized TS storage alongside the packet reader. Returning this owner
 // is safe: the snapshot's Source address is stable until deinit.
 pub const PacketInput = struct {
@@ -846,7 +858,7 @@ pub const PacketInput = struct {
         }
         var input = PacketInput{ .reader = try media.mp4.Reader.init(a, source, video.mp4_coded.limits), .allocator = a };
         errdefer input.deinit();
-        input.inband_config = try video.hevc_config.normalizeReader(a, &input.reader);
+        input.inband_config = try normalizeHevc(a, &input.reader);
         return input;
     }
     pub fn deinit(self: *PacketInput) void {
@@ -1150,6 +1162,8 @@ pub fn inspectReaderPlanWithSelection(a: std.mem.Allocator, borrowed: *const med
     source.limits = borrowed.input.limits;
     var reader = borrowed.*;
     reader.input = &source;
+    const normalized = try normalizeHevc(a, &reader);
+    defer if (normalized) |config_bytes| a.free(config_bytes);
     return inspectPacketPlan(a, &reader, control, sampling, metal, selection);
 }
 pub fn inspectConfiguredPlan(a: std.mem.Allocator, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration, metal: bool) !Plan {
@@ -1549,6 +1563,8 @@ pub const Prefetch = struct {
             reader = packet_input.?.reader;
         }
         defer if (inspection == null and webm and self.webm_input == null) webm_reader.deinit() else if (packet_input) |*input| input.deinit();
+        const normalized_hevc = if (webm) null else try normalizeHevc(a, &reader);
+        defer if (normalized_hevc) |bytes_owned| a.free(bytes_owned);
         var webm_index: ?video.webm_pictures.Index = if (inspection) |owner| owner.webm_index else if (self.webm_input) |input| input.index.* else if (webm) try video.webm_pictures.index(a, &webm_reader, webmDecodeOptions(source.control, pool)) else null;
         if (webm_index) |*index| index.reader = &webm_reader;
         defer if (inspection == null and self.webm_input == null) {
@@ -2049,6 +2065,8 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         reader = packet_input.?.reader;
     }
     defer if (inspection == null and webm and webm_input == null) webm_reader.deinit() else if (packet_input) |*input| input.deinit();
+    const normalized_hevc = if (webm) null else try normalizeHevc(a, &reader);
+    defer if (normalized_hevc) |bytes_owned| a.free(bytes_owned);
     var webm_index: ?video.webm_pictures.Index = if (inspection) |owner| owner.webm_index else if (webm_input) |input| input.index.* else if (webm) try video.webm_pictures.index(a, &webm_reader, webmDecodeOptions(source.control, pool)) else null;
     if (webm_index) |*index| index.reader = &webm_reader;
     defer if (inspection == null and webm_input == null) {
@@ -5681,4 +5699,27 @@ test "model aware media frame observer shares original decoder surfaces before m
         try std.testing.expectEqual(@as(usize, 1), observer.calls);
         try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
     }
+}
+
+test "HEVC borrowed readers and inspection scopes share active SPS geometry" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/codecs/hevc-multi-sps.mp4");
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "borrowed-multi-sps" };
+    var reader = try media.mp4.Reader.init(a, &source, video.mp4_coded.limits);
+    defer reader.deinit();
+    const initial = reader.track.codec_config;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+    const expected = try inspectPlan(a, bytes, .{}, .reference, &pool, true);
+    const borrowed = try inspectReaderPlan(a, &reader, .{}, .reference, &pool, true);
+    try std.testing.expectEqual(expected.sequence_tokens, borrowed.sequence_tokens);
+    try std.testing.expectEqual(expected.patch_output_bytes, borrowed.patch_output_bytes);
+    var scope = InspectionScope{ .allocator = a };
+    defer scope.deinit();
+    const scoped = try scope.inspect(bytes, &reader, .{}, .{}, true);
+    try std.testing.expectEqual(expected.patch_output_bytes, scoped.patch_output_bytes);
+    try std.testing.expect(scope.entries[0].?.reader.track.hevc_policy_validated);
+    try std.testing.expectEqual(@as(u32, 2), (try video.hevc_config.parse(a, scope.entries[0].?.reader.track.codec_config)).?.sar.horizontal);
+    // Borrowed metadata and ownership belong to the caller, never to the scope.
+    try std.testing.expectEqual(initial.ptr, reader.track.codec_config.ptr);
+    try std.testing.expect(!reader.track.hevc_policy_validated);
 }

@@ -510,8 +510,10 @@ test "gemma4 video names the missing HEVC route instead of calling the clip corr
     };
     var context: u8 = 0;
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes } };
-    const result = embedding_video.observeConfigured(a, @embedFile("../testdata/video/codecs/hevc-hvc1.mp4"), null, .{}, .{ .observer = .{ .context = &context, .accept = Reject.accept }, .sampling = sampling, .pool = &pool, .decoder = .{ .policy = .portable } });
-    try std.testing.expectError(error.HevcDecoderUnavailable, result);
+    inline for (.{ "hevc-hvc1.mp4", "hevc-422.mp4" }) |name| {
+        const result = embedding_video.observeConfigured(a, @embedFile("../testdata/video/codecs/" ++ name), null, .{}, .{ .observer = .{ .context = &context, .accept = Reject.accept }, .sampling = sampling, .pool = &pool, .decoder = .{ .policy = .portable } });
+        try std.testing.expectError(error.HevcDecoderUnavailable, result);
+    }
     // The shared input normalizer must keep this distinct from corrupt media.
     try std.testing.expectEqual(error.HevcDecoderUnavailable, inputError(error.HevcDecoderUnavailable));
 }
@@ -573,28 +575,40 @@ test "gemma4 video reports presentation size for anamorphic containers" {
 test "HEVC inband SAR agrees across admission planning and decoded presentation" {
     if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;
-    const inband = @embedFile("../testdata/video/codecs/hevc-sar-inband.mp4");
-    const original = @embedFile("../testdata/video/codecs/hevc-sar-nopasp.mp4");
-    var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes, .device_bytes = video.apple_hevc.max_surface_bytes } };
-    const expected = try embedding_video.inspectPlan(a, original, .{}, sampling, &pool, true);
-    const actual = try embedding_video.inspectPlan(a, inband, .{}, sampling, &pool, true);
-    try std.testing.expectEqual(expected.sequence_tokens, actual.sequence_tokens);
-    try std.testing.expectEqual(expected.patch_output_bytes, actual.patch_output_bytes);
-    try std.testing.expectEqual(reservation(a, original), reservation(a, inband));
-    const Record = struct {
-        seen: usize = 0,
-        fn accept(raw: *anyopaque, _: usize, frame: video.preparation.BorrowedFrame, options: video.preparation.Options, control: media.source.Control) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            try std.testing.expectEqual(@as(u32, 128), options.presentation_width);
-            try std.testing.expectEqual(@as(u32, 64), options.presentation_height);
-            var displayed = try frame.display(std.testing.allocator, options, control);
-            defer displayed.deinit(std.testing.allocator);
-            try std.testing.expectEqual(@as(u32, 64), displayed.width);
-            try std.testing.expectEqual(@as(u32, 64), displayed.height);
-            self.seen += 1;
+    inline for (.{ "hevc-sar-inband.mp4", "hevc-multi-sps.mp4" }) |name| {
+        const inband = @embedFile("../testdata/video/codecs/" ++ name);
+        const original = @embedFile("../testdata/video/codecs/hevc-sar-nopasp.mp4");
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes, .device_bytes = video.apple_hevc.max_surface_bytes } };
+        const expected = try embedding_video.inspectPlan(a, original, .{}, sampling, &pool, true);
+        const actual = try embedding_video.inspectPlan(a, inband, .{}, sampling, &pool, true);
+        try std.testing.expectEqual(expected.sequence_tokens, actual.sequence_tokens);
+        try std.testing.expectEqual(expected.patch_output_bytes, actual.patch_output_bytes);
+        try std.testing.expectEqual(reservation(a, original), reservation(a, inband));
+        const Record = struct {
+            seen: usize = 0,
+            fn accept(raw: *anyopaque, _: usize, frame: video.preparation.BorrowedFrame, options: video.preparation.Options, control: media.source.Control) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try std.testing.expectEqual(@as(u32, 128), options.presentation_width);
+                try std.testing.expectEqual(@as(u32, 64), options.presentation_height);
+                var displayed = try frame.display(std.testing.allocator, options, control);
+                defer displayed.deinit(std.testing.allocator);
+                try std.testing.expectEqual(@as(u32, 64), displayed.width);
+                try std.testing.expectEqual(@as(u32, 64), displayed.height);
+                self.seen += 1;
+            }
+        };
+        var record: Record = .{};
+        try embedding_video.observeConfigured(a, inband, null, .{}, .{ .observer = .{ .context = &record, .accept = Record.accept }, .sampling = sampling, .pool = &pool });
+        try std.testing.expect(record.seen != 0);
+        var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = inband }, .identity = "borrowed-sar" };
+        var reader = try media.mp4.Reader.init(a, &source, video.mp4_coded.limits);
+        defer reader.deinit();
+        for ([_]bool{ false, true }) |scoped| {
+            var scope = embedding_video.InspectionScope{ .allocator = a };
+            defer scope.deinit();
+            record.seen = 0;
+            try embedding_video.observeConfigured(a, inband, &reader, .{}, .{ .observer = .{ .context = &record, .accept = Record.accept }, .sampling = sampling, .pool = &pool, .inspection_scope = if (scoped) &scope else null });
+            try std.testing.expect(record.seen != 0);
         }
-    };
-    var record: Record = .{};
-    try embedding_video.observeConfigured(a, inband, null, .{}, .{ .observer = .{ .context = &record, .accept = Record.accept }, .sampling = sampling, .pool = &pool });
-    try std.testing.expect(record.seen != 0);
+    }
 }

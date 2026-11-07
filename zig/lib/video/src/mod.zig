@@ -47,6 +47,7 @@ test {
     _ = mp4_coded;
     _ = hevc_restart;
     _ = hevc_config;
+    _ = @import("hevc_inspection.zig");
     _ = apple_hevc;
     _ = live_coordinator;
     _ = live_windows;

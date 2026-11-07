@@ -36,6 +36,8 @@ pub const Codec = enum { avc, mjpeg, hevc, av1 };
 pub const Track = struct {
     codec: Codec = .avc,
     inband_parameter_sets: bool = false,
+    /// Header inspection resolved HEVC activation and validated one static policy.
+    hevc_policy_validated: bool = false,
     id: u32,
     timescale: u32,
     width: u16,
