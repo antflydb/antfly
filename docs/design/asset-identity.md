@@ -9,7 +9,7 @@ embedder run (see Verification).
 Identity shouldn't depend on where bytes live. A document that moves to a
 new URL, bucket, hostname, or provider is still the same document if its
 bytes are unchanged, and the system that owns a document's identity should
-say so without needing to know anything about *why* it moved. This task
+say so without needing to know anything about *why* it moved. This design
 gives each system exactly one change, and neither is specific to migration:
 Antfly gets a way to identify a document by a declared content digest
 instead of by its location, and antfly-source gets a way to key a row by a
@@ -103,7 +103,7 @@ row key before this; a verified digest (`go/pkg/sources/document.go`'s
 `metadata["sha256"]`) lives nested under `metadata` in antfly-source's row
 envelope, not at the top level. Rather than ask antfly-source to duplicate
 that digest into a second, top-level field purely for Antfly's convenience —
-which would create exactly the kind of second source of truth this task is
+which would create exactly the kind of second source of truth this design is
 trying to avoid — the row-field lookup (`dupeOptionalStringField`) now walks
 a dot-separated path (e.g. `checksum_field: "metadata.sha256"`) through
 nested objects when the field name contains one. A field name with no dot is
@@ -268,7 +268,7 @@ change: a rotated signed URL or refreshed presigned token (the URL changes,
 the bytes don't); a CDN or hostname change in front of the same object; an
 S3 bucket rename or a cross-region move; mirroring the same bucket to a
 second provider for redundancy; and a provider migration in the other
-direction, GCS to S3. Each of these changes exactly the fields this task
+direction, GCS to S3. Each of these changes exactly the fields this design
 removed from Antfly's fingerprint and from antfly-source's key formula, and
 nothing else.
 
@@ -292,7 +292,7 @@ migration would impose.
 **A global content-digest cache.** A cache mapping content digests to
 already-computed derived artifacts, shared across sources and even across
 tables, would also solve "don't recompute what we've already computed" and
-would generalize further than this task's scope (for example, to two
+would generalize further than this design's scope (for example, to two
 unrelated sources that happen to ingest the same file). It's a reasonable
 project on its own, but a materially larger one — it needs its own storage,
 eviction, and consistency story independent of any one producer or table —
@@ -323,14 +323,14 @@ not (see `identity.namespace`'s `LegacyNamespace` derivation above).
 
 Signed media references (`service_media_http.go`'s `media_pin`) bind to a
 source's connection and config (`sourceMediaBinding`), so any connection or
-config change — including the one this task's own migration path makes —
+config change — including the one `migrate-local` makes —
 invalidates every outstanding pin immediately (410) rather than waiting for
-the next sync or prune pass. That gap predates this task and is unrelated to
+the next sync or prune pass. That gap predates this design and is unrelated to
 it: it exists whether or not a row's ID changes, and whether or not derived
 data survives. Loosening it to tolerate a connection change within the same
 provider identity is a separate security decision (pins exist specifically
 to bind a signed reference to the connection that was authorized to serve
-it), not something this task's identity model should casually relax as a
+it), not something this identity model should casually relax as a
 side effect.
 
 A generic field-scoped skip check for *every* producer kind — so that a
@@ -349,7 +349,7 @@ that whole-row digest changes whenever *any* field changes, including
 for correctness properties beyond simple caching (it is also how a producer
 notices its row changed underneath it at all), so narrowing it is a
 separate change with its own review, not a small adjustment to make here
-silently. It does not affect the document-extraction pipeline this task's
+silently. It does not affect the document-extraction pipeline this design's
 proof exercises, which chunks before embedding.
 
 ## Verification
@@ -380,14 +380,14 @@ verification agreed -- `rekeys: false` -- so this, the source's first-ever
 provider change, never re-keyed anything (the actual destination objects
 were independently read back and hashed and matched):
 
-- The extraction-fetch log added for this proof (`document extraction
+- The extraction-fetch log added to prove this (`document extraction
   fetching source`, in both `enrichment_runtime.zig` and
   `mutation_materialization.zig`) recorded **zero** new fetches across the
   move: 1 before, 1 after.
 - `skip_by_hash_count` on the table's `document_vectors` index went from
   0 to 2 across the same move: one skip for `document_extraction`'s own
   fingerprint, one for the chunk-sourced embedding's content hash --
-  exactly the two producers this task's checks traced.
+  exactly the two producers traced for this design.
 - The row's ID was byte-for-byte identical before and after
   (`.../records/ee2d74315f...`); only `source.uri` changed, from
   `local:///...` to `s3://asset-identity2/...`. The adopted namespace,
