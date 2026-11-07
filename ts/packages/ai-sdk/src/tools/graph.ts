@@ -60,14 +60,14 @@ export function createGraphTool(options: AntflyGraphToolOptions): Record<string,
       const kind = kinds[0];
       const body = { ...(op[kind] as Record<string, unknown>) };
       if (kind === "match") {
-        const existingReturn = (body.return as Record<string, unknown>) ?? {};
+        const existingReturn = (op.return as Record<string, unknown>) ?? {};
         if (existingReturn.aggregates === undefined) {
-          body.return = {
+          op.return = {
             ...existingReturn,
             limit: clamp(existingReturn.limit as number, maxResults),
           };
         } else {
-          body.return = existingReturn;
+          op.return = existingReturn;
         }
       } else {
         body.max_depth = clamp(body.max_depth as number, maxDepth);
@@ -87,7 +87,8 @@ export function createGraphTool(options: AntflyGraphToolOptions): Record<string,
         operations: z.record(z.string(), z.record(z.string(), z.unknown())),
       })
       .strict(),
-    execute: async ({ operations }) => {
+    execute: async ({ operations }, { abortSignal }) => {
+      abortSignal?.throwIfAborted();
       const graph_queries = scoped(operations as Record<string, GraphOperation>);
       // The server's GraphQuery schema is a precise discriminated union; this
       // tool intentionally accepts the looser bounded-JSON shape the model
@@ -96,10 +97,14 @@ export function createGraphTool(options: AntflyGraphToolOptions): Record<string,
       // the `{ responses: [...] }` envelope (unlike `client.query`, which
       // unwraps it), already checked against this request by
       // `validateGraphQueryResponses` inside the SDK.
-      const envelope = await options.client.tables.query(options.table, {
-        graph_queries: graph_queries as never,
-        limit: 0,
-      });
+      const envelope = await options.client.tables.query(
+        options.table,
+        {
+          graph_queries: graph_queries as never,
+          limit: 0,
+        },
+        { signal: abortSignal }
+      );
       const first = (envelope as { responses?: { graph_results?: unknown }[] } | undefined)
         ?.responses?.[0];
       return first?.graph_results ?? {};

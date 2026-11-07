@@ -9,6 +9,7 @@ import type {
   SharedV4Warning,
 } from "@ai-sdk/provider";
 import type { AntflyClient, GenerateRequest, InferenceClient } from "@antfly/sdk";
+import { abortable, combinedSignal } from "./abort.js";
 import { resolveAuthorizedAsset } from "./asset/catalog.js";
 import { type AuthorizeAsset, decodeAssetReference } from "./asset/reference.js";
 import {
@@ -71,14 +72,18 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
     const { client, authorizeAsset } = options;
     this.resolveSource =
       client && authorizeAsset
-        ? (id: string) => resolveAuthorizedAsset(client, authorizeAsset, decodeAssetReference(id))
+        ? (id: string, signal?: AbortSignal) =>
+            resolveAuthorizedAsset(client, authorizeAsset, decodeAssetReference(id), signal)
         : undefined;
   }
 
   async doGenerate(options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
     const warnings: SharedV4Warning[] = [];
-    const request = await this.buildRequest(options, warnings);
-    const response = await this.inference.generate(request, { signal: options.abortSignal });
+    const request = await abortable(this.buildRequest(options, warnings), options.abortSignal);
+    const response = await this.inference.generate(request, {
+      signal: options.abortSignal,
+      headers: options.headers,
+    });
     return {
       content: toContent(response),
       finishReason: toFinishReason(response.choices[0]?.finish_reason),
@@ -94,20 +99,33 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
 
   async doStream(options: LanguageModelV4CallOptions): Promise<LanguageModelV4StreamResult> {
     const warnings: SharedV4Warning[] = [];
-    const request = await this.buildRequest(options, warnings);
-    const parts = this.streamParts(request, warnings, options.abortSignal);
+    const cancellation = new AbortController();
+    const signal = combinedSignal(options.abortSignal, cancellation.signal);
+    const request = await abortable(
+      this.buildRequest({ ...options, abortSignal: signal }, warnings),
+      signal
+    );
+    const parts = this.streamParts(request, warnings, signal, options.headers);
+    let cancelled = false;
     return {
       stream: new ReadableStream<LanguageModelV4StreamPart>({
         async pull(controller) {
-          const next = await parts.next();
-          if (next.done) {
-            controller.close();
-          } else {
-            controller.enqueue(next.value);
+          try {
+            const next = await parts.next();
+            // cancel() may run while next() is waiting for a network read.
+            if (cancelled) return;
+            if (next.done) controller.close();
+            else controller.enqueue(next.value);
+          } catch (error) {
+            if (!cancelled) controller.error(error);
           }
         },
-        async cancel() {
-          await parts.return?.(undefined);
+        cancel(reason) {
+          cancelled = true;
+          cancellation.abort(reason);
+          // Abort interrupts a pending read. Do not queue cancellation behind
+          // an uncooperative iterator; observe its eventual cleanup instead.
+          void parts.return?.(undefined).catch(() => {});
         },
       }),
     };
@@ -133,9 +151,14 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
     }
     const responseFormat = toResponseFormat(options.responseFormat, warnings);
     const tools = toInferenceTools(options.tools, warnings);
+    const resolver = this.resolveSource;
     return {
       model: this.modelId,
-      messages: await toInferenceMessages(options.prompt, warnings, this.resolveSource),
+      messages: await toInferenceMessages(
+        options.prompt,
+        warnings,
+        resolver ? (id) => resolver(id, options.abortSignal) : undefined
+      ),
       max_tokens: options.maxOutputTokens,
       temperature: options.temperature,
       top_p: options.topP,
@@ -150,7 +173,8 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
   private async *streamParts(
     request: Omit<GenerateRequest, "stream">,
     warnings: SharedV4Warning[],
-    signal: AbortSignal | undefined
+    signal: AbortSignal | undefined,
+    headers: LanguageModelV4CallOptions["headers"]
   ): AsyncGenerator<LanguageModelV4StreamPart> {
     yield { type: "stream-start", warnings };
     let sentResponseMetadata = false;
@@ -160,12 +184,12 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
     const reasoningId = "reasoning-0";
     const toolCalls = new Map<
       number,
-      { id: string; name: string; args: string; started: boolean }
+      { id?: string; name: string; args: string; started: boolean }
     >();
     let finishReason: LanguageModelV4FinishReason = { unified: "other", raw: undefined };
     let usage: LanguageModelV4Usage = toUsage(undefined);
     try {
-      for await (const chunk of this.inference.generateStream(request, { signal })) {
+      for await (const chunk of this.inference.generateStream(request, { signal, headers })) {
         if (!sentResponseMetadata) {
           yield {
             type: "response-metadata",
@@ -197,23 +221,21 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
           const index = toolDelta.index ?? 0;
           let state = toolCalls.get(index);
           if (!state) {
-            state = {
-              id: toolDelta.id ?? `call_${index}`,
-              name: toolDelta.function?.name ?? "",
-              args: "",
-              started: false,
-            };
+            state = { name: "", args: "", started: false };
             toolCalls.set(index, state);
           }
-          if (!state.started && state.name) {
+          if (toolDelta.id && !state.started) state.id = toolDelta.id;
+          if (toolDelta.function?.name) state.name += toolDelta.function.name;
+          const args = toolDelta.function?.arguments ?? "";
+          state.args += args;
+          // Names may span deltas. Arguments mark the boundary; buffer any
+          // early arguments until the provider has supplied both ID and name.
+          if (!state.started && state.id && state.name && state.args.length > 0) {
             yield { type: "tool-input-start", id: state.id, toolName: state.name };
+            yield { type: "tool-input-delta", id: state.id, delta: state.args };
             state.started = true;
-          }
-          if (toolDelta.function?.arguments) {
-            state.args += toolDelta.function.arguments;
-            if (state.started) {
-              yield { type: "tool-input-delta", id: state.id, delta: toolDelta.function.arguments };
-            }
+          } else if (state.started && state.id && args) {
+            yield { type: "tool-input-delta", id: state.id, delta: args };
           }
         }
         if (choice.finish_reason) finishReason = toFinishReason(choice.finish_reason);
@@ -224,9 +246,15 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
     }
     if (reasoningOpen) yield { type: "reasoning-end", id: reasoningId };
     if (textOpen) yield { type: "text-end", id: textId };
-    for (const state of toolCalls.values()) {
-      if (state.started) yield { type: "tool-input-end", id: state.id };
-      yield { type: "tool-call", toolCallId: state.id, toolName: state.name, input: state.args };
+    for (const [index, state] of toolCalls) {
+      if (!state.name) throw new Error("Antfly tool-call stream ended without a function name");
+      const id = state.id ?? `call_${index}`;
+      if (!state.started) {
+        yield { type: "tool-input-start", id, toolName: state.name };
+        if (state.args) yield { type: "tool-input-delta", id, delta: state.args };
+      }
+      yield { type: "tool-input-end", id };
+      yield { type: "tool-call", toolCallId: id, toolName: state.name, input: state.args };
     }
     yield { type: "finish", usage, finishReason };
   }

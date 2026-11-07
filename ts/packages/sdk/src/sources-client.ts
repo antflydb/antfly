@@ -30,6 +30,21 @@ export interface SourceDefinition {
   identity?: { namespace?: string };
 }
 
+/** Durable migration lineage returned by the companion; clients cannot mutate it directly. */
+export interface LocalMigrationReceipt {
+  version: 1;
+  source_id: string;
+  table: string;
+  namespace: string;
+  from_connection: string;
+  from_prefix: string;
+  from_binding: string;
+  to_connection: string;
+  to_bucket: string;
+  to_prefix: string;
+  to_binding: string;
+}
+
 export interface SourceProfile {
   version: 1;
   endpoint: string;
@@ -38,6 +53,7 @@ export interface SourceProfile {
   principals?: string[];
   connections: Record<string, SourceConnection>;
   sources: SourceDefinition[];
+  readonly local_migrations?: Record<string, LocalMigrationReceipt>;
 }
 
 export interface SourceSyncJob {

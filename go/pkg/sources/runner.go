@@ -38,13 +38,14 @@ import (
 const maxOwnedSourceObjects = 1000000
 
 type Profile struct {
-	CatalogTable      string                `json:"catalog_table,omitempty"`
-	Version           int                   `json:"version"`
-	Endpoint          string                `json:"endpoint"`
-	DataPlaneTokenEnv string                `json:"data_plane_token_env,omitempty"`
-	Principals        []string              `json:"principals,omitempty"`
-	Connections       map[string]Connection `json:"connections"`
-	Sources           []Source              `json:"sources"`
+	LocalMigrations   map[string]LocalMigrationReceipt `json:"local_migrations,omitempty"`
+	CatalogTable      string                           `json:"catalog_table,omitempty"`
+	Version           int                              `json:"version"`
+	Endpoint          string                           `json:"endpoint"`
+	DataPlaneTokenEnv string                           `json:"data_plane_token_env,omitempty"`
+	Principals        []string                         `json:"principals,omitempty"`
+	Connections       map[string]Connection            `json:"connections"`
+	Sources           []Source                         `json:"sources"`
 }
 
 // Identity names the opaque prefix that scopes a source's row keys,
@@ -412,13 +413,8 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if c, ok := connector.(*CollaborationConnector); ok {
 		// Pool immutable provider transports/token sources, never per-acquisition
 		// cursors, scope caches, or hydration state across logical sources.
-		run := CollaborationConnector{
-			ProviderName: c.ProviderName, HTTPClient: c.HTTPClient, AccessToken: c.AccessToken,
-			Services: c.Services, APIBase: c.APIBase, GmailBase: c.GmailBase, CalendarBase: c.CalendarBase,
-			DriveBase: c.DriveBase, Extractor: c.Extractor, DownloadTransport: c.DownloadTransport,
-			NativeAttachments: c.NativeAttachments, ExtractorVersion: c.ExtractorVersion, accessAuditWindow: c.accessAuditWindow, accessWait: c.accessWait,
-		}
-		c, connector = &run, &run
+		run := c.newAcquisition()
+		c, connector = run, run
 		c.Baseline = state.Published
 		if r.Restart {
 			c.Baseline = nil

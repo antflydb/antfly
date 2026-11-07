@@ -156,6 +156,16 @@ export class InferenceClient {
     });
   }
 
+  /** Each call owns its headers; protocol negotiation stays with the selected decoder. */
+  private requestHeaders(overrides: RequestOptions["headers"], accept: string): Headers {
+    const headers = new Headers(this.headers);
+    for (const [name, value] of Object.entries(overrides ?? {})) {
+      if (value !== undefined) headers.set(name, value);
+    }
+    headers.set("Accept", accept);
+    return headers;
+  }
+
   /** Generate one non-streaming chat completion. */
   async generate(
     request: Omit<GenerateRequest, "stream">,
@@ -163,10 +173,7 @@ export class InferenceClient {
   ): Promise<GenerateResponse> {
     const response = await fetch(`${this.baseUrl}/ai/v1/generate`, {
       method: "POST",
-      headers: {
-        ...this.headers,
-        Accept: "application/json",
-      },
+      headers: this.requestHeaders(options?.headers, "application/json"),
       body: JSON.stringify({ ...request, stream: false }),
       signal: options?.signal,
     });
@@ -202,10 +209,7 @@ export class InferenceClient {
   ): Promise<ContextPrepareResponse> {
     const response = await fetch(`${this.baseUrl}/ai/v1/generate/context/prepare`, {
       method: "POST",
-      headers: {
-        ...this.headers,
-        Accept: "application/json",
-      },
+      headers: this.requestHeaders(options?.headers, "application/json"),
       body: JSON.stringify(request),
       signal: options?.signal,
     });
@@ -234,10 +238,7 @@ export class InferenceClient {
   ): AsyncGenerator<GenerateChunk, void, void> {
     const response = await fetch(`${this.baseUrl}/ai/v1/generate`, {
       method: "POST",
-      headers: {
-        ...this.headers,
-        Accept: "text/event-stream",
-      },
+      headers: this.requestHeaders(options?.headers, "text/event-stream"),
       body: JSON.stringify({ ...request, stream: true }),
       signal: options?.signal,
     });
@@ -331,6 +332,7 @@ export class InferenceClient {
       },
       parseAs: "json",
       signal: options?.signal,
+      headers: this.requestHeaders(options?.headers, "application/json"),
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Embed failed: unexpected empty response");
@@ -361,10 +363,7 @@ export class InferenceClient {
     const response = await fetch(`${this.baseUrl}/ai/v1/embed`, {
       method: "POST",
       signal: options?.signal,
-      headers: {
-        ...this.headers,
-        Accept: NUMERIC_RESPONSE_ACCEPT,
-      },
+      headers: this.requestHeaders(options?.headers, NUMERIC_RESPONSE_ACCEPT),
       body: JSON.stringify({
         model,
         input,
@@ -447,6 +446,7 @@ export class InferenceClient {
         config,
       },
       signal: options?.signal,
+      headers: this.requestHeaders(options?.headers, "application/json"),
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Chunk failed: unexpected empty response");
@@ -462,6 +462,7 @@ export class InferenceClient {
     const { data, error, response } = await this.client.POST("/ai/v1/chunk", {
       body: { ...request, stream: false },
       signal: options?.signal,
+      headers: this.requestHeaders(options?.headers, "application/json"),
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);
     if (data?.object !== "chunk.embedding.list")
@@ -476,7 +477,7 @@ export class InferenceClient {
   ): AsyncGenerator<ChunkEmbeddingStreamEvent> {
     const response = await fetch(`${this.baseUrl}/ai/v1/chunk`, {
       method: "POST",
-      headers: { ...this.headers, Accept: "application/x-ndjson" },
+      headers: this.requestHeaders(options?.headers, "application/x-ndjson"),
       body: JSON.stringify({ ...request, stream: true }),
       signal: options?.signal,
     });
@@ -583,10 +584,11 @@ export class InferenceClient {
     model: string,
     query: string,
     documents: RerankDocument[],
-    options?: { signal?: AbortSignal }
+    options?: RequestOptions
   ): Promise<RerankResponse> {
     const { data, error, response } = await this.client.POST("/ai/v1/rerank", {
       signal: options?.signal,
+      headers: this.requestHeaders(options?.headers, "application/json"),
       body: {
         model,
         query,
@@ -839,6 +841,7 @@ export class InferenceClient {
   ): Promise<components["schemas"]["InferenceModelInstanceList"]> {
     const { data, error, response } = await this.client.GET("/ai/v1/models/instances", {
       signal: options?.signal,
+      headers: this.requestHeaders(options?.headers, "application/json"),
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("List model instances failed: unexpected empty response");
@@ -853,6 +856,7 @@ export class InferenceClient {
     const { data, error, response } = await this.client.POST("/ai/v1/models/instances", {
       body: request,
       signal: options?.signal,
+      headers: this.requestHeaders(options?.headers, "application/json"),
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Load model instance failed: unexpected empty response");
@@ -866,7 +870,11 @@ export class InferenceClient {
   ): Promise<components["schemas"]["InferenceModelInstanceUnloadResponse"]> {
     const { data, error, response } = await this.client.DELETE(
       "/ai/v1/models/instances/{instance_id}",
-      { params: { path: { instance_id: instanceId } }, signal: options?.signal }
+      {
+        params: { path: { instance_id: instanceId } },
+        signal: options?.signal,
+        headers: this.requestHeaders(options?.headers, "application/json"),
+      }
     );
     if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Unload model instance failed: unexpected empty response");

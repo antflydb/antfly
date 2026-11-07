@@ -124,3 +124,57 @@ it.each([
   expect(response.headers.get("content-security-policy")).toContain("sandbox");
   expect(response.headers.get("cache-control")).toBe("private, no-store");
 });
+
+it("HEAD display uses HEAD upstream and returns no body", async () => {
+  let method: string | undefined;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = input instanceof Request ? input : new Request(input, init);
+      if (req.url.includes("/documents/")) return Response.json({ content: { resource } });
+      method = req.method;
+      return new Response(method === "HEAD" ? null : "abc");
+    })
+  );
+  const handler = createAssetDisplayHandler({
+    client: new AntflyClient({ baseUrl: "http://db.test" }),
+    authorize: () => true,
+    referenceId: () => encodeAssetReference(reference),
+  });
+  const response = await handler(new Request("http://app.test/file", { method: "HEAD" }));
+  expect(method).toBe("HEAD");
+  expect(response.body).toBeNull();
+});
+it("display cancellation aborts an in-flight catalog lookup", async () => {
+  let finish!: (response: Response) => void;
+  let signal: AbortSignal | undefined;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = input instanceof Request ? input : new Request(input, init);
+      if (!req.url.includes("/documents/")) {
+        req.signal.throwIfAborted();
+        return new Response("abc");
+      }
+      signal = req.signal;
+      return new Promise<Response>((resolve) => {
+        finish = resolve;
+      });
+    })
+  );
+  const controller = new AbortController();
+  const handler = createAssetDisplayHandler({
+    client: new AntflyClient({ baseUrl: "http://db.test" }),
+    authorize: () => true,
+    referenceId: () => encodeAssetReference(reference),
+  });
+  const pending = handler(new Request("http://app.test/file", { signal: controller.signal })).catch(
+    () => undefined
+  );
+  await vi.waitFor(() => expect(signal).toBeDefined());
+  controller.abort();
+  const aborted = signal?.aborted;
+  finish(Response.json({ content: { resource } }));
+  await pending;
+  expect(aborted).toBe(true);
+});

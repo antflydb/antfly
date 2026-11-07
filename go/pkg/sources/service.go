@@ -269,6 +269,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveManagement(w, r)
 		return
 	}
+	var adoption *namespaceAdoptionCheck
 	// Authentication happens before decoding, but no service lock is held
 	// while a caller sends its request body or a provider builds a client.
 	if r.Method == http.MethodPut || r.Method == http.MethodPost {
@@ -303,6 +304,13 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					serviceError(w, 409, "source_destination_immutable")
 					return
 				}
+				if candidate.ID == strings.TrimPrefix(r.URL.Path, "/v1/sources/") && candidate.Identity.Namespace != "" {
+					adoption = s.prepareNamespaceAdoption(r.Context(), candidate.ID, candidate.Identity.Namespace)
+					if r.Context().Err() != nil {
+						serviceError(w, http.StatusRequestTimeout, "request_cancelled")
+						return
+					}
+				}
 			}
 		}
 		r.Body = io.NopCloser(bytes.NewReader(raw))
@@ -319,7 +327,14 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/v1/profile" && r.Method == http.MethodGet {
+		w.Header().Set("X-Antfly-Source-Preconditions", "2")
 		serviceJSON(w, 200, s.profile)
+		return
+	}
+	// Migration fences source and connection changes in the same critical
+	// section as PUT/sync admission. No provider I/O is needed for this check.
+	if !migrationConnectionsMatch(s.profile, r.Header.Get("X-Antfly-Migration-Connections")) {
+		serviceError(w, http.StatusPreconditionFailed, "migration_connection_revision_changed")
 		return
 	}
 	if r.URL.Path == "/v1/sync" && r.Method == http.MethodPost {
@@ -332,6 +347,19 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err := serviceDecode(w, r, &input); err != nil {
 			serviceError(w, 400, "invalid_request")
 			return
+		}
+		if condition := r.Header.Get("If-Match"); condition != "" {
+			matches := false
+			for _, source := range s.profile.Sources {
+				if source.ID == input.SourceID && sourceRevision(source) == condition {
+					matches = true
+					break
+				}
+			}
+			if !matches || input.PurgeOnly {
+				serviceError(w, http.StatusPreconditionFailed, "source_revision_changed")
+				return
+			}
 		}
 		if err := s.validateProfile(s.profile); err != nil {
 			serviceError(w, 400, "invalid_source_profile")
@@ -585,6 +613,14 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				serviceError(w, 400, "invalid_source")
 				return
 			}
+			if condition := r.Header.Get("If-Match"); condition != "" && (index < 0 || condition != sourceRevision(next.Sources[index])) {
+				serviceError(w, http.StatusPreconditionFailed, "source_revision_changed")
+				return
+			}
+			if adoption != nil && (index < 0 || !adoption.current(s, next.Sources[index], source.Identity.Namespace)) {
+				serviceError(w, http.StatusPreconditionFailed, "namespace_adoption_revision_changed")
+				return
+			}
 			if index < 0 {
 				// New sources get an opaque namespace at creation so a later
 				// connection or provider change never has to re-key anything:
@@ -624,11 +660,26 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						// reproduces this source's current keys under its
 						// EXISTING connection/config -- before this request's own
 						// change, if any -- checked for real rather than assumed.
-						rekeys = !s.namespaceReproducesExistingKeys(r.Context(), id, existing, source.Identity.Namespace)
+						if adoption == nil {
+							serviceError(w, http.StatusPreconditionFailed, "namespace_adoption_revision_changed")
+							return
+						}
+						rekeys = !adoption.matches
 					}
 				}
 				next.Sources[index] = source
 			}
+			if raw := r.Header.Get("X-Antfly-Local-Migration"); raw != "" {
+				if r.Header.Get("If-Match") == "" || r.Header.Get("X-Antfly-Migration-Connections") == "" {
+					serviceError(w, 400, "migration_preconditions_required")
+					return
+				}
+				if err := applyMigrationReceipt(s.profile, &next, source, raw); err != nil {
+					serviceError(w, http.StatusPreconditionFailed, "migration_lineage_mismatch")
+					return
+				}
+			}
+
 		case http.MethodDelete:
 			if index < 0 && r.URL.Query().Get("purge") == "true" {
 				// A retained source can be explicitly purged after its definition
@@ -710,6 +761,47 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	serviceError(w, 404, "not_found")
 }
 
+// Provider work runs outside s.mu. The result is advisory (failure reports
+// a re-key), but its source/connection witnesses must still match at commit.
+type namespaceAdoptionCheck struct {
+	sourceRevision, connectionBinding, clientGeneration, namespace string
+	connectionExists, matches                                      bool
+}
+
+// current runs under s.mu, after normal source preconditions are checked.
+func (check namespaceAdoptionCheck) current(s *Service, source Source, namespace string) bool {
+	connection, exists := s.profile.Connections[source.Connection]
+	return check.namespace == namespace && check.sourceRevision == sourceRevision(source) &&
+		check.connectionExists == exists && check.connectionBinding == connectionMediaBinding(connection) &&
+		check.clientGeneration == s.clientGeneration(connection)
+}
+
+func (s *Service) prepareNamespaceAdoption(ctx context.Context, id, namespace string) *namespaceAdoptionCheck {
+	s.mu.Lock()
+	var existing Source
+	found := false
+	for _, source := range s.profile.Sources {
+		if source.ID == id {
+			existing, found = source, true
+			break
+		}
+	}
+	if !found || existing.Identity.Namespace != "" || s.closed || s.cancel != nil {
+		s.mu.Unlock()
+		return nil
+	}
+	connection, exists := s.profile.Connections[existing.Connection]
+	check := &namespaceAdoptionCheck{sourceRevision: sourceRevision(existing), connectionBinding: connectionMediaBinding(connection), clientGeneration: s.clientGeneration(connection), namespace: namespace, connectionExists: exists}
+	s.mu.Unlock()
+	if !exists {
+		return check
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	check.matches = s.namespaceReproducesExistingKeys(ctx, id, existing, connection, namespace)
+	return check
+}
+
 // namespaceReproducesExistingKeys reports whether namespace is exactly the
 // prefix that reproduces id's current row keys under existing's connection
 // and config (LegacyNamespace), so adopting it as part of this PUT does not
@@ -725,26 +817,20 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // safety). An empty inventory (nothing published under the existing
 // connection/config yet) has nothing to re-key regardless of which
 // namespace is adopted, so that alone is verified "yes".
-//
-// This runs with s.mu already held by ServeHTTP's caller and is bounded to
-// a Preview-limited enumeration (at most one item for every connector
-// today): namespace adoption happens at most once per source, so a single
-// bounded, synchronous provider round trip here is an acceptable cost for
-// an accurate answer.
-func (s *Service) namespaceReproducesExistingKeys(ctx context.Context, id string, existing Source, namespace string) (matches bool) {
+func (s *Service) namespaceReproducesExistingKeys(ctx context.Context, id string, existing Source, connection Connection, namespace string) (matches bool) {
 	defer func() {
 		if recover() != nil {
 			matches = false
 		}
 	}()
-	connection, ok := s.profile.Connections[existing.Connection]
-	if !ok {
-		return false
-	}
 	connector, err := s.providerConnector(ctx, connection)
 	if err != nil {
 		return false
 	}
+	if collaboration, ok := connector.(*CollaborationConnector); ok {
+		connector = collaboration.newAcquisition()
+	}
+
 	inventory, err := connector.Enumerate(ctx, Request{SourceNamespace: "job/" + id, Config: existing.Config, Mode: ImportModeSource, Preview: true})
 	if err != nil {
 		return false
@@ -898,6 +984,9 @@ func mediaMIME(item Item) string { return MediaMIME(item) }
 // the same representation MIME, including the filename fallback.
 func MediaMIME(item Item) string {
 	typ := configString(item.Metadata, "mime_type")
+	if typ == "" && item.SourceKind == ProviderLocal {
+		typ = localMediaMIMEForPath(item.Path)
+	}
 	if typ == "" {
 		typ = mime.TypeByExtension(filepath.Ext(item.Path))
 	}

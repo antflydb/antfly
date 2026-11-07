@@ -22135,11 +22135,21 @@ pub const Node = struct {
     }
 
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        if (requestUsesAttachmentEnvelope(ctx)) {
-            var envelope = parseRequestAttachmentEnvelope(ctx, .{ .max_metadata_bytes = ctx.max_request_body_size, .max_attachment_bytes = requestMediaMaxBytes(self), .max_total_attachment_bytes = requestMediaMaxBytes(self) }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{ .@"error" = attachmentEnvelopeErrorCode(err), .message = attachmentEnvelopeErrorMessage(err) });
-            defer envelope.deinit();
+        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
+        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
+        defer if (attachment_envelope) |*envelope| envelope.deinit();
+        if (uses_attachment_envelope) {
+            // The transport body is single-pass. Retain the admitted payload
+            // until either audio or image dispatch has finished using it.
+            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{ .max_metadata_bytes = ctx.max_request_body_size, .max_attachment_bytes = requestMediaMaxBytes(self), .max_total_attachment_bytes = requestMediaMaxBytes(self) }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{ .@"error" = attachmentEnvelopeErrorCode(err), .message = attachmentEnvelopeErrorMessage(err) });
+            const envelope = attachment_envelope.?;
             var metadata = std.json.parseFromSlice(std.json.Value, ctx.allocator, envelope.metadata, .{ .duplicate_field_behavior = .@"error" }) catch return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST" });
             defer metadata.deinit();
+            if (metadata.value == .object) {
+                const object = metadata.value.object;
+                const forms = @as(usize, @intFromBool(object.contains("images"))) + @intFromBool(object.contains("documents")) + @intFromBool(object.contains("audio"));
+                if (forms != 1) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "read requires exactly one input form" });
+            }
             if (metadata.value == .object) if (metadata.value.object.get("audio")) |audio| {
                 if (audio != .string or envelope.attachments.len != 1 or !std.mem.eql(u8, audio.string, "attachment:0")) return ctx.status(400).json(.{ .@"error" = "InvalidAudioAttachment" });
                 const attachment = envelope.attachments[0];
@@ -22149,8 +22159,7 @@ pub const Node = struct {
                 try ctx.setHeader("content-type", "application/json");
                 return ctx.response.build();
             };
-        }
-        if (try ctx.body()) |raw| {
+        } else if (try ctx.body()) |raw| {
             const envelope = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw, .{}) catch null;
             if (envelope) |parsed_document| {
                 defer parsed_document.deinit();
@@ -22177,25 +22186,15 @@ pub const Node = struct {
             }
         }
         var execution_control = httpInferenceExecutionControl(self, ctx);
-        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
-        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
-        defer if (attachment_envelope) |*envelope| envelope.deinit();
-        var parsed = if (uses_attachment_envelope) blk: {
-            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{
-                .max_metadata_bytes = ctx.max_request_body_size,
-                .max_attachment_bytes = requestMediaMaxBytes(self),
-                .max_total_attachment_bytes = requestMediaMaxBytes(self),
-            }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
-                .@"error" = attachmentEnvelopeErrorCode(err),
-                .message = attachmentEnvelopeErrorMessage(err),
-            });
-            break :blk std.json.parseFromSlice(api.ReadRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
+        var parsed = if (attachment_envelope) |envelope|
+            std.json.parseFromSlice(api.ReadRequest, ctx.allocator, envelope.metadata, .{}) catch
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
                     .message = "attachment envelope metadata must be a valid read request",
-                });
-        } else (try ctx.parseJson(api.ReadRequest)) orelse
-            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+                })
+        else
+            (try ctx.parseJson(api.ReadRequest)) orelse
+                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
         if ((body.images orelse @as([]const api.ImageURL, &.{})).len == 0) {
@@ -38644,6 +38643,66 @@ fn parseAttachmentUrl(url: []const u8) !?usize {
     for (digits) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidAttachmentReference;
     if (digits.len > 1 and digits[0] == '0') return error.InvalidAttachmentReference;
     return std.fmt.parseUnsigned(usize, digits, 10) catch error.InvalidAttachmentReference;
+}
+
+test "framed read consumes streaming image envelopes exactly once" {
+    const allocator = std.testing.allocator;
+    const Source = struct {
+        bytes: []const u8,
+        offset: usize = 0,
+        reads_after_end: usize = 0,
+        fn readAll(_: ?*anyopaque) !?[]const u8 {
+            return error.UnexpectedWholeBodyRead;
+        }
+        fn read(raw: ?*anyopaque, out: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.offset == self.bytes.len) self.reads_after_end += 1;
+            const n = @min(@min(out.len, 7), self.bytes.len - self.offset);
+            @memcpy(out[0..n], self.bytes[self.offset..][0..n]);
+            self.offset += n;
+            return n;
+        }
+    };
+    var node = try Node.init(allocator, .{});
+    defer node.deinit();
+    const cases = [_]struct { metadata: []const u8, status: u16, message: []const u8 }{
+        .{ .metadata = "{\"model\":\"missing/model\",\"images\":[{\"url\":\"attachment:1\"}]}", .status = 400, .message = "every framed attachment must be referenced exactly once" },
+        // Valid image framing must reach model resolution without a GPU.
+        .{ .metadata = "{\"model\":\"missing/model\",\"images\":[{\"url\":\"attachment:0\"}]}", .status = 404, .message = "MODEL_NOT_FOUND" },
+        .{ .metadata = "{\"model\":\"missing/model\",\"audio\":\"attachment:1\"}", .status = 400, .message = "InvalidAudioAttachment" },
+        .{ .metadata = "{\"model\":\"missing/model\",\"audio\":\"attachment:0\",\"images\":[{\"url\":\"attachment:0\"}]}", .status = 400, .message = "read requires exactly one input form" },
+    };
+    for (cases) |case| {
+        const encoded = try httpx.attachment_envelope.encodeAlloc(allocator, case.metadata, &.{.{ .mime_type = "image/png", .data = "image bytes" }});
+        defer allocator.free(encoded);
+        for ([_]bool{ false, true }) |streaming| {
+            for ([_]bool{ false, true }) |budgeted| {
+                var budget = httpx.SharedBodyBudget.init(encoded.len);
+                var request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
+                defer request.deinit();
+                if (budgeted) request.body_budget = &budget;
+                try request.headers.set("Content-Type", httpx.attachment_envelope.content_type);
+                var source = Source{ .bytes = encoded };
+                if (!streaming) request.body = encoded;
+                var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+                defer ctx.deinit();
+                if (streaming) ctx.body_delegate = .{ .ptr = &source, .read_all = Source.readAll, .read = Source.read, .streaming = true };
+                var response = try node.readImages(&ctx);
+                defer response.deinit();
+                try std.testing.expectEqual(case.status, response.status.code);
+                try std.testing.expect(std.mem.indexOf(u8, response.body.?, case.message) != null);
+                try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+                try std.testing.expectEqual(@as(usize, 0), request.body_budget_reserved);
+                if (streaming) {
+                    try std.testing.expectEqual(encoded.len, source.offset);
+                    // One EOF check from parseReaderAlloc, no second parse or readAll.
+                    try std.testing.expectEqual(@as(usize, 1), source.reads_after_end);
+                    try std.testing.expect(request.body == null);
+                    if (budgeted) try std.testing.expectEqual(case.metadata.len + "image/png".len + "image bytes".len, budget.stats().peak_in_use);
+                }
+            }
+        }
+    }
 }
 
 test "framed read attachment URLs are canonical and bounded integers" {

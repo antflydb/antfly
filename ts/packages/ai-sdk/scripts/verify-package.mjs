@@ -5,9 +5,21 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const registrySDK = process.argv.includes("--registry-sdk");
-const registrySDKVersion = process.env.ANTFLY_SDK_VERSION ?? "0.2.2";
+const sdkManifest = JSON.parse(
+  readFileSync(new URL("../../sdk/package.json", import.meta.url), "utf8")
+);
+const registrySDKVersion = process.env.ANTFLY_SDK_VERSION ?? sdkManifest.version;
 const packedNames = registrySDK ? ["ai-sdk"] : ["sdk", "ai-sdk"];
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
+const manifest = JSON.parse(readFileSync(resolve(root, "ts/packages/ai-sdk/package.json"), "utf8"));
+const latestPeers = process.argv.includes("--latest-peers");
+function peerVersion(name) {
+  const range = manifest.peerDependencies[name];
+  if (!/^\^\d+\.\d+\.\d+$/.test(range)) throw new Error(`Expected a caret peer range for ${name}`);
+  if (!latestPeers) return range.slice(1);
+  const values = JSON.parse(run("npm", ["view", `${name}@${range}`, "version", "--json"], root));
+  return Array.isArray(values) ? values.at(-1) : values;
+}
 const state = resolve(root, ".state/ai-sdk");
 mkdirSync(state, { recursive: true });
 const consumer = mkdtempSync(resolve(state, "consumer-"));
@@ -25,12 +37,21 @@ function run(command, args, cwd = consumer) {
   return result.stdout;
 }
 
+const aiVersion = peerVersion("ai");
+const zodVersion = peerVersion("zod");
+
 for (const name of packedNames)
   run(
     "pnpm",
     ["pack", "--out", resolve(artifacts, `${name}.tgz`)],
     resolve(root, `ts/packages/${name}`)
   );
+
+const packedManifest = JSON.parse(
+  run("tar", ["-xOf", resolve(artifacts, "ai-sdk.tgz"), "package/package.json"])
+);
+if (packedManifest.dependencies["@antfly/sdk"] !== `^${sdkManifest.version}`)
+  throw new Error("Packed SDK dependency floor differs from the tested minimum");
 
 const entries = run("tar", ["-tzf", resolve(artifacts, "ai-sdk.tgz")])
   .trim()
@@ -46,19 +67,25 @@ run("npm", [
   "--no-fund",
   registrySDK ? `@antfly/sdk@${registrySDKVersion}` : resolve(artifacts, "sdk.tgz"),
   resolve(artifacts, "ai-sdk.tgz"),
-  "ai@7.0.162",
-  "zod@4.6.7",
+  `ai@${aiVersion}`,
+  `zod@${zodVersion}`,
   "typescript@5.9.3",
   "@types/node@25.9.3",
 ]);
 
 for (const [extension, statement] of [
-  ["mjs", "import * as integration from '@antfly/ai-sdk';"],
-  ["cjs", "const integration = require('@antfly/ai-sdk');"],
+  [
+    "mjs",
+    "import * as integration from '@antfly/ai-sdk'; import * as sdk from '@antfly/sdk'; import { StandaloneSourcesClient } from '@antfly/sdk/sources';",
+  ],
+  [
+    "cjs",
+    "const integration = require('@antfly/ai-sdk'); const sdk = require('@antfly/sdk'); const { StandaloneSourcesClient } = require('@antfly/sdk/sources');",
+  ],
 ]) {
   writeFileSync(
     resolve(consumer, `exports.${extension}`),
-    `${statement}\nfor (const key of ['createAntfly','createMemoryTools','createSearchTool','createGraphTool','createSqlTool','createChatHistory','AntflyChatLanguageModel','AntflyEmbeddingModel','AntflyRerankingModel']) { if (typeof integration[key] !== 'function') throw new Error(key); }\n`
+    `${statement}\nfor(const name of ['AntflyHTTPError','AntflyResponseError','AntflyClient']) if(typeof sdk[name] !== 'function') throw new Error('SDK foundation missing: '+name);\nif(typeof StandaloneSourcesClient !== 'function') throw new Error('SDK sources subpath missing');\nfor (const key of ['createAntfly','createMemoryTools','createSearchTool','createGraphTool','createSqlTool','createChatHistory','AntflyChatLanguageModel','AntflyEmbeddingModel','AntflyRerankingModel']) { if (typeof integration[key] !== 'function') throw new Error(key); }\n`
   );
   run("node", [`exports.${extension}`]);
 }
@@ -99,13 +126,92 @@ const installed = JSON.parse(
 if (registrySDK && installed.version !== registrySDKVersion)
   throw new Error("Registry SDK version mismatch");
 
+// npm's hoisted layout can hide undeclared imports in published .d.ts files.
+// Repeat the export and type checks in a consumer that exposes only declared
+// dependencies. Keep consumer imports limited to packages it actually declares.
+// Keep this outside the npm consumer so parent node_modules cannot hide
+// missing declarations in the non-hoisted dependency graph.
+const isolated = mkdtempSync(resolve(state, "isolated-consumer-"));
+const sdkDependency = registrySDK ? registrySDKVersion : `file:${resolve(artifacts, "sdk.tgz")}`;
+writeFileSync(
+  resolve(isolated, "package.json"),
+  JSON.stringify({
+    private: true,
+    type: "module",
+    dependencies: {
+      "@antfly/sdk": sdkDependency,
+      "@antfly/ai-sdk": `file:${resolve(artifacts, "ai-sdk.tgz")}`,
+      ai: aiVersion,
+      zod: zodVersion,
+      typescript: "5.9.3",
+      "@types/node": "25.9.3",
+      // @ai-sdk/provider's own json-schema dependency omits its typings. Supply
+      // those upstream typings so skipLibCheck can remain disabled here.
+      "@types/json-schema": "7.0.15",
+    },
+  })
+);
+writeFileSync(
+  resolve(isolated, "pnpm-workspace.yaml"),
+  `hoist: false\nautoInstallPeers: true\noverrides:\n  '@antfly/sdk': ${JSON.stringify(sdkDependency)}\n`
+);
+run("pnpm", ["install", "--ignore-scripts", "--no-frozen-lockfile"], isolated);
+const isolatedContract = `import type { LanguageModel, EmbeddingModel } from 'ai';
+import { createAntfly, createSearchTool, uploadFile } from '@antfly/ai-sdk';
+import { StandaloneSourcesClient } from '@antfly/sdk/sources';
+const provider = createAntfly({baseUrl:'http://localhost:8080'});
+const language: LanguageModel = provider.languageModel('model');
+const embedding: EmbeddingModel = provider.embeddingModel('model');
+void language; void embedding; void uploadFile;
+void new StandaloneSourcesClient({baseUrl:'http://localhost:8082',token:'test-token'});
+void createSearchTool({client:provider.client,table:'docs'});
+`;
+for (const extension of ["mts", "cts"]) {
+  writeFileSync(resolve(isolated, `contract.${extension}`), isolatedContract);
+  run(
+    "node",
+    [
+      "node_modules/typescript/bin/tsc",
+      "--noEmit",
+      "--strict",
+      "--target",
+      "ES2022",
+      "--module",
+      "NodeNext",
+      "--moduleResolution",
+      "NodeNext",
+      `contract.${extension}`,
+    ],
+    isolated
+  );
+}
+for (const extension of ["mjs", "cjs"]) {
+  writeFileSync(
+    resolve(isolated, `exports.${extension}`),
+    readFileSync(resolve(consumer, `exports.${extension}`))
+  );
+  run("node", [`exports.${extension}`], isolated);
+}
+
 const receipt = {
   consumer,
   node: process.version,
+  peers: {
+    selection: latestPeers ? "latest-compatible" : "minimum",
+    ai: aiVersion,
+    zod: zodVersion,
+  },
   sdk: { source: registrySDK ? "npm-registry" : "local-tarball", version: installed.version },
   esm: "passed",
   commonjs: "passed",
   types: "passed",
+  isolated: {
+    hoisting: false,
+    skipLibCheck: false,
+    types: "passed",
+    esm: "passed",
+    commonjs: "passed",
+  },
   artifacts: Object.fromEntries(
     packedNames.map((name) => [
       name,

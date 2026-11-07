@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   FilesV4,
   LanguageModelV4,
@@ -7,6 +8,7 @@ import type {
 } from "@ai-sdk/provider";
 import type { AntflyClient } from "@antfly/sdk";
 import { type LanguageModelMiddleware, uploadFile, wrapLanguageModel } from "ai";
+import { abortable, combinedSignal } from "../abort.js";
 import { type CatalogResource, resolveAuthorizedAsset } from "./catalog.js";
 import { type AuthorizeAsset, antflyAssetReferenceFrom } from "./reference.js";
 
@@ -15,7 +17,7 @@ export interface AssetUploadCacheEntry {
   expiresAt?: Date;
 }
 
-/** Caches an uploaded vendor file by content digest and target provider. */
+/** Caches a vendor file by opaque representation identity and target provider. */
 export interface AssetUploadCache {
   get(
     digest: string,
@@ -24,16 +26,76 @@ export interface AssetUploadCache {
   set(digest: string, provider: string, entry: AssetUploadCacheEntry): void | Promise<void>;
 }
 
-/** An in-memory cache, scoped to this process. Good enough for a single app server. */
-export function createInMemoryAssetUploadCache(): AssetUploadCache {
+/** A bounded LRU cache. Scope a shared cache to one vendor account. */
+export function createInMemoryAssetUploadCache(maxEntries = 1024): AssetUploadCache {
+  if (!Number.isSafeInteger(maxEntries) || maxEntries < 1)
+    throw new RangeError("maxEntries must be a positive integer");
   const entries = new Map<string, AssetUploadCacheEntry>();
   const cacheKey = (digest: string, provider: string) => `${provider}\u0000${digest}`;
   return {
-    get: (digest, provider) => entries.get(cacheKey(digest, provider)),
+    get: (digest, provider) => {
+      const key = cacheKey(digest, provider);
+      const entry = entries.get(key);
+      if (!entry) return undefined;
+      entries.delete(key);
+      if (entry.expiresAt && entry.expiresAt.getTime() <= Date.now()) return undefined;
+      entries.set(key, entry);
+      return entry;
+    },
     set: (digest, provider, entry) => {
-      entries.set(cacheKey(digest, provider), entry);
+      const key = cacheKey(digest, provider);
+      entries.delete(key);
+      entries.set(key, entry);
+      while (entries.size > maxEntries) {
+        const oldest = entries.keys().next();
+        if (oldest.done) break;
+        entries.delete(oldest.value);
+      }
     },
   };
+}
+
+type UploadFlight = {
+  controller: AbortController;
+  promise: Promise<AssetUploadCacheEntry>;
+  waiters: number;
+  settled: boolean;
+};
+// Sharing a cache also shares in-flight work, even across middleware instances.
+// Each reference is authorized before joining; each waiter keeps its own signal.
+const uploadFlights = new WeakMap<AssetUploadCache, Map<string, UploadFlight>>();
+
+async function uploadedOnce(
+  cache: AssetUploadCache,
+  key: string,
+  signal: AbortSignal | undefined,
+  upload: (signal: AbortSignal) => Promise<AssetUploadCacheEntry>
+): Promise<AssetUploadCacheEntry> {
+  signal?.throwIfAborted();
+  const flights = uploadFlights.get(cache) ?? new Map<string, UploadFlight>();
+  uploadFlights.set(cache, flights);
+  let flight = flights.get(key);
+  if (!flight) {
+    const controller = new AbortController();
+    const promise = Promise.resolve().then(() => upload(controller.signal));
+    const created: UploadFlight = { controller, waiters: 0, settled: false, promise };
+    created.promise = promise.finally(() => {
+      created.settled = true;
+      if (flights.get(key) === created) flights.delete(key);
+    });
+    flights.set(key, created);
+    flight = created;
+  }
+  flight.waiters++;
+  try {
+    return await abortable(flight.promise, signal);
+  } finally {
+    flight.waiters--;
+    if (flight.waiters === 0 && !flight.settled) {
+      flight.controller.abort();
+      if (flights.get(key) === flight) flights.delete(key);
+    }
+  }
 }
 
 export interface AssetMiddlewareOptions {
@@ -50,7 +112,7 @@ export interface AssetMiddlewareOptions {
   allowVendorUpload?: boolean;
   /** The provider's files API, required when `allowVendorUpload` is true. */
   files?: FilesV4 | ProviderV4;
-  /** Shared across calls so the same asset is not re-uploaded. Defaults to an in-memory cache. */
+  /** Shared across calls for one vendor account. Defaults to a bounded in-memory cache. */
   cache?: AssetUploadCache;
   /** Defaults to `globalThis.fetch`. */
   fetch?: typeof fetch;
@@ -118,52 +180,79 @@ export function createAssetMiddleware(options: AssetMiddlewareOptions): Language
 
   async function rewriteFilePart(
     part: LanguageModelV4FilePart,
-    provider: string
+    provider: string,
+    signal: AbortSignal | undefined
   ): Promise<LanguageModelV4FilePart> {
     if (part.data.type !== "reference") return part;
     const reference = antflyAssetReferenceFrom(part.data.reference);
     if (!reference) return part;
-    const resource = await resolveAuthorizedAsset(options.client, options.authorize, reference);
+    const resource = await resolveAuthorizedAsset(
+      options.client,
+      options.authorize,
+      reference,
+      signal
+    );
 
     if (options.allowVendorUpload && options.files) {
-      const cached = await cache.get(resource.version, provider);
-      if (cached && (!cached.expiresAt || cached.expiresAt.getTime() > Date.now())) {
-        return {
-          ...part,
-          data: { type: "reference", reference: { ...part.data.reference, ...cached.reference } },
-        };
-      }
-      const bytes = await fetchResourceBytes(resource, fetchFn, options.abortSignal);
-      const uploaded = await uploadFile({
-        api: options.files,
-        data: bytes,
-        mediaType: resource.mime_type,
-        abortSignal: options.abortSignal,
-      });
-      await cache.set(resource.version, provider, {
-        reference: uploaded.providerReference,
-        expiresAt: uploaded.expiresAt,
-      });
+      // A representation ETag is scoped to one asset, not globally to bytes.
+      // Only source metadata supplies the separately verified content digest.
+      // MIME is part of a vendor file's representation as well.
+      const identity = resource.content_sha256
+        ? ["sha256", resource.content_sha256, resource.mime_type]
+        : [
+            "asset",
+            reference.table,
+            reference.key,
+            resource.uri,
+            resource.version,
+            resource.mime_type,
+          ];
+      // Keep capability URLs out of externally implemented cache keys.
+      const cacheIdentity = createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+      const files = options.files;
+      const entry = await uploadedOnce(
+        cache,
+        `${provider}\u0000${cacheIdentity}`,
+        signal,
+        async (sharedSignal) => {
+          const cached = await cache.get(cacheIdentity, provider);
+          sharedSignal.throwIfAborted();
+          if (cached && (!cached.expiresAt || cached.expiresAt.getTime() > Date.now()))
+            return cached;
+          const bytes = await fetchResourceBytes(resource, fetchFn, sharedSignal);
+          const uploaded = await uploadFile({
+            api: files,
+            data: bytes,
+            mediaType: resource.mime_type,
+            abortSignal: sharedSignal,
+          });
+          sharedSignal.throwIfAborted();
+          const result = { reference: uploaded.providerReference, expiresAt: uploaded.expiresAt };
+          await cache.set(cacheIdentity, provider, result);
+          return result;
+        }
+      );
       return {
         ...part,
-        data: {
-          type: "reference",
-          reference: { ...part.data.reference, ...uploaded.providerReference },
-        },
+        mediaType: resource.mime_type,
+        data: { type: "reference", reference: { ...part.data.reference, ...entry.reference } },
       };
     }
 
-    const bytes = await fetchResourceBytes(resource, fetchFn, options.abortSignal);
-    return { ...part, data: { type: "data", data: bytes } };
+    const bytes = await fetchResourceBytes(resource, fetchFn, signal);
+    return { ...part, mediaType: resource.mime_type, data: { type: "data", data: bytes } };
   }
 
   async function rewriteMessage(
     message: LanguageModelV4Message,
-    provider: string
+    provider: string,
+    signal: AbortSignal | undefined
   ): Promise<LanguageModelV4Message> {
     if (message.role !== "user" && message.role !== "assistant") return message;
     const content = await Promise.all(
-      message.content.map((part) => (part.type === "file" ? rewriteFilePart(part, provider) : part))
+      message.content.map((part) =>
+        part.type === "file" ? rewriteFilePart(part, provider, signal) : part
+      )
     );
     return { ...message, content } as LanguageModelV4Message;
   }
@@ -172,8 +261,12 @@ export function createAssetMiddleware(options: AssetMiddlewareOptions): Language
     specificationVersion: "v4",
     transformParams: async ({ params, model }) => {
       if (model.provider === "antfly") return params;
-      const prompt = await Promise.all(
-        params.prompt.map((message) => rewriteMessage(message, model.provider))
+      const signal = combinedSignal(options.abortSignal, params.abortSignal);
+      const prompt = await abortable(
+        Promise.all(
+          params.prompt.map((message) => rewriteMessage(message, model.provider, signal))
+        ),
+        signal
       );
       return { ...params, prompt };
     },

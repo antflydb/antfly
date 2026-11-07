@@ -78,3 +78,30 @@ describe("createGraphTool", () => {
     ).rejects.toThrow(/exactly one of/);
   });
 });
+
+it.each([
+  [
+    { bindings: ["n"], limit: 9999 },
+    { bindings: ["n"], limit: 5 },
+  ],
+  [{ bindings: ["n"] }, { bindings: ["n"], limit: 5 }],
+  [{ aggregates: { count: { count: "*" } } }, { aggregates: { count: { count: "*" } } }],
+])("keeps MATCH return at its canonical level and bounds bindings", async (projection, expected) => {
+  const query = vi.fn().mockResolvedValue({ responses: [{ graph_results: {} }] });
+  const tools = createGraphTool({
+    client: { tables: { query } } as never,
+    table: "docs",
+    maxResults: 5,
+  });
+  const match = { anchor: "n", nodes: { n: {} }, edges: [] };
+  await tools.antfly_graph_query.execute?.(
+    { operations: { q: { match, return: projection } } },
+    toolOptions()
+  );
+  expect(query.mock.calls[0][1].graph_queries.q).toEqual({
+    index: "graph",
+    match,
+    return: expected,
+  });
+  expect(match).not.toHaveProperty("return");
+});

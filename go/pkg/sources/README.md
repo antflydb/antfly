@@ -402,7 +402,11 @@ and media protocol as a bucket, so an application keeps the same code when it mo
 to object storage. Objects live at `<local_root>/<prefix>/objects/sha256/<digest>[.ext]`.
 The name is the revision, and the extension selects the MIME type. Go applications
 can write with `PutLocalObject`; others write to a temporary dot-file in that
-directory and rename it. Source config accepts an optional `prefix`.
+directory, fsync the file, and publish it atomically without replacing an existing
+object (for example, link the temporary file to the final name). Verify any
+existing object instead of replacing it, then fsync the containing directories
+before starting sync. Use owner-only directories and files. Source config accepts
+an optional `prefix`.
 
 `ANTFLY_SOURCE_LOCAL_ROOTS` lists the directories a connection may use, separated by
 the platform path-list separator. Unset denies local connections, because whoever can
@@ -422,7 +426,8 @@ fetch: list the listener in `remote_content.security.source_media_base_urls`, su
 `http://127.0.0.1:8082/v1/media/`. This allows that listener without opening other
 private addresses or ports. Run one source with
 `POST /v1/sync` and `{"source_id": "<uuid>"}` to publish a new upload without syncing
-the others. Runs are serialized across the service, so a concurrent run returns 409.
+the others. Upload callers must set `"restart": true` to enumerate newly written
+objects even after a failed pinned inventory. Runs are serialized across the service, so a concurrent run returns 409.
 
 ### Moving a local store to a bucket
 
@@ -480,6 +485,26 @@ resync) is the one step that needs admission, and has two modes:
   way, so there's no downtime to protect, and `migrate-local` refuses to
   start if `serve` (or another `migrate-local` run) already holds that
   directory, rather than racing it.
+
+Live cutover requires a companion advertising conditional source updates
+(`X-Antfly-Source-Preconditions: 1` on `/v1/profile`). Migration re-reads the
+source after copying, preserves concurrent naming, permission and stream edits,
+and rejects concurrent acquisition, identity or transfer-connection changes. Both the source PUT
+and sync admission use an atomic `If-Match` precondition, together with
+configuration digests for both transfer connections; a conflicting edit
+fails cutover without overwriting it. Copied objects remain available for retry.
+Destination copy keys and source selection use the same canonical prefix; `.`
+names the bucket root, just like an empty prefix. Namespace adoption checks provider
+identity outside the service mutex with a bounded deadline. Concurrent source,
+connection or credential changes invalidate that check before the source is written.
+
+Live migration requires companion precondition protocol version 2. Cutover
+atomically persists a migration receipt alongside the source. Every retry must
+match the original local root, prefix, destination connection, bucket, prefix,
+source namespace and table. A different target fails before copying or syncing.
+The receipt survives companion restarts. Bucket-backed sources cut over by older
+versions without a receipt cannot safely infer their original local store;
+automatic mop-up refuses them. Upgrade the companion before the first cutover.
 
 The destination connection must already exist in the repointed-against
 profile (the live server's own, or the one seeded at `--state-dir`); this is

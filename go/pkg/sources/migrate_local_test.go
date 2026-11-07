@@ -19,6 +19,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -1047,10 +1049,10 @@ func TestMigrateLocalRepointsCatalogForGCSAndSyncsAfterward(t *testing.T) {
 	// The write side bypasses migrateGCSWriteClient/OAuth the same way --
 	// an already-authorized plain client, directly.
 	dest := &gcsDestination{client: gcsServer.Client(), bucket: "testbucket", apiBase: gcsServer.URL, uploadBase: gcsServer.URL}
-	opts := MigrateLocalOptions{FromPrefix: "assets", ToConnection: "gcs", ToBucket: "testbucket", ToPrefix: "migrated"}
+	opts := MigrateLocalOptions{FromConnection: "local", FromPrefix: "assets", ToConnection: "gcs", ToBucket: "testbucket", ToPrefix: "migrated"}
 	result := MigrateLocalResult{SourceID: testSourceID, ToConnection: "gcs", Bucket: "testbucket", ToPrefix: "migrated"}
 
-	result, err = migrateLocalRun(t.Context(), opts, result, source, &LocalConnector{Root: root}, dest, ProviderGCS, service)
+	result, err = migrateLocalRun(t.Context(), opts, result, source, &LocalConnector{Root: root}, dest, ProviderGCS, service, profile.Connections)
 	require.NoError(t, err, "result: %+v", result)
 	require.True(t, result.CatalogRepointed)
 	require.Equal(t, 1, result.Copied)
@@ -1171,5 +1173,418 @@ func TestBucketRelativeKeysPreserveExactPrefixSuffix(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestMigrateLocalRejectsWrongOriginalPrefixBeforeCopy(t *testing.T) {
+	for _, dryRun := range []bool{false, true} {
+		t.Run(fmt.Sprint(dryRun), func(t *testing.T) {
+			opts, root, stateDir, _, bucket, backend := migrateServiceFixture(t)
+			localPut(t, root, "other", ".bin", "unrelated store")
+			pre, err := NewService(ServiceOptions{Profile: opts.Profile, StateDir: stateDir, PublicURL: opts.PublicURL, AdminToken: opts.AdminToken, MediaKey: opts.MediaKey})
+			require.NoError(t, err)
+			require.Equal(t, "completed", startServiceJob(t, pre).State)
+			require.NoError(t, pre.Close())
+			backend.mu.Lock()
+			var oldKey string
+			for key := range backend.records {
+				oldKey = key
+			}
+			backend.mu.Unlock()
+			opts.FromPrefix = "other"
+			opts.DryRun = dryRun
+			result, err := MigrateLocal(t.Context(), opts)
+			require.ErrorIs(t, err, ErrInvalidInput)
+			require.Contains(t, err.Error(), "from-prefix")
+			require.False(t, result.CatalogRepointed)
+			bucket.mu.Lock()
+			puts := bucket.puts
+			bucket.mu.Unlock()
+			require.Zero(t, puts)
+			backend.mu.Lock()
+			_, originalPresent := backend.records[oldKey]
+			count := len(backend.records)
+			backend.mu.Unlock()
+			require.True(t, originalPresent)
+			require.Equal(t, 1, count)
+		})
+	}
+}
+
+func TestMigrateLocalLiveRejectsWrongOriginalPrefix(t *testing.T) {
+	opts, service, root, bucket, _ := migrateLiveFixture(t)
+	localPut(t, root, "other", ".bin", "other")
+	opts.FromPrefix = "other"
+	result, err := MigrateLocal(t.Context(), opts)
+	require.ErrorIs(t, err, ErrInvalidInput)
+	require.False(t, result.CatalogRepointed)
+	service.mu.Lock()
+	connection := service.profile.Sources[0].Connection
+	service.mu.Unlock()
+	require.Equal(t, "local", connection)
+	bucket.mu.Lock()
+	puts := bucket.puts
+	bucket.mu.Unlock()
+	require.Zero(t, puts)
+}
+
+func TestMigrateLocalVerifiesEmptyObjectDigest(t *testing.T) {
+	for _, kind := range migrateTestDestinationKinds {
+		for _, alreadyPresent := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/existing=%v", kind, alreadyPresent), func(t *testing.T) {
+				root := t.TempDir()
+				dir := filepath.Join(root, "assets", "objects", "sha256")
+				require.NoError(t, os.MkdirAll(dir, 0700))
+				wrong := strings.Repeat("a", 64)
+				require.NoError(t, os.WriteFile(filepath.Join(dir, wrong+".bin"), nil, 0600))
+				td := newMigrateTestDestination(t, kind)
+				if alreadyPresent {
+					td.seed("copied/objects/sha256/"+wrong+".bin", nil)
+				}
+				local := &LocalConnector{Root: root}
+				result, err := MigrateLocalCopy(t.Context(), local, localRequest(t, "assets"), td.dest, "copied", false, nil)
+				require.Error(t, err)
+				require.Equal(t, 1, result.Failed)
+				require.Zero(t, result.Copied)
+				require.Zero(t, result.Skipped)
+			})
+		}
+		t.Run(kind+"/valid-empty", func(t *testing.T) {
+			root := t.TempDir()
+			localPut(t, root, "assets", ".bin", "")
+			td := newMigrateTestDestination(t, kind)
+			result, err := MigrateLocalCopy(t.Context(), &LocalConnector{Root: root}, localRequest(t, "assets"), td.dest, "copied", false, nil)
+			require.NoError(t, err)
+			require.Equal(t, 1, result.Copied)
+		})
+	}
+}
+
+func TestMigrateLocalPreservesConcurrentSourceEdit(t *testing.T) {
+	opts, service, _, _, _ := migrateLiveFixture(t)
+	changed := false
+	opts.Progress = func(_ MigrateLocalObject) {
+		if changed {
+			return
+		}
+		changed = true
+		service.mu.Lock()
+		updated := service.profile.Sources[0]
+		service.mu.Unlock()
+		updated.Alias = "edited-during-copy"
+		updated.Permissions = &Permissions{Readers: []string{"user:self"}}
+		response, err := serviceAdminCall(t.Context(), service, http.MethodPut, "/v1/sources/"+updated.ID, updated)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, response.status)
+	}
+	_, err := MigrateLocal(t.Context(), opts)
+	require.NoError(t, err)
+	require.True(t, changed)
+	service.mu.Lock()
+	alias := service.profile.Sources[0].Alias
+	service.mu.Unlock()
+	require.Equal(t, "edited-during-copy", alias)
+	service.mu.Lock()
+	require.False(t, service.profile.Sources[0].Permissions.Public)
+	require.Equal(t, []string{"user:self"}, service.profile.Sources[0].Permissions.Readers)
+	service.mu.Unlock()
+}
+
+func TestMigrateLocalRejectsConcurrentAcquisitionChange(t *testing.T) {
+	opts, service, _, _, _ := migrateLiveFixture(t)
+	changed := false
+	opts.Progress = func(_ MigrateLocalObject) {
+		if changed {
+			return
+		}
+		changed = true
+		service.mu.Lock()
+		updated := service.profile.Sources[0]
+		service.mu.Unlock()
+		updated.Config = json.RawMessage(`{"prefix":"changed"}`)
+		out, err := serviceAdminCall(t.Context(), service, http.MethodPut, "/v1/sources/"+updated.ID, updated)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, out.status)
+	}
+	result, err := MigrateLocal(t.Context(), opts)
+	require.ErrorContains(t, err, "source changed during migration")
+	require.False(t, result.CatalogRepointed)
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	require.Equal(t, "local", service.profile.Sources[0].Connection)
+	require.JSONEq(t, `{"prefix":"changed"}`, string(service.profile.Sources[0].Config))
+}
+
+func TestSourceConditionalMutationAndSync(t *testing.T) {
+	_, service, _, _, _ := migrateLiveFixture(t)
+	service.mu.Lock()
+	source := service.profile.Sources[0]
+	service.mu.Unlock()
+	revision := sourceRevision(source)
+	source.Alias = "concurrent edit"
+	out, err := serviceAdminCall(t.Context(), service, http.MethodPut, "/v1/sources/"+source.ID, source, http.Header{"If-Match": {revision}})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, out.status)
+	source.Alias = "stale writer"
+	out, err = serviceAdminCall(t.Context(), service, http.MethodPut, "/v1/sources/"+source.ID, source, http.Header{"If-Match": {revision}})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusPreconditionFailed, out.status)
+	out, err = serviceAdminCall(t.Context(), service, http.MethodPost, "/v1/sync", map[string]any{"source_id": source.ID}, http.Header{"If-Match": {revision}})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusPreconditionFailed, out.status)
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	require.Equal(t, "concurrent edit", service.profile.Sources[0].Alias)
+	require.Nil(t, service.cancel)
+}
+
+func TestMigrateLocalRequiresConditionalCutoverSupport(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		require.Equal(t, "/v1/profile", r.URL.Path)
+		require.Equal(t, http.MethodGet, r.Method)
+		serviceJSON(w, http.StatusOK, Profile{Version: 1})
+	}))
+	defer server.Close()
+	_, err := MigrateLocal(t.Context(), MigrateLocalOptions{Server: server.URL, AdminToken: "test", SourceID: testSourceID, FromConnection: "local", ToConnection: "bucket", ToBucket: "testbucket"})
+	require.ErrorContains(t, err, "does not support conditional source cutover")
+	require.Equal(t, 1, calls)
+}
+
+func TestMigrateLocalRejectsConcurrentConnectionChange(t *testing.T) {
+	for _, name := range []string{"local", "bucket"} {
+		t.Run(name, func(t *testing.T) {
+			opts, service, root, _, _ := migrateLiveFixture(t)
+			replacement := filepath.Join(root, "changed")
+			require.NoError(t, os.MkdirAll(replacement, 0700))
+			t.Setenv("MIGRATE_CHANGED_ACCESS", "replacement-test-access")
+			changed := false
+			opts.Progress = func(_ MigrateLocalObject) {
+				if changed {
+					return
+				}
+				changed = true
+				service.mu.Lock()
+				connection := service.profile.Connections[name]
+				service.mu.Unlock()
+				if name == "local" {
+					connection.LocalRoot = replacement
+				} else {
+					connection.AccessKeyEnv = "MIGRATE_CHANGED_ACCESS"
+				}
+				out, err := serviceAdminCall(t.Context(), service, http.MethodPut, "/v1/connections/"+name, connection)
+				require.NoError(t, err)
+				require.Equal(t, http.StatusOK, out.status)
+			}
+			result, err := MigrateLocal(t.Context(), opts)
+			require.ErrorContains(t, err, "connection")
+			require.ErrorContains(t, err, "changed during migration")
+			require.False(t, result.CatalogRepointed)
+			service.mu.Lock()
+			defer service.mu.Unlock()
+			require.Equal(t, "local", service.profile.Sources[0].Connection)
+		})
+	}
+}
+
+func TestMigrationConnectionFenceIsAtomicAtPutAndSync(t *testing.T) {
+	_, service, root, _, _ := migrateLiveFixture(t)
+	service.mu.Lock()
+	source := service.profile.Sources[0]
+	original := cloneProfile(service.profile).Connections
+	connection := service.profile.Connections["local"]
+	service.mu.Unlock()
+	headers := migrationHeaders(sourceRevision(source), original)
+	replacement := filepath.Join(root, "changed")
+	require.NoError(t, os.MkdirAll(replacement, 0700))
+	connection.LocalRoot = replacement
+	out, err := serviceAdminCall(t.Context(), service, http.MethodPut, "/v1/connections/local", connection)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, out.status)
+	out, err = serviceAdminCall(t.Context(), service, http.MethodPut, "/v1/sources/"+source.ID, source, headers)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusPreconditionFailed, out.status)
+	out, err = serviceAdminCall(t.Context(), service, http.MethodPost, "/v1/sync", map[string]any{"source_id": source.ID}, headers)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusPreconditionFailed, out.status)
+}
+
+func TestMigrateLocalMopUpRejectsAnotherDestinationPrefix(t *testing.T) {
+	opts, _, stateDir, _, bucket, backend := migrateServiceFixture(t)
+	_, err := MigrateLocal(t.Context(), opts)
+	require.NoError(t, err)
+	// A new object arrives only in the bucket after initial cutover.
+	extra := []byte("arrived in bucket after migration")
+	sum := sha256.Sum256(extra)
+	bucket.mu.Lock()
+	bucket.objects["migrated/objects/sha256/"+hex.EncodeToString(sum[:])+".txt"] = extra
+	bucket.mu.Unlock()
+	service, err := NewService(ServiceOptions{Profile: opts.Profile, StateDir: stateDir, PublicURL: opts.PublicURL, AdminToken: opts.AdminToken, MediaKey: opts.MediaKey})
+	require.NoError(t, err)
+	service.mu.Lock()
+	profile := cloneProfile(service.profile)
+	service.mu.Unlock()
+	require.Equal(t, "assets", profile.LocalMigrations[testSourceID].FromPrefix)
+	require.Equal(t, "migrated", profile.LocalMigrations[testSourceID].ToPrefix)
+
+	out, err := serviceAdminCall(t.Context(), service, http.MethodPost, "/v1/sync", map[string]any{"source_id": testSourceID})
+	require.NoError(t, err)
+	var job SyncJob
+	require.NoError(t, json.Unmarshal(out.body.Bytes(), &job))
+	require.Equal(t, "completed", waitServiceJob(t, service, job.ID).State)
+	require.NoError(t, service.Close())
+	backend.mu.Lock()
+	count := len(backend.records)
+	backend.mu.Unlock()
+	require.Equal(t, 2, count)
+	opts.ToPrefix = "typo"
+	_, err = MigrateLocal(t.Context(), opts)
+	backend.mu.Lock()
+	remaining := len(backend.records)
+	backend.mu.Unlock()
+	require.Equal(t, 2, remaining, "mop-up must preserve bucket-only rows")
+	require.Error(t, err, "a mop-up must not silently change the existing destination")
+}
+
+func TestMigrationReceiptRejectsChangedRetryAndMissingLineage(t *testing.T) {
+	opts, _, _, _, _, _ := migrateServiceFixture(t)
+	original := opts.Profile.Sources[0]
+	original.Identity.Namespace = "migration-namespace"
+	opts.Profile.Sources[0] = original
+	target := original
+	target.Connection = opts.ToConnection
+	var err error
+	target.Config, err = migrateDestinationConfig(ProviderS3, opts.ToBucket, opts.ToPrefix)
+	require.NoError(t, err)
+	receipt := migrationReceipt(target, opts, opts.Profile.Connections[opts.FromConnection], opts.Profile.Connections[opts.ToConnection])
+	raw, err := json.Marshal(receipt)
+	require.NoError(t, err)
+	next := opts.Profile
+	next.Sources = []Source{target}
+	require.NoError(t, applyMigrationReceipt(opts.Profile, &next, target, string(raw)))
+	require.Equal(t, receipt, next.LocalMigrations[target.ID])
+	_, _, _, err = resolveMigrationSource(next, opts)
+	require.NoError(t, err)
+	for _, field := range []string{"from-prefix", "to-prefix", "to-bucket", "local-root", "destination-config", "missing-receipt"} {
+		t.Run(field, func(t *testing.T) {
+			changed := opts
+			profile := next
+			switch field {
+			case "from-prefix":
+				changed.FromPrefix = "different"
+			case "to-prefix":
+				changed.ToPrefix = "different"
+			case "to-bucket":
+				changed.ToBucket = "different"
+			case "local-root":
+				profile.Connections = make(map[string]Connection)
+				for key, value := range next.Connections {
+					profile.Connections[key] = value
+				}
+				connection := profile.Connections[opts.FromConnection]
+				connection.LocalRoot += "-different"
+				profile.Connections[opts.FromConnection] = connection
+			case "destination-config":
+				source := target
+				source.Config, err = migrateDestinationConfig(ProviderS3, opts.ToBucket, "different")
+				require.NoError(t, err)
+				profile.Sources = []Source{source}
+			case "missing-receipt":
+				profile.LocalMigrations = nil
+			}
+			_, _, _, err := resolveMigrationSource(profile, changed)
+			require.ErrorIs(t, err, ErrInvalidInput)
+		})
+	}
+	require.Error(t, applyMigrationReceipt(opts.Profile, &next, target, string(raw)+" {}"))
+}
+
+func TestNewUploadFreshInventoryAfterFailedSync(t *testing.T) {
+	_, service, root, _, backend := migrateLiveFixture(t)
+	backend.mu.Lock()
+	backend.dropContentAck = true
+	backend.mu.Unlock()
+	first, err := serviceAdminCall(t.Context(), service, http.MethodPost, "/v1/sync", map[string]any{})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusAccepted, first.status)
+	var job SyncJob
+	require.NoError(t, json.Unmarshal(first.body.Bytes(), &job))
+	require.Equal(t, "failed", waitServiceJob(t, service, job.ID).State)
+	localPut(t, root, "assets", ".txt", "new upload after failure")
+	second, err := serviceAdminCall(t.Context(), service, http.MethodPost, "/v1/sync", map[string]any{"source_id": testSourceID, "restart": true})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusAccepted, second.status)
+	require.NoError(t, json.Unmarshal(second.body.Bytes(), &job))
+	require.Equal(t, "completed", waitServiceJob(t, service, job.ID).State)
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	require.Len(t, backend.records, 2)
+}
+
+func TestMigrateLocalDotPrefixPreservesPublishedRows(t *testing.T) {
+	opts, _, stateDir, _, _, backend := migrateServiceFixture(t)
+	service, err := NewService(ServiceOptions{Profile: opts.Profile, StateDir: stateDir, PublicURL: opts.PublicURL, AdminToken: opts.AdminToken, MediaKey: opts.MediaKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := serviceAdminCall(t.Context(), service, http.MethodPost, "/v1/sync", map[string]any{"source_id": testSourceID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var job SyncJob
+	if err := json.Unmarshal(out.body.Bytes(), &job); err != nil {
+		t.Fatal(err)
+	}
+	if state := waitServiceJob(t, service, job.ID).State; state != "completed" {
+		t.Fatalf("initial sync: %s", state)
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backend.mu.Lock()
+	before := len(backend.records)
+	backend.mu.Unlock()
+	if before != 1 {
+		t.Fatalf("initial rows: %d", before)
+	}
+	opts.ToPrefix = "."
+	result, err := MigrateLocal(t.Context(), opts)
+	require.NoError(t, err)
+	require.Empty(t, result.ToPrefix)
+	// Either spelling of the root must match the same durable retry lineage.
+	opts.ToPrefix = ""
+	retry, err := MigrateLocal(t.Context(), opts)
+	require.NoError(t, err)
+	require.True(t, retry.CatalogRepointed)
+	require.Equal(t, 1, retry.Skipped)
+	backend.mu.Lock()
+	after := len(backend.records)
+	backend.mu.Unlock()
+	if after != before {
+		t.Errorf("successful migration deleted catalog rows: before=%d after=%d repointed=%v", before, after, result.CatalogRepointed)
+	}
+}
+
+func TestMigrationDestinationPrefixMatchesCopyKeys(t *testing.T) {
+	for _, prefix := range []string{"", ".", "assets", "nested/assets"} {
+		for _, provider := range []string{ProviderS3, ProviderGCS} {
+			t.Run(provider+"/"+prefix, func(t *testing.T) {
+				config, err := migrateDestinationConfig(provider, "bucket", prefix)
+				require.NoError(t, err)
+				var selected struct {
+					Prefix string `json:"prefix"`
+				}
+				require.NoError(t, json.Unmarshal(config, &selected))
+				filename := strings.Repeat("a", 64) + ".txt"
+				key, err := migrateDestinationKey(prefix, filename)
+				require.NoError(t, err)
+				require.Equal(t, selected.Prefix+localObjectDir+"/"+filename, key)
+			})
+		}
+	}
+	for _, prefix := range []string{"../outside", "/absolute", "a/../b", "a/"} {
+		_, err := migrateDestinationConfig(ProviderS3, "bucket", prefix)
+		require.Error(t, err)
 	}
 }

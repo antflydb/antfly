@@ -1,7 +1,7 @@
 # @antfly/ai-sdk
 
 Antfly provider, tools, chat history persistence and the asset flow for the
-Vercel AI SDK (`ai` v7). Requires Node 24+.
+Vercel AI SDK (`ai` >=7.0.162 <8, `zod` >=4.1.8 <5). Requires Node 24+ and `@antfly/sdk` >=0.2.3 <0.3 (including its `/sources` export).
 
 ```ts
 import { createAntfly, createMemoryTools, createSearchTool, createSqlTool } from "@antfly/ai-sdk";
@@ -28,6 +28,10 @@ const result = await generateText({
 `NoSuchModelError` -- Antfly has no image generation model, and `ProviderV4`
 requires the method to exist. It also exposes `.client` (`AntflyClient`) and
 `.inference` (`InferenceClient`) for building tools and history below.
+
+Per-call HTTP `headers` are forwarded for generation, streaming, embedding and
+reranking. Defined values override configured headers case-insensitively without
+changing other requests. The transport owns `Accept` to match its response decoder.
 
 Known limitations, documented rather than silently handled: `stopSequences`
 and `seed` have no server-side equivalent and are reported as call warnings;
@@ -73,26 +77,44 @@ const result = await generateText({
 
 - **To Antfly itself** (`AntflyChatLanguageModel`, constructed with a
   `client`): the reference resolves natively into the typed `source` content
-  part. The gateway fetches and inlines the pinned bytes server-side, so the
-  source companion's capability URL never appears in the request this
-  package builds.
+  part sent to the Antfly gateway. The gateway fetches and inlines the pinned
+  bytes server-side before calling the model.
 - **To an external model**: wrap it with `withAssetMiddleware(model, { client })`
   (or `createAssetMiddleware` + `wrapLanguageModel`). It fetches the asset
-  with `If-Match` and inlines it by default. Set `allowVendorUpload: true`
+  with `If-Match` and inlines it by default. The resolved catalog MIME type
+  accompanies both inline bytes and vendor file references, overriding the
+  caller-supplied label. Set `allowVendorUpload: true`
   and `files: <that provider's files API>` to upload once per provider and
-  cache by content digest instead -- off by default, because revoking
-  access in Antfly does not remove a vendor's own copy.
+  cache by verified content digest and MIME type instead -- off by default, because revoking
+  access in Antfly does not remove a vendor's own copy. Concurrent references
+  share one fetch/upload while each reference still checks authorization.
+  Cancelling one caller leaves other callers running; cancelling all callers
+  aborts the shared request. The default LRU cache holds at most 1024 entries.
+  Scope any explicitly shared cache to a single vendor account. Without a
+  verified `metadata.sha256`, caching stays scoped to the asset, URI, version
+  and MIME type; a strong ETag alone is not a global content identity.
 - **Uploading a new asset**: `uploadFile({ client, sources, sourceId,
   localRoot, table, data, mimeType })` writes the bytes under a registered
   source's local content-addressed store and triggers a per-source sync run,
   waiting for `waitFor: "published"` (default) or `"searchable"` (a
   best-effort poll -- publishing the catalog row is not the same as being
   enrichment-indexed, and the server has no durable signal for the latter).
+  Publication preserves existing verified objects and their inode/mtime pins.
+  New files and directories use owner-only permissions; file and directory
+  durability barriers finish before sync. Corrupt existing content fails without
+  overwriting it. The filesystem must support atomic hard links and directory
+  fsync. Each upload starts a fresh inventory (`restart: true`), including after
+  a failed run.
   The helper checks the configured source and looks up its exact record key
   with `read_index`, verifying ownership and the pinned content digest. Table
   size and other sources with identical bytes do not affect confirmation.
   Pass `prefix` when the source has a configured prefix. Searchable polling
-  is restricted to this same record.
+  is restricted to this same record. `timeoutMs` is an overall deadline,
+  including file writing and stalled requests; `signal` also cancels requests.
+  Uploads accept the MIME types in the shared
+  [`local_media_types.json`](../../../go/pkg/sources/local_media_types.json)
+  catalogue (including FLAC), normalize common aliases, and reject unsupported
+  types and empty media before writing. The local provider uses the same canonical MIME types.
   Only the `local` antfly-sources provider is implemented; a bucket-backed
   connection needs the equivalent provider-specific PUT. `FilesV4` is not
   implemented for Antfly: an existing object can't be re-registered through
@@ -100,6 +122,8 @@ const result = await generateText({
 - **Displaying an asset in a browser**: `createAssetDisplayHandler({ client,
   authorize, referenceId })` builds a plain `Request -> Response` handler
   for a route in your own app (the pattern settled on antfly#1491).
+  GET and HEAD preserve upstream method semantics; request cancellation also
+  cancels catalog lookup and upstream delivery.
   `FileUIPart.url` points at that route; the capability URL never reaches
   the browser, and Antfly never fetches through it. Passive image, audio, and
   video formats use an explicit inline allowlist; HTML, SVG, and other formats
@@ -136,6 +160,10 @@ constructor options, not model-controllable tool arguments, per antfly#1505.
   with authentication off and permissions aren't checked at all. It isn't a
   security boundary. Writing is never a tool argument.
 
+Tool execution forwards the AI SDK cancellation signal to Antfly requests,
+including memory mutations. Cancellation after a write has committed does not
+undo it.
+
 ## Chat history
 
 `createChatHistory({ client, table })` stores `ai` v7 `UIMessage[]` in a
@@ -157,3 +185,8 @@ explicit memory tools.
 From `ts/`: `pnpm --filter @antfly/ai-sdk build`, `pnpm --filter @antfly/ai-sdk test`.
 `pnpm --filter @antfly/ai-sdk typecheck` also compile-checks the provider and
 each model against the installed `@ai-sdk/provider` types.
+
+The registry release gate checks the exact minimum SDK version and runs the same
+strict ESM/CommonJS and non-hoisted consumers as package CI, with library checks
+enabled. Publish SDK 0.2.3 before tagging the AI SDK integration; the gate refuses
+publication while that SDK release is unavailable.

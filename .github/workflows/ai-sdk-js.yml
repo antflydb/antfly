@@ -28,7 +28,7 @@ jobs:
       - name: Update compatible dependencies
         if: matrix.dependencies == 'latest-compatible'
         working-directory: ts
-        run: pnpm --filter @antfly/ai-sdk add --save-dev 'ai@^7.0.0' 'zod@^4.0.0' --ignore-scripts
+        run: pnpm --filter @antfly/ai-sdk add --save-dev 'ai@^7.0.162' 'zod@^4.1.8' --ignore-scripts
       - name: Build, typecheck, lint and test
         working-directory: ts
         run: |
@@ -38,7 +38,12 @@ jobs:
           pnpm --filter @antfly/ai-sdk... test
       - name: Verify independent npm consumer
         working-directory: ts
-        run: pnpm --filter @antfly/ai-sdk test:package
+        run: |
+          if [ '${{ matrix.dependencies }}' = latest-compatible ]; then
+            pnpm --filter @antfly/ai-sdk test:package --latest-peers
+          else
+            pnpm --filter @antfly/ai-sdk test:package
+          fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

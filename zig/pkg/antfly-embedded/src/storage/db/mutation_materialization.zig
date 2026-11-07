@@ -6540,52 +6540,36 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, source_url, config_json, config);
             defer if (metadata_fingerprint) |fingerprint| alloc.free(fingerprint);
-            // A stored pre-upgrade (location-based) fingerprint is also an
-            // acceptable match; see the matching comment in
-            // processDocumentExtractionAsset in enrichment_runtime.zig.
-            const legacy_fingerprint = if (metadata_fingerprint != null)
-                try document_extraction_mod.metadataFingerprintLegacyAlloc(alloc, source_url, config_json, config)
-            else
-                null;
-            defer if (legacy_fingerprint) |fingerprint| alloc.free(fingerprint);
+            // As in async replay, checksum opt-in requires verified bytes;
+            // metadata-only legacy fingerprints cannot prove that provenance.
             if (!force_reprocess) {
-                if (metadata_fingerprint) |primary| {
-                    var candidates: [2][]const u8 = .{ primary, primary };
-                    var candidate_count: usize = 1;
-                    if (legacy_fingerprint) |legacy| {
-                        if (!std.mem.eql(u8, legacy, primary)) {
-                            candidates[1] = legacy;
-                            candidate_count = 2;
-                        }
-                    }
-                    for (candidates[0..candidate_count]) |fingerprint| {
-                        if (existing_state) |state| {
-                            if (documentExtractionStateFingerprintMatches(alloc, state, fingerprint) and
-                                documentExtractionStateHasChunkUnitFingerprints(alloc, state))
-                            {
-                                if (existing_manifest) |value| {
-                                    const manifest_has_last_error = documentExtractionManifestHasLastError(alloc, value) catch |err| switch (err) {
-                                        error.OutOfMemory => return err,
-                                        else => true,
-                                    };
-                                    if (!manifest_has_last_error) {
-                                        try appendDocumentExtractionNavigationBackfill(
-                                            alloc,
-                                            db,
-                                            request.doc_key,
-                                            artifact_name,
-                                            fingerprint,
-                                            state,
-                                            from_generation,
-                                            artifact_writes,
-                                            artifact_delete_keys,
-                                        );
-                                        try artifact_writes.append(alloc, .{
-                                            .key = try alloc.dupe(u8, manifest_key),
-                                            .value = try alloc.dupe(u8, value),
-                                        });
-                                        return;
-                                    }
+                if (metadata_fingerprint) |fingerprint| {
+                    if (existing_state) |state| {
+                        if (documentExtractionStateFingerprintMatches(alloc, state, fingerprint) and
+                            documentExtractionStateHasChunkUnitFingerprints(alloc, state))
+                        {
+                            if (existing_manifest) |value| {
+                                const manifest_has_last_error = documentExtractionManifestHasLastError(alloc, value) catch |err| switch (err) {
+                                    error.OutOfMemory => return err,
+                                    else => true,
+                                };
+                                if (!manifest_has_last_error) {
+                                    try appendDocumentExtractionNavigationBackfill(
+                                        alloc,
+                                        db,
+                                        request.doc_key,
+                                        artifact_name,
+                                        fingerprint,
+                                        state,
+                                        from_generation,
+                                        artifact_writes,
+                                        artifact_delete_keys,
+                                    );
+                                    try artifact_writes.append(alloc, .{
+                                        .key = try alloc.dupe(u8, manifest_key),
+                                        .value = try alloc.dupe(u8, value),
+                                    });
+                                    return;
                                 }
                             }
                         }

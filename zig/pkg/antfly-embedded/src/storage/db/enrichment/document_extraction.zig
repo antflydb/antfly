@@ -2596,11 +2596,13 @@ pub fn applySourceMetadataFromJson(alloc: Allocator, config: *Config, doc_value:
 /// anything about the source record's shape, and without inventing a second,
 /// top-level copy of the same digest for Antfly's convenience alone.
 fn dupeOptionalStringField(alloc: Allocator, object: std.json.ObjectMap, field: []const u8) !?[]const u8 {
-    if (std.mem.indexOfScalar(u8, field, '.') == null) {
-        const value = object.get(field) orelse return null;
+    // Existing configs may name a literal top-level key containing dots.
+    // Its presence wins, including non-string values; traversal is a fallback.
+    if (object.get(field)) |value| {
         if (value != .string) return null;
         return try alloc.dupe(u8, value.string);
     }
+    if (std.mem.indexOfScalar(u8, field, '.') == null) return null;
     var current: std.json.Value = .{ .object = object };
     var parts = std.mem.splitScalar(u8, field, '.');
     while (parts.next()) |part| {
@@ -2669,15 +2671,9 @@ pub fn metadataFingerprintAlloc(
     return metadataFingerprintLegacyAlloc(alloc, source_url, config_json, config);
 }
 
-/// The original, location-based v3 formula, unconditionally -- regardless of
-/// `checksum_algorithm`. A row extracted before `checksum_algorithm` existed
-/// (or before it was declared on this config) stored this shape. Recomputing
-/// it from the row's current fields and comparing against a stored
-/// fingerprint proves the row's location and metadata have not changed since
-/// that extraction, exactly as strictly as it always did; it is never trusted
-/// on its own, only as a second candidate match alongside the current
-/// `metadataFingerprintAlloc` result, so upgrading to `checksum_algorithm`
-/// does not force a one-time re-extraction of every already-extracted row.
+/// The original, location-based v3 formula. Used only when no declared
+/// digest is active. A legacy fingerprint does not prove that a digest was
+/// checked against downloaded bytes, so it cannot authorize SHA-256 opt-in.
 pub fn metadataFingerprintLegacyAlloc(
     alloc: Allocator,
     source_url: []const u8,
@@ -6972,4 +6968,54 @@ test "native text routes independently of OCR output thresholds and counts Unico
     try std.testing.expect(assessTextQuality("     ", .{ .min_chars = 1 }).too_short);
     try std.testing.expect(assessTextQuality("\u{a0}\u{2003}\u{3000}", .{ .min_chars = 1 }).too_short);
     try std.testing.expectEqual(@as(usize, 2), assessTextQuality("世\u{3000}界", .{}).non_whitespace_chars);
+}
+
+test "document extraction dotted metadata fields preserve literal keys before traversal" {
+    const a = std.testing.allocator;
+    var config = try parseConfig(a,
+        \\{"source":{"checksum_field":"file.sha256","filename_field":"file.name","etag_field":"file.etag","content_type_field":"file.mime","version_field":"file.version","last_modified_field":"file.modified"}}
+    );
+    defer config.deinit(a);
+    try applySourceMetadataFromJson(a, &config,
+        \\{"file.sha256":"literal","file.name":"original.pdf","file.etag":"etag","file.mime":"application/pdf","file.version":"1","file.modified":"today","file":{"sha256":"nested","name":"other.pdf"}}
+    );
+    try std.testing.expectEqualStrings("literal", config.checksum);
+    try std.testing.expectEqualStrings("original.pdf", config.filename);
+    try std.testing.expectEqualStrings("etag", config.etag);
+    try std.testing.expectEqualStrings("application/pdf", config.content_type);
+    try std.testing.expectEqualStrings("1", config.version);
+    try std.testing.expectEqualStrings("today", config.last_modified);
+    // A present non-string literal also retains the legacy no-value behavior.
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"a.b\":null,\"a\":{\"b\":\"nested\"}}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), try dupeOptionalStringField(a, parsed.value.object, "a.b"));
+}
+
+test "document extraction checksum opt in requires verified identity then reuses relocation" {
+    const a = std.testing.allocator;
+    const old_json = "{\"source\":{\"checksum_field\":\"metadata.sha256\"}}";
+    const new_json = "{\"checksum_algorithm\":\"sha256\",\"source\":{\"checksum_field\":\"metadata.sha256\"}}";
+    const digest = testRepeatedHexDigest('a');
+    const row = try std.fmt.allocPrint(a, "{{\"metadata\":{{\"sha256\":\"{s}\"}}}}", .{digest});
+    defer a.free(row);
+    var old = try parseConfig(a, old_json);
+    defer old.deinit(a);
+    var new = try parseConfig(a, new_json);
+    defer new.deinit(a);
+    try applySourceMetadataFromJson(a, &old, row);
+    try applySourceMetadataFromJson(a, &new, row);
+    const legacy = (try metadataFingerprintAlloc(a, "https://old/a", old_json, old)).?;
+    defer a.free(legacy);
+    const verified = (try metadataFingerprintAlloc(a, "https://old/a", new_json, new)).?;
+    defer a.free(verified);
+    const moved = (try metadataFingerprintAlloc(a, "https://new/b", new_json, new)).?;
+    defer a.free(moved);
+    try std.testing.expect(!std.mem.eql(u8, legacy, verified));
+    try std.testing.expectEqualStrings(verified, moved);
+    // An unchanged legacy config cannot waive the opt-in integrity check.
+    const legacy_same_config = (try metadataFingerprintLegacyAlloc(a, "https://old/a", new_json, new)).?;
+    defer a.free(legacy_same_config);
+    try std.testing.expect(!std.mem.eql(u8, legacy_same_config, verified));
+    const wrong = testRepeatedHexDigest('b');
+    try std.testing.expectError(error.DocumentChecksumMismatch, verifyChecksumDigestHex(new, &wrong));
 }

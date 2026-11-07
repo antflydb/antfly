@@ -1,8 +1,12 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, rename, writeFile } from "node:fs/promises";
-import { join, posix } from "node:path";
+import { createHash } from "node:crypto";
+import { posix } from "node:path";
 import type { AntflyClient } from "@antfly/sdk";
 import type { SourceSyncJob, StandaloneSourcesClient } from "@antfly/sdk/sources";
+import localMediaTypes from "../../../../../go/pkg/sources/local_media_types.json" with {
+  type: "json",
+};
+import { abortable, combinedSignal } from "../abort.js";
+import { publishLocalObject } from "./local-store.js";
 import { type AntflyAssetReference, encodeAssetReference } from "./reference.js";
 
 /**
@@ -46,7 +50,7 @@ export interface UploadFileOptions {
   maxSyncConflictRetries?: number;
   /** Delay between 409 retries. Default 2000ms. */
   syncConflictRetryDelayMs?: number;
-  /** Bound on polling the sync job and, for `searchable`, the search query. Default 120000ms. */
+  /** Overall deadline, including requests, file writing, sync and publication polling. Default 120000ms. */
   timeoutMs?: number;
   pollIntervalMs?: number;
   signal?: AbortSignal;
@@ -60,17 +64,11 @@ export interface UploadFileResult {
   state: AssetPublicationState;
 }
 
-const MIME_EXTENSIONS: Record<string, string> = {
-  "video/mp4": "mp4",
-  "video/quicktime": "mov",
-  "video/webm": "webm",
-  "image/png": "png",
-  "image/jpeg": "jpg",
-  "image/webp": "webp",
-  "image/gif": "gif",
-  "audio/mpeg": "mp3",
-  "audio/wav": "wav",
-  "audio/ogg": "ogg",
+const MIME_EXTENSIONS: Readonly<Record<string, string>> = localMediaTypes;
+const MIME_ALIASES: Readonly<Record<string, string>> = {
+  "audio/x-wav": "audio/wav",
+  "audio/x-flac": "audio/flac",
+  "image/jpg": "image/jpeg",
 };
 
 export class SourceSyncConflictError extends Error {
@@ -112,8 +110,52 @@ export class AssetUploadTimeoutError extends Error {
  * for a newly-uploaded object.
  */
 export async function uploadFile(options: UploadFileOptions): Promise<UploadFileResult> {
-  const deadline = Date.now() + (options.timeoutMs ?? 120_000);
+  const timeoutMs = options.timeoutMs ?? 120_000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 2_147_483_647) {
+    throw new RangeError("timeoutMs must be an integer between 1 and 2147483647");
+  }
+  const cancellation = new AbortController();
+  const signal = combinedSignal(options.signal, cancellation.signal) ?? cancellation.signal;
+  let state: AssetPublicationState = "published";
+  const deadline = Date.now() + timeoutMs;
+  const check = () => {
+    signal.throwIfAborted();
+    if (Date.now() >= deadline) {
+      cancellation.abort(new AssetUploadTimeoutError(state));
+      throw signal.reason;
+    }
+  };
+  const timer = setTimeout(() => cancellation.abort(new AssetUploadTimeoutError(state)), timeoutMs);
+  try {
+    check();
+    return await abortable(
+      uploadWithinDeadline({ ...options, signal }, check, () => {
+        state = "searchable";
+      }),
+      signal
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function uploadWithinDeadline(
+  options: UploadFileOptions,
+  check: () => void,
+  searching: () => void
+): Promise<UploadFileResult> {
+  const suppliedMime = options.mimeType.split(";", 1)[0].trim().toLowerCase();
+  const mimeType = Object.hasOwn(MIME_ALIASES, suppliedMime)
+    ? MIME_ALIASES[suppliedMime]
+    : suppliedMime;
+  if (!Object.hasOwn(MIME_EXTENSIONS, mimeType))
+    throw new Error(`Unsupported local upload MIME type: ${mimeType}`);
+  if (options.data.byteLength === 0)
+    throw new RangeError("Local media uploads must contain at least one byte");
+  if (options.data.byteLength > 256 * 1024 * 1024)
+    throw new RangeError("Local uploads may not exceed 256 MiB");
   const profile = await options.sources.profile(options.signal);
+  check();
   const source = profile.sources.find((source) => source.id === options.sourceId);
   if (
     !source ||
@@ -138,9 +180,8 @@ export async function uploadFile(options: UploadFileOptions): Promise<UploadFile
     throw new Error("Upload prefix must match the source's local prefix");
   }
   const digest = createHash("sha256").update(options.data).digest("hex");
-  const ext = MIME_EXTENSIONS[options.mimeType];
-  const objectsDir = join(options.localRoot, options.prefix ?? "", "objects", "sha256");
-  const filename = ext ? `${digest}.${ext}` : digest;
+  const ext = MIME_EXTENSIONS[mimeType];
+  const filename = `${digest}.${ext}`;
   const relativeKey = `objects/sha256/${filename}`;
   const identity = source.identity?.namespace
     ? `${source.identity.namespace}/${relativeKey}`
@@ -150,17 +191,20 @@ export async function uploadFile(options: UploadFileOptions): Promise<UploadFile
     table: options.table,
     key: `source://job/${options.sourceId}/records/${keyDigest}`,
   };
-  const finalPath = join(objectsDir, filename);
-  await mkdir(objectsDir, { recursive: true });
-  const tempPath = join(objectsDir, `.upload-${randomUUID()}`);
-  await writeFile(tempPath, options.data);
-  await rename(tempPath, finalPath);
-
-  const job = await runSourceSync(options, deadline);
+  await publishLocalObject(
+    options.localRoot,
+    prefix,
+    filename,
+    digest,
+    options.data,
+    check,
+    options.signal
+  );
+  const job = await runSourceSync(options, check);
   if (job.state !== "completed") throw new SourceSyncFailedError(job);
 
   const pollIntervalMs = options.pollIntervalMs ?? 500;
-  await pollForCatalogRow(options, reference, relativeKey, digest, deadline, pollIntervalMs);
+  await pollForCatalogRow(options, reference, relativeKey, digest, check, pollIntervalMs);
   if ((options.waitFor ?? "published") === "published") {
     return {
       reference,
@@ -169,7 +213,8 @@ export async function uploadFile(options: UploadFileOptions): Promise<UploadFile
       state: "published",
     };
   }
-  await pollForSearchable(options, reference, digest, deadline, pollIntervalMs);
+  searching();
+  await pollForSearchable(options, reference, digest, check, pollIntervalMs);
   return {
     reference,
     providerReferenceId: encodeAssetReference(reference),
@@ -178,13 +223,21 @@ export async function uploadFile(options: UploadFileOptions): Promise<UploadFile
   };
 }
 
-async function runSourceSync(options: UploadFileOptions, deadline: number): Promise<SourceSyncJob> {
+async function runSourceSync(
+  options: UploadFileOptions,
+  check: () => void
+): Promise<SourceSyncJob> {
   const maxRetries = options.maxSyncConflictRetries ?? 5;
   const retryDelayMs = options.syncConflictRetryDelayMs ?? 2000;
   let job: SourceSyncJob | undefined;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    check();
     try {
-      job = await options.sources.sync({ sourceId: options.sourceId, signal: options.signal });
+      job = await options.sources.sync({
+        sourceId: options.sourceId,
+        restart: true,
+        signal: options.signal,
+      });
       break;
     } catch (error) {
       const status = (error as { status?: number } | undefined)?.status;
@@ -197,10 +250,11 @@ async function runSourceSync(options: UploadFileOptions, deadline: number): Prom
   }
   if (!job) throw new SourceSyncConflictError(options.sourceId);
   while (job.state === "running") {
-    if (Date.now() > deadline) throw new AssetUploadTimeoutError("published");
+    check();
     await delay(options.pollIntervalMs ?? 500, options.signal);
     job = await options.sources.job(job.id, options.signal);
   }
+  check();
   return job;
 }
 
@@ -210,10 +264,11 @@ async function pollForCatalogRow(
   reference: AntflyAssetReference,
   relativeKey: string,
   digest: string,
-  deadline: number,
+  check: () => void,
   pollIntervalMs: number
 ): Promise<void> {
   while (true) {
+    check();
     const { data, response } = await options.client
       .getRawClient()
       .GET("/db/v1/tables/{tableName}/documents/{key}", {
@@ -223,6 +278,7 @@ async function pollForCatalogRow(
         },
         signal: options.signal,
       });
+    check();
     if (response.ok) {
       const row = data as {
         source?: { id?: string; relative_key?: string };
@@ -240,7 +296,7 @@ async function pollForCatalogRow(
     } else if (response.status !== 404) {
       throw new Error(`Upload catalog lookup failed: HTTP ${response.status}`);
     }
-    if (Date.now() > deadline) throw new AssetUploadTimeoutError("published");
+    check();
     await delay(pollIntervalMs, options.signal);
   }
 }
@@ -249,18 +305,24 @@ async function pollForSearchable(
   options: UploadFileOptions,
   reference: AntflyAssetReference,
   digest: string,
-  deadline: number,
+  check: () => void,
   pollIntervalMs: number
 ): Promise<void> {
   while (true) {
-    const response = await options.client.tables.query(options.table, {
-      full_text_search: { query: digest },
-      filter_query: { ids: [reference.key] },
-      limit: 1,
-    });
+    check();
+    const response = await options.client.tables.query(
+      options.table,
+      {
+        full_text_search: { query: digest },
+        filter_query: { ids: [reference.key] },
+        limit: 1,
+      },
+      { signal: options.signal }
+    );
+    check();
     const envelope = response as { responses?: { hits?: { hits?: unknown[] } }[] };
     if ((envelope.responses?.[0]?.hits?.hits?.length ?? 0) > 0) return;
-    if (Date.now() > deadline) throw new AssetUploadTimeoutError("searchable");
+    check();
     await delay(pollIntervalMs, options.signal);
   }
 }

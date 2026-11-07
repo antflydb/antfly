@@ -17,6 +17,10 @@ paths:
       responses:
         '200':
           description: Current profile; credentials are references only.
+          headers:
+            X-Antfly-Source-Preconditions:
+              description: Version of conditional source cutover support. Migration clients require this advertisement before copying.
+              schema: {type: string, enum: ['2']}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Profile'}
@@ -80,7 +84,20 @@ paths:
       - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
     put:
       operationId: putSource
-      description: Reconfiguration is serialized with sync. The body id must equal the path id.
+      description: Reconfiguration is serialized with sync. The body id must equal the path id. Migration cutover supplies If-Match to reject a changed or removed source with HTTP 412.
+      parameters:
+        - name: If-Match
+          in: header
+          description: Expected source revision for conditional migration cutover.
+          schema: {type: string}
+        - name: X-Antfly-Migration-Connections
+          in: header
+          description: JSON object mapping the two transfer connection names to their expected configuration digests; checked atomically with source mutation or sync admission. A mismatch returns HTTP 412.
+          schema: {type: string}
+        - name: X-Antfly-Local-Migration
+          in: header
+          description: JSON LocalMigrationReceipt committed atomically with cutover. Requires both conditional headers. Post-cutover retries must match the durable receipt exactly; mismatches return HTTP 412.
+          schema: {type: string, maxLength: 16384}
       requestBody:
         required: true
         content:
@@ -107,6 +124,15 @@ paths:
   /v1/sync:
     post:
       operationId: startSourceSync
+      parameters:
+        - name: If-Match
+          in: header
+          description: Expected revision of source_id at sync admission. A mismatch, missing source_id, or purge_only returns HTTP 412.
+          schema: {type: string}
+        - name: X-Antfly-Migration-Connections
+          in: header
+          description: JSON object mapping both transfer connection names to expected configuration digests. Checked atomically at sync admission; a mismatch returns HTTP 412.
+          schema: {type: string}
       description: >-
         Start one durable sync of the full profile, or of one source with
         source_id. Sync is serialized across the service, so another source's
@@ -315,6 +341,26 @@ components:
         principals: {type: array, items: {type: string}}
         connections: {type: object, additionalProperties: {$ref: '#/components/schemas/Connection'}}
         sources: {type: array, items: {$ref: '#/components/schemas/Source'}}
+        local_migrations:
+          type: object
+          readOnly: true
+          additionalProperties: {$ref: '#/components/schemas/LocalMigrationReceipt'}
+    LocalMigrationReceipt:
+      type: object
+      readOnly: true
+      required: [version, source_id, table, namespace, from_connection, from_prefix, from_binding, to_connection, to_bucket, to_prefix, to_binding]
+      properties:
+        version: {type: integer, enum: [1]}
+        source_id: {type: string}
+        table: {type: string}
+        namespace: {type: string}
+        from_connection: {type: string}
+        from_prefix: {type: string}
+        from_binding: {type: string}
+        to_connection: {type: string}
+        to_bucket: {type: string}
+        to_prefix: {type: string}
+        to_binding: {type: string}
     SyncJob:
       type: object
       required: [version, id, state, started_at]

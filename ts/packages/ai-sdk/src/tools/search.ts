@@ -37,13 +37,18 @@ export function createSearchTool(options: AntflySearchToolOptions): Record<strin
         limit: z.number().int().min(1).max(100).optional(),
       })
       .strict(),
-    execute: async ({ query, limit }) => {
-      const response = await options.client.tables.query(options.table, {
-        full_text_search: { query },
-        ...(options.indexes?.length ? { semantic_search: query, indexes: options.indexes } : {}),
-        fields: options.fields,
-        limit: Math.min(limit ?? maxResults, maxResults),
-      });
+    execute: async ({ query, limit }, { abortSignal }) => {
+      abortSignal?.throwIfAborted();
+      const response = await options.client.tables.query(
+        options.table,
+        {
+          full_text_search: { query },
+          ...(options.indexes?.length ? { semantic_search: query, indexes: options.indexes } : {}),
+          fields: options.fields,
+          limit: Math.min(limit ?? maxResults, maxResults),
+        },
+        { signal: abortSignal }
+      );
       return response;
     },
   });
