@@ -351,7 +351,7 @@ test "lite allocator v4 live certificates share the caller transaction and rejec
         try file.beginTransaction();
         try file.putDocument("one", "committed");
         try file.putDocument("two", "same transaction");
-        try file.commitTransactionWithDurability(false);
+        try file.commitTransactionWithDurability(false, null);
         try std.testing.expectEqual(sequence + 1, file.activeCheckpoint().commit_sequence);
         try std.testing.expectEqual(catalog, file.activeCheckpoint().catalog_root_page);
         var peer = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
@@ -962,7 +962,7 @@ test "lite allocator v4 small checkpoints bound counter and queue boundary growt
     try std.testing.expect(file.test_page_writes.load(.monotonic) - writes <= 5);
     try std.testing.expectEqual(@as(u64, 0), pages.ledger.?.root.deltas);
     try std.testing.expectEqual(@as(u64, 0), pages.ledger.?.root.build_limit);
-    try file.publishCheckpoint(checkpoint, false);
+    try file.publishCheckpoint(checkpoint, false, null);
     file.invalidateLedger();
     try std.testing.expect((try file.check()).valid);
 }
@@ -995,7 +995,7 @@ test "lite allocator v4 owner checkpoints bound metadata work across reopen and 
         checkpoint.commit_sequence += 1;
         checkpoint.free_map_root_page = try pages.allocate();
         try file.persistAllocator(&pages, &checkpoint);
-        try file.publishCheckpoint(checkpoint, false);
+        try file.publishCheckpoint(checkpoint, false, null);
         const writes = file.test_page_writes.load(.monotonic);
         _ = try file.reclaimPages(1);
         try std.testing.expect(file.ledger.?.root.build_limit != 0);
@@ -1287,7 +1287,7 @@ test "issue1362 full snapshots retain unpublished standalone roots through sync"
     writer.reader_coordinator = &coordinator;
     try writer.beginTransaction();
     try writer.putDocument("private", "pending");
-    try writer.commitTransactionWithDurability(false);
+    try writer.commitTransactionWithDurability(false, null);
     try std.testing.expect(writer.durable_header != null);
     var snapshot = try writer.captureFullReadSnapshot();
     defer snapshot.close();
@@ -1555,14 +1555,14 @@ test "lite coordinator publication cancellation never performs fallible notifica
     }
     Fault.writes = 0;
     Fault.cancel_stat = true;
-    try std.testing.expectError(error.Canceled, file.publishCheckpoint(checkpoint, false));
+    try std.testing.expectError(error.Canceled, file.publishCheckpoint(checkpoint, false, null));
     try std.testing.expectEqual(@as(usize, 0), Fault.writes);
     try std.testing.expectEqualDeep(before, file.header);
     try std.testing.expect(!file.checkpoint_publication_uncertain);
     Fault.cancel_stat = false;
     Fault.cancel_write = true;
     // Cancellation inside the uncertain window reports an unknown outcome.
-    try std.testing.expectError(error.OutcomeUnknown, file.publishCheckpoint(checkpoint, false));
+    try std.testing.expectError(error.OutcomeUnknown, file.publishCheckpoint(checkpoint, false, null));
     try std.testing.expect(file.checkpoint_publication_uncertain);
     try std.testing.expectEqualDeep(before, file.header);
     Fault.cancel_stat = false;
@@ -1573,7 +1573,7 @@ test "lite coordinator publication cancellation never performs fallible notifica
     // Cancellation after the active-slot write cannot undo a committed result
     // or make its coordinator notification abort the process.
     Fault.cancel_after_commit = true;
-    try file.publishCheckpoint(checkpoint, false);
+    try file.publishCheckpoint(checkpoint, false, null);
     try std.testing.expect(!file.checkpoint_publication_uncertain);
     try std.testing.expectEqual(checkpoint, file.activeCheckpoint());
     Fault.cancel_after_commit = false;
@@ -1691,7 +1691,7 @@ test "lite allocator v4 external readers and deferred durability fence reuse" {
         try file.beginTransaction();
         errdefer file.abortTransaction();
         try file.putDocument("doc", "unsynced");
-        try file.commitTransactionWithDurability(false);
+        try file.commitTransactionWithDurability(false, null);
     }
     try std.testing.expect(file.durable_header != null);
     var pinned: NativeFile = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
@@ -1735,7 +1735,7 @@ test "lite allocator v4 reuse frontier withholds pages retired by undurable comm
         try file.beginTransaction();
         errdefer file.abortTransaction();
         try file.putDocument("doc", if (i % 2 == 0) &second else &first);
-        try file.commitTransactionWithDurability(false);
+        try file.commitTransactionWithDurability(false, null);
     }
     try std.testing.expect(file.durable_header != null);
     const pending_before = (try file.allocatorStats()).?.pending_data_objects;
@@ -1808,7 +1808,7 @@ test "lite allocator v4 rejects a durable free bit for a live page" {
     checkpoint.commit_sequence += 1;
     checkpoint.free_map_root_page = try pages.allocate();
     try file.persistAllocator(&pages, &checkpoint);
-    try file.publishCheckpoint(checkpoint, false);
+    try file.publishCheckpoint(checkpoint, false, null);
     const report = try file.check();
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("invalid_allocator", report.issue.?);
@@ -3894,7 +3894,18 @@ pub const OwnedDocument = struct {
     value: []u8,
 };
 
-/// See `NativeFile.sync_lock_hooks`.
+/// Optional hooks a caller passes into exactly one
+/// `commitTransactionWithDurability` call, to release an outer lock for the
+/// actual durability-barrier syscall and re-acquire it immediately after
+/// (WS2): everything `syncIfRequired` does before and after this pair --
+/// the preceding page/slot writes, and the checkpoint-slot publication that
+/// follows once it returns -- still runs under that lock, since those touch
+/// state other lock holders read. `context` is opaque here on purpose:
+/// NativeFile has no business knowing what kind of lock a caller above it
+/// uses. Threaded explicitly as a parameter (never stored on `NativeFile`)
+/// so two commits on the same file -- the group leader's, and any other
+/// caller's (reclaim, vacuum, `sync()`) that passes `null` -- can never
+/// observe or act on each other's hooks.
 pub const SyncLockHooks = struct {
     context: *anyopaque,
     release: *const fn (context: *anyopaque) void,
@@ -4825,6 +4836,13 @@ const PageWriteBatch = struct {
                 _ = file.test_page_write_calls.fetchAdd(1, .monotonic);
                 _ = file.test_page_writes.fetchAdd(@intCast(end - start), .monotonic);
             }
+            // Reserve room for this batch's entries before the write below,
+            // so `note` itself never allocates and a genuine allocation
+            // failure can never be mistaken for this window simply
+            // overflowing -- see `ManifestBuilder.reserveCapacity`.
+            if (NativeFile.manifest_commits_enabled) {
+                file.manifest_builder.reserveCapacity(file.allocator, @intCast(end - start));
+            }
             (file.file.writePositionalAll(file.runtimeIo(), self.buffer[start * size .. end * size], self.page_ids[start] * @as(u64, size)) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
@@ -4839,7 +4857,7 @@ const PageWriteBatch = struct {
             // non-durable commit, or the eventual durable one.
             if (NativeFile.manifest_commits_enabled) {
                 for (self.page_ids[start..end], start..end) |page_id, i|
-                    file.manifest_builder.note(file.allocator, page_id, std.mem.readInt(u32, self.buffer[i * size ..][page_crc_offset..][0..4], .little));
+                    file.manifest_builder.note(page_id, std.mem.readInt(u32, self.buffer[i * size ..][page_crc_offset..][0..4], .little));
             }
             start = end;
         }
@@ -5176,16 +5194,23 @@ pub const NativeFile = struct {
     /// clears (on success in `publishCheckpoint`, or by reconciliation).
     uncertain_checkpoint: ?CheckpointSlot = null,
     uncertain_slot: ?u8 = null,
-    /// Optional hooks a caller installs (and clears) around exactly one
-    /// `commitTransactionWithDurability`/`sync` call, to release an outer
-    /// lock for the actual durability-barrier syscall and re-acquire it
-    /// immediately after (WS2): everything `syncIfRequired` does before and
-    /// after this pair -- the preceding page/slot writes, and the
-    /// checkpoint-slot publication that follows once it returns -- still
-    /// runs under that lock, since those touch state other lock holders
-    /// read. `context` is opaque here on purpose: NativeFile has no
-    /// business knowing what kind of lock a caller above it uses.
-    sync_lock_hooks: ?SyncLockHooks = null,
+    // WS2's `sync_lock_hooks` field was removed: it let a commit that never
+    // installed its own hooks (reclaim's `reclaimPagesImpl`, `sync()`,
+    // `publishBareCommit`) silently observe and act on whatever *another*
+    // commit happened to have installed on this same `NativeFile`, since
+    // the field was shared mutable state rather than scoped to one call.
+    // That is how a reclaim/maintenance commit running concurrently with a
+    // foreground group's fsync ended up releasing and reacquiring the
+    // group leader's lock on its behalf -- an extra unlock that skips a
+    // ticket (`PublicationMutex` in `docstore.zig`), and a `defer` in the
+    // leader's own call that can observe the field already cleared by the
+    // *other* caller's matching commit and skip reacquiring entirely. Hooks
+    // are now passed explicitly as a parameter to the one call that may
+    // use them (`commitTransactionWithDurability`, threaded through to its
+    // `syncIfRequired`/`publishCheckpoint`), captured on that call's own
+    // stack, so two concurrent commits on the same file can never see or
+    // act on each other's hooks. See `SyncLockHooks`'s doc comment for what
+    // the hooks themselves still do.
     /// Owner admission budget. Reuse remains permitted at the file-size cap.
     /// Null means unlimited; the owner subtracts retired/workspace capacity.
     max_file_bytes: ?u64 = null,
@@ -6012,7 +6037,7 @@ pub const NativeFile = struct {
         try self.writePage(record, .catalog, encoded.items);
         // Stage the root in memory. The ordinary commit supplies the single
         // data durability barrier before publishing the checkpoint slots.
-        try self.publishCheckpoint(next, false);
+        try self.publishCheckpoint(next, false, null);
         self.allocator_certificate_staged = true;
     }
 
@@ -6732,7 +6757,7 @@ pub const NativeFile = struct {
         self.header.checkpoints = .{ checkpoint, checkpoint };
         try self.writeSlotPage(0, checkpoint);
         try self.writeSlotPage(1, checkpoint);
-        try self.syncIfRequired();
+        try self.syncIfRequired(null);
     }
 
     fn stampLogicalGenerations(self: *NativeFile, checkpoint: *CheckpointSlot) !void {
@@ -6989,12 +7014,17 @@ pub const NativeFile = struct {
         next.commit_sequence += 1;
         next.free_map_root_page = try pages.allocate();
         try self.persistAllocator(&pages, &next);
-        try self.syncIfRequired();
-        try self.publishCheckpoint(next, false);
+        // Never the group-commit path: this reclaim commit holds whatever
+        // outer lock its caller took (Store's `maintainOnceWithCancel`)
+        // unreleased across its own sync, rather than racing a foreground
+        // group's released window. Passing a real hooks value here would
+        // have this commit act on a lock it does not own.
+        try self.syncIfRequired(null);
+        try self.publishCheckpoint(next, false, null);
         if (cancel) |token| try token.check();
         // No cancellation checks after checkpoint publication begins: preserve
         // the usual uncertain-outcome fencing across the durability boundary.
-        try self.commitTransactionWithDurability(durable);
+        try self.commitTransactionWithDurability(durable, null);
         return count;
     }
 
@@ -7479,12 +7509,12 @@ pub const NativeFile = struct {
         if (!self.flushing_transaction and root == .index and mutations.len == 1 and !self.checkpoint_publication_uncertain) {
             const mutation = mutations[0];
             const size = try self.getCatalogRecordSizeFromRoot(root, mutation.key);
-            if (mutation.is_delete and size == null) return self.syncIfRequired();
+            if (mutation.is_delete and size == null) return self.syncIfRequired(null);
             if (mutation.external_value_root_page == 0 and !mutation.is_delete and size != null and size.? == mutation.value.len and self.catalogEntryFitsInline(mutation.key, mutation.value)) {
                 const existing = try self.getCatalogRecordFromRootAlloc(self.allocator, root, mutation.key);
                 defer if (existing) |bytes| self.allocator.free(bytes);
                 if (existing) |bytes| {
-                    if (std.mem.eql(u8, bytes, mutation.value)) return self.syncIfRequired();
+                    if (std.mem.eql(u8, bytes, mutation.value)) return self.syncIfRequired(null);
                 }
             }
         }
@@ -7561,7 +7591,7 @@ pub const NativeFile = struct {
             try self.persistAllocator(page_allocator, &next);
             try self.publishBareCommit(page_allocator, &next);
         } else {
-            try self.publishCheckpoint(next, false);
+            try self.publishCheckpoint(next, false, null);
         }
     }
 
@@ -8987,7 +9017,7 @@ pub const NativeFile = struct {
             try self.persistAllocator(page_allocator, &next);
             try self.publishBareCommit(page_allocator, &next);
         } else {
-            try self.publishCheckpoint(next, false);
+            try self.publishCheckpoint(next, false, null);
         }
         if (directory.indexed) {
             deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
@@ -9086,7 +9116,7 @@ pub const NativeFile = struct {
             try self.persistAllocator(pages, &next);
             try self.publishBareCommit(pages, &next);
         } else {
-            try self.publishCheckpoint(next, false);
+            try self.publishCheckpoint(next, false, null);
         }
     }
 
@@ -10515,7 +10545,7 @@ pub const NativeFile = struct {
         self.header.active_checkpoint = 0;
         try self.writeSlotPage(0, checkpoint);
         try self.writeSlotPage(1, checkpoint);
-        try self.syncIfRequired();
+        try self.syncIfRequired(null);
     }
 
     // Bound editor state and retained inline values independently. External
@@ -11625,6 +11655,21 @@ pub const NativeFile = struct {
             // already-open nested call is live (`reader_window_depth != 0`):
             // that window is already open for free, so there is no cost to
             // avoid and no reason to bypass it.
+            // This snapshot (`state`, from `loadLedger` above) must stay the
+            // freshest truth for the entire call: nothing else may mutate
+            // this file's ledger/free-map/retirement heaps between here and
+            // `drainRetirement` below using it. That is no longer "this
+            // function already runs under the caller's lock, end of story"
+            // once a commit can have that lock released mid-publish (WS2,
+            // `Store.commit_in_sync`/`lockStoreExclusive` in docstore.zig):
+            // every Store entry point that reaches this function (a
+            // foreground commit's `beginTransaction`, or a reclaim/vacuum
+            // pass) now waits out another commit's released sync window
+            // before calling in, under the same mutex, so this remains a
+            // single point-in-time decision made and used without any
+            // other thread able to touch this file's allocator state in
+            // between. Re-verify there, not here: `NativeFile` stays
+            // agnostic of what lock (if any) a caller above it holds.
             const has_retirement_backlog = state.free_pages != 0 or state.heap.count() != 0 or
                 state.metadata_heap.count() != 0 or state.chains_heap.count() != 0;
             const skip_reuse_lock = !has_retirement_backlog and self.reader_window_depth == 0;
@@ -12467,7 +12512,7 @@ pub const NativeFile = struct {
                 std.debug.assert(self.manifest_builder.entries.contains(page.*));
             }
         }
-        try self.publishCheckpoint(next, false);
+        try self.publishCheckpoint(next, false, null);
         self.transaction_writes = null;
         writes.deinit(self.allocator);
     }
@@ -12687,7 +12732,7 @@ pub const NativeFile = struct {
     }
 
     pub fn commitTransaction(self: *NativeFile) !void {
-        return self.commitTransactionWithDurability(true);
+        return self.commitTransactionWithDurability(true, null);
     }
 
     /// Reset accumulated manifest tracking when a bare (no caller-owned
@@ -12741,11 +12786,13 @@ pub const NativeFile = struct {
     fn publishBareCommit(self: *NativeFile, pages: *PageAllocator, next: *CheckpointSlot) !void {
         if (manifest_commits_enabled) try self.manifest_builder.noteReused(self.allocator, &pages.reused);
         const manifest_prepared = if (manifest_commits_enabled) try self.tryBuildCommitManifest(next) else false;
-        if (!manifest_prepared) try self.syncIfRequired();
-        try self.publishCheckpoint(next.*, manifest_prepared);
+        // Never the group-commit path: a bare commit has no outer Store
+        // lock to release around its sync.
+        if (!manifest_prepared) try self.syncIfRequired(null);
+        try self.publishCheckpoint(next.*, manifest_prepared, null);
     }
 
-    pub fn commitTransactionWithDurability(self: *NativeFile, durable: bool) !void {
+    pub fn commitTransactionWithDurability(self: *NativeFile, durable: bool, hooks: ?SyncLockHooks) !void {
         defer self.artifact_lease_transaction = false;
         defer self.allocator_certificate_staged = false;
         const previous = self.transaction_header orelse return error.InvalidTransactionState;
@@ -12813,8 +12860,8 @@ pub const NativeFile = struct {
         }
         if (changed) {
             const manifest_prepared = if (manifest_commits_enabled) try self.tryBuildCommitManifest(&next) else false;
-            if (!manifest_prepared) try self.syncIfRequired();
-            try self.publishCheckpoint(next, manifest_prepared);
+            if (!manifest_prepared) try self.syncIfRequired(hooks);
+            try self.publishCheckpoint(next, manifest_prepared, hooks);
         } else try self.sync();
     }
 
@@ -12951,7 +12998,7 @@ pub const NativeFile = struct {
     /// would then re-verify a stale entry list an unrelated, possibly
     /// already-overwritten commit wrote. `false` resets all four to the
     /// safe presynced default before anything else.
-    fn publishCheckpoint(self: *NativeFile, proposed: CheckpointSlot, manifest_prepared: bool) !void {
+    fn publishCheckpoint(self: *NativeFile, proposed: CheckpointSlot, manifest_prepared: bool, hooks: ?SyncLockHooks) !void {
         var checkpoint = proposed;
         if (!manifest_prepared) {
             checkpoint.presynced = true;
@@ -13012,7 +13059,7 @@ pub const NativeFile = struct {
                 break :blk err;
             };
             self.file.writePositionalAll(io, slot_page, slotPhysicalPage(next_slot) * @as(u64, self.header.page_size)) catch |err| break :blk err;
-            self.syncIfRequired() catch |err| break :blk err;
+            self.syncIfRequired(hooks) catch |err| break :blk err;
             break :blk {};
         }) catch {
             // Cancellation included: once slot I/O may have started, the
@@ -13059,16 +13106,17 @@ pub const NativeFile = struct {
         self.durability_policy = policy;
     }
 
-    fn syncIfRequired(self: *NativeFile) !void {
+    fn syncIfRequired(self: *NativeFile, hooks: ?SyncLockHooks) !void {
         if (!self.no_sync and self.transaction_header == null) {
             // WS2: release the caller's lock (if any) for exactly the
             // durability-barrier syscall -- the one part of a commit slow
             // enough to be worth not blocking a concurrent reader/writer
             // for -- and re-acquire it before returning, so every other
             // NativeFile field this function or its caller touches, before
-            // and after, stays under that lock. See `sync_lock_hooks`.
-            if (self.sync_lock_hooks) |hooks| hooks.release(hooks.context);
-            defer if (self.sync_lock_hooks) |hooks| hooks.reacquire(hooks.context);
+            // and after, stays under that lock. `hooks` is this call's own
+            // parameter, never a shared field: see `SyncLockHooks`.
+            if (hooks) |h| h.release(h.context);
+            defer if (hooks) |h| h.reacquire(h.context);
             if (self.durability_policy) |policy|
                 try antfly_platform.filesystem.syncData(self.file.handle, policy)
             else
@@ -13081,8 +13129,11 @@ pub const NativeFile = struct {
         if (self.transaction_header != null) return;
         if (!self.checkpoint_publication_uncertain and self.durable_header == null)
             if (self.last_synced_header) |synced| if (std.meta.eql(synced, self.header)) return;
-        try self.syncIfRequired();
-        if (self.durable_header != null) try self.publishCheckpoint(self.activeCheckpoint(), false);
+        // Never the group-commit path: a caller reaching here (Store's
+        // `syncIndexContents`/`sync`, a bare durability barrier) holds its
+        // own lock across this whole call, unreleased.
+        try self.syncIfRequired(null);
+        if (self.durable_header != null) try self.publishCheckpoint(self.activeCheckpoint(), false, null);
         self.last_synced_header = self.header;
     }
 
@@ -13122,7 +13173,7 @@ pub const NativeFile = struct {
     pub fn preparePrivatePublication(self: *NativeFile, destination_path: []const u8) !void {
         if (self.read_only) return error.ReadOnly;
         try self.bindPrivateEpochNamespace(destination_path);
-        try self.syncIfRequired();
+        try self.syncIfRequired(null);
     }
 
     /// Atomically publishes a fully built Lite generation into this file and
@@ -13195,8 +13246,12 @@ fn appendPageToFile(
     const page = try allocator.alloc(u8, page_size);
     defer allocator.free(page);
     encodePage(page, kind, contents);
+    // Reserve before the write, same as `PageWriteBatch.flushCount`: see
+    // `ManifestBuilder.reserveCapacity`'s doc comment for why `note` itself
+    // must never allocate.
+    if (manifest) |builder| builder.reserveCapacity(allocator, 1);
     try file.writePositionalAll(io, page, page_id * @as(u64, @intCast(page_size)));
-    if (manifest) |builder| builder.note(allocator, page_id, std.mem.readInt(u32, page[page_crc_offset..][0..4], .little));
+    if (manifest) |builder| builder.note(page_id, std.mem.readInt(u32, page[page_crc_offset..][0..4], .little));
     next_page_id.* += 1;
     return page_id;
 }
@@ -13988,12 +14043,30 @@ const ManifestBuilder = struct {
         self.reused_pages.deinit(allocator);
     }
 
-    fn note(self: *ManifestBuilder, allocator: Allocator, page_id: u64, crc: u32) void {
+    /// Reserve room for `additional` more `note` calls before the page
+    /// writes they describe, so `note` itself never allocates and never has
+    /// to tell "this window overflowed" (an ordinary, expected fallback to
+    /// the presynced two-sync path) apart from a genuine, unrelated
+    /// allocation failure -- `checkAllAllocationFailures` flagged the old
+    /// `put(...) catch { overflowed = true; }` shape in `note`/`noteReused`
+    /// as exactly that: a real `error.OutOfMemory` silently relabeled as a
+    /// benign size-limit overflow instead of surfacing (`SwallowedOutOfMemoryError`).
+    /// A reservation failure here is still the same safe fallback, just made
+    /// explicitly, at the one place capacity is actually grown, rather than
+    /// implicitly inside every subsequent `put`.
+    fn reserveCapacity(self: *ManifestBuilder, allocator: Allocator, additional: u32) void {
         if (self.overflowed) return;
-        self.entries.put(allocator, page_id, crc) catch {
+        self.entries.ensureUnusedCapacity(allocator, additional) catch {
             self.overflowed = true;
-            return;
         };
+    }
+
+    fn note(self: *ManifestBuilder, page_id: u64, crc: u32) void {
+        if (self.overflowed) return;
+        // Capacity for this entry was already reserved by `reserveCapacity`
+        // before the page write it describes: see that function's doc
+        // comment for why `note` itself must never allocate.
+        self.entries.putAssumeCapacity(page_id, crc);
         if (self.entries.count() > max_single_sync_pages) self.overflowed = true;
     }
 
@@ -14002,14 +14075,17 @@ const ManifestBuilder = struct {
     /// intermediate flush in the window uses its own fresh `PageAllocator`,
     /// each with its own `reused` set) so the final `reused_pages` covers
     /// the whole since-last-durable-checkpoint window, not just the last
-    /// flush.
+    /// flush. Reserves capacity for the whole merge up front (see
+    /// `reserveCapacity`'s doc comment) instead of risking an ordinary
+    /// `put` failure reading as this window simply overflowing.
     fn noteReused(self: *ManifestBuilder, allocator: Allocator, reused: *const std.AutoHashMapUnmanaged(u64, void)) !void {
         if (self.overflowed) return;
-        var it = reused.keyIterator();
-        while (it.next()) |page| self.reused_pages.put(allocator, page.*, {}) catch {
+        self.reused_pages.ensureUnusedCapacity(allocator, reused.count()) catch {
             self.overflowed = true;
             return;
         };
+        var it = reused.keyIterator();
+        while (it.next()) |page| self.reused_pages.putAssumeCapacity(page.*, {});
     }
 };
 
@@ -15089,7 +15165,7 @@ test "lite native manifest catches a torn page from an earlier non-durable commi
         try file.beginTransaction();
         errdefer file.abortTransaction();
         try file.putDocument("non-durable-marker", non_durable_value);
-        try file.commitTransactionWithDurability(false);
+        try file.commitTransactionWithDurability(false, null);
     }
     try std.testing.expect(file.manifest_builder.entries.count() > 0);
 
@@ -18729,7 +18805,7 @@ test "lite deferred durability preserves the durable roots until a shared barrie
     for (0..4) |_| {
         try file.beginTransaction();
         try file.appendIndexCatalogRecord("wal", "+");
-        try file.commitTransactionWithDurability(false);
+        try file.commitTransactionWithDurability(false, null);
     }
     const live = (try file.getIndexCatalogRecordAlloc(alloc, "wal")).?;
     defer alloc.free(live);
@@ -19492,7 +19568,7 @@ test "lite document index coverage accepts legacy tombstones and rejects missing
         try file.file.writePositionalAll(std.testing.io, &page, live.document_index_root_page * default_page_size);
         file.page_cache.clear(a);
         deleted.commit_sequence += 1;
-        try file.publishCheckpoint(deleted, false);
+        try file.publishCheckpoint(deleted, false, null);
         try std.testing.expect((try file.check()).valid);
     }
     var file = try NativeFile.open(a, path, false);
@@ -19906,7 +19982,7 @@ fn legacyNamespaceDirectoryForTest(file: *NativeFile) !CheckpointSlot {
     next.commit_sequence += 1;
     try pages.flush();
     try file.writeFreeMapPage(next.free_map_root_page, next.page_count, pages.remainingFreePages());
-    try file.publishCheckpoint(next, false);
+    try file.publishCheckpoint(next, false, null);
     return next;
 }
 
@@ -20034,7 +20110,7 @@ fn linkedValueForTest(file: *NativeFile, value: []const u8) !NativeFile.IndexVal
     checkpoint.commit_sequence += 1;
     try pages.flush();
     try file.writeFreeMapPage(checkpoint.free_map_root_page, checkpoint.page_count, pages.remainingFreePages());
-    try file.publishCheckpoint(checkpoint, false);
+    try file.publishCheckpoint(checkpoint, false, null);
     return .{ .root = root, .length = value.len };
 }
 
@@ -21318,7 +21394,7 @@ test "lite grouped snapshots preserve allocator ownership pinned values and mixe
         var pinned = file.activeCheckpoint();
         pinned.document_index_root_page = original.document_index_root_page;
         pinned.commit_sequence += 1;
-        try file.publishCheckpoint(pinned, false);
+        try file.publishCheckpoint(pinned, false, null);
         try std.testing.expect((try file.check()).valid);
         try file.putDocument("a", "new");
         try file.deleteDocument("b");
