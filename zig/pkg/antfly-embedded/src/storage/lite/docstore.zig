@@ -7421,6 +7421,149 @@ test "lite ride-along members never pay their own fsync: N ride-alongs plus one 
     try std.testing.expectEqualStrings("written", try read.get("foreground"));
 }
 
+// Regression for a close hang specific to a `Store` that has *only ever*
+// had ride-along work: every other ride-along test above does a
+// foreground write before `close()`, which starts (and keeps busy) the
+// WS2 idle-flush background task (`ensureRideAlongFlushStarted`'s
+// `rideAlongFlushLoop`) well before `close()` ever runs, leaving it
+// already parked in its own `waitTimeout` by the time `stopRideAlongFlush`
+// signals it. A `stageRideAlong`-only store starts that same task but
+// `close()` can follow moments later, racing its very first wait -- and
+// `close()` must still interrupt it promptly rather than silently waiting
+// out `ride_along_idle_ns` (set deliberately long here, 10s, matching the
+// existing ride-along tests' own convention for "the timer must not be
+// what makes this test pass") or hanging forever. Runs `close()` on its
+// own thread with a deadline so a regression fails loudly instead of
+// wedging the whole suite, mirroring
+// crash_consistency_test.zig's identical pattern for the staged-commit-
+// failure regression.
+test "lite closing a store with only ride-along work (no foreground write) does not hang" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "ride-along-only-close.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{});
+    var store_open = true;
+    defer if (store_open) store.close();
+    store.ride_along_idle_ns = 10 * std.time.ns_per_s;
+
+    const Context = struct {
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            try file.putDocument("ride-only", "rode along");
+        }
+    };
+    var ctx: u8 = 0;
+    const ticket = try store.stageRideAlong(.{ .context = &ctx, .apply = Context.apply });
+
+    const Closer = struct {
+        store: *Store,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.store.close();
+            self.done.store(true, .release);
+        }
+    };
+    var closer: Closer = .{ .store = &store };
+    const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    const deadline_ns = antfly_platform.time.monotonicNs() +| (10 * std.time.ns_per_s);
+    while (!closer.done.load(.acquire)) {
+        if (antfly_platform.time.monotonicNs() >= deadline_ns) {
+            thread.detach();
+            return error.CloseHangDetected;
+        }
+        std.Thread.yield() catch {};
+    }
+    thread.join();
+    store_open = false;
+
+    // `close()`'s own durability barrier (b) -- `forceDrainDurable()`
+    // before `stopRideAlongFlush()` -- must have made this durable despite
+    // no foreground write ever arriving to lead the queue.
+    try ticket.wait();
+    var reopened = try Store.open(alloc, path, true);
+    defer reopened.close();
+    const value = try reopened.file.getDocumentAlloc(alloc, "ride-only");
+    defer if (value) |bytes| alloc.free(bytes);
+    try std.testing.expectEqualStrings("rode along", value orelse return error.TestExpectedEqual);
+}
+
+test "lite ride-along idle-flush timer alone makes N ride-alongs durable with exactly 1 sync" {
+    // Barrier (a) in isolation, with no foreground write and no close():
+    // the background `rideAlongFlushLoop` itself must lead the queue once
+    // `ride_along_idle_ns` has elapsed with something still pending,
+    // committing every queued ride-along in exactly one native transaction
+    // (one fsync), not one per member and not zero.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "ride-along-idle-timer.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{});
+    defer store.close();
+    store.ride_along_idle_ns = 20 * std.time.ns_per_ms;
+
+    const commit_before = store.file.activeCheckpoint().commit_sequence;
+    const Context = struct {
+        key: []const u8,
+        fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try file.putDocument(self.key, "rode along");
+        }
+    };
+    var ride_1 = Context{ .key = "idle-ride1" };
+    var ride_2 = Context{ .key = "idle-ride2" };
+    const ticket_1 = try store.stageRideAlong(.{ .context = &ride_1, .apply = Context.apply });
+    const ticket_2 = try store.stageRideAlong(.{ .context = &ride_2, .apply = Context.apply });
+
+    const deadline_ns = antfly_platform.time.monotonicNs() +| (10 * std.time.ns_per_s);
+    while (store.file.activeCheckpoint().commit_sequence == commit_before) {
+        if (antfly_platform.time.monotonicNs() >= deadline_ns) return error.IdleFlushNeverFired;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expectEqual(commit_before + 1, store.file.activeCheckpoint().commit_sequence);
+    try ticket_1.wait();
+    try ticket_2.wait();
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("rode along", try read.get("idle-ride1"));
+    try std.testing.expectEqualStrings("rode along", try read.get("idle-ride2"));
+}
+
+test "lite ride-along undurable-bytes threshold triggers exactly 1 sync" {
+    // Barrier in `stageRideAlong` itself (the byte-threshold check right
+    // after enqueueing): crossing `ride_along_byte_threshold` must force a
+    // durable drain synchronously, inline in the staging call that crossed
+    // it -- no timer, no close(), no foreground write needed.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "ride-along-byte-threshold.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{});
+    defer store.close();
+    store.ride_along_idle_ns = 10 * std.time.ns_per_s; // keep the timer out of this.
+    store.ride_along_byte_threshold = 16;
+
+    const commit_before = store.file.activeCheckpoint().commit_sequence;
+    const Context = struct {
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            try file.putDocument("byte-threshold-ride", "rode along");
+        }
+    };
+    var ctx: u8 = 0;
+    const ticket = try store.stageRideAlong(.{ .context = &ctx, .apply = Context.apply, .estimated_bytes = 32 });
+
+    // Synchronous: no wait, no polling, no background task involved.
+    try std.testing.expectEqual(commit_before + 1, store.file.activeCheckpoint().commit_sequence);
+    try ticket.wait();
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("rode along", try read.get("byte-threshold-ride"));
+}
+
 test "lite a new Txn opens and stages while a group's fsync is in flight" {
     // WS2: self.mutex (PublicationMutex, a spin lock) must only be held for
     // the in-memory parts of a commit; NativeFile.sync_lock_hooks releases
@@ -7898,8 +8041,28 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
             var context: u8 = 0;
             try std.testing.expectError(error.OutcomeUnknown, store.submitMutation(&context, Fault.apply));
             try std.testing.expectEqual(@as(usize, 0), Fault.remaining);
-            // Later mutations never run until the outcome is reconciled.
-            try std.testing.expectError(error.OutcomeReconciliationRequired, store.submitMutation(&context, Fault.apply));
+            // `NativeFile.reconcilePublicationUncertainty` (wired into
+            // `beginTransaction`) now resolves the latch in-process on the
+            // very next mutation: the mock only fails the `syncData`
+            // acknowledgment above, never the underlying page writes, so
+            // the checkpoint this failed commit targeted actually landed on
+            // disk. Reconciliation re-reads that on-disk slot, finds it
+            // valid, and adopts it -- so this submit succeeds instead of
+            // surfacing `OutcomeReconciliationRequired`, and it recovers
+            // every root (document, index catalog, and plain catalog) at
+            // that one checkpoint together, exactly as this test's name
+            // promises. Assert that precisely, in-process, before ever
+            // reopening the file.
+            try store.submitMutation(&context, Fault.apply);
+            const live_doc = (try store.file.getDocumentAlloc(alloc, "doc")).?;
+            defer alloc.free(live_doc);
+            const live_index = (try store.file.getIndexCatalogRecordAlloc(alloc, "index")).?;
+            defer alloc.free(live_index);
+            const live_meta = (try store.file.getCatalogRecordAlloc(alloc, "meta")).?;
+            defer alloc.free(live_meta);
+            try std.testing.expectEqualStrings("after", live_doc);
+            try std.testing.expectEqualStrings("after", live_index);
+            try std.testing.expectEqualStrings("after", live_meta);
         }
         var reopened = try Store.open(alloc, path, true);
         defer reopened.close();
@@ -7909,9 +8072,9 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
         defer alloc.free(index);
         const meta = (try reopened.file.getCatalogRecordAlloc(alloc, "meta")).?;
         defer alloc.free(meta);
-        try std.testing.expect(std.mem.eql(u8, doc, "before") or std.mem.eql(u8, doc, "after"));
-        try std.testing.expectEqualStrings(doc, index);
-        try std.testing.expectEqualStrings(doc, meta);
+        try std.testing.expectEqualStrings("after", doc);
+        try std.testing.expectEqualStrings("after", index);
+        try std.testing.expectEqualStrings("after", meta);
         try std.testing.expect((try reopened.file.check()).valid);
     }
 }

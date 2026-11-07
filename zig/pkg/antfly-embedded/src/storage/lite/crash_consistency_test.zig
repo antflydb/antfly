@@ -207,6 +207,7 @@ pub fn runCrashSweep(allocator: Allocator, scenario: Scenario, opts: SweepOption
 
         const sim = try sim_io.SimIo.init(allocator, std.testing.io);
         defer sim.deinit();
+        sim.setRunLabel(scenario.name);
         var checkpoints = std.ArrayListUnmanaged(Checkpoint).empty;
         defer checkpoints.deinit(allocator);
         try scenario.run(allocator, path, sim.io(), &checkpoints);
@@ -240,7 +241,14 @@ fn runOneCrash(allocator: Allocator, scenario: Scenario, barrier_seq: u64, when:
     defer allocator.free(path);
 
     const sim = try sim_io.SimIo.init(allocator, std.testing.io);
-    defer sim.deinit();
+    const label = try std.fmt.allocPrint(allocator, "{s} barrier={d} when={s} power_loss={s}", .{ scenario.name, barrier_seq, @tagName(when), @tagName(power_loss) });
+    // `label` must outlive every use of `sim.run_label`, including the one
+    // inside `sim.deinit()` itself -- free it only after `deinit` runs.
+    defer {
+        sim.deinit();
+        allocator.free(label);
+    }
+    sim.setRunLabel(label);
     sim.setCrashPlan(.{ .at_barrier = barrier_seq, .when = when, .power_loss = power_loss });
 
     var checkpoints = std.ArrayListUnmanaged(Checkpoint).empty;
@@ -1507,3 +1515,119 @@ test "a ride-along commit needs an explicit durability barrier before close, or 
         try std.testing.expectEqualStrings("ride-along-value", recovered orelse return error.TestExpectedEqual);
     }
 }
+
+// ---------------------------------------------------------------------
+// Crash-during-ride-along regression (prefix-ordered durability)
+//
+// The close-time fix above (`Owner.deinit()` now calls
+// `Store.syncIndexContents()` before closing its own generation) only
+// protects a *graceful* close: a ride-along commit's pages are flushed
+// (`flushTransactionWrites` runs regardless of `durable`) but its
+// checkpoint publication is deliberately deferred, so a plain close with
+// no later durability barrier silently drops it. That fix says nothing
+// about a real crash mid-stream. The open question the fix's own author
+// raised: can a ride-along segment merge, WS5 retirement turn, or
+// deferred progress-v2 record make the *last durably-published*
+// checkpoint itself unreachable or inconsistent after a crash -- e.g. a
+// merge's page reuse overwriting pages the durable segment set still
+// points at, or a retirement deleting journal entries durable progress
+// still needs? That would be a real prefix-order violation: losing
+// already-acknowledged, already-durable data, not merely losing the
+// not-yet-durable ride-along work (which is expected and fine).
+//
+// This scenario reuses "sustained full_index single writer..."'s own
+// recipe above (a tiny key set under repeated overwrite, a lowered
+// merge-policy override, and interleaved WS5 retirement turns) kept small
+// enough for `runCrashSweep` to enumerate and replay every barrier it
+// crosses -- including barriers immediately following a ride-along
+// commit's own staged writes -- under `power_loss = .drop_unsynced`
+// (the only mode that actually drops unsynced bytes; see
+// `crash_sim_io.zig`'s `PowerLoss` doc comment). No graceful `close()`
+// ever runs on the crashed replay path: `scenario.run` returns the
+// injected error before reaching its own `defer handle.close()`'s normal
+// fall-through effects on disk (see `DbHandle.close`'s doc comment -- the
+// backend/DB teardown that *does* still run is best-effort cleanup of
+// in-memory state, not a new durability barrier).
+const ride_along_key_count = 3;
+const ride_along_round_count = 3;
+const RideAlongStep = struct {
+    key: []const u8,
+    before: ?[]const u8,
+    after: []const u8,
+    retire_after: bool,
+};
+const ride_along_steps: [ride_along_key_count * ride_along_round_count]RideAlongStep = blk: {
+    var steps: [ride_along_key_count * ride_along_round_count]RideAlongStep = undefined;
+    var i: usize = 0;
+    for (0..ride_along_round_count) |round| {
+        for (0..ride_along_key_count) |slot| {
+            steps[i] = .{
+                .key = std.fmt.comptimePrint("doc-{d}", .{slot}),
+                .before = if (round == 0) null else std.fmt.comptimePrint("marker{d}", .{i - ride_along_key_count}),
+                .after = std.fmt.comptimePrint("marker{d}", .{i}),
+                // Roughly every third write, matching the non-crash
+                // regression's `i % 29 == 0` cadence scaled down to this
+                // scenario's much smaller write count -- frequent enough
+                // that a WS5 retirement turn's own commit is itself a
+                // barrier candidate throughout the sweep, not just at the
+                // very end.
+                .retire_after = (i % 3) == 2,
+            };
+            i += 1;
+        }
+    }
+    break :blk steps;
+};
+
+fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    var handle = try openDbWithIo(allocator, path, io, true);
+    defer handle.close();
+
+    // Reaches the same merge/retirement machinery the production repro
+    // needed ~7,500 writes for in a handful of writes instead -- see the
+    // non-crash regression above for the full rationale.
+    index_manager.setBenchmarkTextMergePolicyOverride(.{
+        .max_segments_per_tier = 2,
+        .max_segment_size = 5 * 1024 * 1024 * 1024,
+        .floor_segment_size = 0,
+    });
+    defer index_manager.setBenchmarkTextMergePolicyOverride(null);
+
+    for (ride_along_steps) |step| {
+        const json = try std.fmt.allocPrint(allocator, "{{\"body\":\"{s} churn alpha beta gamma\"}}", .{step.after});
+        defer allocator.free(json);
+        try checkpoints.append(allocator, .{
+            .expectations = &.{.{ .key = step.key, .before = step.before, .after = step.after, .searchable_after = step.after }},
+        });
+        try handle.db.batch(.{ .writes = &.{.{ .key = step.key, .value = json }}, .sync_level = .full_index });
+
+        // Mirrors production: a WS5 retirement turn driven explicitly here
+        // (this harness bypasses the Owner/pool layer that normally drives
+        // it from the ack path) interleaved with sustained full_index
+        // writes and the segment merges they trigger. No checkpoint: a
+        // retirement turn touches no document key.
+        if (step.retire_after) try runRetirementTurn(allocator, &handle);
+    }
+}
+
+test "crash sweep: sustained full_index writes survive a crash during ride-along merge and retirement" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "sustained-full-index-ride-along",
+        .run = runSustainedFullIndexRideAlongUnderCrash,
+        .via_db = true,
+        .search_index = "body_text",
+        .search_field = "body",
+        .retirement = true,
+    }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+// Deliberately no `.exhaustive` variant: this scenario's own writes already
+// cross several native commits each (primary + full-text + occasional
+// merge/retirement ride-along), so an exhaustive sweep's every-barrier
+// replay is combinatorially far more expensive here than for the simpler
+// primary/full-text scenarios above. `quick` mode's sampled barriers
+// (including, by construction, points right after a ride-along commit --
+// see `RideAlongStep.retire_after`) already cover this scenario's own
+// specific risk.
