@@ -358,6 +358,20 @@ authoritative verifier for composite routes and preserves stored receipts when
 that verification is unavailable. Stored successful responses are reclassified
 under the current policy without model inference; an upstream veto retracts a
 historical accepted verdict to REVIEW and restores the mention's own endpoint.
+Ordinary low-confidence abstentions still verify model revisions. Veto receipts
+also refresh when authoritative verification succeeds; an unavailable verifier
+can retain the recorded veto without another inference call.
+
+Resolution artifacts carry one optional `adjudication_execution_hash` for their
+shared policy/source binding, independent of model revisions. This lets changed
+inputs invalidate old failure receipts before obsolete dependencies need
+verification. Legacy receipts retain verified migration; a recorded changed
+mention can also prove invalidation. Ambiguous legacy bindings remain preserved
+until they can be verified or explicitly invalidated by a new configuration.
+Revision discovery and inference share one monotonic deadline, narrowed by any
+cascade deadline. Each lookup receives only the remaining whole milliseconds;
+discovery exhaustion preserves committed evidence. A validated recorded veto
+can still retract an older accepted verdict to REVIEW.
 
 Stage traces include `model_revision` when the provider reports an immutable
 revision. Resolver adjudication verifies the definition, escalation decisions,

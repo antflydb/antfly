@@ -579,6 +579,7 @@ pub fn inBand(band: Band, answers: V) !bool {
     if (answers != .array) return error.InvalidDecisionOutput;
     var matched = false;
     for (answers.array.items) |answer| {
+        if (answer != .object) return error.InvalidDecisionOutput;
         const kind = answer.object.get("type") orelse return error.InvalidDecisionOutput;
         // A named choice value only applies to choice answers.
         const choice = if (kind == .string and std.mem.eql(u8, kind.string, "choice")) band.choice else null;
@@ -1565,4 +1566,17 @@ test "decision cascade verdict confidence is rejected per stage without losing v
     var scoped = band;
     scoped.question = "measured";
     try std.testing.expect(try inBand(scoped, mixed));
+}
+
+test "decision cascade malformed unscoped answers return validation errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "[null]",                                              "[true]", "[1]", "[[]]",
+        "[{\"type\":\"predicate\",\"probability\":0.6},null]",
+    }) |raw| {
+        const answers = try std.json.parseFromSliceLeaky(V, a, raw, .{});
+        try std.testing.expectError(error.InvalidDecisionOutput, inBand(.{ .low = 0.3, .high = 0.9 }, answers));
+    }
 }

@@ -351,6 +351,17 @@ the current alias binding; querying the previously resolved leaf is insufficient
 Earlier dependency-free proxy bindings and native hex-hash bindings are upgraded
 only after the recorded revision is verified, without repeating inference.
 
+New resolution artifacts store the base policy/source binding once as
+`adjudication_execution_hash`, outside the per-entity evidence. A changed binding
+invalidates obsolete failure receipts even when model revision metadata is
+unavailable. Older readers ignore the added artifact field; evidence parsing
+and disabled-guard definition identities retain their existing wire format.
+Legacy receipts without this binding migrate using verified revisions, or are
+invalidated when their recorded mention proves the input changed. Unknown
+legacy bindings are preserved rather than guessed. Ordinary abstentions and
+vetoes still refresh when their recorded model dependencies change; only a
+validated veto can replay without inference when verification is unavailable.
+
 Probability thresholds apply to the probabilistic stages; a terminal
 verdict-only stage must provide a categorical 0/1 distribution. Catalogs with a cascade policy
 require reader epoch 30; policies with an enabled `require_agreement` guard
@@ -400,7 +411,9 @@ readiness cycle. No automatic retrospective candidate-dependency scan is introdu
 
 **Bounded execution and queries.** `max_pairs` bounds model invocations per source,
 `max_input_bytes` bounds rendered text, `timeout_ms` bounds an individual call, and
-`budget_ms` bounds the source's total model-time allowance. Calls use the shared
+`budget_ms` bounds the source's total adjudication allowance, including revision
+discovery and preparation before inference. One monotonic deadline is shared
+across all lookups and model calls, and a cascade's own deadline may narrow it. Calls use the shared
 decision executor's token, memory, rate, and provider capability limits. Query
 resolution applies the same policy against an ephemeral store and returns evidence
 without writing artifacts, promoting entities or recording curator overrides. Its

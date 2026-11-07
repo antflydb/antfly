@@ -23460,6 +23460,8 @@ export interface components {
             resolution: {
                 /** Format: uint64 */
                 config_generation: number;
+                /** @description Shared base policy and source binding for adjudication receipts, independent of model revisions. Omitted by older writers. */
+                adjudication_execution_hash?: string;
                 skipped_mentions?: number;
                 entities: components["schemas"]["ResolverResolvedEntity"][];
                 _resolution_work?: {

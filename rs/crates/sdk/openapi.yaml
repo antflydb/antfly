@@ -52458,6 +52458,11 @@ components:
             config_generation:
               type: integer
               format: uint64
+            adjudication_execution_hash:
+              type: string
+              pattern: ^[0-9a-f]{64}$
+              description: Shared base policy and source binding for adjudication receipts, independent
+                of model revisions. Omitted by older writers.
             skipped_mentions:
               type: integer
               minimum: 0

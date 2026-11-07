@@ -28,6 +28,33 @@ pub const Question = struct {
     instructions: []const u8 = "",
     choices: []const Choice,
 };
+/// One monotonic deadline shared by discovery, preparation and inference.
+/// Hosts may inject a clock; direct embedded callers use the platform clock.
+pub const ExecutionBudget = struct {
+    now_ns: *const fn () u64,
+    deadline_ns: u64,
+
+    pub fn init(clock: ?*const fn () u64, limit_ms: u32) ExecutionBudget {
+        const now_fn = clock orelse @import("antfly_platform").time.monotonicNs;
+        return .{ .now_ns = now_fn, .deadline_ns = now_fn() +| @as(u64, limit_ms) * std.time.ns_per_ms };
+    }
+    pub fn now(self: ExecutionBudget) u64 {
+        return self.now_ns();
+    }
+    pub fn check(self: ExecutionBudget) !void {
+        if (self.now() >= self.deadline_ns) return error.Timeout;
+    }
+    pub fn timeout(self: ExecutionBudget, limit_ms: u32) !u32 {
+        const current = self.now();
+        if (current >= self.deadline_ns) return error.Timeout;
+        // The verifier API is millisecond-granular. Do not round a partial
+        // millisecond up past the remaining deadline.
+        const remaining = (self.deadline_ns - current) / std.time.ns_per_ms;
+        if (remaining == 0) return error.Timeout;
+        return @intCast(@min(limit_ms, remaining));
+    }
+};
+
 pub const Config = struct {
     decider: std.json.Value,
     template: []const u8,
@@ -169,6 +196,7 @@ pub const Config = struct {
     }
 
     pub const RevisionCache = struct {
+        budget: ?ExecutionBudget = null,
         stages: [@import("antfly_decisions").cascade.max_stages]RevisionProbe = @splat(.{}),
         proxies: std.AutoHashMapUnmanaged([32]u8, RevisionProbe) = .empty,
 
@@ -227,6 +255,7 @@ pub const Config = struct {
         const cached = try cache.proxies.getOrPut(a, key);
         if (!cached.found_existing) {
             cached.value_ptr.* = .{};
+            if (cache.budget) |budget| try budget.check();
             var copy = self;
             copy.decider = decider;
             // Discovery-only envelope: never used as an inference request or
@@ -237,12 +266,14 @@ pub const Config = struct {
                 .model = model.string,
                 .dependencies = if (scalar) null else dependencies.items(),
             } }, .{ .emit_null_optional_fields = false });
-            cached.value_ptr.revision = resolve(current.ptr, a, probe, self.revisionTimeout()) catch |err| {
+            const timeout = if (cache.budget) |budget| try budget.timeout(self.revisionTimeout()) else self.revisionTimeout();
+            cached.value_ptr.revision = resolve(current.ptr, a, probe, timeout) catch |err| {
                 cached.value_ptr.failure = err;
                 return err;
             };
         }
         if (cached.value_ptr.failure) |err| return err;
+        if (cache.budget) |budget| try budget.check();
         return cached.value_ptr.revision orelse error.CapabilityDiscoveryUnavailable;
     }
 
@@ -287,8 +318,8 @@ pub const Config = struct {
         return if (std.mem.eql(u8, method.string, "generated")) try reportedRevision(response) else null;
     }
 
-    fn revisionTimeout(self: Config) u32 {
-        var timeout = @min(self.timeout_ms, self.budget_ms);
+    pub fn budgetLimitMs(self: Config) u32 {
+        var timeout = self.budget_ms;
         if (self.cascadeStages().len > 0) {
             const body = self.decider.object.get("cascade").?;
             if (body.object.get("budget")) |budget| if (budget == .object) if (budget.object.get("deadline_ms")) |deadline| {
@@ -297,11 +328,17 @@ pub const Config = struct {
         }
         return timeout;
     }
+    fn revisionTimeout(self: Config) u32 {
+        return @min(self.timeout_ms, self.budgetLimitMs());
+    }
 
     /// Receipt dependencies are the generated executions that actually answered,
     /// including typed proxy stages, never unreachable stages. With an executor, refresh those dependencies
     /// for reuse; without one, hash the revisions recorded by execution.
     pub fn responseRevision(self: Config, a: std.mem.Allocator, response: std.json.Value, executor: ?Executor, cache: *RevisionCache) !?[32]u8 {
+        // Standalone hosts get the same bounded per-batch discovery behavior;
+        // ResolutionStage supplies its earlier discovery/inference deadline.
+        if (executor != null and cache.budget == null) cache.budget = ExecutionBudget.init(null, self.budgetLimitMs());
         const stages = self.cascadeStages();
         if (response != .object) return error.InvalidAdjudicationOutput;
         if (stages.len == 0) {
@@ -339,7 +376,10 @@ pub const Config = struct {
                 };
                 const probe = &cache.stages[i];
                 if (!probe.resolved) {
-                    probe.revision = resolve(current.ptr, a, try self.stageProducerSpecification(a, stages[i]), self.revisionTimeout()) catch |err| {
+                    if (cache.budget) |budget| try budget.check();
+                    const specification = try self.stageProducerSpecification(a, stages[i]);
+                    const timeout = if (cache.budget) |budget| try budget.timeout(self.revisionTimeout()) else self.revisionTimeout();
+                    probe.revision = resolve(current.ptr, a, specification, timeout) catch |err| {
                         probe.resolved = true;
                         probe.failure = err;
                         return err;
@@ -347,6 +387,7 @@ pub const Config = struct {
                     probe.resolved = true;
                 }
                 if (probe.failure) |err| return err;
+                if (cache.budget) |budget| try budget.check();
                 if (recorded != null and probe.revision == null) return error.CapabilityDiscoveryUnavailable;
                 break :blk probe.revision;
             } else recorded;
