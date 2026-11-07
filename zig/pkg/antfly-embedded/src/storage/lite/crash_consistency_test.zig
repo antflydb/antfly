@@ -70,6 +70,7 @@ const connection = @import("connection.zig");
 const docstore = @import("docstore.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 const index_manager = @import("../db/catalog/index_manager.zig");
+const graph_mod = @import("../../graph/graph.zig");
 
 pub const When = sim_io.When;
 pub const PowerLoss = sim_io.PowerLoss;
@@ -102,6 +103,17 @@ pub const Expectation = struct {
     /// in-flight resolved to `after`): `key` must be a full-text hit for
     /// this phrase against the scenario's `search_index`/`search_field`.
     searchable_after: ?[]const u8 = null,
+    /// Checked only on the `after` side, same as `searchable_after`: the
+    /// edge this write declared must be readable in both directions --
+    /// `source` (this checkpoint's `key`) -> `target` via `.out`, and
+    /// `target` -> `source` via `.in` -- against `index_name`/`edge_type`.
+    graph_edge_after: ?GraphEdgeExpectation = null,
+};
+
+pub const GraphEdgeExpectation = struct {
+    index_name: []const u8,
+    edge_type: []const u8,
+    target: []const u8,
 };
 
 pub const Checkpoint = struct {
@@ -551,6 +563,7 @@ pub fn checkCheckpointsViaDb(
             return error.CrashConsistencyAcknowledgedWriteLost;
         }
         if (exp.searchable_after) |text| try assertSearchable(&handle, allocator, search_index, search_field, exp.key, text);
+        if (exp.graph_edge_after) |ge| try assertGraphEdgeConsistent(&handle, allocator, exp.key, ge);
     }
 
     if (split.in_flight) |cp| try checkAtomicCheckpointDb(cp, &handle, allocator, search_index, search_field, &lookup_ctx);
@@ -606,11 +619,13 @@ fn checkAtomicCheckpointDb(
 ) !void {
     try checkInFlightResolutionDb(cp, handle, allocator);
     for (cp.expectations) |exp| {
-        const text = exp.searchable_after orelse continue;
+        if (exp.searchable_after == null and exp.graph_edge_after == null) continue;
         const got = try lookup_ctx.get(exp.key);
         defer if (got) |bytes| allocator.free(@constCast(bytes));
         const resolved_after = exp.after != null and got != null and std.mem.indexOf(u8, got.?, exp.after.?) != null;
-        if (resolved_after) try assertSearchable(handle, allocator, search_index, search_field, exp.key, text);
+        if (!resolved_after) continue;
+        if (exp.searchable_after) |text| try assertSearchable(handle, allocator, search_index, search_field, exp.key, text);
+        if (exp.graph_edge_after) |ge| try assertGraphEdgeConsistent(handle, allocator, exp.key, ge);
     }
 }
 
@@ -700,6 +715,41 @@ fn assertSearchable(handle: *DbHandle, allocator: Allocator, search_index: []con
         }
         std.debug.print("crash-consistency: acknowledged document not searchable key={s} text={s}\n", .{ key, text });
         return error.CrashConsistencyFullTextNotRebuilt;
+    }
+}
+
+/// An acknowledged edge must be readable in both directions: `source` ->
+/// `target` via `.out`, and `target` -> `source` via `.in`. Graph's reverse
+/// adjacency is maintained alongside the forward edge in the same
+/// publication (see graph/graph.zig), so unlike full-text there is no
+/// separate catch-up/rebuild window to retry through here.
+fn assertGraphEdgeConsistent(handle: *DbHandle, allocator: Allocator, source: []const u8, exp: GraphEdgeExpectation) !void {
+    const outgoing = try handle.db.getEdges(allocator, exp.index_name, source, exp.edge_type, .out);
+    defer graph_mod.GraphIndex.freeEdges(allocator, outgoing);
+    var found_outgoing = false;
+    for (outgoing) |edge| {
+        if (std.mem.eql(u8, edge.target, exp.target)) {
+            found_outgoing = true;
+            break;
+        }
+    }
+    if (!found_outgoing) {
+        std.debug.print("crash-consistency: acknowledged edge missing forward source={s} target={s} index={s} edge_type={s}\n", .{ source, exp.target, exp.index_name, exp.edge_type });
+        return error.CrashConsistencyGraphEdgeMissingForward;
+    }
+
+    const incoming = try handle.db.getEdges(allocator, exp.index_name, exp.target, exp.edge_type, .in);
+    defer graph_mod.GraphIndex.freeEdges(allocator, incoming);
+    var found_incoming = false;
+    for (incoming) |edge| {
+        if (std.mem.eql(u8, edge.source, source)) {
+            found_incoming = true;
+            break;
+        }
+    }
+    if (!found_incoming) {
+        std.debug.print("crash-consistency: acknowledged edge missing reverse source={s} target={s} index={s} edge_type={s}\n", .{ source, exp.target, exp.index_name, exp.edge_type });
+        return error.CrashConsistencyGraphEdgeMissingReverse;
     }
 }
 
@@ -1025,6 +1075,44 @@ fn runSparseVectorAddIndexMidScenario(allocator: Allocator, path: []const u8, io
     try handle.db.batch(.{ .writes = &.{.{ .key = "sp-doc", .value = "{\"marker\":\"sp-doc-marker\",\"_embeddings\":{\"sp_idx\":{\"5\":1.0,\"12\":0.5}}}" }}, .sync_level = .full_index });
 }
 
+/// Graph analog of runDenseVectorAddIndexMidScenario/
+/// runSparseVectorAddIndexMidScenario: same shape, a `graph` index instead
+/// of a vector one, and an edge write asserted consistent in both
+/// directions via `Expectation.graph_edge_after` (see
+/// assertGraphEdgeConsistent) once it resolves durably/acknowledged --
+/// "every acked edge present after reopen, reverse consistent with
+/// forward".
+fn runGraphAddIndexMidScenario(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    var handle = try openDbWithIo(allocator, path, io, true);
+    defer handle.close();
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "seed", .before = null, .after = "seed body", .searchable_after = "seed" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .full_text });
+
+    try handle.db.addIndex(.{
+        .name = "gr_idx",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "after-add-index", .before = null, .after = "needle in a haystack", .searchable_after = "needle" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "after-add-index", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+
+    try checkpoints.append(allocator, .{ .expectations = &.{
+        .{
+            .key = "edge-source",
+            .before = null,
+            .after = "edge-source-marker",
+            .graph_edge_after = .{ .index_name = "gr_idx", .edge_type = "links", .target = "edge-target" },
+        },
+        .{ .key = "edge-target", .before = null, .after = "edge-target-marker" },
+    } });
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "edge-source", .value = "{\"marker\":\"edge-source-marker\",\"_edges\":{\"gr_idx\":{\"links\":[{\"target\":\"edge-target\",\"weight\":1.0}]}}}" },
+        .{ .key = "edge-target", .value = "{\"marker\":\"edge-target-marker\"}" },
+    }, .sync_level = .full_index });
+}
+
 test "crash sweep: primary single doc" {
     var report = try runCrashSweep(std.testing.allocator, .{ .name = "primary-single-doc", .run = runPrimarySingleDoc }, .{});
     defer report.deinit();
@@ -1178,6 +1266,18 @@ test "crash sweep: sparse vector add-index mid-scenario" {
     var report = try runCrashSweep(std.testing.allocator, .{
         .name = "sparse-vector-add-index-mid-scenario",
         .run = runSparseVectorAddIndexMidScenario,
+        .via_db = true,
+        .search_index = "body_text",
+        .search_field = "body",
+    }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep: graph add-index mid-scenario" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "graph-add-index-mid-scenario",
+        .run = runGraphAddIndexMidScenario,
         .via_db = true,
         .search_index = "body_text",
         .search_field = "body",
