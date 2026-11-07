@@ -1168,3 +1168,12 @@ acceptance remain deployment gates.
 For continuous writable Iceberg changes, publication visibility, catalog-history
 growth and concurrent vacuum, see [Continuous writable-lake qualification](CONTINUOUS_LAKE.md).
 This is a separate bounded workload from the static archive search timings.
+
+
+The composed query path now reuses pinned text/scalar lake readers within each
+request, adapts bounded overlay batches to suppression, and materializes durable
+cut capabilities only when returning a continuation. Replacement keys
+still use indexed probes, and public cursors retain their restart-safe protocol.
+See [remote serving performance](../../docs/operations/hackernews/remote-serving-performance.md#composed-reader-lifetime-and-immutable-hn-tables)
+for the lifetime/fencing contract, live immutable-table migration, measurements
+and remaining release qualification.

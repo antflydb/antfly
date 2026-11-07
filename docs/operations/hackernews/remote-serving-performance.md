@@ -465,3 +465,66 @@ query stores retain cumulative limits on both cold reads and warm cache hits.
 The regression covers raw and decoded dispatch, exhausted prior allowances,
 single and batched reads, and cancellation. All 20 focused Debug navigation,
 publication and coalesced-I/O tests passed without failures or leaks.
+
+## Composed reader lifetime and immutable HN tables
+
+A composed text/scalar request owns a bounded scope of up to 16 prepared lake
+readers, with a 64 MiB preparation budget. Refills and overlay key probes reuse
+the exact source cut first returned by that leaf. Each leaf still resolves and
+authorizes its table; reuse fences incarnation, object generation, index recipe,
+visibility, receipt watermark, expiry, cancellation and the reader/snapshot lease.
+Readers are request-local, never shared across principals or unrelated requests.
+Vector and named-component execution keep their existing preparation path.
+
+Overlay windows grow with observed suppression, up to the existing 128-row
+physical batch limit. Unfiltered indexed probes still cover every replacement
+key, including matching buffered rows, tombstones and newer nonmatching rows.
+Skipping probes based only on matching buffered hits would let duplicate newer
+keys outside that ranked window evade validation. These changes preserve source
+ranks and continuation positions.
+
+Internal refills use request-local cut references. Only a returned continuation
+materializes durable leaf capabilities and its composed cursor. Counts and
+complete result sets need no retained cursor uploads. Public cursors retain the
+existing `source2:`/`lake2:` protocol and expiry; a restart must reopen the same
+published source and accepted WAL cut. This reduces redundant setup and needless
+retention writes; it does not remove mandatory fresh authority checks or the
+writes needed for an actual restart-safe continuation.
+
+On November 7 UTC, the managed rc.10 HN qualification instance's public bindings
+were migrated to explicit `object_mutability: immutable`. The archive retains
+its frozen Parquet input; the current writer uses a fresh Iceberg warehouse
+prefix and new file URIs. All five original CDC transactions were replayed with
+their original source epoch, checkpoints and batch IDs. Exact retries returned
+the original WAL positions. Full row comparisons verified 175 archive rows and
+117 current rows; the saved source and existing scoped read key were preserved.
+Four combined cursor pages returned all 72 distinct `database` matches. The old
+bindings remain as `hn_archive_mutable_20261107` and
+`hn_current_mutable_20261107`; their files were not deleted. The producer remains
+at checkpoint 5 with its native state and backup retained.
+
+This is qualification data, not the full HN archive. Migration alone did not
+remove the composed metadata overhead. Managed end-to-end medians in a small
+before/after diagnostic were:
+
+| View | Before (3 samples) | After (5 samples) |
+| --- | ---: | ---: |
+| History | 245 ms | 359 ms |
+| Recent | 853 ms | 831 ms |
+| All | 2,592 ms | 2,369 ms |
+
+After samples used a 1.2-second inter-request delay. An earlier unpaced All
+request returned HTTP 500; the runtime recorded `RateLimited` from GCS, and the
+immediate recheck succeeded. Keep that failure separate from successful latency
+samples. Different pacing, small samples, fresh publications and an unchanged
+rc.10 runtime make this an operational check, not a causal engine speedup or a
+production latency qualification. The new reader-sharing code needs its own
+release and managed benchmark.
+
+The local regression in `zig/e2e/antfly/test_composed_lake_readers.py` uses real
+Parquet, managed Iceberg CDC, a newer nonmatching row and a tombstone. It requires
+two source/publication preparations despite multiple composed leaves, exact
+counts and duplicate-free pagination after later accepted writes and a process
+restart. Fresh requests must see the new ACK while the first cursor keeps its
+original cut. Released
+rc.10 performs seven source/publication preparations on that same fixture.
