@@ -1518,6 +1518,9 @@ pub const Store = struct {
     retired_file_bytes: u64 = 0,
     artifact_account: ?*ArtifactAccount = null,
     artifact_registry: ?*artifact_source.Registry = null,
+    /// Borrowed while this Store lives. Registries retain it independently, so
+    /// owned staging never keeps the mutable Store/Owner alive while queued.
+    artifact_publication_gate: ?@import("publication_gate.zig").Gate = null,
     /// Short-lived capture runtimes fence artifact readers instead of changing
     /// the durable catalog merely to open their existing immutable inputs.
     artifact_reader_fence: bool = false,
@@ -1826,6 +1829,13 @@ pub const Store = struct {
         const admission = try self.acquireIndexReadAdmission();
         defer if (admission) |held| held.leave(held.ptr);
         return (try self.artifactRegistry()).beginConstruction();
+    }
+
+    pub fn setArtifactPublicationGate(self: *Store, gate: @import("publication_gate.zig").Gate) void {
+        lockStore(self);
+        defer self.mutex.unlock();
+        self.artifact_publication_gate = gate;
+        if (self.artifact_registry) |registry| registry.installPublicationGate(gate);
     }
 
     pub fn artifactRegistry(self: *Store) !*artifact_source.Registry {

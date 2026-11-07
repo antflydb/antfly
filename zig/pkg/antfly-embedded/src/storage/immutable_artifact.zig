@@ -107,8 +107,9 @@ pub const Stager = struct {
     dispatch: Boundary.Dispatch = Boundary.local_dispatch,
     pub const VTable = struct {
         stage: *const fn (*anyopaque, []const u8) anyerror!Prepared,
-        /// Pure owned preparation. This operation must neither borrow a live
-        /// runtime nor acquire publication admission; unsupported sizes decline.
+        /// Independently owned preparation. It borrows no live runtime or
+        /// primary snapshot. Large artifacts may use bounded unpublished
+        /// native commands through an independently retained publication gate.
         stage_detached: ?*const fn (*anyopaque, []const u8) anyerror!Prepared = null,
         acquire_build_resources: ?*const fn (*anyopaque) anyerror!?BuildResources = null,
         deinit: *const fn (*anyopaque) void,

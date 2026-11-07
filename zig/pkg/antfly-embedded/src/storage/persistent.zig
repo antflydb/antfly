@@ -1299,6 +1299,8 @@ pub const PersistentIndex = struct {
     retired_segment_file_deleter: ?*RetiredSegmentFileDeleter = null,
     retirement_reconcile_pending: bool = false,
     retirement_reconcile_after: ?u64 = null,
+    retirement_retry_at_ns: u64 = 0,
+    retirement_failures: u8 = 0,
     deferred_retirement_maintenance: bool = false,
     active_rebuild_page: ?*RebuildPage = null,
     wal: wal_mod.WAL,
@@ -2753,14 +2755,18 @@ pub const PersistentIndex = struct {
         if (self.read_only) return;
         const deleter = self.retired_segment_file_deleter orelse return;
         if (!self.retirement_reconcile_pending and !deleter.hasRetirementWork()) return;
+        if (platform_time.monotonicNs() < self.retirement_retry_at_ns) return;
         // Native cleanup reads current markers under its own bounded physical
         // publication. A detached serving snapshot is not cleanup authority.
         const root = std.fs.path.dirname(deleter.root_dir) orelse deleter.root_dir;
         const native_page = deleter.storage.sweepTextRetirements(root, self.retirement_reconcile_after) catch |err| {
+            self.deferRetirementRetry();
             if (builtin.os.tag != .freestanding) std.log.warn("native text retirement sweep deferred: {s}", .{@errorName(err)});
             return;
         };
         if (native_page) |page| {
+            self.retirement_retry_at_ns = 0;
+            self.retirement_failures = 0;
             deleter.acknowledgeNativeSweep(page.ids[0..page.count]);
             self.retirement_reconcile_pending = !page.complete;
             self.retirement_reconcile_after = if (page.complete or page.count == 0) null else page.ids[page.count - 1];
@@ -2770,6 +2776,7 @@ pub const PersistentIndex = struct {
             return;
         }
         var txn = self.beginWriteMainTxn() catch |err| {
+            self.deferRetirementRetry();
             if (builtin.os.tag != .freestanding) {
                 std.log.warn("retired text segment marker flush deferred: {s}", .{@errorName(err)});
             }
@@ -2778,18 +2785,22 @@ pub const PersistentIndex = struct {
         var txn_open = true;
         defer if (txn_open) txn.abort();
         self.clearCompletedRetirementMarkersInTxn(&txn) catch |err| {
+            self.deferRetirementRetry();
             if (builtin.os.tag != .freestanding) {
                 std.log.warn("retired text segment marker flush deferred: {s}", .{@errorName(err)});
             }
             return;
         };
         txn.commit() catch |err| {
+            self.deferRetirementRetry();
             if (builtin.os.tag != .freestanding) {
                 std.log.warn("retired text segment marker flush commit deferred: {s}", .{@errorName(err)});
             }
             return;
         };
         txn_open = false;
+        self.retirement_retry_at_ns = 0;
+        self.retirement_failures = 0;
     }
 
     /// Discover durable retirement work on open. Failed scans stay pending;
@@ -2909,9 +2920,22 @@ pub const PersistentIndex = struct {
         try self.main_store_owner.sync(force);
     }
 
+    fn deferRetirementRetry(self: *PersistentIndex) void {
+        self.retirement_failures +|= 1;
+        const exponent: u6 = @intCast(@min(@as(u8, 10), self.retirement_failures -| 1));
+        const delay = @min(@as(u64, std.time.ns_per_ms) << exponent, std.time.ns_per_s);
+        self.retirement_retry_at_ns = platform_time.monotonicNs() +| delay;
+    }
+
+    fn retirementWakeDelayNs(self: *const PersistentIndex) ?u64 {
+        const queued = if (self.retired_segment_file_deleter) |deleter| deleter.nextWakeDelayNs() else null;
+        const delay: u64 = if (self.retirement_reconcile_pending) 0 else queued orelse return null;
+        return @max(delay, self.retirement_retry_at_ns -| platform_time.monotonicNs());
+    }
+
     pub fn lsmMaintenanceScore(self: *const PersistentIndex) u64 {
-        const due = if (self.retired_segment_file_deleter) |deleter| if (deleter.nextWakeDelayNs()) |delay| delay == 0 else false else false;
-        return self.main_store_owner.lsmMaintenanceScore() +| @intFromBool(self.retirement_reconcile_pending or due);
+        const due = if (self.retirementWakeDelayNs()) |delay| delay == 0 else false;
+        return self.main_store_owner.lsmMaintenanceScore() +| @intFromBool(due);
     }
 
     pub fn lsmMaintenanceDebtHint(self: *const PersistentIndex) u64 {
@@ -2922,12 +2946,11 @@ pub const PersistentIndex = struct {
     }
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PersistentIndex) ?u64 {
-        if (self.retirement_reconcile_pending) return 0;
         const storage_delay: ?u64 = switch (self.main_store_owner) {
             .mem, .native => null,
             .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
         };
-        const retirement_delay = if (self.retired_segment_file_deleter) |deleter| deleter.nextWakeDelayNs() else null;
+        const retirement_delay = self.retirementWakeDelayNs();
         if (storage_delay) |delay| return if (retirement_delay) |other| @min(delay, other) else delay;
         return retirement_delay;
     }
@@ -5905,6 +5928,56 @@ test "retired segment native batches bound work and preserve failed retries" {
     deleter.retryFailedDeletes();
     try std.testing.expectEqual(@as(usize, 4), state.calls);
     try std.testing.expectEqual(@as(?u64, null), deleter.nextWakeDelayNs());
+}
+
+test "retired segment refused native sweeps back off without losing recovery progress" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var pi = try PersistentIndex.open(a, .{ .path = path });
+    defer pi.close();
+    const deleter = pi.retired_segment_file_deleter.?;
+    const original = deleter.storage;
+    defer deleter.storage = original;
+    const Probe = struct {
+        calls: usize = 0,
+        refuse: bool = true,
+        fn sweep(raw: *anyopaque, _: []const u8, after: ?u64) !?storage_io.Storage.TextRetirementSweep {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(?u64, 73), after);
+            if (self.refuse) return error.EnrichmentWaitCanceled;
+            return .{ .complete = true };
+        }
+    };
+    var probe: Probe = .{};
+    var vtable = original.vtable.*;
+    vtable.sweep_text_retirements = Probe.sweep;
+    deleter.storage = .{ .ptr = &probe, .vtable = &vtable };
+    pi.retirement_reconcile_pending = true;
+    pi.retirement_reconcile_after = 73;
+    pi.flushCompletedRetirementMarkersLocked();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(u8, 1), pi.retirement_failures);
+    try std.testing.expect(pi.retirement_retry_at_ns != 0);
+    try std.testing.expectEqual(@as(?u64, 73), pi.retirement_reconcile_after);
+    try std.testing.expect(pi.retirement_reconcile_pending);
+    // Hold the test's retry clock safely ahead even on a heavily shared host.
+    pi.retirement_retry_at_ns = std.math.maxInt(u64);
+    for (0..100) |_| pi.flushCompletedRetirementMarkersLocked();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(pi.retirementWakeDelayNs().? > 0);
+    try std.testing.expectEqual(pi.main_store_owner.lsmMaintenanceScore(), pi.lsmMaintenanceScore());
+    pi.retirement_retry_at_ns = 0;
+    probe.refuse = false;
+    pi.flushCompletedRetirementMarkersLocked();
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expect(!pi.retirement_reconcile_pending);
+    try std.testing.expectEqual(@as(?u64, null), pi.retirement_reconcile_after);
+    try std.testing.expectEqual(@as(u8, 0), pi.retirement_failures);
+    try std.testing.expectEqual(@as(?u64, null), pi.retirementWakeDelayNs());
 }
 
 test "retired segment recovery pages keep their cursor after interrupted discovery" {

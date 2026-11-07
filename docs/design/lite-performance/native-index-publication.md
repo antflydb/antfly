@@ -423,3 +423,33 @@ witnesses before applying primary postimages, then stages index and metadata
 changes against those postimages in the same transaction. Composite publishers
 forward both phases. This avoids a metadata witness conflicting with the
 request's own primary writes; a refusal rolls back the complete native group.
+
+
+### Independent native staging and physical retirement
+
+Foreground preparation binds progress to the actual assigned source sequence,
+including reservation gaps. Its root metadata participant also validates the
+captured committed source tip before primary staging, so unchanged index metadata
+cannot authorize skipping another writer's pending record.
+
+Resident staging uses captured resource, inode and file-namespace identities;
+copying bytes and preparing authoritative ordinal columns need no live Store.
+Large staging acquires an independently retained path gate before opening its
+own native writer. Each turn appends at most 1 MiB of unpublished construction
+bytes and checks the exact inode and persisted file namespace. The final turn
+transfers the construction's existing durable lease into an immutable Source.
+The gate retains file-lifetime IO and allocator-cache resources, without retaining
+a mutable Owner, Connection or Store. Existing replay workers retain their
+lifecycle-admitted staging path; owned foreground preparation uses this service.
+
+Native retirement discovers and settles at most 64 current markers per atomic
+physical publication. It keeps active aliases, removes stale retirement markers,
+and leaves semantic namespace generations unchanged. A detached index snapshot
+is no longer cleanup authority. Refused sweeps preserve the cursor and back off
+from one millisecond to one second; maintenance readiness includes that deadline.
+
+The component evidence and remaining qualification are in
+[owned-publication-service-debug.json](owned-publication-service-debug.json).
+These contracts do not establish end-to-end performance. Primary-effect readsets,
+same-index commit cohorts and durable posting-delta buffering remain separate
+integration work.

@@ -1113,6 +1113,43 @@ const PathGate = struct {
     lease_stats: native.PathLeaseStats = .{},
     writer_allocator_cache: native.WriterAllocatorCache = .{},
 };
+/// A file-lifetime capability, independent of every mutable Owner. Waiting
+/// commands borrow neither the registry's Store nor a serving runtime.
+const OwnedArtifactGate = struct {
+    fn view(gate: *PathGate) @import("../storage/lite/publication_gate.zig").Gate {
+        return .{ .ptr = gate, .retain_fn = retain, .release_fn = release, .acquire_fn = acquire };
+    }
+    fn retain(raw: *anyopaque) void {
+        const gate: *PathGate = @ptrCast(@alignCast(raw));
+        @import("io_lifetime.zig").acquire();
+        registry_mutex.lockUncancelable(h.handleLockIo());
+        defer registry_mutex.unlock(h.handleLockIo());
+        gate.references += 1;
+    }
+    fn release(raw: *anyopaque) void {
+        const gate: *PathGate = @ptrCast(@alignCast(raw));
+        releaseGate(gate);
+        @import("io_lifetime.zig").release();
+    }
+    fn acquire(raw: *anyopaque, lock_io: std.Io, deadline_ns: i96) !@import("../storage/lite/publication_gate.zig").Lease {
+        const gate: *PathGate = @ptrCast(@alignCast(raw));
+        const io = h.handleLockIo();
+        const started = std.Io.Clock.awake.now(io).nanoseconds;
+        try gate.mutex.lockForLeaseUntil(io, deadline_ns);
+        errdefer gate.mutex.unlock(io);
+        var lease = gate.mutex.takeRetained() orelse try native.fairWriterLockWithIo(alloc, io, lock_io, gate.path, deadline_ns);
+        if (lease.acquired_ns == 0) lease.acquired_ns = std.Io.Clock.awake.now(io).nanoseconds;
+        lease.admission_ns = @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started));
+        lease.stats = &gate.lease_stats;
+        return .{ .ptr = gate, .io = io, .allocator = alloc, .lock = lease, .allocator_cache = &gate.writer_allocator_cache, .release_fn = leave };
+    }
+    fn leave(raw: *anyopaque, lease: *native.PathWriterLock) void {
+        const gate: *PathGate = @ptrCast(@alignCast(raw));
+        lease.close();
+        gate.mutex.unlock(h.handleLockIo());
+    }
+};
+
 var registry_mutex: std.Io.Mutex = .init;
 var gates: std.StringHashMapUnmanaged(*PathGate) = .empty;
 
@@ -1197,6 +1234,89 @@ pub fn testPathReplacementAdmission() !void {
     defer next.release();
     try std.testing.expect(replacement.failure == null);
     try std.testing.expect(replacement.acquired);
+}
+
+test "capi owned native artifact service queues without a Store and survives last connection close" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("owned-artifact-service");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(h.handleLockIo(), tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+    const id = try api.publishHandle(wrapper);
+    var live = true;
+    defer if (live) api.antfly_db_close(id);
+    var stager: @import("../storage/immutable_artifact.zig").Stager = undefined;
+    var registry: *artifact_source.Registry = undefined;
+    var target: @import("../storage/immutable_artifact.zig").AliasTarget = undefined;
+    {
+        const guard = api.enterHandle(id, .read).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        const store = guard.handle.owned_lite_backend.?.native_docstore.?;
+        var adapter = @import("../storage/lite/index_storage.zig").Store.init(a, store);
+        stager = (try adapter.storage().acquireImmutableStager(a)).?;
+        registry = store.artifact_registry.?;
+        target = .{ .inode = (try store.file.file.stat(store.file.runtime())).inode, .file_namespace = store.file.header.reader_epoch_namespace, .prefix = "/indexes/service" };
+    }
+    defer stager.deinit();
+    const gate: *PathGate = @ptrCast(@alignCast(registry.publication_gate.?.ptr));
+    api.antfly_db_close(id);
+    live = false;
+    try std.testing.expect(registry.store == null);
+    const bytes = try a.alloc(u8, 2 * 1024 * 1024 + 17);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% 17);
+    var held: ?PathReplacementGuard = try acquirePathReplacement(path);
+    const before = gate.mutex.next;
+    const Work = struct {
+        result: ?@import("../storage/immutable_artifact.zig").Prepared = null,
+        failure: ?anyerror = null,
+        finished: std.Io.Event = .unset,
+        fn run(self: *@This(), capability: @import("../storage/immutable_artifact.zig").Stager, input: []const u8) void {
+            defer self.finished.set(h.handleLockIo());
+            self.result = capability.stageDetached(input) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var work: Work = .{};
+    const thread = try std.Thread.spawn(.{}, Work.run, .{ &work, stager, bytes });
+    defer {
+        if (held) |guard| guard.release();
+        thread.join();
+    }
+    const deadline = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds + 5 * std.time.ns_per_s;
+    while (true) {
+        gate.mutex.state.lockUncancelable(h.handleLockIo());
+        const queued = gate.mutex.next > before;
+        gate.mutex.state.unlock(h.handleLockIo());
+        if (queued) break;
+        try std.testing.expect(!work.finished.isSet());
+        if (std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds >= deadline) return error.TestWatchdog;
+        try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 0), registry.callbacks);
+    held.?.release();
+    held = null;
+    work.finished.waitUncancelable(h.handleLockIo());
+    if (work.failure) |err| return err;
+    var prepared = work.result.?;
+    defer prepared.deinit();
+    try std.testing.expectEqual(before + 3, gate.mutex.next);
+    try std.testing.expectEqual(@as(usize, 0), registry.callbacks);
+    var source = try prepared.prepareLinkAt(target, "/indexes/service/segments/1.seg");
+    defer source.close();
+    const got = try a.alloc(u8, bytes.len);
+    defer a.free(got);
+    try source.readInto(0, got);
+    try std.testing.expectEqualSlices(u8, bytes, got);
+    var file = try native.NativeFile.openWithIo(a, h.handleLockIo(), path, .{ .no_sync = true });
+    defer file.close();
+    try std.testing.expect((try file.check()).valid);
 }
 
 fn retainGate(path: []const u8) !*PathGate {
@@ -1631,6 +1751,7 @@ pub const Owner = struct {
         const replacement = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, self.current);
         self.publication_stats.serving_runtime_refreshes +|= 1;
         errdefer h.closeHandle(replacement);
+        replacement.owned_lite_backend.?.native_docstore.?.setArtifactPublicationGate(OwnedArtifactGate.view(self.gate));
         try self.bindGroupSourceState(replacement);
         if (self.current) |previous| {
             // A clean memo is meaningful only at its logical metadata cut.
@@ -2645,6 +2766,7 @@ pub const Owner = struct {
         const store = snapshot.owned_lite_backend.?.native_docstore.?;
         store.file.reader_coordinator = self.reader_coordinator;
         store.file.writer_allocator_cache = &self.gate.writer_allocator_cache;
+        store.setArtifactPublicationGate(OwnedArtifactGate.view(self.gate));
         try store.file.inheritAllocatorVerification(file);
         // Named indexes must open before the old wrapper closes. The source
         // pool can then hand unchanged immutable ranges to the new runtime
@@ -4635,7 +4757,10 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         } else owner.reader_coordinator = try native.ReaderCoordinator.create(alloc, io);
         owner.options.reader_coordinator = owner.reader_coordinator;
         owner.options.writer_allocator_cache = &gate.writer_allocator_cache;
-        if (initial) |root| root.owned_lite_backend.?.native_docstore.?.file.writer_allocator_cache = &gate.writer_allocator_cache;
+        if (initial) |root| {
+            root.owned_lite_backend.?.native_docstore.?.file.writer_allocator_cache = &gate.writer_allocator_cache;
+            root.owned_lite_backend.?.native_docstore.?.setArtifactPublicationGate(OwnedArtifactGate.view(gate));
+        }
         if (initial) |root| root.owned_lite_backend.?.native_docstore.?.file.reader_coordinator = owner.reader_coordinator;
     }
     errdefer if (existing == null) owner.reader_coordinator.release();

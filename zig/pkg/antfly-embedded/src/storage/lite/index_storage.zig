@@ -448,6 +448,8 @@ const NativeArtifactStager = struct {
     inode: u64,
     file_namespace: [32]u8,
     resources: ?immutable_artifact.BuildResources,
+    no_sync: bool,
+    max_file_bytes: ?u64,
     const vtable: immutable_artifact.Stager.VTable = .{ .stage = stage, .stage_detached = stageDetached, .acquire_build_resources = acquireBuildResources, .deinit = deinit };
 
     fn retainBuildResources(raw: *anyopaque) void {
@@ -477,8 +479,53 @@ const NativeArtifactStager = struct {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (bytes.len == 0) return error.InvalidArtifactConstructionState;
         const resources = self.resources orelse return error.Unsupported;
-        if (bytes.len > artifacts.OwnedBytes.maximum_length) return error.Unsupported;
-        return InlinePreparedArtifact.createAt(self, bytes, resources.resource_manager, self.inode, self.file_namespace);
+        if (bytes.len <= artifacts.OwnedBytes.maximum_length) {
+            if (InlinePreparedArtifact.createAt(self, bytes, resources.resource_manager, self.inode, self.file_namespace)) |artifact| return artifact else |err| switch (err) {
+                error.ResourceBudgetExceeded, error.OutOfMemory => {},
+                else => return err,
+            }
+        }
+        return self.stageOwnedConstruction(bytes, resources);
+    }
+
+    fn stageOwnedConstruction(self: *@This(), bytes: []const u8, resources: immutable_artifact.BuildResources) !immutable_artifact.Prepared {
+        var gate = self.registry.capturePublicationGate() orelse return error.Unsupported;
+        defer gate.deinit();
+        const pending = try self.alloc.create(NativePreparedArtifact);
+        errdefer self.alloc.destroy(pending);
+        const prefix = try self.alloc.dupe(u8, self.prefix);
+        errdefer self.alloc.free(prefix);
+        var construction = try self.registry.beginOwnedConstruction(self.inode);
+        errdefer construction.deinit();
+        pending.* = .{ .alloc = self.alloc, .prefix = prefix, .construction = construction };
+        // Ownership moves to pending only after every fallible operation.
+        // Each bounded command acquires both writer gates before opening its
+        // own NativeFile; no Registry callback or mutable runtime is borrowed.
+        var offset: usize = 0;
+        const io = self.registry.io();
+        while (offset < bytes.len) {
+            var lease = try gate.acquire(io, std.Io.Clock.awake.now(io).nanoseconds + 5 * std.time.ns_per_s);
+            defer lease.deinit();
+            var file = try native.NativeFile.openWithIo(lease.allocator, lease.io, self.registry.path, .{ .externally_locked = true, .no_sync = self.no_sync, .reader_coordinator = self.registry.coordinator, .resource_manager = resources.resource_manager });
+            defer file.close();
+            if ((try file.file.stat(file.runtime())).inode != self.inode or !std.mem.eql(u8, &file.header.reader_epoch_namespace, &self.file_namespace)) return error.StaleArtifactConstruction;
+            file.writer_allocator_cache = lease.allocator_cache;
+            file.max_file_bytes = self.max_file_bytes;
+            const end = offset + @min(bytes.len - offset, 1024 * 1024);
+            try file.beginArtifactLeaseTransaction();
+            errdefer file.abortTransaction();
+            try file.appendArtifactConstruction(construction.key, offset, bytes[offset..end]);
+            try file.commitTransaction();
+            construction.length = end;
+            offset = end;
+            if (end == bytes.len) {
+                try construction.seal(bytes.len);
+                pending.construction = construction;
+                try pending.freezeOwnedSource(&file, resources.resource_manager);
+                construction = pending.construction;
+            }
+        }
+        return .{ .ptr = pending, .vtable = &NativePreparedArtifact.vtable };
     }
 
     fn stage(raw: *anyopaque, bytes: []const u8) !immutable_artifact.Prepared {
@@ -651,6 +698,21 @@ const NativePreparedArtifact = struct {
         self.file_namespace = file_namespace;
     }
 
+    fn freezeOwnedSource(self: *@This(), file: *native.NativeFile, manager: ?*@import("../resource_manager.zig").ResourceManager) !void {
+        if (self.pending_link != null) return;
+        const registry = self.construction.registry orelse return error.InvalidArtifactConstructionState;
+        const key = try self.alloc.dupe(u8, self.construction.key);
+        errdefer self.alloc.free(key);
+        const path = try self.alloc.dupe(u8, "");
+        errdefer self.alloc.free(path);
+        const inode = self.construction.inode;
+        const length = self.construction.length;
+        const file_namespace = file.header.reader_epoch_namespace;
+        const source = try self.construction.prepareOwnedSource(file, manager);
+        self.pending_link = .{ .key = key, .path = path, .inode = inode, .length = length, .source = source, .registry = registry };
+        self.file_namespace = file_namespace;
+    }
+
     fn prepareLinkAt(raw: *anyopaque, target: immutable_artifact.AliasTarget, path: []const u8) !SegmentSource {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const pending = if (self.pending_link) |*value| value else return error.InvalidArtifactConstructionState;
@@ -731,7 +793,7 @@ fn acquireImmutableStager(raw: *anyopaque, alloc: Allocator) !?immutable_artifac
     errdefer if (resources) |*owned| owned.deinit();
     const inode = (try self.docs.file.file.stat(self.docs.file.runtime())).inode;
     registry.retainOwner();
-    state.* = .{ .alloc = alloc, .registry = registry, .prefix = prefix, .inode = inode, .file_namespace = self.docs.file.header.reader_epoch_namespace, .resources = resources };
+    state.* = .{ .alloc = alloc, .registry = registry, .prefix = prefix, .inode = inode, .file_namespace = self.docs.file.header.reader_epoch_namespace, .resources = resources, .no_sync = self.docs.file.no_sync, .max_file_bytes = self.docs.file.max_file_bytes };
     return .{ .ptr = state, .vtable = &NativeArtifactStager.vtable };
 }
 

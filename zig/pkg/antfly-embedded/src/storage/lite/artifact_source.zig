@@ -419,6 +419,7 @@ pub const Registry = struct {
     borrowed_next: usize = 0,
     retired_bytes: std.atomic.Value(u64) = .init(0),
     coordinator: ?*native.ReaderCoordinator = null,
+    publication_gate: ?@import("publication_gate.zig").Gate = null,
     owned_resources: ?struct { manager: *@import("../resource_manager.zig").ResourceManager, allocator: Allocator } = null,
 
     pub fn create(allocator: Allocator, store: *docs.Store) !*Registry {
@@ -436,7 +437,26 @@ pub const Registry = struct {
         if (self.coordinator) |coordinator| coordinator.retain();
         errdefer if (self.coordinator) |coordinator| coordinator.release();
         if (!store.read_only) self.publication_guard = try openPublicationGuard(allocator, self.io(), path);
+        if (store.artifact_publication_gate) |gate| self.publication_gate = gate.retained();
         return self;
+    }
+
+    /// Installed once under the owner's path gate, before independent staging
+    /// is exposed. This reference owns no mutable runtime and survives detach.
+    pub fn installPublicationGate(self: *Registry, gate: @import("publication_gate.zig").Gate) void {
+        self.mutex.lockUncancelable(self.io());
+        defer self.mutex.unlock(self.io());
+        if (self.publication_gate) |current| {
+            std.debug.assert(current.ptr == gate.ptr);
+            return;
+        }
+        self.publication_gate = gate.retained();
+    }
+
+    pub fn capturePublicationGate(self: *Registry) ?@import("publication_gate.zig").Gate {
+        self.mutex.lockUncancelable(self.io());
+        defer self.mutex.unlock(self.io());
+        return if (self.publication_gate) |gate| gate.retained() else null;
     }
 
     /// Transfer the backend's resource owner before dropping the Store's
@@ -468,6 +488,7 @@ pub const Registry = struct {
             self.allocator.free(identity.inline_bytes);
         }
         self.allocator.free(self.path);
+        if (self.publication_gate) |*gate| gate.deinit();
         self.allocator.destroy(self);
     }
 
@@ -635,11 +656,19 @@ pub const Registry = struct {
         defer self.endCallback();
         if (owner.read_only) return error.ReadOnly;
         if (!self.marker_namespace_safe) return error.UnsafeNativeReaderAlias;
-        const runtime = self.io();
-        const a = self.allocator;
         owner.generation_lock.lockSharedUncancelable(owner.file.runtime());
         defer owner.generation_lock.unlockShared(owner.file.runtime());
         const inode = (try owner.file.file.stat(owner.file.runtime())).inode;
+        return self.beginOwnedConstruction(inode);
+    }
+
+    /// Owns only a locked marker, release ticket and Registry reference. The
+    /// independently admitted native writer checks inode and namespace before
+    /// publishing any construction bytes.
+    pub fn beginOwnedConstruction(self: *Registry, inode: u64) !Construction {
+        if (!self.marker_namespace_safe or inode != self.inode) return error.StaleArtifactConstruction;
+        const runtime = self.io();
+        const a = self.allocator;
         var random: [16]u8 = undefined;
         try runtime.randomSecure(&random);
         const id = std.fmt.bytesToHex(random, .lower);
@@ -801,13 +830,19 @@ pub const Registry = struct {
     // Once the source is fully prepared, registration cannot fail. A sealed
     // construction can transfer its existing registry reference and lease.
     fn registerSource(self: *Registry, state: *State, owner: *docs.Store, captured_inode: u64, transfer_reference: bool) Source {
+        const source = self.registerOwnedSource(state, captured_inode, transfer_reference, owner.artifactPoolLookupAllowed());
+        owner.recordArtifactSourceOpen(false);
+        return source;
+    }
+
+    fn registerOwnedSource(self: *Registry, state: *State, captured_inode: u64, transfer_reference: bool, pool_allowed: bool) Source {
         const runtime = self.io();
         self.mutex.lockUncancelable(runtime);
         state.next = self.first;
         self.first = state;
         if (!transfer_reference) _ = self.references.fetchAdd(1, .monotonic);
         self.mutex.unlock(runtime);
-        if (state.marker != null and owner.artifactPoolLookupAllowed()) {
+        if (state.marker != null and pool_allowed) {
             const identity: ArtifactIdentity = .{ .path = self.path, .key = state.artifact_key, .inode = captured_inode, .root = state.value.root, .length = state.value.length, .inline_bytes = state.value.inline_bytes };
             @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
             // A closed old source can remain referenced by a weak LSM cache.
@@ -816,13 +851,11 @@ pub const Registry = struct {
             source_pool.putContext(std.heap.page_allocator, identity, state, identity) catch {
                 // Pooling is optional; the newly opened lease remains valid.
                 source_pool_mutex.unlock();
-                owner.recordArtifactSourceOpen(false);
                 return state.source();
             };
             state.pool_identity = identity;
             source_pool_mutex.unlock();
         }
-        owner.recordArtifactSourceOpen(false);
         return state.source();
     }
 };
@@ -894,15 +927,29 @@ pub const Construction = struct {
         const captured_owner = registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
         defer registry.endCallback();
         if (captured_owner != owner) return error.StaleArtifactConstruction;
-        const runtime = registry.io();
         owner.generation_lock.lockSharedUncancelable(owner.file.runtime());
         defer owner.generation_lock.unlockShared(owner.file.runtime());
+        return self.prepareSourceAt(&owner.file, owner.resource_manager, owner.assessment_generation, path, if (link_now) owner else null, owner);
+    }
+
+    /// Caller owns the independent native publication gate. No mutable Store
+    /// callback or snapshot is needed to transfer this construction's exact
+    /// durable lease into an immutable reader.
+    pub fn prepareOwnedSource(self: *Construction, file: *native.NativeFile, manager: ?*@import("../resource_manager.zig").ResourceManager) !Source {
+        if (!self.sealed) return error.InvalidArtifactConstructionState;
+        return self.prepareSourceAt(file, manager, 0, self.key, null, null);
+    }
+
+    fn prepareSourceAt(self: *Construction, file: *native.NativeFile, manager: ?*@import("../resource_manager.zig").ResourceManager, generation: u64, path: []const u8, link_owner: ?*docs.Store, stats_owner: ?*docs.Store) !Source {
+        const registry = self.registry orelse return error.InvalidArtifactConstructionState;
+        const runtime = registry.io();
+        if ((try file.file.stat(file.runtime())).inode != self.inode) return error.StaleArtifactConstruction;
         const a = registry.allocator;
         const state = try a.create(State);
         errdefer a.destroy(state);
         const artifact_key = try a.dupe(u8, path);
         errdefer a.free(artifact_key);
-        var reader = try native.NativeFile.openWithIo(a, runtime, registry.path, .{ .read_only = true, .internal_reader = true, .reader_coordinator = owner.file.reader_coordinator, .no_sync = true });
+        var reader = try native.NativeFile.openWithIo(a, runtime, registry.path, .{ .read_only = true, .internal_reader = true, .reader_coordinator = registry.coordinator, .no_sync = true });
         errdefer reader.close();
         reader.reader_coordinator = null;
         reader.page_cache_enabled.store(false, .monotonic);
@@ -917,20 +964,21 @@ pub const Construction = struct {
             .reader = reader,
             .value = value,
             .checkpoint = checkpoint,
-            .generation = owner.assessment_generation,
+            .generation = generation,
             .lease_key = self.key,
             .release_ticket = self.release_ticket,
             .marker_path = self.marker_path,
             .marker = self.marker,
-            .resource_manager = owner.resource_manager,
+            .resource_manager = manager,
             .artifact_key = artifact_key,
         };
         try initializeSourceCache(registry, state, captured_inode);
         errdefer state.cache.?.deinit();
-        if (link_now) try self.link(owner, path);
+        if (link_owner) |owner| try self.link(owner, path);
         self.registry = null;
         self.release_ticket = null;
-        return registry.registerSource(state, owner, captured_inode, true);
+        if (stats_owner) |owner| return registry.registerSource(state, owner, captured_inode, true);
+        return registry.registerOwnedSource(state, captured_inode, true, true);
     }
 
     pub fn deinit(self: *Construction) void {

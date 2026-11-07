@@ -1,0 +1,72 @@
+{
+  "scope": "Owned native staging, exact progress and bounded physical retirement",
+  "previous_runtime": "3bee0f6081",
+  "source_patch_sha256": "b1e3a0f6e245fdbad27b7e03839dfaaf6e308b796778a520654d1ed16476a52c",
+  "changes": [
+    "Bind rich/scalar projection progress and physical seals to the actual source sequence; fence the committed source tip independently of index metadata.",
+    "Settle at most 64 current retirement markers in one typed native transaction; preserve active aliases and semantic namespace identities.",
+    "Back off refused retirement turns from 1 ms to 1 s, preserving recovery cursor and durable markers.",
+    "Copy resident artifacts and prepare ordinal columns without live Store callbacks or writer admission.",
+    "Stage large unpublished artifacts through independently retained process/kernel gates in at most 1 MiB turns; validate exact inode/file namespace each turn.",
+    "Transfer the construction lease to an immutable Source without a Store callback; retain gate IO and allocator resources independently of runtime shutdown.",
+    "Release root/table registry pins when request preparation fails before admission."
+  ],
+  "validation": {
+    "native_retirement_initial": {
+      "passed": 3,
+      "failed": 0,
+      "leaked": 0
+    },
+    "native_owned_sources_and_construction": {
+      "passed": 8,
+      "failed": 0,
+      "leaked": 0,
+      "companion_roots_passed": 12,
+      "note": "Before the final retirement scheduling backoff; shared native staging/construction code unchanged."
+    },
+    "foreground_publication_and_metadata": {
+      "passed": 10,
+      "failed": 0,
+      "leaked": 0,
+      "note": "Resident preparation stage."
+    },
+    "full_persistent": {
+      "passed": 92,
+      "skipped_benchmarks": 1,
+      "failed": 0,
+      "leaked": 0,
+      "companion_root_passed": 1
+    },
+    "physical_capi_owner": {
+      "passed": 2,
+      "failed": 0,
+      "leaked": 0,
+      "tests": [
+        "capi native batch preparation failure releases table and parent pins",
+        "capi owned native artifact service queues without a Store and survives last connection close"
+      ]
+    },
+    "configuration": {
+      "optimize": "Debug",
+      "strip": true,
+      "jobs_per_build": 1,
+      "rss_cap_bytes": 32212254720
+    },
+    "full_capi_gate": "Not completed in this stage; broad compilation was interrupted during integration. No passing result claimed.",
+    "previous_intermittent_issue1015_invalid_argument": "Cause remains unproven; targeted service tests do not resolve it."
+  },
+  "qualification": {
+    "end_to_end": "Not run for this stage",
+    "optimized_wolfspider": "Reserved for final integrated qualification",
+    "baseline_rebuilt_or_rerun": false,
+    "new_qualification_databases_archived": false,
+    "installed_library": "Still the previously recorded aecea Debug library; this receipt concerns source-level contracts."
+  },
+  "architecture_remaining": [
+    "Owned primary readsets/effects including SQL and transforms",
+    "Before-gate same-index cohorts with individual logical outcomes",
+    "Durable posting-delta windows and a query-visible hot tail",
+    "Whole-source correctness, crash, SDK/ABI and unchanged-importer validation",
+    "Final optimized performance and active-write storage qualification"
+  ]
+}
