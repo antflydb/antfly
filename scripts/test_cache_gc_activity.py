@@ -192,6 +192,27 @@ class InspectionFailureFailSafeTests(unittest.TestCase):
         self.assertIn("exit 2", result.stdout)
         self.assertIn("skipping to be safe", result.stdout)
 
+    def test_pgrep_sandbox_error_with_no_match_status_keeps_caches_busy(self):
+        # macOS pgrep can report an inspection failure with status 1, the
+        # same status as a successful search that found no matching process.
+        _make_stub(
+            self.bin_dir, "pgrep", 'echo "pgrep: Cannot get process list" >&2\nexit 1'
+        )
+        for call in ('build_active_in "/tmp"', "shared_cache_busy zig"):
+            with self.subTest(call=call):
+                result = _run_activity_func(
+                    f'{call}; echo "rc=$?"', env=self._stubbed_env()
+                )
+                self.assertIn("rc=0", result.stdout)
+                self.assertIn("skipping to be safe", result.stdout)
+
+    def test_clean_pgrep_no_matches_stays_idle(self):
+        _make_stub(self.bin_dir, "pgrep", "exit 1")
+        result = _run_activity_func(
+            '_pids_for_names zig; echo "rc=$?"', env=self._stubbed_env()
+        )
+        self.assertEqual(result.stdout.strip(), "rc=1")
+
     def test_lsof_failure_for_live_pid_makes_build_active_in_busy(self):
         candidate_cwd = self.bin_dir.parent / f"lsof-fixture-{uuid.uuid4().hex[:8]}"
         self._spawn_live_candidate(candidate_cwd)

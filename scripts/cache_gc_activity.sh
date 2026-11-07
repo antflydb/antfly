@@ -64,14 +64,19 @@ _pids_for_names() {
 	local pattern out rc
 	pattern="$(printf '%s' "$1" | tr -s ' ' '|')"
 	[ -n "$pattern" ] || return 1
-	out="$(pgrep -x "$pattern" 2>/dev/null)"
+	out="$(pgrep -x "$pattern" 2>&1)"
 	rc=$?
 	case "$rc" in
 	0)
 		printf '%s\n' "$out"
 		return 0
 		;;
-	1) return 1 ;;
+	1)
+		# macOS also uses status 1 when sandboxed process inspection fails.
+		# Only an empty, quiet result proves that there were no matches.
+		[ -z "$out" ] && return 1
+		return 2
+		;;
 	*) return "$rc" ;;
 	esac
 }
