@@ -42,12 +42,82 @@ const MUTATING_KEYWORDS = new Set([
   "into",
 ]);
 
-/** Removes comments and quoted text, so only SQL keywords and identifiers remain. */
-function sqlCode(statement: string): string {
-  return statement.replace(
-    /\/\*[\s\S]*?\*\/|--[^\n]*|'(?:[^']|'')*'|"(?:[^"]|"")*"|\$([a-zA-Z_]*)\$[\s\S]*?\$\1\$/g,
-    " "
-  );
+/** A monotonic lexer: malformed quoted text fails closed without rescanning suffixes. */
+function sqlCode(statement: string): string | undefined {
+  const chunks: string[] = [];
+  let i = 0;
+  let start = 0;
+  while (i < statement.length) {
+    const c = statement[i];
+    let end: number | undefined;
+    if (statement.startsWith("--", i)) {
+      const newline = statement.indexOf("\n", i + 2);
+      end = newline < 0 ? statement.length : newline + 1;
+    } else if (statement.startsWith("/*", i)) {
+      let depth = 1;
+      let cursor = i + 2;
+      while (cursor < statement.length && depth > 0) {
+        if (statement.startsWith("/*", cursor)) {
+          depth++;
+          cursor += 2;
+        } else if (statement.startsWith("*/", cursor)) {
+          depth--;
+          cursor += 2;
+        } else cursor++;
+      }
+      if (depth !== 0) return undefined;
+      end = cursor;
+    } else if (c === "'" || c === '"') {
+      let cursor = i + 1;
+      let closed = false;
+      while (cursor < statement.length) {
+        if (statement[cursor++] !== c) continue;
+        if (statement[cursor] === c) {
+          cursor++;
+          continue;
+        }
+        closed = true;
+        break;
+      }
+      if (!closed) return undefined;
+      end = cursor;
+    } else if (c === "$" && (statement[i + 1] === "$" || /[a-z_]/i.test(statement[i + 1] ?? ""))) {
+      let cursor = i + 1;
+      while (cursor < statement.length && /[a-z0-9_]/i.test(statement[cursor])) cursor++;
+      if (statement[cursor] === "$") {
+        const delimiter = statement.slice(i, cursor + 1);
+        let close = cursor + 1;
+        while (close < statement.length) {
+          if (statement[close] !== "$") {
+            close++;
+            continue;
+          }
+          let matched = 1;
+          while (matched < delimiter.length && statement[close + matched] === delimiter[matched])
+            matched++;
+          if (matched === delimiter.length) {
+            end = close + matched;
+            break;
+          }
+          // Tags contain no internal dollar sign. Consume the matched prefix;
+          // the mismatching character can itself begin the next candidate.
+          close += matched;
+        }
+        if (end === undefined) return undefined;
+      } else {
+        // The entire candidate is an ordinary token; do not scan it again.
+        i = cursor;
+        continue;
+      }
+    }
+    if (end !== undefined) {
+      chunks.push(statement.slice(start, i), " ");
+      i = end;
+      start = i;
+    } else i++;
+  }
+  chunks.push(statement.slice(start));
+  return chunks.join("");
 }
 
 /**
@@ -57,7 +127,9 @@ function sqlCode(statement: string): string {
  * unquoted identifier that happens to be one of these keywords.
  */
 function looksReadOnly(statement: string): boolean {
-  const code = sqlCode(statement).trim().replace(/;\s*$/, "");
+  const scanned = sqlCode(statement);
+  if (scanned === undefined) return false;
+  const code = scanned.trim().replace(/;\s*$/, "");
   if (code.includes(";")) return false;
   const words = code.toLowerCase().match(/[a-z_][a-z0-9_]*/g) ?? [];
   const first = words[0];

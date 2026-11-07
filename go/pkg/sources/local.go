@@ -110,6 +110,24 @@ func localStoreDir(prefix string) (string, error) {
 	return path.Join(prefix, localObjectDir), nil
 }
 
+// localIdentityNamespace derives legacy identity from configuration, never inventory.
+func localIdentityNamespace(r Request) (string, error) {
+	cfg, err := decodeSourceConfig[LocalConfig](r.Config)
+	if err != nil {
+		return "", err
+	}
+	dir, err := localStoreDir(cfg.Prefix)
+	if err != nil {
+		return "", err
+	}
+	prefix := strings.TrimSuffix(strings.TrimSuffix(dir, localObjectDir), "/")
+	namespace := "local://" + strings.Trim(r.SourceNamespace, "/")
+	if prefix != "" {
+		namespace += "/" + prefix
+	}
+	return namespace, nil
+}
+
 func (c *LocalConnector) store(r Request) (*os.Root, string, error) {
 	cfg, err := decodeSourceConfig[LocalConfig](r.Config)
 	if err != nil {
@@ -134,6 +152,10 @@ func (c *LocalConnector) Enumerate(ctx context.Context, r Request) (Inventory, e
 		return Inventory{}, err
 	}
 	defer root.Close()
+	namespace, err := localIdentityNamespace(r)
+	if err != nil {
+		return Inventory{}, err
+	}
 	entries, err := fs.ReadDir(root.FS(), dir)
 	if err != nil {
 		return Inventory{}, fmt.Errorf("local store is unavailable: %w", err)
@@ -175,7 +197,7 @@ func (c *LocalConnector) Enumerate(ctx context.Context, r Request) (Inventory, e
 		// S3/GCS's prefix stripping. Content-addressed storage already names
 		// objects by digest, so this is stable across a prefix change too.
 		relativeKey := path.Join(localObjectDir, name)
-		out.Objects = append(out.Objects, Item{ID: "local://" + strings.Trim(r.SourceNamespace, "/") + "/" + rel, Path: rel, RelativeKey: relativeKey, Filename: name, Revision: match[1], URL: uri, Size: info.Size(), SourceKind: ProviderLocal, ReadMode: sourceReadBytes, ObjectIndex: len(out.Objects) + 1, Metadata: map[string]any{"source_namespace": r.SourceNamespace, "canonical_url": uri, localModifiedKey: localModified(info)}})
+		out.Objects = append(out.Objects, Item{ID: namespace + "/" + relativeKey, Path: rel, RelativeKey: relativeKey, Filename: name, Revision: match[1], URL: uri, Size: info.Size(), SourceKind: ProviderLocal, ReadMode: sourceReadBytes, ObjectIndex: len(out.Objects) + 1, Metadata: map[string]any{"source_namespace": r.SourceNamespace, "canonical_url": uri, localModifiedKey: localModified(info)}})
 		if r.Preview {
 			break
 		}

@@ -178,3 +178,36 @@ it("display cancellation aborts an in-flight catalog lookup", async () => {
   await pending;
   expect(aborted).toBe(true);
 });
+
+it.each([
+  "GET",
+  "HEAD",
+])("rejects encoded upstream %s responses and cancels their body", async (method) => {
+  const cancel = vi.fn();
+  const media = vi.fn(async (_url: unknown, init?: RequestInit) => {
+    expect(new Headers(init?.headers).get("accept-encoding")).toBe("identity");
+    return new Response(new ReadableStream({ cancel }), {
+      status: 206,
+      headers: {
+        "content-encoding": "gzip",
+        "content-length": "49",
+        "content-range": "bytes 0-48/49",
+      },
+    });
+  });
+  stubCatalogAndMedia(() => new Response());
+  const handler = createAssetDisplayHandler({
+    client: new AntflyClient({ baseUrl: "http://catalog.test" }),
+    authorize: () => true,
+    referenceId: () => encodeAssetReference(reference),
+    fetch: media as typeof fetch,
+  });
+  const response = await handler(
+    new Request("http://app.test/asset", { method, headers: { Range: "bytes=0-48" } })
+  );
+  expect(response.status).toBe(502);
+  expect(response.headers.has("content-range")).toBe(false);
+  expect(response.headers.has("content-length")).toBe(false);
+  expect(cancel).toHaveBeenCalledOnce();
+  if (method === "HEAD") expect(await response.text()).toBe("");
+});

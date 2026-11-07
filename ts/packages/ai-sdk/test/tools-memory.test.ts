@@ -100,3 +100,35 @@ describe("createMemoryTools", () => {
     expect(body.evidence_ids).toEqual(["ev1"]);
   });
 });
+
+it.each([
+  ["antfly_memory_recall", { query: "fact" }],
+  ["antfly_memory_remember", { subject: "a", predicate: "b", value: "c", statement: "abc" }],
+  ["antfly_memory_forget", { evidenceIds: ["e"] }],
+] as const)("serializes exact integers throughout %s results", async (name, input) => {
+  const data = {
+    revision: 18446744073709551615n,
+    nested: [{ safe: 42, exact: 9007199254740993n }],
+  };
+  const POST = vi.fn(async () => ({ data, response: new Response() }));
+  const tool = createMemoryTools({ client: { memoryApi: { POST } } as never, space: "s" })[name];
+  const result = await tool.execute?.(input, toolOptions());
+  expect(JSON.parse(JSON.stringify(result))).toEqual({
+    revision: "18446744073709551615",
+    nested: [{ safe: 42, exact: "9007199254740993" }],
+  });
+  expect(data.revision).toBe(18446744073709551615n);
+});
+it("preserves exact integers in memory errors", async () => {
+  const POST = vi.fn(async () => ({
+    error: { revision: 18446744073709551615n },
+    response: new Response(null, { status: 409 }),
+  }));
+  const tool = createMemoryTools({
+    client: { memoryApi: { POST } } as never,
+    space: "s",
+  }).antfly_memory_recall;
+  await expect(tool.execute?.({ query: "fact" }, toolOptions())).rejects.toThrow(
+    '"revision":"18446744073709551615"'
+  );
+});

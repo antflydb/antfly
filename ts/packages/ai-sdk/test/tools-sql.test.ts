@@ -122,3 +122,27 @@ describe("createSqlTool", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+it.each([
+  `select 1 ${"/*a".repeat(33330)}`,
+  `select '${"a".repeat(90000)}`,
+  `select $tag9$${"a".repeat(90000)}`,
+  "select 1 /* outer /* inner */",
+  `select $${"a".repeat(1000)}$${`$${"a".repeat(999)}b`.repeat(90)}`,
+])("rejects malformed bounded SQL without executing it", async (statement) => {
+  const executeSQL = vi.fn();
+  const tool = createSqlTool({ client: { executeSQL } as never }).antfly_sql;
+  await expect(tool.execute?.({ statement }, toolOptions())).rejects.toThrow("read-only");
+  expect(executeSQL).not.toHaveBeenCalled();
+});
+it.each([
+  "select $$delete; drop$$;",
+  "select $tag9$delete; drop$tag9$;",
+  "select 1 /* outer /* delete */ inner */; -- tail",
+  "select $1, 'it''s delete', \"a\"\"drop\";",
+])("allows properly delimited SQL text", async (statement) => {
+  const executeSQL = vi.fn(async () => ({}));
+  const tool = createSqlTool({ client: { executeSQL } as never }).antfly_sql;
+  await tool.execute?.({ statement }, toolOptions());
+  expect(executeSQL).toHaveBeenCalledOnce();
+});

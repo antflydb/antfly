@@ -250,6 +250,10 @@ func migrateLocalRun(ctx context.Context, opts MigrateLocalOptions, result Migra
 		return result, err
 	}
 	request := Request{SourceNamespace: "job/" + source.ID, Config: localConfig, Mode: ImportModeSource}
+	legacyNamespace, err := localIdentityNamespace(request)
+	if err != nil {
+		return result, err
+	}
 	copyResult, err := MigrateLocalCopy(ctx, local, request, dest, opts.ToPrefix, opts.DryRun, opts.Progress)
 	result.Objects, result.Copied, result.Skipped, result.Failed = copyResult.Objects, copyResult.Copied, copyResult.Skipped, copyResult.Failed
 	result.BytesCopied, result.BytesSkipped = copyResult.BytesCopied, copyResult.BytesSkipped
@@ -273,20 +277,8 @@ func migrateLocalRun(ctx context.Context, opts MigrateLocalOptions, result Migra
 	updated := source
 	updated.Connection, updated.Config = opts.ToConnection, destConfig
 	if updated.Identity.Namespace == "" {
-		// Row identity (IdentityKey) depends only on namespace and each
-		// row's relative key, never on connection or provider. A source that
-		// has never had a namespace is still on the legacy, location-based
-		// formula (RecordKey). Adopting the exact namespace that reproduces
-		// its CURRENT keys (LegacyNamespace, derived from the local store
-		// under its still-current connection/config, before the provider
-		// change above takes effect) keeps every existing row's key, so this
-		// repoint does not re-key anything even though it is also the first
-		// time this source gets a namespace.
-		namespace, err := migrateLegacyNamespace(ctx, local, request, source.ID)
-		if err != nil {
-			return result, fmt.Errorf("determine existing row identity before repointing: %w", err)
-		}
-		updated.Identity.Namespace = namespace
+		// Pin the original configured identity before copying; inventory may change.
+		updated.Identity.Namespace = legacyNamespace
 	}
 	receipt := migrationReceipt(updated, opts, connections[opts.FromConnection], connections[opts.ToConnection])
 	snapshot := migrationSnapshot{Source: source, Connections: connections, Migration: &receipt}
@@ -299,25 +291,6 @@ func migrateLocalRun(ctx context.Context, opts MigrateLocalOptions, result Migra
 	result.RunID = job.ID
 	result.Rekeyed = rekeys
 	return result, nil
-}
-
-// migrateLegacyNamespace enumerates the local store once more (cheap: a
-// directory listing, not a copy, independent of MigrateLocalCopy's own
-// enumeration) to derive the namespace that reproduces this source's
-// current row keys (LegacyNamespace), so adopting it alongside this
-// repoint's connection/config change does not also re-key every row. An
-// empty store (nothing published under this connection/config yet) has
-// nothing to preserve, so it falls back to the source's own ID, the same
-// default a brand new source gets at creation.
-func migrateLegacyNamespace(ctx context.Context, local *LocalConnector, request Request, sourceID string) (string, error) {
-	inventory, err := local.Enumerate(ctx, request)
-	if err != nil {
-		return "", fmt.Errorf("enumerate local store: %w", err)
-	}
-	if len(inventory.Objects) == 0 {
-		return sourceID, nil
-	}
-	return LegacyNamespace(sourceID, inventory.Objects)
 }
 
 // resolveMigrationSource finds the source and its two connections in

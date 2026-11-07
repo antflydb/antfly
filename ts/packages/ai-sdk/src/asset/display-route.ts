@@ -101,7 +101,7 @@ export function createAssetDisplayHandler(
       throw error;
     }
 
-    const upstreamHeaders = new Headers();
+    const upstreamHeaders = new Headers({ "accept-encoding": "identity" });
     for (const name of FORWARDED_REQUEST_HEADERS) {
       const value = request.headers.get(name);
       if (value !== null) upstreamHeaders.set(name, value);
@@ -113,6 +113,17 @@ export function createAssetDisplayHandler(
       headers: upstreamHeaders,
       signal: request.signal,
     });
+
+    // Fetch implementations may decompress automatically while retaining encoded
+    // lengths/ranges. Refuse an upstream that ignores identity negotiation.
+    const encoding = upstream.headers.get("content-encoding")?.trim().toLowerCase();
+    if (encoding && encoding !== "identity") {
+      await upstream.body?.cancel();
+      return new Response(request.method === "HEAD" ? null : "Unsupported upstream encoding", {
+        status: 502,
+        headers: { "cache-control": "private, no-store" },
+      });
+    }
 
     const headers = new Headers();
     for (const name of FORWARDED_RESPONSE_HEADERS) {

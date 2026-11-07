@@ -810,11 +810,13 @@ func (s *Service) prepareNamespaceAdoption(ctx context.Context, id, namespace st
 // migrate-local's repoint does) is checked against what produced the
 // CURRENT rows, not against the change about to take effect.
 //
-// Best-effort: unable to verify -- no such connection, a connector that
+// Local identity is derived directly from configuration, even for an empty or
+// missing store: an empty listing does not prove that no catalog rows exist.
+// Other connectors use a best-effort preview: unable to verify -- no such connection, a connector that
 // cannot be opened, an enumeration failure, a panic from a connector this
 // has not been exercised against, or items that disagree on their prefix --
 // is treated as "no" (report a re-key rather than risk a false claim of
-// safety). An empty inventory (nothing published under the existing
+// safety). For those connectors, an empty inventory (nothing published under the existing
 // connection/config yet) has nothing to re-key regardless of which
 // namespace is adopted, so that alone is verified "yes".
 func (s *Service) namespaceReproducesExistingKeys(ctx context.Context, id string, existing Source, connection Connection, namespace string) (matches bool) {
@@ -823,6 +825,10 @@ func (s *Service) namespaceReproducesExistingKeys(ctx context.Context, id string
 			matches = false
 		}
 	}()
+	if connection.Provider == ProviderLocal {
+		legacy, err := localIdentityNamespace(Request{SourceNamespace: "job/" + id, Config: existing.Config})
+		return err == nil && legacy == namespace
+	}
 	connector, err := s.providerConnector(ctx, connection)
 	if err != nil {
 		return false

@@ -63,17 +63,22 @@ that `checksum` (or the row value named by `source.checksum_field`) is a
 digest of the original bytes, computed with that algorithm.
 
 When `checksum_algorithm` is set and the row resolves to a well-formed
-digest, the metadata fingerprint (now v4) hashes the digest, the filename,
+digest, the metadata fingerprint (now v5) hashes the digest, the filename,
 the content type, the native-text policy/quality config, and the extraction
-config — and nothing about location: no `source_url`, `etag`,
-`last_modified`, or `version`. Enabling `checksum_algorithm` on an existing
+config, plus URL extension predicates used by built-in and configured routes.
+Equivalent routing locations preserve reuse; changing an extension that affects
+routing invalidates it. The fingerprint excludes hosts, signed queries, `etag`,
+`last_modified`, and `version`. Enabling `checksum_algorithm` on an existing
 configuration establishes a new verified identity. Legacy v3 state cannot
 prove that its recorded checksum was checked against the original bytes,
-so opt-in requires one successful download and extraction before v4 reuse.
-After that, unchanged bytes and configuration retain the same v4 identity
+so opt-in requires one successful download and extraction before v5 reuse.
+After that, unchanged bytes and configuration retain the same v5 identity
 across relocations. No legacy fingerprint is accepted as a shortcut around
 this integrity check. Sources that enable SHA-256 before their initial sync
-avoid the upgrade cost entirely.
+avoid the upgrade cost entirely. Existing v4 state is revalidated once.
+When MIME is not configured, reuse is checked after downloading and verifying
+bytes, using the resolved response MIME (including a known absent MIME). This
+avoids stale extraction when the same bytes acquire a different HTTP type.
 
 The declared digest is not trusted blindly. The bytes extraction actually
 downloads are hashed — using whichever hash the fetch path already computes
@@ -93,7 +98,7 @@ disable identity checking.
 
 Without `checksum_algorithm`, behavior is byte-for-byte unchanged, including
 for a row that sets a bare `checksum_field` with no algorithm declared: the
-v4 path is only reachable once an algorithm is declared, and in every other
+v5 path is only reachable once an algorithm is declared, and in every other
 case `metadataFingerprintAlloc` is now a thin wrapper that defers to exactly
 the old v3 formula.
 
@@ -247,7 +252,7 @@ says a re-key happened rather than silently claiming otherwise.
   (`"...ignores config without checksum_algorithm, byte for byte"`); once
   set, the fingerprint is identical across two different declared
   locations and still changes when the digest itself changes
-  (`"...v4 fingerprint ignores location once a digest is declared"`); a
+  (`"...v5 fingerprint ignores equivalent routing locations"`); a
   malformed digest is rejected rather than silently falling back
   (`"...rejects a malformed digest rather than falling back to location"`);
   downloaded-byte verification matches, mismatches, and no-ops correctly

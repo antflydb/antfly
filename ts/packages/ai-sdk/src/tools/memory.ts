@@ -16,6 +16,16 @@ export interface AntflyMemoryToolsOptions {
   recallLimit?: number;
 }
 
+// Tool results must survive model messages, UI streams and persisted JSON history.
+// Preserve exact uint64 values as decimal strings rather than rounding them.
+function memoryJSON(value: unknown): string | undefined {
+  return JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? item.toString() : item));
+}
+function memoryToolResult(value: unknown): unknown {
+  const json = memoryJSON(value);
+  return json === undefined ? null : JSON.parse(json);
+}
+
 const RECALL_KIND = [
   "semantic",
   "episodic",
@@ -77,8 +87,8 @@ export function createMemoryTools(options: AntflyMemoryToolsOptions): Record<str
           body: { query, kind, limit: boundedLimit(limit) },
         }
       );
-      if (!response.ok) throw new Error(`Antfly memory recall failed: ${JSON.stringify(error)}`);
-      return data;
+      if (!response.ok) throw new Error(`Antfly memory recall failed: ${memoryJSON(error)}`);
+      return memoryToolResult(data);
     },
   });
 
@@ -131,9 +141,8 @@ export function createMemoryTools(options: AntflyMemoryToolsOptions): Record<str
           },
         }
       );
-      if (!response.ok)
-        throw new Error(`Antfly memory observation failed: ${JSON.stringify(error)}`);
-      return data;
+      if (!response.ok) throw new Error(`Antfly memory observation failed: ${memoryJSON(error)}`);
+      return memoryToolResult(data);
     },
   });
 
@@ -158,8 +167,8 @@ export function createMemoryTools(options: AntflyMemoryToolsOptions): Record<str
           body: { evidence_ids: evidenceIds },
         }
       );
-      if (!response.ok) throw new Error(`Antfly memory forget failed: ${JSON.stringify(error)}`);
-      return data;
+      if (!response.ok) throw new Error(`Antfly memory forget failed: ${memoryJSON(error)}`);
+      return memoryToolResult(data);
     },
   });
 

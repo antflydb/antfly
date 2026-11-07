@@ -146,6 +146,9 @@ constructor options, not model-controllable tool arguments, per antfly#1505.
   `forget` (destructive, `needsApproval: true`). Covers only those three
   operations; the rest of the memory API (assertions, corrections,
   supersession, evaluation, lineage, entities, ...) is out of scope here.
+  Tool results encode exact integers outside JavaScript’s safe numeric range
+  as decimal strings so model messages, UI streams and JSON history retain
+  their full precision. Safe numeric values remain numbers.
 - **Search**: full-text, or hybrid full-text + semantic (RRF) when `indexes`
   is configured -- the server embeds the query string itself.
 - **Graph**: bounded canonical Antfly graph JSON (`match`/`traverse`/

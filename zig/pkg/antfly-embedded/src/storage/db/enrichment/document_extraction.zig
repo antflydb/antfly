@@ -2626,17 +2626,10 @@ pub fn isValidSha256Hex(value: []const u8) bool {
     return true;
 }
 
-/// Identity follows the declared digest, not the source's location, once
-/// `checksum_algorithm` names a recognized algorithm and a digest is actually
-/// present (resolved from `checksum`/`checksum_field`). `source_url`, `etag`,
-/// `version`, and `last_modified` are deliberately excluded: none of them
-/// prove anything about the bytes once a digest is available, and keeping
-/// them would force a re-extraction every time the source moves even though
-/// nothing about its content changed. A malformed digest -- present, but not
-/// a well-formed digest for the declared algorithm -- is a configuration
-/// error here rather than a silent fall back to location-based identity,
-/// since silently falling back would let a typo'd digest field keep stale
-/// output alive forever.
+/// Verified identity binds the digest and extraction inputs, including the URL
+/// extension predicates used for routing. Hosts and signed query parameters
+/// do not affect it. An unresolved response MIME requires download first.
+/// Malformed declared digests fail rather than falling back to legacy identity.
 ///
 /// Without `checksum_algorithm`, or with it declared but no digest resolved
 /// for this row, this defers to `metadataFingerprintLegacyAlloc` (the
@@ -2648,6 +2641,10 @@ pub fn metadataFingerprintAlloc(
     config_json: []const u8,
     config: Config,
 ) !?[]u8 {
+    return metadataFingerprintResolvedAlloc(alloc, source_url, config_json, config, false);
+}
+
+fn metadataFingerprintResolvedAlloc(alloc: Allocator, source_url: []const u8, config_json: []const u8, config: Config, mime_resolved: bool) !?[]u8 {
     if (config.checksum_algorithm) |algorithm| {
         if (config.checksum.len > 0) {
             switch (algorithm) {
@@ -2655,12 +2652,33 @@ pub fn metadataFingerprintAlloc(
                     if (!isValidSha256Hex(config.checksum)) return error.InvalidChecksumDigest;
                 },
             }
+            // Without authoritative MIME, fetch first: HTTP content type can
+            // change routing even when the declared byte digest is unchanged.
+            if (config.content_type.len == 0 and !mime_resolved) return null;
             var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-            hashField(&hasher, "kind", "document_extraction_metadata_fingerprint_v4");
+            hashField(&hasher, "kind", "document_extraction_metadata_fingerprint_v5");
             hashNativeTextConfig(&hasher, config.native_text);
             hashField(&hasher, "config_json", config_json);
             hashField(&hasher, "filename", config.filename);
             hashField(&hasher, "content_type", config.content_type);
+            // Hash the same URL-dependent predicates used by the extractors.
+            // Hosts, signed queries and equivalent suffixes do not affect reuse.
+            const routing = [_]bool{
+                isPdfContent(config.content_type, config.filename, source_url, ""),
+                isHtmlContent(config.content_type, config.filename, source_url, ""),
+                isEmailContent(config.content_type, config.filename, source_url, ""),
+                isDocxContent(config.content_type, config.filename, source_url),
+                isPptxContent(config.content_type, config.filename, source_url),
+                isXlsxContent(config.content_type, config.filename, source_url),
+                isZipArchiveContent(config.content_type, config.filename, source_url),
+                isImageContent(config.content_type, config.filename, source_url, ""),
+                isAudioContent(config.content_type, config.filename, source_url, ""),
+                isTextContent(config.content_type, config.filename, source_url, ""),
+            };
+            for (routing) |matched| hashField(&hasher, "url_route", if (matched) "1" else "0");
+            for (config.routes) |route| {
+                hashField(&hasher, "url_route_match", if (routeMatches(route.match, config.content_type, config.filename, source_url, "")) "1" else "0");
+            }
             hashField(&hasher, "checksum_algorithm", @tagName(algorithm));
             hashField(&hasher, "checksum", config.checksum);
             var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -2669,6 +2687,15 @@ pub fn metadataFingerprintAlloc(
         }
     }
     return metadataFingerprintLegacyAlloc(alloc, source_url, config_json, config);
+}
+
+/// Called only after fetching and verifying the declared digest. An absent
+/// response MIME is now known, rather than an unresolved routing input.
+pub fn downloadedMetadataFingerprintAlloc(alloc: Allocator, source_url: []const u8, config_json: []const u8, config: Config, downloaded_content_type: []const u8) !?[]u8 {
+    if (config.checksum_algorithm == null or config.checksum.len == 0) return null;
+    var resolved = config;
+    if (resolved.content_type.len == 0) resolved.content_type = downloaded_content_type;
+    return metadataFingerprintResolvedAlloc(alloc, source_url, config_json, resolved, true);
 }
 
 /// The original, location-based v3 formula. Used only when no declared
@@ -5790,11 +5817,11 @@ fn testRepeatedHexDigest(byte: u8) [64]u8 {
     return buf;
 }
 
-test "document extraction v4 fingerprint ignores location once a digest is declared" {
+test "document extraction v5 fingerprint ignores equivalent routing locations" {
     const alloc = std.testing.allocator;
     const digest_a = testRepeatedHexDigest('a');
     var config = try parseConfig(alloc,
-        \\{"checksum_algorithm":"sha256"}
+        \\{"checksum_algorithm":"sha256","content_type":"text/plain"}
     );
     defer config.deinit(alloc);
     alloc.free(@constCast(config.checksum));
@@ -5829,7 +5856,7 @@ test "document extraction checksum verification matches, mismatches and no-ops" 
     const digest_c = testRepeatedHexDigest('c');
 
     var declared = try parseConfig(alloc,
-        \\{"checksum_algorithm":"sha256"}
+        \\{"checksum_algorithm":"sha256","content_type":"text/plain"}
     );
     defer declared.deinit(alloc);
     alloc.free(@constCast(declared.checksum));
@@ -5846,7 +5873,7 @@ test "document extraction checksum verification matches, mismatches and no-ops" 
     try verifyChecksumDigestHex(no_algorithm, "anything-at-all");
 
     var no_digest = try parseConfig(alloc,
-        \\{"checksum_algorithm":"sha256"}
+        \\{"checksum_algorithm":"sha256","content_type":"text/plain"}
     );
     defer no_digest.deinit(alloc);
     try verifyChecksumDigestHex(no_digest, "anything-at-all");
@@ -6994,7 +7021,7 @@ test "document extraction dotted metadata fields preserve literal keys before tr
 test "document extraction checksum opt in requires verified identity then reuses relocation" {
     const a = std.testing.allocator;
     const old_json = "{\"source\":{\"checksum_field\":\"metadata.sha256\"}}";
-    const new_json = "{\"checksum_algorithm\":\"sha256\",\"source\":{\"checksum_field\":\"metadata.sha256\"}}";
+    const new_json = "{\"content_type\":\"text/plain\",\"checksum_algorithm\":\"sha256\",\"source\":{\"checksum_field\":\"metadata.sha256\"}}";
     const digest = testRepeatedHexDigest('a');
     const row = try std.fmt.allocPrint(a, "{{\"metadata\":{{\"sha256\":\"{s}\"}}}}", .{digest});
     defer a.free(row);
@@ -7018,4 +7045,62 @@ test "document extraction checksum opt in requires verified identity then reuses
     try std.testing.expect(!std.mem.eql(u8, legacy_same_config, verified));
     const wrong = testRepeatedHexDigest('b');
     try std.testing.expectError(error.DocumentChecksumMismatch, verifyChecksumDigestHex(new, &wrong));
+}
+
+test "document extraction verified fingerprints bind URL routing and resolved MIME" {
+    const a = std.testing.allocator;
+    const digest = testRepeatedHexDigest('a');
+    const config: Config = .{ .checksum_algorithm = .sha256, .checksum = &digest, .content_type = "text/plain" };
+    const downloaded: TestDownloadedContent = .{ .data = @constCast("<b>hello</b>"), .content_type = @constCast("text/plain") };
+    var html_result = try extractDownloadedAlloc(a, downloaded, "https://old/file.html", config);
+    defer html_result.deinit(a);
+    var text_result = try extractDownloadedAlloc(a, downloaded, "https://old/file.txt", config);
+    defer text_result.deinit(a);
+    try std.testing.expect(!std.mem.eql(u8, html_result.units[0].text, text_result.units[0].text));
+
+    const html = (try metadataFingerprintAlloc(a, "https://old/file.html?sig=1", "{}", config)).?;
+    defer a.free(html);
+    const moved = (try metadataFingerprintAlloc(a, "https://new/other.HTM#fragment", "{}", config)).?;
+    defer a.free(moved);
+    const text = (try metadataFingerprintAlloc(a, "https://old/file.txt", "{}", config)).?;
+    defer a.free(text);
+    try std.testing.expectEqualStrings(html, moved);
+    try std.testing.expect(!std.mem.eql(u8, html, text));
+    // MIME already selects text for both suffixes: retain relocation reuse.
+    const markdown = (try metadataFingerprintAlloc(a, "https://new/notes.md", "{}", config)).?;
+    defer a.free(markdown);
+    try std.testing.expectEqualStrings(text, markdown);
+
+    var unknown = config;
+    unknown.content_type = "";
+    try std.testing.expectEqual(@as(?[]u8, null), try metadataFingerprintAlloc(a, "https://old/file", "{}", unknown));
+    const resolved_html = (try downloadedMetadataFingerprintAlloc(a, "https://old/file", "{}", unknown, "text/html")).?;
+    defer a.free(resolved_html);
+    const resolved_text = (try downloadedMetadataFingerprintAlloc(a, "https://old/file", "{}", unknown, "text/plain")).?;
+    defer a.free(resolved_text);
+    try std.testing.expect(!std.mem.eql(u8, resolved_html, resolved_text));
+    const absent = (try downloadedMetadataFingerprintAlloc(a, "https://old/file", "{}", unknown, "")).?;
+    defer a.free(absent);
+    const absent_moved = (try downloadedMetadataFingerprintAlloc(a, "https://new/other", "{}", unknown, "")).?;
+    defer a.free(absent_moved);
+    try std.testing.expectEqualStrings(absent, absent_moved);
+}
+
+test "document extraction fingerprint binds custom extension routing" {
+    const a = std.testing.allocator;
+    var config = try parseConfig(a,
+        \\{"checksum_algorithm":"sha256","content_type":"application/octet-stream","routes":[{"match":{"extension":["custom"]},"extractor":{"type":"text","unit":"note"}}]}
+    );
+    defer config.deinit(a);
+    const digest = testRepeatedHexDigest('a');
+    a.free(@constCast(config.checksum));
+    config.checksum = try a.dupe(u8, &digest);
+    const custom = (try metadataFingerprintAlloc(a, "https://old/file.custom", "{}", config)).?;
+    defer a.free(custom);
+    const moved = (try metadataFingerprintAlloc(a, "https://new/other.CUSTOM?x=1", "{}", config)).?;
+    defer a.free(moved);
+    const other = (try metadataFingerprintAlloc(a, "https://old/file.other", "{}", config)).?;
+    defer a.free(other);
+    try std.testing.expectEqualStrings(custom, moved);
+    try std.testing.expect(!std.mem.eql(u8, custom, other));
 }
