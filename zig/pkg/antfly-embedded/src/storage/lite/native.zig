@@ -6886,6 +6886,22 @@ pub const NativeFile = struct {
         return self.retirementNeedsServiceWithCancel(self.allocator_cancel_token);
     }
 
+    pub const RetirementServiceHint = struct { objects: u64, pressure: bool };
+
+    /// Scalar debt from the admitted ledger; never walks retired page graphs.
+    /// This is a scheduling hint only. Collection still acquires reader epochs
+    /// and validates the current checkpoint at its ordinary publication fence.
+    pub fn retirementServiceHint(self: *NativeFile) !RetirementServiceHint {
+        if (!self.header.indexed_reclamation or self.read_only) return .{ .objects = 0, .pressure = false };
+        const loan = try self.enterWriterAllocator();
+        defer self.leaveWriterAllocator(loan);
+        const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), self.allocator_cancel_token);
+        return .{
+            .objects = state.pending.count(),
+            .pressure = state.pending.count() >= state.pending_limit / 2 or state.checkpointDue() or self.budgetedCheckpointDue(state),
+        };
+    }
+
     pub fn retirementNeedsServiceWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !bool {
         if (cancel) |token| try token.check();
         if (!self.header.indexed_reclamation or self.read_only) return false;

@@ -134,6 +134,7 @@ pub const Policy = struct {
     assessment_activity_bytes: u64 = 0,
     retirement_bytes: u64 = 0,
     assessed_retirement_bytes: u64 = 0,
+    retirement_batch: RetirementBatch = .{},
     shrink_primary: ?[32]u8 = null,
     shrink_primary_since_ns: i96 = 0,
 
@@ -215,6 +216,51 @@ pub const Policy = struct {
         self.status.estimated_at_sequence = null;
     }
 };
+
+/// Foreground publications already collect eligible objects. Background work
+/// batches the residual debt rather than chasing every newly retired root with
+/// another durable checkpoint. The first observation owns a deadline: later
+/// writes and runtime adoption must not postpone it. Capacity and checkpoint
+/// pressure bypass the delay; explicit maintenance never consults this policy.
+pub const RetirementBatch = struct {
+    pub const maximum_delay_ns = 25 * std.time.ns_per_ms;
+    first_pending_ns: ?i96 = null,
+
+    pub fn due(self: *@This(), now_ns: i96, objects: u64, work_budget: usize, pressure: bool) bool {
+        if (objects == 0 and !pressure) {
+            self.first_pending_ns = null;
+            return false;
+        }
+        if (self.first_pending_ns == null) self.first_pending_ns = now_ns;
+        return pressure or objects >= @max(@as(u64, 64), work_budget) or now_ns >= self.deadline().?;
+    }
+
+    pub fn deadline(self: RetirementBatch) ?i96 {
+        return if (self.first_pending_ns) |first| first +| maximum_delay_ns else null;
+    }
+
+    pub fn serviced(self: *@This()) void {
+        self.first_pending_ns = null;
+    }
+};
+
+test "lite reclamation batches residual retirement without postponing debt or pressure" {
+    var batch: RetirementBatch = .{};
+    try std.testing.expect(!batch.due(100, 2, 128, false));
+    const deadline = batch.deadline().?;
+    for (1..20) |n| try std.testing.expect(!batch.due(100 + @as(i96, @intCast(n)) * std.time.ns_per_ms, 3 + n, 128, false));
+    try std.testing.expectEqual(deadline, batch.deadline().?);
+    // A serving replacement copies the scheduling witness, not a new clock.
+    var adopted = batch;
+    try std.testing.expect(adopted.due(deadline, 4, 128, false));
+    adopted.serviced();
+    try std.testing.expect(!adopted.due(deadline + 1, 1, 128, false));
+    try std.testing.expect(adopted.due(deadline + 2, 128, 128, false));
+    adopted.serviced();
+    try std.testing.expect(adopted.due(deadline + 3, 1, 128, true));
+    try std.testing.expect(!adopted.due(deadline + 4, 0, 128, false));
+    try std.testing.expectEqual(@as(?i96, null), adopted.deadline());
+}
 
 test "lite reclamation cooperative shrink waits for replay and quiet primary across cache refresh" {
     var policy = try Policy.init(.{ .retry_ms = 10 });

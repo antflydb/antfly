@@ -2520,6 +2520,9 @@ pub const Owner = struct {
 
     fn inheritReclamationTelemetry(destination: anytype, source: anytype) void {
         destination.file.allocator_work.absorb(&source.file.allocator_work);
+        // The detached physical service owns this deadline. Preserve it when
+        // the serving wrapper later becomes the next maintenance source.
+        destination.maintenance_policy.retirement_batch = source.maintenance_policy.retirement_batch;
         const stats = &destination.maintenance_policy.status;
         const previous = source.maintenance_policy.status;
         if (previous.rewrite_count > stats.rewrite_count) stats.last_reclaimed_bytes = previous.last_reclaimed_bytes;

@@ -1351,6 +1351,50 @@ test "lite allocator v4 releasing the last old reader starts idle retirement" {
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
+test "lite reclamation background batches residual roots while explicit service remains immediate" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "retirement-coalescing.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    // Isolate residual background debt from foreground contributions.
+    store.file.retirement_work_pages = 0;
+    for ([_][]const u8{ "first", "second", "third" }) |value| {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("document", value);
+        try write.commit();
+    }
+    try std.testing.expect(try store.file.retirementNeedsService());
+    const before = store.file.activeCheckpoint().commit_sequence;
+    // Keep the fixture independent of scheduler pauses between assertions;
+    // the pure policy test covers establishing the first real-time deadline.
+    store.maintenance_policy.retirement_batch.first_pending_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds + std.time.ns_per_min;
+    try store.maintainBackgroundOnce(null);
+    try std.testing.expectEqual(before, store.file.activeCheckpoint().commit_sequence);
+    const deadline = store.maintenance_policy.retirement_batch.deadline() orelse return error.TestUnexpectedResult;
+    // Notifications and a second visit retain the first debt's deadline.
+    try store.maintainBackgroundOnce(null);
+    try std.testing.expectEqual(deadline, store.maintenance_policy.retirement_batch.deadline().?);
+    try std.testing.expectEqual(before, store.file.activeCheckpoint().commit_sequence);
+    // Expiration needs no new foreground mutation.
+    store.maintenance_policy.retirement_batch.first_pending_ns = 0;
+    try store.maintainBackgroundOnce(null);
+    try std.testing.expect(store.file.activeCheckpoint().commit_sequence > before);
+    const serviced = store.file.activeCheckpoint().commit_sequence;
+    if (try store.file.retirementNeedsService()) {
+        try store.maintainOnce(false);
+        try std.testing.expect(store.file.activeCheckpoint().commit_sequence > serviced);
+    }
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("third", try read.get("document"));
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
 pub const OpenOptions = struct {
     externally_locked: bool = false,
     reclamation: reclamation.Options = .{},
@@ -2135,7 +2179,20 @@ pub const Store = struct {
                 retry_at = .zero;
                 const more = self.maintenanceNeedsService() catch false;
                 if (self.maintenance_cancel.requested.load(.acquire)) break;
-                if (!more) {
+                if (more) {
+                    lockStore(self);
+                    const retirement_deadline = self.maintenance_policy.retirement_batch.deadline();
+                    self.mutex.unlock();
+                    if (retirement_deadline) |deadline| {
+                        // A mutation can wake this wait to report pressure.
+                        // Residual debt retains its original deadline, so a
+                        // quiet final write needs no later notification.
+                        self.maintenance_wake.waitTimeout(io, .{ .duration = .{
+                            .raw = std.Io.Clock.awake.now(io).durationTo(.{ .nanoseconds = deadline }),
+                            .clock = .awake,
+                        } }) catch {};
+                    }
+                } else {
                     lockStore(self);
                     const rewrite_retry = self.maintenance_policy.rewrite_retry_at_ns;
                     self.mutex.unlock();
@@ -2284,9 +2341,13 @@ pub const Store = struct {
             try self.releaseDeferredArtifactLeases();
             _ = try artifact_source.cleanupOrphans(&self.file, &self.artifact_cleanup_cursor);
             try self.artifact_marker_sweep.run(&self.file);
-            if (try self.file.retirementNeedsService()) {
+            const retirement_pending = try self.file.retirementNeedsService();
+            const retirement_hint = if (retirement_pending) try self.file.retirementServiceHint() else native.NativeFile.RetirementServiceHint{ .objects = 0, .pressure = false };
+            const retirement_due = self.maintenance_policy.retirement_batch.due(std.Io.Clock.awake.now(self.file.runtime()).nanoseconds, retirement_hint.objects, self.maintenance_policy.options.retirement_work_pages, retirement_hint.pressure);
+            if (retirement_pending and (!cooperative or retirement_due)) {
                 try self.refreshAdmissionAssumeLocked();
                 _ = try self.file.reclaimPagesForMaintenanceWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel);
+                self.maintenance_policy.retirement_batch.serviced();
                 self.maintenance_policy.status.state = if (self.maintenance_policy.options.enabled) .idle else .disabled;
                 self.maintenance_policy.status.reason = if (self.maintenance_policy.options.enabled) .none else .disabled;
                 self.maintenance_policy.status.last_error = null;
