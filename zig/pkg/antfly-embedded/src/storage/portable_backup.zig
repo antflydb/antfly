@@ -1298,10 +1298,8 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
                         if (value.len >= 8) std.mem.readInt(u64, value[0..8], .little) else 0
                     else
                         0,
+                    .ttl_source_ns = if (timestamp_value) |value| archiveTtlSource(value) else null,
                 });
-                if (timestamp_value) |value| if (value.len == 24) {
-                    doc_batch.items[doc_batch.items.len - 1].ttl_source_ns = @import("ttl.zig").sourceTimestamp(value);
-                };
                 owned_key_pending = false;
                 owned_value_pending = false;
                 doc_batch_bytes += user_key.len + owned_value.len + 17 + @as(usize, if (doc_batch.items[doc_batch.items.len - 1].ttl_source_ns != null) 16 else 0);
@@ -1675,6 +1673,13 @@ fn flushDocBatch(
         alloc.free(e.value);
     }
     batch.clearRetainingCapacity();
+}
+
+/// Zero in the legacy archive timestamp field means missing metadata. Carry
+/// an explicit source for an existing epoch record so restore preserves presence.
+fn archiveTtlSource(value: []const u8) ?i128 {
+    const source = @import("ttl.zig").sourceTimestamp(value) orelse return null;
+    return if (value.len == 24 or source == 0) source else null;
 }
 
 fn timestampValueAlloc(alloc: Allocator, timestamp_ns: u64) ![]u8 {
@@ -7787,11 +7792,24 @@ test "time series portable restore retains signed TTL source independently of ve
     defer directory.cleanup();
     var store = try openTestStore(a, &directory);
     defer store.close();
-    const encoded = try backup_codec.encodeDocumentBatch(a, &.{.{ .key = "historical", .value_flags = 0, .value = "{\"observed_at\":\"1969-12-31T23:59:59Z\"}", .timestamp_ns = 12345, .ttl_source_ns = -1_000_000_000 }});
-    defer a.free(encoded);
-    try importDocumentBatch(a, &store, encoded);
     const ttl = @import("ttl.zig");
-    try std.testing.expectEqual(@as(?u64, 12345), try ttl.readTimestamp(&store, a, "historical"));
-    try std.testing.expectEqual(@as(?i128, -1_000_000_000), try ttl.readSourceTimestamp(&store, a, "historical"));
-    try std.testing.expect(try ttl.isDocExpired(&store, a, "historical", .{ .duration_ns = 1_000_000_000 }, 1));
+    const cases = [_]struct { key: []const u8, version: u64, source: i128 }{
+        .{ .key = "historical", .version = 12345, .source = -1_000_000_000 },
+        .{ .key = "epoch", .version = 23456, .source = 0 },
+        .{ .key = "legacy_epoch", .version = 0, .source = 0 },
+        .{ .key = "legacy_positive", .version = 12345, .source = 12345 },
+    };
+    for (cases) |case| {
+        const metadata = try ttl.encodeTimestampAlloc(a, case.version, case.source);
+        defer a.free(metadata);
+        const archive_source = archiveTtlSource(metadata);
+        if (case.source == 0) try std.testing.expectEqual(@as(?i128, 0), archive_source);
+        if (std.mem.eql(u8, case.key, "legacy_positive")) try std.testing.expect(archive_source == null);
+        const encoded = try backup_codec.encodeDocumentBatch(a, &.{.{ .key = case.key, .value_flags = 0, .value = "{}", .timestamp_ns = case.version, .ttl_source_ns = archive_source }});
+        defer a.free(encoded);
+        try importDocumentBatch(a, &store, encoded);
+        try std.testing.expectEqual(@as(?u64, case.version), try ttl.readTimestamp(&store, a, case.key));
+        try std.testing.expectEqual(@as(?i128, case.source), try ttl.readSourceTimestamp(&store, a, case.key));
+        try std.testing.expect(try ttl.isDocExpired(&store, a, case.key, .{ .duration_ns = 1_000_000_000 }, 2_000_000_000));
+    }
 }
