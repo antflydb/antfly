@@ -2915,7 +2915,20 @@ pub const Store = struct {
         var changes = native.ChangeCapture{};
         defer changes.deinit(self.allocator);
         var latest = blk: {
-            lockStore(self);
+            // Exclusive, not plain lockStore: `takeResidualVacuumChangesAssumeLocked`
+            // -> `captureFullReadSnapshot` requires `self.header` to already
+            // match what is actually on disk. A foreground group's
+            // writePositionalAll for its checkpoint slot runs *before* it
+            // releases `self.mutex` for the sync (`syncIfRequired`'s hooks),
+            // so a plain `lockStore` here could acquire the mutex during
+            // that released window and see the new slot bytes already on
+            // disk (an ordinary write is visible to a fresh read without an
+            // intervening fsync) while `self.header` still reflects the
+            // pre-commit state -- a real mismatch, not a bug in the check,
+            // reported as `EnrichmentWaitCanceled`. `lockStoreExclusive`
+            // waits out that window first, same as every other path that
+            // reads or publishes a checkpoint on `self.file`.
+            lockStoreExclusive(self);
             defer self.mutex.unlock();
             break :blk try self.takeResidualVacuumChangesAssumeLocked(capture, &changes);
         };
