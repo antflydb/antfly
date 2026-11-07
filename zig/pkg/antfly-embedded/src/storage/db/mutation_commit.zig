@@ -3141,7 +3141,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // though their actual index effects still need that worker's
             // ordinary (non-inline) catch-up. Skip the whole attempt for
             // this path instead.
-            if (append_derived_replay and effective_req.sync_level == .full_text and
+            //
+            // `.full_index` requires this text index's visibility too --
+            // it is `.full_text`'s superset (`types.SyncLevel`'s enum order
+            // is `propose`/`write`/`full_text`/`enrichments`/`full_index`)
+            // -- so the fast path must engage there as well, same as the
+            // graph extension below is already gated on `.full_index`.
+            // Without this, an `indexed`/`full_index` write with a text
+            // index never takes the fast path at all: the exact-equality
+            // check this replaces used to make every such write fall
+            // through to the slow, several-commits-per-write path even
+            // though the write's own effective sync level already demands
+            // text visibility. The `all_indexes` filter below (not just
+            // `full_text_indexes`) is what then keeps the `.full_index`
+            // no-worker fallback from re-applying an index this inline
+            // publication already made durable.
+            if (append_derived_replay and
+                (effective_req.sync_level == .full_text or effective_req.sync_level == .full_index) and
                 opts.transaction_resolution == null and materialized_derived_batch != null)
             {
                 for (sync_targets.full_text_indexes) |target_name| {
@@ -3253,6 +3269,41 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                     filter_alloc.free(@constCast(sync_targets.full_text_indexes));
                     sync_targets.full_text_indexes = filtered;
+                }
+                // `.full_index` writes drive their no-worker fallback and
+                // worker-catchup bookkeeping off `sync_targets.all_indexes`,
+                // not `full_text_indexes` -- see the `.full_index` branch
+                // of the `applyDerivedBatchTargetsProfiled` dispatch below.
+                // Every name in `full_text_indexes` is also in
+                // `all_indexes` (`collectManagedSyncTargets*` adds a
+                // `.full_text` candidate's name to both arrays), so the
+                // same `inline_text_handled_names` set applies here too.
+                // Skipping this for a `.full_text` write is harmless -- its
+                // own fallback never reads `all_indexes` -- but filtering
+                // unconditionally keeps this correct if that ever changes.
+                const handled_all = try filter_alloc.alloc(bool, sync_targets.all_indexes.len);
+                defer filter_alloc.free(handled_all);
+                var kept_all_count: usize = 0;
+                for (sync_targets.all_indexes, 0..) |name, i| {
+                    handled_all[i] = for (inline_text_handled_names[0..inline_text_publication_count]) |h| {
+                        if (std.mem.eql(u8, h, name)) break true;
+                    } else false;
+                    if (!handled_all[i]) kept_all_count += 1;
+                }
+                if (kept_all_count != sync_targets.all_indexes.len) {
+                    const filtered_all = try filter_alloc.alloc([]const u8, kept_all_count);
+                    errdefer filter_alloc.free(filtered_all);
+                    var fill_all: usize = 0;
+                    for (sync_targets.all_indexes, 0..) |name, i| {
+                        if (handled_all[i]) {
+                            filter_alloc.free(@constCast(name));
+                        } else {
+                            filtered_all[fill_all] = name;
+                            fill_all += 1;
+                        }
+                    }
+                    filter_alloc.free(@constCast(sync_targets.all_indexes));
+                    sync_targets.all_indexes = filtered_all;
                 }
             }
             // lite-single-commit-write-path.md §3.3a: the graph extension
@@ -3643,16 +3694,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         }
                     } else if (effective_req.sync_level == .full_index) {
                         // Mirrors the `.full_text` branch above for the
-                        // graph inline fast path: `sync_targets.all_indexes`
-                        // already excludes the inline-handled graph index
-                        // name (filtered once, above, before this no-
-                        // workers fallback and the has-workers notify/wait
-                        // path both run). Applying only to what is left is
-                        // equivalent to the original unfiltered
-                        // `applyDerivedBatchProfiled` call when nothing was
-                        // handled inline (every managed index not actually
-                        // relevant to this batch is already a no-op there
-                        // via `batchAdvancesManagedIndexApplyState`), and
+                        // text and graph inline fast paths:
+                        // `sync_targets.all_indexes` already excludes every
+                        // inline-handled text index name and the
+                        // inline-handled graph index name (each filtered
+                        // once, above, before this no-workers fallback and
+                        // the has-workers notify/wait path both run).
+                        // Applying only to what is left is equivalent to
+                        // the original unfiltered `applyDerivedBatchProfiled`
+                        // call when nothing was handled inline (every
+                        // managed index not actually relevant to this batch
+                        // is already a no-op there via
+                        // `batchAdvancesManagedIndexApplyState`), and
                         // correctly skips re-applying an index this commit
                         // already published inline when something was.
                         if (sync_targets.all_indexes.len != 0) {

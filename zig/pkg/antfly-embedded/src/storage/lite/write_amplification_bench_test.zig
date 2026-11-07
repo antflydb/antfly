@@ -1145,6 +1145,58 @@ test "lite write amplification: full_text inline fast path engages every write i
     try expectAtMost(full_text.durableCommitsPerWrite(), 1.35, "full_text inline fast path steady-state durable commits/write");
 }
 
+// lite-single-commit-write-path.md §3.2a/§3.3/§3.3a (full_index text inline
+// publication): `prepareInlineTextPublication`'s fast path used to be
+// gated on `sync_level == .full_text` exactly, so an `indexed`
+// (`full_index`) write with a text index -- the harness's own "indexed"
+// mode above, and the common case for a write that must also wait for
+// enrichments/dense/graph/LEANN visibility before acking -- never took it,
+// even though `.full_index` is `.full_text`'s superset and already
+// requires this text index's own visibility. Measures that `.full_index`
+// write directly (`measureSingleWriter`'s `indexed` mode, same Fixture and
+// text payload as the main report's "indexed" row) to confirm the fast
+// path now engages there too: before this change this mode cost one
+// native commit for the primary write plus the worker-driven index
+// segment/seal/progress commits (durable_commits_per_write well above 1,
+// calling-thread syncs/update in the tens -- see the `measured
+// main@6c0b004e95 baseline` cited in "lite write amplification ceilings"),
+// after it the same ~1.03 commits/write steady state as the `full_text`
+// sync-level test above.
+test "lite write amplification report: full_index with text index (sparse-text-inline round 1)" {
+    const alloc = std.testing.allocator;
+    const updates = default_updates;
+
+    const indexed = try measureSingleWriter(alloc, "lite-write-amp-fullindex-text", true, updates);
+    std.debug.print("lite write amplification report, full_index sync level with text index (updates={d}, text_bytes={d}):\n", .{ updates, text_bytes });
+    printStageTable("full-index-visible with text index (sync_level=full_index, workers on)", indexed);
+
+    const report = modeJson(indexed);
+    const json_text = try std.json.Stringify.valueAlloc(alloc, report, .{ .whitespace = .indent_2 });
+    defer alloc.free(json_text);
+    std.debug.print("lite_write_amplification_full_index_text_json_begin\n{s}\nlite_write_amplification_full_index_text_json_end\n", .{json_text});
+
+    // Same headroom as the `full_text` sync-level test above: one amortized
+    // startup write (the very first write for this index, which always
+    // defers to the slow worker-driven path -- see
+    // `batchInternalPreparedOwned`'s comment on "the very first write this
+    // worker has ever been asked to apply") plus slack.
+    try expectAtMost(indexed.durableCommitsPerWrite(), 1.25, "full_index-with-text durable commits/write (workers on)");
+}
+
+// Steady-state counterpart to the `full_text` alternation regression test
+// above, but for `.full_index`: guards against the same class of bug
+// (a use-after-free or a stale filtered-name comparison) reappearing
+// specifically on the `.full_index` branch of the fast-path gate and its
+// own `sync_targets.all_indexes` filter, which the `.full_text` steady-
+// state test above cannot see since it never takes that branch.
+test "lite write amplification: full_index text inline fast path engages every write in steady state" {
+    const alloc = std.testing.allocator;
+    const updates: usize = 20;
+
+    const indexed = try measureSingleWriter(alloc, "lite-write-amp-fullindex-text-steady", true, updates);
+    try expectAtMost(indexed.durableCommitsPerWrite(), 1.35, "full_index-with-text inline fast path steady-state durable commits/write");
+}
+
 fn expectAtMost(actual: f64, ceiling: f64, comptime label: []const u8) !void {
     if (actual > ceiling) {
         std.debug.print("{s}: {d:.3} exceeds ceiling {d:.3}\n", .{ label, actual, ceiling });
