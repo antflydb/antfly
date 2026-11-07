@@ -2525,6 +2525,8 @@ pub const NativeGenerationPipeline = struct {
     execution_gate: ?*execution_control_mod.ExecutionLane = null,
     execution_pause: ?*const execution_control_mod.ExecutionPause = null,
     execution_cleanup_owner: ?*const @import("../execution/cleanup_owner.zig").Owner = null,
+    /// Invocation-local receiver, never retained by a cached runtime or graph.
+    request_finish: ?*graph_mod.model_runtime.RequestFinish = null,
     draft_execution_cleanup_owner: ?*const @import("../execution/cleanup_owner.zig").Owner = null,
     /// Optional bounded polling for a shared epoch gate; zero retains yielding.
     execution_contention_wait_ns: u64 = 0,
@@ -2886,6 +2888,16 @@ pub const NativeGenerationPipeline = struct {
         defer if (self.execution_cleanup_owner) |owner| {
             fallback_decode_state.deinitWithCleanup(.{ .boundary = owner.epoch(), .operation = self.cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
         } else fallback_decode_state.deinit();
+        // A cached whole-model executor can leave its next decode frame
+        // submitted. Settle it on EOS, length, cancellation and errors before
+        // request KV/provider cleanup consumes that physical frame behind it.
+        var request_finish: graph_mod.model_runtime.RequestFinish = .{};
+        const previous_finish = self.request_finish;
+        self.request_finish = &request_finish;
+        defer {
+            self.finishModelRuntimeRequest() catch platform.inference_process_supervisor.restartWorker();
+            self.request_finish = previous_finish;
+        }
         const decode_state = self.decode_state orelse &fallback_decode_state;
         decode_state.configureForGptConfig(self.gpt_config);
         try self.rejectUnsupportedDeepSeekV4GraphMode();
@@ -3771,6 +3783,10 @@ pub const NativeGenerationPipeline = struct {
             try draft_runtime.notePrefill(seq_len);
 
             var draft_pipeline = self.makeSpeculativeDraftPipeline(draft_cb, draft_gpt_config);
+            var draft_request_finish: graph_mod.model_runtime.RequestFinish = .{};
+            draft_pipeline.request_finish = &draft_request_finish;
+            draft_pipeline.execution_cleanup_owner = self.draft_execution_cleanup_owner;
+            defer draft_pipeline.finishModelRuntimeRequest() catch platform.inference_process_supervisor.restartWorker();
             var mtp_activation = Gemma4MtpActivationState{
                 .allocator = allocator,
                 .draft_cb = &draft_pipeline.cb,
@@ -6183,6 +6199,7 @@ pub const NativeGenerationPipeline = struct {
     fn graphExecutionContext(self: *NativeGenerationPipeline) graph_mod.execution.Context {
         return .{
             .cleanup_owner = self.execution_cleanup_owner,
+            .request_finish = self.request_finish,
             .allocator = self.allocator,
             .cb = &self.cb,
             .gpt_config = &self.gpt_config,
@@ -7648,6 +7665,25 @@ pub const NativeGenerationPipeline = struct {
         var execution_scope: ?ExecutionScope = if (device) (if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex) else null) else null;
         defer if (execution_scope) |*scope| scope.deinit();
         projected.deinit();
+    }
+
+    fn finishModelRuntimeRequest(self: *NativeGenerationPipeline) !void {
+        const finish = self.request_finish orelse return;
+        if (finish.runtime == null) return;
+        // Settle only the actual selected participant, never unrelated cached
+        // graphs or another request. Cleanup must proceed after cancellation.
+        var scope = if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex) else null;
+        defer if (scope) |*held| held.deinit();
+        const operation = self.cb.operationToken();
+        var inherited = if (self.execution_cleanup_owner == null)
+            (if (operation) |held| try held.retainCleanupEpoch() else null)
+        else
+            null;
+        defer if (inherited) |*epoch| epoch.release();
+        try finish.finish(.{
+            .boundary = if (self.execution_cleanup_owner) |owner| owner.epoch() else if (inherited) |*epoch| epoch else null,
+            .operation = operation,
+        });
     }
 
     pub fn deinit(self: *NativeGenerationPipeline) void {
@@ -15238,4 +15274,151 @@ test "model selection request projector fallback cannot reopen a replacement pub
     try std.testing.expectError(error.ModelArtifactsChanging, pipeline.openRequestProjector(a, path));
     pipeline.projector_store_error = error.Cancelled;
     try std.testing.expectError(error.Cancelled, pipeline.openRequestProjector(a, path));
+}
+
+fn generationRequestFinishCase(a: std.mem.Allocator) !void {
+    const model_runtime = graph_mod.model_runtime;
+    const cleanup_mod = @import("../execution/cleanup_context.zig");
+    const sink = @import("../execution/retirement_sink.zig");
+    const Owner = @import("../execution/cleanup_owner.zig").Owner;
+    const EpochOwner = struct {
+        fn create() !Owner {
+            var stable = try sink.Ref.create();
+            errdefer stable.release();
+            var held = try stable.enter();
+            errdefer held.finish();
+            const epoch = try held.retainEpoch();
+            return .{ .retained_sink = stable, .guard = held, .owned_epoch = epoch };
+        }
+    };
+    var cleanup = try EpochOwner.create();
+    defer cleanup.finishAfterUnlock();
+    const Probe = struct {
+        expected: *const sink.Epoch,
+        calls: usize = 0,
+        armed: bool = false,
+        closed: bool = false,
+        pipeline: ?*NativeGenerationPipeline = null,
+        value: model_runtime.ModelRuntime = undefined,
+        fail_on_execute: ?anyerror = null,
+        failure: ?anyerror = null,
+        fn progress(raw: ?*anyopaque, value: execution_control_mod.Progress) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (value.phase == .tokenizing and value.completed == 1) {
+                const pipeline = self.pipeline orelse unreachable;
+                const receiver = pipeline.request_finish orelse unreachable;
+                receiver.receive(&self.value) catch |err| {
+                    self.failure = err;
+                };
+            }
+            if (value.phase == .executing) if (self.fail_on_execute) |err| {
+                self.failure = err;
+            };
+        }
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.failure) |err| return err;
+        }
+        fn capabilities(_: *anyopaque) model_runtime.RuntimeCapabilities {
+            return .{ .state_ownership = .runtime_owned_host_cache };
+        }
+        fn accepts(table: *const model_runtime.ModelRuntime.VTable) bool {
+            return table == &vtable;
+        }
+        fn finish(raw: *anyopaque, current: cleanup_mod.Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(current.boundary == self.expected);
+            try std.testing.expect(!self.closed);
+            self.calls += 1;
+            self.armed = false;
+        }
+        fn prefill(_: *anyopaque, _: std.mem.Allocator, _: model_runtime.PrefillRequest) !model_runtime.ModelOutput {
+            return error.UnusedFinishFixtureRuntime;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed = true;
+        }
+        fn closeCurrent(raw: *anyopaque, _: cleanup_mod.Context) void {
+            close(raw);
+        }
+        const services = model_runtime.ModelRuntime.ColdCleanupServices{ .accepts = accepts, .deinit = closeCurrent, .finish_request = finish };
+        const vtable = model_runtime.ModelRuntime.VTable{ .prefill = prefill, .deinit = close, .capabilities = capabilities, .cold_cleanup_services = &services };
+    };
+    const probe = try a.create(Probe);
+    defer a.destroy(probe);
+    probe.* = .{ .expected = cleanup.epoch().? };
+    probe.value = .{ .ptr = probe, .vtable = &Probe.vtable };
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(a);
+    defer model.deinit(a);
+    const decoder_fixture = @import("../execution/testing/decoder.zig");
+    try decoder_fixture.populate(&model.store);
+    const tokenizer_json =
+        \\{"model":{"type":"WordPiece","unk_token":"[UNK]","continuing_subword_prefix":"##","vocab":{"[UNK]":0,"hello":1}},"pre_tokenizer":{"type":"Whitespace"},"decoder":{"type":"WordPiece","prefix":"##","cleanup":false},"added_tokens":[{"id":0,"content":"[UNK]","special":true}]}
+    ;
+    var tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(a, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    // Existing control callbacks exercise the invocation-local receiver only;
+    // they never replace a numerical backend or claim an actual GPU frame.
+    var cfg = decoder_fixture.config();
+    cfg.eos_token_id = -1;
+    var eager = model.pipeline(a, cfg);
+    eager.prompt_override = "hello";
+    eager.tokenizer = tokenizer.tokenizer();
+    eager.return_raw_token_ids = true;
+    var reference = try eager.generate(&.{.{ .role = "user", .content = "hello" }}, .{ .max_tokens = 2, .temperature = 0 });
+    defer reference.deinit();
+    try std.testing.expectEqual(@as(usize, 2), reference.token_ids.?.len);
+    const Stop = struct {
+        calls: usize = 0,
+        fn stream(raw: *anyopaque, _: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return false;
+        }
+    };
+    for ([_]enum { length, eos, stream_stop, cancel, failure }{ .length, .eos, .stream_stop, .cancel, .failure }, 0..) |mode, index| {
+        var pipeline = model.pipeline(a, cfg);
+        pipeline.prompt_override = "hello";
+        pipeline.tokenizer = tokenizer.tokenizer();
+        pipeline.return_raw_token_ids = true;
+        pipeline.execution_cleanup_owner = &cleanup;
+        if (mode == .eos) pipeline.gpt_config.eos_token_id = reference.token_ids.?[0];
+        var stop = Stop{};
+        probe.pipeline = &pipeline;
+        probe.failure = null;
+        probe.fail_on_execute = if (mode == .failure) error.InjectedGenerationRequestFailure else if (mode == .cancel) error.Cancelled else null;
+        pipeline.execution_control = .{ .ptr = probe, .check_fn = Probe.check, .progress = .{ .ptr = probe, .update_fn = Probe.progress }, .native_call_policy = .in_process };
+        probe.armed = true;
+        const result = if (mode == .stream_stop)
+            pipeline.generateStreaming(&.{.{ .role = "user", .content = "hello" }}, .{ .max_tokens = 2, .temperature = 0 }, &stop, Stop.stream)
+        else
+            pipeline.generate(&.{.{ .role = "user", .content = "hello" }}, .{ .max_tokens = 2, .temperature = 0 });
+        if (result) |value| {
+            var output = value;
+            defer output.deinit();
+            if (mode == .failure or mode == .cancel) return error.ExpectedGenerationRequestFailure;
+            if (mode == .length) {
+                try std.testing.expectEqualStrings("length", output.finish_reason);
+                try std.testing.expectEqualSlices(i32, reference.token_ids.?, output.token_ids.?);
+            } else try std.testing.expectEqualStrings("stop", output.finish_reason);
+            if (mode == .stream_stop) try std.testing.expect(stop.calls > 0);
+        } else |err| {
+            const expected: anyerror = if (mode == .cancel) error.Cancelled else error.InjectedGenerationRequestFailure;
+            if ((mode != .failure and mode != .cancel) or err != expected) return err;
+        }
+        try std.testing.expectEqual(index + 1, probe.calls);
+        try std.testing.expect(!probe.armed and !probe.closed);
+    }
+}
+
+test "generation invocation settles received runtime on EOS length streaming stop cancellation and error" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    try generationRequestFinishCase(std.testing.allocator);
+}
+
+test "generation invocation finish retains received runtime through allocation failure unwind" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, generationRequestFinishCase, .{});
 }

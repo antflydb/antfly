@@ -59343,7 +59343,7 @@ fn mappedF32WeightBorrowCase(a: std.mem.Allocator) !void {
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
     const header = "{\"projection.weight\":{\"dtype\":\"F32\",\"shape\":[64,64],\"data_offsets\":[0,16384]},\"other.weight\":{\"dtype\":\"F32\",\"shape\":[64,64],\"data_offsets\":[16384,32768]}}";
-    const padded = std.mem.alignForward(usize, header.len, 8);
+    const padded = comptime std.mem.alignForward(usize, header.len, 8);
     var bytes: [8 + padded + 32768]u8 = @splat(' ');
     std.mem.writeInt(u64, bytes[0..8], padded, .little);
     @memcpy(bytes[8..][0..header.len], header);

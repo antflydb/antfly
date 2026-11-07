@@ -38,6 +38,9 @@ pub const ModelRuntime = struct {
         accepts: *const fn (*const VTable) bool,
         deinit: *const fn (*anyopaque, CleanupContext) void,
         reset: ?*const fn (*anyopaque, CleanupContext) anyerror!void = null,
+        /// Settle speculative request work before its current provider/B retires.
+        /// This does not reset KV or destroy the cached runtime.
+        finish_request: ?*const fn (*anyopaque, CleanupContext) anyerror!void = null,
     };
 
     ptr: *anyopaque,
@@ -138,6 +141,20 @@ pub const ModelRuntime = struct {
         const getter = self.vtable.operation_backend orelse return null;
         return getter(self.ptr).*;
     }
+    /// The owning invocation calls this on every exit while its actual backend
+    /// operation and cleanup epoch are still held. Unsupported runtimes have no
+    /// asynchronous request work and return without acquiring an operation.
+    pub fn finishRequestWithCleanup(self: *ModelRuntime, current: CleanupContext) !void {
+        const services = self.vtable.cold_cleanup_services orelse return;
+        const finish = services.finish_request orelse return;
+        if (!services.accepts(self.vtable)) return error.RuntimeRequestCleanupChanged;
+        const backend = self.operationBackend();
+        if (backend) |target| if (current.operation != null) {
+            _ = try current.operationFor(&target);
+        };
+        try @import("../execution/backend_operation.zig").callOpaque(backend, current.operation, finish, .{ self.ptr, current });
+    }
+
     pub fn resetWithCleanup(self: *ModelRuntime, current: CleanupContext) !void {
         if (self.vtable.cold_cleanup_services) |services| {
             if (services.accepts(self.vtable)) if (services.reset) |reset_fn| {
@@ -289,6 +306,41 @@ pub const ModelRuntime = struct {
         }
         self.vtable.deinit(self.ptr);
         self.* = undefined;
+    }
+};
+
+/// One backend-owned session-runtime role per generation invocation. The
+/// retaining Model and its execution scope keep this selected runtime alive;
+/// no participant or request pointer is published into the shared cache.
+pub const RequestFinish = struct {
+    runtime: ?*ModelRuntime = null,
+    context: ?*anyopaque = null,
+    table: ?*const ModelRuntime.VTable = null,
+
+    pub fn receive(self: *RequestFinish, selected: *ModelRuntime) !void {
+        const services = selected.vtable.cold_cleanup_services orelse return;
+        if (services.finish_request == null) return;
+        if (!services.accepts(selected.vtable)) return error.RuntimeRequestCleanupChanged;
+        if (self.runtime) |held| {
+            if (held != selected or self.context != selected.ptr or self.table != selected.vtable)
+                return error.RuntimeRequestParticipantChanged;
+            return;
+        }
+        // Entry-specific host-assisted runtimes cannot claim this one session
+        // role. A new role must be planned before it can submit asynchronous work.
+        if (selected.capabilities().state_ownership == .host_assisted_inputs)
+            return error.UnsupportedRuntimeRequestParticipant;
+        self.runtime = selected;
+        self.context = selected.ptr;
+        self.table = selected.vtable;
+    }
+
+    pub fn finish(self: *RequestFinish, current: CleanupContext) !void {
+        const selected = self.runtime orelse return;
+        if (selected.ptr != self.context or selected.vtable != self.table)
+            return error.RuntimeRequestParticipantChanged;
+        try selected.finishRequestWithCleanup(current);
+        self.* = .{};
     }
 };
 
@@ -1430,4 +1482,135 @@ test "Model runtime exported logits sanitize request header before parent stack 
     const values = try output.hostLogitsWithCleanup(a, current);
     try std.testing.expectEqualSlices(f32, &.{ 3, 5 }, values);
     try std.testing.expectEqual(@as(usize, 0), Parent.callbacks);
+}
+
+fn modelRequestFinishCase(a: std.mem.Allocator) !void {
+    const native = @import("../ops/native_compute.zig");
+    const operation = @import("../execution/backend_operation.zig");
+    const sink = @import("../execution/retirement_sink.zig");
+    var stable = try sink.Ref.create();
+    defer stable.release();
+    var guard = try stable.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.resident_weights.deinit(a);
+    defer weights.lazy_weights.deinit(a);
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    var operation_owner: @import("../execution/operation_owner.zig").Owner = .{};
+    compute.shared_operation_owner = &operation_owner;
+    defer compute.shared_operation_owner = null;
+    const backend = compute.computeBackend();
+    var scope: operation.Scope = undefined;
+    try operation.enterInto(&backend, null, null, .managed, &scope);
+    defer scope.deinitChecked() catch @panic("request finish fixture operation teardown failed");
+    _ = try scope.bindCleanupEpoch(&epoch);
+    const token = scope.token() orelse return error.ExpectedActualNativeOperation;
+    const current: CleanupContext = .{ .boundary = &epoch, .operation = token };
+    const Probe = struct {
+        backend: ops.ComputeBackend,
+        boundary: *const sink.Epoch,
+        calls: usize = 0,
+        armed: bool = true,
+        fail: bool = false,
+        fn capabilities(_: *anyopaque) RuntimeCapabilities {
+            return .{ .state_ownership = .runtime_owned_host_cache };
+        }
+        fn accepts(table: *const ModelRuntime.VTable) bool {
+            return table == &table_value;
+        }
+        fn operationBackend(raw: *anyopaque) *const ops.ComputeBackend {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return &self.backend;
+        }
+        fn finish(raw: *anyopaque, supplied: CleanupContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(supplied.boundary == self.boundary);
+            _ = try supplied.operationFor(&self.backend);
+            self.calls += 1;
+            if (self.fail) return error.InjectedRequestAwaitFailure;
+            self.armed = false;
+        }
+        fn prefill(_: *anyopaque, _: std.mem.Allocator, _: PrefillRequest) !ModelOutput {
+            return error.UnusedFixturePrefill;
+        }
+        fn close(_: *anyopaque) void {}
+        fn resetCopy(_: *anyopaque) !void {}
+        const services = ModelRuntime.ColdCleanupServices{ .accepts = accepts, .deinit = closeWithCleanup, .finish_request = finish };
+        fn closeWithCleanup(_: *anyopaque, _: CleanupContext) void {}
+        const table_value = ModelRuntime.VTable{ .prefill = prefill, .deinit = close, .capabilities = capabilities, .operation_backend = operationBackend, .accepts_operation_backend = accepts, .cold_cleanup_services = &services };
+    };
+    const probe = try a.create(Probe);
+    defer a.destroy(probe);
+    probe.* = .{ .backend = backend, .boundary = &epoch };
+    var model = ModelRuntime{ .ptr = probe, .vtable = &Probe.table_value };
+    var request: RequestFinish = .{};
+    try request.receive(&model);
+    try request.receive(&model);
+    try request.finish(current);
+    try std.testing.expect(request.runtime == null);
+    try std.testing.expect(!probe.armed);
+    probe.armed = true;
+    probe.fail = true;
+    // This receiving call borrows the live actual Native operation. A denial
+    // is not permission to clear the runtime's uncertain pending ownership.
+    try request.receive(&model);
+    if (request.finish(current)) |_| return error.ExpectedRequestFinishFailure else |err| {
+        if (err != error.InjectedRequestAwaitFailure) return err;
+    }
+    try std.testing.expect(probe.armed and request.runtime == &model);
+    var other = ModelRuntime{ .ptr = @ptrFromInt(16), .vtable = &Probe.table_value };
+    try std.testing.expectError(error.RuntimeRequestParticipantChanged, request.receive(&other));
+    const original_context = model.ptr;
+    model.ptr = @ptrFromInt(16);
+    const changed_context = request.finish(current);
+    model.ptr = original_context;
+    try std.testing.expectError(error.RuntimeRequestParticipantChanged, changed_context);
+    try std.testing.expect(probe.armed);
+    var foreign_sink = try sink.Ref.create();
+    defer foreign_sink.release();
+    var foreign_guard = try foreign_sink.enter();
+    defer foreign_guard.finish();
+    var foreign_epoch = try foreign_guard.retainEpoch();
+    defer foreign_epoch.release();
+    try std.testing.expectError(error.BackendOperationCleanupChanged, request.finish(.{ .boundary = &foreign_epoch, .operation = token }));
+    try std.testing.expect(probe.armed and request.runtime == &model);
+    probe.fail = false;
+    try request.finish(current);
+    try std.testing.expect(!probe.armed);
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+    var copied = Probe.table_value;
+    copied.reset = Probe.resetCopy;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(&copied != &Probe.table_value);
+    var foreign = ModelRuntime{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    try std.testing.expectError(error.RuntimeRequestCleanupChanged, foreign.finishRequestWithCleanup(current));
+    // Absence is a literal no-op: no backend getter, provider or opaque cast.
+    const no_finish = ModelRuntime.VTable{ .prefill = Probe.prefill, .deinit = Probe.close };
+    var ordinary = ModelRuntime{ .ptr = @ptrFromInt(16), .vtable = &no_finish };
+    try ordinary.finishRequestWithCleanup(.{});
+    var unused_request: RequestFinish = .{};
+    try unused_request.receive(&ordinary);
+    try std.testing.expect(unused_request.runtime == null);
+    const HostAssisted = struct {
+        fn accepts(table: *const ModelRuntime.VTable) bool {
+            return table == &value;
+        }
+        const services = ModelRuntime.ColdCleanupServices{ .accepts = accepts, .deinit = Probe.closeWithCleanup, .finish_request = Probe.finish };
+        const value = ModelRuntime.VTable{ .prefill = Probe.prefill, .deinit = Probe.close, .cold_cleanup_services = &services };
+    };
+    var unsupported_role = ModelRuntime{ .ptr = @ptrFromInt(16), .vtable = &HostAssisted.value };
+    try std.testing.expectError(error.UnsupportedRuntimeRequestParticipant, unused_request.receive(&unsupported_role));
+}
+
+test "model request finish preserves actual operation epoch and uncertain state before provider retirement" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try modelRequestFinishCase(std.testing.allocator);
+}
+
+test "model request finish metadata ownership survives allocation failures" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, modelRequestFinishCase, .{});
 }

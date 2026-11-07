@@ -99,6 +99,9 @@ pub const Context = struct {
     /// Borrowed exact outer owner; reader stores it in stable epoch allocation.
     cleanup_epoch: ?*const @import("../execution/retirement_sink.zig").Epoch = null,
     cleanup_owner: ?*const @import("../execution/cleanup_owner.zig").Owner = null,
+    /// Borrowed only for this invocation; receive the actual selected session
+    /// runtime before any of its numerical work can be submitted.
+    request_finish: ?*model_runtime.RequestFinish = null,
     /// Borrowed from the actual retaining model owner. A standalone/draft
     /// execution need not acquire Session numerical/provider capabilities just
     /// to publish its physical observations. The model outlives this context.
@@ -679,6 +682,7 @@ pub fn graphForwardCompiledModelLast(
         },
     }
     if (try backend_def.candidate(allocator, cache, attach_context, .single_device)) |candidate| {
+        if (pipeline.request_finish) |finish| try finish.receive(candidate.runtime);
         if (try candidate.forward(allocator, request)) |last_logits| return last_logits;
     }
 
@@ -770,6 +774,7 @@ pub fn prepareCompiledModelRuntime(
     defer cleanup.deinit();
     const attach_context = compiledBackendAttachContext(pipeline, backend, null);
     const candidate = (try backend_def.candidate(pipeline.allocator, cache, attach_context, .single_device)) orelse return false;
+    if (pipeline.request_finish) |finish| try finish.receive(candidate.runtime);
     return candidate.prepare(pipeline.allocator, .{ .execution_control = pipeline.execution_control, .kv_tokens_hint = kv_tokens_hint, .backend_operation = pipeline.cb.operationToken(), .cleanup_epoch = cleanup.current() });
 }
 
@@ -804,6 +809,7 @@ pub fn graphForwardCompiledModelOutput(
         },
     }
     const candidate = (try backend_def.candidate(pipeline.allocator, cache, attach_context, .single_device)) orelse return null;
+    if (pipeline.request_finish) |finish| try finish.receive(candidate.runtime);
     return candidate.output(pipeline.allocator, request);
 }
 
@@ -834,6 +840,7 @@ pub fn graphForwardCompiledModelGreedyToken(
         },
     }
     const candidate = (try backend_def.candidate(pipeline.allocator, cache, attach_context, .single_device)) orelse return null;
+    if (pipeline.request_finish) |finish| try finish.receive(candidate.runtime);
     return candidate.greedy(pipeline.allocator, request, vocab_size);
 }
 
@@ -859,6 +866,7 @@ pub fn graphForwardCompiledModelSampledToken(
         request.decode.attention_mode,
     );
     const candidate = (try backend_def.candidate(pipeline.allocator, cache, attach_context, .single_device)) orelse return null;
+    if (pipeline.request_finish) |finish| try finish.receive(candidate.runtime);
     var scoped = request;
     scoped.decode.backend_operation = pipeline.cb.operationToken();
     scoped.decode.cleanup_epoch = cleanup.current();

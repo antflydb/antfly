@@ -493,6 +493,51 @@ def select_cases(suite, names, encoder=False, text_only=False):
     return dict(suite, cases=selected)
 
 
+def relocate_assets(suite, asset_root):
+    """Relocate selected media bytes, never the suite/oracles or unused media."""
+    if asset_root is None:
+        return suite, None
+    proof = {"root": str(asset_root), "applied": False, "assets": []}
+    media = {case["name"] for case in suite["cases"] if "text" not in case}
+    if not media:
+        return suite, proof  # Explicit text/encoder scope performs no asset I/O.
+    if not media.issubset({"image", "audio", "text_image", "image_text", "mixed"}):
+        raise ValueError("asset relocation does not support selected media cases")
+    assets = suite.get("assets")
+    if not isinstance(assets, dict) or any(
+        not isinstance(name, str) or name not in ("image.png", "audio.wav")
+        or Path(name).name != name or "/" in name or "\\" in name
+        for name in assets
+    ):
+        raise ValueError("unsafe or unsupported suite asset name")
+    root = Path(asset_root).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("asset root is not a directory")
+    required = set()
+    if media & {"image", "text_image", "image_text", "mixed"}:
+        required.add("image.png")
+    if media & {"audio", "mixed"}:
+        required.add("audio.wav")
+    relocated = dict(assets)
+    for name in sorted(required):
+        entry = assets.get(name)
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or not entry["path"] or not isinstance(entry.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]):
+            raise ValueError("invalid selected media asset declaration")
+        path = root / name
+        if path.is_symlink() or not path.is_file() or path.resolve(strict=True).parent != root:
+            raise ValueError("unsafe or missing relocated media asset")
+        before = path.stat()
+        actual = reference.sha256(path)
+        after = path.stat()
+        fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if actual != entry["sha256"] or any(getattr(before, field) != getattr(after, field) for field in fields):
+            raise ValueError("relocated media asset changed")
+        relocated[name] = dict(entry, path=str(path))
+        proof["assets"].append({"name": name, "original_path": entry["path"], "path": str(path), "sha256": actual})
+    proof.update(root=str(root), applied=True)
+    return dict(suite, assets=relocated), proof
+
+
 def case_warmups(case, override):
     return (
         override if override is not None else (0 if len(case["token_ids"]) > 512 else 2)
@@ -1044,6 +1089,7 @@ def main():
         help="Gate vectors, rankings and routing against a completed matched runtime result",
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--asset-root", type=Path, help="Relocate selected image.png/audio.wav payloads after verifying their declared suite SHA256; keep suite/oracle bytes unchanged")
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument(
         "--case", action="append", help="Select named cases; may be repeated"
@@ -1073,6 +1119,8 @@ def main():
     ):
         parser.error("iterations must be 1..100")
     if args.backend == "prepare":
+        if args.asset_root is not None:
+            parser.error("--asset-root applies to runtime suites; prepare uses --artifacts-dir")
         if not args.artifacts_dir and not args.text_only:
             parser.error("full prepare requires --artifacts-dir")
         prepare(args.model_dir, args.artifacts_dir, args.output, args.text_only)
@@ -1095,6 +1143,7 @@ def main():
     if suite["revision"] != reference.REVISION:
         raise ValueError("suite checkpoint revision differs")
     suite = select_cases(suite, args.case, args.timing_mode == "encoder", args.text_only)
+    suite, asset_relocation = relocate_assets(suite, args.asset_root)
     if args.timing_mode == "encoder" and args.warmups is None:
         args.warmups = 2
     result = {
@@ -1137,6 +1186,8 @@ def main():
         "cases": {},
         "before": conditions(args.backend),
     }
+    if asset_relocation is not None:
+        result["asset_relocation"] = asset_relocation
     try:
         if args.backend in ("native", "metal", "cuda"):
             (encoder_run if args.timing_mode == "encoder" else native)(

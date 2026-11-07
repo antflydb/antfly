@@ -2062,7 +2062,9 @@ test "CUDA boundary retained forward transposes match pinned head dots and gradi
     const expected = if (device.backend.ctx.info.compute_major == 12 and device.backend.ctx.info.compute_minor == 1)
         switch (device.backend.training_blas.?.version) {
             120804 => "37705bbe694699b897492817adce54dc380c2d1d6d508df43bcc43b20d49abc7",
-            130101 => "92c2c0eb8434b3e68cf0da2e376f41ee853ab66b4a66c5a54b8025c28c64ac78",
+            // Independently reproduced with the maintained oracle against
+            // the exact GB10 cuBLAS 13.4.1.3 library, with TF32 disabled.
+            130101, 130401 => "92c2c0eb8434b3e68cf0da2e376f41ee853ab66b4a66c5a54b8025c28c64ac78",
             else => return error.UnqualifiedCublasReference,
         }
     else

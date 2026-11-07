@@ -458,5 +458,104 @@ class PlatformObservationContracts(unittest.TestCase):
         with mock.patch.object(compare.subprocess, "check_output", return_value='{"SPDisplaysDataType":[]}'):
             self.assertEqual(compare.metal_identity()["status"], "unavailable")
 
+
+
+class AssetRelocationContracts(unittest.TestCase):
+    def test_selected_media_relocates_without_mutating_suite_or_unused_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            payload = b"exact original image bytes"
+            (root / "image.png").write_bytes(payload)
+            suite = {"revision": compare.reference.REVISION, "cases": [
+                {"name": "text", "text": "unchanged", "token_ids": [1]},
+                {"name": "image", "token_ids": [2], "oracle": [0.25, 0.75]},
+                {"name": "audio", "token_ids": [3]}],
+                "assets": {"image.png": {"path": "/old-machine/image.png", "sha256": hashlib.sha256(payload).hexdigest()},
+                           "audio.wav": {"path": "/unselected/audio.wav", "sha256": "0" * 64}}}
+            before = copy.deepcopy(suite)
+            selected = compare.select_cases(suite, ["image"])
+            with mock.patch.object(compare.reference, "sha256", wraps=compare.reference.sha256) as hashed:
+                relocated, proof = compare.relocate_assets(selected, root)
+            self.assertEqual(suite, before)
+            self.assertIs(relocated["cases"], selected["cases"])
+            self.assertEqual(relocated["cases"][0]["oracle"], [0.25, 0.75])
+            self.assertEqual(relocated["assets"]["image.png"]["path"], str(root / "image.png"))
+            self.assertEqual(relocated["assets"]["audio.wav"], suite["assets"]["audio.wav"])
+            self.assertEqual(hashed.call_args_list, [mock.call(root / "image.png")])
+            self.assertTrue(proof["applied"])
+            self.assertEqual(proof["assets"][0]["original_path"], "/old-machine/image.png")
+            self.assertEqual(base64.b64decode(compare.media_parts(relocated, "image")[0]["data"]), payload)
+
+    def test_default_and_selected_text_scope_never_resolve_or_hash_assets(self):
+        suite = {"cases": [{"name": "text", "text": "unchanged"}], "assets": {"unsafe/unused": {}}}
+        with mock.patch.object(compare.reference, "sha256", side_effect=AssertionError("asset hash in text scope")), mock.patch.object(Path, "resolve", side_effect=AssertionError("asset path in text scope")):
+            self.assertEqual(compare.relocate_assets(suite, None), (suite, None))
+            relocated, proof = compare.relocate_assets(suite, Path("missing-root"))
+        self.assertIs(relocated, suite)
+        self.assertFalse(proof["applied"])
+        self.assertEqual(proof["assets"], [])
+
+    def test_media_relocation_rejects_unsafe_unknown_names_and_unknown_cases(self):
+        for name in ("../image.png", "/image.png", "nested/image.png", "nested\\image.png", "video.mp4"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "unsafe or unsupported"):
+                compare.relocate_assets({"cases": [{"name": "image"}], "assets": {name: {}}}, Path("unused"))
+        with self.assertRaisesRegex(ValueError, "does not support"):
+            compare.relocate_assets({"cases": [{"name": "unimplemented-media"}], "assets": {}}, Path("unused"))
+
+    def test_relocation_requires_exact_payload_and_rejects_symlink_or_missing_asset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            payload = b"actual pinned bytes"
+            suite = {"cases": [{"name": "image"}], "assets": {"image.png": {"path": "/old-machine/image.png", "sha256": hashlib.sha256(payload).hexdigest()}}}
+            for declaration in (None, {}, {"path": "x", "sha256": "G" * 64}):
+                with self.subTest(declaration=declaration), self.assertRaisesRegex(ValueError, "declaration"):
+                    compare.relocate_assets(dict(suite, assets={"image.png": declaration}), root)
+            with self.assertRaisesRegex(ValueError, "missing"):
+                compare.relocate_assets(suite, root)
+            path = root / "image.png"
+            path.write_bytes(b"different payload")
+            with self.assertRaisesRegex(ValueError, "changed"):
+                compare.relocate_assets(suite, root)
+            path.unlink()
+            other = root / "other.png"
+            other.write_bytes(payload)
+            path.symlink_to(other)
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                compare.relocate_assets(suite, root)
+
+    def test_runtime_cli_keeps_original_suite_bytes_sha_and_records_relocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            assets = root / "assets"
+            assets.mkdir()
+            payload = b"transported exact image bytes"
+            (assets / "image.png").write_bytes(payload)
+            model = root / "model"
+            model.mkdir()
+            (model / "embeddinggemma2_receipt.json").write_text("{}")
+            suite_path = root / "suite.json"
+            raw = json.dumps({"revision": compare.reference.REVISION, "cases": [{"name": "image", "token_ids": [2], "oracle": [1.0, 0.0]}], "assets": {"image.png": {"path": "/other-host/image.png", "sha256": hashlib.sha256(payload).hexdigest()}}}, indent=3).encode()
+            suite_path.write_bytes(raw)
+            output = root / "result.json"
+            def native(args, suite, result):
+                self.assertEqual(suite["assets"]["image.png"]["path"], str(assets / "image.png"))
+                self.assertEqual(suite["cases"][0]["oracle"], [1.0, 0.0])
+                result["cases"] = {"image": {"vector": [1.0, 0.0]}}
+            argv = ["compare.py", "--backend", "native", "--model-dir", str(model), "--binary", str(root / "image"), "--suite", str(suite_path), "--asset-root", str(assets), "--output", str(output), "--iterations", "1", "--warmups", "0"]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(compare, "native", side_effect=native), mock.patch.object(compare, "conditions", return_value={}):
+                compare.main()
+            result = json.loads(output.read_text())
+            self.assertEqual(suite_path.read_bytes(), raw)
+            self.assertEqual(result["suite_sha256"], hashlib.sha256(raw).hexdigest())
+            self.assertTrue(result["asset_relocation"]["applied"])
+            self.assertEqual(result["asset_relocation"]["assets"][0]["sha256"], hashlib.sha256(payload).hexdigest())
+            self.assertEqual(result["status"], "pass")
+
+    def test_prepare_rejects_runtime_asset_root_without_preparation(self):
+        argv = ["compare.py", "--backend", "prepare", "--model-dir", "model", "--output", "out", "--text-only", "--asset-root", "assets"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(compare, "prepare") as prepared, self.assertRaises(SystemExit):
+            compare.main()
+        prepared.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

@@ -2158,7 +2158,7 @@ fn operationBackend(raw: *anyopaque) *const ops.ComputeBackend {
     const self: *RuntimeContext = @ptrCast(@alignCast(raw));
     return &self.cb;
 }
-const runtime_cleanup_services = model_runtime.ModelRuntime.ColdCleanupServices{ .accepts = acceptsOperationBackend, .deinit = runtimeDeinitWithCleanup };
+const runtime_cleanup_services = model_runtime.ModelRuntime.ColdCleanupServices{ .accepts = acceptsOperationBackend, .deinit = runtimeDeinitWithCleanup, .finish_request = runtimeFinishRequestWithCleanup };
 const runtime_vtable = model_runtime.ModelRuntime.VTable{
     .operation_backend = operationBackend,
     .accepts_operation_backend = acceptsOperationBackend,
@@ -2423,6 +2423,14 @@ fn runtimePrepare(
         ) catch false;
     }
     return prepare.prepared;
+}
+
+fn runtimeFinishRequestWithCleanup(ctx: *anyopaque, _: @import("../execution/cleanup_context.zig").Context) !void {
+    const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    // Finish the same submitted speculative frame before the request's Engine
+    // quiesces the shared provider. Only a successful real await clears armed
+    // state; a missing/failed frame remains an ownership error.
+    try runtime_ctx.drainPipelinedDecodeChecked();
 }
 
 fn runtimeReset(ctx: *anyopaque) !void {
@@ -3325,4 +3333,61 @@ test "retiring cached Metal runtime preserves a newer request actual empty frame
     cached.deinit();
     cached_live = false;
     try std.testing.expect(metal_runtime.hasActiveFrame(frame_runtime));
+}
+
+test "cached Metal pipelined runtime settles each real request before Engine epoch retirement" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const path = platform.env.getenv("ANTFLY_UNIFIED_DECODER_FIXTURE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var session = try session_factory.createMetalSession(a, path);
+    defer session.close();
+    session_factory.attachIo(session, std.testing.io);
+    const config = session_factory.getGptConfig(session).?;
+    if (config.family != .gemma or !pipelinedDecodeFrameEnabled(config) or !metal_runtime.supportsDecoderRuntimeConfig(config)) return error.SkipZigTest;
+    {
+        const warm = try session_factory.getComputeBackend(session, a);
+        warm.deinit();
+    }
+    var executor = try createModelExecutor(a, session, config, null, null);
+    defer executor.deinit();
+    var instance = try executor.createRuntime(a);
+    defer instance.deinit();
+    const physical: *RuntimeContext = @ptrCast(@alignCast(instance.ptr));
+    const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(physical.cb.ptr));
+    const raw = compute.provider_impl.raw_decode_runtime orelse return error.ExpectedActualMetalProvider;
+    const prompt = [_]i64{ 1, 2, 3, 4 };
+    var first_token: ?i64 = null;
+    for (0..2) |_| {
+        // Both requests have independent real cleanup epochs and owning Engine
+        // scopes. The cached runtime and its KV survive between these scopes.
+        var cleanup = try @import("../execution/cleanup_owner.zig").Owner.beginResident(session);
+        defer cleanup.finishAfterUnlock();
+        var backend = try session_factory.getComputeBackend(session, a);
+        const current: @import("../execution/cleanup_context.zig").Context = .{ .boundary = cleanup.epoch(), .operation = backend.operationToken() };
+        defer backend.deinitWithCleanup(current);
+        try std.testing.expect(try cleanup.bindBackend(&backend));
+        _ = try cleanup.retainThroughBackend(&backend);
+        // On every later assertion/allocation failure, pending numerical work
+        // still retires through this same current owner before Engine cleanup.
+        defer instance.finishRequestWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+        try instance.resetWithCleanup(current);
+        _ = try instance.prepare(a, .{ .kv_tokens_hint = 16, .cleanup_epoch = current.boundary, .backend_operation = current.operation });
+        const seed = blk: {
+            var prefill = try instance.prefill(a, .{ .input_ids = &prompt, .seq_len = prompt.len, .query_seq_len = prompt.len, .attention_mode = .paged_prefill, .cleanup_epoch = current.boundary, .backend_operation = current.operation });
+            defer prefill.deinitWithCleanup(a, current);
+            break :blk try prefill.greedyTokenWithCleanup(a, config.vocab_size, current);
+        };
+        var output = try instance.decodeGreedy(a, .{ .token_id = seed, .position = prompt.len, .cleanup_epoch = current.boundary, .backend_operation = current.operation });
+        defer output.deinitWithCleanup(current);
+        if (first_token) |expected| try std.testing.expectEqual(expected, output.token_id) else first_token = output.token_id;
+        // A one-step length limit leaves the speculative successor submitted.
+        // End-of-request settlement must consume that actual CB, not infer
+        // completion from the next Engine's empty provider state.
+        try std.testing.expect(physical.pipelined_decode_armed);
+        try std.testing.expect(metal_runtime.hasSubmittedFrame(raw));
+        try instance.finishRequestWithCleanup(current);
+        try std.testing.expect(!physical.pipelined_decode_armed);
+        try std.testing.expect(!metal_runtime.hasSubmittedFrame(raw));
+        try std.testing.expect(!metal_runtime.hasActiveFrame(raw));
+    }
 }
