@@ -673,8 +673,9 @@ pub const RunAdmission = struct {
             // encoder allocation. Its Flash layers are HD256/local512; global
             // HD512 and masked layers use the zero-workspace efficient route.
             const split_workspace = try embeddingGemma2SplitWorkspaceBytes(request.batch, request.sequence);
+            const classic_workspace = if (@import("../ops/cuda/libraries.zig").Policy.current() == .off) @as(usize, 0) else @import("../ops/cuda/libraries.zig").MatmulArithmetic.maximum_workspace_bytes;
             const logical_metadata = 2 * @sizeOf(u32); // exact mask-bank device tail
-            return try addBytes(try addBytes(try addBytes(try addBytes(arena, states), staging), try addBytes(attention, fixed)), try addBytes(split_workspace, logical_metadata));
+            return try addBytes(try addBytes(try addBytes(try addBytes(arena, states), staging), try addBytes(attention, fixed)), try addBytes(@max(split_workspace, classic_workspace), logical_metadata));
         }
         // Attention and FFN phases are sequential, so reserve the larger peak
         // rather than summing mutually exclusive intermediates.
@@ -752,7 +753,7 @@ fn embeddingGemma2AdmissionSequence(sequence: usize) usize {
 /// public HD256/global descriptors may use Flash beyond511 and are unrelated.
 fn embeddingGemma2SplitWorkspaceBytes(batch: usize, sequence_bound: usize) !usize {
     if (batch == 0 or sequence_bound == 0) return 0;
-    const flash_keys = @min(sequence_bound, @as(usize, 511));
+    const flash_keys: usize = @min(sequence_bound, @as(usize, 511));
     const splits = (flash_keys + 63) / 64; // <=8, without guessing a GPU SM count
     if (splits <= 1) return 0;
     const physical = embeddingGemma2AdmissionSequence(flash_keys);
@@ -10207,7 +10208,7 @@ test "official CUDA encoder admission bounds actual split programs for every dec
     // Pure typed schedule/layout calls only. No Context/driver/module/model is
     // initialized, and no GPU or allocation timing is part of this contract.
     const Attention = @import("../ops/cuda/embedding_gemma2.zig");
-    const envelopes = [_]usize{ 1, 64, 65, 127, 128, 177, 178, 256, 270, 320, 511, 512, 513, 577, 8192 };
+    const envelopes = [_]usize{ 1, 64, 65, 127, 128, 177, 178, 256, 270, 320, 447, 448, 449, 510, 511, 512, 513, 577, 8192 };
     const logical_lengths = [_]usize{ 1, 16, 63, 64, 65, 127, 128, 129, 177, 178, 255, 256, 257, 270, 319, 320, 383, 384, 385, 447, 448, 449, 510, 511, 512, 513, 577, 1024, 4096, 8192 };
     for ([_]usize{ 1, 4, 8 }) |batch| for (envelopes) |envelope| {
         const bound = try embeddingGemma2SplitWorkspaceBytes(batch, envelope);

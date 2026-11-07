@@ -25221,7 +25221,7 @@ pub const Node = struct {
     /// Embedded callers use the same validated contract and admission path as
     /// HTTP. The returned JSON is owned by `allocator`.
     pub fn decideDirectJsonWithControl(self: *Node, allocator: std.mem.Allocator, request_json: []const u8, control: ?InferenceExecutionControl) ![]u8 {
-        return self.decideJsonWithAdmission(allocator, request_json, .direct, control);
+        return self.decideJsonWithAdmission(allocator, request_json, if (control != null and control.?.http_request_admitted) .http_route else .direct, control);
     }
 
     fn decideJsonWithAdmission(self: *Node, allocator: std.mem.Allocator, request_json: []const u8, owner: ExtractionAdmissionOwner, control: ?InferenceExecutionControl) ![]u8 {
@@ -25250,7 +25250,7 @@ pub const Node = struct {
         defer manifest.deinit();
         if (manifest.embedding_style == .embedding_gemma2) {
             if (request.long_document.mode == .window) return error.UnsupportedDecisionWindowing;
-            return self.decideEmbeddingSimilarity(allocator, a, path, public_request, selected_control);
+            return self.decideEmbeddingSimilarity(allocator, a, path, public_request, owner, selected_control);
         }
         if (request.model_identity != null) return error.UnsupportedDecideModel;
         for (public_request.policies) |policy| if (policy.embedding_configured or policy.kind == .multi_choice) return error.UnsupportedDecideModel;
@@ -25501,7 +25501,7 @@ pub const Node = struct {
         return std.json.Stringify.valueAlloc(allocator, root, .{});
     }
 
-    fn decideEmbeddingSimilarity(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, path: []const u8, public_request: @import("antfly_decisions").Request, control: ?InferenceExecutionControl) ![]u8 {
+    fn decideEmbeddingSimilarity(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, path: []const u8, public_request: @import("antfly_decisions").Request, owner: ExtractionAdmissionOwner, control: ?InferenceExecutionControl) ![]u8 {
         const scoring = @import("antfly_decisions").scoring;
         const request = public_request.inner;
         var text_count: usize = 0;
@@ -25516,8 +25516,18 @@ pub const Node = struct {
         if (text_count > 1024) return error.DecideRequestLimitExceeded;
         const effective = self.extractionExecutionControl(control);
         try effective.check();
-        try self.acquireAdmissionUnits(1);
-        defer self.releaseAdmissionUnits(1);
+        // The HTTP router already owns the request-count permit. This
+        // subwork reserves only its weighted unit; direct callers still own
+        // both acquisitions. Ownership comes from the actual private ingress,
+        // never from another request's global active counter.
+        switch (owner) {
+            .direct => try self.acquireAdmissionUnits(1),
+            .http_route => try self.reserveAdmissionUnits(1),
+        }
+        defer switch (owner) {
+            .direct => self.releaseAdmissionUnits(1),
+            .http_route => self.releaseSlotUnits(1),
+        };
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(a, effective.io, &owned_io);
@@ -54382,4 +54392,70 @@ test "model selection compatibility signature tracks selected Jina adapter files
     try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_model.safetensors", .data = "bbbbb" });
     const weights_changed = try computeCompatibilitySignatureWithDependencies(a, io, root, &man, &.{}, true);
     try std.testing.expect(!std.mem.eql(u8, &config_changed, &weights_changed));
+}
+
+test "embedding decision HTTP subwork preserves concurrency one ingress across denial cancellation and OOM" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const models = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(models);
+    var failures = std.testing.FailingAllocator.init(a, .{});
+    var node = try Node.init(failures.allocator(), .{ .models_dir = models, .max_concurrent_requests = 1, .max_work_units = 32 });
+    defer node.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const json = "{\"model\":\"missing\",\"input\":\"Reset my password\",\"questions\":[{\"name\":\"route\",\"type\":\"choice\",\"instructions\":\"Route the support request.\",\"choices\":[{\"value\":\"account\",\"description\":\"Account access and forgotten passwords\"},{\"value\":\"billing\",\"description\":\"Payments, invoices and unexpected charges\"},{\"value\":\"delivery\",\"description\":\"Deliveries, shipping and missing parcels\"}]}]}";
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, json, .{});
+    const request = try @import("antfly_decisions").parseValue(scratch, parsed);
+    const control = InferenceExecutionControl{ .io = std.testing.io };
+    const http_control = InferenceExecutionControl{ .io = std.testing.io, .http_request_admitted = true };
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+
+    // This is the SAME request-count permit held by HTTP routing, not a
+    // guessed active-count exemption. The actual public parsed routing core
+    // must reach its model allocation, where the controlled fail0 fires.
+    try node.inference_admission.acquireRequestSlot();
+    {
+        defer node.inference_admission.releaseRequestSlot();
+        failures.fail_index = failures.alloc_index;
+        failures.has_induced_failure = false;
+        defer failures.fail_index = std.math.maxInt(usize);
+        try std.testing.expectError(error.OutOfMemory, node.decideEmbeddingSimilarity(a, scratch, models, request, .http_route, http_control));
+        try std.testing.expect(failures.has_induced_failure);
+        failures.fail_index = std.math.maxInt(usize);
+        try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightRequests());
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+        try std.testing.expectError(error.QueueFull, node.inference_admission.acquireRequestSlot());
+
+        // Genuine unit exhaustion still denies, without consuming the
+        // caller's request permit or releasing another owner's reservation.
+        try node.inference_admission.reserveUnits(32);
+        {
+            defer node.inference_admission.releaseReservedUnits(32);
+            try std.testing.expectError(error.QueueFull, node.decideEmbeddingSimilarity(a, scratch, models, request, .http_route, http_control));
+            try std.testing.expectEqual(@as(usize, 32), node.inference_admission.inFlightUnits());
+            try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightRequests());
+        }
+        try std.testing.expectError(error.Cancelled, node.decideEmbeddingSimilarity(a, scratch, models, request, .http_route, .{ .io = std.testing.io, .http_request_admitted = true, .check_fn = Cancel.check }));
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+        try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightRequests());
+        // A legitimate direct caller cannot steal this other HTTP slot.
+        try std.testing.expectError(error.QueueFull, node.decideEmbeddingSimilarity(a, scratch, models, request, .direct, control));
+        try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightRequests());
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+    failures.fail_index = failures.alloc_index;
+    failures.has_induced_failure = false;
+    defer failures.fail_index = std.math.maxInt(usize);
+    try std.testing.expectError(error.OutOfMemory, node.decideEmbeddingSimilarity(a, scratch, models, request, .direct, control));
+    try std.testing.expect(failures.has_induced_failure);
+    failures.fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
 }

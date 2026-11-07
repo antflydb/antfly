@@ -10,7 +10,7 @@
   "changed_instructions": [],
   "changed_resources": [],
   "original_image_sha256": "0cc41e211289f4415649458aa8fd5322221f8b567e98b682212f02eedd77850d",
-  "candidate_image_sha256": "a325bd419cc112b23180f60c22b85d0381552277ece472bff3cf695773970858",
+  "candidate_image_sha256": "c92d70b1e92c7151ce4cffeac7dde8397f90f170806ee406d663059ce7f115fe",
   "programs": [
     {
       "arch": "sm_89",
@@ -30,13 +30,13 @@
     }
   ],
   "previous_current_binding": {
-    "path": "src/ops/cuda/generated/evidence/native_source_previous_sm89.json",
-    "sha256": "4c8b9e74d0504498a922228b3de97a0899532d2d0458ada026a352e4fb84945c",
-    "candidate_image_sha256": "54ad80e2ad5bf16b0f644d5ebeb68da74afa8909c6cb707107837fd0ddec1130"
+    "path": "src/ops/cuda/generated/evidence/native_source_previous_a325_sm89.json",
+    "sha256": "50b4bca2e9c3cbbded630c4612fa5f962ca0470b68abec7bacf1c2084b56b7c0",
+    "candidate_image_sha256": "a325bd419cc112b23180f60c22b85d0381552277ece472bff3cf695773970858"
   },
   "program_closure_equivalence": {
     "path": "src/ops/cuda/generated/evidence/native_source_closure_sm89.json",
-    "sha256": "da899c9fb51702543103d8d1c258418a0a1225d5a7ce3314b44439f255524128"
+    "sha256": "b0e66f7bd7bcdec77eb767c2f216a5911fd701834c2ef69abbe756a571205bb9"
   },
-  "scope": "Historical SM89 qualification is preserved transitively. Exact native function text, per-function constants, resource metadata and closed call/relocation payloads match the previously bound image. No new timing, GPU or architecture qualification."
+  "scope": "Historical SM89 qualification is preserved transitively. Exact native text, owned constants, normalized symbol-index metadata, global resources and closed call/relocation payloads match through current artifact A. Original timing revision/target retained; no new timing/GPU qualification. Full raw text equality also binds the prior disassembly to these unchanged instruction bytes."
 }

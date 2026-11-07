@@ -6679,7 +6679,14 @@ pub const NativeCompute = struct {
             var growth = data.tier_cache.?.snapshotPhysicalOwnerGrowthLocked(policy.bytes, physical) catch |err| {
                 data.embeddinggemma2_f32_cache_lock.unlock();
                 data.prefetch.unlock();
-                return err;
+                // This is a NEW optional mirror, not an already-live raw
+                // cache's mandatory metadata upgrade. A hard policy ceiling
+                // or in-flight ledger refusal declines just as later funding
+                // does, preserving the original owned getter fallback.
+                return switch (err) {
+                    error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable => false,
+                    else => err,
+                };
             };
             defer growth.finishOutsideExecution();
             retainF32RecipeSourcesLocked(data, &sources) catch |err| {

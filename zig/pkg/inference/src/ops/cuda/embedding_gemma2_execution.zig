@@ -35,6 +35,8 @@ pub const EncoderRouteState = struct {
     cudnn_initialized: bool = false,
     scratch_bytes: usize = 0,
     scratch_limit: usize = 0,
+    matmul_arithmetic: @import("libraries.zig").MatmulArithmetic = .full_f32,
+    matmul_workspace_bytes: usize = 0,
 };
 pub const LogicalUpload = struct {
     values: [2]u32 = .{ 0, 0 },
@@ -1149,6 +1151,10 @@ test "encoder retained logical metadata rejects topology changes without borrowi
     entry.warm = true;
     try entry.prepareAttentionSource(&ctx, next, config, .{ .graph_replay = true }, .{ .cudnn_enabled = true });
     try std.testing.expect(!entry.warm);
+    entry.noteAttentionSource(first, config, .{ .graph_replay = true }, .{ .matmul_arithmetic = .bf16_reduced, .matmul_workspace_bytes = 32 * 1024 * 1024 });
+    entry.warm = true;
+    try entry.prepareAttentionSource(&ctx, next, config, .{ .graph_replay = true, .matmul_arithmetic = .full_f32 }, .{ .matmul_arithmetic = .full_f32, .matmul_workspace_bytes = 0 });
+    try std.testing.expect(!entry.warm and entry.attention_source == null);
     try std.testing.expectEqual(@as(usize, 192 * 8 + 8), try encoderMaskBytes(192));
     try std.testing.expectEqual(@sizeOf(LogicalUpload), logicalUploadHostBytes(.encoder));
     try std.testing.expectEqual(@as(usize, 0), logicalUploadHostBytes(.audio));

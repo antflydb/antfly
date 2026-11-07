@@ -89,7 +89,7 @@ pub const AttentionProgram = struct {
         const blocks = (shape.seq + 63) / 64;
         const work = try std.math.mul(u32, try std.math.mul(u32, shape.batch, shape.q_heads), blocks);
         if (@as(f32, @floatFromInt(work)) >= 0.8 * @as(f32, @floatFromInt(sms))) return 1;
-        const limit = @min(@as(u32, 128), sms, blocks);
+        const limit: u32 = @min(@as(u32, 128), sms, blocks);
         var efficiency: [128]f32 = @splat(0);
         var maximum: f32 = 0;
         for (1..limit + 1) |value| {
@@ -143,6 +143,7 @@ pub const Stats = struct {
     audio_batch_layout_launches: u64 = 0,
     cublaslt_matmuls: u64 = 0,
     cublas_f32_matmuls: u64 = 0,
+    cublas_bf16_matmuls: u64 = 0,
     attention_launches: u64 = 0,
     attention_scalar_fallbacks: u64 = 0,
     scalar_matmul_fallbacks: u64 = 0,
@@ -330,6 +331,9 @@ pub const Module = struct {
 
     pub fn noteCublasLtMatmul(self: *Module) void {
         self.stats_.cublaslt_matmuls += 1;
+    }
+    pub fn noteCublasBf16Matmul(self: *Module) void {
+        self.stats_.cublas_bf16_matmuls += 1;
     }
     pub fn noteCublasF32Matmul(self: *Module) void {
         self.stats_.cublas_f32_matmuls += 1;
@@ -1525,8 +1529,16 @@ test "EmbeddingGemma 2 local flash accepts only supported local and global geome
     const global = Attention{ .batch = 32, .seq = 512, .q_heads = 4, .kv_heads = 1, .head_dim = 512, .local_radius = 0 };
     try std.testing.expect(Module.localFlashAttentionGeometrySupported(local));
     try std.testing.expect(Module.localFlashAttentionGeometrySupported(global));
-    try std.testing.expect(!Module.localFlashAttentionGeometrySupported(.{ .batch = 32, .seq = 512, .q_heads = 4, .kv_heads = 1, .head_dim = 512, .local_radius = 512 }));
-    try std.testing.expect(!Module.localFlashAttentionGeometrySupported(.{ .batch = 32, .seq = 512, .q_heads = 4, .kv_heads = 2, .head_dim = 256, .local_radius = 0 }));
+    // The shared BF16 program now supports both window policies for each
+    // validated head geometry; schedule selection remains independently typed.
+    const clipped_global = Attention{ .batch = 32, .seq = 512, .q_heads = 4, .kv_heads = 1, .head_dim = 512, .local_radius = 512 };
+    try clipped_global.validate();
+    try std.testing.expect(Module.localFlashAttentionGeometrySupported(clipped_global));
+    try std.testing.expectEqual(AttentionSchedule.efficient_bf16, (try AttentionProgram.forResolvedMask(clipped_global, 512, true, 48)).probability_schedule);
+    const full_local = Attention{ .batch = 32, .seq = 512, .q_heads = 4, .kv_heads = 2, .head_dim = 256, .local_radius = 0 };
+    try full_local.validate();
+    try std.testing.expect(Module.localFlashAttentionGeometrySupported(full_local));
+    try std.testing.expectEqual(AttentionSchedule.flash_bf16, (try AttentionProgram.forResolvedMask(full_local, 512, true, 48)).probability_schedule);
     try std.testing.expect(!Module.localFlashAttentionGeometrySupported(.{ .batch = 32, .seq = 512, .q_heads = 2, .kv_heads = 1, .head_dim = 512, .local_radius = 0 }));
 }
 

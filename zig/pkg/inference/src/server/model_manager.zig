@@ -5387,6 +5387,11 @@ pub const ModelManager = struct {
         var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
         defer publication_lease.deinit(io);
         const publication = try self.publicationForRequest(model_dir, control);
+        // Capture the actual root while this manager's publication lease is
+        // held, before another cancellation/progress callback can replace it.
+        var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = publication });
+        defer artifacts.deinit();
+        artifacts.verification_cache = &self.verified_artifacts;
         try control.check();
         self.lockLoadedModels();
         const backend_snapshot = self.session_manager;
@@ -5400,6 +5405,7 @@ pub const ModelManager = struct {
             .admission_enabled = resources.host.session_loading.admission_enabled,
             .expected_publication = publication,
             .verification_cache = &self.verified_artifacts,
+            .borrowed_artifacts = &artifacts,
         }, control);
     }
 
@@ -15464,7 +15470,7 @@ test "model selection direct ONNX artifacts share directory data and tokenizer c
 test "model selection chunk planning rejects root replacement during construction" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    for ([_]bool{ false, true }) |managed_model| for ([_]bool{ false, true }) |late_replacement| {
+    for ([_]bool{ false, true }) |managed_model| for ([_]?usize{ 2, 3, null }) |replacement_check| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         for ([_][]const u8{ "model", "replacement" }) |name| {
@@ -15497,9 +15503,13 @@ test "model selection chunk planning rejects root replacement during constructio
         // same checkpoint after parsing and retaining tokenizer admission.
         var baseline = try manager.loadChunkPlanningAssets(root, io, .{ .ptr = &probe, .check_fn = Probe.check });
         baseline.deinit();
-        probe.switch_at = if (late_replacement) probe.checks else 3;
+        probe.switch_at = replacement_check orelse probe.checks;
         probe.checks = 0;
-        try std.testing.expectError(error.ModelArtifactsChanging, manager.loadChunkPlanningAssets(root, io, .{ .ptr = &probe, .check_fn = Probe.check }));
+        if (manager.loadChunkPlanningAssets(root, io, .{ .ptr = &probe, .check_fn = Probe.check })) |returned| {
+            var unexpected = returned;
+            unexpected.deinit();
+            return error.TestExpectedError;
+        } else |err| try std.testing.expectEqual(error.ModelArtifactsChanging, err);
         try std.testing.expect(probe.checks >= probe.switch_at.?);
         try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
     };

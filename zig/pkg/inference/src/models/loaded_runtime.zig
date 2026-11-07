@@ -635,7 +635,7 @@ pub const Runtime = struct {
                 },
                 .preserve_inline_specials = if (sp_tok) |sp| sp.preserve_inline_specials_after_literal_bos else false,
             } else null,
-            .embedding_identity = if (embedding_snapshot) |snapshot| eg2_identity.forBackend(snapshot.digest, session.backend()) else null,
+            .embedding_identity = if (embedding_snapshot) |snapshot| embeddingIdentityForSession(snapshot.digest, session) else null,
             .embedding_validation = if (embedding_snapshot) |snapshot| .{ .value = snapshot } else null,
             .manifest = man,
             .hf_tok = hf_tok,
@@ -933,7 +933,6 @@ pub const Runtime = struct {
         const mutable = @constCast(self);
         try control.check();
         const validation = if (mutable.embedding_validation) |*value| value else return;
-        const identity = @import("../models/embedding_gemma2_identity.zig");
         const snapshot = validation.refresh(self.allocator, self.executor_io orelse std.Options.debug_io, self.model_dir, self.manifest.safetensors_path.?, control) catch |err| {
             // An unstable filesystem snapshot does not prove this loaded
             // runtime is stale. Preserve it and retry publication instead of
@@ -947,7 +946,7 @@ pub const Runtime = struct {
                 },
             }
         };
-        const digest = identity.forBackend(snapshot.digest, self.session.backend());
+        const digest = embeddingIdentityForSession(snapshot.digest, self.session);
         if (self.embedding_identity) |loaded| if (std.mem.eql(u8, &loaded, &digest)) return;
         // Active handles retain rejected assets until they unwind; later
         // calls reload instead of reusing a permanently stale generation.
@@ -2321,6 +2320,9 @@ pub fn embeddingPlanningBackend(manager: backends.SessionManager) backends.Backe
 /// A metadata-only planning snapshot uses the same tokenizer resource service
 /// as a full model load. No backend or driver is constructed here.
 pub const PlanningPreparation = struct {
+    /// Synchronous caller-owned root captured under its publication lease.
+    /// The returned planning assets retain no pointer to this owner.
+    borrowed_artifacts: ?*PublishedArtifacts = null,
     expected_publication: ?[32]u8 = null,
     verification_cache: ?*@import("../registry/published_artifacts.zig").VerificationCache = null,
     backend_snapshot: backends.SessionManager,
@@ -2333,20 +2335,29 @@ pub fn loadPlanningAssets(allocator: std.mem.Allocator, model_dir: []const u8, i
     try control.check();
     var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, io, model_dir);
     defer publication_lease.deinit(io);
+    var owned_artifacts: ?PublishedArtifacts = if (preparation.borrowed_artifacts == null)
+        try PublishedArtifacts.init(allocator, io, model_dir, if (preparation.expected_publication) |publication| .{ .publication = publication } else null)
+    else
+        null;
+    defer if (owned_artifacts) |*owned| owned.deinit();
+    const artifacts = preparation.borrowed_artifacts orelse &owned_artifacts.?;
+    if (!std.mem.eql(u8, artifacts.root, model_dir) or
+        (preparation.expected_publication != null and !std.meta.eql(preparation.expected_publication, artifacts.publication))) return error.ModelArtifactsChanging;
+    // Verify the original directory identity before loading any manifest from
+    // its name. A newly parsed replacement cannot become its own authority.
+    try artifacts.verify();
     var man = try manifest_mod.loadFromDir(allocator, model_dir);
     errdefer man.deinit();
-    if (preparation.expected_publication != null and !std.meta.eql(preparation.expected_publication, man.managed_publication)) return error.ModelArtifactsChanging;
-    var artifacts = try PublishedArtifacts.init(allocator, io, model_dir, .{ .publication = man.managed_publication });
-    defer artifacts.deinit();
-    artifacts.verification_cache = preparation.verification_cache;
-    var proof = session_loader.ComponentConstruction.borrowingUnderLease(io, &artifacts);
+    if (!std.meta.eql(artifacts.publication, man.managed_publication)) return error.ModelArtifactsChanging;
+    if (owned_artifacts != null) artifacts.verification_cache = preparation.verification_cache;
+    var proof = session_loader.ComponentConstruction.borrowingUnderLease(io, artifacts);
     defer proof.deinit();
     var bound = try session_loader.BoundModelSource.init(&proof, model_dir, @import("model_source.zig").ModelSource.kindForPath(model_dir), &man, null);
     defer bound.deinit();
-    const revision = try modelIdentityWithArtifacts(allocator, preparation.identity_io orelse return error.MissingIoRuntime, model_dir, man, &artifacts);
+    const revision = try modelIdentityWithArtifacts(allocator, preparation.identity_io orelse return error.MissingIoRuntime, model_dir, man, artifacts);
     const planning = try chunkPlanningSnapshotWithControl(allocator, io, man, revision, control);
-    const kind = try tokenizer_loader.tokenizerKindWithArtifacts(man, &artifacts, tokenizer_loader.tokenizerGemmaCompat(man, model_dir));
-    const plan = try @import("load_plan.zig").tokenizerLoadAdmissionPlanWithArtifacts(allocator, model_dir, &man, kind, &artifacts);
+    const kind = try tokenizer_loader.tokenizerKindWithArtifacts(man, artifacts, tokenizer_loader.tokenizerGemmaCompat(man, model_dir));
+    const plan = try @import("load_plan.zig").tokenizerLoadAdmissionPlanWithArtifacts(allocator, model_dir, &man, kind, artifacts);
     var lease = if (preparation.tokenizer_admission) |service| try service.reserve(plan) else if (preparation.admission_enabled) return error.MissingTokenizerAdmissionService else null;
     errdefer if (lease) |*active| active.release();
     var hf: ?*hf_tokenizer.HfTokenizer = null;
@@ -2357,7 +2368,7 @@ pub fn loadPlanningAssets(allocator: std.mem.Allocator, model_dir: []const u8, i
         allocator.destroy(tok);
     };
     const parsed_tokenizer = try tokenizer_loader.loadSelected(allocator, model_dir, &man, kind, .{
-        .artifacts = &artifacts,
+        .artifacts = artifacts,
         .cache = preparation.tokenizer_options.cache,
         .parallel = preparation.tokenizer_options.parallel,
     });
@@ -2584,4 +2595,53 @@ pub fn loadNativeWhisperPrompt(allocator: std.mem.Allocator, admission_service: 
         (cache.decode.suppress_tokens.len + cache.decode.begin_suppress_tokens.len) * @sizeOf(i32);
     if (admission) |*lease| try lease.retain(.{ .host_weight_bytes = resident });
     return .{ .cache = cache, .admission = admission };
+}
+
+test "metadata planning borrows exact root authority and owns its returned assets" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try writeRuntimeConstructionFixture(temp.dir);
+    try temp.dir.createDirPath(io, "foreign");
+    try temp.dir.writeFile(io, .{ .sub_path = "foreign/config.json", .data = "invalid manifest must not be read" });
+    const directory = try temp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(directory);
+    const foreign = try temp.dir.realPathFileAlloc(io, "foreign", a);
+    defer a.free(foreign);
+    var artifacts = try PublishedArtifacts.init(a, io, directory, null);
+    var artifacts_live = true;
+    defer if (artifacts_live) artifacts.deinit();
+    const preparation = PlanningPreparation{
+        .borrowed_artifacts = &artifacts,
+        .backend_snapshot = .{ .allocator = a, .preferred_backends = &.{.native} },
+        .identity_io = io,
+    };
+    try std.testing.expectError(error.ModelArtifactsChanging, loadPlanningAssets(a, foreign, io, preparation, .{}));
+    try artifacts.verify();
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var canceled = preparation;
+    canceled.borrowed_artifacts = @ptrFromInt(16);
+    try std.testing.expectError(error.Cancelled, loadPlanningAssets(a, "/missing-cancelled-planning-root", io, canceled, .{ .check_fn = Cancel.check }));
+    var assets = try loadPlanningAssets(a, directory, io, preparation, .{});
+    defer assets.deinit();
+    artifacts.deinit();
+    artifacts_live = false;
+    try assets.verify();
+    const ids = try assets.tokenizer().encode(a, "hello");
+    defer a.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{1}, ids);
+}
+
+/// Publication and later validation use the actual cold-selected arithmetic.
+/// Planning before session construction remains prospective; it cannot claim
+/// an available vendor or publish an unavailable BF16 runtime identity.
+fn embeddingIdentityForSession(artifact_identity: [64]u8, session: backends.Session) [64]u8 {
+    if (session.backend() == .cuda) if (session_factory.getEmbeddingGemma2CudaPolicy(session)) |policy|
+        return eg2_identity.forCudaPolicy(artifact_identity, policy);
+    return eg2_identity.forBackend(artifact_identity, session.backend());
 }

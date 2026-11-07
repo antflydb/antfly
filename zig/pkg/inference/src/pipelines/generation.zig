@@ -15404,8 +15404,10 @@ fn generationRequestFinishCase(a: std.mem.Allocator) !void {
     defer model.deinit(a);
     const decoder_fixture = @import("../execution/testing/decoder.zig");
     try decoder_fixture.populate(&model.store);
+    // Both decoder output IDs must produce text so streaming cancellation is
+    // actually exercised. Unknown and padding IDs lie outside its two-token output.
     const tokenizer_json =
-        \\{"model":{"type":"WordPiece","unk_token":"[UNK]","continuing_subword_prefix":"##","vocab":{"[UNK]":0,"hello":1}},"pre_tokenizer":{"type":"Whitespace"},"decoder":{"type":"WordPiece","prefix":"##","cleanup":false},"added_tokens":[{"id":0,"content":"[UNK]","special":true}]}
+        \\{"model":{"type":"WordPiece","unk_token":"[UNK]","continuing_subword_prefix":"##","vocab":{"world":0,"hello":1,"[UNK]":2,"[PAD]":3}},"pre_tokenizer":{"type":"Whitespace"},"decoder":{"type":"WordPiece","prefix":"##","cleanup":false},"added_tokens":[{"id":2,"content":"[UNK]","special":true},{"id":3,"content":"[PAD]","special":true}]}
     ;
     var tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(a, tokenizer_json);
     defer tokenizer.deinitSelf();
@@ -15420,6 +15422,7 @@ fn generationRequestFinishCase(a: std.mem.Allocator) !void {
     var reference = try eager.generate(&.{.{ .role = "user", .content = "hello" }}, .{ .max_tokens = 2, .temperature = 0 });
     defer reference.deinit();
     try std.testing.expectEqual(@as(usize, 2), reference.token_ids.?.len);
+    try std.testing.expect(reference.text.len > 0);
     const Stop = struct {
         calls: usize = 0,
         fn stream(raw: *anyopaque, _: []const u8) bool {
@@ -15453,7 +15456,7 @@ fn generationRequestFinishCase(a: std.mem.Allocator) !void {
                 try std.testing.expectEqualStrings("length", output.finish_reason);
                 try std.testing.expectEqualSlices(i32, reference.token_ids.?, output.token_ids.?);
             } else try std.testing.expectEqualStrings("stop", output.finish_reason);
-            if (mode == .stream_stop) try std.testing.expect(stop.calls > 0);
+            if (mode == .stream_stop) try std.testing.expectEqual(@as(usize, 1), stop.calls);
         } else |err| {
             const expected: anyerror = if (mode == .cancel) error.Cancelled else error.InjectedGenerationRequestFailure;
             if ((mode != .failure and mode != .cancel) or err != expected) return err;

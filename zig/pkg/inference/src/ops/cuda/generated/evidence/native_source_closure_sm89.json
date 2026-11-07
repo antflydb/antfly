@@ -1,7 +1,7 @@
 {
   "schema": "antfly.cuda_program_closure_equivalence.v1",
   "historical_image_sha256": "54ad80e2ad5bf16b0f644d5ebeb68da74afa8909c6cb707107837fd0ddec1130",
-  "current_image_sha256": "a325bd419cc112b23180f60c22b85d0381552277ece472bff3cf695773970858",
+  "current_image_sha256": "c92d70b1e92c7151ce4cffeac7dde8397f90f170806ee406d663059ce7f115fe",
   "historical_git_commit": "95ff41c1ac90b82eb7ee6e97ebf6321864a4b213",
   "programs": [
     {

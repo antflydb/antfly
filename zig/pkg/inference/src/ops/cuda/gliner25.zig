@@ -1967,7 +1967,7 @@ test "CUDA resident training cuBLAS runtime selection fails closed" {
     try device.backend.enableResidentTrainingBlas();
     const version = device.backend.training_blas.?.version;
     try std.testing.expect(version > 0);
-    const Blas = @import("libraries.zig").CublasF32;
+    const Blas = @import("libraries.zig").Cublas;
     const configured = @import("antfly_platform").env.getenv("ANTFLY_INFERENCE_CUDA_TRAINING_CUBLAS_LIBRARY");
     var explicit = try Blas.initWithLibrary(device.backend.ctx.stream, configured);
     defer explicit.deinit();

@@ -780,11 +780,13 @@ const ProjectorWeights = struct {
     }
 
     fn releaseCompletedNativeLayer(self: *ProjectorWeights) void {
-        // Native HF execution is synchronous and the returned layer output
-        // owns its storage. Keeping every widened layer weight would turn
-        // request scratch into a second F32 copy of the entire media tower.
-        // Metal retains identity-based slots; GGUF keeps its existing cache.
-        if (self.gguf == null and self.cb.kind() == .native) self.deinit();
+        // Native execution is synchronous and the returned layer output owns
+        // its storage, for both resident HF weights and request-owned GGUF CT
+        // copies. Retaining completed layers would make request scratch a
+        // second F32 copy of the whole tower. Held aliases keep their own refs;
+        // the original model-owned store and mapping stay alive independently.
+        // Asynchronous backends retain their existing identity-based cache.
+        if (self.cb.kind() == .native) self.deinit();
     }
 };
 
@@ -9854,4 +9856,110 @@ fn checkPromptImageInputOwnership(a: std.mem.Allocator) !void {
 test "typed prompt image input preserves actual host resident phase lifetimes and allocation failure ownership" {
     try checkPromptImageInputOwnership(std.testing.allocator);
     try platform.allocator.checkAllAllocationFailures(std.testing.allocator, checkPromptImageInputOwnership, .{});
+}
+
+fn nativeGgufLayerRetirementCase(allocator: std.mem.Allocator, projector: *ProjectorStore) !void {
+    const native_compute = @import("../ops/native_compute.zig");
+    var native_weights = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer native_compute.deinitPrefetchQueue(&native_weights);
+    var compute = native_compute.NativeCompute.init(allocator, &native_weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var weights = ProjectorWeights.init(&cb, allocator, projector.gguf, projector);
+    defer weights.deinit();
+    const name = "a.blk.0.ffn_up.weight";
+    const first = try weights.cachedWeightCt(name);
+    const alias = (try cb.retainImmutableTensor(first, allocator)) orelse return error.TestUnexpectedResult;
+    defer cb.free(alias);
+    const held_output = try cb.add(first, first);
+    defer cb.free(held_output);
+    try std.testing.expectEqual(@as(usize, 1), weights.entries.count());
+
+    // A non-Native receiver never enters the synchronous retirement path.
+    // No numerical callback or CUDA opaque cast runs through this canary.
+    const Async = struct {
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .cuda;
+        }
+    };
+    var table = native_compute.vtable_impl;
+    table.backendKind = Async.kind;
+    const asynchronous = ComputeBackend{ .ptr = &compute, .vtable = &table };
+    {
+        const original = weights.cb;
+        defer weights.cb = original;
+        weights.cb = &asynchronous;
+        weights.releaseCompletedNativeLayer();
+        try std.testing.expectEqual(@as(usize, 1), weights.entries.count());
+    }
+
+    // The completed layer's output and independently retained source alias
+    // both remain valid after the cache drops its own references.
+    weights.releaseCompletedNativeLayer();
+    try std.testing.expectEqual(@as(usize, 0), weights.entries.count());
+    const actual = try cb.toFloat32(held_output, allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 10, 12 }, actual);
+    const aliased = try cb.toFloat32(alias, allocator);
+    defer allocator.free(aliased);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 6 }, aliased);
+    for (0..12) |_| {
+        const reloaded = try weights.cachedWeightCt(name);
+        try std.testing.expect(first != reloaded);
+        const result = try cb.add(reloaded, reloaded);
+        defer cb.free(result);
+        weights.releaseCompletedNativeLayer();
+        try std.testing.expectEqual(@as(usize, 0), weights.entries.count());
+        const values = try cb.toFloat32(result, allocator);
+        defer allocator.free(values);
+        try std.testing.expectEqualSlices(f32, &.{ 10, 12 }, values);
+    }
+
+    // Cancellation before a layer completes retains the ordinary error
+    // unwind, rather than pretending the successful-layer boundary ran.
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+        fn run(a: std.mem.Allocator, backend: *const ComputeBackend, owner: *ProjectorStore) !void {
+            var pending = ProjectorWeights.init(backend, a, owner.gguf, owner);
+            defer pending.deinit();
+            _ = try pending.cachedWeightCt("a.blk.0.ffn_up.weight");
+            var canceled = backend.*;
+            canceled.execution_control = .{ .check_fn = check };
+            try canceled.checkExecutionControl();
+        }
+    };
+    var saw_cancellation = false;
+    Cancel.run(allocator, &cb, projector) catch |err| switch (err) {
+        error.Cancelled => {
+            saw_cancellation = true;
+        },
+        else => return err,
+    };
+    try std.testing.expect(saw_cancellation);
+}
+
+test "native GGUF completed layer cache releases copies and preserves held outputs" {
+    const a = std.testing.allocator;
+    var fixture = try tensor_store_mod.writeGemma4AudioProjectorFixture(a, "native-gguf-layer-retirement");
+    defer fixture.deinit(a);
+    const projector = try ProjectorStore.open(a, fixture.projector_path);
+    defer projector.close();
+    var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = 1024 * 1024 };
+    try nativeGgufLayerRetirementCase(bounded.allocator(), projector);
+    try std.testing.expectEqual(@as(usize, 0), bounded.live);
+    try std.testing.expect(!bounded.denied);
+    var source = try loadTensorF32(projector.gguf, "a.blk.0.ffn_up.weight");
+    defer source.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 5, 6 }, source.data);
+}
+
+test "native GGUF layer retirement survives every request allocation failure" {
+    const a = std.testing.allocator;
+    var fixture = try tensor_store_mod.writeGemma4AudioProjectorFixture(a, "native-gguf-layer-retirement-oom");
+    defer fixture.deinit(a);
+    const projector = try ProjectorStore.open(a, fixture.projector_path);
+    defer projector.close();
+    try std.testing.checkAllAllocationFailures(a, nativeGgufLayerRetirementCase, .{projector});
 }

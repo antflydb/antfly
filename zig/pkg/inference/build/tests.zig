@@ -50,8 +50,28 @@ pub fn create(ctx: Context) Suite {
     // retain its16 GiB reservation alongside the larger measured GPU bounds.
     const cuda_arm_linux = ctx.backend.enable_cuda and b.graph.host.result.os.tag == .linux and
         b.graph.host.result.cpu.arch == .aarch64;
+    // Exact unfiltered native ARM Linux CUDA+PJRT ReleaseFast, unstripped
+    // A suite peaked at 58,795,728,896 bytes. The outer build returned zero
+    // despite a declaration failure at 28 GiB; keep that diagnostic as a
+    // failure. Reserve 25% headroom rounded up to 64 MiB (70,144 MiB).
+    // Do not extrapolate to filtered/runtime-filtered, stripped, CPU-only,
+    // cross-target, other backend combinations or other optimization modes.
+    const baseline_cpu = switch (ctx.target.query.cpu_model) {
+        .baseline => true,
+        else => false,
+    };
+    const measured_cuda_pjrt_arm_linux = !ctx.strip and ctx.optimize == .fast and
+        ctx.backend.enable_cuda and ctx.backend.enable_pjrt and !ctx.backend.enable_metal and
+        selected_test_filters.len == 0 and !ctx.runtime_test_filter and baseline_cpu and
+        b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and
+        ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and ctx.target.result.abi == .gnu and
+        ctx.target.query.cpu_features_add.isEmpty() and ctx.target.query.cpu_features_sub.isEmpty();
+    const existing_test_compile_max_rss: usize = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) 16 * 1024 * 1024 * 1024 else if (native_cpu_macos) @as(usize, if (ctx.optimize == .debug) 12_672 else 12_032) * 1024 * 1024 else @as(usize, if (cuda_arm_linux) 28 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 20 else 9) * 1024 * 1024 * 1024;
+    const default_test_compile_memory_mb: usize = if (measured_cuda_pjrt_arm_linux) 70144 else existing_test_compile_max_rss / (1024 * 1024);
+    const test_compile_memory_mb = b.option(usize, "inference-test-compile-memory-mb", "Declared inference test compiler memory bound in MiB") orelse default_test_compile_memory_mb;
+    if (test_compile_memory_mb == 0) @panic("inference test compiler memory bound must be positive");
     const tests = b.addTest(.{
-        .max_rss = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) 16 * 1024 * 1024 * 1024 else if (native_cpu_macos) @as(usize, if (ctx.optimize == .debug) 12_672 else 12_032) * 1024 * 1024 else @as(usize, if (cuda_arm_linux) 28 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 20 else 9) * 1024 * 1024 * 1024,
+        .max_rss = std.math.mul(usize, test_compile_memory_mb, 1024 * 1024) catch @panic("inference test compiler memory bound overflows"),
 
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),

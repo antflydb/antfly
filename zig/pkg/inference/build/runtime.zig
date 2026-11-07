@@ -626,7 +626,9 @@ pub fn create(config: Config) Graph {
 
 pub const StandaloneCompileOptions = struct {
     strip: bool,
-    has_accelerator: bool,
+    enable_metal: bool,
+    enable_cuda: bool,
+    enable_pjrt: bool,
 };
 
 pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, inference_root: []const u8, link_libc: bool, options: StandaloneCompileOptions) *std.Build.Step.Compile {
@@ -636,7 +638,7 @@ pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.Re
         .baseline => true,
         else => false,
     };
-    const measured_release = !options.strip and !options.has_accelerator and baseline_cpu and optimize == .fast;
+    const measured_release = !options.strip and !(options.enable_metal or options.enable_cuda or options.enable_pjrt) and baseline_cpu and optimize == .fast;
     const darwin_linux_release = measured_release and b.graph.host.result.os.tag == .macos and
         b.graph.host.result.cpu.arch == .aarch64 and target.result.os.tag == .linux and target.result.cpu.arch == .x86_64 and
         target.result.abi == .gnu;
@@ -645,7 +647,24 @@ pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.Re
     const native_linux_release = measured_release and b.graph.host.result.os.tag == .linux and
         b.graph.host.result.cpu.arch == .x86_64 and target.result.os.tag == .linux and
         target.result.cpu.arch == .x86_64 and target.result.abi == .gnu;
-    const default_compile_memory_mb: usize = if (darwin_linux_release) 14976 else if (native_linux_release) 12800 else if (target.result.os.tag == .macos) 14 * 1024 else 7 * 1024;
+    // Exact native Linux aarch64 CUDA+PJRT ReleaseFast, unstripped CLI:
+    // A measured 35,198,545,920 bytes (declaration-only failure at 32 GiB).
+    // Reserve 25% headroom rounded up to 64 MiB; do not extrapolate to other
+    // backend combinations, CPU models, cross targets, stripped or debug modes.
+    const measured_cuda_pjrt_arm_linux = !options.strip and optimize == .fast and
+        options.enable_cuda and options.enable_pjrt and !options.enable_metal and baseline_cpu and
+        b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and
+        target.result.os.tag == .linux and target.result.cpu.arch == .aarch64 and target.result.abi == .gnu and
+        target.query.cpu_features_add.isEmpty() and target.query.cpu_features_sub.isEmpty();
+    // The exact native Darwin aarch64 CUDA+Metal+PJRT ReleaseFast,
+    // unstripped A CLI completed cleanly under a 24 GiB declaration. Its
+    // displayed MaxRSS is rounded, so use that declared upper bound rather
+    // than inventing byte precision; 25% headroom gives exactly 30 GiB.
+    const measured_all_accelerators_arm_macos = !options.strip and optimize == .fast and
+        options.enable_cuda and options.enable_metal and options.enable_pjrt and target.query.isNative() and
+        b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+        target.result.os.tag == .macos and target.result.cpu.arch == .aarch64;
+    const default_compile_memory_mb: usize = if (measured_all_accelerators_arm_macos) 30720 else if (measured_cuda_pjrt_arm_linux) 41984 else if (darwin_linux_release) 14976 else if (native_linux_release) 12800 else if (target.result.os.tag == .macos) 14 * 1024 else 7 * 1024;
     const compile_memory_mb = b.option(usize, "inference-compile-memory-mb", "Declared standalone inference compiler memory bound in MiB") orelse
         default_compile_memory_mb;
     if (compile_memory_mb == 0) @panic("inference compiler memory bound must be positive");

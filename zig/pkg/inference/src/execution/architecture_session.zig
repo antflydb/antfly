@@ -15065,8 +15065,17 @@ pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
         }
         pub fn retire(self: *@This(), current: @import("cleanup_context.zig").Context) !void {
             if (self.program) |program| {
+                // Observe this invocation-owned program only. PAGE state
+                // retirement destroys it BEFORE the later CUDA interval drain.
+                // Copy its existing counters without an SDK query or saved B;
+                // publish only after teardown validates the actual current B.
+                const profile = cudaOpProfileLoggingEnabled();
+                const dispatches = if (profile) program.dispatches else 0;
+                const busy_declines = if (profile) program.busy_declines else 0;
+                const owner_id = if (profile) @intFromPtr(program) else 0;
                 try program.destroyWithCleanup(current);
                 self.program = null;
+                if (profile) std.log.info("physical_program_profile: role=dense_ffn scope=invocation owner={x} dispatches={d} busy_declines={d} status=retired", .{ owner_id, dispatches, busy_declines });
             }
         }
         /// Caller has retired its program and released every actual lane.
@@ -19071,6 +19080,7 @@ fn nativeCacheActualStageCase(a: std.mem.Allocator, cancel_during_fund: bool, mo
         [_][]const u8{ "audio_tower.subsample_conv_projection.layer0.conv.weight", "audio_tower.subsample_conv_projection.layer0.norm.weight" };
     const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
     defer domain.release();
+    defer std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot()) catch @panic("Native Stage source/cache quota leaked");
     const pin = domain.pin();
     defer pin.release();
     const actual = try a.create(ArchSession);
@@ -19170,6 +19180,7 @@ fn nativeCacheActualStageCase(a: std.mem.Allocator, cancel_during_fund: bool, mo
         try std.testing.expect(stage.epoch() != null and waiter.acquired);
         try std.testing.expect(!try stage.epoch().?.isSealed());
         probe.armed = true;
+        const before_audio_getters = pin.controller().snapshot();
         if (cancel_during_fund) {
             const attempted = cb.getWeight(names[0]);
             if (attempted) |unexpected| {
@@ -19204,7 +19215,15 @@ fn nativeCacheActualStageCase(a: std.mem.Allocator, cancel_during_fund: bool, mo
             try std.testing.expect(!compute.mirror_source_claim and !compute.mirror_cache_receiving);
         }
         if (mode == .audio_denied) {
+            // The actual one-byte cache ceiling remains unchanged. All three
+            // public getters used the original owned conversion, with no
+            // prepared map/payload or extra quota/source charge published.
+            try std.testing.expectEqual(@as(usize, 1), data.tier_cache.?.budget.host_limit_bytes);
             try std.testing.expectEqual(@as(u32, 0), data.embeddinggemma2_f32_cache.count());
+            try std.testing.expectEqual(@as(usize, 0), data.embeddinggemma2_f32_prepared_map_bytes);
+            try std.testing.expectEqual(@as(usize, 0), data.tier_cache.?.host_bytes);
+            try std.testing.expectEqual(@as(usize, 0), probe.panel_calls);
+            try std.testing.expectEqualDeep(before_audio_getters, pin.controller().snapshot());
         } else {
             const cached = data.embeddinggemma2_f32_cache.get(names[0]) orelse return error.MissingColdAudioMirror;
             try std.testing.expect(cached.prepared_physical_bytes > cached.bytes);

@@ -1312,7 +1312,7 @@ test "boundary qualification range matching has no saturating or overflow accept
     try std.testing.expectError(error.GlinerBoundaryDocumentBytesLimitExceeded, matchEntries(&.{row}, row.identity, .native, row.features, observed));
 }
 
-test "boundary qualification Transformers wrapper has exactly the original fp32 profiles" {
+test "boundary qualification Transformers wrapper preserves original fp32 profiles without base-only grants" {
     const identity = fastino_gliner25_base_v1_transformers;
     const bytes = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(std.testing.allocator, "models/base/config_transformers.json");
     defer std.testing.allocator.free(bytes);
@@ -1323,10 +1323,22 @@ test "boundary qualification Transformers wrapper has exactly the original fp32 
     try std.testing.expect(hasQualifiedIdentity(identity));
     var original_count: usize = 0;
     var wrapper_count: usize = 0;
+    var base_only_count: usize = 0;
     for (publishedProfiles()) |entry| {
         const original = equalIdentity(entry.identity, fastino_gliner25_base_v1);
         const wrapper = equalIdentity(entry.identity, identity);
         if (!original and !wrapper) continue;
+        if (original and entry.features.contains(.overlap_allow)) {
+            // This separately qualified extension has no wrapper reference.
+            // Authenticate its exact grant without broadening wrapper support.
+            try std.testing.expect(entry.backend == .native or entry.backend == .metal);
+            try std.testing.expect(std.meta.eql(entry.features, base_overlap_allow_features));
+            try std.testing.expect(std.meta.eql(entry.lengths, fastino_gliner25_base_v1_lengths));
+            try require(entry.identity, entry.backend, entry.features, entry.lengths);
+            try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, entry.backend, entry.features, entry.lengths));
+            base_only_count += 1;
+            continue;
+        }
         if (original) original_count += 1 else wrapper_count += 1;
         const peer_identity = if (original) identity else fastino_gliner25_base_v1;
         var exact_peers: usize = 0;
@@ -1343,6 +1355,7 @@ test "boundary qualification Transformers wrapper has exactly the original fp32 
     // Metal batch profiles all authenticate the same original FP32 identity.
     try std.testing.expect(original_count > 0);
     try std.testing.expectEqual(original_count, wrapper_count);
+    try std.testing.expectEqual(base_overlap_allow_entries.len, base_only_count);
     for (0..4) |index| {
         var changed = identity;
         changed.sidecars[index].sha256[0] = 'f';

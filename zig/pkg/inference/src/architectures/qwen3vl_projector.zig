@@ -1878,7 +1878,7 @@ fn encodePreparedSingleImage(
     errdefer allocator.free(owned_deepstack);
     if (profile) {
         std.debug.print(
-            "qwen3vl-projector-profile: patches={d} merged_tokens={d} decode_ms={d:.3} preprocess_ms={d:.3} patchify_ms={d:.3} patch_embed_ms={d:.3} positions_ms={d:.3} blocks_ms={d:.3} deepstack_ms={d:.3} final_merge_ms={d:.3}\n",
+            "qwen3vl-projector-profile: patches={d} merged_tokens={d} decode_ms={d:.3} preprocess_ms={d:.3} patchify_ms={d:.3} patch_embed_ms={d:.3} positions_ms={d:.3} blocks_ms={d:.3} deepstack_ms={d:.3} final_merge_ms={d:.3} feature_publication={s}\n",
             .{
                 geometry.patchCount(),
                 geometry.tokenCount(),
@@ -1890,6 +1890,7 @@ fn encodePreparedSingleImage(
                 @as(f64, @floatFromInt(blocks_ns)) / std.time.ns_per_ms,
                 @as(f64, @floatFromInt(deepstack_ns)) / std.time.ns_per_ms,
                 @as(f64, @floatFromInt(final_merge_ns)) / std.time.ns_per_ms,
+                if (device_output != null) "device_admitted" else "host",
             },
         );
     }
