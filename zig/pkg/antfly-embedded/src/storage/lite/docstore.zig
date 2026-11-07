@@ -4112,7 +4112,18 @@ pub const Txn = struct {
                 self.writer_reserved = false;
             }
         }
-        const wal_trace_scope = wal_trace.scope(.primary_commit);
+        // `scopeDefault`, not `scope`: a caller that already pushed its own
+        // more specific tag before reaching this generic commit helper
+        // (e.g. `db.zig`'s `PersistReplayProgress.run` pushing `.progress`,
+        // or `index_manager.zig`'s dense-mapping commit pushing
+        // `.hbc_metadata_commit`) must keep attribution for this call's
+        // actual sync -- otherwise this fallback push always shadowed it,
+        // since `currentStage()` returns the innermost tag. See
+        // `write_amplification_trace.zig`'s `scopeDefault` doc comment.
+        // Previously this was unconditional `scope(.primary_commit)`, which
+        // made `.progress` read zero syncs in every write-amplification
+        // mode (full_text/sparse/dense/primary alike), not just dense's.
+        const wal_trace_scope = wal_trace.scopeDefault(.primary_commit);
         defer wal_trace_scope.end();
         // Enqueue, then release the writer slot, and drive the coordinator
         // only in `StagedCommit.wait()` (WS2/WS3). The slot only serializes
