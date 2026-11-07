@@ -319,6 +319,10 @@ pub const IndexBackendOptions = struct {
     dense_storage_backend: hbc_mod.StorageBackend = .lsm,
     sparse_backend: sparse_mod.SparseBackend = .lsm,
     graph_reverse_backend: graph_mod.ReverseBackend = .lsm,
+    /// Required when `graph_reverse_backend == .native_catalog` (Lite only).
+    /// See `graph/graph.zig:NativeCatalogSink` and `storage/
+    /// native_catalog_backend.zig:Sink`.
+    graph_native_catalog_sink: ?graph_mod.NativeCatalogSink = null,
     text_lsm_storage: ?lsm_backend_mod.Storage = null,
     dense_lsm_storage: ?lsm_backend_mod.Storage = null,
     /// Raw durable file service for table-level native vector generations.
@@ -533,6 +537,7 @@ pub fn indexBackendOptionsForPrimary(
         .dense_storage_backend = if (dense_storage_override) overrides.dense_storage_backend else denseStorageBackendForPrimary(kind),
         .sparse_backend = if (sparse_storage_override) overrides.sparse_backend else sparseBackendForPrimary(kind),
         .graph_reverse_backend = if (graph_storage_override) overrides.graph_reverse_backend else graphReverseBackendForPrimary(kind),
+        .graph_native_catalog_sink = overrides.graph_native_catalog_sink,
         .text_lsm_storage = overrides.text_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .dense_lsm_storage = overrides.dense_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .vector_block_storage = overrides.vector_block_storage orelse if (kind == .lsm) primary_lsm_storage else null,

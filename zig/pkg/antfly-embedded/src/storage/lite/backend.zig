@@ -308,7 +308,14 @@ pub const Handle = struct {
                 opts.index_backends.text_main_native_catalog_sink = self.native_catalog_sink.?.sink();
                 opts.index_backends.dense_storage_backend = .lsm;
                 opts.index_backends.sparse_backend = .lsm;
-                opts.index_backends.graph_reverse_backend = .lsm;
+                // Graph forward/reverse adjacency and metadata are
+                // native-catalog-backed too (same shared sink, scope
+                // disambiguated by each store's own path): see
+                // graph/graph.zig's `openEdgeStore` and
+                // docs/design/lite-performance/lite-single-commit-write-path.md
+                // §3.3. Dense/sparse indexes are unaffected and stay on `.lsm`.
+                opts.index_backends.graph_reverse_backend = .native_catalog;
+                opts.index_backends.graph_native_catalog_sink = self.native_catalog_sink.?.sink();
                 opts.index_backends.text_lsm_storage = storage;
                 opts.index_backends.dense_lsm_storage = storage;
                 opts.index_backends.vector_block_storage = storage;
@@ -387,7 +394,12 @@ pub const Handle = struct {
         opts.index_backends.text_main_native_catalog_sink = self.native_catalog_sink.?.sink();
         opts.index_backends.dense_storage_backend = .lsm;
         opts.index_backends.sparse_backend = .lsm;
-        opts.index_backends.graph_reverse_backend = .lsm;
+        // See the root-namespace configureDbOpenOptions above: graph
+        // forward/reverse adjacency and metadata are native-catalog-backed
+        // here too, same shared sink, scope disambiguated by this
+        // namespace's own index paths.
+        opts.index_backends.graph_reverse_backend = .native_catalog;
+        opts.index_backends.graph_native_catalog_sink = self.native_catalog_sink.?.sink();
         opts.index_backends.text_lsm_storage = storage;
         opts.index_backends.dense_lsm_storage = storage;
         opts.index_backends.vector_block_storage = storage;
@@ -1193,7 +1205,8 @@ test "lite backend native engine creates and checks aflite file" {
     try std.testing.expect(db_opts.index_backends.text_main_native_catalog_sink != null);
     try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.dense_storage_backend), .lsm), db_opts.index_backends.dense_storage_backend);
     try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.sparse_backend), .lsm), db_opts.index_backends.sparse_backend);
-    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.graph_reverse_backend), .lsm), db_opts.index_backends.graph_reverse_backend);
+    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.graph_reverse_backend), .native_catalog), db_opts.index_backends.graph_reverse_backend);
+    try std.testing.expect(db_opts.index_backends.graph_native_catalog_sink != null);
     try std.testing.expect(db_opts.index_backends.text_lsm_storage != null);
     try std.testing.expect(db_opts.index_backends.dense_lsm_storage != null);
     try std.testing.expect(db_opts.index_backends.sparse_lsm_storage != null);

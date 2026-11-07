@@ -232,6 +232,125 @@ pub const Backend = struct {
         return try backend_erased.namespaceStoreFrom(allocator, self, backend_types.Namespace, identityNamespace);
     }
 
+    /// Flat (non-namespaced) view of this backend, bound to one fixed
+    /// `namespace`, for consumers that use `backend_erased.Store`/`Batch`
+    /// rather than `NamespaceStore` (graph's forward/reverse adjacency
+    /// stores -- see `graph/graph.zig`'s `openEdgeStore` -- which treat
+    /// their keyspace as entirely flat). Composes `NamespaceTxn` rather
+    /// than re-deriving its commit/clone-swap logic.
+    pub fn runtimeStore(self: *Backend, allocator: Allocator, namespace: backend_types.Namespace) !backend_erased.Store {
+        return try backend_erased.storeFrom(allocator, BoundStore{ .backend = self, .namespace = namespace });
+    }
+
+    /// Like `runtimeStore(...).beginWrite()`, but returns the concrete
+    /// (unerased) write handle instead of `backend_erased.WriteTxn`. For a
+    /// caller that needs to inspect this transaction's own staged
+    /// `Mutation` list before it commits (an inline publication building a
+    /// small, bounded mutation set to fold into an externally-owned native
+    /// transaction -- see `graph/graph.zig`'s `prepareInlineEdgePublication`,
+    /// mirroring `persistent.zig`'s `prepareInlineSegmentPublication`),
+    /// `backend_erased.Batch`'s vtable has no such accessor, so this bypasses
+    /// erasure entirely. The caller must `abort()` (never `commit()`) once
+    /// it has harvested what it needs -- this never talks to `sink`.
+    pub fn boundWrite(self: *Backend, namespace: backend_types.Namespace) !BoundTxn {
+        return .{ .inner = try NamespaceTxn.open(self, false), .namespace = namespace };
+    }
+
+    const BoundStore = struct {
+        backend: *Backend,
+        namespace: backend_types.Namespace,
+
+        pub fn capabilities(_: *@This()) backend_types.Capabilities {
+            return .{
+                .ordered_ranges = true,
+                .reverse_ranges = true,
+                .cursors = true,
+                .native_namespaces = false,
+                .write_batches = .atomic,
+                .single_writer = true,
+                .read_snapshots = .snapshot,
+            };
+        }
+
+        pub fn beginRead(self: *@This()) !BoundTxn {
+            return .{ .inner = try NamespaceTxn.open(self.backend, true), .namespace = self.namespace };
+        }
+
+        pub fn beginWrite(self: *@This()) !BoundTxn {
+            return .{ .inner = try NamespaceTxn.open(self.backend, false), .namespace = self.namespace };
+        }
+
+        pub fn beginBatch(self: *@This()) !BoundTxn {
+            return try self.beginWrite();
+        }
+
+        /// WS7/§3.2a: `.ride_along` marks this batch's eventual commit as
+        /// background work that must never force its own durability
+        /// barrier -- see `NamespaceTxn.setDurable`'s doc comment. Mirrors
+        /// `persistent.zig`'s direct `txn.setDurableHint(false)` call, but
+        /// applied before this handle is erased into `backend_erased.Batch`
+        /// (which has no generic durability-hint vtable slot today).
+        pub fn beginBatchWithOptions(self: *@This(), options: backend_types.BatchOptions) !BoundTxn {
+            var txn = try self.beginWrite();
+            if (options.durability == .ride_along) txn.setDurable(false);
+            return txn;
+        }
+    };
+
+    /// Namespace-bound write/read handle, composing `NamespaceTxn`. Backs
+    /// `BoundStore`'s `backend_erased.Store`/`Batch` erasure.
+    const BoundTxn = struct {
+        inner: NamespaceTxn,
+        namespace: backend_types.Namespace,
+
+        pub fn abort(self: *@This()) void {
+            self.inner.abort();
+        }
+
+        pub fn commit(self: *@This()) !void {
+            try self.inner.commit();
+        }
+
+        pub fn setDurable(self: *@This(), durable: bool) void {
+            self.inner.setDurable(durable);
+        }
+
+        // `anyerror`, not an inferred set: `graph/graph.zig`'s
+        // `prepareInlineEdgePublication` calls generic helpers
+        // (`readU64OrZero` and friends) directly against this concrete
+        // type, bypassing `backend_erased` erasure (whose own vtable
+        // function pointers are always `anyerror`-typed, which is why nothing
+        // else going through this file hits this). Those helpers' `catch
+        // |err| switch (err) { error.NotFound => ..., else => return err }`
+        // shape needs a widened set, or `NamespaceTxn.get`'s true inferred
+        // set (exactly `error{NotFound}`) makes the `else` prong
+        // unreachable -- a compile error, not just a style nit.
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            return try self.inner.get(self.namespace, key);
+        }
+
+        pub fn put(self: *@This(), key: []const u8, value: []const u8) anyerror!void {
+            try self.inner.put(self.namespace, key, value);
+        }
+
+        pub fn delete(self: *@This(), key: []const u8) anyerror!void {
+            try self.inner.delete(self.namespace, key);
+        }
+
+        pub fn openCursor(self: *@This()) !Cursor {
+            return Cursor.init(self.inner.allocator, self.inner.rc.?.state.tree, self.namespace);
+        }
+
+        /// This transaction's staged mutations so far, in call order --
+        /// valid only until the next `put`/`delete`/`abort`/`commit` call
+        /// (the arena backing their bytes is `self.inner`'s own). A
+        /// `boundWrite` caller harvesting these to fold into an externally
+        /// owned commit must deep-copy before calling `abort()`.
+        pub fn pendingMutations(self: *const @This()) []const Mutation {
+            return self.inner.pending.items;
+        }
+    };
+
     /// WS4 phase 2: bring this backend's in-memory read mirror in sync with
     /// `mutations` that an EXTERNAL native transaction already committed
     /// durably -- bypassing this backend's own `Sink.submit` entirely (see
@@ -827,4 +946,60 @@ test "native catalog backend applyExternallyCommittedMutations syncs the read mi
     defer read_final.abort();
     try std.testing.expectError(error.NotFound, read_final.get(.{ .name = "meta" }, "active-segment/1"));
     try std.testing.expectEqualStrings("bytes-1", try read_final.get(.{ .name = "segments" }, "seg:1"));
+}
+
+test "native catalog backend runtimeStore gives a flat (non-namespaced) erased Store" {
+    // graph/graph.zig's `openEdgeStore` uses this, not `runtimeNamespaceStore`:
+    // forward/reverse adjacency is a flat keyspace, one `Backend`/scope per
+    // store, with no namespace indirection.
+    const a = std.testing.allocator;
+    var test_sink = TestSink{ .allocator = a };
+    defer test_sink.deinit();
+
+    var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "graph:g:forward" });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+
+    try std.testing.expect(runtime.capabilities().cursors);
+
+    {
+        var batch = try runtime.beginBatch();
+        try batch.put("edge:a->b", "1.0");
+        try batch.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), test_sink.submit_calls);
+
+    var read = try runtime.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("1.0", try read.get("edge:a->b"));
+}
+
+test "native catalog backend boundWrite exposes pending mutations before commit, for an external fold-in" {
+    // The shape `graph/graph.zig`'s `prepareInlineEdgePublication` depends
+    // on: build up a transaction's puts, harvest its `pendingMutations()`
+    // (deep-copying before `abort()`, since the arena backing them dies
+    // with the transaction), and never call `commit()` -- this `Sink` must
+    // see zero submits for the harvested mutations to be foldable into a
+    // different, externally-owned native transaction instead.
+    const a = std.testing.allocator;
+    var test_sink = TestSink{ .allocator = a };
+    defer test_sink.deinit();
+
+    var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "graph:g:reverse" });
+    defer backend.close();
+
+    var txn = try backend.boundWrite(.{});
+    try txn.put("edge:b<-a", "1.0");
+    try txn.put("meta:edge_count", "1");
+
+    const pending = txn.pendingMutations();
+    try std.testing.expectEqual(@as(usize, 2), pending.len);
+    try std.testing.expectEqualStrings("edge:b<-a", pending[0].key);
+    try std.testing.expectEqualStrings("1.0", pending[0].value);
+    try std.testing.expectEqualStrings("meta:edge_count", pending[1].key);
+
+    txn.abort();
+    try std.testing.expectEqual(@as(usize, 0), test_sink.submit_calls);
+    try std.testing.expectEqual(@as(usize, 0), test_sink.entries.items.len);
 }

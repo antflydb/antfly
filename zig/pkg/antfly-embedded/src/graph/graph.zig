@@ -45,6 +45,13 @@ const internal_keys = @import("../storage/internal_keys.zig");
 const backfill_state_mod = @import("../storage/db/backfill_state.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
+const native_catalog_backend = @import("../storage/native_catalog_backend.zig");
+const wal_trace = @import("../storage/write_amplification_trace.zig");
+
+/// Lite-only durable sink for `.native_catalog` forward/reverse stores. See
+/// `storage/native_catalog_backend.zig:Sink` and `persistent.zig`'s own
+/// `NativeCatalogSink` alias, which this mirrors.
+pub const NativeCatalogSink = native_catalog_backend.Sink;
 
 // ============================================================================
 // Edge types
@@ -833,6 +840,9 @@ pub const GraphIndexOptions = struct {
     no_sync: bool = false,
     no_meta_sync: bool = false,
     reverse_backend: ReverseBackend = .lsm,
+    /// Required when `reverse_backend == .native_catalog` (Lite only). See
+    /// `storage/native_catalog_backend.zig:Sink`.
+    native_catalog_sink: ?NativeCatalogSink = null,
     reverse_lsm_storage: ?lsm_backend.Storage = null,
     reverse_lsm_cache: ?*lsm_backend.Cache = null,
     reverse_lsm_options: lsm_backend.Options = .{ .flush_threshold = 1 },
@@ -1141,6 +1151,13 @@ pub const ReverseBackend = enum {
     mem,
     lsm_memory,
     lsm,
+    /// Lite only: forward and reverse adjacency, and all graph metadata
+    /// (counters, topology epochs, intents), live as native index-catalog
+    /// records through `native_catalog_sink`, one durable native commit
+    /// per store commit instead of an LSM-on-virtual-filesystem WAL/segment/
+    /// artifact-lease stack. See `storage/native_catalog_backend.zig` and
+    /// `docs/design/lite-performance/lite-single-commit-write-path.md` §3.3.
+    native_catalog,
 };
 
 pub var test_artifact_rebuild_abort_after_outgoing: std.atomic.Value(bool) = .init(false);
@@ -1199,6 +1216,7 @@ pub const GraphIndex = struct {
         none,
         mem: *mem_backend.Backend,
         lsm: lsm_backend.BackendHandle,
+        native_catalog: *native_catalog_backend.Backend,
 
         fn close(self: *ReverseStoreOwner, alloc: Allocator) void {
             switch (self.*) {
@@ -1208,6 +1226,10 @@ pub const GraphIndex = struct {
                     alloc.destroy(backend);
                 },
                 .lsm => |*handle| handle.close(),
+                .native_catalog => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
             }
             self.* = .none;
         }
@@ -1220,20 +1242,34 @@ pub const GraphIndex = struct {
                     alloc.destroy(backend);
                 },
                 .lsm => |*handle| handle.abandonAfterCrash(),
+                // Nothing to abandon: every record this owner's writes
+                // produced either reached the sink's own durable native
+                // commit (recovered on the next open) or never left this
+                // process (ride-along/in-flight, lost with the process).
+                .native_catalog => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
             }
             self.* = .none;
         }
 
         pub fn sync(self: *ReverseStoreOwner, force: bool) !void {
             switch (self.*) {
-                .none, .mem => {},
+                // A durable `NamespaceTxn.commit()` already forced a native
+                // sync through the sink; `force`'s only caller
+                // (`applyMutationPage`'s "outgoing must be durable before
+                // reverse retires its intent" ordering) needs nothing further
+                // here, since a non-ride-along outgoing commit is already
+                // durable by the time this would run.
+                .none, .mem, .native_catalog => {},
                 .lsm => |*handle| try handle.backend.sync(force),
             }
         }
 
         fn ensureDurableEmptyManifest(self: *ReverseStoreOwner) !void {
             switch (self.*) {
-                .none, .mem => {},
+                .none, .mem, .native_catalog => {},
                 .lsm => |*handle| {
                     if (handle.backend.options.backend.read_only) return;
                     if (handle.backend.manifest_backing != null) return;
@@ -1245,7 +1281,7 @@ pub const GraphIndex = struct {
 
         fn checkpointLsmWalAfterDurableBoundary(self: *ReverseStoreOwner) !void {
             switch (self.*) {
-                .none, .mem => {},
+                .none, .mem, .native_catalog => {},
                 .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
             }
         }
@@ -1253,7 +1289,7 @@ pub const GraphIndex = struct {
         fn pinNativeCheckpoint(self: *ReverseStoreOwner) !lsm_backend.Backend.NativeCheckpoint {
             return switch (self.*) {
                 .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
-                .none, .mem => error.Unsupported,
+                .none, .mem, .native_catalog => error.Unsupported,
             };
         }
     };
@@ -6768,6 +6804,34 @@ pub const GraphIndex = struct {
                     .owner = .{ .lsm = handle },
                 };
             },
+            // WS4-equivalent for graph (design doc §3.3): forward/reverse
+            // adjacency and all graph metadata as native index-catalog
+            // records, one durable native commit per store commit instead
+            // of an LSM WAL + segment + artifact-lease stack on Lite's
+            // virtual filesystem. `path` (the caller-supplied, already
+            // forward/reverse-distinct "<index path>/forward" or
+            // "<index path>/reverse" string -- see `open`/
+            // `openWithPrivateStores`) is the sink scope, mirroring
+            // `persistent.zig`'s `index_path` scope for text's own
+            // `.native_catalog` main backend. No on-disk path is created:
+            // this never touches a filesystem.
+            .native_catalog => {
+                const sink = opts.native_catalog_sink orelse return error.MissingNativeCatalogSink;
+                const backend = try alloc.create(native_catalog_backend.Backend);
+                errdefer alloc.destroy(backend);
+                backend.* = try native_catalog_backend.Backend.init(alloc, .{
+                    .sink = sink,
+                    .scope = std.mem.span(path),
+                });
+                errdefer backend.close();
+
+                var runtime = try backend.runtimeStore(alloc, .{});
+                errdefer runtime.deinit();
+                return .{
+                    .store = runtime,
+                    .owner = .{ .native_catalog = backend },
+                };
+            },
         }
     }
 
@@ -7703,7 +7767,28 @@ pub const GraphIndex = struct {
             try self.syncCommittedIntent();
         }
 
-        var main_batch = try self.beginWriteOutgoingBatch();
+        // §3.2a ride-along: under `.native_catalog`, when none of the three
+        // crash-ordering-sensitive conditions below hold, the outgoing
+        // commit need not force its own `syncData` -- the reverse commit a
+        // few lines down is the very next durable commit against this same
+        // `.aflite` file, on this same calling thread, and a durable
+        // commit's manifest covers every page written since the last
+        // durable checkpoint (design doc §3.1/§3.2a), so it durably covers
+        // the outgoing write too. That collapses the common single-edge
+        // write (no document clear, no producer clear, no completed range-
+        // prune intent) from two native syncs to one. The three excluded
+        // cases keep today's ordering exactly: a plain durable outgoing
+        // commit already guarantees "outgoing durable before reverse
+        // retires its recovery intent" without any extra sync (see
+        // `ReverseStoreOwner.sync`'s `.native_catalog` arm).
+        const outgoing_ride_along = switch (self.outgoing_owner) {
+            .native_catalog => completed_intent == null and !clears_private_state and !clears_producer,
+            else => false,
+        };
+        var main_batch = if (outgoing_ride_along)
+            try self.outgoing_store.beginBatchWithOptions(.{ .durability = .ride_along })
+        else
+            try self.beginWriteOutgoingBatch();
         var main_active = true;
         errdefer if (main_active) main_batch.abort();
 
@@ -7897,7 +7982,11 @@ pub const GraphIndex = struct {
         try putU64(&reverse_batch, graph_read_generation_key, next_read_generation);
         try bumpReverseReadGeneration(&reverse_batch);
         if (builtin.is_test) if (test_counter_publication_hook) |hook| try hook(self, counters);
-        try main_batch.commit();
+        {
+            const wal_trace_scope = wal_trace.scope(.graph_forward_commit);
+            defer wal_trace_scope.end();
+            try main_batch.commit();
+        }
         main_active = false;
         // A durable reverse-store completion must never retire its recovery
         // intent while the outgoing deletion can still be lost on power loss.
@@ -7908,8 +7997,195 @@ pub const GraphIndex = struct {
             }
         }
         if (builtin.is_test and completed_intent != null and test_abort_prune_after_forward_commit) return error.TestInjectedBackfillFailure;
-        try reverse_batch.commit();
+        {
+            const wal_trace_scope = wal_trace.scope(.graph_reverse_commit);
+            defer wal_trace_scope.end();
+            try reverse_batch.commit();
+        }
         self.publishCounters(counters);
+    }
+
+    // ------------------------------------------------------------------
+    // Inline edge publication (design doc §3.3's graph extension).
+    //
+    // Mirrors `persistent.zig`'s `prepareInlineSegmentPublication`/
+    // `installInlineSegmentPublication`: build a small, bounded mutation
+    // set OUTSIDE any durable commit, hand it to a caller that folds it
+    // into an externally-owned native transaction (one `commit_participant.
+    // View.putIndexCatalog` call per store scope -- see
+    // `native_catalog_backend.zig`'s `Backend.boundWrite`/
+    // `BoundTxn.pendingMutations`), then publish this index's own
+    // in-memory state (counters, read generation) only once that external
+    // commit has returned successfully.
+    //
+    // Scope is deliberately narrow -- exactly the common case the WS0
+    // harness measures (`write_amplification_bench_test.zig`'s graph
+    // modes): one `BatchWrite`, no deletes, no owner-membership tracking,
+    // no TTL contribution, no metrics (so no topology/typed-edge
+    // bookkeeping -- `applyMutationPage` itself only writes that
+    // durably when a `.types`-filtered metric is configured; see
+    // `typed_demand`/`typed_state.active` there), and both stores already
+    // on `.native_catalog`. Everything else keeps going through
+    // `applyMutationPage`'s own two commits.
+    //
+    // NOT wired into the production ack path yet (`mutation_materialization
+    // .zig`'s graph write handling still calls `applyMutationPage`
+    // unconditionally): doing that safely needs the same commit-plan
+    // integration `InlineTextPublication` (mutation_materialization.zig)
+    // required for text, which touches the primary-commit assembly this
+    // task's instructions scope to a different agent's area. This is the
+    // API + tests half of that follow-up, intentionally stopped short of
+    // the wiring -- see docs/design/lite-performance/
+    // lite-single-commit-write-path.md §3.3 and this file's write-
+    // amplification ceiling test comment for the gap this closes.
+    pub const InlineEdgePublicationError = error{InlineEdgePublicationUnsupported};
+
+    /// A single edge write's forward/reverse mutations, staged but not yet
+    /// durable. Exactly one of `install` (the mutations are now durable in
+    /// an externally-owned commit) or `abort` (they are not) must run
+    /// exactly once for every value this returns.
+    pub const InlineEdgePublication = struct {
+        alloc: Allocator,
+        forward_mutations: []native_catalog_backend.Mutation,
+        reverse_mutations: []native_catalog_backend.Mutation,
+        counters: Stats,
+
+        /// This publication's forward-store (outgoing adjacency) mutations,
+        /// to fold into an externally-owned native transaction via
+        /// `commit_participant.View.putIndexCatalog(forward_scope, ...)`.
+        /// `forward_scope` is this index's own outgoing-store path (the
+        /// same string `openEdgeStore` used as the `.native_catalog`
+        /// `Backend`'s scope); the caller already knows it from opening
+        /// this index and is not re-derived here.
+        pub fn forwardMutations(self: *const InlineEdgePublication) []const native_catalog_backend.Mutation {
+            return self.forward_mutations;
+        }
+
+        /// This publication's reverse-store (incoming adjacency) mutations;
+        /// see `forwardMutations`.
+        pub fn reverseMutations(self: *const InlineEdgePublication) []const native_catalog_backend.Mutation {
+            return self.reverse_mutations;
+        }
+
+        /// Discards a publication whose mutations were never committed
+        /// durably (or whose commit failed): nothing becomes visible to
+        /// either store's readers or this index's in-memory counters.
+        pub fn abort(self: *InlineEdgePublication) void {
+            freeOwnedMutations(self.alloc, self.forward_mutations);
+            freeOwnedMutations(self.alloc, self.reverse_mutations);
+            self.* = undefined;
+        }
+    };
+
+    fn dupeOwnedMutationsAlloc(alloc: Allocator, items: []const native_catalog_backend.Mutation) ![]native_catalog_backend.Mutation {
+        // Deep copy: `items` is normally a `BoundTxn.pendingMutations()`
+        // slice whose key/value/namespace bytes live in that transaction's
+        // own arena, freed the moment the caller aborts it.
+        const out = try alloc.alloc(native_catalog_backend.Mutation, items.len);
+        var filled: usize = 0;
+        errdefer freeOwnedMutations(alloc, out[0..filled]);
+        for (items, 0..) |m, i| {
+            out[i] = .{
+                .namespace = if (m.namespace) |n| try alloc.dupe(u8, n) else null,
+                .key = try alloc.dupe(u8, m.key),
+                .value = if (m.is_delete) "" else try alloc.dupe(u8, m.value),
+                .is_delete = m.is_delete,
+            };
+            filled = i + 1;
+        }
+        return out;
+    }
+
+    fn freeOwnedMutations(alloc: Allocator, items: []const native_catalog_backend.Mutation) void {
+        for (items) |m| {
+            if (m.namespace) |n| alloc.free(n);
+            alloc.free(m.key);
+            if (!m.is_delete) alloc.free(m.value);
+        }
+        alloc.free(items);
+    }
+
+    /// Builds one edge write's `InlineEdgePublication`, without touching
+    /// either store's durable sink (see `native_catalog_backend.Backend.
+    /// boundWrite`'s "never talks to sink" note). Returns
+    /// `error.InlineEdgePublicationUnsupported` for everything outside
+    /// this API's narrow scope (see the section doc comment above); the
+    /// caller falls back to `applyMutationPage` (via `addEdge`/the public
+    /// batch-apply entry points) in that case.
+    pub fn prepareInlineEdgePublication(self: *GraphIndex, write: BatchWrite) !InlineEdgePublication {
+        if (std.meta.activeTag(self.outgoing_owner) != .native_catalog or std.meta.activeTag(self.reverse_owner) != .native_catalog) {
+            return error.InlineEdgePublicationUnsupported;
+        }
+        if (write.owner.len != 0 or write.owner_document.len != 0) return error.InlineEdgePublicationUnsupported;
+        if (self.ttl_duration_ns != 0) return error.InlineEdgePublicationUnsupported;
+        if (self.metric_configs.len != 0) return error.InlineEdgePublicationUnsupported;
+
+        try @import("mutation_identity.zig").validate(write.edge_id, write.owner_document, write.owner);
+        try edge_type_mod.validateStored(write.edge_type);
+        try edge_weight.validateStored(write.weight);
+
+        const forward_backend = self.outgoing_owner.native_catalog;
+        const reverse_backend = self.reverse_owner.native_catalog;
+
+        var forward_txn = try forward_backend.boundWrite(.{});
+        defer forward_txn.abort();
+        var reverse_txn = try reverse_backend.boundWrite(.{});
+        defer reverse_txn.abort();
+
+        const edge_val = try encodeEdgeValueWithTtlAlloc(
+            self.alloc,
+            write.weight,
+            write.created_at,
+            write.updated_at,
+            write.ttl_created_ns,
+            write.metadata_json,
+        );
+        defer self.alloc.free(edge_val);
+
+        const out_key = try relationshipKeyAlloc(self.alloc, write.source, self.index_name, write.edge_type, write.target, write.edge_id, write.owner_document);
+        defer self.alloc.free(out_key);
+        try forward_txn.put(out_key, edge_val);
+
+        const rev_key = try relationshipKeyAlloc(self.alloc, write.target, self.index_name, write.edge_type, write.source, write.edge_id, write.owner_document);
+        defer self.alloc.free(rev_key);
+        var counters = try graphCountersInTxn(&reverse_txn);
+        try self.accountReverseInsert(&reverse_txn, &counters, write.source, write.target, rev_key);
+        try reverse_txn.put(rev_key, edge_val);
+        try persistCounters(&reverse_txn, counters);
+
+        const read_generation_key = try outgoingReadGenerationKeyAlloc(self.alloc, self.index_name);
+        defer self.alloc.free(read_generation_key);
+        const next_read_generation = std.math.add(u64, try readU64OrZero(&reverse_txn, graph_read_generation_key), 1) catch return error.InlineEdgePublicationUnsupported;
+        try putU64(&forward_txn, read_generation_key, next_read_generation);
+        try putU64(&reverse_txn, graph_read_generation_key, next_read_generation);
+        try bumpReverseReadGeneration(&reverse_txn);
+
+        const forward_mutations = try dupeOwnedMutationsAlloc(self.alloc, forward_txn.pendingMutations());
+        errdefer freeOwnedMutations(self.alloc, forward_mutations);
+        const reverse_mutations = try dupeOwnedMutationsAlloc(self.alloc, reverse_txn.pendingMutations());
+        errdefer freeOwnedMutations(self.alloc, reverse_mutations);
+
+        return .{
+            .alloc = self.alloc,
+            .forward_mutations = forward_mutations,
+            .reverse_mutations = reverse_mutations,
+            .counters = counters,
+        };
+    }
+
+    /// Runs only after `publication`'s mutations (`forwardMutations()`/
+    /// `reverseMutations()`) are already durable in an externally-owned
+    /// native transaction's commit. Syncs both stores' in-memory read
+    /// mirrors (so this index's own subsequent reads see the edge) and
+    /// publishes the in-memory counters -- the step after which a
+    /// synchronous graph-visible write's ack may return.
+    pub fn installInlineEdgePublication(self: *GraphIndex, publication: *InlineEdgePublication) !void {
+        try self.outgoing_owner.native_catalog.applyExternallyCommittedMutations(publication.forward_mutations);
+        try self.reverse_owner.native_catalog.applyExternallyCommittedMutations(publication.reverse_mutations);
+        self.publishCounters(publication.counters);
+        freeOwnedMutations(self.alloc, publication.forward_mutations);
+        freeOwnedMutations(self.alloc, publication.reverse_mutations);
+        publication.* = undefined;
     }
 
     const TopologyMutation = struct { before: bool, after: bool, kind: []const u8, source: []const u8, target: []const u8 };
@@ -21008,6 +21284,349 @@ test "graph addEdge and getEdges out" {
     try std.testing.expectEqual(@as(usize, 2), edges.len);
     try std.testing.expectEqualStrings("doc1", edges[0].source);
     try std.testing.expectApproxEqAbs(@as(f64, 0.9), edges[0].weight, 0.001);
+}
+
+// ---------------------------------------------------------------------------
+// `.native_catalog` reverse backend: forward/reverse adjacency as native
+// index-catalog records (design doc §3.3's graph extension). `NativeCatalogTestSink`
+// is a minimal, allocator-backed `native_catalog_backend.Sink`, standing in
+// for Lite's real `lite/native_catalog_sink.zig` the same way the hosted
+// backend's own tests substitute `mem_backend`/`lsm_backend` for a real
+// `.aflite` file -- the `Sink` contract (one `submit` per commit, `scope`
+// disambiguates callers sharing one durable root) is exactly what a real
+// Lite DB's `Store` provides, so the full write/reopen path below (`addEdge`
+// -> `batchApplyWithAccounting` -> `applyMutationPage` -> ride-along forward
+// commit + durable reverse commit) runs unmodified against this fixture.
+// ---------------------------------------------------------------------------
+
+const NativeCatalogTestSink = struct {
+    allocator: Allocator,
+    entries: std.StringHashMapUnmanaged([]u8) = .empty,
+    submit_calls: usize = 0,
+    durable_submit_calls: usize = 0,
+
+    fn compositeKeyAlloc(alloc: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) ![]u8 {
+        return try std.mem.concat(alloc, u8, &.{ scope, "\x00", namespace orelse "", "\x00", key });
+    }
+
+    fn deinit(self: *@This()) void {
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.entries.deinit(self.allocator);
+    }
+
+    fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.submit_calls += 1;
+        if (durable) self.durable_submit_calls += 1;
+        for (mutations) |m| {
+            const composite = try compositeKeyAlloc(self.allocator, scope, m.namespace, m.key);
+            if (m.is_delete) {
+                if (self.entries.fetchRemove(composite)) |removed| {
+                    self.allocator.free(removed.key);
+                    self.allocator.free(removed.value);
+                }
+                self.allocator.free(composite);
+                continue;
+            }
+            if (self.entries.getEntry(composite)) |existing| {
+                self.allocator.free(existing.value_ptr.*);
+                existing.value_ptr.* = try self.allocator.dupe(u8, m.value);
+                self.allocator.free(composite);
+                continue;
+            }
+            try self.entries.put(self.allocator, composite, try self.allocator.dupe(u8, m.value));
+        }
+    }
+
+    fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var result = std.ArrayListUnmanaged(native_catalog_backend.Entry).empty;
+        errdefer {
+            for (result.items) |e| {
+                if (e.namespace) |n| allocator.free(n);
+                allocator.free(e.key);
+                allocator.free(e.value);
+            }
+            result.deinit(allocator);
+        }
+        const prefix = try std.mem.concat(allocator, u8, &.{ scope, "\x00" });
+        defer allocator.free(prefix);
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
+            const remainder = entry.key_ptr.*[prefix.len..];
+            const sep = std.mem.indexOfScalar(u8, remainder, 0) orelse return error.InvalidTestKey;
+            const ns = remainder[0..sep];
+            const key = remainder[sep + 1 ..];
+            try result.append(allocator, .{
+                .namespace = if (ns.len == 0) null else try allocator.dupe(u8, ns),
+                .key = try allocator.dupe(u8, key),
+                .value = try allocator.dupe(u8, entry.value_ptr.*),
+            });
+        }
+        return try result.toOwnedSlice(allocator);
+    }
+
+    fn sink(self: *@This()) native_catalog_backend.Sink {
+        return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc };
+    }
+};
+
+test "graph native_catalog backend: edges survive reopen, change and delete" {
+    const alloc = std.testing.allocator;
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "native-catalog-reopen");
+    defer cleanupTmp(rev_path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+
+    {
+        var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+            .reverse_backend = .native_catalog,
+            .native_catalog_sink = test_sink.sink(),
+        });
+        defer graph.close();
+        try graph.addEdge("a", "b", "cites", 1.0, 10, 10, "");
+    }
+    // At least the ride-along forward commit (no own sync) plus the durable
+    // reverse commit must have gone through the sink; see `applyMutationPage`'s
+    // `outgoing_ride_along`.
+    try std.testing.expect(test_sink.submit_calls >= 1);
+
+    // Reopen: a fresh GraphIndex sharing only the sink (the "disk"), proving
+    // the edge's durability does not depend on the first instance's
+    // in-memory state.
+    {
+        var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+            .reverse_backend = .native_catalog,
+            .native_catalog_sink = test_sink.sink(),
+        });
+        defer graph.close();
+
+        const edges = try graph.getEdges(alloc, "a", "cites", .out);
+        defer GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expectEqualStrings("b", edges[0].target);
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), edges[0].weight, 0.001);
+
+        // Change: re-adding the same (source, target, edge_type) updates the
+        // weight in place rather than duplicating the edge.
+        try graph.addEdge("a", "b", "cites", 2.5, 20, 20, "");
+        const changed = try graph.getEdges(alloc, "a", "cites", .out);
+        defer GraphIndex.freeEdges(alloc, changed);
+        try std.testing.expectEqual(@as(usize, 1), changed.len);
+        try std.testing.expectApproxEqAbs(@as(f64, 2.5), changed[0].weight, 0.001);
+
+        // Delete.
+        try graph.batchApply(&.{}, &.{.{ .source = "a", .target = "b", .edge_type = "cites" }});
+        const deleted = try graph.getEdges(alloc, "a", "cites", .out);
+        defer GraphIndex.freeEdges(alloc, deleted);
+        try std.testing.expectEqual(@as(usize, 0), deleted.len);
+    }
+
+    // The delete's durability (not just this process' in-memory view) is
+    // what a crash sweep actually needs: reopen once more and confirm the
+    // edge stays gone.
+    {
+        var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+            .reverse_backend = .native_catalog,
+            .native_catalog_sink = test_sink.sink(),
+        });
+        defer graph.close();
+        const edges = try graph.getEdges(alloc, "a", "cites", .out);
+        defer GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
+}
+
+test "graph native_catalog backend: reverse index stays consistent with forward after many writes" {
+    const alloc = std.testing.allocator;
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "native-catalog-consistency");
+    defer cleanupTmp(rev_path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+
+    var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+        .reverse_backend = .native_catalog,
+        .native_catalog_sink = test_sink.sink(),
+    });
+    defer graph.close();
+
+    for (0..16) |i| {
+        var source_buf: [16]u8 = undefined;
+        var target_buf: [16]u8 = undefined;
+        const source = try std.fmt.bufPrint(&source_buf, "n{d}", .{i % 4});
+        const target = try std.fmt.bufPrint(&target_buf, "n{d}", .{(i + 1) % 4});
+        try graph.addEdge(source, target, "rel", @floatFromInt(i + 1), 0, 0, "");
+    }
+
+    for (0..4) |i| {
+        var node_buf: [16]u8 = undefined;
+        const node = try std.fmt.bufPrint(&node_buf, "n{d}", .{i});
+        const out = try graph.getEdges(alloc, node, "rel", .out);
+        defer GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 1), out.len);
+
+        var expected_source_buf: [16]u8 = undefined;
+        const expected_target = try std.fmt.bufPrint(&expected_source_buf, "n{d}", .{(i + 1) % 4});
+        const in_edges = try graph.getEdges(alloc, expected_target, "rel", .in);
+        defer GraphIndex.freeEdges(alloc, in_edges);
+        try std.testing.expectEqual(@as(usize, 1), in_edges.len);
+        try std.testing.expectEqualStrings(node, in_edges[0].source);
+    }
+}
+
+test "graph inline edge publication stages mutations without touching the sink, then installs durably via an external fold-in" {
+    const alloc = std.testing.allocator;
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "inline-edge-publication");
+    defer cleanupTmp(rev_path);
+    const root = std.mem.span(rev_path);
+    const forward_scope = try std.fmt.allocPrint(alloc, "{s}/forward", .{root});
+    defer alloc.free(forward_scope);
+    const reverse_scope = try std.fmt.allocPrint(alloc, "{s}/reverse", .{root});
+    defer alloc.free(reverse_scope);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+
+    var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+        .reverse_backend = .native_catalog,
+        .native_catalog_sink = test_sink.sink(),
+    });
+    defer graph.close();
+    // `open`'s own one-time prune/legacy-owner-directory setup already
+    // submits through the sink for a fresh index; this test only cares that
+    // `prepareInlineEdgePublication` adds none of its own on top of that.
+    const submit_calls_after_open = test_sink.submit_calls;
+
+    var publication = try graph.prepareInlineEdgePublication(.{ .source = "x", .target = "y", .edge_type = "rel", .weight = 3.0 });
+    // Nothing durable yet, and no reader of this index sees the edge.
+    try std.testing.expectEqual(submit_calls_after_open, test_sink.submit_calls);
+    {
+        const edges = try graph.getEdges(alloc, "x", "rel", .out);
+        defer GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
+    try std.testing.expect(publication.forwardMutations().len > 0);
+    try std.testing.expect(publication.reverseMutations().len > 0);
+
+    // Simulate an externally-owned combined commit folding both stores'
+    // mutations into one native transaction (one `commit_participant.View.
+    // putIndexCatalog` call per scope, per the section doc comment): this
+    // harness calls the sink directly in scope order, same as
+    // `lite/native_catalog_sink.zig`'s `Sink.submit` would for each
+    // `putIndexCatalog` call inside one caller-held native transaction.
+    try NativeCatalogTestSink.submit(&test_sink, forward_scope, publication.forwardMutations(), true);
+    try NativeCatalogTestSink.submit(&test_sink, reverse_scope, publication.reverseMutations(), true);
+
+    try graph.installInlineEdgePublication(&publication);
+
+    const edges = try graph.getEdges(alloc, "x", "rel", .out);
+    defer GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("y", edges[0].target);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), edges[0].weight, 0.001);
+
+    // Reopen: the externally-committed mutations are genuinely durable in
+    // the sink, not merely visible through this process' in-memory mirror.
+    var reopened = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+        .reverse_backend = .native_catalog,
+        .native_catalog_sink = test_sink.sink(),
+    });
+    defer reopened.close();
+    const reopened_edges = try reopened.getEdges(alloc, "x", "rel", .out);
+    defer GraphIndex.freeEdges(alloc, reopened_edges);
+    try std.testing.expectEqual(@as(usize, 1), reopened_edges.len);
+}
+
+test "graph inline edge publication abort discards staged mutations" {
+    const alloc = std.testing.allocator;
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "inline-edge-publication-abort");
+    defer cleanupTmp(rev_path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+
+    var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+        .reverse_backend = .native_catalog,
+        .native_catalog_sink = test_sink.sink(),
+    });
+    defer graph.close();
+    const submit_calls_after_open = test_sink.submit_calls;
+
+    var publication = try graph.prepareInlineEdgePublication(.{ .source = "p", .target = "q", .edge_type = "rel" });
+    publication.abort();
+    try std.testing.expectEqual(submit_calls_after_open, test_sink.submit_calls);
+
+    const edges = try graph.getEdges(alloc, "p", "rel", .out);
+    defer GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+}
+
+test "graph inline edge publication rejects owner, TTL and metric-configured indexes" {
+    const alloc = std.testing.allocator;
+
+    {
+        var rev_buf: [256]u8 = undefined;
+        const rev_path = tmpPath(&rev_buf, "inline-edge-unsupported-owner");
+        defer cleanupTmp(rev_path);
+        var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+        defer test_sink.deinit();
+        var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+            .reverse_backend = .native_catalog,
+            .native_catalog_sink = test_sink.sink(),
+        });
+        defer graph.close();
+        try std.testing.expectError(error.InlineEdgePublicationUnsupported, graph.prepareInlineEdgePublication(.{ .source = "a", .target = "b", .edge_type = "rel", .owner = "doc:1" }));
+    }
+    {
+        var rev_buf: [256]u8 = undefined;
+        const rev_path = tmpPath(&rev_buf, "inline-edge-unsupported-ttl");
+        defer cleanupTmp(rev_path);
+        var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+        defer test_sink.deinit();
+        var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+            .reverse_backend = .native_catalog,
+            .native_catalog_sink = test_sink.sink(),
+            .ttl_duration_ns = 1,
+        });
+        defer graph.close();
+        try std.testing.expectError(error.InlineEdgePublicationUnsupported, graph.prepareInlineEdgePublication(.{ .source = "a", .target = "b", .edge_type = "rel" }));
+    }
+    {
+        var rev_buf: [256]u8 = undefined;
+        const rev_path = tmpPath(&rev_buf, "inline-edge-unsupported-metric");
+        defer cleanupTmp(rev_path);
+        var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+        defer test_sink.deinit();
+        var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{
+            .reverse_backend = .native_catalog,
+            .native_catalog_sink = test_sink.sink(),
+            .metric_configs = &.{.{ .name = "degree", .kind = .degree }},
+        });
+        defer graph.close();
+        try std.testing.expectError(error.InlineEdgePublicationUnsupported, graph.prepareInlineEdgePublication(.{ .source = "a", .target = "b", .edge_type = "rel" }));
+    }
+    {
+        // The LSM backend never supports the inline fast path: text's own
+        // `InlineTextPublication` makes the same `main_backend ==
+        // .native_catalog` check (mutation_materialization.zig).
+        var rev_buf: [256]u8 = undefined;
+        const rev_path = tmpPath(&rev_buf, "inline-edge-unsupported-lsm");
+        defer cleanupTmp(rev_path);
+        var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), rev_path, "g", .{ .reverse_backend = .mem });
+        defer graph.close();
+        try std.testing.expectError(error.InlineEdgePublicationUnsupported, graph.prepareInlineEdgePublication(.{ .source = "a", .target = "b", .edge_type = "rel" }));
+    }
 }
 
 test "graph pagerank metric publishes top-k scores and status" {
