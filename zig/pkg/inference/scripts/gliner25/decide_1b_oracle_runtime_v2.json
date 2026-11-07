@@ -1,0 +1,577 @@
+{
+  "format_version": 2,
+  "oracle_runtime_decide_1b": {
+    "python": "3.12.3",
+    "unicode": "15.0.0",
+    "isolated_packages": {
+      "annotated-doc": "0.0.5",
+      "anyio": "4.15.1",
+      "certifi": "2026.7.22",
+      "click": "8.5.0",
+      "filelock": "4.0.12",
+      "fsspec": "2026.9.0",
+      "h11": "0.16.0",
+      "hf-xet": "1.6.0",
+      "httpcore": "1.0.9",
+      "httpx": "0.28.1",
+      "huggingface-hub": "1.33.0",
+      "idna": "3.20",
+      "markdown-it-py": "4.2.0",
+      "mdurl": "0.1.2",
+      "numpy": "2.5.3",
+      "packaging": "26.3",
+      "pygments": "2.21.0",
+      "pyyaml": "6.0.3",
+      "regex": "2026.9.29",
+      "rich": "15.0.0",
+      "safetensors": "0.8.0",
+      "shellingham": "1.5.4",
+      "tokenizers": "0.23.2",
+      "tqdm": "4.70.1",
+      "transformers": "5.17.0",
+      "typer": "0.27.3",
+      "typing-extensions": "4.16.0"
+    },
+    "external_packages": {
+      "pydantic": "2.12.3",
+      "torch": "2.9.1"
+    },
+    "transformers_distribution": {
+      "filename": "transformers-5.17.0-py3-none-any.whl",
+      "sha256": "78ec1ce21579b38dfb83950a0658cd119f87212a2fcfdff478096ce9d6c03801",
+      "size_bytes": 12295140,
+      "source_repo": "https://github.com/huggingface/transformers",
+      "source_revision": "856157a2f3e9594954310df18fdccc31ffddebe9",
+      "installed_metadata_sha256": "cd295c5ad2c605e3c04456740df174e6a1bf5418eb2563788dc2163253f6d882",
+      "installed_record_sha256": "9abc15801d4bf3c6d5962bc03df670ae577967be4e5ac995c082c6255023910c"
+    },
+    "rope_contract": {
+      "head_dim": 64,
+      "layer_types": [
+        "full_attention",
+        "sliding_attention"
+      ],
+      "rope_theta": 160000.0,
+      "rope_type": "default",
+      "inv_freq_sha256_f32le": "adb41194debe8e6c185d47754f68cc2dd59960a03cb4ccbc71acd14b860c4604"
+    },
+    "compatibility": {
+      "gliner2_declared_transformers_range": "transformers>=4.38,<5",
+      "checkpoint_transformers_version": "5.17.0",
+      "status": "checkpoint_runtime_outside_upstream_declared_dependency_range"
+    },
+    "rejected_runtime_observation": {
+      "transformers_version": "4.55.4",
+      "full_attention_rope_theta": 160000.0,
+      "full_attention_inv_freq_sha256_f32le": "adb41194debe8e6c185d47754f68cc2dd59960a03cb4ccbc71acd14b860c4604",
+      "sliding_attention_rope_theta": 10000.0,
+      "sliding_attention_inv_freq_sha256_f32le": "734f9e6b629f7baccc4de81b7e8d2982035ee1b81f73f158e7d33a4dcf13fa0e",
+      "reason": "nested rope_parameters are retained as unknown metadata but ignored by the 4.55 ModernBERT per-layer constructor"
+    },
+    "runtime_tree_sha256": "6259dc40ff96d6bb7afaf079345be8e36bc3c3fd77194b9a88a6c635ba0f6969"
+  },
+  "portable_runtime": {
+    "schema": "authenticated-wheel-recipes-v2",
+    "identity": "decide1b-cpython3123-macos-arm64-official-wheels-v2",
+    "historical_byte_identity": false,
+    "qualification": "pending_frozen_capture_and_holdout_validation",
+    "interpreter": {
+      "prefix_name": "cpython-3.12.3+20240415-macos-arm64",
+      "omit_python_bytecode": true,
+      "archive": {
+        "filename": "cpython-3.12.3+20240415-aarch64-apple-darwin-install_only.tar.gz",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20240415/cpython-3.12.3%2B20240415-aarch64-apple-darwin-install_only.tar.gz",
+        "bytes": 16814925,
+        "sha256": "ccc40e5af329ef2af81350db2a88bbd6c17b56676e82d62048c15d548401519e",
+        "checksum_source": "https://raw.githubusercontent.com/astral-sh/uv/0.11.28/crates/uv-python/download-metadata.json",
+        "checksum_source_sha256": "d82884291b7cfffc6d9ff853254be0aa9e3158b8bb2503cd021460a5128afaaf"
+      }
+    },
+    "driver_sources": {
+      "benchmark_family_python.py": "214b2f9ed386774c220743138d1d69138548762839db60dd3483e578fb67eeb6",
+      "verify_family_contract.py": "eae6b30fadba39c5ed59bb4d28abbc0462a3c151e8ef793440125208df8360cb",
+      "family_contract.json": "0beb19e072fd46f0318bd7a1e2c0ac3b8ad1deaf47bdc0cf1ce7ca1e9c6364c5",
+      "decide_1b_oracle_runtime.json": "3cefce06c367cd09d1754f467e83173e37550506ff94c1112bb038e1600478bc"
+    },
+    "provenance": {
+      "raw_wheel_metadata": "Exact official38wheel URL/size/SHA recipes derive complete payload+metadata+mode facts directly; no private payload inventory artifact required.",
+      "installed_metadata_distinction": "RECORD is raw authenticated wheel RECORD, not claimed equivalent to v1 installed9abc. No installer additions allowed in payload roots.",
+      "new_runtime_only": "No historical byte-identity or model quality claim; old format1/default/goldens unchanged.",
+      "interpreter": "Exact official CPython3.12.3 BUILD20240415 archive, published uv checksum; derive source/symlink/mode facts directly and deterministically omit all pyc before execution."
+    },
+    "platform": {
+      "system": "Darwin",
+      "machine": "arm64"
+    },
+    "wheels": {
+      "isolated": {
+        "packages": {
+          "annotated-doc": "0.0.5",
+          "anyio": "4.15.1",
+          "certifi": "2026.7.22",
+          "click": "8.5.0",
+          "filelock": "4.0.12",
+          "fsspec": "2026.9.0",
+          "h11": "0.16.0",
+          "hf-xet": "1.6.0",
+          "httpcore": "1.0.9",
+          "httpx": "0.28.1",
+          "huggingface-hub": "1.33.0",
+          "idna": "3.20",
+          "markdown-it-py": "4.2.0",
+          "mdurl": "0.1.2",
+          "numpy": "2.5.3",
+          "packaging": "26.3",
+          "pygments": "2.21.0",
+          "pyyaml": "6.0.3",
+          "regex": "2026.9.29",
+          "rich": "15.0.0",
+          "safetensors": "0.8.0",
+          "shellingham": "1.5.4",
+          "tokenizers": "0.23.2",
+          "tqdm": "4.70.1",
+          "transformers": "5.17.0",
+          "typer": "0.27.3",
+          "typing-extensions": "4.16.0"
+        },
+        "wheels": [
+          {
+            "bytes": 5302,
+            "filename": "annotated_doc-0.0.5-py3-none-any.whl",
+            "metadata_sha256": "8c24d70c5d9153d22123353a906042fd7603df2d15c2196290b0f8a962558c46",
+            "name": "annotated-doc",
+            "pypi_metadata_sha256": "1aab691a5f37dd292e6d93ab53f7da5d839f56ba605345f017022ec75eb643af",
+            "record_sha256": "f956b04f14d28135b1f30d6343816b47db2d1aa1eb2ecd027f6c428ea0575f04",
+            "sha256": "117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101",
+            "url": "https://files.pythonhosted.org/packages/3e/30/e900b21425a860e195f32e37657aa1f7c7f2b1bfb26f03ca209b90933c06/annotated_doc-0.0.5-py3-none-any.whl",
+            "version": "0.0.5"
+          },
+          {
+            "bytes": 132079,
+            "filename": "anyio-4.15.1-py3-none-any.whl",
+            "metadata_sha256": "043aecb571af7189e8a6c528f5d8e32545f1b2cdfaaf761d51e6d5b67ea3ca81",
+            "name": "anyio",
+            "pypi_metadata_sha256": "16b64a4ca0f1779bc3faf59f27685c728d0ac3085ea7585f3f40e11c265b8d70",
+            "record_sha256": "f4042bec513d826bf50bbb4a6f09805f50d5e7968a337d9bcad375e17db309c9",
+            "sha256": "6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101",
+            "url": "https://files.pythonhosted.org/packages/12/b8/4bd346e22b28902df4d651910f5242c28d84e4a5c2435ca5c3f797ed7e2e/anyio-4.15.1-py3-none-any.whl",
+            "version": "4.15.1"
+          },
+          {
+            "bytes": 136983,
+            "filename": "certifi-2026.7.22-py3-none-any.whl",
+            "metadata_sha256": "ef5af1638fbb23676ac3c5777dfcfc2cd9c348fe4172ed5ba3d277655b248090",
+            "name": "certifi",
+            "pypi_metadata_sha256": "1cdb529dfcaf4fea8e4fe581726f335a0da5abbbd5bde225205a6911ca1981b1",
+            "record_sha256": "ffbaaaa116c13b3c0337a451c316aab71c19aec40b67f4fc971e4685565bddc5",
+            "sha256": "62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775",
+            "url": "https://files.pythonhosted.org/packages/0b/a7/71ac2cff56fec219ed242bb11b8efb69fcc4bec75db06fb7bfe35de520e6/certifi-2026.7.22-py3-none-any.whl",
+            "version": "2026.7.22"
+          },
+          {
+            "bytes": 125251,
+            "filename": "click-8.5.0-py3-none-any.whl",
+            "metadata_sha256": "e87bce0bd194de70dfb8e708e0a6b0483009f25611804eaf87bfeb63e6c20501",
+            "name": "click",
+            "pypi_metadata_sha256": "6fc33d0e534d89a788a0965bb5071ca0726a483747589201789b60babd602686",
+            "record_sha256": "3ac6566ea107d9a43b9756f87cfcdaa2ffd93ab2c7cf4021c21bfb7ec53c33b4",
+            "sha256": "255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360",
+            "url": "https://files.pythonhosted.org/packages/58/50/6c0d534c5f134586a8e1ba4e330569e32f057e33372ae556463212fb4cd3/click-8.5.0-py3-none-any.whl",
+            "version": "8.5.0"
+          },
+          {
+            "bytes": 111732,
+            "filename": "filelock-4.0.12-py3-none-any.whl",
+            "metadata_sha256": "13cef4f5394eede99fa578d493e22e063e9aa007d90b7145c18c21cb2ea0102a",
+            "name": "filelock",
+            "pypi_metadata_sha256": "f7813c7efb5ae4573f6de08f31ad4b35d04bae86ca4f0ba854c2436f2489cae5",
+            "record_sha256": "662851b127d59c80678c8ef3dec467f6d758f7db623132befffbc7dee608b857",
+            "sha256": "5f17ee83ecee8a6f3e389c75822fb70a1c2f0506b99438a6dffa1d56793588c8",
+            "url": "https://files.pythonhosted.org/packages/da/a1/b047e1c486a2c66283633b7dbb73872ca16ca1ce6a426f70d4d037fc8e1c/filelock-4.0.12-py3-none-any.whl",
+            "version": "4.0.12"
+          },
+          {
+            "bytes": 221738,
+            "filename": "fsspec-2026.9.0-py3-none-any.whl",
+            "metadata_sha256": "68f5a262767510638e9b1933b1493f2baadc9616fe1e696f62aedd59c8c0a37c",
+            "name": "fsspec",
+            "pypi_metadata_sha256": "4a93a853911936a59262f3ccc1a36a42cfbff106beec53d6e247d00f7a3aa1e9",
+            "record_sha256": "387ca73d3478296bbc04bcba06f8a7fd2302f60cb5549aefe55f5dcd3e30f869",
+            "sha256": "8dd6e646e99ea382bd85f97a45e6b526a442d79423a7dc673f1e2756d05fcb5f",
+            "url": "https://files.pythonhosted.org/packages/6c/c0/a98505f18594f1bce828bb159cec0fcf9860562f1a2c85913409fc8f3d9e/fsspec-2026.9.0-py3-none-any.whl",
+            "version": "2026.9.0"
+          },
+          {
+            "bytes": 37515,
+            "filename": "h11-0.16.0-py3-none-any.whl",
+            "metadata_sha256": "28f326098ac09fcba79b8f180f96087c841fe2456215cb7b872a9c7d5cd19d64",
+            "name": "h11",
+            "pypi_metadata_sha256": "97f4efb9cc00826f0408076983adc1a1e48e8f2cabf403aaf250f724e081440d",
+            "record_sha256": "1f1d4d9080c9f2a995417616ead6ea614da41b477958ed0ba0e45a82c6212721",
+            "sha256": "63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86",
+            "url": "https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl",
+            "version": "0.16.0"
+          },
+          {
+            "bytes": 3876287,
+            "filename": "hf_xet-1.6.0-cp38-abi3-macosx_11_0_arm64.whl",
+            "metadata_sha256": "becdd6ec73b515dc38c59501956134eb0b903bfed33ffcd99b252361acd926e9",
+            "name": "hf-xet",
+            "pypi_metadata_sha256": "bee8a777284d0cc7a4f619b09b46cb60aade9a0f9295f5a051d6db6d5011d952",
+            "record_sha256": "b08b57827decc0d99b582483cf7771ac202b339455e863cd67dd6d4dc841fdc6",
+            "sha256": "f0906082d9932ae0c0057fa194041c22b4e2cdb46b2592ef3b91f020d62a081a",
+            "url": "https://files.pythonhosted.org/packages/4b/69/55b8dcf636142ae660fec1869fcac14c4da2e8412e14d6eee1523be77e9f/hf_xet-1.6.0-cp38-abi3-macosx_11_0_arm64.whl",
+            "version": "1.6.0"
+          },
+          {
+            "bytes": 78784,
+            "filename": "httpcore-1.0.9-py3-none-any.whl",
+            "metadata_sha256": "fe2d4fda6199128978779e0cf27f3c045c531863fcdd987eacc74f3a18d41c21",
+            "name": "httpcore",
+            "pypi_metadata_sha256": "e26eca5c3d288fe9e6446af9bcbca1038ba688629d5c8a2886c47d74718d87a2",
+            "record_sha256": "56c7eb698ca4b47f9eb3ccbae04bdd802a651114200a9fadbff5665029d441db",
+            "sha256": "2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55",
+            "url": "https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl",
+            "version": "1.0.9"
+          },
+          {
+            "bytes": 73517,
+            "filename": "httpx-0.28.1-py3-none-any.whl",
+            "metadata_sha256": "febb9b0f8f3e80d57c8199c304f35c4336e8581d1d18d7983c92766b82793b25",
+            "name": "httpx",
+            "pypi_metadata_sha256": "293bfab7bf587fcd0825f1bd8eed8e6303285ba14801b15659853827cbe30796",
+            "record_sha256": "0ecebd0f1f2f26e90b04b235c20c996fe53f9fbf24cf0a84c8cd2e668d3b0ec5",
+            "sha256": "d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad",
+            "url": "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl",
+            "version": "0.28.1"
+          },
+          {
+            "bytes": 846435,
+            "filename": "huggingface_hub-1.33.0-py3-none-any.whl",
+            "metadata_sha256": "bee565776d66f486d224f74024b656a69ed42e2639d80b18811fca4365adc42e",
+            "name": "huggingface-hub",
+            "pypi_metadata_sha256": "cbb5c8feeaa6e5bb95c5dd4c95cb8e0277c7279892476bde6c3dad53e1beefca",
+            "record_sha256": "aa4bf10bb81e4bd14b3ea3a5720bf710e04bb85e778cf7b975964da5d9ae2b51",
+            "sha256": "04e434b06e100eddbce9a6e817d72693a7884b10a79bd67ab48080d5c07eb899",
+            "url": "https://files.pythonhosted.org/packages/fc/16/963096d224b80909432dc16561a615fd33d2d13beef3ce4c63fa25e40867/huggingface_hub-1.33.0-py3-none-any.whl",
+            "version": "1.33.0"
+          },
+          {
+            "bytes": 69583,
+            "filename": "idna-3.20-py3-none-any.whl",
+            "metadata_sha256": "dbd8c14c1e4ca1e0c9824a6dbc7cbbf78884f38eb52d91148cd3025f671e4b85",
+            "name": "idna",
+            "pypi_metadata_sha256": "e7cbd26e23ce60f6cb3a151d2adf3b1b087bb8f10ac2d9d6db70fdccbf3bb041",
+            "record_sha256": "8e2670b3fc1bbf1e2cf99050b062fda50203881e43420bbc6772dad2cde2d548",
+            "sha256": "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c",
+            "url": "https://files.pythonhosted.org/packages/58/a2/bb081bab032533a855d44de1d56f8e8426114ff1ba5d1f07a438a0a654f8/idna-3.20-py3-none-any.whl",
+            "version": "3.20"
+          },
+          {
+            "bytes": 91687,
+            "filename": "markdown_it_py-4.2.0-py3-none-any.whl",
+            "metadata_sha256": "72c36ff516755443b1ecb61e17b2567a990230b49a504b0eb0c42d5f82448a9c",
+            "name": "markdown-it-py",
+            "pypi_metadata_sha256": "62affba459c80b1279b5759735f7da3e9c7d24966086ff81ec0303c94512b966",
+            "record_sha256": "83ac63dc42bcfcb56bee31a39046dcefc187b2da6870471e8e3fdf8e6ae6e958",
+            "sha256": "9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a",
+            "url": "https://files.pythonhosted.org/packages/b3/81/4da04ced5a082363ecfa159c010d200ecbd959ae410c10c0264a38cac0f5/markdown_it_py-4.2.0-py3-none-any.whl",
+            "version": "4.2.0"
+          },
+          {
+            "bytes": 9979,
+            "filename": "mdurl-0.1.2-py3-none-any.whl",
+            "metadata_sha256": "b53b29d48f499367053fda3c81e7ce27d2558380ebbf83e66023b02eb7ddd25d",
+            "name": "mdurl",
+            "pypi_metadata_sha256": "c7baac0b363d92cf55f1f3a313f4bb0564bff27343e6a0a4e9d7ff03afc8a6c7",
+            "record_sha256": "72e8c94bf8f6a74a6a9a113a56ae3e9cade7dcb3ce2591fe60eb161f2948167f",
+            "sha256": "84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8",
+            "url": "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl",
+            "version": "0.1.2"
+          },
+          {
+            "bytes": 5445405,
+            "filename": "numpy-2.5.3-cp312-cp312-macosx_14_0_arm64.whl",
+            "metadata_sha256": "451a9b8028000588e66b0b415587b6aef0bbc51a96d8e8a0cba0dc23acf64f99",
+            "name": "numpy",
+            "pypi_metadata_sha256": "2f7296e81e93d8a90ea442e7b7a5393ddab2f7ead5075cafd9be381dcbdffb6e",
+            "record_sha256": "746538e43c5fc8b4abc43820f2eb954478df5728c1c92abf39de7eb694d49410",
+            "sha256": "a72f874bc9e10e4b8f80426fb49716d5141f64442a0c8418065093ec8017fbb0",
+            "url": "https://files.pythonhosted.org/packages/9c/59/a312e95696e5f601914dd8b6dd844692ba61670807417e24b68e337b5c70/numpy-2.5.3-cp312-cp312-macosx_14_0_arm64.whl",
+            "version": "2.5.3"
+          },
+          {
+            "bytes": 129956,
+            "filename": "packaging-26.3-py3-none-any.whl",
+            "metadata_sha256": "70fdb89fc4d4a9a043bf7372b8972bcc883fddff34ab55e9cf80d73875384763",
+            "name": "packaging",
+            "pypi_metadata_sha256": "4f190d2f0b312b3086058cee64ab4333bf3ce67fb78b4c2bdb43899049b29f4d",
+            "record_sha256": "49910a2cb1de4511589f678097f0fd771a2b4266f944806edb1b846f11af324c",
+            "sha256": "d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c",
+            "url": "https://files.pythonhosted.org/packages/63/34/ba1c580383c9eada3711951fef0795c80b829a078d72188184bcab9dd527/packaging-26.3-py3-none-any.whl",
+            "version": "26.3"
+          },
+          {
+            "bytes": 1250147,
+            "filename": "pygments-2.21.0-py3-none-any.whl",
+            "metadata_sha256": "1dde075570136774c706bf0009183a793fe0ee262e4a5590cc6eff8453eedd43",
+            "name": "pygments",
+            "pypi_metadata_sha256": "330104a10adc8a587e3f98f4e207557125ca0c1d489e129334da5acb2b813a03",
+            "record_sha256": "1ca0a14983b717b3728988a152d217ce938b6286e10c8176212e2ff9c5e85f0a",
+            "sha256": "2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9",
+            "url": "https://files.pythonhosted.org/packages/71/46/17f022dd3e953bf20a04a028a21ec746d942f8d2af30fa0f124fa0e6a684/pygments-2.21.0-py3-none-any.whl",
+            "version": "2.21.0"
+          },
+          {
+            "bytes": 173973,
+            "filename": "pyyaml-6.0.3-cp312-cp312-macosx_11_0_arm64.whl",
+            "metadata_sha256": "03c3b415ed38d09faedc49360e930769b40c58f68585e6de00e2e4916a858d34",
+            "name": "pyyaml",
+            "pypi_metadata_sha256": "c3f35597bc2f08cc990c2a5fe57bef6687b3a3d7c61d8b0ba4cc067777eb1def",
+            "record_sha256": "715146d21711444bc73c3137d18cffb6e38ace40e8998c5a9dfa69bd7dc46e3e",
+            "sha256": "fc09d0aa354569bc501d4e787133afc08552722d3ab34836a80547331bb5d4a0",
+            "url": "https://files.pythonhosted.org/packages/89/a0/6cf41a19a1f2f3feab0e9c0b74134aa2ce6849093d5517a0c550fe37a648/pyyaml-6.0.3-cp312-cp312-macosx_11_0_arm64.whl",
+            "version": "6.0.3"
+          },
+          {
+            "bytes": 293633,
+            "filename": "regex-2026.9.29-cp312-cp312-macosx_11_0_arm64.whl",
+            "metadata_sha256": "33859377dbf8dd38ee3de73fd97faebf4a63d50576e3cc1a9dfe44df08b0936a",
+            "name": "regex",
+            "pypi_metadata_sha256": "a8c8be9b6cd548537b8e8ba921ac87bc1955272402e2ca3562c7f9bebd575709",
+            "record_sha256": "04f0ef8fc5c0711dc824aa53d23f14a638de92745f2dd47735c9a5c9bd919da5",
+            "sha256": "f57dc6b8fef170f105d2cf5cdce254f47b137d7755086cf7050f47e16582abba",
+            "url": "https://files.pythonhosted.org/packages/37/14/f3f0ba083d2094392d5eabf56db5ea6ba469fd6e927afd187042054ea68a/regex-2026.9.29-cp312-cp312-macosx_11_0_arm64.whl",
+            "version": "2026.9.29"
+          },
+          {
+            "bytes": 310654,
+            "filename": "rich-15.0.0-py3-none-any.whl",
+            "metadata_sha256": "fad34fc603fac4481bf81f8dd629492fc302c0ec31909c86644751512afb2e3b",
+            "name": "rich",
+            "pypi_metadata_sha256": "455015cb0b237a24819d91236152ad0e71b2be39a83cbe6afa0e29ea8aafa550",
+            "record_sha256": "4df2d4633403b39b320d055b22acd8ee1517b18e7c4bc76dc9fd56220ec1d1e6",
+            "sha256": "33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb",
+            "url": "https://files.pythonhosted.org/packages/82/3b/64d4899d73f91ba49a8c18a8ff3f0ea8f1c1d75481760df8c68ef5235bf5/rich-15.0.0-py3-none-any.whl",
+            "version": "15.0.0"
+          },
+          {
+            "bytes": 484562,
+            "filename": "safetensors-0.8.0-cp310-abi3-macosx_11_0_arm64.whl",
+            "metadata_sha256": "645be7b8d55e91534f991d144dc9e279581ea8dbea1a8c5b0be14e529d01e345",
+            "name": "safetensors",
+            "pypi_metadata_sha256": "b8d395b433d0319498c9192ed323b86a84d82b5f40b4adf1b97b3bf8963fafad",
+            "record_sha256": "66baf2a8138c8eaa12f535a0027c54372a2c3d847f3d0ec55e01a39bdd904918",
+            "sha256": "c80201d22cbf405b80647a60ada77bba06c8fba2da2743ba1e89cdcc39a81f25",
+            "url": "https://files.pythonhosted.org/packages/f5/b1/fa7c600e7dceae12e9606c7578cbc9ff1e1ed55844883ee5c92205e86226/safetensors-0.8.0-cp310-abi3-macosx_11_0_arm64.whl",
+            "version": "0.8.0"
+          },
+          {
+            "bytes": 9755,
+            "filename": "shellingham-1.5.4-py2.py3-none-any.whl",
+            "metadata_sha256": "183d80220a37493262795739dd357cc5bb3f49bd390cc9198d5180e5451a07fa",
+            "name": "shellingham",
+            "pypi_metadata_sha256": "9381443cd6295d50fc7f7bd34a457243b0f3a54732cde45b0fc2d0994b61f3af",
+            "record_sha256": "8a597e3b2d3670074d11918c80d30f3c1694ccd7ae30e9d1e7c784b800e98010",
+            "sha256": "7ecfff8f2fd72616f7481040475a65b2bf8af90a56c89140852d1120324e8686",
+            "url": "https://files.pythonhosted.org/packages/e0/f9/0595336914c5619e5f28a1fb793285925a8cd4b432c9da0a987836c7f822/shellingham-1.5.4-py2.py3-none-any.whl",
+            "version": "1.5.4"
+          },
+          {
+            "bytes": 3101593,
+            "filename": "tokenizers-0.23.2-cp310-abi3-macosx_11_0_arm64.whl",
+            "metadata_sha256": "d2d200c0d0c48895b2c3b02cdd8c06c26dea8f9be38ef193e9b4dd5a566c89be",
+            "name": "tokenizers",
+            "pypi_metadata_sha256": "f5ff231c20e7c6396ca13e20b0142ddbc23ee73779f73462b9bcc727e7f86f76",
+            "record_sha256": "ea2c76bf4a59c250c4dba1115d3148f9bc70ef23c5f9ba467ab021fcd96671fc",
+            "sha256": "986670e43691469dcee610ea0f846f91a8f84e91fc6f7a48d4c064414c0ec2bf",
+            "url": "https://files.pythonhosted.org/packages/67/49/22da045a91732384d3a3771816bf188dc5a1f702c32e635afa7c679c0bef/tokenizers-0.23.2-cp310-abi3-macosx_11_0_arm64.whl",
+            "version": "0.23.2"
+          },
+          {
+            "bytes": 80199,
+            "filename": "tqdm-4.70.1-py3-none-any.whl",
+            "metadata_sha256": "a5da70b966afea3a759716041bad7187f2ece02c22348cf9e7c0a512bbf15f57",
+            "name": "tqdm",
+            "pypi_metadata_sha256": "0589819a1bc3437c8f215d95f3f64ff24d602dc6a62598eb8d2e420c8e6a0b25",
+            "record_sha256": "a09accd5190caec98e08df6bd39d60015b8c56faa0cb6e032d88323430264dd4",
+            "sha256": "c293e525e6fef9c20e8728fd4612df02a0aa31bb5fe91ecd93e123b1b7bffa73",
+            "url": "https://files.pythonhosted.org/packages/a7/03/921a3d3c75785aca9ebfbfcabfbc3a1be12e2ab5265deb026d55a5a3f83e/tqdm-4.70.1-py3-none-any.whl",
+            "version": "4.70.1"
+          },
+          {
+            "bytes": 12295140,
+            "filename": "transformers-5.17.0-py3-none-any.whl",
+            "metadata_sha256": "cd295c5ad2c605e3c04456740df174e6a1bf5418eb2563788dc2163253f6d882",
+            "name": "transformers",
+            "pypi_metadata_sha256": "f94ff0e69c8f15cebae19b1d4ce47a737d9772fb3a6dfbcbfe6b1ff6d9e12509",
+            "record_sha256": "c19dceb09661b0791487af1a5e1753ee85be5887db86ce066579e0e85ce0cc85",
+            "sha256": "78ec1ce21579b38dfb83950a0658cd119f87212a2fcfdff478096ce9d6c03801",
+            "url": "https://files.pythonhosted.org/packages/e8/d0/c502b60d684adbd98a8dc7d5bb866842772b816ac4354e4608be240041ae/transformers-5.17.0-py3-none-any.whl",
+            "version": "5.17.0"
+          },
+          {
+            "bytes": 123312,
+            "filename": "typer-0.27.3-py3-none-any.whl",
+            "metadata_sha256": "fc2cbb86c4fd175326b63427e9a3fa13e79364d7333a945414d9c6ac80c0f0e4",
+            "name": "typer",
+            "pypi_metadata_sha256": "f1ab016bbada2cf55995c4cd4b56bfe889de8ae5a92af2e48690b093eec8ab4e",
+            "record_sha256": "db97182a4c36ff3ddd633e80226f8304bea8fa0854d22f0d5e54adbdaedc9c41",
+            "sha256": "e50022f28b82a86313e54501317a1db64bf8f8d036ff8cfe5ca7e47675454aff",
+            "url": "https://files.pythonhosted.org/packages/07/ea/2e31b67051e91a133189e9c000c222502ddc6969856416de0d095de4c0b0/typer-0.27.3-py3-none-any.whl",
+            "version": "0.27.3"
+          },
+          {
+            "bytes": 45571,
+            "filename": "typing_extensions-4.16.0-py3-none-any.whl",
+            "metadata_sha256": "b05084ca1d50879865178d9fff9fabeab61bdfb1f361bfbde95421ffc8f9be46",
+            "name": "typing-extensions",
+            "pypi_metadata_sha256": "2140da00d62dde967f52d0be0ae28444f1d6a3fe603f52c83c23988c32122d5a",
+            "record_sha256": "44dcf97810bea7b84bcd83890b6674bbcc2f4c5ef899a4887f15d524bdf6bb97",
+            "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+            "url": "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl",
+            "version": "4.16.0"
+          }
+        ]
+      },
+      "external": {
+        "packages": {
+          "annotated-types": "0.8.0",
+          "jinja2": "3.1.6",
+          "markupsafe": "3.0.4",
+          "mpmath": "1.3.0",
+          "networkx": "3.7",
+          "pydantic": "2.12.3",
+          "pydantic-core": "2.41.4",
+          "setuptools": "84.2.1",
+          "sympy": "1.14.0",
+          "torch": "2.9.1",
+          "typing-inspection": "0.4.5"
+        },
+        "wheels": [
+          {
+            "bytes": 74479191,
+            "filename": "torch-2.9.1-cp312-none-macosx_11_0_arm64.whl",
+            "metadata_sha256": "a7976fb5ed9044fb2bf421b99d888356a3a180d9e9ddd6ac10a46230bf68fc1a",
+            "name": "torch",
+            "pypi_metadata_sha256": "3d87c390675bd859b06f0fdc1e42f7f4dbff57144ff2a0eeeca62a323031368c",
+            "record_sha256": "aec51bf5c3c01384dae1f599f3ba11243afdde2bf03ea60aefd757c8e06e1bc0",
+            "sha256": "c0d25d1d8e531b8343bea0ed811d5d528958f1dcbd37e7245bc686273177ad7e",
+            "url": "https://files.pythonhosted.org/packages/6e/ab/07739fd776618e5882661d04c43f5b5586323e2f6a2d7d84aac20d8f20bd/torch-2.9.1-cp312-none-macosx_11_0_arm64.whl",
+            "version": "2.9.1"
+          },
+          {
+            "bytes": 462431,
+            "filename": "pydantic-2.12.3-py3-none-any.whl",
+            "metadata_sha256": "348336c208743aafeabfa5537c29f429035a3107b7a78bbb6a3bf7b3a42fe4aa",
+            "name": "pydantic",
+            "pypi_metadata_sha256": "1eb08836dcf7fd818a672203455be52bc09d1f3213fb13953705b13c016d4602",
+            "record_sha256": "61c8b9c4548e60af32b90448900b8cecc74c10fee2a39668e7b3d6ed7f866e0e",
+            "sha256": "6986454a854bc3bc6e5443e1369e06a3a456af9d339eda45510f517d9ea5c6bf",
+            "url": "https://files.pythonhosted.org/packages/a1/6b/83661fa77dcefa195ad5f8cd9af3d1a7450fd57cc883ad04d65446ac2029/pydantic-2.12.3-py3-none-any.whl",
+            "version": "2.12.3"
+          },
+          {
+            "bytes": 13427,
+            "filename": "annotated_types-0.8.0-py3-none-any.whl",
+            "metadata_sha256": "614985b278f601b8ef863f82783b991cc3ada4b89f592eb71c7c48c5f2ef2298",
+            "name": "annotated-types",
+            "pypi_metadata_sha256": "a6e8e5b10c8fd2f596bba53e015cd37f6279fb5cec26ce0c5e9968625be4fefa",
+            "record_sha256": "114b36a7ba292e2b78ecd901d104c3fade4699ccfb684a5d9179749cbaeaeaaa",
+            "sha256": "f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0",
+            "url": "https://files.pythonhosted.org/packages/99/91/8acff4f5e50511b911bbccb72b8628a49c68ce14148cd9f6431094859a90/annotated_types-0.8.0-py3-none-any.whl",
+            "version": "0.8.0"
+          },
+          {
+            "bytes": 1910699,
+            "filename": "pydantic_core-2.41.4-cp312-cp312-macosx_11_0_arm64.whl",
+            "metadata_sha256": "3434fb886fe254ed414541f305a86e43ff575093f8f6d15c89bd11144ed8e131",
+            "name": "pydantic-core",
+            "pypi_metadata_sha256": "d9b19dd397896062c4e843866a3dfde95b689beab0c09f1bb8235234c572343f",
+            "record_sha256": "b21e4b279ff53fb71336e68460150d30b9c19f6d0865a2245e2f95a7ce909abd",
+            "sha256": "c53ff33e603a9c1179a9364b0a24694f183717b2e0da2b5ad43c316c956901b2",
+            "url": "https://files.pythonhosted.org/packages/58/da/46fdac49e6717e3a94fc9201403e08d9d61aa7a770fab6190b8740749047/pydantic_core-2.41.4-cp312-cp312-macosx_11_0_arm64.whl",
+            "version": "2.41.4"
+          },
+          {
+            "bytes": 14874,
+            "filename": "typing_inspection-0.4.5-py3-none-any.whl",
+            "metadata_sha256": "7306933907768b0098784e56dfd678242f52383ff3e35c10a4c150539393d6ec",
+            "name": "typing-inspection",
+            "pypi_metadata_sha256": "5143a2b62f3dcf4202e44c2b48d661a1251059f65fc4a996040278adc4a8c5eb",
+            "record_sha256": "5ac4a3904616961d714913e364784583dc346bfa102fe75de67056fda8e3f0eb",
+            "sha256": "bc210535442b39e1bf2805e0c7a17dfd6a4ace760c84c7f7d16245d23a6b1c39",
+            "url": "https://files.pythonhosted.org/packages/de/0c/ea2544850a7c135e15033a5c7a8e7211136184b7ae63e2239d557c2b3019/typing_inspection-0.4.5-py3-none-any.whl",
+            "version": "0.4.5"
+          },
+          {
+            "bytes": 876263,
+            "filename": "setuptools-84.2.1-py3-none-any.whl",
+            "metadata_sha256": "24939b84ead30ff4581918c8d5a95aafd377f6a8afc61f30ea18358a8786bfa4",
+            "name": "setuptools",
+            "pypi_metadata_sha256": "d75de8ba0d3304a3d74484fb9f340edb87ef02712da4fa02a2ed92e71b0572dd",
+            "record_sha256": "1b00e6cc97fb071aa56037eb39b99f0adf8e0ef5cf99243de64287be5e4e98de",
+            "sha256": "ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2",
+            "url": "https://files.pythonhosted.org/packages/ef/55/6dc6d6bb953bdfc52519a0059592c52b6e3b8ad51cf8256dffceb55b0610/setuptools-84.2.1-py3-none-any.whl",
+            "version": "84.2.1"
+          },
+          {
+            "bytes": 6299353,
+            "filename": "sympy-1.14.0-py3-none-any.whl",
+            "metadata_sha256": "b756c2fbfd5be05ac5bdb0ebca61f55618f30f633ed92d88a5687429313a7595",
+            "name": "sympy",
+            "pypi_metadata_sha256": "7f17c97b2d9ccec17969f30bd7e43c58db3de1145cd1cf00773e48991048d176",
+            "record_sha256": "abd10691397bcfd7b3f5b1b5b71ee2dd59fa133ce3e2656543e7244cb796e389",
+            "sha256": "e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5",
+            "url": "https://files.pythonhosted.org/packages/a2/09/77d55d46fd61b4a135c444fc97158ef34a095e5681d0a6c10b75bf356191/sympy-1.14.0-py3-none-any.whl",
+            "version": "1.14.0"
+          },
+          {
+            "bytes": 536198,
+            "filename": "mpmath-1.3.0-py3-none-any.whl",
+            "metadata_sha256": "44b66ea444b9c0d19ae94815d356bf047ae6b680c19268b5c265687cd6a81406",
+            "name": "mpmath",
+            "pypi_metadata_sha256": "cc8d63714e311b9a2f9419d8dcb63d52190b5f69a63bc85e570987a434dc7a57",
+            "record_sha256": "944fc817cb47cf14dac9adea1060f37df3e4d5ff4bf47eb7b0c412065161922f",
+            "sha256": "a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c",
+            "url": "https://files.pythonhosted.org/packages/43/e3/7d92a15f894aa0c9c4b49b8ee9ac9850d6e63b03c9c32c0367a13ae62209/mpmath-1.3.0-py3-none-any.whl",
+            "version": "1.3.0"
+          },
+          {
+            "bytes": 2142205,
+            "filename": "networkx-3.7-py3-none-any.whl",
+            "metadata_sha256": "ffcf42a343af6ffc54ff9cc4c09cf9638cd73b131370f395abd11b630186c90c",
+            "name": "networkx",
+            "pypi_metadata_sha256": "7f1ed131b5a2e9e53bd980cfce44f80960241c76ea494935c3ec798bed686442",
+            "record_sha256": "8e9a00c8b8f36ecf605de22424b06a0e2748063d232080a5e389cee5118aa1ad",
+            "sha256": "e3fd2c13a7814cee3746340d8d7f8598a67f16a58bf47fb7f8793fab6efca1b0",
+            "url": "https://files.pythonhosted.org/packages/7e/cd/fe58041e9011f307c490e3e17dd48cc516448f7c698a3f2d9d9d65d7e6a8/networkx-3.7-py3-none-any.whl",
+            "version": "3.7"
+          },
+          {
+            "bytes": 134899,
+            "filename": "jinja2-3.1.6-py3-none-any.whl",
+            "metadata_sha256": "68c5548fb67c4132a13898d9b31ec50c6bea2abdd915d921f214355c3a6499c8",
+            "name": "jinja2",
+            "pypi_metadata_sha256": "1bc757d7065f3e67d3a49e72ebc731d0774055575732592eede9820c136329cc",
+            "record_sha256": "2e9f60b12e1a436c1ac6fdbded6090b6b791eb8d6753935c49941846e05a294d",
+            "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67",
+            "url": "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl",
+            "version": "3.1.6"
+          },
+          {
+            "bytes": 12050,
+            "filename": "markupsafe-3.0.4-cp312-cp312-macosx_11_0_arm64.whl",
+            "metadata_sha256": "66767d76388ece15d49d50dafb655891ef5d868715e7128e7f7d737a70b353c4",
+            "name": "markupsafe",
+            "pypi_metadata_sha256": "85cd5bce3f85e67ab0b921be9c9ba144a7cc01a2d02b85ad65b1f8dabeac4c57",
+            "record_sha256": "1d111ccbb87f88b6da8af06d58cd6738679fbde1a6a8d3085d133e8a0e1f84fc",
+            "sha256": "0930db9bdc62d22944e10b066448bb65dc9abe9112880c7cab8da54db4284d5f",
+            "url": "https://files.pythonhosted.org/packages/a2/f0/d6613774d86fbf6d145751d43c59875e47a6f9f17daee0aef173bd36d90e/markupsafe-3.0.4-cp312-cp312-macosx_11_0_arm64.whl",
+            "version": "3.0.4"
+          }
+        ]
+      }
+    }
+  }
+}

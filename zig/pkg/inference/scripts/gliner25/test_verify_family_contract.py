@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 import benchmark_family_python as benchmark
+import benchmark_decide_pairs as pairs
 import verify_family_contract as family
 
 
@@ -333,6 +334,199 @@ class FamilyBenchmarkContractTest(unittest.TestCase):
         self.assertEqual("decision", prepare({"id": "choice"}))
         extract.assert_not_called()
         decide.assert_called_once_with({"id": "choice"})
+
+
+class PortableDecideRuntimeTest(unittest.TestCase):
+    def fixture(self, root: Path):
+        import csv
+        import io
+        import zipfile
+        wheel_dir = root / "wheels"
+        wheel_dir.mkdir()
+        payload = {"portable.py": b"trusted = True\n", "portable-1.0.dist-info/METADATA": b"Metadata-Version: 2.4\nName: portable\nVersion: 1.0\n"}
+        record = "portable-1.0.dist-info/RECORD"
+        output = io.StringIO(newline="")
+        writer = csv.writer(output, lineterminator="\n")
+        for path, raw in payload.items():
+            digest = base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).rstrip(b"=").decode()
+            writer.writerow([path, "sha256=" + digest, len(raw)])
+        writer.writerow([record, "", ""])
+        payload[record] = output.getvalue().encode()
+        path = wheel_dir / "portable-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, raw in payload.items():
+                archive.writestr(name, raw)
+        files = {name: {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw), "wheel": path.name, "mode": 0o600} for name, raw in payload.items()}
+        scope = {"packages": {"portable": "1.0"}, "wheels": [{"name": "portable", "version": "1.0", "filename": path.name, "bytes": path.stat().st_size, "sha256": benchmark.sha256(path), "record_sha256": files[record]["sha256"], "metadata_sha256": files["portable-1.0.dist-info/METADATA"]["sha256"]}], "files": files}
+        installed = root / "runtime"
+        for name, raw in payload.items():
+            destination = installed / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(raw)
+            destination.chmod(0o600)
+        return wheel_dir, path, installed, scope
+
+    def test_portable_artifact_and_full_payload_authentication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wheels, wheel, installed, scope = self.fixture(Path(tmp))
+            self.assertEqual(scope["files"], benchmark._portable_wheels(wheels, scope))
+            self.assertEqual({"files": 3}, benchmark._portable_tree(installed, scope["files"]))
+            (installed / "portable.py").chmod(0o700)
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "identity differs"):
+                benchmark._portable_tree(installed, scope["files"])
+            (installed / "portable.py").chmod(0o600)
+            (installed / "portable.py").write_bytes(b"trusted = False\n")
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "identity differs"):
+                benchmark._portable_tree(installed, scope["files"])
+            wheel.write_bytes(wheel.read_bytes() + b"tamper")
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "artifact identity"):
+                benchmark._portable_wheels(wheels, scope)
+
+    def test_portable_rejects_installer_record_rewrite_extra_and_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, installed, scope = self.fixture(Path(tmp))
+            extra = installed / "sitecustomize.py"
+            extra.write_bytes(b"untrusted\n")
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "inventory differs"):
+                benchmark._portable_tree(installed, scope["files"])
+            extra.unlink()
+            code = installed / "portable.py"
+            raw = code.read_bytes()
+            code.unlink()
+            outside = Path(tmp) / "outside.py"
+            outside.write_bytes(raw)
+            code.symlink_to(outside)
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "symlink"):
+                benchmark._portable_tree(installed, scope["files"])
+            code.unlink()
+            code.write_bytes(raw)
+            code.chmod(0o600)
+            record = installed / "portable-1.0.dist-info/RECORD"
+            record.write_bytes(record.read_bytes() + b"INSTALLER,sha256=notallowed,1\n")
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "identity differs"):
+                benchmark._portable_tree(installed, scope["files"])
+
+    def test_portable_rejects_recipe_metadata_forgery_and_package_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wheels, _, _, scope = self.fixture(Path(tmp))
+            saved = scope["wheels"][0]["record_sha256"]
+            scope["wheels"][0]["record_sha256"] = "0" * 64
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "metadata identity"):
+                benchmark._portable_wheels(wheels, scope)
+            scope["wheels"][0]["record_sha256"] = saved
+            scope["wheels"].append(scope["wheels"][0])
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "package identity"):
+                benchmark._portable_wheels(wheels, scope)
+
+    def test_portable_rejects_archive_paths_even_with_matching_artifact_hash(self):
+        import zipfile
+        with tempfile.TemporaryDirectory() as tmp:
+            wheels, wheel, _, scope = self.fixture(Path(tmp))
+            with zipfile.ZipFile(wheel, "a") as archive:
+                archive.writestr("../escaped.py", b"untrusted")
+            scope["wheels"][0].update(bytes=wheel.stat().st_size, sha256=benchmark.sha256(wheel))
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "path escapes"):
+                benchmark._portable_wheels(wheels, scope)
+
+    def test_paired_runtime_contract_parser_and_exact_command_forwarding(self):
+        import argparse
+        required = ["--binary", "binary", "--build-receipt", "build.json", "--model-dir", "model",
+                    "--upstream", "source", "--runtime-dir", "runtime", "--output", "output", "--backend", "native"]
+        self.assertIsNone(pairs.parse_args(required).runtime_contract)
+        explicit = pairs.parse_args(required + ["--runtime-contract", "runtime-v2.json"])
+        self.assertEqual(Path("runtime-v2.json").resolve(), explicit.runtime_contract)
+        for selected in (None, Path("runtime-v2.json").resolve()):
+            with tempfile.TemporaryDirectory() as tmp:
+                args = argparse.Namespace(python=Path("python"), backend="native", model_dir=Path("model"),
+                                          upstream=Path("source"), runtime_dir=Path("runtime"), runtime_contract=selected, timeout=1)
+                captured = []
+                def child(command, env, log, timeout):
+                    captured.append(command)
+                    return 1  # Retain the deliberate child failure; launch nothing.
+                with mock.patch.object(pairs.perf, "source_identity", return_value={"source": "fixed"}), \
+                     mock.patch.object(pairs.perf, "host_context", return_value={}), \
+                     mock.patch.object(pairs.perf, "run_child", side_effect=child), \
+                     mock.patch.object(pairs.perf, "parse_time", return_value={}), \
+                     mock.patch.object(Path, "read_text", return_value=""):
+                    receipt = pairs.run_python(args, Path(tmp) / "out")
+                self.assertFalse(receipt["passed"])
+                if selected is None:
+                    self.assertNotIn("--runtime-contract", captured[0])
+                else:
+                    index = captured[0].index("--runtime-contract")
+                    self.assertEqual(str(selected), captured[0][index + 1])
+
+    def test_portable_module_resolution_rejects_same_version_foreign_source(self):
+        root = Path("runtime-root").resolve()
+        runtime = root / "runtime"
+        upstream = root / "upstream"
+        external = root / "venv/lib/python3.12/site-packages"
+        origins = {"torch": external / "torch/__init__.py", "pydantic": external / "pydantic/__init__.py",
+                   "transformers": runtime / "transformers/__init__.py", "gliner2": upstream / "gliner2/__init__.py"}
+        def find(name):
+            return mock.Mock(origin=str(origins[name]))
+        with mock.patch.object(benchmark.importlib.util, "find_spec", side_effect=find), mock.patch.object(benchmark, "sys", mock.Mock(modules={})), mock.patch.object(benchmark, "verify_source", return_value={}):
+            benchmark.verify_portable_import_sources(runtime, upstream)
+            origins["torch"] = root / "foreign/torch/__init__.py"
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "import source differs"):
+                benchmark.verify_portable_import_sources(runtime, upstream)
+
+    def python_archive(self, root, escape=False):
+        import tarfile
+        import io
+        path = root / "python.tar.gz"
+        with tarfile.open(path, "w:gz") as archive:
+            for name, raw in [("python/bin/python3.12", b"authenticated executable"), ("python/lib/__pycache__/ignored.pyc", b"official precompiled bytecode")]:
+                member = tarfile.TarInfo(name)
+                member.size = len(raw)
+                member.mode = 0o755 if name.endswith("python3.12") else 0o644
+                archive.addfile(member, io.BytesIO(raw))
+            link = tarfile.TarInfo("python/bin/python")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../../outside" if escape else "python3.12"
+            archive.addfile(link)
+        return path, {"archive": {"filename": path.name, "bytes": path.stat().st_size, "sha256": benchmark.sha256(path)}, "omit_python_bytecode": True}
+
+    def test_clean_python_is_derived_from_exact_archive_without_cached_bytecode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive, recipe = self.python_archive(root)
+            prefix = root / "prefix"
+            facts = benchmark._portable_python(archive, recipe, prefix)
+            self.assertEqual({"bin/python", "bin/python3.12"}, set(facts))
+            self.assertFalse(any(prefix.rglob("*.pyc")))
+            benchmark._portable_prefix(prefix, facts)
+            (prefix / "bin/python3.12").chmod(0o644)
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "identity differs"):
+                benchmark._portable_prefix(prefix, facts)
+
+    def test_python_archive_rejects_unmatched_artifact_and_escaping_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive, recipe = self.python_archive(root, escape=True)
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "symlink escapes"):
+                benchmark._portable_python(archive, recipe)
+            recipe["archive"]["sha256"] = "0" * 64
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "archive identity"):
+                benchmark._portable_python(archive, recipe)
+
+    def test_v2_dispatch_is_explicit_and_v1_default_unchanged(self):
+        with mock.patch.object(benchmark, "verify_portable_runtime_dir", return_value={"v2": True}) as portable:
+            self.assertEqual({"v2": True}, benchmark.verify_runtime_dir(Path("runtime"), {"format_version": 2}))
+            portable.assert_called_once()
+        contract = benchmark.strict_json(benchmark.RUNTIME_CONTRACT_1B)
+        with mock.patch.object(benchmark.platform, "python_version", return_value="wrong"):
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "Python/Unicode"):
+                benchmark.verify_runtime_dir(Path("runtime"), contract)
+
+    def test_v2_cannot_change_frozen_numerical_or_version_contract(self):
+        original = benchmark.strict_json(benchmark.RUNTIME_CONTRACT_1B)
+        for key in ("python", "unicode", "isolated_packages", "external_packages", "rope_contract", "transformers_distribution"):
+            changed = json.loads(json.dumps(original))
+            changed["format_version"] = 2
+            changed["oracle_runtime_decide_1b"][key] = "changed"
+            with self.subTest(key=key), self.assertRaisesRegex(benchmark.BenchmarkError, "changes frozen contract"):
+                benchmark.verify_runtime_dir(Path("runtime"), changed)
 
 
 if __name__ == "__main__":
