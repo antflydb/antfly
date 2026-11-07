@@ -43,6 +43,8 @@ pub const Ports = struct {
     /// configuration, pagination revision and topology before returning.
     fan_in_fn: *const fn (*anyopaque, A, Definition, index.Partition, i64) anyerror!FanIn,
     submit_fn: *const fn (*anyopaque, contract.Command) anyerror!void,
+    /// Optional atomic metadata publisher for one owned source-control page.
+    submit_many_fn: ?*const fn (*anyopaque, []const contract.Command) anyerror!void = null,
     /// Nonblocking ordinary producer/graph visibility observation.
     settled_fn: *const fn (*anyopaque, u64, []const []const u8) anyerror!bool,
 };
@@ -108,6 +110,20 @@ pub const Worker = struct {
     }
     /// One bounded activation or delivery slice. Callers yield between slices
     /// and back off transient route/readiness/provider failures.
+    const SourceControls = struct {
+        allocator: A,
+        ports: Ports,
+        commands: std.ArrayList(contract.Command) = .empty,
+        fn submit(self: *@This(), command: contract.Command) !void {
+            if (self.ports.submit_many_fn == null) return self.ports.submit_fn(self.ports.ptr, command);
+            if (self.commands.items.len == contract.max_page_items) return error.InvalidGroupedSourceCommand;
+            try self.commands.append(self.allocator, command);
+        }
+        fn flush(self: *@This()) !void {
+            if (self.commands.items.len != 0) try self.ports.submit_many_fn.?(self.ports.ptr, self.commands.items);
+        }
+    };
+
     pub fn sourceStep(self: *Worker, a: A, ports: Ports, definition: Definition) !void {
         const activated = try query(bool, a, ports, definition.route.value, contract.Query{ .action = .activation, .artifact = definition.artifact, .definition = definition.definition });
         if (!activated) {
@@ -128,6 +144,11 @@ pub const Worker = struct {
         const page = try query(reads.PointerPage, a, ports, definition.route.value, contract.Query{ .action = .outbox, .artifact = definition.artifact, .definition = definition.definition, .cursor = cursor_state.source, .limit = 128 });
         // One page is bounded; visit other queues even while this one waits
         // for expensive ordinary producers on a coordinator.
+        var controls: SourceControls = .{ .allocator = a, .ports = ports };
+        defer controls.commands.deinit(a);
+        // A failed page remains durable. Do not skip its uncommitted controls
+        // just because discovery visited their pointers before publication.
+        errdefer if (ports.submit_many_fn != null) self.advance(&cursor_state.source, "") catch {};
         for (page.rows) |pointer| {
             const selected = try reads.decode(a, pointer.key_base64);
             // Keep fair progress even if one remote owner or source event
@@ -141,12 +162,12 @@ pub const Worker = struct {
             const status = try query(Status, a, ports, route, .{ .action = "status", .artifact = definition.artifact, .definition = definition.definition, .group = group.key, .segment = event.partition.segment, .cell = event.partition.cell, .source_owner = definition.source_owner, .event = event });
             if (status.event_status) |receipt| {
                 if (receipt.source_revision == event.source_revision and receipt.propagated and receipt.settled) {
-                    try ports.submit_fn(ports.ptr, .{ .action = .acknowledge, .artifact = definition.artifact, .definition = definition.definition, .namespace = definition.namespace, .acknowledge = .{ .document = event.document, .key_base64 = pointer.key_base64, .observed_base64 = pointer.value_base64 } });
+                    try controls.submit(.{ .action = .acknowledge, .artifact = definition.artifact, .definition = definition.definition, .namespace = definition.namespace, .acknowledge = .{ .document = event.document, .key_base64 = pointer.key_base64, .observed_base64 = pointer.value_base64 } });
                     continue;
                 }
                 if (receipt.source_revision == event.source_revision) {
                     if (!event.delivered) {
-                        try ports.submit_fn(ports.ptr, .{ .action = .acknowledge, .artifact = definition.artifact, .definition = definition.definition, .namespace = definition.namespace, .acknowledge = .{ .document = event.document, .key_base64 = pointer.key_base64, .observed_base64 = pointer.value_base64, .delivery = true } });
+                        try controls.submit(.{ .action = .acknowledge, .artifact = definition.artifact, .definition = definition.definition, .namespace = definition.namespace, .acknowledge = .{ .document = event.document, .key_base64 = pointer.key_base64, .observed_base64 = pointer.value_base64, .delivery = true } });
                         continue;
                     }
                     // Poll providers without appending empty Raft controls.
@@ -155,11 +176,12 @@ pub const Worker = struct {
                 }
             } else if (event.delivered) {
                 // A replaced/restored coordinator must enroll the event again.
-                try ports.submit_fn(ports.ptr, .{ .action = .acknowledge, .artifact = definition.artifact, .definition = definition.definition, .namespace = definition.namespace, .acknowledge = .{ .document = event.document, .key_base64 = pointer.key_base64, .observed_base64 = pointer.value_base64, .delivery = false } });
+                try controls.submit(.{ .action = .acknowledge, .artifact = definition.artifact, .definition = definition.definition, .namespace = definition.namespace, .acknowledge = .{ .document = event.document, .key_base64 = pointer.key_base64, .observed_base64 = pointer.value_base64, .delivery = false } });
                 continue;
             }
-            try ports.submit_fn(ports.ptr, .{ .action = .invalidate, .artifact = definition.artifact, .definition = definition.definition, .namespace = status.namespace, .invalidate = .{ .owner = definition.source_owner, .event = event } });
+            try controls.submit(.{ .action = .invalidate, .artifact = definition.artifact, .definition = definition.definition, .namespace = status.namespace, .invalidate = .{ .owner = definition.source_owner, .event = event } });
         }
+        try controls.flush();
         try self.advance(&cursor_state.source, if (page.done) "" else page.cursor);
     }
     /// Group-local ordering and leases serialize only the dependent units.

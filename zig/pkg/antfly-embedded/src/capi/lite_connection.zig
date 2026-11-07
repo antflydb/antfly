@@ -850,6 +850,51 @@ pub const PreparedPublication = struct {
     /// newly opened DB/index/provider runtime. Borrow the already pinned raw
     /// store under ordinary checked writer admission. Prepared output uses the
     /// same proof when its dependencies fit this captured namespace.
+    fn submitGroupSource(raw: *anyopaque, command: @import("../storage/db/group_source_contract.zig").Command) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (comptime h.builtin.is_test) if (self.owner.test_before_group_command) |hook| hook.notify(hook.ptr, command);
+        // Every command validates its lease/revision and catalog against the
+        // admitted primary cut. Discovery/fan-in and sibling commands never
+        // borrow this lease. The detached DB's index actors are not authority
+        // for a primary-only control publication.
+        try Owner.enterMaintenanceWriter(self.snapshot_root, .primary);
+        defer Owner.leaveMaintenanceWriter(self.snapshot_root);
+        const database = try self.groupCommandDatabase();
+        try database.batch(.{ .group_source = command, .sync_level = .write });
+        self.owner.notifyMutation();
+    }
+
+    fn groupCommandDatabase(self: *@This()) !*h.db_mod.DB {
+        const database = self.snapshot_database;
+        try self.validateStorageCurrent(&self.snapshot_root.owned_lite_backend.?.native_docstore.?.file);
+        try database.core.store.invalidateDetachedSourceObservations();
+        var read = try database.core.store.beginReadTxn();
+        const sequence = database.core.store.lastReplaySequenceFromTxn(&read, 0) catch |err| {
+            read.abort();
+            return err;
+        };
+        read.abort();
+        database.core.store.observeExternalReplayCommit(sequence);
+        return database;
+    }
+
+    fn submitGroupSourceControls(raw: *anyopaque, commands: []const @import("../storage/db/group_source_contract.zig").Command) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (comptime h.builtin.is_test) if (self.owner.test_before_group_command) |hook| for (commands) |command| hook.notify(hook.ptr, command);
+        try Owner.enterMaintenanceWriter(self.snapshot_root, .primary);
+        defer Owner.leaveMaintenanceWriter(self.snapshot_root);
+        const database = try self.groupCommandDatabase();
+        const file = &self.snapshot_root.owned_lite_backend.?.native_docstore.?.file;
+        const before = file.activeCheckpoint().commit_sequence;
+        try database.batchGroupSourceControls(commands);
+        const commits = file.activeCheckpoint().commit_sequence - before;
+        std.debug.assert(commits <= 1);
+        self.owner.publication_stats.group_source_control_batches +|= 1;
+        self.owner.publication_stats.group_source_control_commands +|= commands.len;
+        self.owner.publication_stats.group_source_control_commits +|= commits;
+        self.owner.notifyMutation();
+    }
+
     fn acquireCapturedStore(self: *@This(), fence: ?WriteFence, now_ms: u64) !StoreLease {
         try Owner.enterMaintenanceWriter(self.snapshot_root, .primary);
         errdefer Owner.leaveMaintenanceWriter(self.snapshot_root);
@@ -1415,6 +1460,7 @@ pub const MaintenanceHoldSites = struct {
     turn_capture: Site = .{},
     /// Time inside `turn_capture`, by step (total ns).
     capture_steps: CaptureSteps = .{},
+    capture_max_steps: CaptureSteps = .{},
     storage_turn: Site = .{},
     idle_adopt: Site = .{},
 
@@ -1446,14 +1492,19 @@ pub const CaptureSteps = struct {
     schedule_ns: u64 = 0,
     snapshot_ns: u64 = 0,
     publication_catalog_ns: u64 = 0,
+    setup_ns: u64 = 0,
+    ready_merge_ns: u64 = 0,
+    finish_ns: u64 = 0,
 };
 
 /// Splits one held interval into consecutive steps.
 const StepClock = struct {
     last: i96,
-    fn mark(self: *StepClock, total: *u64) void {
+    fn mark(self: *StepClock, total: *u64, maximum: *u64) void {
         const now = nowNs();
-        total.* +|= @intCast(@max(0, now - self.last));
+        const elapsed: u64 = @intCast(@max(0, now - self.last));
+        total.* +|= elapsed;
+        maximum.* = @max(maximum.*, elapsed);
         self.last = now;
     }
 };
@@ -1588,6 +1639,9 @@ pub const Owner = struct {
         maintenance_rounds: u64 = 0,
         maintenance_database_turns: u64 = 0,
         maintenance_source_turns: u64 = 0,
+        group_source_control_batches: u64 = 0,
+        group_source_control_commands: u64 = 0,
+        group_source_control_commits: u64 = 0,
         covered_source_observations: u64 = 0,
         serving_physical_turns: u64 = 0,
         admitted_merge_captures: u64 = 0,
@@ -1703,6 +1757,8 @@ pub const Owner = struct {
     embedding_memo: ?memo_mod.QueryEmbeddingCache = null,
     embedding_memo_budget: cache_budget.CacheBudget = .init(embedding_memo_bytes),
     test_after_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *h.Handle) void } else void = if (h.builtin.is_test) null else {},
+    test_before_group_source: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
+    test_before_group_command: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, @import("../storage/db/group_source_contract.zig").Command) void } else void = if (h.builtin.is_test) null else {},
     test_after_allocator_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *native.NativeFile) void } else void = if (h.builtin.is_test) null else {},
     test_before_allocator_reader_close: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *native.NativeFile) void } else void = if (h.builtin.is_test) null else {},
     test_allocator_wait: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
@@ -3379,11 +3435,12 @@ pub const Owner = struct {
         var clock: StepClock = .{ .last = turn_held_from };
         var lease_held = true;
         defer if (lease_held) {
+            clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.finish_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.finish_ns);
             lease.close();
             MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.turn_capture, turn_held_from);
         };
         const foreground = try self.refresh();
-        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.refresh_ns);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.refresh_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.refresh_ns);
         if (needsOutcomeReconciliation(foreground)) {
             self.discardMaintenanceRuntime();
             self.maintenance_turn_deferred = true;
@@ -3403,7 +3460,7 @@ pub const Owner = struct {
         // canceled before its detached graph walk can finish.
         if (self.options.open_mode == .writer)
             try self.artifact_marker_sweep.run(foreground_file);
-        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.marker_sweep_ns);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.marker_sweep_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.marker_sweep_ns);
         if (self.options.open_mode == .writer and !foreground_file.free_pages_verified) {
             if (!self.allocator_proof_mutex.tryLock()) return true;
             defer self.allocator_proof_mutex.unlock(io);
@@ -3415,7 +3472,7 @@ pub const Owner = struct {
         }
         try @import("sql_commit.zig").recover(foreground);
         try @import("sql_ddl.zig").recover(foreground);
-        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.recover_ns);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.recover_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.recover_ns);
         // A ready result can outlive its namespace. Validate before selection
         // so a dropped table cannot strand its job forever. Publish ready
         // merges before source retries which may need their segment capacity.
@@ -3535,7 +3592,7 @@ pub const Owner = struct {
             database = (if (self.options.profile == .native and namespace_root != foreground) self.openMaintenanceNamespace(namespace_root, name) else @import("tables.zig").get(namespace_root, name)) catch return true;
             selected = namespace_root.embedded_tables.get(name).?;
         };
-        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.catalog_ns);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.catalog_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.catalog_ns);
         const selection_root = selected_root orelse foreground;
         const selection_file = &selection_root.owned_lite_backend.?.native_docstore.?.file;
         var namespace_pending = self.options.open_mode == .writer and try hasPendingReplay(database);
@@ -3546,7 +3603,7 @@ pub const Owner = struct {
         defer authority_arena.deinit();
         if (self.options.open_mode == .writer and try @import("resolver_authority.zig").hasProjectionDebt(selection_root, database, authority_arena.allocator())) namespace_pending = true;
         const group_state = try self.groupSourceStateNamed(database, if (selected) |table| table.name else "default");
-        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.debt_checks_ns);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.debt_checks_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.debt_checks_ns);
         const allocator_stats = stats: {
             const foreground_store = selection_root.owned_lite_backend.?.native_docstore.?;
             foreground_store.mutex.lock();
@@ -3607,14 +3664,21 @@ pub const Owner = struct {
         // Group fan-in is bounded control work on the current coordinator.
         // Alternate it with detached provider replay per namespace so a busy
         // root or a long backfill cannot starve a child or its consumers.
-        if (!publish_ready_merge and self.options.open_mode == .writer and schedule.group_source_next and
+        var group_source_turn = false;
+        if (!publish_ready_merge and self.options.open_mode == .writer and schedule.has_group_sources and schedule.group_source_next and
             now >= schedule.next_group_source_ns)
         {
             // Group queues can advance through cursor/lease observations
             // without appending a journal record. Their poll deadline is an
             // independent wake source, not evidence that providers must run.
             schedule.next_group_source_ns = now + 100 * std.time.ns_per_ms;
-            if (try database.runGroupSourceMaintenanceSlice(group_state)) {
+            if (self.options.profile == .native) {
+                // A worker can submit several control commands. Capture its
+                // immutable runtime here, then discover/fan in off admission
+                // and admit commands individually through PreparedPublication.
+                group_source_turn = true;
+                schedule.group_source_next = false;
+            } else if (try database.runGroupSourceMaintenanceSlice(group_state, null)) {
                 schedule.group_source_next = false;
                 self.runnable_sources.notify(io, .{ .table_id = database.core.identity_namespace.table_id, .incarnation = database.root_incarnation });
                 schedule.database_pending = true;
@@ -3622,7 +3686,7 @@ pub const Owner = struct {
                 return true;
             }
         }
-        schedule.group_source_next = true;
+        if (!group_source_turn) schedule.group_source_next = true;
         var ttl_more = false;
         if (!publish_ready_merge and now >= schedule.next_ttl_ns) {
             // Each namespace owns its cleanup cadence. Failure still consumes
@@ -3676,11 +3740,12 @@ pub const Owner = struct {
                     debt.records >= @max(@as(u64, 1), @min(64, debt.limits.records / 4))) schedule.next_artifact_ns = now;
             }
         }
-        const run_source = !publish_ready_merge and if (self.options.profile == .native)
+        const ordinary_source_due = if (self.options.profile == .native)
             namespace_pending or schedule.database_pending or entry_sequence != schedule.serviced_sequence or
                 database.core.nextDerivedSequence() != entry_sequence or now >= schedule.next_database_audit_ns
         else
             self.maintenance_pending;
+        const run_source = !publish_ready_merge and (group_source_turn or ordinary_source_due);
         const run_database = publish_ready_merge or run_source or (schedule.artifact_pending and now >= schedule.next_artifact_ns);
         var serving_physical_serviced = false;
         var serving_retirement_more = false;
@@ -3768,7 +3833,7 @@ pub const Owner = struct {
         // merely because inference or segment construction is still running.
         // Hosted/manual runtimes retain their caller-supplied provider borrow.
         const independent = self.options.profile == .native;
-        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.schedule_ns);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.schedule_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.schedule_ns);
         const root = selected_root orelse if (independent) try self.refreshMaintenanceSnapshotNamed(foreground, if (run_source) .source else if (run_database) .artifacts else .storage, if (selected) |table| table.name else null) else foreground;
         if (independent and run_database) {
             database = if (selected) |table| try @import("tables.zig").get(root, table.name) else &root.db;
@@ -3783,12 +3848,12 @@ pub const Owner = struct {
         // Replay may lazily open reads against this captured primary tip.
         // Retain its data frontier through the bounded replay window; artifact
         // leases and catalog fingerprints do not protect these primary roots.
-        var source_read = if (run_source) try database.core.store.runtime_store.beginRead() else null;
+        var source_read = if (run_source and !group_source_turn) try database.core.store.runtime_store.beginRead() else null;
         defer if (source_read) |*read| read.abort();
-        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.snapshot_ns);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.snapshot_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.snapshot_ns);
         var catalog = if (run_database) try PublicationCatalog.captureForStoragePublication(turn_alloc, root, database, publication_name) else null;
         defer if (catalog) |*proof| proof.deinit();
-        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.publication_catalog_ns);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.publication_catalog_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.publication_catalog_ns);
         // Artifact/control turns may continue a previously validated source
         // runtime. They cannot promote an artifact-only runtime into one.
         const had_source_runtime = if (self.text_source_runtime_cache) |cache| cache.root == root else false;
@@ -3869,6 +3934,7 @@ pub const Owner = struct {
         if (run_source) database.async_context.replay_publication = .{ .ptr = &publication, .publish = PreparedPublication.publishReplay };
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
         const publication_overhead_before = group_state.publication_overhead_ns.load(.monotonic);
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.setup_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.setup_ns);
         if (publish_ready_merge and split_index_work and !run_source) {
             // Immutable output and source-coordinate lookup were prepared off
             // admission. Reconstruct current source deletions on this fresh
@@ -3942,8 +4008,10 @@ pub const Owner = struct {
             self.publication_stats.publication_hold_ns +|= @intCast(@max(0, nowNs() - started));
             self.publication_stats.maintenance_capture_ns +|= @import("antfly_platform").time.monotonicNs() -| turn_started;
             self.maintenance_storage_pending = true;
+            clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.ready_merge_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.ready_merge_ns);
             return self.finishMaintenanceVisit(lookup_pending, true, audit_round_end);
         }
+        clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.finish_ns, &self.publication_stats.maintenance_hold_sites.capture_max_steps.finish_ns);
         lease.close();
         MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.turn_capture, turn_held_from);
         lease_held = false;
@@ -3969,7 +4037,7 @@ pub const Owner = struct {
         // turn before replay, whose serving-index publication invalidates the
         // broad capture. Unrelated serving writes may rebase this turn, while
         // changes to any selected shadow generation still reject publication.
-        const projected = if (run_source and maintenance_error == null) @import("resolver_authority.zig").pullProjection(root, database, turn_alloc) catch |err| blk: {
+        const projected = if (run_source and !group_source_turn and maintenance_error == null) @import("resolver_authority.zig").pullProjection(root, database, turn_alloc) catch |err| blk: {
             if (err == error.TextMergeProducerDeferred) {
                 source_capacity_yield = true;
                 break :blk false;
@@ -3978,7 +4046,23 @@ pub const Owner = struct {
             break :blk false;
         } else false;
         var retain_artifact_runtime = !run_database and root.db_live and self.maintenance_retained_logical != null;
-        var pending = if (maintenance_error != null or source_capacity_yield) true else if (run_source and !projected) database.runBackgroundTurnWithCancellation(cancellation, if (shadow_scopes.items.len != 0) .shadow else if (split_index_work) .replay else .complete) catch |err| blk: {
+        var group_source_changed = false;
+        var pending = if (maintenance_error != null or source_capacity_yield) true else if (group_source_turn) group: {
+            // Queries pin fresh primary cuts after admission. Command CAS and
+            // group lease checks execute again inside their individual writer
+            // admission; the source/ack cursor cannot authorize stale effects.
+            const previous = store.primary_reads_require_admission;
+            store.primary_reads_require_admission = true;
+            defer store.primary_reads_require_admission = previous;
+            if (comptime h.builtin.is_test) if (self.test_before_group_source) |hook| hook.notify(hook.ptr);
+            group_source_changed = database.runGroupSourceMaintenanceSlice(group_state, .{ .ptr = &publication, .submit_fn = PreparedPublication.submitGroupSource, .submit_many_fn = PreparedPublication.submitGroupSourceControls }) catch |err| {
+                maintenance_error = err;
+                break :group true;
+            };
+            // An idle control poll must not manufacture provider replay debt.
+            // Keep a pre-existing ordinary turn, or wake it for committed work.
+            break :group ordinary_source_due or group_source_changed;
+        } else if (run_source and !projected) database.runBackgroundTurnWithCancellation(cancellation, if (shadow_scopes.items.len != 0) .shadow else if (split_index_work) .replay else .complete) catch |err| blk: {
             // Capacity is scheduler control flow, not a stale source. Keep
             // its immutable runtime and service the merges that return credits.
             // Treating it as a source failure skips that service indefinitely.
@@ -3995,11 +4079,11 @@ pub const Owner = struct {
         // its own continuation. An artifact-only turn must never re-run source
         // providers, replay, relational sweeps or status snapshot publication.
         const source_more = run_source and (pending or projected or publication.index_inputs_changed or maintenance_error != null);
-        const source_completed = run_source and maintenance_error == null and !source_capacity_yield;
+        const source_completed = run_source and !group_source_turn and maintenance_error == null and !source_capacity_yield;
         // Another consumer may have advanced before a sibling capacity yield.
         // Its durable fragment/coverage is useful progress even though the
         // complete source round must remain pending.
-        const source_advanced = if (run_source and maintenance_error == null) replay_progress.?.advanced(database) else false;
+        const source_advanced = if (run_source and !group_source_turn and maintenance_error == null) replay_progress.?.advanced(database) else false;
         // The schedule map can grow while the owner gate is released.
         var artifact_more = !run_database and captured_artifact_pending;
         var artifact_delay_ns: u64 = 100 * std.time.ns_per_ms;
@@ -4200,7 +4284,7 @@ pub const Owner = struct {
         if (maintenance_error) |err| {
             self.noteMaintenanceFailure(err, publication.identity.table_id, maintenance_error_phase);
         } else self.publication_stats.last_maintenance_error = null;
-        if (source_more and source_advanced) {
+        if (source_more and (source_advanced or group_source_changed)) {
             self.runnable_sources.notify(io, .{ .table_id = publication.identity.table_id, .incarnation = publication.incarnation });
             self.publication_stats.maintenance_progress_requeues +|= 1;
         }
@@ -4645,15 +4729,19 @@ pub const Owner = struct {
         // Numeric/enum diagnostics only: no path, SQL, model or document data.
         // Preparation overlaps actor service; durations are not additive.
         std.log.info("antfly_bench_native_owner source_turns={d} capture_ns={d} replay_ns={d} artifacts_ns={d} storage_ns={d} runtime_refreshes={d} maintenance_errors={d} maintenance_timeouts={d} merge_started={d} merge_applied={d} merge_discarded={d} merge_prepare_ns={d} merge_staging_ns={d} merge_staged_bytes={d} merge_publication_ns={d} sql_overlay_hits={d} sql_overlay_scope_extensions={d} sql_overlay_rebuilds={d} sql_overlay_rebuild_entries={d} sql_overlay_evictions={d} sql_staged_statements={d} replay_waits={d} replay_refused_prepare_ns={d} last_failure={s}", .{ p.maintenance_source_turns, p.maintenance_capture_ns, p.maintenance_replay_ns, p.maintenance_artifacts_ns, p.maintenance_storage_ns, p.serving_runtime_refreshes, p.maintenance_errors, p.maintenance_queue_timeouts, p.text_merge_jobs_started, p.text_merge_jobs_applied, p.text_merge_jobs_discarded, p.text_merge_prepare_ns, p.text_merge_staging_ns, p.text_merge_staged_bytes, p.text_merge_publication_ns, p.sql_constraint_overlay_hits, p.sql_constraint_overlay_scope_extensions, p.sql_constraint_overlay_rebuilds, p.sql_constraint_overlay_rebuild_entries, p.sql_constraint_overlay_evictions, p.sql_constraint_staged_statements, p.replay_backpressure_waits, p.replay_refused_preparation_ns, p.last_maintenance_failure orelse "none" });
+        std.log.info("antfly_bench_native_group_controls batches={d} commands={d} native_commits={d}", .{ p.group_source_control_batches, p.group_source_control_commands, p.group_source_control_commits });
         std.log.info("antfly_bench_native_service covered_observations={d} serving_physical_turns={d} admitted_merge_captures={d} ready_merge_publication_turns={d}", .{ p.covered_source_observations, p.serving_physical_turns, p.admitted_merge_captures, p.ready_merge_publication_turns });
         inline for (@typeInfo(MaintenanceHoldSites).@"struct".field_names) |field_name| {
-            if (comptime !std.mem.eql(u8, field_name, "capture_steps")) {
+            if (comptime !std.mem.eql(u8, field_name, "capture_steps") and !std.mem.eql(u8, field_name, "capture_max_steps")) {
                 const site = @field(p.maintenance_hold_sites, field_name);
                 std.log.info("antfly_bench_native_hold_" ++ field_name ++ " count={d} ns={d} max_ns={d}", .{ site.count, site.ns, site.max_ns });
             }
         }
         const steps = p.maintenance_hold_sites.capture_steps;
         std.log.info("antfly_bench_native_capture_steps refresh_ns={d} marker_sweep_ns={d} recover_ns={d} catalog_ns={d} debt_checks_ns={d} schedule_ns={d} snapshot_ns={d} publication_catalog_ns={d}", .{ steps.refresh_ns, steps.marker_sweep_ns, steps.recover_ns, steps.catalog_ns, steps.debt_checks_ns, steps.schedule_ns, steps.snapshot_ns, steps.publication_catalog_ns });
+        inline for (@typeInfo(CaptureSteps).@"struct".field_names) |field_name| {
+            std.log.info("antfly_bench_native_capture_step_{s} ns={d} max_ns={d}", .{ field_name, @field(steps, field_name), @field(p.maintenance_hold_sites.capture_max_steps, field_name) });
+        }
         inline for (@typeInfo(TextRuntimeCacheDiagnostics).@"struct".field_names) |field_name| {
             const count = @field(p.text_runtime_cache, field_name);
             if (count != 0) std.log.info("antfly_bench_native_runtime_cache_{s} count={d}", .{ field_name, count });
@@ -12028,4 +12116,138 @@ test "capi native consumerless source observes new tips without replaying empty 
     }
     try std.testing.expect(owner.publication_stats.maintenance_source_turns > source_turns);
     try std.testing.expect((try owner.current.?.owned_lite_backend.?.native_docstore.?.file.check()).valid);
+}
+
+test "capi native group discovery releases admission and rebases individual commands" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("group-discovery-command-admission", 1000, .batch);
+    defer fixture.deinit();
+    const owner = fixture.connection.owner;
+    {
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const root = try owner.refresh();
+        try root.db.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread_id", .order_by = "ordinal", .segment_by = "turn_id", .field = "text" } });
+        var txn = try root.db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        const prefix = "\x00\x00__group_cohort_cursor:";
+        try txn.put(prefix ++ "a", "first");
+        try txn.put(prefix ++ "b", "second");
+        const view = @import("../storage/db/group_source_mutations.zig").Reader.fromTxn(&txn);
+        var cursor = try view.cursor_fn(view.ptr, std.testing.allocator);
+        {
+            defer cursor.close();
+            try std.testing.expectEqualStrings(prefix ++ "a", (try cursor.seekAtOrAfter(prefix)).?.key);
+            try std.testing.expectEqualStrings(prefix ++ "b", (try cursor.next()).?.key);
+        }
+        // Closing a borrowed cursor must not abort its cohort transaction.
+        try txn.put(prefix ++ "c", "third");
+        try txn.commit();
+    }
+    try fixture.writeReplaySource(.{ .writes = &.{ .{ .key = "message", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"turn\",\"ordinal\":1,\"text\":\"History episode\"}" }, .{ .key = "other-message", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"turn\",\"ordinal\":2,\"text\":\"Other episode\"}" } }, .sync_level = .write });
+    const Probe = struct {
+        fixture: *AdmissionFollowupFixture,
+        called: bool = false,
+        admission_free: bool = false,
+        foreground_status: h.capi.ErrorCode = .internal,
+        source_edited: bool = false,
+        first_publish_revision: u64 = 0,
+        source_edit_failure: ?anyerror = null,
+        fn beforeCommand(raw: *anyopaque, command: @import("../storage/db/group_source_contract.zig").Command) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (command.action != .publish or self.source_edited) return;
+            self.source_edited = true;
+            self.first_publish_revision = command.publish.?.held.lease.revision;
+            self.fixture.writeReplaySource(.{ .writes = &.{.{ .key = "message", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"turn\",\"ordinal\":1,\"text\":\"Replaced episode\"}" }}, .sync_level = .write }) catch |err| {
+                self.source_edit_failure = err;
+            };
+        }
+        fn notify(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.called) return;
+            self.called = true;
+            self.admission_free = self.fixture.connection.gate.mutex.tryLock();
+            if (!self.admission_free) return;
+            self.fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            // Move the primary tip after service capture, before discovery and
+            // its first command. Command replay sequence and CAS observations
+            // must be based on the new cut, preserving this independent write.
+            self.foreground_status = self.fixture.call(.batch);
+        }
+    };
+    var probe: Probe = .{ .fixture = &fixture };
+    owner.test_before_group_source = .{ .ptr = &probe, .notify = Probe.notify };
+    defer owner.test_before_group_source = null;
+    for (0..64) |_| {
+        _ = try owner.maintenanceTurn();
+        if (probe.called) {
+            var lease = try fixture.connection.acquire();
+            defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            defer lease.close();
+            const root = try owner.refresh();
+            if ((try owner.groupSourceStateNamed(&root.db, "default")).submitted.load(.monotonic) != 0) break;
+        }
+    }
+    try std.testing.expect(probe.called);
+    try std.testing.expect(probe.admission_free);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, probe.foreground_status);
+    owner.test_before_group_command = .{ .ptr = &probe, .notify = Probe.beforeCommand };
+    defer owner.test_before_group_command = null;
+    var replacement_published = false;
+    for (0..256) |_| {
+        {
+            var lease = try fixture.connection.acquire();
+            defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            defer lease.close();
+            const root = try owner.refresh();
+            const state = try owner.groupSourceStateNamed(&root.db, "default");
+            _ = state;
+            owner.maintenance_schedules.getPtr(.{ .table_id = root.db.core.identity_namespace.table_id, .incarnation = root.db.root_incarnation }).?.next_group_source_ns = 0;
+        }
+        _ = try owner.maintenanceTurn();
+        if (!probe.source_edited) continue;
+        if (probe.source_edit_failure) |err| return err;
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const root = try owner.refresh();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const definitions = (try root.db.lookup(a, "", .{ .group_source_query_json = "{\"action\":\"definitions\"}" })).?;
+        const entries = try std.json.parseFromSliceLeaky([]@import("../storage/db/group_source_worker.zig").Definition, a, definitions.json, .{});
+        for (entries) |entry| {
+            if (entry.retirement) continue;
+            const request = try std.json.Stringify.valueAlloc(a, @import("../storage/db/group_source_contract.zig").Query{ .action = .status, .artifact = entry.artifact, .definition = entry.definition, .group = "thread", .segment = "turn", .cell = 0 }, .{});
+            const response = (try root.db.lookup(a, "", .{ .group_source_query_json = request })).?;
+            const status = try std.json.parseFromSliceLeaky(struct { snapshot: ?@import("../storage/db/group_source_state.zig").Snapshot = null }, a, response.json, .{ .ignore_unknown_fields = true });
+            if (status.snapshot) |snapshot| for (snapshot.units) |unit| {
+                const key = try keys.documentKeyAlloc(a, unit);
+                const payload = try root.db.core.store.get(a, key);
+                // The stale fan-in must never become visible, including in
+                // the interval before the replacement event is invalidated.
+                try std.testing.expect(std.mem.indexOf(u8, payload, "History episode") == null);
+                if (std.mem.indexOf(u8, payload, "Replaced episode") != null) {
+                    try std.testing.expect(std.mem.indexOf(u8, payload, "Other episode") != null);
+                    replacement_published = true;
+                }
+            };
+        }
+        if (replacement_published) break;
+    }
+    try std.testing.expect(probe.source_edited);
+    try std.testing.expect(probe.first_publish_revision >= 2);
+    try std.testing.expect(replacement_published);
+    try std.testing.expect(owner.publication_stats.group_source_control_batches != 0);
+    try std.testing.expect(owner.publication_stats.group_source_control_commands > owner.publication_stats.group_source_control_batches);
+    try std.testing.expect(owner.publication_stats.group_source_control_commits <= owner.publication_stats.group_source_control_batches);
+    var lease = try fixture.connection.acquire();
+    defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    defer lease.close();
+    const root = try owner.refresh();
+    try std.testing.expect((try owner.groupSourceStateNamed(&root.db, "default")).submitted.load(.monotonic) != 0);
+    var row = (try root.db.getDocument(std.testing.allocator, "accepted", .{})).?;
+    defer row.deinit(std.testing.allocator);
+    try std.testing.expect((try root.owned_lite_backend.?.native_docstore.?.file.check()).valid);
 }

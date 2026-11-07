@@ -1,0 +1,74 @@
+{
+  "status": "component_correctness_passed",
+  "qualified": false,
+  "scope": "Detached grouped-source discovery and atomic bounded native control cohorts",
+  "source_snapshot_parent": "9b9b4dc72dfead5b26eb6b33ba819be97b99be35",
+  "source_runtime_files": {
+    "zig/pkg/antfly-embedded/src/capi/db.zig": "365bd8cc19623e881fff24687b8682e2c56bf7f5cc354891001a006b736975ba",
+    "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "ead1d27eb39f608133154f65ab163753b48335d022969b898a8ab29d01dbbaed",
+    "zig/pkg/antfly-embedded/src/storage/db/db.zig": "ab9ebb847fb199302de3acc05bdf92970a372b07e7d08fc41ca78424acbbd985",
+    "zig/pkg/antfly-embedded/src/storage/db/execution_resources.zig": "09364de8bdb14e3565390d1bf654795afdd54341f7d32a43f34f113208df3c23",
+    "zig/pkg/antfly-embedded/src/storage/db/group_source_apply.zig": "c72e158cb46a3d372c6ec397c4090d3322aa223b07f28a24882f5adc78b393d6",
+    "zig/pkg/antfly-embedded/src/storage/db/group_source_mutations.zig": "b7dc703974c0a958cbb7cacda756e36969aa875dcdc1952cadea5adc30a181fa",
+    "zig/pkg/antfly-embedded/src/storage/db/group_source_owner.zig": "2d1ec2a447878075d099b7fbd0979d32623d3df9d35860b9d9a6b019eb538b38",
+    "zig/pkg/antfly-embedded/src/storage/db/group_source_worker.zig": "6b5eed11c34c9a575088bbd01c68bec8d8e07ab035dabf8ed94e44eb39a38516",
+    "zig/pkg/antfly-embedded/src/storage/db/mutation_commit.zig": "54f2eabeae798f30740dc826db140e24207043b0456ea2f94ae07b31ae710f40",
+    "zig/pkg/antfly-embedded/src/storage/engine.zig": "3923277aa81cfab419b5c81614165c1a14069d13781ae15efca7cfb3b01bb41d",
+    "zig/pkg/antfly-embedded/src/storage/engine_exports.zig": "3dcf6ecbcafd3a1cf062448386cafd0957a0b47a9498a8adfbc3e8f1e1186fe9"
+  },
+  "mode": "Debug",
+  "library_sha256": "7cfee15f3d791c1463e26a35e65ad74fd347351019c8cb064a61e34af081a4a7",
+  "public_format_or_sdk_change": false,
+  "confirmed_mechanism": "A source slice held outer writer admission across discovery and fan-in plus up to 128 separate control transactions.",
+  "corrections": [
+    "Discover and fan in outside outer writer admission; admit validated publications separately.",
+    "Stage each bounded invalidation/acknowledgement page in one native transaction, reading prior staged commands and aborting the entire cohort on error.",
+    "Validate the exact local source partition revision before publishing prepared group output.",
+    "Synchronize progress observations and preserve idle scheduling when a group poll commits nothing."
+  ],
+  "validation": {
+    "full_capi_before_observation_and_idle_polish": {
+      "passed": 384,
+      "core_passed": 87,
+      "skipped": 3,
+      "failed": 0,
+      "leaked": 0,
+      "seconds": 946.348
+    },
+    "exact_final_selected_regressions": {
+      "passed": 14,
+      "failed": 0,
+      "leaked": 0,
+      "seconds_including_library_and_linkage": 771.391
+    },
+    "admission_process_tests": 7,
+    "public_exports": 138,
+    "c_and_shared_library_linkage_passed": true,
+    "python_sql_catalog_outcomes_concurrency": {
+      "passed": 209,
+      "failed": 0,
+      "seconds": 93.04517937498167,
+      "closed_fixture_bytes_removed": 325726208
+    }
+  },
+  "diagnostic_preflight": {
+    "unchanged_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+    "scope": "Replacement import on the one reused large fixture; shared local host, not a matched performance comparison",
+    "completed": true,
+    "censored": false,
+    "seconds": 122.14683533299831,
+    "busy_or_native_page_markers": 0,
+    "control_commands": 13,
+    "control_native_transactions": 1,
+    "maintenance_capture_count": 27,
+    "maintenance_capture_max_ns": 2777240333,
+    "kernel_lease_max_ns": 45883908583,
+    "kernel_lease_metric_limit": "Measures a continuous kernel lease across local handoffs, not one request or gate hold."
+  },
+  "pending": [
+    "Fresh all-input unchanged importer and semantic verification",
+    "Final optimized qualification on wolfspider with retained references",
+    "Externally owned aggregate CI and full factory qualification"
+  ],
+  "retention": "One reusable current database; closed successful SDK fixtures removed; no run/commit database archives."
+}

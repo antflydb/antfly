@@ -7354,24 +7354,82 @@ pub const DB = struct {
         return self.runGroupSourceSlice();
     }
     pub const GroupSourceMaintenanceState = @import("group_source_owner.zig").State;
+    pub const GroupSourcePublication = @import("group_source_owner.zig").Publication;
 
-    /// One bounded producer/control slice, without inference. Native Lite calls
-    /// this on the live coordinator under its short path lease, then replays
-    /// downstream providers in its separate detached turn.
-    pub fn runGroupSourceMaintenanceSlice(self: *DB, state: *GroupSourceMaintenanceState) !bool {
-        if (comptime storage_engine.enabled) return storage_engine.call("runGroupSourceMaintenanceSlice", .{ self, state });
-        const before = state.submitted;
-        _ = try self.runGroupSourceSliceWithState(state);
+    /// Discovery and fan-in may prepare several commands. A detached host
+    /// provides per-command publication rather than holding its writer lease
+    /// through the entire slice. Ordinary resident owners keep local apply.
+    pub fn runGroupSourceMaintenanceSlice(self: *DB, state: *GroupSourceMaintenanceState, publication: ?GroupSourcePublication) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runGroupSourceMaintenanceSlice", .{ self, state, publication });
+        const before = state.submitted.load(.monotonic);
+        _ = try self.runGroupSourceSliceWithPublication(state, publication);
         // Only a committed control mutation makes detached provider replay
         // eligible. Visiting an idle sibling must not reopen provider state.
-        return state.submitted != before;
+        return state.submitted.load(.monotonic) != before;
+    }
+
+    /// One atomic metadata publication for a bounded source-control page.
+    /// Existing command transactions are not nested: ordered commands stage
+    /// into one backend transaction and retain normal local admission policy.
+    pub fn batchGroupSourceControls(self: *DB, commands: []const @import("group_source_contract.zig").Command) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("batchGroupSourceControls", .{ self, commands });
+        const contract = @import("group_source_contract.zig");
+        if (commands.len == 0) return;
+        if (commands.len > contract.max_page_items) return error.InvalidGroupedSourceCommand;
+        for (commands) |command| {
+            try command.validate();
+            if (command.action != .invalidate and command.action != .acknowledge) return error.InvalidGroupedSourceCommand;
+        }
+        return self.batchInternal(.{ .group_source = commands[0], .sync_level = .write }, null, .{ .group_source_controls = commands, .wait_for_sync_level = false });
+    }
+
+    fn commitLocalGroupSourceControls(self: *DB, commands: []const @import("group_source_contract.zig").Command) !void {
+        if (self.core.byteRange().start.len != 0 or self.core.byteRange().end.len != 0) return error.GroupedSourceTopologyUnavailable;
+        try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
+        var mutation = self.core.snapshot_admission.acquireMutation();
+        defer mutation.release();
+        var plan = try self.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        const selected = plan.plan().group_sources orelse return error.PreparedGenerationChanged;
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (try self.maintenanceRequiresOrderedApply()) return error.GroupedSourceTopologyUnavailable;
+        if (plan.generation() != self.core.index_manager.writePlanGeneration()) return error.PreparedGenerationChanged;
+        var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.init(manager, .shard_transition_working_set, self.runtime_alloc, 1) else null;
+        defer if (budget) |*value| value.deinit();
+        var arena = std.heap.ArenaAllocator.init(if (budget) |*value| value.allocator() else self.runtime_alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var namespace: [24]u8 = undefined;
+        doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        for (commands) |command| {
+            var overlay = @import("group_source_mutations.zig").Overlay{
+                .allocator = a,
+                .reader = @import("group_source_mutations.zig").Reader.fromTxn(&txn),
+                .completion_root = self.root_incarnation,
+                .owner_incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation),
+            };
+            const entry = (try @import("group_source_apply.zig").requireCommandContext(&overlay, &selected, command, self.core.identity_namespace.table_id, self.root_incarnation, namespace)).?;
+            const staged = try @import("group_source_apply.zig").stage(a, &overlay, command, 0, entry.horizons);
+            std.debug.assert(!staged.hasReplay());
+            var effects = overlay.effects.iterator();
+            while (effects.next()) |effect| {
+                if (effect.value_ptr.*) |bytes| try txn.put(effect.key_ptr.*, bytes) else txn.delete(effect.key_ptr.*) catch |err| if (err != error.NotFound) return err;
+            }
+        }
+        try txn.commit();
     }
 
     fn runGroupSourceSlice(self: *DB) !bool {
         return self.runGroupSourceSliceWithState(self.borrowed_group_source_state orelse &self.group_source_owner.state);
     }
-    const LocalGroupSourceContext = struct { db: *DB, state: *GroupSourceMaintenanceState };
+    const LocalGroupSourceContext = struct { db: *DB, state: *GroupSourceMaintenanceState, publication: ?GroupSourcePublication = null };
     fn runGroupSourceSliceWithState(self: *DB, state: *GroupSourceMaintenanceState) !bool {
+        return self.runGroupSourceSliceWithPublication(state, null);
+    }
+    fn runGroupSourceSliceWithPublication(self: *DB, state: *GroupSourceMaintenanceState, publication: ?GroupSourcePublication) !bool {
         if (!state.slice_mutex.tryLock()) return false;
         defer state.slice_mutex.unlock();
         // The resident scheduler runs independently of foreground index DDL.
@@ -7382,9 +7440,9 @@ pub const DB = struct {
         // durable group queues retain every pending command for the next turn.
         if (!self.enrichment_owner.replacement_mutex.tryLock()) return false;
         defer self.enrichment_owner.replacement_mutex.unlock();
-        return self.runGroupSourceSliceLocked(state);
+        return self.runGroupSourceSliceLocked(state, publication);
     }
-    fn runGroupSourceSliceLocked(self: *DB, state: *GroupSourceMaintenanceState) !bool {
+    fn runGroupSourceSliceLocked(self: *DB, state: *GroupSourceMaintenanceState, publication: ?GroupSourcePublication) !bool {
         // A table-wide coordinator must drive partial owners. The native
         // worker can certify membership only for an unpartitioned Lite DB.
         if (self.core.byteRange().start.len != 0 or self.core.byteRange().end.len != 0) return false;
@@ -7400,19 +7458,18 @@ pub const DB = struct {
         const raw = (try self.lookupGroupSource(a, "{\"action\":\"definitions\"}")) orelse return false;
         const definitions = try std.json.parseFromSliceLeaky([]work.Definition, a, raw.json, .{});
         if (definitions.len == 0) return false;
-        const definition = definitions[state.next_definition % definitions.len];
-        state.next_definition +%= 1;
+        const definition = definitions[state.next_definition.fetchAdd(1, .monotonic) % definitions.len];
         const namespace = definition.namespace;
         if (state.worker == null) {
             const identity = try std.json.Stringify.valueAlloc(a, .{ self.root_incarnation, platform_time.realtimeNs(), namespace }, .{});
             state.worker = .{ .allocator = state.allocator orelse self.runtime_alloc, .identity = @import("group_sources.zig").digest(identity) };
         }
-        var context = LocalGroupSourceContext{ .db = self, .state = state };
-        const ports = work.Ports{ .ptr = &context, .query_fn = localGroupSourceQuery, .submit_fn = localGroupSourceSubmit, .fan_in_fn = localGroupSourceFanIn, .settled_fn = localGroupSourceSettled };
-        const before = state.submitted;
+        var context = LocalGroupSourceContext{ .db = self, .state = state, .publication = publication };
+        const ports = work.Ports{ .ptr = &context, .query_fn = localGroupSourceQuery, .submit_fn = localGroupSourceSubmit, .submit_many_fn = if (publication) |host| if (host.submit_many_fn != null) localGroupSourceSubmitMany else null else null, .fan_in_fn = localGroupSourceFanIn, .settled_fn = localGroupSourceSettled };
+        const before = state.submitted.load(.monotonic);
         try state.worker.?.sourceStep(a, ports, definition);
         try state.worker.?.groupStep(a, ports, definition, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_ms)));
-        const changed = state.submitted != before;
+        const changed = state.submitted.load(.monotonic) != before;
         state.idle_definitions = if (changed) 0 else state.idle_definitions +| 1;
         // A no-op GC/idle definition is not proof that its siblings are idle.
         // Complete a fair round before allowing a manual or connection owner
@@ -7430,12 +7487,22 @@ pub const DB = struct {
         const context: *LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
         const self = context.db;
         if (try self.maintenanceRequiresOrderedApply()) return error.ArtifactCatalogDrift;
-        try self.batchInternal(.{ .group_source = command, .sync_level = .write }, null, .{});
-        context.state.submitted +%= 1;
+        if (context.publication) |publication|
+            try publication.submit(command)
+        else
+            try self.batchInternal(.{ .group_source = command, .sync_level = .write }, null, .{});
+        _ = context.state.submitted.fetchAdd(1, .monotonic);
         // Group publication appends private producer rows. Independent resident
         // owners need the same downstream wake as an enrichments-level wait;
         // connection-owned Lite observes the durable sequence on its next turn.
         if (self.enrichment_runtime) |runtime| runtime.notifySequence(self.core.nextDerivedSequence());
+    }
+    fn localGroupSourceSubmitMany(ptr: *anyopaque, commands: []const @import("group_source_contract.zig").Command) !void {
+        const context: *LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
+        const publication = context.publication orelse return error.InvalidGroupedSourceCommand;
+        try publication.submitMany(commands);
+        _ = context.state.submitted.fetchAdd(commands.len, .monotonic);
+        if (context.db.enrichment_runtime) |runtime| runtime.notifySequence(context.db.core.nextDerivedSequence());
     }
     fn localGroupSourceFanIn(ptr: *anyopaque, a: Allocator, definition: @import("group_source_worker.zig").Definition, partition: @import("group_source_index.zig").Partition, ordinal: i64) !@import("group_source_worker.zig").FanIn {
         const context: *LocalGroupSourceContext = @ptrCast(@alignCast(ptr));
@@ -9018,6 +9085,15 @@ pub const DB = struct {
             return self.batchInternal(.{ .sync_level = .write }, profile, review_opts);
         }
         try @import("group_source_contract.zig").validateRequest(req);
+        if (opts.group_source_controls.len != 0) {
+            // This is an internal local envelope, never a way to drop another
+            // request's writes, receipts or replicated completion effects.
+            const permitted: BatchExecutionOptions = .{ .group_source_controls = opts.group_source_controls, .wait_for_sync_level = opts.wait_for_sync_level, .primary_committed = opts.primary_committed };
+            if (!std.meta.eql(opts, permitted) or req.group_source == null or !std.meta.eql(req.group_source.?, opts.group_source_controls[0])) return error.InvalidBatchRequest;
+            try self.commitLocalGroupSourceControls(opts.group_source_controls);
+            if (opts.primary_committed) |committed| committed.* = true;
+            return;
+        }
         if (req.group_source) |command| {
             var control_opts = opts;
             control_opts.group_source_command = &command;
@@ -34407,7 +34483,7 @@ pub const DB = struct {
                 if (options.deadline_ns) |deadline| if (monotonicTimeNs() >= deadline) return error.RunUntilIdleDidNotConverge;
                 // Detached snapshots compute providers; their connection owner
                 // issues group commands on the current coordinator instead.
-                const group_pending = if (drive_groups) try self.runGroupSourceSliceLocked(group_state) else false;
+                const group_pending = if (drive_groups) try self.runGroupSourceSliceLocked(group_state, null) else false;
                 try self.drainReplayStagesUntilStableWithOptions(options);
                 if (!group_pending or options.bounded_replay) break;
             }
@@ -147434,9 +147510,9 @@ test "grouped sources production yields across producer replacement and resumes 
         var called: bool = false;
         fn run(live: *DB) !void {
             called = true;
-            const before = live.group_source_owner.state.submitted;
+            const before = live.group_source_owner.state.submitted.load(.monotonic);
             try std.testing.expect(!try live.runGroupSourceSlice());
-            try std.testing.expectEqual(before, live.group_source_owner.state.submitted);
+            try std.testing.expectEqual(before, live.group_source_owner.state.submitted.load(.monotonic));
             try std.testing.expect(live.group_source_owner.state.worker == null);
         }
     };
@@ -147449,7 +147525,7 @@ test "grouped sources production yields across producer replacement and resumes 
     try db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true });
     try std.testing.expect(Probe.called);
     try std.testing.expect(try db.runGroupSourceSlice());
-    try std.testing.expect(db.group_source_owner.state.submitted > 0);
+    try std.testing.expect(db.group_source_owner.state.submitted.load(.monotonic) > 0);
 }
 
 test "grouped sources production publishes private units incrementally across delete and reopen" {
@@ -150681,4 +150757,55 @@ test "db native publication cohort preserves logical journals receipts and one d
     try std.testing.expectEqual(before_refusal, file.activeCheckpoint().commit_sequence);
     try std.testing.expect((try database.get(a, "unapplied")) == null);
     try std.testing.expect((try file.check()).valid);
+}
+
+test "grouped sources production control cohort aborts atomically and observes prior commands" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("group-control-cohort-atomic");
+    defer directory.cleanup();
+    const db = try DB.openOwned(a, directory.path(), .{ .start_optional_runtime_workers = false, .enrichment = .{ .enable_without_producers = true } });
+    defer db.closeOwned();
+    try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread_id", .order_by = "ordinal", .segment_by = "turn_id", .field = "text" } });
+    try db.batch(.{ .writes = &.{ .{ .key = "one", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"a\",\"ordinal\":1,\"text\":\"alpha\"}" }, .{ .key = "two", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"b\",\"ordinal\":2,\"text\":\"beta\"}" } }, .sync_level = .write });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const work = @import("group_source_worker.zig");
+    const contract = @import("group_source_contract.zig");
+    const reads = @import("group_source_reads.zig");
+    const state = @import("group_source_state.zig");
+    const definitions = (try db.lookup(owned, "", .{ .group_source_query_json = "{\"action\":\"definitions\"}" })).?;
+    const entries = try std.json.parseFromSliceLeaky([]work.Definition, owned, definitions.json, .{});
+    const definition = entries[0];
+    const request = try std.json.Stringify.valueAlloc(owned, contract.Query{ .action = .outbox, .artifact = definition.artifact, .definition = definition.definition }, .{});
+    const response = (try db.lookup(owned, "", .{ .group_source_query_json = request })).?;
+    const page = try std.json.parseFromSliceLeaky(reads.PointerPage, owned, response.json, .{});
+    try std.testing.expectEqual(@as(usize, 2), page.rows.len);
+    var commands: [2]contract.Command = undefined;
+    for (page.rows, &commands) |pointer, *command| {
+        const key = try reads.decode(owned, pointer.key_base64);
+        const value = try reads.decode(owned, pointer.value_base64);
+        const event = try @import("group_source_index.zig").readInvalidation(owned, key, value);
+        command.* = .{ .action = .invalidate, .artifact = definition.artifact, .definition = definition.definition, .namespace = definition.namespace, .invalidate = .{ .owner = definition.source_owner, .event = event } };
+    }
+    const original_namespace = commands[1].namespace;
+    commands[1].namespace[0] ^= 1;
+    try commands[1].validate(); // Rejection occurs after command one is staged.
+    try std.testing.expectError(error.InvalidGroupedSourceCommand, db.batchGroupSourceControls(&commands));
+    const group = state.Group{ .definition = definition.definition, .key = "thread" };
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        for (commands) |command| try std.testing.expect((try state.pendingFor(owned, &read, group, command.invalidate.?.event.partition)) == null);
+    }
+    commands[1].namespace = original_namespace;
+    try std.testing.expectError(error.InvalidGroupedSourceCommand, db.batchInternal(.{ .group_source = commands[0], .writes = &.{.{ .key = "ignored", .value = "{}" }} }, null, .{ .group_source_controls = &commands }));
+    try db.batchGroupSourceControls(&commands);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    const first = (try state.pendingFor(owned, &read, group, commands[0].invalidate.?.event.partition)).?;
+    const second = (try state.pendingFor(owned, &read, group, commands[1].invalidate.?.event.partition)).?;
+    try std.testing.expect(second.revision > first.revision);
+    const earliest = (try state.nextPending(owned, &read, group)).?;
+    try std.testing.expectEqual(@as(i64, 1), earliest.ordinal);
 }

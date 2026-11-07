@@ -2370,19 +2370,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.group_source_command) |command| {
                 const empty_groups = group_mutations.Plan{ .arena = undefined, .entries = &.{} };
                 const plan = group_plan orelse &empty_groups;
-                var matched = false;
-                var matched_entry: ?group_mutations.Plan.Entry = null;
-                for (plan.entries) |entry| if (std.mem.eql(u8, entry.name, command.artifact) and std.mem.eql(u8, &entry.configuration, &command.definition.configuration)) {
-                    matched = true;
-                    matched_entry = entry;
-                    break;
-                };
-                if (!matched and command.action != .retire and !command.isActivation()) return error.PreparedGenerationChanged;
-                const table = try group_mutations.tableIdentity(&group_overlay, S.ownerField(self, "core").*.identity_namespace.table_id, S.ownerField(self, "root_incarnation").*);
-                if (table != command.definition.table_incarnation) return error.InvalidGroupedSourceCommand;
                 var namespace: [24]u8 = undefined;
                 doc_identity.encodeNamespace(&namespace, S.ownerField(self, "core").*.identity_namespace);
-                if (!std.mem.eql(u8, &namespace, &command.namespace)) return error.InvalidGroupedSourceCommand;
+                const matched_entry = try @import("group_source_apply.zig").requireCommandContext(&group_overlay, plan, command.*, S.ownerField(self, "core").*.identity_namespace.table_id, S.ownerField(self, "root_incarnation").*, namespace);
+                const table = command.definition.table_incarnation;
+                if (command.publish) |publication| if (opts.ordered_apply_receipt == null and !try self.maintenanceRequiresOrderedApply()) {
+                    var source_namespace = namespace;
+                    if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], S.ownerField(self, "root_incarnation").*, .big);
+                    try @import("group_source_apply.zig").requireLocalSourceCut(group_alloc, &group_overlay, publication, .{ .namespace = source_namespace, .incarnation = group_overlay.groupIncarnation() });
+                };
                 if (command.finish) |finish| {
                     if (opts.ordered_apply_receipt == null and opts.legacy_group_plan_generation == preparation.write_plan.?.generation() and opts.legacy_group_completed_through != null and opts.legacy_group_completed_through.? >= finish.through_sequence) group_overlay.legacy_completion = true;
                 }

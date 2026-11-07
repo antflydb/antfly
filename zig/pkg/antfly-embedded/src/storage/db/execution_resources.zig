@@ -1076,6 +1076,8 @@ pub const BatchExecutionOptions = struct {
     cohort_outcome_marker_writes: []const docstore_mod.KVPair = &.{},
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
+    /// Local metadata-only source controls. Never serialized into a Raft request.
+    group_source_controls: []const @import("group_source_contract.zig").Command = &.{},
     /// Native-only completion observation; never encoded in a replicated command.
     legacy_group_completed_through: ?u64 = null,
     legacy_group_plan_generation: ?u64 = null,

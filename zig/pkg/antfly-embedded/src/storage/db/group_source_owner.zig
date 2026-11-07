@@ -16,6 +16,28 @@
 const std = @import("std");
 const runtime = @import("../background_runtime.zig");
 const work = @import("group_source_worker.zig");
+/// Borrowed only during one service slice. Discovery and fan-in run outside
+/// publication admission; the host admits and validates each command separately.
+pub const Publication = struct {
+    ptr: *anyopaque,
+    submit_fn: *const fn (*anyopaque, @import("group_source_contract.zig").Command) anyerror!void,
+    submit_many_fn: ?*const fn (*anyopaque, []const @import("group_source_contract.zig").Command) anyerror!void = null,
+    dispatch: Boundary.Dispatch = Boundary.local_dispatch,
+    const Boundary = @import("../../runtime_callback_abi.zig").Boundary(struct {
+        submit: *const fn (*anyopaque, @import("group_source_contract.zig").Command) anyerror!void,
+        submit_many: ?*const fn (*anyopaque, []const @import("group_source_contract.zig").Command) anyerror!void,
+    });
+
+    pub fn submit(self: Publication, command: @import("group_source_contract.zig").Command) !void {
+        return Boundary.call("submit", self.dispatch, self.submit_fn, .{ self.ptr, command });
+    }
+
+    pub fn submitMany(self: Publication, commands: []const @import("group_source_contract.zig").Command) !void {
+        if (self.submit_many_fn) |submit_many| return Boundary.call("submit_many", self.dispatch, submit_many, .{ self.ptr, commands });
+        for (commands) |command| try self.submit(command);
+    }
+};
+
 /// Namespace maintenance continuation belongs to the scheduling owner, not a reopened DB.
 /// Native Lite preserves group cursor/lease identity and replay feedback per table.
 pub const State = struct {
@@ -43,9 +65,10 @@ pub const State = struct {
     slice_mutex: std.atomic.Mutex = .unlocked,
     allocator: ?std.mem.Allocator = null,
     worker: ?work.Worker = null,
-    next_definition: usize = 0,
+    next_definition: std.atomic.Value(usize) = .init(0),
     idle_definitions: usize = 0,
-    submitted: u64 = 0,
+    /// Observed by admission/statistics without taking the discovery lock.
+    submitted: std.atomic.Value(u64) = .init(0),
 
     pub fn deinit(self: *State) void {
         if (self.worker) |*worker| worker.deinit();

@@ -162,8 +162,13 @@ fn runExplicitReplayDrainTurn(self: *DB, state: *DB.GroupSourceMaintenanceState,
     return .{ .value = self.runExplicitReplayDrainTurn(state, producer_after) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn runGroupSourceMaintenanceSlice(self: *DB, state: *DB.GroupSourceMaintenanceState) engine.Outcome(bool) {
-    return .{ .value = self.runGroupSourceMaintenanceSlice(state) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn runGroupSourceMaintenanceSlice(self: *DB, state: *DB.GroupSourceMaintenanceState, publication: ?DB.GroupSourcePublication) engine.Outcome(bool) {
+    return .{ .value = self.runGroupSourceMaintenanceSlice(state, publication) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn batchGroupSourceControls(self: *DB, commands: []const @import("db/group_source_contract.zig").Command) engine.Outcome(void) {
+    self.batchGroupSourceControls(commands) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = {} };
 }
 
 fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, phase: types.BackgroundMaintenancePhase) engine.Outcome(bool) {

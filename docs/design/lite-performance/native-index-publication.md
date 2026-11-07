@@ -71,6 +71,29 @@ barriers until authenticated. Recovery and failure injection rules are described
 in [native-commit-proofs.md](native-commit-proofs.md); removing a synchronization
 call without those proofs is not a valid optimization.
 
+## Grouped-source publication
+
+Source discovery and fan-in use short, admitted read snapshots outside writer
+admission. They do not keep a file writer lease across a page of source queries
+or across several control publications. The scheduling owner retains the worker
+continuation until its service turn finishes; progress counters read by other
+threads are atomic.
+
+A bounded source page prepares invalidation and acknowledgement commands. Native
+Lite validates the commands against its current table incarnation and write-plan
+generation, then stages the whole page in one transaction. Each command sees
+earlier staged changes in that transaction. Failure aborts the entire page and
+resets discovery eligibility; its durable outbox remains available for retry.
+Replicated adapters retain their ordered command path.
+The [grouped-source publication receipt](grouped-source-publication-debug.json)
+records the atomicity and interleaving regressions and the diagnostic operation
+counts; final end-to-end qualification is tracked separately.
+
+Fan-in publication also checks the exact source partition revision under current
+primary admission. A group lease alone is insufficient: a source edit can advance
+the partition while its invalidation is still queued. Such an edit rejects the
+stale prepared output rather than publishing it under an unchanged lease.
+
 ## Posting windows independent of RPC boundaries
 
 Native text writes retain bounded, durable normalized posting deltas rather than
