@@ -54,7 +54,7 @@ fn run(db: *DB, alloc: std.mem.Allocator, out: *contract.ProbeResult) !void {
     if (@import("builtin").is_test or !engine.enabled) return error.UnsupportedVersion;
     const descriptor = engine.descriptorForValidation();
     mark(out, "descriptor_version");
-    if (descriptor.version != 35) return error.UnsupportedVersion;
+    if (descriptor.version != 36) return error.UnsupportedVersion;
     inline for (@typeInfo(engine.Descriptor).@"struct".field_names, @typeInfo(engine.Descriptor).@"struct".field_types) |field, T| {
         if (comptime T == @TypeOf(engine.table_layout)) {
             const actual = @field(descriptor.*, field);

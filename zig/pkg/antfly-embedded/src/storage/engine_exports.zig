@@ -1992,6 +1992,7 @@ const descriptor: engine.Descriptor = .{
     .read_array_stored_view_layout = engine.read_array_stored_view_layout,
     .read_array_stored_validation_layout = engine.read_array_stored_validation_layout,
     .read_session_handle_layout = engine.read_session_handle_layout,
+    .retained_query_lease_layout = engine.retained_query_lease_layout,
     .query_read_lease_handle_layout = engine.query_read_lease_handle_layout,
     .query_read_lease_operations_layout = engine.query_read_lease_operations_layout,
     .read_reader_request_layout = engine.read_reader_request_layout,

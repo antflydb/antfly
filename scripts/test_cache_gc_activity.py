@@ -192,9 +192,9 @@ class InspectionFailureFailSafeTests(unittest.TestCase):
         self.assertIn("exit 2", result.stdout)
         self.assertIn("skipping to be safe", result.stdout)
 
-    def test_pgrep_sandbox_error_with_no_match_status_keeps_caches_busy(self):
-        # macOS pgrep can report an inspection failure with status 1, the
-        # same status as a successful search that found no matching process.
+    def test_pgrep_diagnostic_with_no_match_status_keeps_caches_busy(self):
+        # A nonmatch with an inspection diagnostic is ambiguous. Model that
+        # result and require the guard to keep caches instead of inferring idle.
         _make_stub(
             self.bin_dir, "pgrep", 'echo "pgrep: Cannot get process list" >&2\nexit 1'
         )

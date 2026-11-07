@@ -431,6 +431,9 @@ def main():
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--zig", default="zig")
     parser.add_argument("--profile", choices=PROFILES, default="sessions")
+    parser.add_argument(
+        "--strip", action="store_true", help="Omit Debug information for cache checks"
+    )
     parser.add_argument("--expected-tests", type=int, default=6)
     args = parser.parse_args()
     if args.timeout < 1:
@@ -454,6 +457,7 @@ def main():
         "runtime-unit-storage-adapter",
         "runtime-unit-storage-engine",
         "-Doptimize=debug",
+        f"-Dstrip={str(args.strip).lower()}",
         "-Dshared-image-operations=true",
         "-Dshared-lake-execution=true",
         "-Dmetal=false",
@@ -462,10 +466,12 @@ def main():
         "-Dcpu=baseline",
         "--summary",
         "all",
+        "-j1",
     ]
     report = dict(
         scope=__doc__,
         profile=args.profile,
+        strip=args.strip,
         expected_linked_tests=args.expected_tests,
         passed=False,
         command=command,

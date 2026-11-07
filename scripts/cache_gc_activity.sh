@@ -56,7 +56,8 @@ _inspection_available() { _activity_have pgrep && _activity_have ps; }
 #
 # Returns 0 with the matching PIDs on stdout, 1 if pgrep ran cleanly and
 # found nothing (a genuine, safe-to-treat-as-idle "no matches"), or
-# pgrep's own exit status (2, 3, a signal, ...) when pgrep itself failed
+# an inspection-error status (2, 3, a signal, ...) when pgrep itself failed
+# (diagnostic-bearing status 1 is normalized to 2)
 # -- a bad pattern or a sandboxed/missing pgrep must never read the same
 # as "no matches", or a live build's cache can get deleted out from
 # under it.
@@ -72,7 +73,7 @@ _pids_for_names() {
 		return 0
 		;;
 	1)
-		# macOS also uses status 1 when sandboxed process inspection fails.
+		# A diagnostic-bearing nonmatch does not prove inspection succeeded.
 		# Only an empty, quiet result proves that there were no matches.
 		[ -z "$out" ] && return 1
 		return 2

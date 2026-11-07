@@ -1,6 +1,7 @@
 # Production owner redesign qualification, 2026-11-02
 
-This summarizes the compilation work through `f4b81822ca`. Current contracts and
+This summarizes cleanup through `f4b81822ca`, later owner screening and the
+November 6 main integration. Current contracts and
 open work live in [production compilation costs](../production-cost-plan.md)
 and [COMPILATION.md](../../../../zig/COMPILATION.md). Counts below describe dated
 checkpoints; they are not continuing product guarantees.
@@ -26,8 +27,9 @@ Local query execution now lives beside private DB state. Relational/document
 read sessions, statement snapshots, Reader/query-lease handles and disposable
 restore materialization use owner-issued capabilities and whole-page operations.
 Exact NUMERIC/SQLARRAY values, cancellation, custom allocators, page release and
-post-close result ownership are covered. General DB lifecycle, statement fences
-and retained covers/query cuts remain follow-up work.
+post-close result ownership are covered. At the cleanup checkpoint, general DB
+lifecycle, statement fences and retained covers/query cuts remained follow-up
+work; later fence/local-lease qualification is recorded below.
 
 Public batch decoding imports public values and rejects private command fields;
 the internal codec retains private replication/LEANN commands. Preparation can
@@ -65,6 +67,39 @@ extents and server instruction-fragment matches were investigative leads only.
 Code dominated the C library; fonts/tokenizer assets were secondary. A server
 final-link map and controlled optimized final-head captures remain open.
 
+## Later owner screening before main integration
+
+CPU-only ReleaseFast image transport passed 111 source/native observations,
+including four VP8 cases in each mode. This establishes equivalence for the
+screened fixtures, not GPU coverage or a final-product performance win.
+
+The optimized lake probe used 1,024 rows/file and four alternating rounds
+(24 observations). Native/source median attempt ratios were 1.094 cold, 1.119
+on checkpoint resume and 1.036 on incremental append. Five parallel native jobs
+retained both hard quotas; separate unknown/low-capacity runs passed 12
+observations each and stayed serial. Source/store opening was under a
+millisecond; most of the gap was physical execution. Lake remains opt-in.
+
+A successful frozen unstripped Debug compiler report at `cefbda93a5` passed 31/31 steps.
+Storage/API compiler wall times were 159.6/159.8 seconds, with LLVM accounting
+for about 78–79%. Internal batch parsing was the largest API frontend declaration
+(4.30 seconds semantic analysis, 4.28 seconds code generation); the mutation
+worker was 0.57/0.44 seconds. These are diagnostic attribution leads. They do not
+rank individual LLVM functions or establish recoverable savings, and the merged
+main source needs a fresh comparison.
+
+The November 6 merged-source report also passed 31/31 steps, this time with
+`-Dstrip=true`. Storage/API had 55,853/67,295 generic instances, 45.30/17.48
+seconds of semantic CPU time and 11.80/6.85 seconds of IR-codegen CPU time.
+Generic formatting, block sorting and JSON parsing/stringification led frontend
+costs. Private batch parsing reported only 73.5/51.7 milliseconds of semantic/
+codegen time; the older ranking does not justify making it the next redesign.
+LLVM emission stages reported 480.4/238.7 seconds of wall time on a busy host,
+while LLVM pass timers reported 68.2/47.6 seconds of CPU time. These have different
+scopes and must not be summed or interpreted as one slow function. Both source
+and debug-information settings changed from the earlier capture, so these are
+attribution leads, not a controlled speed comparison.
+
 ## Qualification checkpoints
 
 - Protected retained-read cache matrix: six phases, each 88 steps and five
@@ -92,6 +127,15 @@ final-link map and controlled optimized final-head captures remain open.
   runners additionally reported 219 inference cases passed/one skipped, seven
   local cases and three incomplete-generation HTTP cases. Socket-blocked sandbox
   runs were rerun successfully with local networking enabled.
+
+The November 6 integration of `c8afb96719` passed 156/156 stripped Debug product,
+CAPI smoke and native-client steps, 58/58 lease/privacy steps and the retained
+generation open/read/close regression. All six independent native read-session
+fixtures passed. The five-phase capture matrix preserved API/kernel/client
+caches across actual private fence/statement fields and rebuilt all participants
+for a shared-handle edit. A separate unstripped rebuild passed 67/67 steps and
+all ten archive guards. Cache cleanup passed 14 tests, including a failing
+negative control for diagnostic-bearing process-inspection results.
 
 Normal-runner optimized qualification of the final source remains required.
 Raw logs, linker maps, source snapshots and benchmark JSON remain ignored under

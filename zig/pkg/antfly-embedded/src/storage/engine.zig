@@ -505,7 +505,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 35,
+    version: u32 = 36,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -531,6 +531,7 @@ pub const Descriptor = extern struct {
     read_array_stored_view_layout: native.TypeContract,
     read_array_stored_validation_layout: native.TypeContract,
     read_session_handle_layout: native.TypeContract,
+    retained_query_lease_layout: native.TypeContract,
     query_read_lease_handle_layout: native.TypeContract,
     query_read_lease_operations_layout: native.TypeContract,
     read_reader_request_layout: native.TypeContract,
@@ -679,7 +680,7 @@ pub fn descriptorForValidation() *const Descriptor {
     return antfly_storage_engine_get_descriptor_v29();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 35 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 36 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or
@@ -702,6 +703,7 @@ pub fn validateDescriptor(descriptor: *const Descriptor) !void {
         !descriptor.read_array_stored_view_layout.matches(read_array_stored_view_layout) or
         !descriptor.read_array_stored_validation_layout.matches(read_array_stored_validation_layout) or
         !descriptor.read_session_handle_layout.matches(read_session_handle_layout) or
+        !descriptor.retained_query_lease_layout.matches(retained_query_lease_layout) or
         !descriptor.query_read_lease_handle_layout.matches(query_read_lease_handle_layout) or
         !descriptor.query_read_lease_operations_layout.matches(query_read_lease_operations_layout) or
         !descriptor.read_reader_request_layout.matches(read_reader_request_layout) or
@@ -792,6 +794,7 @@ pub const read_reader_ordinal_view_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("read_reader_values.zig").OrdinalRowView);
 };
+pub const retained_query_lease_layout = native.TypeContract.of(@import("db/native_query_cut_contract.zig").ReadLease);
 pub const read_session_handle_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(session_contract.Handle);

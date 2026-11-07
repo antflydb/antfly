@@ -3053,7 +3053,7 @@ pub const DB = struct {
     resolver_query_schema_digest: [32]u8 = undefined,
     /// Installed only after immutable query-cut admission. Never persisted.
     retained_value_scope: ?@import("../../search/value_membership.zig").Scope = null,
-    retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
+    retained_query_lease: ?@import("native_query_cut_contract.zig").ReadLease = null,
     retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
     native_query_warming: @import("native_query_warming.zig").Owner = .{},
     /// Shared local mutation state outlives foreground and recovery execution.
@@ -6173,7 +6173,7 @@ pub const DB = struct {
         // state has closed.
         if (self.generation_read_lease) |*lease| lease.deinit();
         self.generation_read_lease = null;
-        if (self.retained_query_lease) |*lease| lease.deinit();
+        if (self.retained_query_lease) |*lease| lease.deinit() catch unreachable;
         self.retained_query_lease = null;
         if (self.retained_remote_query_lease) |*lease| lease.deinit();
         self.retained_remote_query_lease = null;
@@ -21095,11 +21095,11 @@ pub const DB = struct {
             try self.admitQueryCut(io, cache_id, control.token());
             source_proof = try cut.validateWithSourceProof(self.alloc, io, path, request, origin, control.token());
         } else return error.CatalogGenerationChanged;
-        var reader = try cut.readLease(self.alloc, io, self.core.path, cache_id, control.token());
+        var reader = try cut.readLeaseOwned(self.alloc, io, self.core.path, cache_id, control.token());
         guard.deinit();
         guarded = false;
         var transferred = false;
-        defer if (!transferred) reader.deinit();
+        defer if (!transferred) reader.deinit() catch unreachable;
         var readonly = try DB.open(self.alloc, path, .{
             .open_mode = .query_readonly,
             .backend_runtime = self.backend_runtime,

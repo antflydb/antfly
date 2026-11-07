@@ -16,7 +16,7 @@ and pinned detailed records are in the [qualification summary](history/productio
 | Image operations | `-Dshared-image-operations=true` selects whole encoded-image operations and retained CPU VP8 sessions on supported native 64-bit macOS/Linux profiles; it also enables retained PDF sessions. Default remains off. |
 | Lake execution | `-Dshared-lake-execution=true` moves complete index attempts to the serverless owner. Coordinator publication/lease authority stays in the caller. Default remains off. |
 | Query execution | Parsing, execution and encoding live beside private DB state. The dispatcher consumes a checked operation capability. |
-| Read/restore ownership | Owner-issued relational/document readers, statement handles, statement capture fences and boxed query leases preserve typed values and explicit page release. Disposable restore materialization stays inside its owner. |
+| Read/restore ownership | Owner-issued relational/document readers, statement handles, statement capture fences and boxed query leases preserve typed values and explicit page release. Retained local query-cut locks expose a release capability rather than file/executor state. Disposable restore materialization stays inside its owner. |
 | Commit disposition | Retry-shaped errors can retry preparation only before primary commit, preventing duplicate non-idempotent application. |
 | Disabled CUDA | Compile-time capability checks prevent CPU-only owners from instantiating concrete CUDA cleanup/execution paths. |
 
@@ -48,7 +48,7 @@ through lossy JSON numbers. Private spill/pattern/page metadata cannot escape.
 
 The engine still has concrete lifecycle/layout checks outside the migrated
 operation families. Do not delete those checks while their private borrows
-remain. Retained covers/query cuts and general DB
+remain. Retained cover authority, remote query-cut lifetimes and general DB
 lifecycle coupling are follow-up work, not completed redesign claims.
 
 For mutation cleanup, preserve acquire/release order, lock fences, durable
@@ -79,6 +79,14 @@ limits. Prime dependencies equivalently. Separate compiler-cold timing from
 fully cold builds; exclude attribution overhead from primary acceptance timing.
 A post-link stripped diagnostic image is not necessarily a `-Dstrip=true` build.
 
+For focused ownership checks that do not need a debugger, combine
+`-Doptimize=debug -Dstrip=true`: runtime safety remains enabled, while compiler
+debug-information emission and symbolized traces are omitted. Keep ordinary
+Debug builds for debugger and trace qualification. A live compiler sample during
+the November 6 main integration was in LLVM DWARF finalization, with a sampled
+9.6 GiB peak footprint. That build was later invalidated by cache eviction;
+the sample motivates a controlled comparison, not a build-speed claim.
+
 Screen with one paired run; qualify with at least three alternating frozen
 baseline/candidate pairs on the normal runner. CPU-only results do not qualify
 GPU/default-Metal profiles. A successful collector run does not automatically
@@ -98,7 +106,8 @@ rebuild and must never be used in a warm-cache isolation check.
 - `check_lake_execution_cache.py`, `check_query_owner_cache.py`,
   `check_public_mutation_cache.py`, `check_read_session_owner_cache.py`:
   production cache isolation, including actual private-layout edits and shared
-  request invalidation.
+  request invalidation. The retained-read tool supports `--profile capture`
+  and optional `--strip` for serial Debug checks without debug information.
 - Image/PDF native contracts, opaque session/query consumers and retained-read
   fixtures: source/native equivalence, allocation failure and cancellation.
 - Real S3 replay and same-executable lake runtime comparison: retained metadata,
@@ -115,8 +124,11 @@ rebuild and must never be used in a warm-cache isolation check.
    and lake variants separately before considering rollout.
 2. Repeat optimized product captures with at least three alternating pairs.
    Complete server final-link attribution where the pinned linker supports it.
-3. Investigate mutation worker LLVM cost before changing resource phases. The
-   large emitted function alone does not identify its compile-time contribution.
+3. Attribute optimized LLVM and final-link work before choosing another owner
+   cut. The merged stripped Debug report no longer singles out private batch
+   parsing: generic formatting, sorting and JSON lead frontend costs, while
+   reported LLVM emission dominates wall time. Measure complete-operation
+   duplication and backend cost before broad codec or mutation-phase rewrites.
 4. Remove remaining private lifecycle borrows one complete operation family at
    a time, retaining layout checks until each replacement is qualified.
 5. Evaluate per-module optimize modes, embedded assets and additional cold
