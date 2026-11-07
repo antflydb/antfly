@@ -83,7 +83,8 @@ pub const resolver_static_profiles_reader_version: u32 = 19;
 pub const resolver_pin_index_reader_version: u32 = 29;
 /// Durable decision producers and adjudication policies with cascade deciders.
 pub const decider_cascade_reader_version: u32 = 30;
-pub const supported_reader_version: u32 = decider_cascade_reader_version;
+pub const cascade_agreement_reader_version: u32 = 31;
+pub const supported_reader_version: u32 = cascade_agreement_reader_version;
 
 const reader_version_encodings = blk: {
     @setEvalBranchQuota(10000);
@@ -131,7 +132,10 @@ pub fn catalogEncoding(a: Allocator, data: []const u8) !CatalogEncoding {
                 defer config.deinit();
                 if (config.value == .object) if (config.value.object.get("decider")) |decider| if (decider == .object) if (decider.object.get("decision_method")) |method| {
                     if (method == .string and std.mem.eql(u8, method.string, "generated")) required = @max(required, generated_producers_reader_version);
-                    if (method == .string and std.mem.eql(u8, method.string, "cascade")) required = @max(required, decider_cascade_reader_version);
+                    if (method == .string and std.mem.eql(u8, method.string, "cascade")) {
+                        const agreement = @import("antfly_decisions").cascade.requiresAgreement(decider.object.get("cascade") orelse .null);
+                        required = @max(required, if (agreement) cascade_agreement_reader_version else decider_cascade_reader_version);
+                    }
                 };
             }
         }
@@ -858,6 +862,8 @@ pub fn serializeCatalogWithEncoding(alloc: Allocator, resolvers: []const Resolve
     var projections: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (resolvers) |cfg| {
         var stored = cfg;
+        if (try @import("antfly_decisions").cascade.normalizeDisabledAgreementJson(a, cfg.adjudicate_json, &.{"decider"})) |normalized|
+            stored.adjudicate_json = normalized;
         if (cfg.namespace_curation_table_id != 0) {
             stored.merges = &.{};
             stored.curation_json = "";
@@ -1395,6 +1401,21 @@ test "resolver adjudication catalogs fence old readers from cascade deciders and
     const public_json = try std.json.Stringify.valueAlloc(a, public, .{});
     defer a.free(public_json);
     try std.testing.expect(std.mem.indexOf(u8, public_json, "private-stage-key") == null);
+    for ([_]bool{ false, true }) |enabled| {
+        const guarded = try std.mem.replaceOwned(u8, arena.allocator(), raw, "\"when\":", if (enabled) "\"require_agreement\":true,\"when\":" else "\"require_agreement\":false,\"when\":");
+        const cfg = try ResolverConfig.parseValue(a, try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), guarded, .{}));
+        defer cfg.deinit();
+        const encoded = try serializeCatalog(a, &.{cfg.value});
+        defer a.free(encoded);
+        try std.testing.expectEqual(if (enabled) cascade_agreement_reader_version else decider_cascade_reader_version, try catalogReaderVersion(a, encoded));
+        if (!enabled) try std.testing.expectEqualStrings(catalog, encoded);
+        const reopened = try deserializeCatalog(a, encoded);
+        defer {
+            for (reopened) |*cfg_row| cfg_row.deinit(a);
+            a.free(reopened);
+        }
+        try std.testing.expect((std.mem.indexOf(u8, reopened[0].adjudicate_json, "require_agreement") != null) == enabled);
+    }
 }
 
 test "ordered artifact inventory resolver catalog serialization preserves explicit envelope" {
