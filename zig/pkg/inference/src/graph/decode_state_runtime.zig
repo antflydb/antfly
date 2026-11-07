@@ -14,116 +14,1423 @@
 // limitations under the License.
 
 const std = @import("std");
+const Cleanup = @import("../execution/cleanup_context.zig").Context;
 const cache_mod = @import("cache.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
-const generation = @import("../pipelines/generation.zig");
+const platform = @import("antfly_platform");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const runtime = @import("../runtime/root.zig");
+const view_metadata = @import("../runtime/kv/view_metadata.zig");
 
-pub const DecodeStateRuntime = struct {
-    state: generation.NativeDecodeState,
+fn selectedScoreCancellationCheck(raw: ?*anyopaque) callconv(.c) c_int {
+    const control: *const InferenceExecutionControl = @ptrCast(@alignCast(raw orelse return 0));
+    control.check() catch return 1;
+    return 0;
+}
+
+// Runtime-owned sequence state. Task adapters supply tokens and scheduling
+// decisions; KV reservations, views, recurrent caches and locking live here.
+pub const KvView = struct {
+    sequence_id: runtime.kv.manager.SequenceId,
+    pool_id: runtime.kv.block.KvPoolId,
+    logical_block_count: usize,
+    tail_tokens: u16,
+    token_count: usize,
+    position_offset: usize,
+    max_inflight_tokens: usize = 0,
+    allow_swa_ring: bool = false,
+    logical_blocks: ?[]const runtime.kv.block.KvBlockId = null,
+    kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
+};
+
+pub const KvMetadataDelta = struct {
+    sequence_replaced: bool = false,
+    logical_block_count_before: usize = 0,
+    logical_block_count_after: usize = 0,
+    position_offset_before: usize = 0,
+    position_offset_after: usize = 0,
+    retained_tokens: ?usize = null,
+};
+
+pub const KvMutationResult = struct {
+    token_count: usize,
+    kv_view: ?KvView,
+    compacted: bool,
+    delta: KvMetadataDelta = .{},
+};
+
+const SelectionQueryEntry = struct {
+    donor_layer: usize,
+    consumer_layer: usize,
+    num_heads: usize,
+    head_dim: usize,
+    positions: std.ArrayListUnmanaged(u64) = .empty,
+    values: std.ArrayListUnmanaged(f32) = .empty,
+
+    fn deinit(self: *SelectionQueryEntry, allocator: std.mem.Allocator) void {
+        self.positions.deinit(allocator);
+        self.values.deinit(allocator);
+    }
+};
+
+pub const NativeDecodeState = struct {
+    /// Borrowed through claimed-step drain and publication.
+    execution_backend: ?@import("../ops/ops.zig").ComputeBackend = null,
+    execution_control: ?InferenceExecutionControl = null,
+    allocator: std.mem.Allocator,
+    kv_manager: ?*runtime.kv.manager.KvManager = null,
+    kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
+    /// Optional external lock for shared paged KV metadata/storage. Batch
+    /// generation wires every decode state in a group to the same manager and
+    /// storage runtime, so admission reads and KV mutations must share this
+    /// lock even though forward execution is serialized by the scheduler turn.
+    kv_lock: ?*std.atomic.Mutex = null,
+    sequence_id: ?runtime.kv.manager.SequenceId = null,
+    pool_id: ?runtime.kv.block.KvPoolId = null,
+    total_tokens: usize = 0,
+    kv_view: ?KvView = null,
+    kv_compacted: bool = false,
+    kv_block_ids: view_metadata.Table = .empty,
+    kv_block_ids_synchronized: bool = false,
+    // Old published tables may still be borrowed by physical metadata readers.
+    // Retain only geometrically grown owners until this state's real teardown.
+    retired_kv_block_ids: view_metadata.History = .empty,
+    moe_runtime: runtime.moe.runtime.MoeRuntime,
+    shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
+    qwen35_linear_cache: ?gpt_arch.Qwen35LinearCache = null,
+    batched_decode_steps: usize = 0,
+    /// Largest successfully executed decoder step for this sequence.
+    max_native_step_items: usize = 0,
+    gemma4_layer_spec_cache: gpt_arch.Gemma4LayerSpecCache = .{},
+    deepseek_v4_compressed_cache: ?gpt_arch.DeepSeekV4CompressedCache = null,
+    force_full_recompute: bool = false,
+    kv_max_inflight_tokens: usize = 0,
+    allow_swa_ring: bool = false,
+    qwen3vl_mrope_position_delta: ?i64 = null,
+    qwen3vl_decode_positions: [3]u32 = .{ 0, 0, 0 },
+    qwen3vl_text_only: bool = false,
+    selection_capture_enabled: bool = false,
+    selection_queries: std.ArrayListUnmanaged(SelectionQueryEntry) = .empty,
+    selection_protected_spans: []const runtime.kv.selection.ProtectedSpan = &.{},
+
+    pub fn initContiguous(allocator: std.mem.Allocator) NativeDecodeState {
+        return .{
+            .allocator = allocator,
+            .moe_runtime = runtime.moe.runtime.MoeRuntime.init(allocator, null),
+        };
+    }
 
     pub fn initPaged(
         allocator: std.mem.Allocator,
         kv_manager: *runtime.kv.manager.KvManager,
         pool_id: runtime.kv.block.KvPoolId,
         shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
-    ) DecodeStateRuntime {
+    ) NativeDecodeState {
         return .{
-            .state = generation.NativeDecodeState.initPaged(allocator, kv_manager, pool_id, shared_moe_cache),
+            .allocator = allocator,
+            .kv_manager = kv_manager,
+            .pool_id = pool_id,
+            .moe_runtime = runtime.moe.runtime.MoeRuntime.init(allocator, shared_moe_cache),
+            .shared_moe_cache = shared_moe_cache,
         };
     }
 
-    pub fn deinit(self: *DecodeStateRuntime) void {
-        self.state.deinit();
+    fn lockPagedKv(self: *const NativeDecodeState) ?*std.atomic.Mutex {
+        const mutex = self.kv_lock orelse return null;
+        platform.sync.lockYielding(mutex);
+        return mutex;
     }
 
-    pub fn configureForGptConfig(self: *DecodeStateRuntime, config: gpt_mod.Config) void {
-        self.state.configureForGptConfig(config);
+    /// Admission reads use the same lock as KV mutation and reservation.
+    pub fn availableKvBlocks(self: *const NativeDecodeState) ?usize {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        const manager = self.kv_manager orelse return null;
+        return manager.poolAvailableBlocks(self.pool_id orelse return null);
     }
 
-    pub fn currentTokenCount(self: *const DecodeStateRuntime) usize {
-        return self.state.total_tokens;
+    pub fn estimateAdditionalKvBlocks(self: *const NativeDecodeState, tokens: usize) ?usize {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        const manager = self.kv_manager orelse return null;
+        return manager.estimateBlocksFor(self.sequence_id orelse return null, tokens);
     }
 
-    pub fn kvView(self: *const DecodeStateRuntime) ?generation.KvView {
-        return self.state.kvView();
+    pub fn requiresExclusiveStep(self: *const NativeDecodeState) bool {
+        return self.deepseek_v4_compressed_cache != null;
     }
 
-    pub fn notePrefill(self: *DecodeStateRuntime, token_count: usize) !void {
-        try self.state.notePrefill(token_count);
+    pub fn isPaged(self: *const NativeDecodeState) bool {
+        return self.kv_manager != null and !self.force_full_recompute;
     }
 
-    pub fn appendPrefillChunk(self: *DecodeStateRuntime, token_count: usize) !void {
-        try self.state.appendPrefillChunk(token_count);
+    pub fn isKvCompacted(self: *const NativeDecodeState) bool {
+        return self.kv_compacted;
     }
 
-    pub fn appendGeneratedToken(self: *DecodeStateRuntime) !usize {
-        try self.state.appendGeneratedToken();
-        return self.currentTokenCount();
+    pub fn configureForGptConfig(self: *NativeDecodeState, config: gpt_mod.Config) void {
+        self.force_full_recompute = false;
+        if (self.total_tokens == 0) self.kv_max_inflight_tokens = 0;
+        self.allow_swa_ring = config.supportsSplitSwaGlobalKvRing();
+        if (config.family != .gemma) self.gemma4_layer_spec_cache.reset();
+        if (!requiresDeepSeekV4CompressedCache(config)) self.clearDeepSeekV4CompressedCache();
+        self.qwen3vl_mrope_position_delta = if (config.family == .qwen3_vl) 0 else null;
+        self.qwen3vl_text_only = config.family == .qwen3_vl;
     }
 
-    pub fn appendGeneratedTokens(self: *DecodeStateRuntime, count: usize) !usize {
-        try self.state.appendGeneratedTokens(count);
-        return self.currentTokenCount();
-    }
-
-    pub fn truncateGeneratedTokens(self: *DecodeStateRuntime, count: usize) !void {
-        try self.state.truncateTokens(count);
-    }
-
-    pub fn compactKvCache(self: *DecodeStateRuntime, config: runtime.kv.compaction.CompactionConfig) !void {
-        _ = try self.state.compactKvCache(config);
-    }
-
-    pub fn validateDecodePosition(self: *const DecodeStateRuntime, position: usize) !void {
-        if (self.currentTokenCount() != position) return error.InvalidDecodePosition;
-    }
-
-    pub fn makeDecodeContext(
-        self: *DecodeStateRuntime,
-        seq_len: usize,
-        query_seq_len: usize,
-        attention_mode: cache_mod.AttentionMode,
-    ) gpt_arch.DecodeContext {
-        var decode_context = self.state.gptDecodeContext(seq_len, query_seq_len);
-        if (attention_mode == .full_recompute) decode_context.attention_mode = .full_recompute;
-        return decode_context;
-    }
-
-    pub fn preparePrefill(
-        self: *DecodeStateRuntime,
-        seq_len: usize,
-        query_seq_len: usize,
-        attention_mode: cache_mod.AttentionMode,
-    ) !gpt_arch.DecodeContext {
-        if (self.currentTokenCount() == 0) {
-            if (seq_len != query_seq_len) return error.UnsupportedShape;
-            try self.notePrefill(query_seq_len);
-        } else {
-            const expected_prior = seq_len - query_seq_len;
-            if (self.currentTokenCount() != expected_prior) return error.InvalidPrefillSequence;
-            try self.appendPrefillChunk(query_seq_len);
+    pub fn captureSelectionQueries(
+        capture_ctx: *anyopaque,
+        donor_layer: usize,
+        consumer_layer: usize,
+        first_position: usize,
+        num_heads: usize,
+        head_dim: usize,
+        values: []const f32,
+    ) !void {
+        const self: *NativeDecodeState = @ptrCast(@alignCast(capture_ctx));
+        if (!self.selection_capture_enabled) return;
+        const width = try std.math.mul(usize, num_heads, head_dim);
+        if (width == 0 or values.len % width != 0) return error.UnexpectedOutputShape;
+        for (values) |value| if (!std.math.isFinite(value)) return error.NonFiniteAttentionInput;
+        const rows = values.len / width;
+        const horizon = runtime.kv.selection.defaults.query_horizon;
+        var entry: *SelectionQueryEntry = blk: {
+            for (self.selection_queries.items) |*candidate| {
+                if (candidate.donor_layer == donor_layer and candidate.consumer_layer == consumer_layer) {
+                    if (candidate.num_heads != num_heads or candidate.head_dim != head_dim) return error.InvalidSelectionConfig;
+                    break :blk candidate;
+                }
+            }
+            try self.selection_queries.append(self.allocator, .{
+                .donor_layer = donor_layer,
+                .consumer_layer = consumer_layer,
+                .num_heads = num_heads,
+                .head_dim = head_dim,
+            });
+            break :blk &self.selection_queries.items[self.selection_queries.items.len - 1];
+        };
+        const incoming_rows = @min(rows, horizon);
+        if (incoming_rows == horizon) {
+            entry.positions.clearRetainingCapacity();
+            entry.values.clearRetainingCapacity();
         }
-        return self.makeDecodeContext(seq_len, query_seq_len, attention_mode);
+        // A fused route may decline after Q capture and retry through the
+        // unfused attention route. Replace that overlapping suffix so every
+        // absolute query position contributes exactly once.
+        while (entry.positions.items.len > 0 and entry.positions.items[entry.positions.items.len - 1] >= first_position) {
+            _ = entry.positions.pop();
+            entry.values.shrinkRetainingCapacity(entry.values.items.len - width);
+        }
+        if (entry.positions.items.len > 0 and entry.positions.items[entry.positions.items.len - 1] + 1 != first_position)
+            return error.NonContiguousKvSelectionQueries;
+        const retained_old = @min(entry.positions.items.len, horizon -| incoming_rows);
+        if (retained_old > 0) {
+            const old_start = entry.positions.items.len - retained_old;
+            std.mem.copyForwards(u64, entry.positions.items[0..retained_old], entry.positions.items[old_start..]);
+            const value_start = old_start * width;
+            std.mem.copyForwards(f32, entry.values.items[0 .. retained_old * width], entry.values.items[value_start..]);
+        }
+        entry.positions.shrinkRetainingCapacity(retained_old);
+        entry.values.shrinkRetainingCapacity(retained_old * width);
+        const incoming_start = rows - @min(rows, horizon);
+        try entry.positions.ensureUnusedCapacity(self.allocator, rows - incoming_start);
+        try entry.values.appendSlice(self.allocator, values[incoming_start * width ..]);
+        for (incoming_start..rows) |row| entry.positions.appendAssumeCapacity(@as(u64, @intCast(first_position + row)));
     }
 
-    pub fn beginDecodeStep(
-        self: *DecodeStateRuntime,
-        position: usize,
-        attention_mode: cache_mod.AttentionMode,
-    ) !struct {
-        seq_len: usize,
-        decode_context: gpt_arch.DecodeContext,
-    } {
-        try self.validateDecodePosition(position);
-        const seq_len = try self.appendGeneratedToken();
+    pub fn clearSelectionQueries(self: *NativeDecodeState) void {
+        for (self.selection_queries.items) |*entry| entry.deinit(self.allocator);
+        self.selection_queries.clearRetainingCapacity();
+    }
+
+    pub fn configureKvMaxInflightTokens(self: *NativeDecodeState, token_count: usize, request_allows_ring: bool) void {
+        if (token_count == 0 or self.total_tokens != 0) {
+            self.allow_swa_ring = false;
+            self.kv_max_inflight_tokens = 0;
+            if (self.kv_view) |*view| {
+                view.max_inflight_tokens = 0;
+                view.allow_swa_ring = false;
+            }
+            return;
+        }
+        // Ring page ids are absolute from sequence position zero. A pool that
+        // front-trims its logical block table would make them view-relative.
+        self.allow_swa_ring = self.allow_swa_ring and request_allows_ring and self.kvSlidingWindowTokens() == null;
+        self.kv_max_inflight_tokens = if (self.allow_swa_ring) token_count else 0;
+        if (self.kv_view) |*view| {
+            view.max_inflight_tokens = self.kv_max_inflight_tokens;
+            view.allow_swa_ring = self.allow_swa_ring;
+        }
+    }
+
+    pub fn requiresFullRecompute(self: *const NativeDecodeState) bool {
+        return self.force_full_recompute;
+    }
+
+    pub fn requiresDeepSeekV4CompressedCache(config: gpt_mod.Config) bool {
+        if (config.family != .deepseek_v4) return false;
+        const schedule_len = @min(@as(usize, @intCast(config.deepseek_v4_attention_schedule_len)), config.deepseek_v4_attention_schedule.len);
+        if (schedule_len > 0) {
+            for (config.deepseek_v4_attention_schedule[0..schedule_len]) |kind| {
+                switch (kind) {
+                    .compressed_sparse_attention, .heavily_compressed_attention => return true,
+                    else => {},
+                }
+            }
+            return false;
+        }
+        return config.deepseek_v4_compressed_sparse_attention_layers > 0 or
+            config.deepseek_v4_heavily_compressed_attention_layers > 0;
+    }
+
+    pub fn ensureDeepSeekV4CompressedCache(self: *NativeDecodeState, config: gpt_mod.Config) !void {
+        if (!requiresDeepSeekV4CompressedCache(config)) return;
+        if (self.deepseek_v4_compressed_cache == null) {
+            self.deepseek_v4_compressed_cache = try gpt_arch.DeepSeekV4CompressedCache.init(self.allocator, @intCast(config.num_hidden_layers));
+        }
+    }
+
+    pub fn resetDeepSeekV4CompressedCache(self: *NativeDecodeState) void {
+        if (self.deepseek_v4_compressed_cache) |*cache| cache.reset();
+    }
+
+    pub fn clearDeepSeekV4CompressedCache(self: *NativeDecodeState) void {
+        if (self.deepseek_v4_compressed_cache) |*cache| cache.deinit();
+        self.deepseek_v4_compressed_cache = null;
+    }
+
+    fn ensureAttachedUnlocked(self: *NativeDecodeState) !void {
+        if (!self.isPaged()) return;
+        if (self.sequence_id != null) return;
+        self.sequence_id = try self.kv_manager.?.attachSequence(self.pool_id orelse return error.InvalidPoolId);
+        if (self.kv_storage) |storage| {
+            const storage_sequence_id = try storage.attachSequence(storage.poolId());
+            if (storage_sequence_id != self.sequence_id.?) return error.InvalidPagedKvState;
+        }
+    }
+
+    pub fn seedAttachedPrefix(self: *NativeDecodeState, sequence_id: runtime.kv.manager.SequenceId, token_count: usize) !void {
+        self.kv_block_ids_synchronized = false;
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        if (!self.isPaged()) return error.InvalidPagedKvState;
+        if (self.sequence_id != null) return error.InvalidPagedKvState;
+        if (self.kv_storage) |storage| {
+            if ((storage.tokenCount(sequence_id) orelse return error.InvalidPagedKvState) != token_count) return error.InvalidPagedKvState;
+        }
+        self.sequence_id = sequence_id;
+        self.total_tokens = token_count;
+        self.kv_compacted = false;
+        try self.syncPagedKvViewForPrefill();
+    }
+
+    pub fn ensureAttached(self: *NativeDecodeState) !void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        return self.ensureAttachedUnlocked();
+    }
+
+    pub fn reserveFreshCudaKvCapacity(self: *NativeDecodeState, token_capacity: usize, token_limit: usize) !void {
+        self.kv_block_ids_synchronized = false;
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        if (!self.isPaged() or self.total_tokens != 0 or self.sequence_id != null)
+            return error.InvalidPagedKvState;
+        const storage = self.kv_storage orelse return error.DeviceWriteUnsupported;
+        try self.ensureAttachedUnlocked();
+        try self.kv_manager.?.reserveTokenCapacity(self.sequence_id.?, token_limit);
+        try storage.reserveDeviceTokenCapacity(self.sequence_id.?, token_capacity, token_limit);
+    }
+
+    pub fn prepareSelectedGlobalDonors(self: *NativeDecodeState, config: gpt_mod.Config) !void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        const storage = self.kv_storage orelse return error.DeviceWriteUnsupported;
+        // A host-authoritative full-history mirror would defeat the bounded
+        // memory contract and cannot represent donor-specific selected rows.
+        if (storage.storage.config.store_cpu_bytes) return error.UnsupportedKvCachePolicy;
+        try self.ensureAttachedUnlocked();
+        const sequence_id = self.sequence_id orelse return error.InvalidPagedKvState;
+        const transient_rows = try runtime.kv.selection.defaults.transientRows();
+        for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
+            if (!config.isKvDonorLayer(layer) or config.layerUsesSlidingAttention(layer)) continue;
+            const geometry = try config.kvDonorGeometry(layer);
+            try storage.reserveSelectedGlobalKvDeviceCapacity(
+                sequence_id,
+                geometry.donor_layer,
+                transient_rows,
+                0,
+                geometry.num_kv_heads,
+                geometry.head_dim,
+            );
+        }
+        self.selection_capture_enabled = true;
+    }
+
+    pub fn compactSelectedGlobalDonors(
+        self: *NativeDecodeState,
+        config: gpt_mod.Config,
+        control: ?InferenceExecutionControl,
+        gpu_oracle: bool,
+    ) !void {
+        if (!self.selection_capture_enabled) return;
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        const storage = self.kv_storage orelse return error.DeviceWriteUnsupported;
+        const sequence_id = self.sequence_id orelse return error.InvalidPagedKvState;
+        const policy = runtime.kv.selection.defaults;
+        var score_control = control orelse InferenceExecutionControl{};
+        for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
+            if (control) |request_control| try request_control.check();
+            if (!config.isKvDonorLayer(layer) or config.layerUsesSlidingAttention(layer)) continue;
+            const geometry = try config.kvDonorGeometry(layer);
+            const descriptor = try storage.pagedLayerKvDevice(
+                sequence_id,
+                geometry.donor_layer,
+                self.total_tokens,
+                geometry.num_kv_heads,
+                geometry.head_dim,
+            );
+            if (descriptor.ring_page_count != 0) return error.InvalidKvSelectionState;
+            if (descriptor.token_count < policy.hard_rows) continue;
+
+            const row_count = descriptor.token_count;
+            if (row_count > try policy.transientRows()) return error.KvCapacityTooSmall;
+            const positions = try self.allocator.alloc(u64, row_count);
+            defer self.allocator.free(positions);
+            if (descriptor.key_positions) |selected_positions| {
+                if (selected_positions.len != row_count) return error.InvalidKvSelectionState;
+                for (selected_positions, positions) |position, *out| out.* = position;
+            } else {
+                for (positions, 0..) |*position, index| position.* = @intCast(index);
+            }
+            const positions_u32 = try runtime.kv.selection.positionsU32(self.allocator, positions);
+            defer self.allocator.free(positions_u32);
+            const oracle_keys: ?[]f32 = if (gpu_oracle)
+                try storage.gatherLayerKeys(self.allocator, sequence_id, geometry.donor_layer, row_count)
+            else
+                null;
+            defer if (oracle_keys) |keys| self.allocator.free(keys);
+
+            var accumulator = try runtime.kv.selection.ScoreAccumulator.init(self.allocator, row_count);
+            defer accumulator.deinit(self.allocator);
+            var expected_consumers: usize = 0;
+            for (0..@as(usize, @intCast(config.num_hidden_layers))) |consumer_layer| {
+                if (config.layerUsesSlidingAttention(consumer_layer)) continue;
+                if ((try config.kvStorageLayerIndex(consumer_layer)) == geometry.donor_layer) expected_consumers += 1;
+            }
+            var captured_consumers: usize = 0;
+            for (self.selection_queries.items) |*capture| {
+                if (capture.donor_layer != geometry.donor_layer) continue;
+                if (control) |request_control| try request_control.check();
+                if (capture.positions.items.len == 0) return error.MissingKvSelectionQueries;
+                const query_positions_u32 = try runtime.kv.selection.positionsU32(self.allocator, capture.positions.items);
+                defer self.allocator.free(query_positions_u32);
+                const gpu_scores = try self.allocator.alloc(f32, row_count);
+                defer self.allocator.free(gpu_scores);
+                try storage.scoreSelectedAttention(.{
+                    .sequence_id = sequence_id,
+                    .layer_index = geometry.donor_layer,
+                    .queries = capture.values.items,
+                    .query_positions = query_positions_u32,
+                    .key_positions = positions_u32,
+                    .num_heads = capture.num_heads,
+                    .num_kv_heads = geometry.num_kv_heads,
+                    .head_dim = geometry.head_dim,
+                    .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(geometry.head_dim))),
+                    .scores_out = gpu_scores,
+                    .check_ctx = &score_control,
+                    .check_fn = selectedScoreCancellationCheck,
+                });
+                if (oracle_keys) |keys| {
+                    const oracle = try runtime.kv.selection.scoreConsumerNormalizedAttention(self.allocator, .{
+                        .queries = capture.values.items,
+                        .query_positions = capture.positions.items,
+                        .keys = keys,
+                        .key_positions = positions,
+                        .num_query_heads = capture.num_heads,
+                        .num_kv_heads = geometry.num_kv_heads,
+                        .head_dim = geometry.head_dim,
+                        .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(geometry.head_dim))),
+                    });
+                    defer self.allocator.free(oracle);
+                    for (gpu_scores, oracle) |actual, expected| {
+                        if (@abs(@as(f64, actual) - expected) > 2e-4) return error.KvSelectionGpuOracleMismatch;
+                    }
+                }
+                const scores = try self.allocator.alloc(f64, row_count);
+                defer self.allocator.free(scores);
+                for (gpu_scores, scores) |score, *out| out.* = score;
+                try accumulator.addConsumer(scores);
+                captured_consumers += 1;
+            }
+            if (captured_consumers != expected_consumers) return error.MissingKvSelectionQueries;
+            const balanced_scores = try accumulator.finish();
+            var plan = try runtime.kv.selection.selectRows(
+                self.allocator,
+                policy,
+                positions,
+                balanced_scores,
+                @intCast(self.total_tokens),
+                self.selection_protected_spans,
+            );
+            defer plan.deinit();
+            const source_rows = try self.allocator.alloc(u32, plan.source_indices.len);
+            defer self.allocator.free(source_rows);
+            for (plan.source_indices, source_rows) |source, *out| out.* = std.math.cast(u32, source) orelse return error.InvalidKvSelectionState;
+            const selected_positions = try runtime.kv.selection.positionsU32(self.allocator, plan.positions);
+            defer self.allocator.free(selected_positions);
+            if (control) |request_control| try request_control.check();
+            _ = try storage.repackSelectedGlobalKv(.{
+                .sequence_id = sequence_id,
+                .layer_index = geometry.donor_layer,
+                .expected_source_slot = descriptor.slot,
+                .expected_written_tokens = self.total_tokens,
+                .source_token_offsets = source_rows,
+                .key_positions = selected_positions,
+                .num_kv_heads = geometry.num_kv_heads,
+                .head_dim = geometry.head_dim,
+            });
+        }
+    }
+
+    fn kvPageSizeTokens(self: *const NativeDecodeState) ?usize {
+        const manager = self.kv_manager orelse return null;
+        const pool_id = self.pool_id orelse return null;
+        const pool = manager.getPool(pool_id) orelse return null;
+        return pool.config.page_size_tokens;
+    }
+
+    pub fn kvSlidingWindowTokens(self: *const NativeDecodeState) ?usize {
+        const manager = self.kv_manager orelse return null;
+        const pool_id = self.pool_id orelse return null;
+        const pool = manager.getPool(pool_id) orelse return null;
+        return if (pool.config.sliding_window_size) |size| @intCast(size) else null;
+    }
+
+    pub fn cudaPagedKvReplayCapacityTokens(self: *const NativeDecodeState) ?usize {
+        const storage = self.kv_storage orelse return null;
+        switch (storage.storage.config.dtype) {
+            .f16, .polar4, .turbo3 => {},
+            else => return null,
+        }
+        const forced = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse return null;
+        return if (forced == 0) null else forced;
+    }
+
+    fn reservePagedKvReplayCapacity(self: *NativeDecodeState) !void {
+        self.kv_block_ids_synchronized = false;
+        const token_capacity = self.cudaPagedKvReplayCapacityTokens() orelse return;
+        const sequence_id = self.sequence_id orelse return;
+        const manager = self.kv_manager orelse return;
+        try manager.reserveTokenCapacity(sequence_id, token_capacity);
+        if (self.kv_storage) |storage| try storage.reserveTokenCapacity(sequence_id, token_capacity);
+    }
+
+    fn setPagedKvView(self: *NativeDecodeState, token_count: usize, position_offset: usize) void {
+        const sequence_id = self.sequence_id orelse {
+            self.kv_view = null;
+            return;
+        };
+        const pool_id = self.pool_id orelse {
+            self.kv_view = null;
+            return;
+        };
+        if (token_count == 0) {
+            self.kv_view = null;
+            return;
+        }
+        const page_size = self.kvPageSizeTokens() orelse {
+            self.kv_view = null;
+            return;
+        };
+        const logical_block_count = (token_count + page_size - 1) / page_size;
+        const rem = token_count % page_size;
+        const tail_tokens: u16 = @intCast(if (rem == 0) page_size else rem);
+        self.kv_view = .{
+            .sequence_id = sequence_id,
+            .pool_id = pool_id,
+            .logical_block_count = logical_block_count,
+            .tail_tokens = tail_tokens,
+            .token_count = token_count,
+            .position_offset = position_offset,
+            .max_inflight_tokens = self.kv_max_inflight_tokens,
+            .allow_swa_ring = self.allow_swa_ring,
+            .logical_blocks = self.kv_block_ids.items,
+            .kv_storage = self.kv_storage,
+        };
+    }
+
+    const PreparedKvView = struct {
+        state: *NativeDecodeState,
+        count: usize,
+        replacement: view_metadata.Table = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.replacement.deinit(self.state.allocator);
+            self.replacement = .empty;
+        }
+
+        /// Only called after authoritative owner commit. No allocation or
+        /// callback can fail between replacing the list and copying its IDs.
+        fn copyFrom(self: *@This(), sequence: runtime.kv.manager.SequenceId) void {
+            const state = self.state;
+            state.kv_block_ids_synchronized = false;
+            if (self.replacement.capacity != 0) {
+                std.mem.swap(view_metadata.Table, &state.kv_block_ids, &self.replacement);
+                if (self.replacement.capacity != 0) {
+                    state.retired_kv_block_ids.appendAssumeCapacity(self.replacement);
+                    self.replacement = .empty;
+                }
+            }
+            state.kv_block_ids.items.len = self.count;
+            state.kv_manager.?.copyLogicalBlocksWithReservationsInto(sequence, state.kv_block_ids.items);
+            state.kv_block_ids_synchronized = true;
+        }
+
+        /// Only the prepared owner can attest that the old combined sequence
+        /// remains a prefix. Never overwrite IDs visible to an older view.
+        fn copySuffixFrom(self: *@This(), sequence: runtime.kv.manager.SequenceId, prefix: usize) void {
+            const state = self.state;
+            std.debug.assert(self.replacement.capacity == 0 and state.kv_block_ids.items.len == prefix and prefix <= self.count);
+            state.kv_block_ids_synchronized = false;
+            state.kv_block_ids.items.len = self.count;
+            state.kv_manager.?.copyLogicalBlocksWithReservationsSuffixInto(sequence, prefix, state.kv_block_ids.items[prefix..]);
+            state.kv_block_ids_synchronized = true;
+        }
+    };
+
+    fn prepareKvView(self: *NativeDecodeState, count: usize) !PreparedKvView {
+        var prepared = PreparedKvView{ .state = self, .count = count };
+        errdefer prepared.deinit();
+        if (count > self.kv_block_ids.capacity) {
+            try prepared.replacement.ensureTotalCapacityPrecise(self.allocator, try view_metadata.capacityForBlocks(count));
+            if (self.kv_block_ids.capacity != 0) try self.retired_kv_block_ids.ensureTotalCapacityPrecise(self.allocator, try view_metadata.capacityForBlocks(self.retired_kv_block_ids.items.len + 1));
+        }
+        return prepared;
+    }
+
+    fn syncPagedKvBlockTable(self: *NativeDecodeState) !void {
+        self.kv_block_ids_synchronized = false;
+        const manager = self.kv_manager orelse {
+            self.kv_block_ids.clearRetainingCapacity();
+            return;
+        };
+        const sequence_id = self.sequence_id orelse {
+            self.kv_block_ids.clearRetainingCapacity();
+            return;
+        };
+        var prepared = try self.prepareKvView(try manager.logicalBlocksWithReservationsCount(sequence_id));
+        defer prepared.deinit();
+        prepared.copyFrom(sequence_id);
+    }
+
+    fn syncPagedKvViewForPrefill(self: *NativeDecodeState) !void {
+        if (!self.isPaged()) {
+            self.kv_view = null;
+            return;
+        }
+        try self.syncPagedKvBlockTable();
+        self.setPagedKvView(self.total_tokens, 0);
+    }
+
+    fn syncPagedKvViewForDecode(self: *NativeDecodeState) !void {
+        if (!self.isPaged()) {
+            self.kv_view = null;
+            return;
+        }
+        try self.syncPagedKvBlockTable();
+        self.publishPagedKvViewForDecode();
+    }
+
+    /// Publish only after the authoritative block table has been copied. This
+    /// phase neither allocates nor suppresses a failed metadata preparation.
+    fn publishPagedKvViewForDecode(self: *NativeDecodeState) void {
+        if (self.kv_compacted) {
+            const manager = self.kv_manager orelse return;
+            const sequence_id = self.sequence_id orelse return;
+            const current_kv_tokens = @min(manager.tokenCount(sequence_id) orelse 0, self.total_tokens);
+            self.setPagedKvView(current_kv_tokens, self.total_tokens - current_kv_tokens);
+            return;
+        }
+        // The sliding-window trim drops whole KV pages, so the view must
+        // track the tokens actually retained (block-aligned), not the exact
+        // window size. Kernels index the compacted block table with
+        // view-relative positions: a token-granular offset here would
+        // misalign every physical KV read and write by (offset % page_size).
+        // The attention kernels apply the exact sliding window themselves.
+        const retained_tokens = blk: {
+            if (self.kvSlidingWindowTokens() == null) break :blk self.total_tokens;
+            const manager = self.kv_manager orelse break :blk self.total_tokens;
+            const sequence_id = self.sequence_id orelse break :blk self.total_tokens;
+            break :blk manager.tokenCount(sequence_id) orelse self.total_tokens;
+        };
+        const kv_tokens = @min(self.total_tokens, retained_tokens);
+        self.setPagedKvView(kv_tokens, self.total_tokens - kv_tokens);
+    }
+
+    fn makeKvMutationResult(self: *const NativeDecodeState, before_view: ?KvView, before_sequence_id: ?runtime.kv.manager.SequenceId, retained_tokens: ?usize) KvMutationResult {
+        const after_view = self.kvView();
         return .{
-            .seq_len = seq_len,
-            .decode_context = self.makeDecodeContext(seq_len, 1, attention_mode),
+            .token_count = self.total_tokens,
+            .kv_view = after_view,
+            .compacted = self.kv_compacted,
+            .delta = .{
+                .sequence_replaced = before_sequence_id != self.sequence_id,
+                .logical_block_count_before = if (before_view) |view| view.logical_block_count else 0,
+                .logical_block_count_after = if (after_view) |view| view.logical_block_count else 0,
+                .position_offset_before = if (before_view) |view| view.position_offset else 0,
+                .position_offset_after = if (after_view) |view| view.position_offset else 0,
+                .retained_tokens = retained_tokens,
+            },
+        };
+    }
+
+    fn deinitRetiredKvBlockIds(self: *NativeDecodeState) void {
+        for (self.retired_kv_block_ids.items) |*table| table.deinit(self.allocator);
+        self.retired_kv_block_ids.deinit(self.allocator);
+        self.retired_kv_block_ids = .empty;
+    }
+
+    pub fn deinitWithCleanup(self: *NativeDecodeState, current: Cleanup) !void {
+        if (current.outside_execution) {
+            var typed_cuda_owner = if (self.kv_storage) |storage| if (storage.device_write_hook) |hook| hook.vtable.prepareMutationWithCleanup != null else false else false;
+            if (comptime @import("build_options").enable_cuda) if (self.qwen35_linear_cache) |cache| for (cache.layers) |layer| {
+                typed_cuda_owner = typed_cuda_owner or layer.cuda_device.prepare_release_with_cleanup != null;
+            };
+            if (typed_cuda_owner) {
+                if (current.boundary != null or current.operation != null) return error.ConflictingCleanupAuthority;
+                // This function will own KV/graph mutexes below. Its genuine
+                // local B is reserved before either lock and seals only after
+                // the recursive typed teardown has released ALL those locks.
+                var pending: @import("../execution/resource_retirement.zig").SynchronousOutsideRawLeases = .{};
+                var local = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+                defer {
+                    const registered = pending.boundary_context != null;
+                    local.finishAfterUnlock();
+                    if (registered) std.debug.assert(pending.finished);
+                }
+                const kv_current = try local.synchronousOutsideContext(&pending);
+                // Only our KV/graph critical section needs this local B. Raw
+                // recurrent quota remains explicit outside AFTER KV unlock.
+                return self.deinitUsing(kv_current, current);
+            }
+        }
+        return self.deinitUsing(current, current);
+    }
+    fn deinitUsing(self: *NativeDecodeState, kv_current: Cleanup, resource_current: Cleanup) !void {
+        if (self.qwen35_linear_cache) |*cache| try cache.validateCleanup(resource_current);
+        {
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            if (self.sequence_id) |sequence| {
+                // Checked physical invalidation precedes logical publication.
+                if (self.kv_storage) |storage| try storage.releaseSequenceWithCleanup(sequence, kv_current);
+                if (self.kv_manager) |manager| try manager.releaseSequence(sequence);
+                // Publish successful retirement before any later fallible
+                // recurrent SDK death. A retry must not release this ID again.
+                self.sequence_id = null;
+                self.kv_view = null;
+                self.kv_compacted = false;
+            }
+        }
+        // Recurrent quota callbacks on an explicit outside path must not run
+        // while this request's KV mutex remains held.
+        if (self.qwen35_linear_cache) |*cache| {
+            try cache.deinitWithCleanup(resource_current);
+            self.qwen35_linear_cache = null;
+        }
+        // No irreversible host metadata is destroyed until every fallible SDK
+        // root has died or transferred its independently funded cache custody.
+        self.moe_runtime.deinit();
+        self.gemma4_layer_spec_cache.deinit(self.allocator);
+        if (self.deepseek_v4_compressed_cache) |*cache| cache.deinit();
+        self.clearSelectionQueries();
+        self.selection_queries.deinit(self.allocator);
+        self.selection_queries = .empty;
+        self.deinitRetiredKvBlockIds();
+        self.kv_block_ids_synchronized = false;
+        self.kv_block_ids.deinit(self.allocator);
+        self.kv_block_ids = .empty;
+        self.sequence_id = null;
+        self.kv_view = null;
+        self.kv_compacted = false;
+        self.qwen35_linear_cache = null;
+        self.deepseek_v4_compressed_cache = null;
+        self.kv_storage = null;
+        self.kv_manager = null;
+        self.kv_lock = null;
+        self.pool_id = null;
+        self.total_tokens = 0;
+    }
+
+    pub fn deinit(self: *NativeDecodeState) void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        if (self.kv_manager) |manager| {
+            if (self.sequence_id) |sequence_id| {
+                manager.releaseSequence(sequence_id) catch {};
+                if (self.kv_storage) |storage| storage.releaseSequence(sequence_id) catch {};
+            }
+        }
+        self.moe_runtime.deinit();
+        if (self.qwen35_linear_cache) |*cache| cache.deinit();
+        self.gemma4_layer_spec_cache.deinit(self.allocator);
+        if (self.deepseek_v4_compressed_cache) |*cache| cache.deinit();
+        self.clearSelectionQueries();
+        self.selection_queries.deinit(self.allocator);
+        self.deinitRetiredKvBlockIds();
+        self.kv_block_ids_synchronized = false;
+        self.kv_block_ids.deinit(self.allocator);
+        self.sequence_id = null;
+        self.kv_view = null;
+        self.kv_compacted = false;
+        self.qwen35_linear_cache = null;
+        self.deepseek_v4_compressed_cache = null;
+    }
+
+    pub fn ensureQwen35LinearCache(self: *NativeDecodeState, config: gpt_mod.Config) !void {
+        if (!config.isQwen35() or !config.qwen35_has_linear_attention) return;
+        if (self.qwen35_linear_cache == null) {
+            self.qwen35_linear_cache = try gpt_arch.Qwen35LinearCache.init(self.allocator, config);
+        }
+    }
+
+    pub fn resetQwen35LinearCache(self: *NativeDecodeState) void {
+        if (self.qwen35_linear_cache) |*cache| cache.reset();
+    }
+
+    /// Prepare a normal full/chunk prefill without publishing a fresh paired
+    /// attachment, page table or token count until every owner is ready.
+    fn tryAtomicPrefillAppend(self: *NativeDecodeState, count: usize, replace_total: bool, current: Cleanup) !bool {
+        if (count == 0 or !self.isPaged() or self.kv_compacted or (replace_total and self.total_tokens != 0) or
+            (self.sequence_id == null and self.total_tokens != 0)) return false;
+        const manager = self.kv_manager.?;
+        const manager_pool_id = if (self.sequence_id) |sequence| (manager.sequenceMut(sequence) catch return false).pool_id else self.pool_id orelse return false;
+        const manager_pool = manager.getPool(manager_pool_id) orelse return false;
+        if (!manager_pool.hasCanonicalHostBlockOwnership()) return false;
+        if (self.kv_storage) |storage| {
+            if (!storage.storage.hasCanonicalHostBlockOwnership() or manager_pool.ptr == storage.storage.ptr or manager_pool.config.page_size_tokens != storage.storage.config.page_size_tokens) return false;
+        }
+        if (self.sequence_id) |sequence| {
+            const manager_sequence = manager.sequenceMut(sequence) catch return false;
+            if (manager_sequence.compacted or !manager.canPreparePrefillAppend(sequence, count) or manager.tokenCount(sequence).? != self.total_tokens) return false;
+            if (self.kv_storage) |storage| {
+                const storage_sequence = storage.sequenceMut(sequence) catch return false;
+                if (storage_sequence.compacted or !storage.canPreparePrefillAppend(sequence, count) or storage.tokenCount(sequence) != manager.tokenCount(sequence)) return false;
+            }
+        }
+        const total = if (replace_total) count else try std.math.add(usize, self.total_tokens, count);
+        const replay = self.cudaPagedKvReplayCapacityTokens() orelse 0;
+        var pending_manager: ?runtime.kv.manager.KvManager.PendingAttachment = null;
+        defer if (pending_manager) |*pending| pending.abort();
+        var pending_storage: ?runtime.kv.storage_runtime.KvStorageRuntime.PendingAttachment = null;
+        defer if (pending_storage) |*pending| pending.abort();
+        var sequence = self.sequence_id;
+        if (sequence == null) {
+            pending_manager = try manager.prepareAttachment(manager_pool_id);
+            sequence = pending_manager.?.sequence_id;
+            if (self.kv_storage) |storage| {
+                pending_storage = try storage.prepareAttachment(storage.poolId());
+                if (pending_storage.?.sequence_id != sequence.?) return error.InvalidPagedKvState;
+            }
+            if (!pending_manager.?.canPreparePrefillAppend(count)) return false;
+            if (pending_storage) |*pending| if (!pending.canPreparePrefillAppend(count)) return false;
+        }
+        var manager_append = if (pending_manager) |*pending| try pending.preparePrefillAppend(count, replay) else try manager.preparePrefillAppend(sequence.?, count, replay);
+        defer manager_append.abort();
+        var storage_append: ?@import("../runtime/kv/writable_blocks.zig").PreparedAppend = null;
+        defer if (storage_append) |*prepared| prepared.abort();
+        if (self.kv_storage) |storage| storage_append = if (pending_storage) |*pending| try pending.preparePrefillAppend(count, replay, current) else try storage.preparePrefillAppendWithCleanup(sequence.?, count, replay, current);
+        if (storage_append) |*prepared| if (prepared.futureTokenCount() != manager_append.futureTokenCount()) return error.InvalidPagedKvState;
+        std.debug.assert(manager_append.futureTokenCount() == total);
+        const block_count = try std.math.add(usize, manager_append.futureLogicalBlockCount(), manager_append.futureReservedBlockCount());
+        const ids_unchanged = self.kv_block_ids_synchronized and self.kv_block_ids.items.len == block_count and !manager_append.idsChanged() and
+            (if (storage_append) |*prepared| !prepared.idsChanged() else true);
+        var prepared_view = try self.prepareKvView(block_count);
+        defer prepared_view.deinit();
+        manager_append.commit();
+        if (storage_append) |*prepared| prepared.commit();
+        if (pending_manager) |*pending| pending.commit();
+        if (pending_storage) |*pending| pending.commit();
+        self.sequence_id = sequence;
+        self.total_tokens = total;
+        self.kv_compacted = false;
+        if (!ids_unchanged) prepared_view.copyFrom(sequence.?);
+        self.setPagedKvView(total, 0);
+        return true;
+    }
+
+    /// Canonical suffix removal keeps original retained-view/position semantics.
+    /// The view allocation is prepared before any storage-specific final phase.
+    fn tryAtomicTruncate(self: *NativeDecodeState, count: usize, current: Cleanup) !bool {
+        if (count == 0 or !self.isPaged()) return false;
+        const sequence = self.sequence_id orelse return false;
+        const manager = self.kv_manager.?;
+        if (!manager.canPrepareTruncate(sequence)) return false;
+        const manager_sequence = manager.sequenceMut(sequence) catch return false;
+        const manager_pool = manager.getPool(manager_sequence.pool_id) orelse return false;
+        if (self.kv_storage) |storage| {
+            if (!storage.canPrepareTruncate(sequence) or manager_pool.ptr == storage.storage.ptr or manager_pool.config.page_size_tokens != storage.storage.config.page_size_tokens or manager.tokenCount(sequence) != storage.tokenCount(sequence)) return false;
+        }
+        const before = manager.tokenCount(sequence) orelse return false;
+        if (before > self.total_tokens) return false;
+        const total = self.total_tokens - count;
+        const removed = @min(before, count);
+        const prior_kv_tokens = if (self.kv_view) |view| view.token_count else 0;
+        const kv_tokens = prior_kv_tokens - @min(prior_kv_tokens, removed);
+        if (kv_tokens > total) return false;
+        var manager_truncate = try manager.prepareTruncate(sequence, count);
+        defer manager_truncate.abort();
+        std.debug.assert(manager_truncate.futureTokenCount() == before - removed);
+        const block_count = try std.math.add(usize, manager_truncate.futureLogicalBlockCount(), manager_truncate.futureReservedBlockCount());
+        var prepared_view = try self.prepareKvView(block_count);
+        defer prepared_view.deinit();
+        var storage_truncate: ?runtime.kv.storage_runtime.KvStorageRuntime.PreparedTruncate = null;
+        defer if (storage_truncate) |*prepared| prepared.abort();
+        if (self.kv_storage) |storage| storage_truncate = try storage.prepareTruncateWithCleanup(sequence, count, current);
+        if (storage_truncate) |*prepared| std.debug.assert(prepared.futureTokenCount() == manager_truncate.futureTokenCount());
+        const ids_unchanged = self.kv_block_ids_synchronized and self.kv_block_ids.items.len == block_count and !manager_truncate.idsChanged() and
+            (if (storage_truncate) |*prepared| !prepared.idsChanged() else true);
+        if (storage_truncate) |*prepared| prepared.commitBackend();
+        manager_truncate.commit();
+        if (storage_truncate) |*prepared| prepared.commit();
+        self.total_tokens = total;
+        if (!ids_unchanged) prepared_view.copyFrom(sequence);
+        self.setPagedKvView(kv_tokens, total - kv_tokens);
+        if (self.deepseek_v4_compressed_cache) |*cache| {
+            cache.reset();
+            self.force_full_recompute = true;
+        }
+        return true;
+    }
+
+    pub fn notePrefill(self: *NativeDecodeState, token_count: usize) !void {
+        return self.notePrefillWithCleanup(token_count, .{});
+    }
+    pub fn notePrefillWithCleanup(self: *NativeDecodeState, token_count: usize, current: Cleanup) !void {
+        if (self.isPaged()) {
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            if (try self.tryAtomicPrefillAppend(token_count, true, current)) return;
+        }
+        self.kv_block_ids_synchronized = false;
+        self.total_tokens = token_count;
+        if (self.isPaged()) {
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
+            try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(token_count));
+            if (self.kv_storage) |storage| try storage.appendTokensWithCleanup(self.sequence_id.?, @intCast(token_count), current);
+            try self.reservePagedKvReplayCapacity();
+            self.kv_compacted = false;
+            try self.syncPagedKvViewForPrefill();
+        }
+    }
+
+    pub fn notePrefillWithResult(self: *NativeDecodeState, token_count: usize) !KvMutationResult {
+        const before_view = self.kvView();
+        const before_sequence_id = self.sequence_id;
+        try self.notePrefill(token_count);
+        return self.makeKvMutationResult(before_view, before_sequence_id, null);
+    }
+
+    pub fn appendPrefillChunk(self: *NativeDecodeState, token_count: usize) !void {
+        return self.appendPrefillChunkWithCleanup(token_count, .{});
+    }
+    pub fn appendPrefillChunkWithCleanup(self: *NativeDecodeState, token_count: usize, current: Cleanup) !void {
+        if (self.isPaged()) {
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            if (try self.tryAtomicPrefillAppend(token_count, false, current)) return;
+        }
+        self.kv_block_ids_synchronized = false;
+        self.total_tokens += token_count;
+        if (self.isPaged()) {
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
+            try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(token_count));
+            if (self.kv_storage) |storage| try storage.appendTokensWithCleanup(self.sequence_id.?, @intCast(token_count), current);
+            try self.reservePagedKvReplayCapacity();
+            self.kv_compacted = false;
+            try self.syncPagedKvViewForPrefill();
+        }
+    }
+
+    pub fn appendPrefillChunkWithResult(self: *NativeDecodeState, token_count: usize) !KvMutationResult {
+        const before_view = self.kvView();
+        const before_sequence_id = self.sequence_id;
+        try self.appendPrefillChunk(token_count);
+        return self.makeKvMutationResult(before_view, before_sequence_id, null);
+    }
+
+    /// Atomic generated append for already-attached canonical host owners.
+    /// Opaque/device providers and fresh attachment retain their existing route;
+    /// eligibility is resolved before any state, page or published-view mutation.
+    fn tryAtomicGeneratedAppend(self: *NativeDecodeState, count: usize, current: Cleanup) !bool {
+        if (count == 0 or !self.isPaged()) return false;
+        const sequence = self.sequence_id orelse return false;
+        const manager = self.kv_manager.?;
+        if (!manager.canPrepareGeneratedAppend(sequence, count)) return false;
+        if (self.kv_storage) |storage| {
+            if (!storage.canPrepareGeneratedAppend(sequence, count)) return false;
+            const manager_sequence = manager.sequenceMut(sequence) catch return false;
+            const manager_pool = manager.getPool(manager_sequence.pool_id) orelse return false;
+            // Two independent prepared plans must not stage against the same
+            // physical pool/refcounts. Such wrappers retain compatibility.
+            if (manager_pool.ptr == storage.storage.ptr) return false;
+            const storage_sequence = storage.sequenceMut(sequence) catch return false;
+            const manager_window: ?u32 = if (manager_sequence.compacted) null else manager_pool.config.sliding_window_size;
+            const storage_window: ?u32 = if (storage_sequence.compacted) null else storage.storage.config.sliding_window_size;
+            if (manager_pool.config.page_size_tokens != storage.storage.config.page_size_tokens or
+                manager.tokenCount(sequence) != storage.tokenCount(sequence) or manager_window != storage_window) return false;
+        }
+        const total = try std.math.add(usize, self.total_tokens, count);
+        const replay_capacity = self.cudaPagedKvReplayCapacityTokens() orelse 0;
+        var manager_append = try manager.prepareGeneratedAppend(sequence, count, replay_capacity);
+        defer manager_append.abort();
+        var storage_append: ?@import("../runtime/kv/writable_blocks.zig").PreparedAppend = null;
+        defer if (storage_append) |*prepared| prepared.abort();
+        if (self.kv_storage) |storage| {
+            storage_append = try storage.prepareGeneratedAppendWithCleanup(sequence, count, replay_capacity, current);
+            if (storage_append.?.futureTokenCount() != manager_append.futureTokenCount()) return error.InvalidPagedKvState;
+        }
+        const block_count = try std.math.add(usize, manager_append.futureLogicalBlockCount(), manager_append.futureReservedBlockCount());
+        const ids_unchanged = self.kv_block_ids_synchronized and self.kv_block_ids.items.len == block_count and !manager_append.idsChanged() and
+            (if (storage_append) |*prepared| !prepared.idsChanged() else true);
+        // Prepare growth without invalidating the still-published table.
+        var prepared_view = try self.prepareKvView(block_count);
+        defer prepared_view.deinit();
+        const prefix = manager_append.preservedCombinedPrefix();
+        const preserve_prefix = self.kv_block_ids_synchronized and prepared_view.replacement.capacity == 0 and
+            prefix != null and prefix.? == self.kv_block_ids.items.len and prefix.? <= block_count and
+            (if (storage_append) |*prepared| prepared.preservedCombinedPrefix() != null else true);
+
+        // All remaining work is infallible under the canonical owners' prepared
+        // contracts. The common KV lock/readback boundary remains held by caller.
+        manager_append.commit();
+        if (storage_append) |*prepared| prepared.commit();
+        if (!ids_unchanged) {
+            if (preserve_prefix) prepared_view.copySuffixFrom(sequence, prefix.?) else prepared_view.copyFrom(sequence);
+        }
+        self.total_tokens = total;
+        self.publishPagedKvViewForDecode();
+        return true;
+    }
+
+    pub fn appendGeneratedToken(self: *NativeDecodeState) !void {
+        return self.appendGeneratedTokenWithCleanup(.{});
+    }
+    pub fn appendGeneratedTokenWithCleanup(self: *NativeDecodeState, current: Cleanup) !void {
+        const lock = if (self.isPaged()) self.lockPagedKv() else null;
+        defer if (lock) |mutex| mutex.unlock();
+        try self.appendGeneratedTokenWithKvLockHeldWithCleanup(current);
+    }
+
+    /// Graph replay holds the common KV lock before its owner mutex, through
+    /// readback; page retirement follows the same lock order.
+    pub fn appendGeneratedTokenWithKvLockHeld(self: *NativeDecodeState) !void {
+        return self.appendGeneratedTokenWithKvLockHeldWithCleanup(.{});
+    }
+    pub fn appendGeneratedTokenWithKvLockHeldWithCleanup(self: *NativeDecodeState, current: Cleanup) !void {
+        if (try self.tryAtomicGeneratedAppend(1, current)) return;
+        self.kv_block_ids_synchronized = false;
+        self.total_tokens += 1;
+        if (self.isPaged()) {
+            try self.ensureAttachedUnlocked();
+            try self.kv_manager.?.appendTokens(self.sequence_id.?, 1);
+            _ = try self.kv_manager.?.trimSequenceToSlidingWindow(self.sequence_id.?);
+            if (self.kv_storage) |storage| {
+                try storage.appendTokensWithCleanup(self.sequence_id.?, 1, current);
+                _ = try storage.trimSequenceToSlidingWindow(self.sequence_id.?);
+            }
+            try self.reservePagedKvReplayCapacity();
+            try self.syncPagedKvViewForDecode();
+        }
+    }
+
+    pub fn appendGeneratedTokenWithResult(self: *NativeDecodeState) !KvMutationResult {
+        const before_view = self.kvView();
+        const before_sequence_id = self.sequence_id;
+        try self.appendGeneratedToken();
+        return self.makeKvMutationResult(before_view, before_sequence_id, null);
+    }
+
+    /// Append `count` generated tokens at once (used by speculative decoding
+    /// after accepting a batch of draft tokens).
+    pub fn appendGeneratedTokens(self: *NativeDecodeState, count: usize) !void {
+        return self.appendGeneratedTokensWithCleanup(count, .{});
+    }
+    pub fn appendGeneratedTokensWithCleanup(self: *NativeDecodeState, count: usize, current: Cleanup) !void {
+        if (count > 0 and self.isPaged() and self.sequence_id != null) {
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            if (try self.tryAtomicGeneratedAppend(count, current)) return;
+        }
+        self.kv_block_ids_synchronized = false;
+        self.total_tokens += count;
+        if (self.isPaged()) {
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
+            try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(count));
+            _ = try self.kv_manager.?.trimSequenceToSlidingWindow(self.sequence_id.?);
+            if (self.kv_storage) |storage| {
+                try storage.appendTokensWithCleanup(self.sequence_id.?, @intCast(count), current);
+                _ = try storage.trimSequenceToSlidingWindow(self.sequence_id.?);
+            }
+            try self.reservePagedKvReplayCapacity();
+            if (count > 0) {
+                try self.syncPagedKvViewForDecode();
+            }
+        }
+    }
+
+    pub fn appendGeneratedTokensWithResult(self: *NativeDecodeState, count: usize) !KvMutationResult {
+        const before_view = self.kvView();
+        const before_sequence_id = self.sequence_id;
+        try self.appendGeneratedTokens(count);
+        return self.makeKvMutationResult(before_view, before_sequence_id, null);
+    }
+
+    /// Roll back `count` tokens from the KV cache (used by speculative
+    /// decoding when draft tokens are rejected).
+    pub fn truncateTokens(self: *NativeDecodeState, count: usize) !void {
+        return self.truncateTokensWithCleanup(count, .{});
+    }
+    pub fn truncateTokensWithCleanup(self: *NativeDecodeState, count: usize, current: Cleanup) !void {
+        if (count > self.total_tokens) return error.TruncateBeyondStart;
+        if (count != 0 and self.isPaged()) {
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            if (try self.tryAtomicTruncate(count, current)) return;
+        }
+        self.kv_block_ids_synchronized = false;
+        if (count == 0) return;
+        if (count > self.total_tokens) return error.TruncateBeyondStart;
+        if (self.kv_storage) |storage| if (storage.device_write_hook) |hook| try hook.prepareMutationWithCleanup(current);
+        const was_paged = self.isPaged();
+        self.total_tokens -= count;
+        if (was_paged) {
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            const manager = self.kv_manager.?;
+            if (self.sequence_id) |seq_id| {
+                const removed = try manager.truncateSequence(seq_id, count);
+                if (self.kv_storage) |storage| _ = try storage.truncateSequenceWithCleanup(seq_id, count, current);
+                const prior_kv_tokens = if (self.kv_view) |view| view.token_count else 0;
+                const kv_tokens = prior_kv_tokens - @min(prior_kv_tokens, removed);
+                try self.syncPagedKvBlockTable();
+                self.setPagedKvView(kv_tokens, self.total_tokens - kv_tokens);
+            }
+        }
+        if (self.deepseek_v4_compressed_cache) |*cache| {
+            cache.reset();
+            self.force_full_recompute = true;
+        }
+    }
+
+    pub fn truncateTokensWithResult(self: *NativeDecodeState, count: usize) !KvMutationResult {
+        const before_view = self.kvView();
+        const before_sequence_id = self.sequence_id;
+        try self.truncateTokens(count);
+        return self.makeKvMutationResult(before_view, before_sequence_id, null);
+    }
+
+    /// Compact the KV cache using Attention Matching. Replaces the current
+    /// sequence with a smaller one containing fitted K/V values that preserve
+    /// attention output. Call after prefill, before the decode loop.
+    pub fn compactKvCache(self: *NativeDecodeState, config: runtime.kv.compaction.CompactionConfig) !usize {
+        try config.validate();
+        if (self.deepseek_v4_compressed_cache != null) return error.DeepSeekV4CompressedKvCompactionNotSupported;
+        if (self.kv_storage != null) return error.KvStorageCompactionNotSupported;
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        const manager = self.kv_manager orelse return 0;
+        const seq_id = self.sequence_id orelse return 0;
+        const pool_id = self.pool_id orelse return error.InvalidPoolId;
+        const pool = manager.getPool(pool_id) orelse return error.InvalidPoolId;
+
+        var compacted = try runtime.kv.compaction.compactSequence(
+            self.allocator,
+            manager,
+            seq_id,
+            pool_id,
+            config,
+        );
+        defer compacted.deinit();
+
+        // Create new sequence and write compacted data.
+        const new_seq_id = try manager.attachSequence(pool_id);
+        errdefer manager.releaseSequence(new_seq_id) catch {};
+        try manager.appendTokens(new_seq_id, @intCast(compacted.retained_count));
+        for (0..pool.config.num_layers_packed) |layer| {
+            try manager.writeFullLayerKv(
+                new_seq_id,
+                layer,
+                compacted.retained_count,
+                compacted.k_per_layer[layer],
+                compacted.v_per_layer[layer],
+            );
+        }
+
+        // Complete every fallible step before releasing the old sequence so
+        // a failed compaction leaves the original state intact.
+        const new_state = try manager.sequenceMut(new_seq_id);
+        new_state.compacted = true;
+        var prepared_view = try self.prepareKvView(try manager.logicalBlocksWithReservationsCount(new_seq_id));
+        defer prepared_view.deinit();
+
+        // Publish directly from the new sequence's authoritative table. Never
+        // shrink view capacity or create a second full temporary view on compaction.
+        self.kv_block_ids_synchronized = false;
+        try manager.releaseSequence(seq_id);
+        self.sequence_id = new_seq_id;
+        prepared_view.copyFrom(new_seq_id);
+        self.kv_compacted = true;
+        self.setPagedKvView(compacted.retained_count, self.total_tokens - compacted.retained_count);
+        // total_tokens stays the same for position encoding continuity.
+        return compacted.retained_count;
+    }
+
+    pub fn compactKvCacheWithResult(self: *NativeDecodeState, config: runtime.kv.compaction.CompactionConfig) !KvMutationResult {
+        const before_view = self.kvView();
+        const before_sequence_id = self.sequence_id;
+        const retained_tokens = try self.compactKvCache(config);
+        return self.makeKvMutationResult(before_view, before_sequence_id, retained_tokens);
+    }
+
+    pub fn kvView(self: *const NativeDecodeState) ?KvView {
+        if (self.force_full_recompute) return null;
+        return self.kv_view;
+    }
+
+    pub fn gptDecodeContext(self: *NativeDecodeState, seq_len: usize, query_seq_len: usize) gpt_arch.DecodeContext {
+        const decode_positions: ?[]const u32 = if (self.qwen3vl_mrope_position_delta != null and query_seq_len == 1 and seq_len > 0) blk: {
+            const position = @as(i64, @intCast(seq_len - 1)) + self.qwen3vl_mrope_position_delta.?;
+            if (position < 0 or position > std.math.maxInt(u32)) break :blk null;
+            @memset(&self.qwen3vl_decode_positions, @intCast(position));
+            break :blk &self.qwen3vl_decode_positions;
+        } else null;
+        if (platform.env.getenvBool("TERMITE_DISABLE_PAGED_KV") or self.force_full_recompute) {
+            return .{
+                .attention_mode = .full_recompute,
+                .total_sequence_len = seq_len,
+                .query_sequence_len = seq_len,
+                .kv_sequence_len = seq_len,
+                .kv_position_offset = 0,
+                .moe_runtime = &self.moe_runtime,
+                .qwen35_linear_cache = if (self.qwen35_linear_cache) |*cache| cache else null,
+                .gemma4_layer_spec_cache = &self.gemma4_layer_spec_cache,
+                .deepseek_v4_compressed_cache = if (self.deepseek_v4_compressed_cache) |*cache| cache else null,
+                .mrope_positions = decode_positions,
+                .qwen3vl_text_only = self.qwen3vl_text_only,
+            };
+        }
+        return .{
+            .attention_mode = if (self.kvView() != null)
+                (if (query_seq_len < seq_len and query_seq_len == 1) .paged_decode else .paged_prefill)
+            else
+                .full_recompute,
+            .total_sequence_len = seq_len,
+            .query_sequence_len = query_seq_len,
+            .kv_sequence_len = if (self.kvView()) |view| view.token_count else seq_len,
+            .kv_position_offset = if (self.kvView()) |view| view.position_offset else 0,
+            .kv_manager = self.kv_manager,
+            .kv_storage = self.kv_storage,
+            .moe_runtime = &self.moe_runtime,
+            .qwen35_linear_cache = if (self.qwen35_linear_cache) |*cache| cache else null,
+            .gemma4_layer_spec_cache = &self.gemma4_layer_spec_cache,
+            .deepseek_v4_compressed_cache = if (self.deepseek_v4_compressed_cache) |*cache| cache else null,
+            .mrope_positions = decode_positions,
+            .qwen3vl_text_only = self.qwen3vl_text_only,
+            .selection_query_capture = if (self.selection_capture_enabled) .{
+                .ctx = @ptrCast(self),
+                .allocator = self.allocator,
+                .horizon = runtime.kv.selection.defaults.query_horizon,
+                .captureFn = captureSelectionQueries,
+            } else null,
+            .kv_cache = if (self.kvView()) |view|
+                .{
+                    .sequence_id = view.sequence_id,
+                    .pool_id = view.pool_id,
+                    .logical_block_count = view.logical_block_count,
+                    .tail_tokens = view.tail_tokens,
+                    .position_offset = view.position_offset,
+                    .max_inflight_tokens = view.max_inflight_tokens,
+                    .allow_swa_ring = view.allow_swa_ring,
+                    .logical_blocks = view.logical_blocks,
+                    .kv_storage = view.kv_storage,
+                }
+            else
+                null,
         };
     }
 };
+
+pub const DecodeStateRuntime = StateRuntime(.owned);
+pub const BorrowedDecodeStateRuntime = StateRuntime(.borrowed);
+
+fn StateRuntime(comptime ownership: enum { owned, borrowed }) type {
+    return struct {
+        const Self = @This();
+        const DecodeStep = struct { seq_len: usize, decode_context: gpt_arch.DecodeContext };
+        state: if (ownership == .owned) NativeDecodeState else *NativeDecodeState,
+
+        /// A borrowed cursor never releases sequence storage; its runtime owner does.
+        pub fn init(state: *NativeDecodeState) Self {
+            return .{ .state = state };
+        }
+
+        pub fn makeDecodeContext(self: *Self, seq_len: usize, query_seq_len: usize) gpt_arch.DecodeContext {
+            return self.makeDecodeContextForMode(seq_len, query_seq_len, null);
+        }
+        pub fn preparePrefill(self: *Self, seq_len: usize, query_seq_len: usize) !gpt_arch.DecodeContext {
+            return self.preparePrefillForMode(seq_len, query_seq_len, null);
+        }
+        pub fn beginDecodeStep(self: *Self, position: usize) !DecodeStep {
+            return self.beginDecodeStepForMode(position, null);
+        }
+        pub fn reservePrefillTo(self: *Self, target: usize) !usize {
+            return self.reservePrefillToWithCleanup(target, .{});
+        }
+        pub fn reservePrefillToWithCleanup(self: *Self, target: usize, current: Cleanup) !usize {
+            if (target < self.currentTokenCount()) return error.InvalidPrefillAdvance;
+            const missing = target - self.currentTokenCount();
+            if (missing != 0) try self.appendPrefillChunkWithCleanup(missing, current);
+            return missing;
+        }
+        pub fn rollbackReservedPrefill(self: *Self, reserved: usize) !void {
+            return self.rollbackReservedPrefillWithCleanup(reserved, .{});
+        }
+        pub fn rollbackReservedPrefillWithCleanup(self: *Self, reserved: usize, current: Cleanup) !void {
+            if (reserved != 0) try self.truncateGeneratedTokensWithCleanup(reserved, current);
+        }
+
+        pub fn initPaged(
+            allocator: std.mem.Allocator,
+            kv_manager: *runtime.kv.manager.KvManager,
+            pool_id: runtime.kv.block.KvPoolId,
+            shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
+        ) Self {
+            return .{
+                .state = NativeDecodeState.initPaged(allocator, kv_manager, pool_id, shared_moe_cache),
+            };
+        }
+
+        pub fn deinitWithCleanup(self: *Self, current: Cleanup) !void {
+            if (ownership == .owned) try self.state.deinitWithCleanup(current);
+        }
+        pub fn deinit(self: *Self) void {
+            if (ownership == .owned) self.state.deinit();
+        }
+
+        pub fn notePrefillWithCleanup(self: *Self, count: usize, current: Cleanup) !void {
+            try self.state.notePrefillWithCleanup(count, current);
+        }
+        pub fn appendPrefillChunkWithCleanup(self: *Self, count: usize, current: Cleanup) !void {
+            try self.state.appendPrefillChunkWithCleanup(count, current);
+        }
+        pub fn appendGeneratedTokensWithCleanup(self: *Self, count: usize, current: Cleanup) !usize {
+            try self.state.appendGeneratedTokensWithCleanup(count, current);
+            return self.currentTokenCount();
+        }
+        pub fn truncateGeneratedTokensWithCleanup(self: *Self, count: usize, current: Cleanup) !void {
+            try self.state.truncateTokensWithCleanup(count, current);
+        }
+        pub fn configureForGptConfig(self: *Self, config: gpt_mod.Config) void {
+            self.state.configureForGptConfig(config);
+        }
+
+        pub fn currentTokenCount(self: *const Self) usize {
+            return self.state.total_tokens;
+        }
+
+        pub fn kvView(self: *const Self) ?KvView {
+            return self.state.kvView();
+        }
+
+        pub fn notePrefill(self: *Self, token_count: usize) !void {
+            try self.state.notePrefill(token_count);
+        }
+
+        pub fn appendPrefillChunk(self: *Self, token_count: usize) !void {
+            try self.state.appendPrefillChunk(token_count);
+        }
+
+        pub fn appendGeneratedToken(self: *Self) !usize {
+            try self.state.appendGeneratedToken();
+            return self.currentTokenCount();
+        }
+
+        pub fn appendGeneratedTokens(self: *Self, count: usize) !usize {
+            try self.state.appendGeneratedTokens(count);
+            return self.currentTokenCount();
+        }
+
+        pub fn truncateGeneratedTokens(self: *Self, count: usize) !void {
+            try self.state.truncateTokens(count);
+        }
+
+        pub fn compactKvCache(self: *Self, config: runtime.kv.compaction.CompactionConfig) !void {
+            _ = try self.state.compactKvCache(config);
+        }
+
+        pub fn validateDecodePosition(self: *const Self, position: usize) !void {
+            if (self.currentTokenCount() != position) return error.InvalidDecodePosition;
+        }
+
+        pub fn makeDecodeContextForMode(
+            self: *Self,
+            seq_len: usize,
+            query_seq_len: usize,
+            attention_mode: ?cache_mod.AttentionMode,
+        ) gpt_arch.DecodeContext {
+            var decode_context = self.state.gptDecodeContext(seq_len, query_seq_len);
+            if (attention_mode != null and attention_mode.? == .full_recompute) decode_context.attention_mode = .full_recompute;
+            return decode_context;
+        }
+
+        pub fn preparePrefillForMode(
+            self: *Self,
+            seq_len: usize,
+            query_seq_len: usize,
+            attention_mode: ?cache_mod.AttentionMode,
+        ) !gpt_arch.DecodeContext {
+            return self.preparePrefillForModeWithCleanup(seq_len, query_seq_len, attention_mode, .{});
+        }
+        pub fn preparePrefillWithCleanup(self: *Self, seq_len: usize, query_seq_len: usize, current: Cleanup) !gpt_arch.DecodeContext {
+            return self.preparePrefillForModeWithCleanup(seq_len, query_seq_len, null, current);
+        }
+        pub fn preparePrefillForModeWithCleanup(self: *Self, seq_len: usize, query_seq_len: usize, attention_mode: ?cache_mod.AttentionMode, current: Cleanup) !gpt_arch.DecodeContext {
+            if (query_seq_len > seq_len) return error.UnsupportedShape;
+            if (self.currentTokenCount() == 0) {
+                if (seq_len != query_seq_len) return error.UnsupportedShape;
+                try self.notePrefillWithCleanup(query_seq_len, current);
+            } else {
+                const expected_prior = seq_len - query_seq_len;
+                if (self.currentTokenCount() != expected_prior) return error.InvalidPrefillSequence;
+                try self.appendPrefillChunkWithCleanup(query_seq_len, current);
+            }
+            return self.makeDecodeContextForMode(seq_len, query_seq_len, attention_mode);
+        }
+
+        pub fn beginDecodeStepForMode(
+            self: *Self,
+            position: usize,
+            attention_mode: ?cache_mod.AttentionMode,
+        ) !DecodeStep {
+            try self.validateDecodePosition(position);
+            const seq_len = try self.appendGeneratedToken();
+            return .{
+                .seq_len = seq_len,
+                .decode_context = self.makeDecodeContextForMode(seq_len, 1, attention_mode),
+            };
+        }
+    };
+}
 
 test "decode state runtime paged prefill and decode step" {
     const allocator = std.testing.allocator;
@@ -143,11 +1450,11 @@ test "decode state runtime paged prefill and decode step" {
     var ds = DecodeStateRuntime.initPaged(allocator, &manager, pool_id, null);
     defer ds.deinit();
 
-    const prefill_ctx = try ds.preparePrefill(4, 4, .paged_prefill);
+    const prefill_ctx = try ds.preparePrefillForMode(4, 4, .paged_prefill);
     try std.testing.expectEqual(@as(usize, 4), ds.currentTokenCount());
     try std.testing.expectEqual(@as(usize, 4), prefill_ctx.kv_sequence_len);
 
-    const step = try ds.beginDecodeStep(4, .paged_decode);
+    const step = try ds.beginDecodeStepForMode(4, .paged_decode);
     try std.testing.expectEqual(@as(usize, 5), step.seq_len);
     try std.testing.expectEqual(@as(usize, 1), step.decode_context.query_sequence_len);
 }
@@ -171,15 +1478,604 @@ test "decode state runtime preserves Qwen3-VL text-only M-RoPE contract" {
     defer ds.deinit();
     ds.configureForGptConfig(.{ .family = .qwen3_vl });
 
-    const prefill_ctx = try ds.preparePrefill(4, 4, .paged_prefill);
+    const prefill_ctx = try ds.preparePrefillForMode(4, 4, .paged_prefill);
     try std.testing.expect(prefill_ctx.qwen3vl_text_only);
     try std.testing.expect(prefill_ctx.mrope_positions == null);
 
-    const step = try ds.beginDecodeStep(4, .paged_decode);
+    const step = try ds.beginDecodeStepForMode(4, .paged_decode);
     try std.testing.expect(step.decode_context.qwen3vl_text_only);
     try std.testing.expectEqualSlices(
         u32,
         &.{ 4, 4, 4 },
         step.decode_context.mrope_positions orelse return error.MissingMropePositions,
     );
+}
+
+test "native decode state compacted batched append advances the full accepted count" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f16,
+        .page_size_tokens = 4,
+        .num_kv_heads = 1,
+        .head_dim = 8,
+    });
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer state.deinit();
+
+    // Model a six-token prompt compacted to two retained KV entries without
+    // invoking the numerical compactor; this test targets view accounting.
+    try state.notePrefill(2);
+    state.total_tokens = 6;
+    state.kv_compacted = true;
+    (try manager.sequenceMut(state.sequence_id.?)).compacted = true;
+    state.setPagedKvView(2, 4);
+
+    try state.appendGeneratedTokens(3);
+    const view = state.kvView().?;
+    try std.testing.expectEqual(@as(usize, 5), view.token_count);
+    try std.testing.expectEqual(@as(usize, 4), view.position_offset);
+    try std.testing.expectEqual(@as(usize, 9), state.total_tokens);
+}
+
+test "borrowed decode cursors share reservations without owning persistent state" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f16, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 4 });
+    var owner = DecodeStateRuntime.initPaged(allocator, &manager, pool, null);
+    defer owner.deinit();
+    try owner.notePrefill(2);
+    var cursor = BorrowedDecodeStateRuntime.init(&owner.state);
+    try std.testing.expectEqual(@as(usize, 3), try cursor.reservePrefillTo(5));
+    try std.testing.expectEqual(@as(usize, 5), owner.currentTokenCount());
+    try std.testing.expectError(error.InvalidPrefillAdvance, cursor.reservePrefillTo(1));
+    try cursor.rollbackReservedPrefill(3);
+    try std.testing.expectEqual(@as(usize, 2), owner.currentTokenCount());
+    try std.testing.expectError(error.UnsupportedShape, cursor.preparePrefill(1, 2));
+    try std.testing.expectEqual(@as(usize, 2), owner.currentTokenCount());
+    const step = try cursor.beginDecodeStep(2);
+    try std.testing.expectEqual(@as(usize, 3), step.seq_len);
+    cursor.deinit();
+    try std.testing.expectEqual(@as(usize, 3), owner.currentTokenCount());
+    const context = owner.makeDecodeContextForMode(3, 1, .full_recompute);
+    try std.testing.expectEqual(gpt_arch.DecodeContext.AttentionMode.full_recompute, context.attention_mode);
+}
+
+test "decode state KV metadata uses its own distinct allocator for initial reserved growth and retirement" {
+    var manager_alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var state_alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var manager = runtime.kv.manager.KvManager.init(manager_alloc.allocator());
+    var manager_live = true;
+    defer if (manager_live) manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2 });
+    var state = NativeDecodeState.initPaged(state_alloc.allocator(), &manager, pool, null);
+    var state_live = true;
+    defer if (state_live) state.deinit();
+    try state.notePrefill(3);
+    const sequence = state.sequence_id orelse return error.MissingActualKvSequence;
+    try manager.reserveTokenCapacity(sequence, 33);
+    try state.syncPagedKvBlockTable();
+    try std.testing.expect(state.kv_block_ids.items.len >= 17);
+    try std.testing.expect(state_alloc.allocations > 0);
+    // Existing manager-owned wrapper retains its original allocator contract.
+    {
+        var legacy: std.ArrayListUnmanaged(runtime.kv.block.KvBlockId) = .empty;
+        defer legacy.deinit(manager_alloc.allocator());
+        const state_allocations = state_alloc.alloc_index;
+        _ = try manager.logicalBlocksWithReservations(sequence, &legacy);
+        try std.testing.expectEqualSlices(runtime.kv.block.KvBlockId, state.kv_block_ids.items, legacy.items);
+        try std.testing.expectEqual(state_allocations, state_alloc.alloc_index);
+    }
+    try state.deinitWithCleanup(.{ .outside_execution = true });
+    state_live = false;
+    try std.testing.expectEqual(state_alloc.allocated_bytes, state_alloc.freed_bytes);
+    try std.testing.expectEqual(state_alloc.allocations, state_alloc.deallocations);
+    manager.deinit();
+    manager_live = false;
+    try std.testing.expectEqual(manager_alloc.allocated_bytes, manager_alloc.freed_bytes);
+    try std.testing.expectEqual(manager_alloc.allocations, manager_alloc.deallocations);
+}
+
+test "attached generated append stages both owners and published view before metadata allocation failure" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |paired| {
+        for (0..2) |failure_step| {
+            var manager_alloc = std.testing.FailingAllocator.init(a, .{});
+            var storage_alloc = std.testing.FailingAllocator.init(a, .{});
+            var state_alloc = std.testing.FailingAllocator.init(a, .{});
+            var manager = runtime.kv.manager.KvManager.init(manager_alloc.allocator());
+            defer manager.deinit();
+            const config = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2 };
+            const pool = try manager.addPool(config);
+            var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(storage_alloc.allocator(), config);
+            defer storage.deinit();
+            var state = NativeDecodeState.initPaged(state_alloc.allocator(), &manager, pool, null);
+            state.kv_storage = if (paired) &storage else null;
+            defer state.deinit();
+            try state.notePrefill(2);
+            const sequence = state.sequence_id.?;
+            const old_view = state.kvView().?;
+            try std.testing.expect(state.kv_block_ids_synchronized);
+            const old_blocks = try a.dupe(runtime.kv.block.KvBlockId, state.kv_block_ids.items);
+            defer a.free(old_blocks);
+            const count = (state.kv_block_ids.capacity + 1) * 2;
+            // Fail replacement payload first, then retirement-owner list metadata.
+            state_alloc.fail_index = state_alloc.alloc_index + failure_step;
+            try std.testing.expectError(error.OutOfMemory, state.appendGeneratedTokens(count));
+            try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
+            try std.testing.expectEqual(@as(usize, 2), manager.tokenCount(sequence).?);
+            if (paired) try std.testing.expectEqual(@as(usize, 2), storage.tokenCount(sequence).?);
+            try std.testing.expectEqual(old_view.logical_blocks.?.ptr, state.kvView().?.logical_blocks.?.ptr);
+            try std.testing.expectEqualSlices(runtime.kv.block.KvBlockId, old_blocks, state.kv_block_ids.items);
+            try std.testing.expectEqual(old_view.token_count, state.kvView().?.token_count);
+            try std.testing.expect(state.kv_block_ids_synchronized);
+            state_alloc.fail_index = std.math.maxInt(usize);
+            try state.appendGeneratedTokens(count);
+            try std.testing.expectEqual(@as(usize, 1), state.retired_kv_block_ids.items.len);
+            try std.testing.expectEqual(old_view.logical_blocks.?.ptr, state.retired_kv_block_ids.items[0].items.ptr);
+            try std.testing.expectEqualSlices(runtime.kv.block.KvBlockId, old_blocks, old_view.logical_blocks.?);
+            try std.testing.expectEqual(2 + count, state.total_tokens);
+            try std.testing.expectEqual(2 + count, manager.tokenCount(sequence).?);
+            if (paired) try std.testing.expectEqual(2 + count, storage.tokenCount(sequence).?);
+            // First enter a unique partial page, then prove the hot tail append
+            // allocates neither plan/page/view metadata nor replacement storage.
+            try state.appendGeneratedToken();
+            const manager_calls = manager_alloc.alloc_index;
+            const storage_calls = storage_alloc.alloc_index;
+            const state_calls = state_alloc.alloc_index;
+            try state.appendGeneratedToken();
+            try std.testing.expectEqual(manager_calls, manager_alloc.alloc_index);
+            try std.testing.expectEqual(storage_calls, storage_alloc.alloc_index);
+            try std.testing.expectEqual(state_calls, state_alloc.alloc_index);
+            try std.testing.expectEqual(4 + count, state.total_tokens);
+            try std.testing.expectEqual(4 + count, state.kvView().?.token_count);
+            try std.testing.expect(state.kv_block_ids_synchronized);
+        }
+    }
+}
+
+test "failed legacy block table synchronization cannot authorize generated append copy elision" {
+    const a = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2 });
+    var state_alloc = std.testing.FailingAllocator.init(a, .{});
+    var state = NativeDecodeState.initPaged(state_alloc.allocator(), &manager, pool, null);
+    defer state.deinit();
+    try state.notePrefill(1);
+    try std.testing.expect(state.kv_block_ids_synchronized);
+    const sequence = state.sequence_id.?;
+    try manager.reserveTokenCapacity(sequence, (state.kv_block_ids.capacity + 1) * 2);
+    state_alloc.fail_index = state_alloc.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, state.syncPagedKvBlockTable());
+    try std.testing.expect(!state.kv_block_ids_synchronized);
+    state_alloc.fail_index = std.math.maxInt(usize);
+    // A partial unique-tail append keeps manager IDs unchanged. The failed
+    // previous copy must still force authoritative table reconstruction.
+    try state.appendGeneratedToken();
+    try std.testing.expect(state.kv_block_ids_synchronized);
+    var expected: std.ArrayListUnmanaged(runtime.kv.block.KvBlockId) = .empty;
+    defer expected.deinit(a);
+    _ = try manager.logicalBlocksWithReservations(sequence, &expected);
+    try std.testing.expectEqualSlices(runtime.kv.block.KvBlockId, expected.items, state.kv_block_ids.items);
+}
+
+test "paired generated append publishes all owners before allocator retirement callbacks" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        manager: ?*runtime.kv.manager.KvManager = null,
+        storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
+        state: ?*NativeDecodeState = null,
+        armed: bool = false,
+        observed_half_commit: bool = false,
+        spill_frees: usize = 0,
+        fn observe(self: *@This(), bytes: usize) void {
+            if (!self.armed) return;
+            const state = self.state.?;
+            const sequence = state.sequence_id.?;
+            const manager_tokens = self.manager.?.tokenCount(sequence).?;
+            const storage_tokens = self.storage.?.tokenCount(sequence).?;
+            const view_tokens = if (state.kvView()) |view| view.token_count else 0;
+            const old = manager_tokens == 20 and storage_tokens == 20 and state.total_tokens == 20 and view_tokens == 20;
+            const committed = manager_tokens == 4 and storage_tokens == 4 and state.total_tokens == 24 and view_tokens == 4;
+            if (!old and !committed) self.observed_half_commit = true;
+            if (bytes == 10 * @sizeOf(runtime.kv.block.KvBlockId)) self.spill_frees += 1;
+        }
+    };
+    const ObservedAllocator = struct {
+        backing: std.mem.Allocator,
+        probe: *Probe,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.backing.rawAlloc(len, alignment, ra);
+        }
+        fn resize(raw: *anyopaque, buffer: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.backing.rawResize(buffer, alignment, len, ra);
+        }
+        fn remap(raw: *anyopaque, buffer: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.backing.rawRemap(buffer, alignment, len, ra);
+        }
+        fn free(raw: *anyopaque, buffer: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.probe.observe(buffer.len);
+            self.backing.rawFree(buffer, alignment, ra);
+        }
+    };
+    var probe = Probe{};
+    var manager_alloc = ObservedAllocator{ .backing = a, .probe = &probe };
+    var storage_alloc = ObservedAllocator{ .backing = a, .probe = &probe };
+    var manager = runtime.kv.manager.KvManager.init(manager_alloc.allocator());
+    defer manager.deinit();
+    const config = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2, .sliding_window_size = 4 };
+    const pool = try manager.addPool(config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(storage_alloc.allocator(), config);
+    defer storage.deinit();
+    var state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+    try state.notePrefill(20);
+    probe.manager = &manager;
+    probe.storage = &storage;
+    probe.state = &state;
+    probe.armed = true;
+    defer probe.armed = false;
+    try state.appendGeneratedTokens(4);
+    probe.armed = false;
+    try std.testing.expect(probe.spill_frees >= 1);
+    try std.testing.expect(!probe.observed_half_commit);
+    try std.testing.expectEqual(@as(usize, 4), manager.tokenCount(state.sequence_id.?).?);
+    try std.testing.expectEqual(@as(usize, 4), storage.tokenCount(state.sequence_id.?).?);
+    try std.testing.expectEqual(@as(usize, 24), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 4), state.kvView().?.token_count);
+}
+
+test "canonical prefill metadata allocation failure preserves both token state and old block IDs" {
+    const a = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2 });
+    var state_alloc = std.testing.FailingAllocator.init(a, .{});
+    var state = NativeDecodeState.initPaged(state_alloc.allocator(), &manager, pool, null);
+    defer state.deinit();
+    try state.notePrefill(2);
+    const old_view = state.kvView().?;
+    state_alloc.fail_index = state_alloc.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, state.appendPrefillChunk(4));
+    // Canonical attached prefill now aborts its private plan before publication.
+    try std.testing.expect(state.kv_block_ids_synchronized);
+    try std.testing.expectEqual(old_view.token_count, state.kvView().?.token_count);
+    try std.testing.expectEqual(old_view.logical_blocks.?.ptr, state.kvView().?.logical_blocks.?.ptr);
+    try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 2), manager.tokenCount(state.sequence_id.?).?);
+}
+
+test "paired generated append host bound covers both simultaneous real plan spills and retained view" {
+    const a = std.testing.allocator;
+    const Tracked = struct {
+        const Entry = struct { address: usize = 0, bytes: usize = 0 };
+        backing: std.mem.Allocator,
+        entries: [256]Entry = @splat(.{}),
+        live: usize = 0,
+        peak: usize = 0,
+        armed: bool = false,
+        growth_attempts: usize = 0,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn add(self: *@This(), ptr: [*]u8, bytes: usize) void {
+            for (&self.entries) |*entry| if (entry.address == 0) {
+                entry.* = .{ .address = @intFromPtr(ptr), .bytes = bytes };
+                self.live += bytes;
+                self.peak = @max(self.peak, self.live);
+                return;
+            };
+            @panic("allocation peak fixture tracking capacity exceeded");
+        }
+        fn remove(self: *@This(), ptr: [*]u8) void {
+            for (&self.entries) |*entry| if (entry.address == @intFromPtr(ptr)) {
+                self.live -= entry.bytes;
+                entry.* = .{};
+                return;
+            };
+            // Manager/storage allocations made before instrumentation still
+            // retire through their real backing allocator, without fake credit.
+        }
+        fn alloc(raw: *anyopaque, bytes: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const ptr = self.backing.rawAlloc(bytes, alignment, ra) orelse return null;
+            self.add(ptr, bytes);
+            return ptr;
+        }
+        fn resize(raw: *anyopaque, buffer: []u8, _: std.mem.Alignment, bytes: usize, _: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (bytes == buffer.len) return true;
+            if (self.armed) self.growth_attempts += 1;
+            // Make every backing transfer observable through actual alloc/free.
+            return false;
+        }
+        fn remap(raw: *anyopaque, buffer: []u8, _: std.mem.Alignment, bytes: usize, _: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (bytes == buffer.len) return buffer.ptr;
+            if (self.armed) self.growth_attempts += 1;
+            return null;
+        }
+        fn free(raw: *anyopaque, buffer: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.remove(buffer.ptr);
+            self.backing.rawFree(buffer, alignment, ra);
+        }
+    };
+    var tracked = Tracked{ .backing = a };
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const config = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 16, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 1, .sliding_window_size = 512 };
+    const pool = try manager.addPool(config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, config);
+    defer storage.deinit();
+    var state = NativeDecodeState.initPaged(tracked.allocator(), &manager, pool, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+    const prompt = 24000;
+    try state.notePrefill(prompt);
+    const sequence = state.sequence_id.?;
+    // Prewarm the preexisting KV pool and mutable table owners separately.
+    // Measurement then contains only real state view backing plus both plans.
+    try manager.reserveTokenCapacity(sequence, 24016);
+    try storage.reserveTokenCapacity(sequence, 24016);
+    const manager_sequence = try manager.sequenceMut(sequence);
+    const storage_sequence = try storage.sequenceMut(sequence);
+    try manager_sequence.block_table.blocks.ensureTotalCapacityPrecise(a, 1501);
+    try storage_sequence.block_table.blocks.ensureTotalCapacityPrecise(a, 1501);
+    try manager_sequence.reserved_tail_blocks.ensureTotalCapacityPrecise(a, 1);
+    try storage_sequence.reserved_tail_blocks.ensureTotalCapacityPrecise(a, 1);
+    const actual_view_bytes = state.kv_block_ids.capacity * @sizeOf(runtime.kv.block.KvBlockId);
+    try std.testing.expectEqual(actual_view_bytes, tracked.live);
+    manager.allocator = tracked.allocator();
+    storage.allocator = tracked.allocator();
+    tracked.peak = tracked.live;
+    tracked.armed = true;
+    defer tracked.armed = false;
+    runtime.kv.manager.TestingViewCopies.ids = 0;
+    try state.appendGeneratedTokens(1);
+    try std.testing.expectEqual(state.kv_block_ids.items.len, runtime.kv.manager.TestingViewCopies.ids);
+    tracked.armed = false;
+    const retired_blocks = (prompt + 1 - 512) / 16;
+    const actual_joint_peak = actual_view_bytes + 2 * retired_blocks * @sizeOf(runtime.kv.block.KvBlockId);
+    try std.testing.expectEqual(@as(usize, 19936), actual_joint_peak);
+    try std.testing.expectEqual(actual_joint_peak, tracked.peak);
+    try std.testing.expectEqual(@as(usize, 0), tracked.growth_attempts);
+    const old_view_only_bound = try view_metadata.hostBytes(prompt + 1, 16, false);
+    const one_plan_bound = try @import("../runtime/kv/writable_blocks.zig").spillHostBytes(prompt + 1, 1, 0, 16, false);
+    const joint_bound = try std.math.add(usize, old_view_only_bound, try std.math.mul(usize, one_plan_bound, 2));
+    try std.testing.expect(tracked.peak > old_view_only_bound);
+    try std.testing.expect(tracked.peak <= joint_bound);
+    // Spill cleanup retires only the plans; the actual published view stays live.
+    try std.testing.expectEqual(actual_view_bytes, tracked.live);
+    try std.testing.expectEqual(@as(usize, prompt + 1), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 513), state.kvView().?.token_count);
+}
+
+test "fresh canonical paired prefill aborts inactive attachments before publication and retries same owners" {
+    const a = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const config = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 1 };
+    const pool = try manager.addPool(config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, config);
+    defer storage.deinit();
+    var state_alloc = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var state = NativeDecodeState.initPaged(state_alloc.allocator(), &manager, pool, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+    try std.testing.expectError(error.OutOfMemory, state.notePrefill(3));
+    try std.testing.expect(state.sequence_id == null and state.kvView() == null);
+    try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
+    try std.testing.expect(manager.tokenCount(1) == null and storage.tokenCount(1) == null);
+    try std.testing.expect(!manager.sequences.items[0].active and !storage.sequences.items[0].active);
+    state_alloc.fail_index = std.math.maxInt(usize);
+    try state.notePrefill(3);
+    try std.testing.expectEqual(@as(runtime.kv.manager.SequenceId, 1), state.sequence_id.?);
+    try std.testing.expectEqual(@as(usize, 3), manager.tokenCount(1).?);
+    try std.testing.expectEqual(@as(usize, 3), storage.tokenCount(1).?);
+    try std.testing.expectEqual(@as(usize, 3), state.kvView().?.token_count);
+    const warm_pointer = state.kvView().?.logical_blocks.?.ptr;
+    const warm_allocations = state_alloc.alloc_index;
+    try state.appendPrefillChunk(1);
+    try state.truncateTokens(1);
+    try std.testing.expectEqual(warm_pointer, state.kvView().?.logical_blocks.?.ptr);
+    try std.testing.expectEqual(warm_allocations, state_alloc.alloc_index);
+    try std.testing.expect(state.kv_block_ids_synchronized);
+    try state.appendPrefillChunk(2);
+    try std.testing.expectEqual(@as(usize, 5), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 5), manager.tokenCount(1).?);
+    try std.testing.expectEqual(@as(usize, 5), storage.tokenCount(1).?);
+    try std.testing.expectEqual(@as(usize, 5), state.kvView().?.token_count);
+}
+
+test "canonical paired suffix truncate stages spill metadata before changing either logical owner or view" {
+    const a = std.testing.allocator;
+    var manager_alloc = std.testing.FailingAllocator.init(a, .{});
+    var manager = runtime.kv.manager.KvManager.init(manager_alloc.allocator());
+    defer manager.deinit();
+    const config = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 1 };
+    const pool = try manager.addPool(config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, config);
+    defer storage.deinit();
+    var state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+    try state.notePrefill(20);
+    const sequence = state.sequence_id.?;
+    var keys: [20]f32 = undefined;
+    var values: [20]f32 = undefined;
+    for (&keys, &values, 0..) |*key, *value, i| {
+        key.* = @floatFromInt(i + 1);
+        value.* = -key.*;
+    }
+    try manager.writeFullLayerKv(sequence, 0, 20, &keys, &values);
+    try storage.writeFullLayerKv(sequence, 0, 20, &keys, &values);
+    const old_view = state.kvView().?;
+    const old_blocks = try a.dupe(runtime.kv.block.KvBlockId, state.kv_block_ids.items);
+    defer a.free(old_blocks);
+    manager_alloc.fail_index = manager_alloc.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, state.truncateTokens(18));
+    try std.testing.expectEqual(@as(usize, 20), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 20), manager.tokenCount(sequence).?);
+    try std.testing.expectEqual(@as(usize, 20), storage.tokenCount(sequence).?);
+    try std.testing.expectEqual(old_view.logical_blocks.?.ptr, state.kvView().?.logical_blocks.?.ptr);
+    try std.testing.expectEqualSlices(runtime.kv.block.KvBlockId, old_blocks, state.kv_block_ids.items);
+    manager_alloc.fail_index = std.math.maxInt(usize);
+    try state.truncateTokens(18);
+    try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 2), manager.tokenCount(sequence).?);
+    try std.testing.expectEqual(@as(usize, 2), storage.tokenCount(sequence).?);
+    try std.testing.expectEqual(@as(usize, 2), state.kvView().?.token_count);
+    try std.testing.expectEqual(@as(usize, 0), state.kvView().?.position_offset);
+    const manager_rows = try manager.gatherLayerKv(a, sequence, 0, 2);
+    defer a.free(manager_rows.k);
+    defer a.free(manager_rows.v);
+    const storage_rows = try storage.gatherLayerKv(a, sequence, 0, 2);
+    defer a.free(storage_rows.k);
+    defer a.free(storage_rows.v);
+    try std.testing.expectEqualSlices(f32, keys[0..2], manager_rows.k);
+    try std.testing.expectEqualSlices(f32, values[0..2], manager_rows.v);
+    try std.testing.expectEqualSlices(f32, keys[0..2], storage_rows.k);
+    try std.testing.expectEqualSlices(f32, values[0..2], storage_rows.v);
+    try state.truncateTokens(2);
+    try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
+    try std.testing.expect(state.kvView() == null);
+}
+
+test "fresh paired prefill sequence mismatch leaves both unpublished endpoints retired" {
+    const a = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const config = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 1 };
+    const pool = try manager.addPool(config);
+    const other_sequence = try manager.attachSequence(pool);
+    defer manager.releaseSequence(other_sequence) catch unreachable;
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, config);
+    defer storage.deinit();
+    var state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+    try std.testing.expectError(error.InvalidPagedKvState, state.notePrefill(3));
+    try std.testing.expect(state.sequence_id == null and state.kvView() == null);
+    try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
+    try std.testing.expect(manager.tokenCount(other_sequence) != null);
+    try std.testing.expect(manager.tokenCount(other_sequence + 1) == null);
+    try std.testing.expect(storage.tokenCount(1) == null);
+}
+
+test "long canonical generated append copies only new combined IDs and preserves held views across growth refusal" {
+    const a = std.testing.allocator;
+    const Id = runtime.kv.block.KvBlockId;
+    const copies = runtime.kv.manager.TestingViewCopies;
+    for ([_]bool{ false, true }) |paired| {
+        var state_alloc = std.testing.FailingAllocator.init(a, .{});
+        var manager = runtime.kv.manager.KvManager.init(a);
+        defer manager.deinit();
+        const config = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 16, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 1, .store_cpu_bytes = false };
+        const pool = try manager.addPool(config);
+        var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, config);
+        defer storage.deinit();
+        var state = NativeDecodeState.initPaged(state_alloc.allocator(), &manager, pool, null);
+        state.kv_storage = if (paired) &storage else null;
+        defer state.deinit();
+        try state.notePrefill(24000);
+        const sequence = state.sequence_id.?;
+        try manager.reserveTokenCapacity(sequence, 24032);
+        // Independent physical owners may hold different reservation lengths.
+        if (paired) try storage.reserveTokenCapacity(sequence, 24048);
+        try state.syncPagedKvBlockTable();
+        state.publishPagedKvViewForDecode();
+        const held = state.kvView().?;
+        const snapshot = try a.dupe(Id, held.logical_blocks.?);
+        defer a.free(snapshot);
+        for ([_]usize{ 1, 16 }) |count| {
+            copies.ids = 0;
+            try state.appendGeneratedTokens(count);
+            try std.testing.expectEqual(@as(usize, 0), copies.ids);
+            try std.testing.expectEqual(held.logical_blocks.?.ptr, state.kv_block_ids.items.ptr);
+            try std.testing.expectEqualSlices(Id, snapshot, held.logical_blocks.?);
+            try std.testing.expectEqual(state.total_tokens, manager.tokenCount(sequence).?);
+            if (paired) try std.testing.expectEqual(state.total_tokens, storage.tokenCount(sequence).?);
+            try std.testing.expectEqual(state.total_tokens, state.kvView().?.token_count);
+            try std.testing.expect(state.kv_block_ids_synchronized);
+        }
+        copies.ids = 0;
+        try state.appendGeneratedTokens(16);
+        try std.testing.expectEqual(@as(usize, 1), copies.ids);
+        try std.testing.expectEqual(@as(usize, 1503), state.kv_block_ids.items.len);
+        const manager_row = try manager.sequenceMut(sequence);
+        try std.testing.expectEqualSlices(Id, manager_row.block_table.blocks.items, state.kv_block_ids.items);
+        try std.testing.expectEqualSlices(Id, snapshot, held.logical_blocks.?);
+
+        const before = state.kvView().?;
+        const before_ids = try a.dupe(Id, state.kv_block_ids.items);
+        defer a.free(before_ids);
+        const before_tokens = state.total_tokens;
+        const grow_count = (state.kv_block_ids.capacity + 1) * 16 - before_tokens;
+        // Both replacement payload and retirement-owner allocation can fail.
+        for (0..2) |failure_step| {
+            state_alloc.fail_index = state_alloc.alloc_index + failure_step;
+            copies.ids = 0;
+            try std.testing.expectError(error.OutOfMemory, state.appendGeneratedTokens(grow_count));
+            try std.testing.expectEqual(@as(usize, 0), copies.ids);
+            try std.testing.expectEqual(before_tokens, state.total_tokens);
+            try std.testing.expectEqual(before_tokens, manager.tokenCount(sequence).?);
+            if (paired) try std.testing.expectEqual(before_tokens, storage.tokenCount(sequence).?);
+            try std.testing.expectEqual(before.logical_blocks.?.ptr, state.kv_block_ids.items.ptr);
+            try std.testing.expectEqualSlices(Id, before_ids, state.kv_block_ids.items);
+            try std.testing.expectEqualSlices(Id, snapshot, held.logical_blocks.?);
+            try std.testing.expect(state.kv_block_ids_synchronized);
+        }
+        state_alloc.fail_index = std.math.maxInt(usize);
+        copies.ids = 0;
+        try state.appendGeneratedTokens(grow_count);
+        try std.testing.expectEqual(state.kv_block_ids.items.len, copies.ids);
+        try std.testing.expectEqual(@as(usize, 2049), copies.ids);
+        try std.testing.expectEqual(@as(usize, 1), state.retired_kv_block_ids.items.len);
+        try std.testing.expectEqual(before.logical_blocks.?.ptr, state.retired_kv_block_ids.items[0].items.ptr);
+        try std.testing.expectEqualSlices(Id, before_ids, before.logical_blocks.?);
+        try std.testing.expectEqualSlices(Id, snapshot, held.logical_blocks.?);
+        try std.testing.expectEqual(state.total_tokens, state.kvView().?.token_count);
+    }
+}
+
+test "generated append shared tail falls back to complete combined ID copy" {
+    const a = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const config = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 16, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 1 };
+    const pool = try manager.addPool(config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, config);
+    defer storage.deinit();
+    var state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+    try state.notePrefill(17);
+    const sequence = state.sequence_id.?;
+    const manager_pool = manager.getPoolMut(pool).?;
+    const manager_tail = (try manager.sequenceMut(sequence)).block_table.last().?;
+    const storage_tail = (try storage.sequenceMut(sequence)).block_table.last().?;
+    try manager_pool.retain(manager_tail);
+    defer _ = manager_pool.releaseRef(a, manager_tail) catch unreachable;
+    try storage.storage.retain(storage_tail);
+    defer _ = storage.storage.releaseRef(a, storage_tail) catch unreachable;
+    runtime.kv.manager.TestingViewCopies.ids = 0;
+    try state.appendGeneratedToken();
+    try std.testing.expectEqual(state.kv_block_ids.items.len, runtime.kv.manager.TestingViewCopies.ids);
+    try std.testing.expect(manager_tail != (try manager.sequenceMut(sequence)).block_table.last().?);
+    try std.testing.expect(storage_tail != (try storage.sequenceMut(sequence)).block_table.last().?);
+    try std.testing.expectEqual(@as(usize, 18), state.kvView().?.token_count);
 }

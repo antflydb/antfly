@@ -162,6 +162,7 @@ def main():
     loaded = ctypes.CDLL(str(library))
     for name, expected in (
         ("antfly_lighton_prefill_abi", (1 << 32) | 2408),
+        ("antfly_recurrent_prefill_workspace_geometry_abi", (1 << 32) | 524),
         ("antfly_attention_abi", (1 << 32) | (104 << 16) | 88),
     ):
         function = getattr(loaded, name)
@@ -170,6 +171,8 @@ def main():
             raise RuntimeError("Native library ABI mismatch: " + name)
     manifest = {
         "architecture": "sm_121",
+        "geometry_abi_version": 1,
+        "geometry_packet_bytes": 524,
         "recurrent_library_sha256": digest(recurrent),
         "library_sha256": digest(library),
         "kernel_library_sha256": digest(native_kernels),

@@ -314,7 +314,7 @@ pub fn executeWithScratchLimit(a: std.mem.Allocator, scratch: std.mem.Allocator,
         const remaining = execution_sequences[finished..end];
         var admitted = try admitChunk(session, remaining, retained, max_workspace_bytes);
         defer admitted.permit.deinit();
-        try executeChunk(a, scratch, &admitted.permit, cfg, execution_tasks[finished..][0..admitted.count], remaining[0..admitted.count], tok.specialTokens().pad_id, decisions[finished..][0..admitted.count], control);
+        try executeChunk(a, scratch, &admitted.permit, &permit, cfg, execution_tasks[finished..][0..admitted.count], remaining[0..admitted.count], tok.specialTokens().pad_id, decisions[finished..][0..admitted.count], control);
         execution_chunks += 1;
         padded_tokens += admitted.count * chunkShape(remaining[0..admitted.count]).sequence;
         finished += admitted.count;
@@ -388,7 +388,7 @@ fn executePacked(a: std.mem.Allocator, scratch: std.mem.Allocator, session: Sess
             if (used + next > batch_limit) break;
             used += next;
         };
-        try runPackedBatch(a, plan, scratch, session, tok, cfg, tasks, rows.items[start..end], decisions, done, &decoded, control, &tokens);
+        try runPackedBatch(a, plan, scratch, session, tok, cfg, tasks, rows.items[start..end], decisions, done, &decoded, control, &tokens, &permit);
         execution_chunks += 1;
         start = end;
     }
@@ -400,7 +400,7 @@ fn executePacked(a: std.mem.Allocator, scratch: std.mem.Allocator, session: Sess
 /// Run one session call over `batch`, a run of `Planned` rows (one call
 /// already, or several coalesced into one physical row). `plan` is an arena
 /// scoped to the whole request; `scratch` backs the model's temporaries.
-fn runPackedBatch(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.mem.Allocator, session: Session, tok: Tokenizer, cfg: model.Config, tasks: []const Task, batch: []const Planned, decisions: []Decision, done: []bool, decoded: *usize, control: ?Control, tokens: *usize) !void {
+fn runPackedBatch(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.mem.Allocator, session: Session, tok: Tokenizer, cfg: model.Config, tasks: []const Task, batch: []const Planned, decisions: []Decision, done: []bool, decoded: *usize, control: ?Control, tokens: *usize, preprocessing: ?*const @import("../backends/session.zig").RunPermit) !void {
     // `plan` is the request arena; a coalesced row's memory is reclaimed
     // with everything else when `executePacked` tears it down.
     var row: tree.Row = undefined;
@@ -415,7 +415,11 @@ fn runPackedBatch(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.me
         owners = merged.owners;
     }
     const questions = row.questions();
-    const outputs = try runPackedRow(session, scratch, row, questions, control);
+    var execution: @import("../backends/session.zig").RunPermit = .{ .session = session, .lease = null };
+    defer execution.deinit();
+    var source = @import("../backends/session.zig").PreparedSource{};
+    defer source.deinit();
+    const outputs = try runPackedRow(&execution, &source, preprocessing, session, scratch, row, questions, control);
     defer {
         for (outputs) |*output| output.deinit();
         scratch.free(outputs);
@@ -432,17 +436,18 @@ fn runPackedBatch(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.me
         // Two-stage choice (LAYA.md, step 2b): refine many-option choices by
         // comparing the stage-1 finalists jointly off the same state.
         if (cfg.packing.mode == .candidate and cfg.packing.two_stage.enabled() and q.kind == .choice and q.labels.len > cfg.packing.two_stage.top_k)
-            decision = try refineTwoStage(a, plan, scratch, session, tok, cfg, batch[owner].text, q, decision, control, tokens);
+            decision = try refineTwoStage(a, plan, scratch, session, tok, cfg, batch[owner].text, q, decision, control, tokens, preprocessing);
         decisions[index] = decision;
         done[index] = true;
         decoded.* += 1;
     }
 }
 
-fn runPackedRow(session: Session, scratch: std.mem.Allocator, row: tree.Row, questions: usize, control: ?Control) ![]Tensor {
+fn runPackedRow(execution: *@import("../backends/session.zig").RunPermit, source: *@import("../backends/session.zig").PreparedSource, preprocessing: ?*const @import("../backends/session.zig").RunPermit, session: Session, scratch: std.mem.Allocator, row: tree.Row, questions: usize, control: ?Control) ![]Tensor {
+    const TensorInfo = @import("../backends/tensor.zig").TensorInfo;
     const n: i64 = @intCast(row.ids.len);
     const q: i64 = @intCast(questions);
-    var request = try session.planShapes(&.{
+    const signature = [_]TensorInfo{
         .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, n } },
         .{ .name = "position_ids", .dtype = .i64, .shape = &.{ 1, n } },
         .{ .name = "token_segment", .dtype = .i64, .shape = &.{ 1, n } },
@@ -450,13 +455,17 @@ fn runPackedRow(session: Session, scratch: std.mem.Allocator, row: tree.Row, que
         .{ .name = "token_qtype", .dtype = .i64, .shape = &.{ 1, n } },
         .{ .name = "marker_pos", .dtype = .i64, .shape = &.{ q, @intCast(row.width) } },
         .{ .name = "anchor_pos", .dtype = .i64, .shape = &.{ q, 1 } },
-    }, 1);
+    };
+    var request = try session.planShapes(&signature, 1);
     request.host_preprocess_bytes = request.input_bytes;
-    var execution = try session.admit(request);
-    defer execution.deinit();
+    execution.* = try session.admitShapeRequest(.{ .host_shapes = &signature }, request, scratch, control);
     var inputs: [7]Tensor = undefined;
     var initialized: usize = 0;
     defer for (inputs[0..initialized]) |*input| input.deinit();
+    // Success and every error/cancel end Model/lane and all header borrows
+    // BEFORE these helper-local inputs die. Source funding remains caller-owned
+    // through output/decode cleanup; ColdCall retains copied values/pins only.
+    defer source.finishInputLifetime();
     for ([_][]const u8{ "input_ids", "position_ids", "token_segment", "segment_parent", "token_qtype", "marker_pos", "anchor_pos" }, [_][]const i64{ row.ids, row.positions, row.segments, row.parents, row.kinds, row.markers, row.anchors }, 0..) |name, values, i| {
         const shape: [2]i64 = switch (i) {
             3 => .{ 1, @intCast(row.parents.len) },
@@ -466,6 +475,16 @@ fn runPackedRow(session: Session, scratch: std.mem.Allocator, row: tree.Row, que
         };
         inputs[i] = try Tensor.initInt64(scratch, name, &shape, values);
         initialized += 1;
+    }
+    if (try source.initOwningSynchronousHostTaskPermitBeforeExecutionInto(execution, preprocessing, &inputs, scratch, control)) {
+        try source.enter();
+        const outputs = try source.runHost(&inputs);
+        errdefer {
+            for (outputs) |*output| output.deinit();
+            scratch.free(outputs);
+        }
+        _ = try source.finishSynchronousHostTaskWorkspaceAfterUnlock();
+        return outputs;
     }
     return execution.runWithControl(&inputs, scratch, control);
 }
@@ -513,7 +532,7 @@ fn branchTokens(row: tree.Row) usize {
 /// `prompt_tokens` counts each input token once, so this adds only the joint
 /// branch's tokens to `*tokens`: the trunk is the same state stage 1 already
 /// counted, whether or not it is re-encoded here.
-fn refineTwoStage(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.mem.Allocator, session: Session, tok: Tokenizer, cfg: model.Config, text: []const u8, q: Question, stage1: Decision, control: ?Control, tokens: *usize) !Decision {
+fn refineTwoStage(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.mem.Allocator, session: Session, tok: Tokenizer, cfg: model.Config, text: []const u8, q: Question, stage1: Decision, control: ?Control, tokens: *usize, preprocessing: ?*const @import("../backends/session.zig").RunPermit) !Decision {
     errdefer a.free(stage1.probabilities);
     const finalists = try selectFinalists(plan, stage1.probabilities, cfg.packing.two_stage.top_k, cfg.packing.two_stage.mass_cutoff);
     std.debug.assert(finalists.len >= 2);
@@ -528,7 +547,11 @@ fn refineTwoStage(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.me
     if (rows.len != 1) return error.UnexpectedOutputShape;
     const row = rows[0];
     tokens.* += branchTokens(row);
-    const outputs = try runPackedRow(session, scratch, row, 1, control);
+    var execution: @import("../backends/session.zig").RunPermit = .{ .session = session, .lease = null };
+    defer execution.deinit();
+    var source = @import("../backends/session.zig").PreparedSource{};
+    defer source.deinit();
+    const outputs = try runPackedRow(&execution, &source, preprocessing, session, scratch, row, 1, control);
     defer {
         for (outputs) |*output| output.deinit();
         scratch.free(outputs);
@@ -648,7 +671,18 @@ fn selectChunk(session: Session, sequences: []const Sequence, retained: usize, m
     return count;
 }
 
-fn executeChunk(a: std.mem.Allocator, scratch: std.mem.Allocator, execution: *@import("../backends/session.zig").RunPermit, cfg: model.Config, tasks: []const Task, sequences: []const Sequence, pad: i32, decisions: []Decision, control: ?Control) !void {
+fn runUnpackedChunkSource(source: *@import("../backends/session.zig").PreparedSource, execution: *@import("../backends/session.zig").RunPermit, preprocessing: ?*const @import("../backends/session.zig").RunPermit, inputs: []const Tensor, scratch: std.mem.Allocator, control: ?Control) ![]Tensor {
+    if (!try source.initOwningSynchronousHostTaskPermitBeforeExecutionInto(execution, preprocessing, inputs, scratch, control))
+        return execution.runWithControl(inputs, scratch, control);
+    try source.enter();
+    return source.runHost(inputs);
+}
+
+fn executeChunk(a: std.mem.Allocator, scratch: std.mem.Allocator, execution: *@import("../backends/session.zig").RunPermit, preprocessing: ?*const @import("../backends/session.zig").RunPermit, cfg: model.Config, tasks: []const Task, sequences: []const Sequence, pad: i32, decisions: []Decision, control: ?Control) !void {
+    // The synchronous Source is declared before ALL copied input buffers.
+    // Output/input physical death precedes its original-floor retirement.
+    var source = @import("../backends/session.zig").PreparedSource{};
+    defer source.deinit();
     var arena = std.heap.ArenaAllocator.init(scratch);
     defer arena.deinit();
     const chunk = arena.allocator();
@@ -710,7 +744,8 @@ fn executeChunk(a: std.mem.Allocator, scratch: std.mem.Allocator, execution: *@i
         }
         return;
     }
-    const outputs = try execution.runWithControl(&inputs, scratch, control);
+    defer source.finishInputLifetime(); // unlock on error BEFORE input frees
+    const outputs = try runUnpackedChunkSource(&source, execution, preprocessing, &inputs, scratch, control);
     defer {
         for (outputs) |*output| output.deinit();
         scratch.free(outputs);
@@ -848,4 +883,985 @@ test "laya length buckets are stable and require meaningful padding savings" {
     try std.testing.expect(try bucketOrder(a, sequences[0..7]) == null);
     for (&sequences) |*sequence| sequence.ids = ids[0..61];
     try std.testing.expect(try bucketOrder(a, &sequences) == null);
+}
+
+fn freeLayaBankTestResult(a: std.mem.Allocator, result: Result) void {
+    for (result.decisions) |decision| a.free(decision.probabilities);
+    a.free(result.decisions);
+}
+fn expectLayaBankTestResult(expected: Result, actual: Result) !void {
+    try std.testing.expectEqual(expected.prompt_tokens, actual.prompt_tokens);
+    try std.testing.expectEqual(expected.execution_chunks, actual.execution_chunks);
+    try std.testing.expectEqual(expected.padded_tokens, actual.padded_tokens);
+    try std.testing.expectEqual(expected.decisions.len, actual.decisions.len);
+    for (expected.decisions, actual.decisions) |want, got| {
+        try std.testing.expectEqualStrings(want.name, got.name);
+        try std.testing.expectEqualStrings(want.label, got.label);
+        try std.testing.expectEqual(want.kind, got.kind);
+        try std.testing.expectEqualSlices(f32, want.probabilities, got.probabilities);
+        try std.testing.expectEqual(want.confidence, got.confidence);
+        try std.testing.expectEqual(want.expected_value, got.expected_value);
+        try std.testing.expectEqual(want.true_probability, got.true_probability);
+        try std.testing.expectEqual(want.act_probability, got.act_probability);
+    }
+}
+// Fixture callbacks may outlive the Model during final current-B retirement.
+// Keep the real gate borrowed through synchronous close, then end that borrow
+// BEFORE sealing B runs pure physical-death/quota callbacks without a Model.
+fn closeLayaProbeFixture(session: Session, probe: anytype) void {
+    if (probe.gate) |gate| {
+        if (gate.tryLock()) gate.unlock() else probe.violation = true;
+    }
+    var sink = @import("../execution/retirement_sink.zig").Ref.create() catch @panic("Laya fixture close sink");
+    defer sink.release();
+    var guard = sink.enter() catch @panic("Laya fixture close guard");
+    defer guard.finish();
+    var epoch = guard.retainEpoch() catch @panic("Laya fixture close epoch");
+    defer epoch.release();
+    session.closeWithBoundary(&epoch);
+    probe.gate = null;
+}
+
+fn layaOriginalPermitBankPipelineCase(a: std.mem.Allocator, path: []const u8, tok: Tokenizer, cfg: model.Config, tasks: []const Task, reference: Result, bank_bytes: usize, extra: usize, accepted: bool) !void {
+    const Memory = @import("../runtime/tier/memory.zig");
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const factory = @import("../architectures/session_factory.zig");
+    var session = try factory.createNativeSession(a, path);
+    var live = true;
+    defer if (live) session.close();
+    try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    const domain = try Domain.create();
+    defer domain.release();
+    var pin = domain.pin();
+    defer pin.release();
+    session.model_lifetime.?.admission_domain = pin.retain();
+    const retained = tasks.len * cfg.max_len * 64;
+    const sequences = try a.alloc(Sequence, tasks.len);
+    defer a.free(sequences);
+    var initialized: usize = 0;
+    defer for (sequences[0..initialized]) |sequence| {
+        a.free(sequence.ids);
+        a.free(sequence.markers);
+    };
+    for (tasks, sequences) |task, *sequence| {
+        sequence.* = try prepare(a, tok, cfg, task);
+        initialized += 1;
+    }
+    const request = try chunkPlan(session, sequences, retained);
+    var policy = @import("../backends/session.zig").RunAdmission{ .controller = pin.controller(), .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    const floor = (try policy.planRequest(request, session.outputInfo())).required;
+    const old_peak = try floor.merge(.{ .host_scratch_bytes = retained });
+    policy.limits.host_limit_bytes = try std.math.add(usize, old_peak.host_scratch_bytes, extra);
+    session.run_admission = policy;
+    const Probe = struct {
+        gate: ?*std.atomic.Mutex,
+        bank_bytes: usize,
+        calls: usize = 0,
+        releases: usize = 0,
+        records: [4]Memory.AdmissionAmounts = undefined,
+        violation: bool = false,
+        cancel_on_bank: bool = false,
+        cancel: bool = false,
+        fn observe(self: *@This()) void {
+            if (self.gate) |gate| {
+                if (gate.tryLock()) gate.unlock() else self.violation = true;
+            }
+        }
+        fn reserve(raw: *anyopaque, amounts: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            if (self.calls >= self.records.len) return error.ResourceLimitExceeded;
+            self.records[self.calls] = amounts;
+            self.calls += 1;
+            if (self.cancel_on_bank and self.calls == 3 and std.meta.eql(amounts, Memory.AdmissionAmounts{ .host_scratch_bytes = self.bank_bytes })) self.cancel = true;
+            return self.calls;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            self.releases += 1;
+        }
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancel) return error.Cancelled;
+        }
+    };
+    var probe = Probe{ .gate = session.execution_gate.?, .bank_bytes = bank_bytes };
+    // Covers ordinary error/cancel/OOM unwind after the callback is installed.
+    defer if (live) {
+        closeLayaProbeFixture(session, &probe);
+        live = false;
+    };
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    const control = Control{ .native_call_policy = .in_process, .ptr = &probe, .check_fn = Probe.check };
+    for (0..2) |_| {
+        probe.calls = 0;
+        probe.releases = 0;
+        const actual = try executeWithScratchLimit(a, a, session, tok, cfg, tasks, control, null, null);
+        defer freeLayaBankTestResult(a, actual);
+        try expectLayaBankTestResult(reference, actual);
+        try std.testing.expectEqual(@as(usize, if (accepted) 3 else 2), probe.calls);
+        try std.testing.expectEqualDeep(Memory.AdmissionAmounts{ .host_scratch_bytes = retained }, probe.records[0]);
+        try std.testing.expectEqualDeep(floor, probe.records[1]);
+        if (accepted) try std.testing.expectEqualDeep(Memory.AdmissionAmounts{ .host_scratch_bytes = bank_bytes }, probe.records[2]);
+        try std.testing.expectEqual(probe.calls, probe.releases);
+        try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
+        try std.testing.expect(!probe.violation and scheduler.head == null);
+    }
+    if (accepted) {
+        probe.calls = 0;
+        probe.releases = 0;
+        probe.cancel_on_bank = true;
+        const attempted = executeWithScratchLimit(a, a, session, tok, cfg, tasks, control, null, null);
+        if (attempted) |unexpected| {
+            freeLayaBankTestResult(a, unexpected);
+            try std.testing.expect(false);
+        } else |err| try std.testing.expectEqual(error.Cancelled, err);
+        try std.testing.expectEqual(@as(usize, 3), probe.calls);
+        try std.testing.expectEqual(probe.calls, probe.releases);
+        try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
+        try std.testing.expect(!probe.violation and scheduler.head == null);
+        probe.cancel = false;
+        probe.cancel_on_bank = false;
+        probe.calls = 0;
+        probe.releases = 0;
+        const recovered = try executeWithScratchLimit(a, a, session, tok, cfg, tasks, control, null, null);
+        defer freeLayaBankTestResult(a, recovered);
+        try expectLayaBankTestResult(reference, recovered);
+        try std.testing.expectEqual(@as(usize, 3), probe.calls);
+        try std.testing.expectEqual(probe.calls, probe.releases);
+        try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
+    }
+    closeLayaProbeFixture(session, &probe);
+    live = false;
+    try std.testing.expect(!probe.violation);
+}
+
+test "actual Laya Q8 task pipeline adopts original chunk once and supplements only exact MAX" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const synthetic = @import("../util/laya_synthetic.zig");
+    const factory = @import("../architectures/session_factory.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    try synthetic.writeModelWith(a, std.testing.io, path, null, ",\"weight_quantization\":\"q8_0\"", 128, 717);
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    const question = Question{ .name = "first", .kind = .choice, .instruction = "which tool is needed?", .labels = &.{ "search", "fetch" }, .descriptions = &.{ "look it up", "fetch it" } };
+    var other = question;
+    other.name = "second";
+    const tasks = [_]Task{
+        .{ .text = "find the invoice and check whether payment is late", .question = question },
+        .{ .text = "find the invoice and check whether payment is late", .question = other },
+    };
+    var raw = try factory.createNativeSession(a, path);
+    var raw_live = true;
+    defer if (raw_live) raw.close();
+    const cfg = factory.getLayaConfig(raw).?;
+    const bytes = try @import("../util/c_file.zig").readFileFromDir(a, path, "config.json");
+    defer a.free(bytes);
+    const encoder = try @import("../architectures/modern_bert_config.zig").parseConfig(a, bytes);
+    const bank = (try model.unpackedMatrixScratchGeometry(cfg, encoder, 2, 1)).?;
+    const reference = try executeWithScratchLimit(a, a, raw, tok, cfg, &tasks, .{ .native_call_policy = .in_process }, null, null);
+    defer freeLayaBankTestResult(a, reference);
+    raw.close();
+    raw_live = false;
+    try layaOriginalPermitBankPipelineCase(a, path, tok, cfg, &tasks, reference, bank.bytes, bank.bytes, true);
+    try layaOriginalPermitBankPipelineCase(a, path, tok, cfg, &tasks, reference, bank.bytes, bank.bytes - 1, false);
+    try layaOriginalPermitBankPipelineCase(a, path, tok, cfg, &tasks, reference, bank.bytes, 0, false);
+}
+
+fn layaOutputOwnerLifetimeCase(comptime packed_mode: bool, comptime outcome: enum { success, invalid_output, decode_oom, cancel_after_decode }, path: []const u8, tok: Tokenizer, tasks: []const Task, reference: Result) !void {
+    const a = std.testing.allocator;
+    const Memory = @import("../runtime/tier/memory.zig");
+    const factory = @import("../architectures/session_factory.zig");
+    var session = try factory.createNativeSession(a, path);
+    var live = true;
+    defer if (live) session.close();
+    try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    var pin = domain.pin();
+    defer pin.release();
+    session.model_lifetime.?.admission_domain = pin.retain();
+    session.run_admission = .{ .controller = pin.controller(), .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    const cfg = factory.getLayaConfig(session).?;
+    try std.testing.expectEqual(packed_mode, cfg.packing.enabled());
+    if (outcome == .invalid_output) {
+        // Real complete checkpoint + actual weight replacement, before run.
+        // Nonfinite scorer output reaches the original decode error branch.
+        const architecture = @import("../execution/architecture_session.zig");
+        const data = architecture.nativeWeightPreparationModelData(session) orelse return error.TestExpectedCanonicalNative;
+        const name = "model.scorer.3.bias";
+        const original = data.resident_weights.getPtr(name) orelse return error.MissingWeight;
+        var replacement = try Tensor.initFloat32(a, name, original.tensor.shape, &.{std.math.nan(f32)});
+        architecture.replaceBlasResidentWeight(session, name, .{ .tensor = replacement }) catch |err| {
+            replacement.deinit();
+            return err;
+        };
+    }
+    const Probe = struct {
+        gate: ?*std.atomic.Mutex,
+        probability_bytes: usize,
+        calls: usize = 0,
+        releases: usize = 0,
+        primary_live: bool = false,
+        after_primary: bool = false,
+        observe_output_death: bool = false,
+        decode_attempts: usize = 0,
+        output_frees_before_primary_close: usize = 0,
+        cancel: bool = false,
+        violation: bool = false,
+        fn outside(self: *@This()) void {
+            if (self.gate) |gate| {
+                if (gate.tryLock()) gate.unlock() else self.violation = true;
+            }
+        }
+        fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.outside();
+            self.calls += 1;
+            // The task's first token is preprocessing, second is its SAME
+            // original numerical/output floor; optional MAX is token three.
+            if (self.calls == 2) {
+                self.primary_live = true;
+                self.after_primary = true;
+            }
+            return self.calls;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.outside();
+        }
+        fn release(raw: *anyopaque, token: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.outside();
+            if (token == 2) {
+                if (self.decode_attempts != 0 and self.output_frees_before_primary_close == 0) self.violation = true;
+                self.primary_live = false;
+                self.observe_output_death = false;
+            }
+            self.releases += 1;
+        }
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancel) return error.Cancelled;
+        }
+        fn allocResult(raw: *anyopaque, bytes: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // All task planning/Decision[] allocations precede primary admit.
+            // Numerical tensors use the DISTINCT scratch allocator below.
+            // The result allocator's label-count F32 allocation after primary
+            // is the actual original decode() probability allocation.
+            if (self.after_primary and bytes == self.probability_bytes) {
+                self.decode_attempts += 1;
+                self.observe_output_death = true;
+                if (!self.primary_live) self.violation = true;
+                if (outcome == .decode_oom) return null;
+                if (outcome == .cancel_after_decode) self.cancel = true;
+            }
+            return a.rawAlloc(bytes, alignment, ra);
+        }
+        fn allocScratch(_: *anyopaque, bytes: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            return a.rawAlloc(bytes, alignment, ra);
+        }
+        fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn freeResult(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            a.rawFree(bytes, alignment, ra);
+        }
+        fn freeScratch(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.observe_output_death) {
+                if (!self.primary_live) self.violation = true;
+                self.output_frees_before_primary_close += 1;
+            }
+            a.rawFree(bytes, alignment, ra);
+        }
+        fn resultAllocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocResult, .resize = resize, .remap = remap, .free = freeResult } };
+        }
+        fn scratchAllocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocScratch, .resize = resize, .remap = remap, .free = freeScratch } };
+        }
+    };
+    var probe = Probe{ .gate = session.execution_gate.?, .probability_bytes = tasks[0].question.labels.len * @sizeOf(f32) };
+    // Covers ordinary error/cancel/OOM unwind after the callback is installed.
+    defer if (live) {
+        closeLayaProbeFixture(session, &probe);
+        live = false;
+    };
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    const result_allocator = probe.resultAllocator();
+    const attempted = executeWithScratchLimit(result_allocator, probe.scratchAllocator(), session, tok, cfg, tasks, .{ .native_call_policy = .in_process, .ptr = &probe, .check_fn = Probe.check }, null, null);
+    if (attempted) |actual| {
+        defer freeLayaBankTestResult(result_allocator, actual);
+        try std.testing.expect(outcome == .success);
+        try expectLayaBankTestResult(reference, actual);
+    } else |err| {
+        const expected: anyerror = switch (outcome) {
+            .success => return err,
+            .invalid_output => error.InvalidLayaOutput,
+            .decode_oom => error.OutOfMemory,
+            .cancel_after_decode => error.Cancelled,
+        };
+        try std.testing.expectEqual(expected, err);
+    }
+    try std.testing.expect(probe.decode_attempts > 0 and probe.output_frees_before_primary_close > 0);
+    try std.testing.expect(!probe.primary_live and !probe.violation and scheduler.head == null);
+    try std.testing.expectEqual(@as(usize, if (packed_mode) 2 else 3), probe.calls);
+    try std.testing.expectEqual(probe.calls, probe.releases);
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
+}
+
+test "actual Laya raw output tensors keep original caller owners through decode error cancellation and OOM" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const synthetic = @import("../util/laya_synthetic.zig");
+    const factory = @import("../architectures/session_factory.zig");
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    const question = Question{ .name = "first", .kind = .choice, .instruction = "choose a tool", .labels = &.{ "search", "fetch" }, .descriptions = &.{ "look it up", "fetch it" } };
+    const tasks = [_]Task{.{ .text = "find the invoice and check payment", .question = question }};
+    inline for (.{ false, true }) |packed_mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(path);
+        try synthetic.writeModelWith(a, std.testing.io, path, if (packed_mode) "{\"mode\":\"question\",\"max_packed_len\":512}" else null, ",\"weight_quantization\":\"q8_0\"", 128, 151);
+        var raw = try factory.createNativeSession(a, path);
+        defer raw.close();
+        const cfg = factory.getLayaConfig(raw).?;
+        const reference = try executeWithScratchLimit(a, a, raw, tok, cfg, &tasks, .{ .native_call_policy = .in_process }, null, null);
+        defer freeLayaBankTestResult(a, reference);
+        inline for (.{ .success, .invalid_output, .decode_oom, .cancel_after_decode }) |outcome|
+            try layaOutputOwnerLifetimeCase(packed_mode, outcome, path, tok, &tasks, reference);
+    }
+}
+
+fn packedLayaTaskBankCase(refine: bool, deny_first: bool) !void {
+    const phases: usize = if (refine) 2 else 1;
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const synthetic = @import("../util/laya_synthetic.zig");
+    const factory = @import("../architectures/session_factory.zig");
+    const architecture = @import("../execution/architecture_session.zig");
+    const Memory = @import("../runtime/tier/memory.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    try synthetic.writeModelWith(a, std.testing.io, path, if (refine) "{\"mode\":\"candidate\",\"max_packed_len\":512,\"two_stage\":{\"top_k\":2}}" else "{\"mode\":\"question\",\"max_packed_len\":512}", ",\"weight_quantization\":\"q8_0\"", 128, 152);
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    const question = Question{ .name = "first", .kind = .choice, .instruction = "choose a tool", .labels = if (refine) &.{ "search", "fetch", "open", "close" } else &.{ "search", "fetch" }, .descriptions = if (refine) &.{ "look it up", "fetch it", "open it", "close it" } else &.{ "look it up", "fetch it" } };
+    const tasks = [_]Task{.{ .text = "find the invoice and check whether payment is late", .question = question }};
+    var raw = try factory.createNativeSession(a, path);
+    var raw_live = true;
+    defer if (raw_live) raw.close();
+    architecture.setLayaTrunkCachePrecision(raw, .f32);
+    architecture.setLayaTrunkCacheLimit(raw, 1 << 20, 1);
+    const cfg = factory.getLayaConfig(raw).?;
+    const reference = try executeWithScratchLimit(a, a, raw, tok, cfg, &tasks, .{ .native_call_policy = .in_process }, null, null);
+    defer freeLayaBankTestResult(a, reference);
+    raw.close();
+    raw_live = false;
+    const config_bytes = try @import("../util/c_file.zig").readFileFromDir(a, path, "config.json");
+    defer a.free(config_bytes);
+    const encoder = try @import("../architectures/modern_bert_config.zig").parseConfig(a, config_bytes);
+    const geometry = (try model.selectedMatrixScratchGeometry(cfg, encoder, .{ .encoder = true, .head = true })).?;
+    const rows = try tree.build(a, tok, cfg, tasks[0].text, &.{question}, null);
+    defer {
+        for (rows) |selected| selected.deinit(a);
+        a.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    const selected_trunk = @import("../architectures/laya_packed.zig").cacheKeyForRow(encoder, cfg, rows[0]).?;
+    const auxiliary = try @import("../architectures/laya_packed.zig").auxiliaryGeometry(encoder.num_hidden_layers + cfg.head_layers, encoder.hidden_size, selected_trunk.tokens);
+    const warm_supplement = try std.math.add(usize, geometry.bytes, auxiliary.bytes);
+    const CacheModule = @import("../architectures/laya_trunk_cache.zig");
+    var empty_cache = CacheModule.Cache.init(a, 1 << 20);
+    defer empty_cache.deinit();
+    var empty_snapshot = try empty_cache.snapshotCold(selected_trunk.key);
+    defer empty_snapshot.finishOutsideExecution(&empty_cache, .{ .outside_execution = true }) catch @panic("cold geometry snapshot unwind");
+    const cold_entries = try CacheModule.coldListGeometry(&empty_snapshot, .entries, 1);
+    const cold_pending = try CacheModule.coldListGeometry(&empty_snapshot, .pending, 1);
+    const cold_entry = try CacheModule.coldFillGeometry(selected_trunk.tokens, encoder.num_hidden_layers + cfg.head_layers, encoder.hidden_size, .f32);
+    const cold_supplement = try std.math.add(usize, warm_supplement, try std.math.add(usize, cold_entries.bytes + cold_pending.bytes, cold_entry.metadata_bytes));
+    var session = try factory.createNativeSession(a, path);
+    var session_live = true;
+    defer if (session_live) session.close();
+    try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    var pin = domain.pin();
+    defer pin.release();
+    session.model_lifetime.?.admission_domain = pin.retain();
+    session.run_admission = .{ .controller = pin.controller(), .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 << 20 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    try architecture.configureSharedCacheAdmissionForSession(session, a, pin.controller(), .cpu, session.run_admission.?.limits, .{});
+    architecture.setLayaTrunkCachePrecision(session, .f32);
+    architecture.setLayaTrunkCacheLimit(session, 1 << 20, 1);
+    const Probe = struct {
+        gate: ?*std.atomic.Mutex,
+        bank_bytes: usize,
+        supplement_bytes: usize,
+        cold_supplement_bytes: usize,
+        deny_cold_once: bool = false,
+        calls: usize = 0,
+        releases: usize = 0,
+        kv_reservations: usize = 0,
+        matrix_allocations: usize = 0,
+        matrix_deaths: usize = 0,
+        matrix_failures: usize = 0,
+        cancel_on_bank: bool = false,
+        fail_bank: bool = false,
+        deny_bank: bool = false,
+        denials: usize = 0,
+        check_matrix_outside: bool = true,
+        awaiting_bank: bool = false,
+        cancelled: bool = false,
+        failed_bank: bool = false,
+        violation: bool = false,
+        fn outside(self: *@This()) void {
+            if (self.gate) |gate| {
+                if (gate.tryLock()) gate.unlock() else self.violation = true;
+            }
+        }
+        fn reserve(raw_ctx: *anyopaque, amounts: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.outside();
+            self.calls += 1;
+            if (self.deny_cold_once and amounts.host_scratch_bytes == self.cold_supplement_bytes and amounts.host_kv_bytes == 0) {
+                self.deny_cold_once = false;
+                self.denials += 1;
+                return error.ResourceLimitExceeded;
+            }
+            if (amounts.host_kv_bytes != 0) self.kv_reservations += 1;
+            if (amounts.host_scratch_bytes == self.supplement_bytes and amounts.host_kv_bytes == 0) {
+                // Every previous numerical bank must already be physically
+                // dead before another refinement's supplier is reached.
+                if (self.matrix_allocations - self.matrix_failures != self.matrix_deaths) self.violation = true;
+                if (self.deny_bank) {
+                    self.denials += 1;
+                    return error.ResourceLimitExceeded;
+                }
+                self.awaiting_bank = true;
+                if (self.cancel_on_bank) self.cancelled = true;
+            }
+            return self.calls;
+        }
+        fn retain(raw_ctx: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.outside();
+        }
+        fn release(raw_ctx: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.outside();
+            self.releases += 1;
+        }
+        fn check(raw_ctx: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+        fn alloc(raw_ctx: *anyopaque, bytes: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            if (bytes == self.bank_bytes) {
+                if (self.check_matrix_outside) self.outside(); // accepted MAX is never allocated in math
+                self.matrix_allocations += 1;
+                if (self.fail_bank and self.awaiting_bank) {
+                    self.failed_bank = true;
+                    self.matrix_failures += 1;
+                    self.awaiting_bank = false;
+                    return null;
+                }
+                self.awaiting_bank = false;
+            }
+            return a.rawAlloc(bytes, alignment, ra);
+        }
+        fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn free(raw_ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            if (bytes.len == self.bank_bytes) {
+                if (self.check_matrix_outside) self.outside();
+                self.matrix_deaths += 1;
+            }
+            a.rawFree(bytes, alignment, ra);
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+    };
+    var probe = Probe{ .gate = session.execution_gate.?, .bank_bytes = geometry.bytes, .supplement_bytes = warm_supplement, .cold_supplement_bytes = cold_supplement, .deny_cold_once = deny_first, .check_matrix_outside = !deny_first };
+    // Covers ordinary error/cancel/OOM unwind after the callback is installed.
+    defer if (session_live) {
+        closeLayaProbeFixture(session, &probe);
+        session_live = false;
+    };
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    const control = Control{ .native_call_policy = .in_process, .ptr = &probe, .check_fn = Probe.check };
+    const first = try executeWithScratchLimit(a, probe.allocator(), session, tok, cfg, &tasks, control, null, null);
+    defer freeLayaBankTestResult(a, first);
+    try expectLayaBankTestResult(reference, first);
+    const cold_stats = architecture.layaTrunkCacheStats(session).?;
+    try std.testing.expectEqual(@as(usize, 1), cold_stats.entries);
+    try std.testing.expectEqual(@as(u64, 1), cold_stats.misses);
+    try std.testing.expectEqual(@as(usize, 1), probe.kv_reservations);
+    if (deny_first) {
+        try std.testing.expect(!probe.deny_cold_once and probe.denials == 1);
+        try std.testing.expect(probe.matrix_allocations != 0); // original numerical scratch route remains selected
+    } else try std.testing.expectEqual(phases, probe.matrix_allocations);
+    try std.testing.expectEqual(probe.matrix_allocations, probe.matrix_deaths);
+    const initial_matrix_allocations = probe.matrix_allocations;
+    probe.check_matrix_outside = true;
+    const retained = pin.controller().snapshot();
+    try std.testing.expect(retained.host_kv_bytes > 0 and retained.host_scratch_bytes > 0);
+    const calls_before_warm = probe.calls;
+    const warm = try executeWithScratchLimit(a, probe.allocator(), session, tok, cfg, &tasks, control, null, null);
+    defer freeLayaBankTestResult(a, warm);
+    try expectLayaBankTestResult(reference, warm);
+    try std.testing.expectEqual(1 + 2 * phases, probe.calls - calls_before_warm); // preprocessing plus SAME original primary and exact bank per original numerical phase
+    try std.testing.expectEqual(@as(usize, 1), probe.kv_reservations);
+    try std.testing.expectEqual(initial_matrix_allocations + phases, probe.matrix_allocations);
+    try std.testing.expectEqualDeep(retained, pin.controller().snapshot());
+    try std.testing.expectEqual(cold_stats.hits + phases, architecture.layaTrunkCacheStats(session).?.hits);
+    probe.cancel_on_bank = true;
+    const cancelled = executeWithScratchLimit(a, probe.allocator(), session, tok, cfg, &tasks, control, null, null);
+    if (cancelled) |unexpected| {
+        freeLayaBankTestResult(a, unexpected);
+        try std.testing.expect(false);
+    } else |err| try std.testing.expectEqual(error.Cancelled, err);
+    try std.testing.expect(probe.cancelled and scheduler.head == null);
+    try std.testing.expectEqualDeep(retained, pin.controller().snapshot());
+    probe.cancel_on_bank = false;
+    probe.cancelled = false;
+    probe.fail_bank = true;
+    const failed = executeWithScratchLimit(a, probe.allocator(), session, tok, cfg, &tasks, control, null, null);
+    if (failed) |unexpected| {
+        freeLayaBankTestResult(a, unexpected);
+        try std.testing.expect(false);
+    } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+    try std.testing.expect(probe.failed_bank and scheduler.head == null);
+    try std.testing.expectEqualDeep(retained, pin.controller().snapshot());
+    probe.fail_bank = false;
+    const recovered = try executeWithScratchLimit(a, probe.allocator(), session, tok, cfg, &tasks, control, null, null);
+    defer freeLayaBankTestResult(a, recovered);
+    try expectLayaBankTestResult(reference, recovered);
+    try std.testing.expectEqual(@as(usize, 1), probe.kv_reservations);
+    try std.testing.expect(!probe.violation and scheduler.head == null);
+    if (!refine) {
+        try packedLayaRotationCapacityCase(session, cfg, rows[0], a, false);
+        try std.testing.expectEqualDeep(retained, pin.controller().snapshot());
+        const TensorInfo = @import("../backends/tensor.zig").TensorInfo;
+        const row = rows[0];
+        const n: i64 = @intCast(row.ids.len);
+        const q: i64 = @intCast(row.questions());
+        const signature = [_]TensorInfo{
+            .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, n } },
+            .{ .name = "position_ids", .dtype = .i64, .shape = &.{ 1, n } },
+            .{ .name = "token_segment", .dtype = .i64, .shape = &.{ 1, n } },
+            .{ .name = "segment_parent", .dtype = .i64, .shape = &.{ 1, @intCast(row.parents.len) } },
+            .{ .name = "token_qtype", .dtype = .i64, .shape = &.{ 1, n } },
+            .{ .name = "marker_pos", .dtype = .i64, .shape = &.{ q, @intCast(row.width) } },
+            .{ .name = "anchor_pos", .dtype = .i64, .shape = &.{ q, 1 } },
+        };
+        // Reconstruct the SAME original request, without subtracting any
+        // estimator component. Cache/primary/preprocess/bank really overlap.
+        var request = try session.planShapes(&signature, 1);
+        request.host_preprocess_bytes = request.input_bytes;
+        const policy = session.run_admission.?;
+        const primary = (try policy.planRequest(request, session.outputInfo())).required;
+        const preprocessing = Memory.AdmissionAmounts{ .host_scratch_bytes = tasks.len * cfg.max_len * 64 };
+        const original_live = try (try retained.merge(primary)).merge(preprocessing);
+        const accepted_live = try original_live.merge(.{ .host_scratch_bytes = warm_supplement });
+        const exact = accepted_live.hostTotalBytes();
+        const previous_limit = session.run_admission.?.limits.host_limit_bytes;
+        defer session.run_admission.?.limits.host_limit_bytes = previous_limit;
+        session.run_admission.?.limits.host_limit_bytes = exact;
+        const calls_exact = probe.calls;
+        const allocs_exact = probe.matrix_allocations;
+        const exact_result = try executeWithScratchLimit(a, probe.allocator(), session, tok, cfg, &tasks, control, null, null);
+        defer freeLayaBankTestResult(a, exact_result);
+        try expectLayaBankTestResult(reference, exact_result);
+        try std.testing.expectEqual(@as(usize, 3), probe.calls - calls_exact);
+        try std.testing.expectEqual(allocs_exact + 1, probe.matrix_allocations);
+        try std.testing.expectEqualDeep(retained, pin.controller().snapshot());
+        // At one byte below the exact bank overlap, and at the original
+        // request's own full overlap, the optional bank declines pre-math.
+        // The old supported route keeps its actual original floor and output.
+        probe.check_matrix_outside = false;
+        for ([_]usize{ exact - 1, original_live.hostTotalBytes() }) |limit| {
+            session.run_admission.?.limits.host_limit_bytes = limit;
+            const before_calls = probe.calls;
+            const legacy = try executeWithScratchLimit(a, probe.allocator(), session, tok, cfg, &tasks, control, null, null);
+            defer freeLayaBankTestResult(a, legacy);
+            try expectLayaBankTestResult(reference, legacy);
+            try std.testing.expectEqual(@as(usize, 2), probe.calls - before_calls);
+            try std.testing.expectEqualDeep(retained, pin.controller().snapshot());
+        }
+        probe.check_matrix_outside = true;
+        session.run_admission.?.limits.host_limit_bytes = previous_limit;
+    }
+    // A real optional supplementary denial leaves the original permit and
+    // original scratch/cache/math route available. No prepared-bank claim is
+    // made for those unchanged legacy numerical allocations.
+    probe.deny_bank = true;
+    probe.check_matrix_outside = false;
+    const denied = try executeWithScratchLimit(a, probe.allocator(), session, tok, cfg, &tasks, control, null, null);
+    defer freeLayaBankTestResult(a, denied);
+    try expectLayaBankTestResult(reference, denied);
+    try std.testing.expectEqual(phases + @intFromBool(deny_first), probe.denials);
+    try std.testing.expectEqualDeep(retained, pin.controller().snapshot());
+    try std.testing.expect(!probe.violation and scheduler.head == null);
+    if (!refine) {
+        probe.deny_bank = false;
+        probe.check_matrix_outside = true;
+        const combined = [_]Task{ tasks[0], .{ .text = "find the contract and check whether delivery is late", .question = question } };
+        var raw_split = try factory.createNativeSession(a, path);
+        defer raw_split.close();
+        architecture.setLayaTrunkCachePrecision(raw_split, .f32);
+        architecture.setLayaTrunkCacheLimit(raw_split, 1 << 20, 1);
+        // Original cold coalesced routing has no cached trunk and therefore
+        // uses the full row, with zero invented Entry births.
+        const coalesced = try executeWithScratchLimit(a, a, raw_split, tok, cfg, &combined, control, null, null);
+        defer freeLayaBankTestResult(a, coalesced);
+        try std.testing.expectEqual(@as(usize, 0), architecture.layaTrunkCacheStats(raw_split).?.entries);
+        const prewarm = try executeWithScratchLimit(a, a, raw_split, tok, cfg, &tasks, control, null, null);
+        defer freeLayaBankTestResult(a, prewarm);
+        const split_reference = try executeWithScratchLimit(a, a, raw_split, tok, cfg, &combined, control, null, null);
+        defer freeLayaBankTestResult(a, split_reference);
+        try std.testing.expectEqual(@as(usize, 2), architecture.layaTrunkCacheStats(raw_split).?.entries);
+        const allocations_before_split = probe.matrix_allocations;
+        const births_before_split = probe.kv_reservations;
+        const split_result = try executeWithScratchLimit(a, probe.allocator(), session, tok, cfg, &combined, control, null, null);
+        defer freeLayaBankTestResult(a, split_result);
+        try expectLayaBankTestResult(split_reference, split_result);
+        try std.testing.expectEqual(allocations_before_split + 1, probe.matrix_allocations); // SAME serial MAX for both trees
+        try std.testing.expectEqual(births_before_split + 1, probe.kv_reservations);
+        try std.testing.expectEqual(@as(usize, 2), architecture.layaTrunkCacheStats(session).?.entries);
+        const split_warm = try executeWithScratchLimit(a, probe.allocator(), session, tok, cfg, &combined, control, null, null);
+        defer freeLayaBankTestResult(a, split_warm);
+        try expectLayaBankTestResult(split_reference, split_warm);
+        try std.testing.expectEqual(allocations_before_split + 2, probe.matrix_allocations);
+        try std.testing.expectEqual(births_before_split + 1, probe.kv_reservations);
+        try std.testing.expect(!probe.violation and scheduler.head == null);
+        const pending_rows = try tree.build(a, tok, cfg, "find the receipt and check whether refund is late", &.{question}, null);
+        defer {
+            for (pending_rows) |pending_row| pending_row.deinit(a);
+            a.free(pending_rows);
+        }
+        try std.testing.expectEqual(@as(usize, 1), pending_rows.len);
+        try packedLayaRotationCapacityCase(session, cfg, pending_rows[0], a, true);
+        try std.testing.expect(!probe.violation and scheduler.head == null);
+    }
+    closeLayaProbeFixture(session, &probe);
+    session_live = false;
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
+    try std.testing.expectEqual(probe.calls - probe.denials, probe.releases);
+}
+
+test "actual packed Laya task uses SAME permit MAX and trunk Entry cold warm cancellation and OOM" {
+    try packedLayaTaskBankCase(false, false);
+}
+
+test "actual candidate Laya refinement retires first numerical bank while original output floor remains live" {
+    try packedLayaTaskBankCase(true, false);
+}
+
+fn packedLayaTaskScratchOomCase(allocator: std.mem.Allocator, path: []const u8, tok: Tokenizer, cfg: model.Config, tasks: []const Task, reference: Result) !void {
+    const a = std.testing.allocator;
+    const architecture = @import("../execution/architecture_session.zig");
+    const Memory = @import("../runtime/tier/memory.zig");
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var session = try @import("../architectures/session_factory.zig").createNativeSession(a, path);
+    // All request objects and registered B callbacks drain before this failing
+    // allocator's context leaves scope, including every failed constructor.
+    defer {
+        session.close();
+        std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot()) catch @panic("packed task all-OOM retained quota after physical close");
+    }
+    try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    session.model_lifetime.?.admission_domain = pin.retain();
+    session.run_admission = .{ .controller = pin.controller(), .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 << 20 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    try architecture.configureSharedCacheAdmissionForSession(session, a, pin.controller(), .cpu, session.run_admission.?.limits, .{});
+    architecture.setLayaTrunkCachePrecision(session, .f32);
+    architecture.setLayaTrunkCacheLimit(session, 1 << 20, 1);
+    const result = try executeWithScratchLimit(allocator, allocator, session, tok, cfg, tasks, .{ .native_call_policy = .in_process }, null, null);
+    defer freeLayaBankTestResult(allocator, result);
+    try expectLayaBankTestResult(reference, result);
+    try std.testing.expect(scheduler.head == null);
+}
+
+test "actual packed Laya Source input control matrix auxiliary output and decode unwind every allocation failure" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const synthetic = @import("../util/laya_synthetic.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    try synthetic.writeModelWith(a, std.testing.io, path, "{\"mode\":\"question\",\"max_packed_len\":512}", ",\"weight_quantization\":\"q8_0\"", 128, 153);
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    const question = Question{ .name = "first", .kind = .choice, .instruction = "choose a tool", .labels = &.{ "search", "fetch" }, .descriptions = &.{ "look it up", "fetch it" } };
+    const tasks = [_]Task{.{ .text = "find the invoice and check whether payment is late", .question = question }};
+    var raw = try @import("../architectures/session_factory.zig").createNativeSession(a, path);
+    defer raw.close();
+    @import("../execution/architecture_session.zig").setLayaTrunkCachePrecision(raw, .f32);
+    @import("../execution/architecture_session.zig").setLayaTrunkCacheLimit(raw, 1 << 20, 1);
+    const cfg = @import("../architectures/session_factory.zig").getLayaConfig(raw).?;
+    const reference = try executeWithScratchLimit(a, a, raw, tok, cfg, &tasks, .{ .native_call_policy = .in_process }, null, null);
+    defer freeLayaBankTestResult(a, reference);
+    try packedLayaTaskScratchOomCase(a, path, tok, cfg, &tasks, reference);
+    try platform.allocator.checkAllAllocationFailures(a, packedLayaTaskScratchOomCase, .{ path, tok, cfg, @as([]const Task, &tasks), reference });
+}
+
+fn packedLayaRotationCapacityCase(session: Session, cfg: model.Config, row: tree.Row, allocator: std.mem.Allocator, pending_peer: bool) !void {
+    const source_module = @import("../backends/session.zig");
+    const TensorInfo = @import("../backends/tensor.zig").TensorInfo;
+    const sink = @import("../execution/retirement_sink.zig");
+    const n: i64 = @intCast(row.ids.len);
+    const q: i64 = @intCast(row.questions());
+    const signature = [_]TensorInfo{
+        .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, n } },
+        .{ .name = "position_ids", .dtype = .i64, .shape = &.{ 1, n } },
+        .{ .name = "token_segment", .dtype = .i64, .shape = &.{ 1, n } },
+        .{ .name = "segment_parent", .dtype = .i64, .shape = &.{ 1, @intCast(row.parents.len) } },
+        .{ .name = "token_qtype", .dtype = .i64, .shape = &.{ 1, n } },
+        .{ .name = "marker_pos", .dtype = .i64, .shape = &.{ q, @intCast(row.width) } },
+        .{ .name = "anchor_pos", .dtype = .i64, .shape = &.{ q, 1 } },
+    };
+    var preprocessing = try session.admitHostPreprocess(cfg.max_len * 64);
+    defer preprocessing.deinit();
+    var request = try session.planShapes(&signature, 1);
+    request.host_preprocess_bytes = request.input_bytes;
+    var execution = try session.admitShapeRequest(.{ .host_shapes = &signature }, request, allocator, .{ .native_call_policy = .in_process });
+    defer execution.deinit();
+    var source = source_module.PreparedSource{}; // final address BEFORE inputs/outputs
+    defer source.deinit();
+    var inputs: [7]Tensor = undefined;
+    var initialized: usize = 0;
+    defer for (inputs[0..initialized]) |*input| input.deinit();
+    defer source.finishInputLifetime();
+    for (signature, [_][]const i64{ row.ids, row.positions, row.segments, row.parents, row.kinds, row.markers, row.anchors }, 0..) |info, values, index| {
+        inputs[index] = try Tensor.initInt64(allocator, info.name, info.shape, values);
+        initialized += 1;
+    }
+    const Cache = @import("../architectures/laya_trunk_cache.zig").Cache;
+    const Entry = @import("../architectures/laya_trunk_cache.zig").Entry;
+    const Pending = struct {
+        cache: *Cache,
+        entry: *Entry,
+        gate: *std.atomic.Mutex,
+        scheduler: *@import("../runtime/embedding_scheduler.zig").Scheduler,
+        checks: usize = 0,
+        published: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.published) return;
+            if (!self.gate.tryLock()) return;
+            defer self.gate.unlock();
+            if (self.scheduler.head != null) return;
+            self.checks += 1;
+            if (self.checks <= 20) return; // prove the old eight-retry decline was unsafe
+            // A real peer can enter Model and publish while cold Source waits:
+            // this is the actual pending Entry, not a fake hit/selector.
+            self.cache.publish(self.entry);
+            self.cache.release(self.entry);
+            self.published = true;
+        }
+    };
+    var setup_sink = try sink.Ref.create();
+    defer setup_sink.release();
+    var setup_guard = try setup_sink.enter();
+    defer setup_guard.finish();
+    var setup_epoch = try setup_guard.retainEpoch();
+    defer setup_epoch.release();
+    var pending: ?Pending = null;
+    defer if (pending) |*peer| if (!peer.published) peer.cache.abandon(peer.entry);
+    if (pending_peer) {
+        const adapter = @import("../execution/architecture_session.zig");
+        var described = (try adapter.collectNativeMatrixScratchCallOutsideExecution(session, &inputs, allocator, .{ .boundary = &setup_epoch })).?;
+        const cache = described.workload.?.cache;
+        const encoder_cfg = described.workload.?.config;
+        try described.finishOutsideExecution(.{ .boundary = &setup_epoch });
+        const selected = @import("../architectures/laya_packed.zig").cacheKeyForRow(encoder_cfg, cfg, row).?;
+        const entry = switch (try cache.lookup(selected.key, selected.tokens, encoder_cfg.num_hidden_layers + cfg.head_layers, encoder_cfg.hidden_size, true)) {
+            .fill => |value| value,
+            else => return error.TestUnexpectedResult,
+        };
+        @memset(entry.host16, 0);
+        @memset(entry.host32, 0);
+        pending = .{ .cache = cache, .entry = entry, .gate = session.execution_gate.?, .scheduler = session.cohort_scheduler.? };
+    }
+    const selected_control = Control{ .native_call_policy = .in_process, .ptr = if (pending) |*peer| peer else null, .check_fn = if (pending != null) Pending.check else null };
+    try std.testing.expect(try source.initOwningSynchronousHostTaskPermitBeforeExecutionInto(&execution, &preprocessing, &inputs, allocator, selected_control));
+    if (pending) |peer| try std.testing.expect(peer.published and peer.checks > 20);
+    try source.enter();
+    const outputs = try source.runHost(&inputs);
+    defer {
+        for (outputs) |*output| output.deinit();
+        allocator.free(outputs);
+    }
+    if (pending_peer) {
+        try std.testing.expect(try source.finishSynchronousHostTaskWorkspaceAfterUnlock());
+        for (outputs) |output| for (output.asFloat32()) |value| try std.testing.expect(std.math.isFinite(value));
+        return;
+    }
+    var original_a = try source.epoch().?.retain();
+    defer original_a.release();
+    const original_amounts = source.permit.?.lease.?.amounts;
+    const before = session.run_admission.?.controller.snapshot();
+    const actual_sink = source.cleanup.retained_sink.?;
+    var guards: [64]sink.Guard = undefined;
+    var count: usize = 0;
+    defer for (guards[0..count]) |*guard| guard.finish();
+    var exhausted = false;
+    while (count < guards.len) {
+        guards[count] = actual_sink.enter() catch |err| {
+            try std.testing.expectEqual(error.RetirementEpochCapacityExceeded, err);
+            exhausted = true;
+            break;
+        };
+        count += 1;
+    }
+    try std.testing.expect(exhausted);
+    try std.testing.expect(!try source.finishSynchronousHostTaskWorkspaceAfterUnlock());
+    try std.testing.expect(!try original_a.isSealed());
+    try std.testing.expect(source.epoch().?.record == original_a.record and source.epoch().?.nonce == original_a.nonce);
+    try std.testing.expectEqualDeep(original_amounts, source.permit.?.lease.?.amounts);
+    try std.testing.expectEqualDeep(before, session.run_admission.?.controller.snapshot());
+    try std.testing.expect(source.native_matrix_scratch == null and source.native_matrix_call == null and source.native_matrix_supplement == null);
+    // Outputs remain readable and owned; no replay/early quota credit occurs.
+    try std.testing.expectEqual(@as(usize, 2), outputs.len);
+    for (outputs) |output| for (output.asFloat32()) |value| try std.testing.expect(std.math.isFinite(value));
+}
+
+test "actual cold first packed Laya numeric MAX denial preserves same cache Entry with KV suppliers outside Model" {
+    try packedLayaTaskBankCase(false, true);
+}
+
+test "actual full-row Laya no-cache optional bank denial uses empty capability with no zero supplier" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const synthetic = @import("../util/laya_synthetic.zig");
+    const factory = @import("../architectures/session_factory.zig");
+    const architecture = @import("../execution/architecture_session.zig");
+    const Memory = @import("../runtime/tier/memory.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    try synthetic.writeModelWith(a, std.testing.io, path, "{\"mode\":\"question\",\"max_packed_len\":512,\"trunk_sees\":\"questions\"}", ",\"weight_quantization\":\"q8_0\"", 128, 154);
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    const question = Question{ .name = "first", .kind = .choice, .instruction = "choose a tool", .labels = &.{ "search", "fetch" }, .descriptions = &.{ "look it up", "fetch it" } };
+    const tasks = [_]Task{.{ .text = "find the invoice and check whether payment is late", .question = question }};
+    var raw = try factory.createNativeSession(a, path);
+    defer raw.close();
+    const cfg = factory.getLayaConfig(raw).?;
+    const reference = try executeWithScratchLimit(a, a, raw, tok, cfg, &tasks, .{ .native_call_policy = .in_process }, null, null);
+    defer freeLayaBankTestResult(a, reference);
+    const config_bytes = try @import("../util/c_file.zig").readFileFromDir(a, path, "config.json");
+    defer a.free(config_bytes);
+    const encoder = try @import("../architectures/modern_bert_config.zig").parseConfig(a, config_bytes);
+    const geometry = (try model.selectedMatrixScratchGeometry(cfg, encoder, .{ .encoder = true, .head = true })).?;
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var session = try factory.createNativeSession(a, path);
+    var live = true;
+    defer if (live) session.close();
+    try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    session.model_lifetime.?.admission_domain = pin.retain();
+    session.run_admission = .{ .controller = pin.controller(), .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 << 20 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    try architecture.configureSharedCacheAdmissionForSession(session, a, pin.controller(), .cpu, session.run_admission.?.limits, .{});
+    architecture.setLayaTrunkCachePrecision(session, .f32);
+    architecture.setLayaTrunkCacheLimit(session, 1 << 20, 1);
+    const Probe = struct {
+        gate: ?*std.atomic.Mutex,
+        bank_bytes: usize,
+        reservations: usize = 0,
+        denials: usize = 0,
+        releases: usize = 0,
+        zero_calls: usize = 0,
+        kv_calls: usize = 0,
+        violation: bool = false,
+        fn outside(self: *@This()) void {
+            if (self.gate) |gate| {
+                if (gate.tryLock()) gate.unlock() else self.violation = true;
+            }
+        }
+        fn reserve(raw_ctx: *anyopaque, amounts: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.outside();
+            if (std.meta.eql(amounts, Memory.AdmissionAmounts{})) self.zero_calls += 1;
+            if (amounts.host_kv_bytes != 0) self.kv_calls += 1;
+            if (std.meta.eql(amounts, Memory.AdmissionAmounts{ .host_scratch_bytes = self.bank_bytes })) {
+                self.denials += 1;
+                return error.ResourceLimitExceeded;
+            }
+            self.reservations += 1;
+            return self.reservations;
+        }
+        fn retain(raw_ctx: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.outside();
+        }
+        fn release(raw_ctx: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.outside();
+            self.releases += 1;
+        }
+    };
+    var probe = Probe{ .gate = session.execution_gate.?, .bank_bytes = geometry.bytes };
+    // Covers ordinary error/cancel/OOM unwind after the callback is installed.
+    defer if (live) {
+        closeLayaProbeFixture(session, &probe);
+        live = false;
+    };
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    for (0..2) |iteration| {
+        const result = try executeWithScratchLimit(a, a, session, tok, cfg, &tasks, .{ .native_call_policy = .in_process }, null, null);
+        defer freeLayaBankTestResult(a, result);
+        try expectLayaBankTestResult(reference, result);
+        try std.testing.expectEqual(iteration + 1, probe.denials);
+        try std.testing.expectEqual(@as(usize, 0), architecture.layaTrunkCacheStats(session).?.entries);
+        try std.testing.expectEqual(@as(usize, 0), probe.zero_calls);
+        try std.testing.expectEqual(@as(usize, 0), probe.kv_calls);
+        try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
+        try std.testing.expect(!probe.violation and scheduler.head == null);
+    }
+    closeLayaProbeFixture(session, &probe);
+    live = false;
+    try std.testing.expectEqual(probe.reservations, probe.releases);
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
 }

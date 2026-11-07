@@ -69,6 +69,10 @@ pub const DType = enum {
             .i8, .u8, .bool_ => 1,
         };
     }
+    /// Dense scalar storage only. Packed quantized extents belong to their codec.
+    pub inline fn byteCount(self: DType, elements: usize) error{Overflow}!usize {
+        return std.math.mul(usize, elements, self.byteSize());
+    }
 };
 
 pub const TensorInfo = struct {
@@ -232,6 +236,89 @@ pub const Tensor = struct {
         return std.mem.bytesAsSlice(f64, aligned);
     }
 
+    /// Copy dense scalar storage to F32 without imposing mapped-byte alignment.
+    pub fn toOwnedF32(self: *const Tensor, allocator: std.mem.Allocator) ![]f32 {
+        const count = self.elementCount();
+        if (try self.dtype.byteCount(count) > self.data.len) return error.InvalidTensorData;
+        const out = try allocator.alloc(f32, count);
+        switch (self.dtype) {
+            .f32 => {
+                if (self.asFloat32IfAligned()) |src| {
+                    @memcpy(out, src[0..count]);
+                } else {
+                    const src_bytes: [*]const u8 = self.data.ptr;
+                    for (0..count) |i| {
+                        const offset = i * 4;
+                        const bits: u32 = @bitCast([4]u8{
+                            src_bytes[offset],
+                            src_bytes[offset + 1],
+                            src_bytes[offset + 2],
+                            src_bytes[offset + 3],
+                        });
+                        out[i] = @bitCast(bits);
+                    }
+                }
+            },
+            .f16 => {
+                const src_bytes: [*]const u8 = self.data.ptr;
+                for (0..count) |i| {
+                    const offset = i * 2;
+                    const half: f16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
+                    out[i] = @floatCast(half);
+                }
+            },
+            .bf16 => {
+                widenBf16LittleEndian(self.data[0 .. count * 2], out);
+            },
+            .f64 => {
+                const src_bytes: [*]const u8 = self.data.ptr;
+                for (0..count) |i| {
+                    const offset = i * 8;
+                    const bits = std.mem.readInt(u64, src_bytes[offset..][0..8], .little);
+                    const value: f64 = @bitCast(bits);
+                    out[i] = @floatCast(value);
+                }
+            },
+            .i8 => {
+                const src = self.asInt8()[0..count];
+                for (src, 0..) |value, i| out[i] = @floatFromInt(value);
+            },
+            .i16 => {
+                const src_bytes: [*]const u8 = self.data.ptr;
+                for (0..count) |i| {
+                    const offset = i * 2;
+                    const value = std.mem.readInt(i16, src_bytes[offset..][0..2], .little);
+                    out[i] = @floatFromInt(value);
+                }
+            },
+            .i32 => {
+                const src_bytes: [*]const u8 = self.data.ptr;
+                for (0..count) |i| {
+                    const offset = i * 4;
+                    const value = std.mem.readInt(i32, src_bytes[offset..][0..4], .little);
+                    out[i] = @floatFromInt(value);
+                }
+            },
+            .i64 => {
+                const src_bytes: [*]const u8 = self.data.ptr;
+                for (0..count) |i| {
+                    const offset = i * 8;
+                    const value = std.mem.readInt(i64, src_bytes[offset..][0..8], .little);
+                    out[i] = @floatFromInt(value);
+                }
+            },
+            .u8 => {
+                const src = self.data[0..count];
+                for (src, 0..) |value, i| out[i] = @floatFromInt(value);
+            },
+            .bool_ => {
+                const src = self.data[0..count];
+                for (src, 0..) |value, i| out[i] = if (value == 0) 0.0 else 1.0;
+            },
+        }
+        return out;
+    }
+
     pub fn elementCount(self: *const Tensor) usize {
         var count: usize = 1;
         for (self.shape) |dim| {
@@ -356,4 +443,64 @@ test "borrowed tensor view does not release source lifetime" {
     try std.testing.expectEqual(@as(usize, 0), counter.count);
     source.deinit();
     try std.testing.expectEqual(@as(usize, 1), counter.count);
+}
+
+test "tensor dense byte extents preserve empty values and reject overflow" {
+    inline for (std.meta.tags(DType)) |dtype| {
+        try std.testing.expectEqual(@as(usize, 0), try dtype.byteCount(0));
+        try std.testing.expectEqual(dtype.byteSize() * 17, try dtype.byteCount(17));
+        const bound = std.math.maxInt(usize) / dtype.byteSize();
+        try std.testing.expectEqual(bound * dtype.byteSize(), try dtype.byteCount(bound));
+        if (dtype.byteSize() > 1) try std.testing.expectError(error.Overflow, dtype.byteCount(bound + 1));
+    }
+}
+
+test "dense F32 conversion accepts unaligned scalar storage and retains source bytes" {
+    const a = std.testing.allocator;
+    inline for (.{ .{ f16, DType.f16 }, .{ f64, DType.f64 }, .{ i8, DType.i8 }, .{ i16, DType.i16 }, .{ i32, DType.i32 }, .{ i64, DType.i64 } }) |entry| {
+        const T = entry[0];
+        const values = [_]T{ 1, -2 };
+        var storage: [1 + @sizeOf(@TypeOf(values))]u8 align(8) = @splat(0xa5);
+        @memcpy(storage[1..], std.mem.sliceAsBytes(&values));
+        const original = storage;
+        const source = Tensor{ .data = storage[1..], .dtype = entry[1], .shape = &.{2}, .name = "", .allocator = a, .owns_data = false, .owns_shape = false };
+        const result = try source.toOwnedF32(a);
+        defer a.free(result);
+        try std.testing.expectEqualSlices(f32, &.{ 1, -2 }, result);
+        try std.testing.expectEqualSlices(u8, &original, &storage);
+    }
+    const bits = [_]u32{ 0x80000000, 0x7fc01234, 0x7f800000, 0xff800000 };
+    var bytes: [17]u8 align(8) = @splat(0xa5);
+    @memcpy(bytes[1..], std.mem.sliceAsBytes(&bits));
+    const source = Tensor{ .data = bytes[1..], .dtype = .f32, .shape = &.{4}, .name = "", .allocator = a, .owns_data = false, .owns_shape = false };
+    const result = try source.toOwnedF32(a);
+    defer a.free(result);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&bits), std.mem.sliceAsBytes(result));
+}
+
+test "dense F32 conversion respects logical prefixes and rejects truncated storage" {
+    const a = std.testing.allocator;
+    inline for (std.meta.tags(DType)) |dtype| {
+        var data: [3 * 8]u8 align(8) = @splat(0);
+        switch (dtype) {
+            .f32 => std.mem.writeInt(u32, data[0..4], @bitCast(@as(f32, 1)), .little),
+            .f16 => std.mem.writeInt(u16, data[0..2], @bitCast(@as(f16, 1)), .little),
+            .bf16 => std.mem.writeInt(u16, data[0..2], 0x3f80, .little),
+            .f64 => std.mem.writeInt(u64, data[0..8], @bitCast(@as(f64, 1)), .little),
+            .i8, .i16, .i32, .i64, .u8, .bool_ => data[0] = 1,
+        }
+        const retained = data;
+        var tensor = Tensor{ .data = &data, .dtype = dtype, .shape = &.{1}, .name = "prefix", .allocator = a, .owns_data = false, .owns_shape = false };
+        const result = try tensor.toOwnedF32(a);
+        defer a.free(result);
+        try std.testing.expectEqualSlices(f32, &.{1}, result);
+        try std.testing.expectEqualSlices(u8, &retained, &data);
+        tensor.data = data[0 .. dtype.byteSize() - 1];
+        try std.testing.expectError(error.InvalidTensorData, tensor.toOwnedF32(a));
+        tensor.shape = &.{0};
+        tensor.data = &.{};
+        const empty = try tensor.toOwnedF32(a);
+        defer a.free(empty);
+        try std.testing.expectEqual(@as(usize, 0), empty.len);
+    }
 }

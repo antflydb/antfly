@@ -152,6 +152,14 @@ static int check(termite_metal_decode_runtime *r, size_t n, size_t prefix, size_
                        "4f,\"gpu_us\":%.4f}\n",
                        heads, n, kv, trial, mode, elapsed / 1000.0, r->last_frame_gpu_nanos / 1000.0);
             const float *got = (float *)y.contents + 4;
+            // A query with no finite score has zero softmax mass. Check this
+            // independently of the generic dispatcher used for A/B parity.
+            if (poison == 1) for (size_t i = 0; i < width; i++) {
+                if (got[i] != 0.0f) {
+                    fprintf(stderr, "invalid-query mass mode=%zu i=%zu got=%g expected=0\n", mode, i, got[i]);
+                    return 17;
+                }
+            }
             if (mode == 0)
                 memcpy(gold, got, count * 4);
             // The first balanced trial can run new before old only on later trials,

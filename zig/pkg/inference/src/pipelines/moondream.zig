@@ -47,7 +47,10 @@ pub const stop_text = "<END>";
 /// single-file safetensors checkpoint. Loads no weights.
 pub fn probeModelDir(allocator: std.mem.Allocator, model_dir: []const u8) !bool {
     if (!build_options.enable_native) return false;
-    var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, std.Options.debug_io, model_dir, null);
+    var artifacts = @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, std.Options.debug_io, model_dir, null) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
     defer artifacts.deinit();
     for ([_][]const u8{ "tokenizer.json", weights_file }) |name| {
         const path = (try artifacts.resolve(name)) orelse return false;
@@ -100,7 +103,15 @@ pub const PromptTokens = struct {
     }
 };
 
+pub const LoadOptions = struct {
+    /// Observe requested owner allocator spans from before model/compute
+    /// construction. Mapped extents and allocator/OS padding remain separate.
+    observe_allocations: bool = false,
+    execution_diagnostics: @import("../execution/diagnostic_policy.zig").Policy = .{},
+};
+
 pub const Pipeline = struct {
+    diagnostics: @import("../execution/diagnostics.zig").Diagnostics = .{},
     allocator: std.mem.Allocator,
     config: Config,
     tokenizer: *hf_tokenizer.HfTokenizer,
@@ -130,6 +141,13 @@ pub const Pipeline = struct {
         control: ?InferenceExecutionControl,
         io: ?std.Io,
     ) !Pipeline {
+        return loadWithOptions(allocator, model_dir, control, io, .{});
+    }
+
+    pub fn loadWithOptions(backing_allocator: std.mem.Allocator, model_dir: []const u8, control: ?InferenceExecutionControl, io: ?std.Io, options: LoadOptions) !Pipeline {
+        const observer = if (options.observe_allocations or options.execution_diagnostics.enabled) try @import("../execution/allocation_observer.zig").State.create(backing_allocator, .from_owner_creation) else null;
+        defer if (observer) |owner| owner.release();
+        const allocator = if (observer) |owner| owner.allocator() else backing_allocator;
         if (!build_options.enable_native) return error.NativeNotEnabled;
         if (control) |active| try active.check();
 
@@ -212,12 +230,8 @@ pub const Pipeline = struct {
             else => return error.UnsupportedTensorType,
         }
 
-        const compute = try allocator.create(native_mod.NativeCompute);
-        errdefer allocator.destroy(compute);
-        compute.* = if (io) |runtime|
-            native_mod.NativeCompute.initWithIo(allocator, weights, null, runtime)
-        else
-            native_mod.NativeCompute.init(allocator, weights, null);
+        const compute_backend = try @import("../backends/compute_factory.zig").createNative(allocator, weights, null, io, .{});
+        const compute: *native_mod.NativeCompute = @ptrCast(@alignCast(compute_backend.ptr));
         // Consume the f16 checkpoint matrices directly instead of widening
         // every projection to f32 on each use.
         compute.borrow_typed_matrix_weights = true;
@@ -225,6 +239,7 @@ pub const Pipeline = struct {
         return .{
             .allocator = allocator,
             .config = config,
+            .diagnostics = .{ .enabled = .init(options.observe_allocations or options.execution_diagnostics.enabled), .export_owner = if (options.execution_diagnostics.enabled) @import("../execution/diagnostic_export.zig").ownerIdentity() else 0 },
             .tokenizer = tok,
             .compute = compute,
             .weights = weights,
@@ -243,6 +258,26 @@ pub const Pipeline = struct {
         self.allocator.free(self.stop_token_ids);
         self.tokenizer.deinitSelf();
         self.* = undefined;
+    }
+
+    /// Raw cold configuration. This request-owned pipeline and all aliases of
+    /// its compute must be quiescent; no shared model gate is implied here.
+    pub fn configureExecutionDiagnostics(self: *Pipeline, enabled: bool) bool {
+        const execution_backend = self.backend(null);
+        self.diagnostics.configureBackend(enabled, &execution_backend);
+        return true;
+    }
+    pub fn executionDiagnostics(self: *Pipeline) ?@import("../execution/diagnostics.zig").Snapshot {
+        return self.diagnostics.snapshot();
+    }
+    fn observationBinding(self: *Pipeline, execution_backend: *const ops.ComputeBackend) @import("../execution/invocation_observation.zig").Binding {
+        return (@import("../execution/invocation_observation.zig").Binding{
+            .diagnostics = &self.diagnostics,
+            .model_allocator = self.weights.allocator,
+        }).forBackend(execution_backend.*);
+    }
+    fn forwardLogits(self: *Pipeline, execution_backend: *const ops.ComputeBackend, embeddings: []const f32, rows: usize, kv: *arch.KvState, operation: @import("../execution/diagnostics.zig").Operation) ![]f32 {
+        return @import("../execution/invocation_observation.zig").callOperation(self.observationBinding(execution_backend), operation, arch.forwardLastLogits, .{ execution_backend, self.allocator, self.config, embeddings, rows, kv });
     }
 
     fn backend(self: *Pipeline, control: ?InferenceExecutionControl) ops.ComputeBackend {
@@ -274,7 +309,7 @@ pub const Pipeline = struct {
         const pixels = try preprocessImage(self.allocator, self.config, image_bytes);
         defer self.allocator.free(pixels);
         var cb = self.backend(control);
-        return arch.encodeImage(&cb, self.allocator, self.config, pixels, true);
+        return @import("../execution/invocation_observation.zig").callOperation(self.observationBinding(&cb), .encoder, arch.encodeImage, .{ &cb, self.allocator, self.config, pixels, true });
     }
 
     pub fn embedTokens(self: *Pipeline, ids: []const i32, out: []f32) !void {
@@ -390,7 +425,7 @@ pub const Pipeline = struct {
         defer generated.deinit(self.allocator);
 
         var timer = Timer.start();
-        var logits = try arch.forwardLastLogits(&cb, self.allocator, self.config, embeddings, prompt_rows, &kv);
+        var logits = try self.forwardLogits(&cb, embeddings, prompt_rows, &kv, .prefill);
         const prefill_ms = timer.lapMs();
         defer self.allocator.free(logits);
 
@@ -411,7 +446,7 @@ pub const Pipeline = struct {
             try history.append(self.allocator, next);
             if (step + 1 == max_new) break;
             try self.embedTokens(&.{next}, row);
-            const next_logits = try arch.forwardLastLogits(&cb, self.allocator, self.config, row, 1, &kv);
+            const next_logits = try self.forwardLogits(&cb, row, 1, &kv, .decode_step);
             self.allocator.free(logits);
             logits = next_logits;
         }
@@ -580,4 +615,127 @@ test "cleanAnswer strips partial stop markers and whitespace" {
         defer std.testing.allocator.free(out);
         try std.testing.expectEqualStrings(case[1], out);
     }
+}
+
+fn putObservationWeight(store: *native_mod.WeightStore, name: []const u8, shape: []const i64, data: []const f32) !void {
+    const key = try store.allocator.dupe(u8, name);
+    errdefer store.allocator.free(key);
+    var value = try @import("../backends/tensor.zig").Tensor.initFloat32(store.allocator, key, shape, data);
+    errdefer value.deinit();
+    try store.resident_weights.put(store.allocator, key, .{ .tensor = value });
+}
+
+test "Moondream actual Native numerical owner observes prefill decode cancellation and disabled callback parity" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = native_mod.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.deinitOwned();
+    try putObservationWeight(&weights, arch.names.lm_head_norm_weight, &.{4}, &.{ 1, 1, 1, 1 });
+    try putObservationWeight(&weights, arch.names.lm_head_norm_bias, &.{4}, &.{ 0, 0, 0, 0 });
+    try putObservationWeight(&weights, arch.names.lm_head_weight, &.{ 2, 4 }, &.{ 1, 0, 0, 0, 0, 1, 0, 0 });
+    try putObservationWeight(&weights, arch.names.lm_head_bias, &.{2}, &.{ 0, 0 });
+    var compute = native_mod.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const config = Config{ .vocab_size = 2, .hidden_size = 4, .num_layers = 0, .num_heads = 1, .rotary_dim = 2, .intermediate_size = 8, .max_position_embeddings = 16, .bos_token_id = 0, .eos_token_id = 1 };
+    // The head-only numerical fixture needs no decoder-layer weights. Its real
+    // paged state still has a valid physical layer and tracks appended rows.
+    var cache_config = config;
+    cache_config.num_layers = 1;
+    var kv = try arch.KvState.init(a, cache_config);
+    defer kv.deinit();
+    var reference = try arch.KvState.init(a, cache_config);
+    defer reference.deinit();
+    var stops: [0]i32 = .{};
+    var pipeline = Pipeline{ .allocator = a, .config = config, .tokenizer = undefined, .compute = &compute, .weights = &weights, .embedding = .{ .data = &.{}, .dtype = .f32, .rows = 0, .cols = 4 }, .stop_token_ids = &stops };
+    var cb = pipeline.backend(null);
+    const embeddings = [_]f32{ 1, 0, 0, 0, 0, 1, 0, 0 };
+    const expected = try arch.forwardLastLogits(&cb, a, config, &embeddings, 2, &reference);
+    defer a.free(expected);
+    const Probe = struct {
+        var observed: bool = false;
+        var calls: usize = 0;
+        var fail_on_call: ?usize = null;
+        fn weight(ctx: *anyopaque, name: []const u8) !ops.CT {
+            if (@import("../execution/allocation_registry.zig").enabled() != observed) return error.MoondreamDisabledCallbackPathChanged;
+            calls += 1;
+            if (fail_on_call) |target| if (target == calls) return error.MoondreamInjectedWeightFailure;
+            return native_mod.vtable_impl.getWeight(ctx, name);
+        }
+        fn cancel(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    Probe.observed = false;
+    Probe.calls = 0;
+    Probe.fail_on_call = null;
+    var table = native_mod.vtable_impl;
+    table.getWeight = Probe.weight;
+    cb.vtable = &table;
+    const disabled = try pipeline.forwardLogits(&cb, &embeddings, 2, &kv, .prefill);
+    defer a.free(disabled);
+    try std.testing.expectEqualSlices(f32, expected, disabled);
+    try std.testing.expectEqual(@as(usize, 4), Probe.calls);
+    try std.testing.expect(pipeline.executionDiagnostics() == null);
+    try std.testing.expect(pipeline.configureExecutionDiagnostics(true));
+    Probe.observed = true;
+    const enabled = try pipeline.forwardLogits(&cb, embeddings[4..], 1, &kv, .decode_step);
+    defer a.free(enabled);
+    try std.testing.expectEqualSlices(f32, expected, enabled);
+    try std.testing.expectEqual(@as(usize, 8), Probe.calls);
+    const sampled = pipeline.executionDiagnostics().?;
+    try std.testing.expect(sampled.outcome == .success and sampled.operation == .decode_step);
+    try std.testing.expect(sampled.context_runtime_scope == .borrowed_execution_backend_context);
+    try std.testing.expect(sampled.runtime.native_allocations.?.compute != null);
+    try std.testing.expectEqual(@as(usize, 3), kv.tokenCount());
+    cb.execution_control = .{ .check_fn = Probe.cancel };
+    if (pipeline.forwardLogits(&cb, embeddings[4..], 1, &kv, .decode_step)) |unexpected| {
+        a.free(unexpected);
+        return error.ExpectedMoondreamCancellation;
+    } else |err| try std.testing.expectEqual(error.Cancelled, err);
+    const failed = pipeline.executionDiagnostics().?;
+    try std.testing.expect(failed.outcome == .failed);
+    try std.testing.expectEqualStrings("Cancelled", failed.error_name.?.view());
+    try std.testing.expectEqual(@as(usize, 8), Probe.calls);
+    try std.testing.expectEqual(@as(usize, 3), kv.tokenCount());
+    cb.execution_control = null;
+    Probe.fail_on_call = Probe.calls + 1;
+    try std.testing.expectError(error.MoondreamInjectedWeightFailure, pipeline.forwardLogits(&cb, embeddings[4..], 1, &kv, .decode_step));
+    try std.testing.expectEqual(@as(usize, 3), kv.tokenCount());
+    Probe.fail_on_call = null;
+    const retried = try pipeline.forwardLogits(&cb, embeddings[4..], 1, &kv, .decode_step);
+    defer a.free(retried);
+    try std.testing.expectEqualSlices(f32, expected, retried);
+    try std.testing.expectEqual(@as(usize, 4), kv.tokenCount());
+    try std.testing.expect(pipeline.configureExecutionDiagnostics(false));
+    Probe.observed = false;
+    const last = try pipeline.forwardLogits(&cb, embeddings[4..], 1, &kv, .decode_step);
+    defer a.free(last);
+    try std.testing.expectEqualSlices(f32, expected, last);
+    try std.testing.expectEqual(@as(usize, 5), kv.tokenCount());
+    var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, arch.forwardLastLogits(&cb, failure.allocator(), config, embeddings[4..], 1, &kv));
+    try std.testing.expectEqual(@as(usize, 5), kv.tokenCount());
+    const after_oom = try pipeline.forwardLogits(&cb, embeddings[4..], 1, &kv, .decode_step);
+    defer a.free(after_oom);
+    try std.testing.expectEqualSlices(f32, expected, after_oom);
+    try std.testing.expectEqual(@as(usize, 6), kv.tokenCount());
+    var wide_config = config;
+    wide_config.max_position_embeddings = 64;
+    var wide_embeddings: [64]f32 = @splat(0);
+    for (0..16) |row| wide_embeddings[row * 4 + 1] = 1;
+    {
+        var append_failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
+        kv.manager.allocator = append_failure.allocator();
+        defer kv.manager.allocator = a;
+        // Ten rows fill the old tail before the next cold block allocation
+        // fails. The rollback must restore those partially appended rows too.
+        try std.testing.expectError(error.OutOfMemory, arch.forwardLastLogits(&cb, a, wide_config, &wide_embeddings, 16, &kv));
+        try std.testing.expectEqual(@as(usize, 6), kv.tokenCount());
+    }
+    const after_append_oom = try arch.forwardLastLogits(&cb, a, wide_config, &wide_embeddings, 16, &kv);
+    defer a.free(after_append_oom);
+    try std.testing.expectEqualSlices(f32, expected, after_append_oom);
+    try std.testing.expectEqual(@as(usize, 22), kv.tokenCount());
+    try std.testing.expect(pipeline.executionDiagnostics() == null);
+    try std.testing.expect(!@import("../execution/allocation_registry.zig").enabled());
 }

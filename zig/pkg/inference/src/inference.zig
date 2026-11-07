@@ -27,6 +27,7 @@ extern fn unsetenv(name: [*:0]const u8) c_int;
 
 pub const backends = @import("backends/backends.zig");
 pub const platform = @import("antfly_platform");
+pub const execution = @import("execution/root.zig");
 pub const execution_control = @import("execution_control.zig");
 pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
 pub const HardCancellationWatchdog = @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog;
@@ -55,6 +56,10 @@ test "CUDA process allocation budget declarations compile" {
     _ = @import("ops/cuda/allocation_budget.zig");
     _ = @import("ops/cuda/device_budget_owner.zig");
     _ = @import("ops/cuda/allocation_ledger.zig");
+}
+
+test "dense projection cache metadata declarations compile" {
+    _ = @import("backends/dense_projection_pack.zig");
 }
 
 test "generation deadline declarations compile" {
@@ -152,6 +157,30 @@ pub const native_compute = struct {
 };
 
 test {
+    _ = @import("pipelines/moondream.zig");
+    _ = @import("execution/testing/model_formats.zig");
+    _ = @import("tile/q4_q8_schedule.zig");
+    // Keep host-only ownership/descriptor tests reachable under narrow filters.
+    if (!build_options.enable_wasm) _ = @import("ops/cuda/embedded_module.zig");
+    _ = @import("ops/kernel_geometry.zig");
+    _ = @import("ops/gpu_hosted_store.zig");
+    _ = @import("models/loaded_runtime.zig");
+    _ = @import("ops/index_metadata.zig");
+    _ = execution.reader_pool;
+    _ = execution.architecture_session;
+    _ = execution.decoder_checkpoint;
+    _ = execution.prepared_invocation;
+    _ = execution.decoder_pending_step;
+    _ = execution.decoder_prefill;
+    _ = @import("execution/cold_metadata.zig");
+    _ = execution.cached_decoder;
+    _ = execution.decoder_stage;
+    _ = execution.speculative_activation;
+    _ = execution.encoder_decoder_runtime;
+    _ = execution.seq2seq_runtime;
+    _ = execution.sequence_pool;
+    _ = execution.text_inputs;
+    _ = execution.submission;
     _ = server;
     _ = @import("documents/sources.zig");
     _ = @import("extractors/gliner_span_long_executor.zig");
@@ -167,7 +196,7 @@ test {
     _ = @import("finetune/laya/training_test.zig");
     _ = @import("finetune/laya/training_packed_test.zig");
     _ = @import("finetune/laya/fused_attention_test.zig");
-    _ = @import("ops/segment_training_attention.zig");
+    _ = @import("ops/range_attention_reference.zig");
     _ = @import("finetune/laya/data.zig");
     _ = @import("finetune/laya/job.zig");
     _ = @import("finetune/laya/evaluate.zig");
@@ -200,6 +229,7 @@ test {
     _ = registry;
     _ = tabular;
     _ = models;
+    _ = @import("models/session_contract.zig");
     _ = gguf;
     _ = runtime;
     _ = util;
@@ -239,7 +269,7 @@ test {
     _ = @import("ops/deberta_training_attention_test.zig");
     _ = @import("ops/deberta_training_attention_source_test.zig");
     _ = @import("ops/deberta_training_attention_device_test.zig");
-    _ = @import("ops/modernbert_training_attention.zig");
+    _ = @import("ops/range_attention_reference.zig");
     _ = @import("ops/modernbert_training_attention_device_test.zig");
     _ = @import("ops/segment_training_attention_device_test.zig");
     _ = @import("graph/recomputed_training_test.zig");
@@ -257,6 +287,9 @@ test {
     _ = @import("architectures/clip.zig");
     _ = @import("architectures/clap.zig");
     _ = @import("architectures/qwen2vl_vision.zig");
+    _ = @import("architectures/gemma3_vision.zig");
+    _ = @import("architectures/gemma3_projector.zig");
+    _ = @import("pipelines/gemma3_multimodal.zig");
     _ = architectures.projector_format;
     _ = architectures.qwen3vl_plan;
     _ = architectures.qwen3vl_projector;
@@ -394,27 +427,26 @@ test "non-device-scalar GQA attention never returns generated decode" {
     ctx.driver.fns.cuLaunchKernel = &Mocks.launchKernel;
 
     const buffer = buffer_mod.DeviceBuffer{ .ptr = 1, .len = 256 * @sizeOf(f32) };
-    const kind = try module.launchGqaAttentionF32(
-        &ctx,
-        buffer,
-        buffer,
-        buffer,
-        buffer,
-        .{},
-        .{},
-        1,
-        1,
-        1,
-        1,
-        1,
-        256,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-    );
+    const kind = try module.launchGqaAttentionF32(&ctx, &.{
+        .dst = buffer,
+        .q = buffer,
+        .k = buffer,
+        .v = buffer,
+        .attn_or_mask = .{},
+        .bias = .{},
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = 1,
+        .num_heads = 1,
+        .num_kv_heads = 1,
+        .head_dim = 256,
+        .query_position_offset = 0,
+        .kv_position_offset = 0,
+        .sliding_window = 0,
+        .total_sequence_len = 1,
+        .mask_len = 0,
+        .bias_mode = 0,
+    });
     try std.testing.expectEqual(kernels_mod.GqaAttentionLaunchKind.decode, kind);
     try std.testing.expect(kind != .decode_generated);
     try std.testing.expectEqual(@as(usize, 1), ctx.stats.kernel_launches);

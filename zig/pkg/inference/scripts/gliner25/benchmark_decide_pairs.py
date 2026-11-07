@@ -56,6 +56,8 @@ def run_python(args, output):
         "--output",
         str(output / "report.json"),
     ]
+    if args.runtime_contract is not None:
+        command.extend(["--runtime-contract", str(args.runtime_contract)])
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     source = perf.source_identity()
     receipt = dict(
@@ -91,7 +93,7 @@ def run_python(args, output):
     return receipt
 
 
-def main():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     for name in (
         "binary",
@@ -102,11 +104,13 @@ def main():
         "output",
     ):
         p.add_argument("--" + name, required=True, type=Path)
+    p.add_argument("--runtime-contract", type=Path,
+                   help="Explicit reference runtime contract; omitted keeps the family driver's v1 default")
     p.add_argument("--python", type=Path, default=Path(sys.executable))
     p.add_argument("--backend", required=True, choices=("metal", "native"))
     p.add_argument("--blocks", type=int, choices=range(1, 7), default=6)
     p.add_argument("--timeout", type=int, default=300)
-    a = p.parse_args()
+    a = p.parse_args(argv)
     for name in (
         "binary",
         "build_receipt",
@@ -117,6 +121,13 @@ def main():
         "python",
     ):
         setattr(a, name, getattr(a, name).resolve())
+    if a.runtime_contract is not None:
+        a.runtime_contract = a.runtime_contract.resolve()
+    return a
+
+
+def main():
+    a = parse_args()
     a.output.mkdir(parents=True, exist_ok=False)
     pairs = []
     for block in range(a.blocks):

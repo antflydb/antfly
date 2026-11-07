@@ -158,10 +158,7 @@ pub const Plan = struct {
             axis -= 1;
             const l = if (axis + lhs.len >= plan.rank) lhs[axis + lhs.len - plan.rank] else 1;
             const r = if (axis + rhs.len >= plan.rank) rhs[axis + rhs.len - plan.rank] else 1;
-            if (l < 0 or r < 0) return error.InvalidTensorShape;
-            if (l != r and l != 1 and r != 1) return error.ShapeMismatch;
-            // max(0, 1) is incorrect: broadcasting an empty axis stays empty.
-            const dim = if (l == 1) r else l;
+            const dim = try @import("kernel_geometry.zig").broadcastExtent(.nonnegative, l, r);
             plan.shape[axis] = dim;
             ls[axis] = if (l == 1) 0 else plan.lhs_count;
             rs[axis] = if (r == 1) 0 else plan.rhs_count;

@@ -22,6 +22,11 @@
 
 #include <cuda_fp16.h>
 
+static __device__ __forceinline__ float antfly_half_le_to_float(const uint8_t *p) {
+    const uint16_t bits = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+    return __half2float(__ushort_as_half(bits));
+}
+
 static __device__ __forceinline__ float antfly_half_bits_to_float(unsigned short bits) {
     return __half2float(__ushort_as_half(bits));
 }
@@ -35,13 +40,16 @@ static __device__ __forceinline__ float antfly_warp_reduce_sum_f32(float value) 
     return value;
 }
 
-static __device__ __forceinline__ float antfly_q6_k_sub_scale_f32(
-    const unsigned char *block,
-    unsigned int sub
-) {
-    const signed char *scales = (const signed char *)(block + 192u);
-    const unsigned short d_bits = (unsigned short)block[208] | ((unsigned short)block[209] << 8);
-    return antfly_half_bits_to_float(d_bits) * (float)scales[sub];
+__device__ __forceinline__ float antfly_q6_k_sub_scale_f32(const unsigned char *block, int lane) {
+    int v0 = lane;
+    int v1 = 208;
+    float v2 = antfly_half_le_to_float(block + v1);
+    int v3 = 192;
+    int v4 = v3 + v0;
+    int v5 = int(((const signed char *)block)[v4]);
+    float v6 = float(v5);
+    float v7 = v2 * v6;
+    return v7;
 }
 
 static __device__ __forceinline__ int antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1_q6_k_pack4(

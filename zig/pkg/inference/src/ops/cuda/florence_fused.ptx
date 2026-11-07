@@ -10,23 +10,23 @@
 .target sm_80
 .address_size 64
 
-	// .globl	florence_token_depthwise_residual
-// _ZZ23florence_layer_norm_f16E4sums has been demoted
-// _ZZ23florence_layer_norm_f16E5sumsq has been demoted
+	// .globl	antfly_depthwise_3x3_residual_f32
 // _ZZ21florence_cross_q1_f32E6scores has been demoted
 // _ZZ21florence_cross_q1_f32E7scratch has been demoted
-// _ZZ24florence_window_norm_f16E4sums has been demoted
-// _ZZ24florence_window_norm_f16E5sumsq has been demoted
+// _ZZ33antfly_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfE4sums has been demoted
+// _ZZ33antfly_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfE5sumsq has been demoted
+// _ZZ40antfly_window_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfjjjE4sums has been demoted
+// _ZZ40antfly_window_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfjjjE5sumsq has been demoted
 
-.visible .entry florence_token_depthwise_residual(
-	.param .u64 florence_token_depthwise_residual_param_0,
-	.param .u64 florence_token_depthwise_residual_param_1,
-	.param .u64 florence_token_depthwise_residual_param_2,
-	.param .u64 florence_token_depthwise_residual_param_3,
-	.param .u32 florence_token_depthwise_residual_param_4,
-	.param .u32 florence_token_depthwise_residual_param_5,
-	.param .u32 florence_token_depthwise_residual_param_6,
-	.param .u32 florence_token_depthwise_residual_param_7
+.visible .entry antfly_depthwise_3x3_residual_f32(
+	.param .u64 antfly_depthwise_3x3_residual_f32_param_0,
+	.param .u64 antfly_depthwise_3x3_residual_f32_param_1,
+	.param .u64 antfly_depthwise_3x3_residual_f32_param_2,
+	.param .u64 antfly_depthwise_3x3_residual_f32_param_3,
+	.param .u32 antfly_depthwise_3x3_residual_f32_param_4,
+	.param .u32 antfly_depthwise_3x3_residual_f32_param_5,
+	.param .u32 antfly_depthwise_3x3_residual_f32_param_6,
+	.param .u32 antfly_depthwise_3x3_residual_f32_param_7
 )
 {
 	.reg .pred 	%p<38>;
@@ -35,14 +35,14 @@
 	.reg .b64 	%rd<50>;
 
 
-	ld.param.u64 	%rd3, [florence_token_depthwise_residual_param_0];
-	ld.param.u64 	%rd5, [florence_token_depthwise_residual_param_1];
-	ld.param.u64 	%rd6, [florence_token_depthwise_residual_param_2];
-	ld.param.u64 	%rd4, [florence_token_depthwise_residual_param_3];
-	ld.param.u32 	%r20, [florence_token_depthwise_residual_param_4];
-	ld.param.u32 	%r17, [florence_token_depthwise_residual_param_5];
-	ld.param.u32 	%r18, [florence_token_depthwise_residual_param_6];
-	ld.param.u32 	%r19, [florence_token_depthwise_residual_param_7];
+	ld.param.u64 	%rd3, [antfly_depthwise_3x3_residual_f32_param_0];
+	ld.param.u64 	%rd5, [antfly_depthwise_3x3_residual_f32_param_1];
+	ld.param.u64 	%rd6, [antfly_depthwise_3x3_residual_f32_param_2];
+	ld.param.u64 	%rd4, [antfly_depthwise_3x3_residual_f32_param_3];
+	ld.param.u32 	%r20, [antfly_depthwise_3x3_residual_f32_param_4];
+	ld.param.u32 	%r17, [antfly_depthwise_3x3_residual_f32_param_5];
+	ld.param.u32 	%r18, [antfly_depthwise_3x3_residual_f32_param_6];
+	ld.param.u32 	%r19, [antfly_depthwise_3x3_residual_f32_param_7];
 	cvta.to.global.u64 	%rd1, %rd6;
 	cvta.to.global.u64 	%rd2, %rd5;
 	mov.u32 	%r21, %ntid.x;
@@ -261,15 +261,15 @@ $L__BB0_23:
 	ret;
 
 }
-	// .globl	florence_layer_norm_f16
-.visible .entry florence_layer_norm_f16(
-	.param .u64 florence_layer_norm_f16_param_0,
-	.param .u64 florence_layer_norm_f16_param_1,
-	.param .u64 florence_layer_norm_f16_param_2,
-	.param .u64 florence_layer_norm_f16_param_3,
-	.param .u32 florence_layer_norm_f16_param_4,
-	.param .u32 florence_layer_norm_f16_param_5,
-	.param .f32 florence_layer_norm_f16_param_6
+	// .globl	antfly_layer_norm_warp_finish_f16
+.visible .entry antfly_layer_norm_warp_finish_f16(
+	.param .u64 antfly_layer_norm_warp_finish_f16_param_0,
+	.param .u64 antfly_layer_norm_warp_finish_f16_param_1,
+	.param .u64 antfly_layer_norm_warp_finish_f16_param_2,
+	.param .u64 antfly_layer_norm_warp_finish_f16_param_3,
+	.param .u32 antfly_layer_norm_warp_finish_f16_param_4,
+	.param .u32 antfly_layer_norm_warp_finish_f16_param_5,
+	.param .f32 antfly_layer_norm_warp_finish_f16_param_6
 )
 {
 	.reg .pred 	%p<18>;
@@ -278,17 +278,17 @@ $L__BB0_23:
 	.reg .b32 	%r<52>;
 	.reg .b64 	%rd<18>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ23florence_layer_norm_f16E4sums[1024];
+	.shared .align 4 .b8 _ZZ33antfly_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfE4sums[1024];
 	// demoted variable
-	.shared .align 4 .b8 _ZZ23florence_layer_norm_f16E5sumsq[1024];
+	.shared .align 4 .b8 _ZZ33antfly_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfE5sumsq[1024];
 
-	ld.param.u64 	%rd5, [florence_layer_norm_f16_param_0];
-	ld.param.u64 	%rd8, [florence_layer_norm_f16_param_1];
-	ld.param.u64 	%rd6, [florence_layer_norm_f16_param_2];
-	ld.param.u64 	%rd7, [florence_layer_norm_f16_param_3];
-	ld.param.u32 	%r17, [florence_layer_norm_f16_param_4];
-	ld.param.u32 	%r16, [florence_layer_norm_f16_param_5];
-	ld.param.f32 	%f12, [florence_layer_norm_f16_param_6];
+	ld.param.u64 	%rd5, [antfly_layer_norm_warp_finish_f16_param_0];
+	ld.param.u64 	%rd8, [antfly_layer_norm_warp_finish_f16_param_1];
+	ld.param.u64 	%rd6, [antfly_layer_norm_warp_finish_f16_param_2];
+	ld.param.u64 	%rd7, [antfly_layer_norm_warp_finish_f16_param_3];
+	ld.param.u32 	%r17, [antfly_layer_norm_warp_finish_f16_param_4];
+	ld.param.u32 	%r16, [antfly_layer_norm_warp_finish_f16_param_5];
+	ld.param.f32 	%f12, [antfly_layer_norm_warp_finish_f16_param_6];
 	cvta.to.global.u64 	%rd1, %rd8;
 	mov.u32 	%r1, %ctaid.x;
 	setp.ge.u32 	%p1, %r1, %r17;
@@ -319,10 +319,10 @@ $L__BB1_3:
 
 $L__BB1_4:
 	shl.b32 	%r18, %r51, 2;
-	mov.u32 	%r19, _ZZ23florence_layer_norm_f16E4sums;
+	mov.u32 	%r19, _ZZ33antfly_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfE4sums;
 	add.s32 	%r9, %r19, %r18;
 	st.shared.f32 	[%r9], %f82;
-	mov.u32 	%r20, _ZZ23florence_layer_norm_f16E5sumsq;
+	mov.u32 	%r20, _ZZ33antfly_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfE5sumsq;
 	add.s32 	%r10, %r20, %r18;
 	st.shared.f32 	[%r10], %f83;
 	bar.sync 	0;
@@ -409,17 +409,17 @@ $L__BB1_4:
 	setp.ne.s32 	%p15, %r51, 0;
 	@%p15 bra 	$L__BB1_7;
 
-	st.shared.f32 	[_ZZ23florence_layer_norm_f16E4sums], %f7;
-	st.shared.f32 	[_ZZ23florence_layer_norm_f16E5sumsq], %f8;
+	st.shared.f32 	[_ZZ33antfly_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfE4sums], %f7;
+	st.shared.f32 	[_ZZ33antfly_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfE5sumsq], %f8;
 
 $L__BB1_7:
 	bar.sync 	0;
 	cvt.rn.f32.u32 	%f9, %r16;
-	ld.shared.f32 	%f66, [_ZZ23florence_layer_norm_f16E4sums];
+	ld.shared.f32 	%f66, [_ZZ33antfly_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfE4sums];
 	div.rn.f32 	%f10, %f66, %f9;
 	@%p2 bra 	$L__BB1_10;
 
-	ld.shared.f32 	%f67, [_ZZ23florence_layer_norm_f16E5sumsq];
+	ld.shared.f32 	%f67, [_ZZ33antfly_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfE5sumsq];
 	add.s32 	%r50, %r51, %r2;
 	cvta.to.global.u64 	%rd2, %rd5;
 	cvta.to.global.u64 	%rd3, %rd7;
@@ -918,18 +918,18 @@ $L__BB3_48:
 	ret;
 
 }
-	// .globl	florence_window_norm_f16
-.visible .entry florence_window_norm_f16(
-	.param .u64 florence_window_norm_f16_param_0,
-	.param .u64 florence_window_norm_f16_param_1,
-	.param .u64 florence_window_norm_f16_param_2,
-	.param .u64 florence_window_norm_f16_param_3,
-	.param .u32 florence_window_norm_f16_param_4,
-	.param .u32 florence_window_norm_f16_param_5,
-	.param .f32 florence_window_norm_f16_param_6,
-	.param .u32 florence_window_norm_f16_param_7,
-	.param .u32 florence_window_norm_f16_param_8,
-	.param .u32 florence_window_norm_f16_param_9
+	// .globl	antfly_window_layer_norm_warp_finish_f16
+.visible .entry antfly_window_layer_norm_warp_finish_f16(
+	.param .u64 antfly_window_layer_norm_warp_finish_f16_param_0,
+	.param .u64 antfly_window_layer_norm_warp_finish_f16_param_1,
+	.param .u64 antfly_window_layer_norm_warp_finish_f16_param_2,
+	.param .u64 antfly_window_layer_norm_warp_finish_f16_param_3,
+	.param .u32 antfly_window_layer_norm_warp_finish_f16_param_4,
+	.param .u32 antfly_window_layer_norm_warp_finish_f16_param_5,
+	.param .f32 antfly_window_layer_norm_warp_finish_f16_param_6,
+	.param .u32 antfly_window_layer_norm_warp_finish_f16_param_7,
+	.param .u32 antfly_window_layer_norm_warp_finish_f16_param_8,
+	.param .u32 antfly_window_layer_norm_warp_finish_f16_param_9
 )
 {
 	.reg .pred 	%p<18>;
@@ -938,20 +938,20 @@ $L__BB3_48:
 	.reg .b32 	%r<75>;
 	.reg .b64 	%rd<18>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ24florence_window_norm_f16E4sums[1024];
+	.shared .align 4 .b8 _ZZ40antfly_window_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfjjjE4sums[1024];
 	// demoted variable
-	.shared .align 4 .b8 _ZZ24florence_window_norm_f16E5sumsq[1024];
+	.shared .align 4 .b8 _ZZ40antfly_window_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfjjjE5sumsq[1024];
 
-	ld.param.u64 	%rd5, [florence_window_norm_f16_param_0];
-	ld.param.u64 	%rd8, [florence_window_norm_f16_param_1];
-	ld.param.u64 	%rd6, [florence_window_norm_f16_param_2];
-	ld.param.u64 	%rd7, [florence_window_norm_f16_param_3];
-	ld.param.u32 	%r21, [florence_window_norm_f16_param_4];
-	ld.param.u32 	%r17, [florence_window_norm_f16_param_5];
-	ld.param.f32 	%f12, [florence_window_norm_f16_param_6];
-	ld.param.u32 	%r18, [florence_window_norm_f16_param_7];
-	ld.param.u32 	%r19, [florence_window_norm_f16_param_8];
-	ld.param.u32 	%r20, [florence_window_norm_f16_param_9];
+	ld.param.u64 	%rd5, [antfly_window_layer_norm_warp_finish_f16_param_0];
+	ld.param.u64 	%rd8, [antfly_window_layer_norm_warp_finish_f16_param_1];
+	ld.param.u64 	%rd6, [antfly_window_layer_norm_warp_finish_f16_param_2];
+	ld.param.u64 	%rd7, [antfly_window_layer_norm_warp_finish_f16_param_3];
+	ld.param.u32 	%r21, [antfly_window_layer_norm_warp_finish_f16_param_4];
+	ld.param.u32 	%r17, [antfly_window_layer_norm_warp_finish_f16_param_5];
+	ld.param.f32 	%f12, [antfly_window_layer_norm_warp_finish_f16_param_6];
+	ld.param.u32 	%r18, [antfly_window_layer_norm_warp_finish_f16_param_7];
+	ld.param.u32 	%r19, [antfly_window_layer_norm_warp_finish_f16_param_8];
+	ld.param.u32 	%r20, [antfly_window_layer_norm_warp_finish_f16_param_9];
 	cvta.to.global.u64 	%rd1, %rd8;
 	mov.u32 	%r1, %ctaid.x;
 	setp.ge.u32 	%p1, %r1, %r21;
@@ -982,10 +982,10 @@ $L__BB4_3:
 
 $L__BB4_4:
 	shl.b32 	%r22, %r74, 2;
-	mov.u32 	%r23, _ZZ24florence_window_norm_f16E4sums;
+	mov.u32 	%r23, _ZZ40antfly_window_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfjjjE4sums;
 	add.s32 	%r9, %r23, %r22;
 	st.shared.f32 	[%r9], %f82;
-	mov.u32 	%r24, _ZZ24florence_window_norm_f16E5sumsq;
+	mov.u32 	%r24, _ZZ40antfly_window_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfjjjE5sumsq;
 	add.s32 	%r10, %r24, %r22;
 	st.shared.f32 	[%r10], %f83;
 	bar.sync 	0;
@@ -1072,13 +1072,13 @@ $L__BB4_4:
 	setp.ne.s32 	%p15, %r74, 0;
 	@%p15 bra 	$L__BB4_7;
 
-	st.shared.f32 	[_ZZ24florence_window_norm_f16E4sums], %f7;
-	st.shared.f32 	[_ZZ24florence_window_norm_f16E5sumsq], %f8;
+	st.shared.f32 	[_ZZ40antfly_window_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfjjjE4sums], %f7;
+	st.shared.f32 	[_ZZ40antfly_window_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfjjjE5sumsq], %f8;
 
 $L__BB4_7:
 	bar.sync 	0;
 	cvt.rn.f32.u32 	%f9, %r17;
-	ld.shared.f32 	%f66, [_ZZ24florence_window_norm_f16E4sums];
+	ld.shared.f32 	%f66, [_ZZ40antfly_window_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfjjjE4sums];
 	div.rn.f32 	%f10, %f66, %f9;
 	@%p2 bra 	$L__BB4_10;
 
@@ -1086,7 +1086,7 @@ $L__BB4_7:
 	rem.u32 	%r53, %r52, %r18;
 	mul.lo.s32 	%r54, %r52, %r19;
 	sub.s32 	%r55, %r1, %r54;
-	ld.shared.f32 	%f67, [_ZZ24florence_window_norm_f16E5sumsq];
+	ld.shared.f32 	%f67, [_ZZ40antfly_window_layer_norm_warp_finish_f16P6__halfPKfS2_S2_jjfjjjE5sumsq];
 	add.s32 	%r73, %r74, %r2;
 	cvta.to.global.u64 	%rd2, %rd5;
 	cvta.to.global.u64 	%rd3, %rd7;

@@ -328,6 +328,220 @@ fn hashNodeIds(node_ids: []const NodeId) u64 {
     return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(node_ids));
 }
 
+/// Typed, stack-only forwarding of an actual invocation's preparation nonce.
+/// Every callback still uses the original backend pointer/table and policy.
+const PreparationBackend = struct {
+    backend: *const ComputeBackend,
+    nonce: u64,
+    fn decoderRuntimeEnsureLinearSlot(self: *const PreparationBackend, request: *const ops_mod.DecoderRuntimeEnsureLinearSlotRequest) !?usize {
+        var scoped = request.*;
+        scoped.preparation_scope = self.nonce;
+        return self.backend.decoderRuntimeEnsureLinearSlot(&scoped);
+    }
+    fn decoderRuntimeEnsureRmsNormSlot(self: *const PreparationBackend, request: *const ops_mod.DecoderRuntimeEnsureRmsNormSlotRequest) !?usize {
+        var scoped = request.*;
+        scoped.preparation_scope = self.nonce;
+        return self.backend.decoderRuntimeEnsureRmsNormSlot(&scoped);
+    }
+    fn sliceRows2D(self: *const PreparationBackend, allocator: std.mem.Allocator, tensor: CT, start: usize, rows: usize, cols: usize) !CT {
+        return self.backend.sliceRows2D(allocator, tensor, start, rows, cols);
+    }
+    fn primSlice(self: *const PreparationBackend, tensor: CT, starts: []const i64, limits: []const i64, strides: []const i64, shape: []const i64) !CT {
+        return self.backend.primSlice(tensor, starts, limits, strides, shape);
+    }
+    fn free(self: *const PreparationBackend, tensor: CT) void {
+        self.backend.free(tensor);
+    }
+};
+
+const PreparedSourceState = struct {
+    const max_sources = 6;
+    nodes: [max_sources]NodeId = undefined,
+    identities: [max_sources]metal_compute_mod.ParameterIdentity = undefined,
+    count: usize = 0,
+    backend: ?metal_compute_mod.PreparedBackendIdentity = null,
+    valid: bool = false,
+    reusable: bool = false,
+    bindings: [6]@import("../backends/prepared_binding.zig").Stamp = undefined,
+    binding_count: usize = 0,
+    checked_binding_generation: u64 = 0,
+    fn addBinding(self: *PreparedSourceState, cb: *const ComputeBackend, kind: @import("../backends/prepared_binding.zig").Kind, slot: usize) void {
+        for (self.bindings[0..self.binding_count]) |prior| if (prior.kind == kind and prior.slot == slot) return;
+        if (self.binding_count == self.bindings.len) {
+            self.valid = false;
+            return;
+        }
+        self.bindings[self.binding_count] = metal_compute_mod.MetalCompute.preparedBindingStamp(cb, kind, slot) orelse {
+            self.valid = false;
+            return;
+        };
+        self.binding_count += 1;
+    }
+    fn ffnBindings(self: *PreparedSourceState, cb: *const ComputeBackend, slots: PreparedGatedFfnResidualRegion) void {
+        self.addBinding(cb, .linear, slots.gate_slot);
+        self.addBinding(cb, .linear, slots.up_slot);
+        self.addBinding(cb, .linear, slots.down_slot);
+        if (slots.post_down_rms_norm_slot) |slot| self.addBinding(cb, .rms_norm, slot);
+    }
+    fn qkvBindings(self: *PreparedSourceState, cb: *const ComputeBackend, slots: PreparedQkvRegion) void {
+        self.addBinding(cb, .linear, slots.q_slot);
+        self.addBinding(cb, .linear, slots.k_slot);
+        self.addBinding(cb, .linear, slots.v_slot);
+    }
+    fn captureBindings(self: *PreparedSourceState, cb: *const ComputeBackend, prepared: PreparedRuntimeRegion) void {
+        self.binding_count = 0;
+        self.checked_binding_generation = 0;
+        switch (prepared) {
+            .raw_linear_dot, .raw_linear_bias, .q_linear => |slots| self.addBinding(cb, .linear, slots.linear_slot),
+            .raw_linear_pair, .raw_linear_bias_pair => |slots| {
+                self.addBinding(cb, .linear, slots.first_slot);
+                self.addBinding(cb, .linear, slots.second_slot);
+            },
+            .linear_qkv, .grouped_linear_qkv_slice, .packed_linear_qkv_slice => |slots| self.qkvBindings(cb, slots),
+            .rms_norm_grouped_linear_qkv_slice => |slots| {
+                self.addBinding(cb, .rms_norm, slots.norm_slot);
+                self.qkvBindings(cb, slots.qkv);
+            },
+            .attention_output_residual => |slots| {
+                self.addBinding(cb, .linear, slots.linear_slot);
+                if (slots.pre_linear_rms_norm_slot) |slot| self.addBinding(cb, .rms_norm, slot);
+                if (slots.post_linear_rms_norm_slot) |slot| self.addBinding(cb, .rms_norm, slot);
+            },
+            .gated_ffn_residual => |slots| self.ffnBindings(cb, slots),
+            .rms_norm_gated_ffn_residual => |slots| {
+                self.addBinding(cb, .rms_norm, slots.norm_slot);
+                self.ffnBindings(cb, slots.ffn);
+            },
+            .ple_residual => |slots| {
+                self.addBinding(cb, .linear, slots.gate_slot);
+                self.addBinding(cb, .linear, slots.projection_slot);
+                self.addBinding(cb, .rms_norm, slots.post_norm_slot);
+            },
+            .deberta_ffn_forward, .deberta_encoder_lora_layer => |slots| {
+                self.addBinding(cb, .linear, slots.first_slot);
+                self.addBinding(cb, .linear, slots.second_slot);
+            },
+            else => {},
+        }
+    }
+
+    fn add(self: *PreparedSourceState, node: NodeId) !void {
+        if (node == null_node) return error.InvalidPreparedParameterSource;
+        for (self.nodes[0..self.count]) |prior| if (prior == node) return;
+        if (self.count == max_sources) return error.TooManyPreparedParameterSources;
+        self.nodes[self.count] = node;
+        self.count += 1;
+    }
+    fn linear(self: *PreparedSourceState, graph: *const Graph, node: NodeId) !void {
+        const inputs = graph.node(node).getInputs();
+        if (inputs.len < 2) return error.InvalidPreparedParameterSource;
+        try self.add(inputs[1]);
+    }
+    fn ffn(self: *PreparedSourceState, graph: *const Graph, pattern: GatedFfnResidualPattern) !void {
+        const pair = graph.node(pattern.pair_id).getInputs();
+        if (pair.len < 3) return error.InvalidPreparedParameterSource;
+        try self.add(pair[1]);
+        try self.add(pair[2]);
+        try self.linear(graph, pattern.down_id);
+        if (pattern.post_down_norm_id) |node| try self.linear(graph, node);
+    }
+    fn sources(self: *PreparedSourceState, graph: *const Graph, region: RuntimeRegion) !void {
+        self.count = 0;
+        switch (region) {
+            .raw_linear_dot => |p| try self.add(p.weight_id),
+            .raw_linear_pair => |p| {
+                try self.add(p.first.weight_id);
+                try self.add(p.second.weight_id);
+            },
+            .raw_linear_bias => |p| {
+                try self.add(p.dot.weight_id);
+                try self.add(p.bias_id);
+            },
+            .raw_linear_bias_pair => |p| {
+                try self.add(p.first.dot.weight_id);
+                try self.add(p.first.bias_id);
+                try self.add(p.second.dot.weight_id);
+                try self.add(p.second.bias_id);
+            },
+            .q_linear => |p| try self.add(p.weight_id),
+            .linear_qkv => |p| {
+                try self.add(p.q_weight_id);
+                try self.add(p.k_weight_id);
+                try self.add(p.v_weight_id);
+            },
+            .grouped_linear_qkv_slice => |p| {
+                try self.add(p.q_weight_id);
+                try self.add(p.k_weight_id);
+                try self.add(p.v_weight_id);
+            },
+            .packed_linear_qkv_slice => |p| {
+                try self.add(p.weight_id);
+                try self.add(p.bias_id);
+            },
+            .rms_norm_grouped_linear_qkv_slice => |p| {
+                try self.add(p.norm_weight_id);
+                try self.add(p.qkv.q_weight_id);
+                try self.add(p.qkv.k_weight_id);
+                try self.add(p.qkv.v_weight_id);
+            },
+            .attention_output_residual => |p| {
+                try self.linear(graph, p.linear_id);
+                if (p.pre_linear_norm_id) |node| try self.linear(graph, node);
+                if (p.post_linear_norm_id) |node| try self.linear(graph, node);
+            },
+            .gated_ffn_residual => |p| try self.ffn(graph, p),
+            .rms_norm_gated_ffn_residual => |p| {
+                try self.add(p.norm_weight_id);
+                try self.ffn(graph, p.ffn);
+            },
+            .ple_residual => |p| {
+                try self.add(p.gate_weight_id);
+                try self.add(p.projection_weight_id);
+                try self.add(p.post_norm_weight_id);
+            },
+            .deberta_ffn_forward => |p| {
+                try self.add(p.first_weight_id);
+                try self.add(p.first_bias_id);
+                try self.add(p.second_weight_id);
+                try self.add(p.second_bias_id);
+            },
+            .deberta_encoder_lora_layer => |p| {
+                try self.add(p.ffn.first_weight_id);
+                try self.add(p.ffn.first_bias_id);
+                try self.add(p.ffn.second_weight_id);
+                try self.add(p.ffn.second_bias_id);
+            },
+            else => {}, // No prepared slots: these paths read current values.
+        }
+    }
+    fn capture(self: *PreparedSourceState, graph: *const Graph, cb: *const ComputeBackend, values: []?CT, value_device: []const DeviceId, device_id: DeviceId, region: RuntimeRegion) !void {
+        self.valid = false;
+        self.reusable = true;
+        self.backend = metal_compute_mod.MetalCompute.preparedBackendIdentity(cb) orelse return;
+        try self.sources(graph, region);
+        for (self.nodes[0..self.count], self.identities[0..self.count]) |node, *identity| {
+            if (node >= value_device.len or value_device[node] != device_id) return;
+            const value = valueFor(values, node) orelse return;
+            identity.* = metal_compute_mod.MetalCompute.preparedParameterIdentity(cb, value) orelse return;
+            if (identity.version == null or identity.secondary_version == null) self.reusable = false;
+        }
+        self.valid = true;
+    }
+    fn matches(self: *PreparedSourceState, cb: *const ComputeBackend, values: []?CT, value_device: []const DeviceId, device_id: DeviceId) bool {
+        if (!self.valid) return false;
+        const current = metal_compute_mod.MetalCompute.preparedBackendIdentity(cb) orelse return false;
+        if (!std.meta.eql(current, self.backend orelse return false)) return false;
+        if (self.binding_count != 0 and !metal_compute_mod.MetalCompute.preparedBindingsMatch(cb, &self.checked_binding_generation, self.bindings[0..self.binding_count])) return false;
+        for (self.nodes[0..self.count], self.identities[0..self.count]) |node, saved| {
+            if (node >= value_device.len or value_device[node] != device_id) return false;
+            const value = valueFor(values, node) orelse return false;
+            const identity = metal_compute_mod.MetalCompute.preparedParameterIdentity(cb, value) orelse return false;
+            if (!std.meta.eql(identity, saved)) return false;
+        }
+        return true;
+    }
+};
+
 const RuntimeRegionPlan = struct {
     node_count: usize = 0,
     value_count: usize = 0,
@@ -337,8 +551,12 @@ const RuntimeRegionPlan = struct {
     // exact same node ordering. Length + endpoints alone can collide across two
     // structurally-different graphs with equal counts and equal first/last ids.
     node_ids_hash: u64 = 0,
+    descriptor_indices: []u32 = &.{},
+    descriptors: []ops_mod.kernel_descriptor.Descriptor = &.{},
     regions_by_pos: []RuntimeRegion = &.{},
     prepared_by_pos: []PreparedRuntimeRegion = &.{},
+    prepared_source_indices: []u32 = &.{},
+    prepared_sources: []PreparedSourceState = &.{},
     attention_input_max_first_node: []NodeId = &.{},
     pre_skipped_by_region: []bool = &.{},
     region_count: usize = 0,
@@ -349,8 +567,12 @@ const RuntimeRegionPlan = struct {
     pre_skip_declined_external_consumer_count: usize = 0,
 
     pub fn deinit(self: *RuntimeRegionPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.descriptor_indices);
+        allocator.free(self.descriptors);
         allocator.free(self.regions_by_pos);
         allocator.free(self.prepared_by_pos);
+        allocator.free(self.prepared_source_indices);
+        allocator.free(self.prepared_sources);
         allocator.free(self.attention_input_max_first_node);
         allocator.free(self.pre_skipped_by_region);
         self.* = .{};
@@ -367,6 +589,12 @@ const RuntimeRegionPlan = struct {
         return self.node_ids_hash == hashNodeIds(node_ids);
     }
 
+    fn descriptorAt(self: RuntimeRegionPlan, position: usize) ?*const ops_mod.kernel_descriptor.Descriptor {
+        if (position >= self.descriptor_indices.len) return null;
+        const index = self.descriptor_indices[position];
+        return if (index < self.descriptors.len) &self.descriptors[index] else null;
+    }
+
     fn regionAt(self: RuntimeRegionPlan, node_pos: usize, node_id: NodeId, node_ids: []const NodeId) RuntimeRegion {
         if (node_pos >= self.regions_by_pos.len or node_pos >= node_ids.len) return .{ .none = {} };
         if (node_ids[node_pos] != node_id) return .{ .none = {} };
@@ -377,6 +605,12 @@ const RuntimeRegionPlan = struct {
         if (node_pos >= self.prepared_by_pos.len or node_pos >= node_ids.len) return null;
         if (node_ids[node_pos] != node_id) return null;
         return &self.prepared_by_pos[node_pos];
+    }
+
+    fn sourceStateAt(self: RuntimeRegionPlan, position: usize) ?*PreparedSourceState {
+        if (position >= self.prepared_source_indices.len) return null;
+        const index = self.prepared_source_indices[position];
+        return if (index < self.prepared_sources.len) &self.prepared_sources[index] else null;
     }
 
     fn needsAttentionInputAfterNode(self: RuntimeRegionPlan, input_id: NodeId, node_id: NodeId) bool {
@@ -1189,7 +1423,7 @@ const ChunkLocalOutputPool = struct {
         if (slot.backend != .metal or slot.storage != .metal_buffer) return null;
         if (slot.allocation == buffer_plan_mod.invalid_allocation) return null;
         const boundary_node_id = node_ids[chunk_boundary_pos];
-        if (slot.last_use > @as(u32, @intCast(boundary_node_id))) return null;
+        if (slot.last_use > buffer_plan.positionForNode(boundary_node_id)) return null;
         if (valueReferencedAfterBoundary(graph, node_ids, chunk_boundary_pos, node_id)) return null;
         const allocation = buffer_plan.allocationForSlot(slot.id) orelse return null;
         if (!allocation.reusable or allocation.kind != .tensor) return null;
@@ -1353,6 +1587,60 @@ pub const MetalPartitionExecutor = struct {
         return &self.pe;
     }
 
+    /// Cold canonical-executor proof. The caller owns the actual provider's
+    /// metadata operation before touching the cached region plan. This reuses
+    /// the plan and reachability authority already used by real execution.
+    pub fn attestOwnedFrameDispatch(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, last_use: []const u32) !bool {
+        if (actual.vtable != &vtable or backend.kind() != .metal or !ownedFramePolicyAvailable()) return false;
+        const self: *MetalPartitionExecutor = @ptrCast(@alignCast(actual.ptr));
+        if (!self.owned or self.graph != graph or self.backend.ptr != backend.ptr or self.backend.vtable != backend.vtable or reachable.len != graph.nodeCount() or last_use.len != graph.nodeCount()) return false;
+        for (nodes) |id| {
+            if (id >= reachable.len) return false;
+            if (!reachable[id]) continue;
+            const node = graph.node(id);
+            if (node.output_shape.dtype != .f32) return false;
+            if (node.op == .parameter) continue;
+            if (node.op == .constant) {
+                // The ORIGINAL executor materializes constants before beginFrame.
+                // Only the declared F32 Shared-stage/Private-bank constructor is
+                // eligible; no new kernel or legacy staging credit is implied.
+                const count = node.output_shape.numElements() orelse return false;
+                if (count <= 0 or count > std.math.maxInt(i32) or count != node.op.constant.data_len) return false;
+                const bytes = std.math.mul(usize, @intCast(count), @sizeOf(f32)) catch return false;
+                const functions = backend.vtable.kernels orelse return false;
+                if (!functions.accepts(backend.vtable)) return false;
+                const eligible = functions.physicalLiteralBindingSupported orelse return false;
+                if (!eligible(backend.ptr)) return false;
+                const query = functions.physicalLiteralInitializer orelse return false;
+                const initializer = (try query(backend.ptr, bytes)) orelse return false;
+                if (initializer.staging.byte_size != bytes or initializer.staging.usage != .host_input or initializer.staging.admitted) return false;
+                continue;
+            }
+            // The existing fused families all require a linear, dot or norm.
+            // Keep those families on their tuned owner path until its complete
+            // ingress/output/scratch contract is declared; never disable them.
+            // Regular RoPE descriptors derive positions in the shared kernel;
+            // the route separately verifies its exact specialized pipeline.
+            const descriptor = ops_mod.kernel_descriptor.lower(graph, id);
+            if (descriptor) |value| switch (value.operation) {
+                .linear, .dot, .norm, .gather => return false,
+                else => {},
+            } else if (@import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return false;
+            // These exact heuristics run ahead of the physical branch. Even
+            // a supported descriptor cannot claim a producer they defer.
+            if (shouldDeferScaleMulForAdd(graph, id, reachable, last_use, null) or shouldDeferElementwiseMulForAdd(graph, id, reachable, last_use, null) or shouldDeferTransposeForLinearDot(graph, id, reachable, last_use)) return false;
+        }
+        var transient: ?RuntimeRegionPlan = null;
+        defer if (transient) |*plan| plan.deinit(self.allocator);
+        const plan = try self.runtimeRegionPlan(self.allocator, graph, nodes, graph.nodeCount(), reachable, last_use, null, &transient);
+        if (!plan.matches(nodes, graph.nodeCount()) or plan.region_count != 0 or plan.covered_node_count != 0 or plan.elided_node_count != 0 or plan.pre_skipped_node_count != 0) return false;
+        for (nodes, 0..) |id, position| {
+            if (!reachable[id] or graph.node(id).op == .parameter or graph.node(id).op == .constant) continue;
+            if (plan.descriptorAt(position) == null and @import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return false;
+        }
+        return true;
+    }
+
     fn executeFn(
         ctx: *anyopaque,
         values: []?CT,
@@ -1508,6 +1796,7 @@ pub const MetalPartitionExecutor = struct {
         const allocator = exec_ctx.allocator orelse self.allocator;
         const graph = exec_ctx.graph orelse self.graph;
         const cb = exec_ctx.backend orelse self.backend;
+        const preparation_scope = metal_compute_mod.nextPreparationNonce();
         const reachable = exec_ctx.reachable orelse return error.MissingPartitionExecutionContext;
         const last_use = exec_ctx.last_use orelse return error.MissingPartitionExecutionContext;
         const buffer_plan = exec_ctx.buffer_plan orelse return error.MissingPartitionExecutionContext;
@@ -1549,9 +1838,11 @@ pub const MetalPartitionExecutor = struct {
 
         const chunk_ops = frameChunkOpsForExecution(exec_ctx.options);
         const planned_primitives = if (exec_ctx.options) |opts| opts.planned_device_execution else false;
+        const owned_frame = if (exec_ctx.options) |options| if (options.physical_frame) |frame| frame.pool.completeOwnedPayload() != null and frame.pool.metal_frame_dispatch else false else false;
+        if (owned_frame and !ownedFramePolicyAvailable()) return error.PreparedMetalFramePolicyChanged;
         const graph_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-        if (reservePartitionGraphPlanForExecution(chunk_ops) or
-            (planned_primitives and !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_PARTITION_GRAPH_PLAN", false)))
+        if (!owned_frame and (reservePartitionGraphPlanForExecution(chunk_ops) or
+            (planned_primitives and !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_PARTITION_GRAPH_PLAN", false))))
         {
             var metal_graph_plan = try buildMetalGraphPlan(allocator, buffer_plan, partition_view);
             defer metal_graph_plan.deinit(allocator);
@@ -1608,18 +1899,10 @@ pub const MetalPartitionExecutor = struct {
             effective_exec_ctx.owned_runtime_transfers = &local_owned_runtime_transfers;
         }
 
-        var rt_map = std.AutoHashMapUnmanaged(NodeId, CT).empty;
-        defer rt_map.deinit(allocator);
-        var donated = std.AutoHashMapUnmanaged(NodeId, void).empty;
-        defer donated.deinit(allocator);
-        if (options.runtime_inputs) |inputs| {
-            for (inputs, 0..) |ri, idx| {
-                try rt_map.put(allocator, ri.node_id, ri.value);
-                if (options.donate) |donate| {
-                    if (idx < donate.len and donate[idx]) try donated.put(allocator, ri.node_id, {});
-                }
-            }
-        }
+        var runtime_input_index = try exec_ctx.runtimeInputIndex(allocator, options);
+        defer runtime_input_index.deinit(allocator);
+        const rt_map = runtime_input_index.values;
+        const donated = runtime_input_index.donated;
 
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_runtime_inputs_begin partition={d}\n", .{partition_index});
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_runtime_inputs_begin partition={d}\n", .{partition_index});
@@ -1657,6 +1940,11 @@ pub const MetalPartitionExecutor = struct {
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_parameters_end partition={d}\n", .{partition_index});
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_parameters_end partition={d}\n", .{partition_index});
 
+        // A complete explicitly synchronous projection partition owns all
+        // numerical nodes. Validate the actual operation Claim and full cover
+        // BEFORE changing the ordinary frame/fusion path or writing any output.
+        if (try executeSynchronousPhysicalRegions(allocator, graph, cb, node_ids, reachable, values, value_device, device_id, options, exec_ctx.stats)) return;
+
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_constants_begin partition={d}\n", .{partition_index});
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_constants_begin partition={d}\n", .{partition_index});
         const constants_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
@@ -1668,6 +1956,7 @@ pub const MetalPartitionExecutor = struct {
             node_ids,
             reachable,
             device_id,
+            options.physical_frame,
         );
         if (collect_loop_profile) loop_profile.materialize_constants_ns += metalPartitionElapsedNs(constants_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_constants_end partition={d}\n", .{partition_index});
@@ -1707,6 +1996,7 @@ pub const MetalPartitionExecutor = struct {
         const begin_frame_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
         var frame_active = if (metalPartitionFrameDisabled() or (!planned_primitives and runtime_region_plan.region_count == 0)) false else try cb.decoderRuntimeBeginFrame();
         errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+        if (owned_frame and !frame_active) return error.PreparedMetalFrameDispatchChanged;
         if (collect_loop_profile) loop_profile.begin_frame_ns += metalPartitionElapsedNs(begin_frame_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
         if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
@@ -1721,11 +2011,16 @@ pub const MetalPartitionExecutor = struct {
         var chunk_executed: usize = 0;
 
         var exec_state = interpreter.ExecState{
+            .allocator = allocator,
             .attention_layer = if (exec_ctx.attention_layer) |layer| layer.* else 0,
             .options = options,
             .last_use = last_use,
             .pair_second = if (exec_ctx.pair_second) |pair| pair.* else null,
         };
+        // The explicit command branch below owns Metal bank eligibility and
+        // its frame completion proof. Interpreter fallbacks retain their
+        // ordinary allocation path, including inside caller-owned frames.
+        exec_state.options.physical_frame = null;
 
         // Per-step disentangled-attention padding-mask cache (computed once,
         // reused across all attention calls this step — see AttnMaskCache).
@@ -1802,6 +2097,7 @@ pub const MetalPartitionExecutor = struct {
             value_device,
             device_id,
             runtime_region_plan,
+            preparation_scope,
             exec_ctx.stats,
         );
 
@@ -1993,6 +2289,8 @@ pub const MetalPartitionExecutor = struct {
             if (try tryExecutePlannedRuntimeRegion(
                 runtime_region,
                 runtime_region_plan.preparedPtrAt(node_pos, node_id, node_ids),
+                runtime_region_plan.sourceStateAt(node_pos),
+                preparation_scope,
                 allocator,
                 graph,
                 cb,
@@ -2054,8 +2352,32 @@ pub const MetalPartitionExecutor = struct {
                     if (trace_node_progress) std.debug.print("metal_partition_progress: phase=fused_pattern_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                     if (trace_node_progress) std.debug.print("metal_partition_progress: phase=metal_command_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                     const command_path_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
+                    // Keep tuned regions and graph fusions ahead of generic
+                    // descriptor dispatch. Once that choice reaches this
+                    // assigned branch, bind the common plan's output directly
+                    // instead of allocating another device-specific hint.
+                    const physical_output: ?CT = physical: {
+                        // An owned frame is drained (or cancelled on error)
+                        // before this invocation releases its storage bank.
+                        // A caller-owned frame can remain unsubmitted beyond
+                        // that lifetime; keep its existing allocation path.
+                        if (!frame_active) break :physical null;
+                        if (metalPartitionRuntimeCommandsDisabled()) break :physical null;
+                        const frame = options.physical_frame orelse break :physical null;
+                        if (runtime_region_plan.descriptorAt(node_pos) == null and !frame.hasPreparedMetadataAlias(node_id)) break :physical null;
+                        // Metal may intentionally leave a producer absent so
+                        // the command path below can fold it into its consumer
+                        // (broadcasts, scales and transposes, for example).
+                        // A frozen descriptor is usable only once all of its
+                        // ordinary operands have actually been materialized.
+                        for (graph.node(node_id).getInputs()) |input| {
+                            if (valueFor(values, input) == null) break :physical null;
+                        }
+                        break :physical try frame.execute(cb, values, node_id, try interpreter.ropePositionOverride(exec_state.options.attention));
+                    };
+                    if (owned_frame and physical_output == null) return error.PreparedMetalFrameDispatchChanged;
                     var output_hint_source: ?OutputHintSource = null;
-                    const output_hint: ?CT = blk: {
+                    const output_hint: ?CT = if (physical_output != null) null else blk: {
                         if (chunk_local_outputs) {
                             if (currentFrameChunkBoundaryPos(node_ids.len, node_pos, chunk_ops, chunk_executed)) |chunk_boundary_pos| {
                                 if (chunk_local_pool.outputHintForNode(cb, graph, buffer_plan, values, node_ids, node_pos, chunk_boundary_pos, node_id)) |hint| {
@@ -2097,10 +2419,20 @@ pub const MetalPartitionExecutor = struct {
                         }
                         break :blk null;
                     };
-                    const command_output_opt = if (!metalPartitionRuntimeCommandsDisabled())
-                        try tryExecuteMetalCommand(allocator, graph, cb, values, node_id, op_plan, &exec_state, output_hint, &attn_mask_cache, exec_ctx.stats, resident_input_cache_ptr)
-                    else
-                        null;
+                    const command_output_opt = command: {
+                        // Frame statistics account this dispatch once at the
+                        // shared runtime boundary, including actual backing.
+                        if (physical_output) |output| break :command output;
+                        if (metalPartitionRuntimeCommandsDisabled()) break :command null;
+                        errdefer if (output_hint) |hint| cb.free(hint);
+                        if (runtime_region_plan.descriptorAt(node_pos)) |descriptor| {
+                            if (try tryExecuteAssignedMetal(cb, descriptor, graph.node(node_id).getInputs(), values, output_hint, if (descriptor.operation == .rope) (try interpreter.ropePositionOverride(exec_state.options.attention)) else null)) |output| {
+                                if (exec_ctx.stats) |stats| stats.assigned_kernel_dispatches += 1;
+                                break :command output;
+                            }
+                        }
+                        break :command try tryExecuteMetalCommand(allocator, graph, cb, values, node_id, op_plan, &exec_state, output_hint, &attn_mask_cache, exec_ctx.stats, resident_input_cache_ptr);
+                    };
                     // Free an unconsumed pooled-output view (op didn't take the hint).
                     if (output_hint) |hint| {
                         const consumed = if (command_output_opt) |co| co == hint else false;
@@ -2458,7 +2790,7 @@ pub const MetalPartitionExecutor = struct {
             if (trace_progress) std.debug.print("metal_partition_progress: phase=sync_graph_outputs_begin partition={d}\n", .{partition_index});
             const graph_outputs_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
             if (!graphOutputOwnedCopyDisabled()) {
-                try copyPartitionGraphOutputsToOwnedStorage(cb, values, partition_view, rt_map, exec_ctx.stats);
+                try copyPartitionGraphOutputsToOwnedStorage(cb, values, partition_view, rt_map, options.physical_frame, exec_ctx.stats);
             }
             // syncPartitionGraphOutputs also materializes pending lazy
             // products; the TERMITE_DISABLE_OUTPUT_HOST_MIRROR_RESYNC
@@ -3586,7 +3918,7 @@ fn arenaAliasStillLive(
     if (alias_index >= last_use.len) return true;
     if (last_use[alias_index] == std.math.maxInt(u32)) return true;
     const slot = buffer_plan.slotForNode(alias_node) orelse return true;
-    if (slot.last_use >= @as(u32, @intCast(node_pos))) return true;
+    if (slot.last_use >= buffer_plan.positionForNode(current_node)) return true;
     if (last_use[alias_index] >= @as(u32, @intCast(current_node))) return true;
     if (valueReferencedAtOrAfterPosition(graph, node_ids, node_pos, alias_node)) return true;
     if (slot.roles.graph_output or slot.roles.partition_output or slot.roles.transfer_source) return true;
@@ -4076,6 +4408,17 @@ fn buildRuntimeRegionPlan(
     reachable: []const bool,
     last_use: []const u32,
 ) !RuntimeRegionPlan {
+    const descriptor_indices = try allocator.alloc(u32, node_ids.len);
+    errdefer allocator.free(descriptor_indices);
+    @memset(descriptor_indices, std.math.maxInt(u32));
+    var descriptors = std.ArrayListUnmanaged(ops_mod.kernel_descriptor.Descriptor).empty;
+    errdefer descriptors.deinit(allocator);
+    for (node_ids, 0..) |node_id, position| {
+        const descriptor = ops_mod.kernel_descriptor.lower(graph, node_id) orelse continue;
+        if (!metal_compute_mod.supportsAssignedDescriptor(&descriptor)) continue;
+        descriptor_indices[position] = @intCast(descriptors.items.len);
+        try descriptors.append(allocator, descriptor);
+    }
     const regions = try allocator.alloc(RuntimeRegion, node_ids.len);
     errdefer allocator.free(regions);
     @memset(regions, .{ .none = {} });
@@ -4286,12 +4629,28 @@ fn buildRuntimeRegionPlan(
         }
     }
 
+    const source_indices = try allocator.alloc(u32, node_ids.len);
+    errdefer allocator.free(source_indices);
+    @memset(source_indices, std.math.maxInt(u32));
+    const source_states = try allocator.alloc(PreparedSourceState, region_count);
+    errdefer allocator.free(source_states);
+    @memset(source_states, .{});
+    var source_count: usize = 0;
+    for (regions, 0..) |region, position| if (std.meta.activeTag(region) != .none) {
+        source_indices[position] = @intCast(source_count);
+        source_count += 1;
+    };
+    std.debug.assert(source_count == region_count);
     return .{
+        .prepared_source_indices = source_indices,
+        .prepared_sources = source_states,
         .node_count = node_ids.len,
         .value_count = value_count,
         .first_node = if (node_ids.len == 0) null_node else node_ids[0],
         .last_node = if (node_ids.len == 0) null_node else node_ids[node_ids.len - 1],
         .node_ids_hash = hashNodeIds(node_ids),
+        .descriptor_indices = descriptor_indices,
+        .descriptors = try descriptors.toOwnedSlice(allocator),
         .regions_by_pos = regions,
         .prepared_by_pos = prepared,
         .attention_input_max_first_node = attention_input_max_first_node,
@@ -5016,6 +5375,7 @@ fn analyzeRuntimeFrameEligibility(graph: ?*const Graph, plan: RuntimeRegionPlan)
 }
 
 fn recordRuntimeFrameEligibilityStats(stats: *PartitionExecutor.ExecutionStats, eligibility: RuntimeFrameEligibility) void {
+    stats.metal_region_policy_observed = true;
     if (eligibility.reason != .no_regions) stats.runtime_frame_candidates += 1;
     if (eligibility.eligible()) {
         stats.runtime_frame_eligible += 1;
@@ -5499,8 +5859,12 @@ fn prepareRuntimeRegionPlan(
     value_device: []DeviceId,
     device_id: DeviceId,
     plan: RuntimeRegionPlan,
+    preparation_scope: u64,
     stats: ?*PartitionExecutor.ExecutionStats,
 ) !void {
+    for (plan.prepared_sources) |*source| if (!source.reusable) {
+        source.valid = false;
+    };
     for (plan.regions_by_pos, 0..) |region, node_pos| {
         if (std.meta.activeTag(region) == .none) continue;
         if (node_pos >= plan.prepared_by_pos.len) continue;
@@ -5512,13 +5876,15 @@ fn prepareRuntimeRegionPlan(
             device_id,
             region,
             &plan.prepared_by_pos[node_pos],
+            plan.sourceStateAt(node_pos),
+            preparation_scope,
             stats,
         );
     }
 }
 
 fn ensurePreparedLinearSlot(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     weight_id: NodeId,
     in_dim: usize,
@@ -5536,7 +5902,7 @@ fn ensurePreparedLinearSlot(
 }
 
 fn ensurePreparedLinearSlotWithOptionalBias(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     weight_id: NodeId,
     bias_id: ?NodeId,
@@ -5556,7 +5922,7 @@ fn ensurePreparedLinearSlotWithOptionalBias(
 }
 
 fn ensurePreparedRmsNormSlot(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     weight_id: NodeId,
     hidden_size: usize,
@@ -5571,7 +5937,7 @@ fn ensurePreparedRmsNormSlot(
 }
 
 fn prepareQLinearRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: QLinearPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5588,7 +5954,7 @@ fn prepareQLinearRegion(
 }
 
 fn prepareQkvRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     q_weight_id: NodeId,
     k_weight_id: NodeId,
@@ -5609,7 +5975,7 @@ fn prepareQkvRegion(
 }
 
 fn prepareLinearNoBiasQkvRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: LinearNoBiasQkvPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5628,7 +5994,7 @@ fn prepareLinearNoBiasQkvRegion(
 }
 
 fn prepareGroupedLinearQkvSliceRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: GroupedLinearQkvSlicePattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5647,7 +6013,7 @@ fn prepareGroupedLinearQkvSliceRegion(
 }
 
 fn ensurePreparedLinearSlotFromTensor(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     weight: CT,
     bias: CT,
     in_dim: usize,
@@ -5665,7 +6031,7 @@ fn ensurePreparedLinearSlotFromTensor(
 
 fn preparePackedLinearQkvSliceRegion(
     allocator: std.mem.Allocator,
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: PackedLinearQkvSlicePattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5697,7 +6063,7 @@ fn preparePackedLinearQkvSliceRegion(
     };
 }
 
-fn slicePackedBias(cb: *const ComputeBackend, bias: CT, start: usize, limit: usize, total: usize) !CT {
+fn slicePackedBias(cb: *const PreparationBackend, bias: CT, start: usize, limit: usize, total: usize) !CT {
     const starts = [_]i64{@intCast(start)};
     const limits = [_]i64{@intCast(limit)};
     const strides = [_]i64{1};
@@ -5706,7 +6072,7 @@ fn slicePackedBias(cb: *const ComputeBackend, bias: CT, start: usize, limit: usi
 }
 
 fn prepareRmsNormGroupedLinearQkvSliceRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: RmsNormGroupedLinearQkvSlicePattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5721,7 +6087,7 @@ fn prepareRmsNormGroupedLinearQkvSliceRegion(
 
 fn prepareAttentionOutputResidualRegion(
     graph: *const Graph,
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: AttentionOutputResidualPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5772,7 +6138,7 @@ fn prepareAttentionOutputResidualRegion(
 
 fn prepareGatedFfnResidualRegion(
     graph: *const Graph,
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: GatedFfnResidualPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5830,7 +6196,7 @@ fn prepareGatedFfnResidualRegion(
 
 fn prepareRmsNormGatedFfnResidualRegion(
     graph: *const Graph,
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: RmsNormGatedFfnResidualPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5847,7 +6213,7 @@ fn prepareRmsNormGatedFfnResidualRegion(
 }
 
 fn preparePleResidualRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: PleResidualPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -5884,17 +6250,17 @@ fn preparePleResidualRegion(
 
 fn prepareDebertaFfnForwardRegion(
     graph: *const Graph,
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     value_device: []DeviceId,
     device_id: DeviceId,
     pattern: DebertaFfnForwardPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
 ) !?PreparedDebertaFfnForwardRegion {
-    _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.first_weight_id)) orelse return null;
-    _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.first_bias_id)) orelse return null;
-    _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.second_weight_id)) orelse return null;
-    _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.second_bias_id)) orelse return null;
+    _ = (try valueForOrMaterializeParameter(graph, cb.backend, values, value_device, device_id, pattern.first_weight_id)) orelse return null;
+    _ = (try valueForOrMaterializeParameter(graph, cb.backend, values, value_device, device_id, pattern.first_bias_id)) orelse return null;
+    _ = (try valueForOrMaterializeParameter(graph, cb.backend, values, value_device, device_id, pattern.second_weight_id)) orelse return null;
+    _ = (try valueForOrMaterializeParameter(graph, cb.backend, values, value_device, device_id, pattern.second_bias_id)) orelse return null;
     const first_slot = (try ensurePreparedLinearSlotWithOptionalBias(
         cb,
         values,
@@ -5918,7 +6284,7 @@ fn prepareDebertaFfnForwardRegion(
 
 fn prepareDebertaEncoderLoraLayerRegion(
     graph: *const Graph,
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     value_device: []DeviceId,
     device_id: DeviceId,
@@ -5927,8 +6293,8 @@ fn prepareDebertaEncoderLoraLayerRegion(
 ) !?PreparedDebertaFfnForwardRegion {
     const ffn = (try prepareDebertaFfnForwardRegion(graph, cb, values, value_device, device_id, pattern.ffn, stats)) orelse return null;
     if (pattern.layer_norm_id != null_node) {
-        _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.layer_norm_weight_id)) orelse return null;
-        _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.layer_norm_bias_id)) orelse return null;
+        _ = (try valueForOrMaterializeParameter(graph, cb.backend, values, value_device, device_id, pattern.layer_norm_weight_id)) orelse return null;
+        _ = (try valueForOrMaterializeParameter(graph, cb.backend, values, value_device, device_id, pattern.layer_norm_bias_id)) orelse return null;
     }
     return ffn;
 }
@@ -5941,77 +6307,89 @@ fn prepareRuntimeRegion(
     device_id: DeviceId,
     region: RuntimeRegion,
     prepared_region: ?*PreparedRuntimeRegion,
+    source_state: ?*PreparedSourceState,
+    preparation_scope: u64,
     stats: ?*PartitionExecutor.ExecutionStats,
 ) !?PreparedRuntimeRegion {
     if (prepared_region) |prepared_ptr| {
-        if (preparedRuntimeRegionMatches(region, prepared_ptr.*)) {
+        if (preparedRuntimeRegionMatches(region, prepared_ptr.*) and (if (source_state) |source| source.matches(cb, values, value_device, device_id) else false)) {
             if (stats) |s| s.runtime_prepare_slot_cache_hits += preparedRuntimeRegionSlotCount(prepared_ptr.*);
             return prepared_ptr.*;
         }
     }
 
+    // A failed reprepare must never leave the previous source's slot armed.
+    if (prepared_region) |prepared_ptr| prepared_ptr.* = .{ .none = {} };
+    if (source_state) |source| source.valid = false;
+    const scoped_cb = &PreparationBackend{ .backend = cb, .nonce = preparation_scope };
     const prepared: PreparedRuntimeRegion = switch (region) {
         .none => return null,
         .raw_linear_dot => |pattern| .{
-            .raw_linear_dot = (try prepareRawLinearDotRegion(cb, values, pattern, stats)) orelse return null,
+            .raw_linear_dot = (try prepareRawLinearDotRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .raw_linear_pair => |pattern| .{
-            .raw_linear_pair = (try prepareRawLinearPairRegion(cb, values, pattern, stats)) orelse return null,
+            .raw_linear_pair = (try prepareRawLinearPairRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .raw_linear_bias => |pattern| .{
-            .raw_linear_bias = (try prepareRawLinearBiasRegion(cb, values, pattern, stats)) orelse return null,
+            .raw_linear_bias = (try prepareRawLinearBiasRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .raw_linear_bias_pair => |pattern| .{
-            .raw_linear_bias_pair = (try prepareRawLinearBiasPairRegion(cb, values, pattern, stats)) orelse return null,
+            .raw_linear_bias_pair = (try prepareRawLinearBiasPairRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .lora_linear => .{ .lora_linear = {} },
         .lora_linear_qkv => .{ .lora_linear_qkv = {} },
         .deberta_attention => .{ .deberta_attention = {} },
         .deberta_ffn_forward => |pattern| .{
-            .deberta_ffn_forward = (try prepareDebertaFfnForwardRegion(graph, cb, values, value_device, device_id, pattern, stats)) orelse return null,
+            .deberta_ffn_forward = (try prepareDebertaFfnForwardRegion(graph, scoped_cb, values, value_device, device_id, pattern, stats)) orelse return null,
         },
         .deberta_encoder_lora_layer => |pattern| .{
-            .deberta_encoder_lora_layer = (try prepareDebertaEncoderLoraLayerRegion(graph, cb, values, value_device, device_id, pattern, stats)) orelse return null,
+            .deberta_encoder_lora_layer = (try prepareDebertaEncoderLoraLayerRegion(graph, scoped_cb, values, value_device, device_id, pattern, stats)) orelse return null,
         },
         .lora_backward => .{ .lora_backward = {} },
         .low_rank_lora_backward => .{ .low_rank_lora_backward = {} },
         .rank_adapter_backward => .{ .rank_adapter_backward = {} },
         .ffn_gelu_backward => .{ .ffn_gelu_backward = {} },
         .q_linear => |pattern| .{
-            .q_linear = (try prepareQLinearRegion(cb, values, pattern, stats)) orelse return null,
+            .q_linear = (try prepareQLinearRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .linear_qkv => |pattern| .{
-            .linear_qkv = (try prepareLinearNoBiasQkvRegion(cb, values, pattern, stats)) orelse return null,
+            .linear_qkv = (try prepareLinearNoBiasQkvRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .grouped_linear_qkv_slice => |pattern| .{
-            .grouped_linear_qkv_slice = (try prepareGroupedLinearQkvSliceRegion(cb, values, pattern, stats)) orelse return null,
+            .grouped_linear_qkv_slice = (try prepareGroupedLinearQkvSliceRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .packed_linear_qkv_slice => |pattern| .{
-            .packed_linear_qkv_slice = (try preparePackedLinearQkvSliceRegion(graph.allocator, cb, values, pattern, stats)) orelse return null,
+            .packed_linear_qkv_slice = (try preparePackedLinearQkvSliceRegion(graph.allocator, scoped_cb, values, pattern, stats)) orelse return null,
         },
         .rms_norm_grouped_linear_qkv_slice => |pattern| .{
-            .rms_norm_grouped_linear_qkv_slice = (try prepareRmsNormGroupedLinearQkvSliceRegion(cb, values, pattern, stats)) orelse return null,
+            .rms_norm_grouped_linear_qkv_slice = (try prepareRmsNormGroupedLinearQkvSliceRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
         .attention_output_residual => |pattern| .{
-            .attention_output_residual = (try prepareAttentionOutputResidualRegion(graph, cb, values, pattern, stats)) orelse return null,
+            .attention_output_residual = (try prepareAttentionOutputResidualRegion(graph, scoped_cb, values, pattern, stats)) orelse return null,
         },
         .rms_norm_gated_ffn_residual => |pattern| .{
-            .rms_norm_gated_ffn_residual = (try prepareRmsNormGatedFfnResidualRegion(graph, cb, values, pattern, stats)) orelse return null,
+            .rms_norm_gated_ffn_residual = (try prepareRmsNormGatedFfnResidualRegion(graph, scoped_cb, values, pattern, stats)) orelse return null,
         },
         .gated_ffn_residual => |pattern| .{
-            .gated_ffn_residual = (try prepareGatedFfnResidualRegion(graph, cb, values, pattern, stats)) orelse return null,
+            .gated_ffn_residual = (try prepareGatedFfnResidualRegion(graph, scoped_cb, values, pattern, stats)) orelse return null,
         },
         .ple_residual => |pattern| .{
-            .ple_residual = (try preparePleResidualRegion(cb, values, pattern, stats)) orelse return null,
+            .ple_residual = (try preparePleResidualRegion(scoped_cb, values, pattern, stats)) orelse return null,
         },
     };
     if (prepared_region) |prepared_ptr| prepared_ptr.* = prepared;
+    if (source_state) |source| {
+        try source.capture(graph, cb, values, value_device, device_id, region);
+        if (source.valid) source.captureBindings(cb, prepared);
+    }
     return prepared;
 }
 
 fn tryExecutePlannedRuntimeRegion(
     region: RuntimeRegion,
     prepared_region: ?*PreparedRuntimeRegion,
+    source_state: ?*PreparedSourceState,
+    preparation_scope: u64,
     allocator: std.mem.Allocator,
     graph: *const Graph,
     cb: *const ComputeBackend,
@@ -6031,7 +6409,7 @@ fn tryExecutePlannedRuntimeRegion(
     _ = node_ids;
     _ = node_pos;
     _ = reachable;
-    const prepared = (try prepareRuntimeRegion(graph, cb, values, value_device, device_id, region, prepared_region, exec_ctx.stats)) orelse {
+    const prepared = (try prepareRuntimeRegion(graph, cb, values, value_device, device_id, region, prepared_region, source_state, preparation_scope, exec_ctx.stats)) orelse {
         if (std.meta.activeTag(region) != .none) {
             if (exec_ctx.stats) |stats| stats.runtime_region_fallbacks += 1;
         }
@@ -6380,7 +6758,7 @@ fn tryExecuteAttentionOutputResidualPattern(
 ) !bool {
     if (!attentionOutputResidualGraphFusionEnabled()) return false;
     const pattern = matchAttentionOutputResidualPattern(graph, node_ids, node_pos, reachable, skipped_nodes, last_use) orelse return false;
-    const prepared = (try prepareAttentionOutputResidualRegion(graph, cb, values, pattern, exec_ctx.stats)) orelse return false;
+    const prepared = (try prepareAttentionOutputResidualRegion(graph, &PreparationBackend{ .backend = cb, .nonce = metal_compute_mod.nextPreparationNonce() }, values, pattern, exec_ctx.stats)) orelse return false;
     return executeAttentionOutputResidualPattern(
         graph,
         cb,
@@ -6621,7 +6999,7 @@ fn tryExecuteRmsNormGatedFfnResidualPattern(
 ) !bool {
     if (!gatedFfnGraphFusionEnabled()) return false;
     const pattern = matchRmsNormGatedFfnResidualPattern(graph, node_ids, node_pos, reachable, skipped_nodes, last_use) orelse return false;
-    const prepared = (try prepareRmsNormGatedFfnResidualRegion(graph, cb, values, pattern, stats)) orelse return false;
+    const prepared = (try prepareRmsNormGatedFfnResidualRegion(graph, &PreparationBackend{ .backend = cb, .nonce = metal_compute_mod.nextPreparationNonce() }, values, pattern, stats)) orelse return false;
     return executeRmsNormGatedFfnResidualPattern(
         graph,
         cb,
@@ -6734,7 +7112,7 @@ fn tryExecuteGatedFfnResidualPattern(
         if (traceMetalGraphFusionsEnabled()) traceGatedFfnResidualCandidate(graph, node_ids, node_pos, reachable, skipped_nodes, last_use);
         return false;
     };
-    const prepared = (try prepareGatedFfnResidualRegion(graph, cb, values, pattern, stats)) orelse return false;
+    const prepared = (try prepareGatedFfnResidualRegion(graph, &PreparationBackend{ .backend = cb, .nonce = metal_compute_mod.nextPreparationNonce() }, values, pattern, stats)) orelse return false;
     return executeMatchedGatedFfnResidualPattern(
         graph,
         cb,
@@ -6912,7 +7290,7 @@ fn tryExecutePleResidualPattern(
     stats: ?*PartitionExecutor.ExecutionStats,
 ) !bool {
     const pattern = matchPleResidualPattern(graph, node_ids, node_pos, reachable, skipped_nodes) orelse return false;
-    const prepared = (try preparePleResidualRegion(cb, values, pattern, stats)) orelse return false;
+    const prepared = (try preparePleResidualRegion(&PreparationBackend{ .backend = cb, .nonce = metal_compute_mod.nextPreparationNonce() }, values, pattern, stats)) orelse return false;
     return executePleResidualPattern(
         graph,
         cb,
@@ -12178,7 +12556,7 @@ fn isLoRAAdapterParameterName(name: []const u8) bool {
 }
 
 fn prepareRawLinearDotRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: RawLinearDotPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -12195,7 +12573,7 @@ fn prepareRawLinearDotRegion(
 }
 
 fn prepareRawLinearPairRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: RawLinearPairPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -12223,7 +12601,7 @@ fn prepareRawLinearPairRegion(
 }
 
 fn prepareRawLinearBiasRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: RawLinearBiasPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -12241,7 +12619,7 @@ fn prepareRawLinearBiasRegion(
 }
 
 fn prepareRawLinearBiasPairRegion(
-    cb: *const ComputeBackend,
+    cb: *const PreparationBackend,
     values: []?CT,
     pattern: RawLinearBiasPairPattern,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -12460,7 +12838,7 @@ fn tryExecuteRmsNormGroupedLinearQkvSlicePattern(
     donated: std.AutoHashMapUnmanaged(NodeId, void),
 ) !bool {
     const pattern = matchRmsNormGroupedLinearQkvSlicePattern(graph, values, node_ids, node_pos, reachable, skipped_nodes) orelse return false;
-    const prepared = (try prepareRmsNormGroupedLinearQkvSliceRegion(cb, values, pattern, exec_ctx.stats)) orelse return false;
+    const prepared = (try prepareRmsNormGroupedLinearQkvSliceRegion(&PreparationBackend{ .backend = cb, .nonce = metal_compute_mod.nextPreparationNonce() }, values, pattern, exec_ctx.stats)) orelse return false;
     return executeRmsNormGroupedLinearQkvSlicePattern(
         allocator,
         graph,
@@ -12656,7 +13034,7 @@ fn tryExecuteGroupedLinearQkvSlicePattern(
     donated: std.AutoHashMapUnmanaged(NodeId, void),
 ) !bool {
     const pattern = matchGroupedLinearQkvSlicePattern(graph, values, node_ids, node_pos, reachable, skipped_nodes) orelse return false;
-    const prepared = (try prepareGroupedLinearQkvSliceRegion(cb, values, pattern, exec_ctx.stats)) orelse return false;
+    const prepared = (try prepareGroupedLinearQkvSliceRegion(&PreparationBackend{ .backend = cb, .nonce = metal_compute_mod.nextPreparationNonce() }, values, pattern, exec_ctx.stats)) orelse return false;
     return executeGroupedLinearQkvSlicePattern(
         allocator,
         graph,
@@ -12868,44 +13246,38 @@ fn matchGroupedLinearQkvSlicePatternAt(
     skipped_nodes: []const bool,
 ) ?GroupedLinearQkvSlicePattern {
     const linear_id = node_ids[node_pos];
-    const linear = graph.node(linear_id);
-    const attrs = switch (linear.op) {
-        .fused_linear_no_bias => |linear_attrs| linear_attrs,
-        else => return null,
+    const Selection = struct {
+        graph: *const Graph,
+        values: []?CT,
+        node_ids: []const NodeId,
+        start: usize,
+        reachable: []const bool,
+        skipped: []const bool,
+        fn find(raw: *anyopaque, linear: NodeId, start: usize, limit: usize) ?NodeId {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return findLinearSliceCandidate(self.graph, self.values, self.node_ids, self.start, self.reachable, self.skipped, linear, start, limit);
+        }
     };
-    const rows = shapeDimUsize(linear.output_shape, 0) orelse return null;
-    const total_out_dim = shapeDimUsize(linear.output_shape, 1) orelse return null;
-    if (rows == 0 or attrs.in_dim == 0 or total_out_dim == 0) return null;
-    const inputs = linear.getInputs();
-    if (inputs.len < 2) return null;
-
-    var leaves: [3]NodeId = undefined;
-    if (!collectThreeRowConcatLeaves(graph, inputs[1], &leaves)) return null;
-    const q_rows = shapeDimUsize(graph.node(leaves[0]).output_shape, 0) orelse return null;
-    const k_rows = shapeDimUsize(graph.node(leaves[1]).output_shape, 0) orelse return null;
-    const v_rows = shapeDimUsize(graph.node(leaves[2]).output_shape, 0) orelse return null;
-    const q_cols = shapeDimUsize(graph.node(leaves[0]).output_shape, 1) orelse return null;
-    const k_cols = shapeDimUsize(graph.node(leaves[1]).output_shape, 1) orelse return null;
-    const v_cols = shapeDimUsize(graph.node(leaves[2]).output_shape, 1) orelse return null;
-    if (q_cols != attrs.in_dim or k_cols != attrs.in_dim or v_cols != attrs.in_dim) return null;
-    if (k_rows != v_rows or total_out_dim != q_rows + k_rows + v_rows) return null;
-
-    const q_slice = findLinearSliceCandidate(graph, values, node_ids, node_pos + 1, reachable, skipped_nodes, linear_id, 0, q_rows) orelse return null;
-    const k_slice = findLinearSliceCandidate(graph, values, node_ids, node_pos + 1, reachable, skipped_nodes, linear_id, q_rows, q_rows + k_rows) orelse return null;
-    const v_slice = findLinearSliceCandidate(graph, values, node_ids, node_pos + 1, reachable, skipped_nodes, linear_id, q_rows + k_rows, q_rows + k_rows + v_rows) orelse return null;
+    var selection = Selection{ .graph = graph, .values = values, .node_ids = node_ids, .start = node_pos + 1, .reachable = reachable, .skipped = skipped_nodes };
+    const head = @import("../ops/kernel_descriptor.zig").groupedProjectionHeadWithSelection(graph, linear_id, .{ .context = &selection, .find = Selection.find }) orelse return null;
+    const dimensions = head.linears[0].operation.linear;
+    const q_rows = dimensions.out_dim;
+    const k_rows = head.linears[1].operation.linear.out_dim;
+    const q_slice = head.outputs[0];
+    const k_slice = head.outputs[1];
+    const v_slice = head.outputs[2];
     if (!hasOnlyExpectedUses(graph, reachable, skipped_nodes, linear_id, &.{ q_slice, k_slice, v_slice })) return null;
-
     return .{
         .linear_id = linear_id,
         .q_slice_id = q_slice,
         .k_slice_id = k_slice,
         .v_slice_id = v_slice,
-        .input_id = inputs[0],
-        .q_weight_id = leaves[0],
-        .k_weight_id = leaves[1],
-        .v_weight_id = leaves[2],
-        .rows = rows,
-        .in_dim = attrs.in_dim,
+        .input_id = head.input,
+        .q_weight_id = head.weights[0],
+        .k_weight_id = head.weights[1],
+        .v_weight_id = head.weights[2],
+        .rows = dimensions.rows,
+        .in_dim = dimensions.in_dim,
         .q_out_dim = q_rows,
         .kv_out_dim = k_rows,
     };
@@ -12985,31 +13357,6 @@ fn findNodePos(node_ids: []const NodeId, needle: NodeId) ?usize {
     return null;
 }
 
-fn collectThreeRowConcatLeaves(graph: *const Graph, root_id: NodeId, out: *[3]NodeId) bool {
-    var count: usize = 0;
-    collectRowConcatLeaves(graph, root_id, out, &count) catch return false;
-    return count == 3;
-}
-
-fn collectRowConcatLeaves(graph: *const Graph, node_id: NodeId, out: *[3]NodeId, count: *usize) !void {
-    const node = graph.node(node_id);
-    switch (node.op) {
-        .concat_prim => |attrs| {
-            if (attrs.axis != 0) return error.UnsupportedShape;
-            const inputs = node.getInputs();
-            if (inputs.len < 2) return error.UnsupportedShape;
-            try collectRowConcatLeaves(graph, inputs[0], out, count);
-            try collectRowConcatLeaves(graph, inputs[1], out, count);
-        },
-        .parameter => {
-            if (count.* >= out.len) return error.UnsupportedShape;
-            out[count.*] = node_id;
-            count.* += 1;
-        },
-        else => return error.UnsupportedShape,
-    }
-}
-
 fn findLinearSliceCandidate(
     graph: *const Graph,
     values: []?CT,
@@ -13058,7 +13405,7 @@ fn tryExecuteLinearNoBiasQkvPattern(
     donated: std.AutoHashMapUnmanaged(NodeId, void),
 ) !bool {
     const pattern = matchLinearNoBiasQkvPattern(graph, values, node_ids, node_pos, reachable, skipped_nodes) orelse return false;
-    const prepared = (try prepareLinearNoBiasQkvRegion(cb, values, pattern, exec_ctx.stats)) orelse return false;
+    const prepared = (try prepareLinearNoBiasQkvRegion(&PreparationBackend{ .backend = cb, .nonce = metal_compute_mod.nextPreparationNonce() }, values, pattern, exec_ctx.stats)) orelse return false;
     return executeLinearNoBiasQkvPattern(
         allocator,
         graph,
@@ -13732,18 +14079,7 @@ fn validatePartitionView(
     }
 }
 
-const RuntimeUnaryOp = enum {
-    negate,
-    sqrt,
-    rsqrt,
-    exp,
-    log,
-    sin,
-    cos,
-    tanh,
-    erf,
-    abs,
-};
+const RuntimeUnaryOp = ops_mod.kernel_descriptor.Unary;
 
 fn runtimeUnaryActivationKind(op: RuntimeUnaryOp) u32 {
     return switch (op) {
@@ -13757,6 +14093,7 @@ fn runtimeUnaryActivationKind(op: RuntimeUnaryOp) u32 {
         .tanh => 13,
         .erf => 14,
         .abs => 15,
+        .gelu, .gelu_exact, .relu, .silu => unreachable,
     };
 }
 
@@ -13785,10 +14122,39 @@ fn executeRuntimeUnary(
         .tanh => cb.primTanh(input),
         .erf => cb.primErf(input),
         .abs => cb.primAbs(input),
+        .gelu, .gelu_exact, .relu, .silu => unreachable,
     } catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
+}
+
+fn tryExecuteAssignedMetal(cb: *const ComputeBackend, frozen: *const ops_mod.kernel_descriptor.Descriptor, input_ids: []const NodeId, values: []?CT, output_hint: ?CT, rope_position: ?usize) !?CT {
+    // The arena binding belongs to Metal. Reference/simulation executions may
+    // run this executor with a native provider whose hooks require physical leases.
+    if (cb.kind() != .metal) return null;
+    const functions = cb.vtable.kernels orelse return null;
+    const run = functions.runAssignedKernel orelse return null;
+    var inputs: [3]CT = undefined;
+    for (input_ids, 0..) |id, index| inputs[index] = valueFor(values, id) orelse return null;
+    var positioned: ops_mod.kernel_descriptor.Descriptor = undefined;
+    const descriptor = if (frozen.operation == .rope and rope_position != null) blk: {
+        positioned = frozen.*;
+        positioned.operation.rope = try positioned.operation.rope.withPosition(rope_position.?);
+        break :blk &positioned;
+    } else frozen;
+    var request = ops_mod.kernel_descriptor.Invocation{ .descriptor = descriptor, .inputs = inputs[0..input_ids.len] };
+    if (!try run(cb.ptr, request)) return null;
+    var shape: [ml.graph.shape.max_rank]i32 = undefined;
+    const rank = descriptor.output_shape.rank();
+    for (descriptor.output_shape.dims[0..rank], 0..) |dimension, axis| shape[axis] = @intCast(dimension);
+    // The backend allocator participates in the current Metal command/arena
+    // plan. An existing pooled output binds directly without another allocation.
+    const output = output_hint orelse (try cb.allocUninitF32Shape(shape[0..rank])) orelse return null;
+    errdefer if (output_hint == null) cb.free(output);
+    request.output = output;
+    if (!try run(cb.ptr, request)) return error.AssignedKernelDeclinedAfterBinding;
+    return output;
 }
 
 fn tryExecuteMetalCommand(
@@ -13923,16 +14289,7 @@ fn tryExecuteMetalCommand(
             break :blk transposed;
         },
         .broadcast_in_dim => |attrs| try executeRuntimeBroadcast(cb, values, inputs, graph.node(inputs[0]).output_shape, attrs, output_hint),
-        .neg => try executeRuntimeUnary(cb, values, inputs, .negate, output_hint),
-        .sqrt => try executeRuntimeUnary(cb, values, inputs, .sqrt, output_hint),
-        .rsqrt => try executeRuntimeUnary(cb, values, inputs, .rsqrt, output_hint),
-        .exp => try executeRuntimeUnary(cb, values, inputs, .exp, output_hint),
-        .log => try executeRuntimeUnary(cb, values, inputs, .log, output_hint),
-        .sin => try executeRuntimeUnary(cb, values, inputs, .sin, output_hint),
-        .cos => try executeRuntimeUnary(cb, values, inputs, .cos, output_hint),
-        .tanh => try executeRuntimeUnary(cb, values, inputs, .tanh, output_hint),
-        .erf => try executeRuntimeUnary(cb, values, inputs, .erf, output_hint),
-        .abs => try executeRuntimeUnary(cb, values, inputs, .abs, output_hint),
+        .neg, .sqrt, .rsqrt, .exp, .log, .sin, .cos, .tanh, .erf, .abs => try executeRuntimeUnary(cb, values, inputs, ops_mod.kernel_descriptor.unary(n.op).?, output_hint),
         .slice => |attrs| try executeRuntimeSlice(graph, cb, values, inputs, attrs),
         .concat_prim => |attrs| try executeRuntimeConcatPrim(graph, cb, values, inputs, attrs),
         .gather => |attrs| try executeRuntimeGather(graph, cb, values, node_id, inputs, attrs, stats, resident_input_cache),
@@ -14007,12 +14364,12 @@ fn tryExecuteMetalCommand(
         .conv_general => |attrs| try executeRuntimeConvGeneral(graph, cb, values, inputs, attrs),
         .fused_conv1d => |attrs| try executeRuntimeConv1d(graph, cb, values, inputs, attrs),
         .fused_conv2d => |attrs| try executeRuntimeConv2d(graph, cb, values, inputs, attrs),
-        .fused_linear => |attrs| try executeRuntimeLinear(cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, true, op_plan),
+        .fused_linear => |attrs| try executeRuntimeLinear(graph, cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, true, op_plan, exec_state.options.mutable_parameters),
         .fused_linear_no_bias => |attrs| blk: {
             if (attrs.num_projections != 0) {
                 break :blk try executeRuntimeLinearNoBiasGrouped(cb, values, inputs, attrs);
             }
-            break :blk try executeRuntimeLinear(cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, false, op_plan);
+            break :blk try executeRuntimeLinear(graph, cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, false, op_plan, exec_state.options.mutable_parameters);
         },
         .fused_linear_no_bias_pair => |attrs| try executeRuntimeLinearNoBiasPair(cb, values, inputs, attrs, exec_state),
         .fused_to_float32 => blk: {
@@ -14022,7 +14379,7 @@ fn tryExecuteMetalCommand(
             }
             break :blk valueFor(values, inputs[0]);
         },
-        .fused_embedding_lookup => |attrs| try executeRuntimeEmbeddingLookup(graph, cb, values, inputs, attrs, exec_state),
+        .fused_embedding_lookup => |attrs| try executeRuntimeEmbeddingLookup(allocator, graph, cb, values, inputs, attrs, exec_state),
         .fused_take_rows => |attrs| try executeRuntimeTakeRows(cb, values, inputs, attrs.rows, attrs.dim, op_plan, exec_state),
         .fused_zero_tensor => |attrs| try executeRuntimeZeroTensor(cb, attrs.rows, attrs.out_dim),
         .fused_rope => |attrs| try executeRuntimeRope(cb, values, inputs, attrs, exec_state),
@@ -14345,6 +14702,7 @@ fn executeRuntimeConvertDType(
 }
 
 fn executeRuntimeEmbeddingLookup(
+    allocator: std.mem.Allocator,
     graph: *const Graph,
     cb: *const ComputeBackend,
     values: []?CT,
@@ -14353,21 +14711,11 @@ fn executeRuntimeEmbeddingLookup(
     exec_state: *interpreter.ExecState,
 ) !?CT {
     const weight = valueFor(values, inputs[0]) orelse return null;
-    var owned_ids: ?[]i64 = null;
-    defer if (owned_ids) |buf| std.heap.page_allocator.free(buf);
-    const ids = blk: {
-        if (graph.node(inputs[1]).op == .fused_from_float32) {
-            break :blk exec_state.options.embedding_ids orelse return error.MissingRuntimeInput;
-        }
-        const ids_ct = valueFor(values, inputs[1]) orelse return null;
-        const raw = try cb.toFloat32(ids_ct, std.heap.page_allocator);
-        defer std.heap.page_allocator.free(raw);
-        const converted = try std.heap.page_allocator.alloc(i64, raw.len);
-        for (converted, raw) |*dst, value| dst.* = @intFromFloat(@round(value));
-        owned_ids = converted;
-        break :blk converted;
-    };
-    return cb.embeddingLookup(weight, ids, attrs.total, attrs.dim) catch |err| switch (err) {
+    const indices: interpreter.EmbeddingIndices = if (graph.node(inputs[1]).op == .fused_from_float32)
+        .{ .host = exec_state.options.embedding_ids orelse return error.MissingRuntimeInput }
+    else
+        .{ .tensor = valueFor(values, inputs[1]) orelse return null };
+    return interpreter.executeEmbeddingLookup(allocator, cb, weight, indices, attrs.total, attrs.dim) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
@@ -14617,7 +14965,26 @@ fn executeRuntimeSlice(
     };
 }
 
+fn parameterBackedMatrix(graph: *const Graph, node_id: NodeId, mutable_parameters: ?[]const bool) bool {
+    var id = node_id;
+    var remaining = graph.nodeCount();
+    while (remaining != 0) : (remaining -= 1) {
+        const node = graph.node(id);
+        switch (node.op) {
+            .constant => return true,
+            .parameter => {
+                if (mutable_parameters) |flags| if (id < flags.len and flags[id]) return false;
+                return true;
+            },
+            .reshape, .transpose => id = node.inputs[0],
+            else => return false,
+        }
+    }
+    return false;
+}
+
 fn executeRuntimeLinear(
+    graph: *const Graph,
     cb: *const ComputeBackend,
     values: []?CT,
     inputs: []const NodeId,
@@ -14626,9 +14993,30 @@ fn executeRuntimeLinear(
     out_dim: usize,
     comptime has_bias: bool,
     op_plan: ?OperatorPlan,
+    mutable_parameters: ?[]const bool,
 ) !?CT {
     const input = valueFor(values, inputs[0]) orelse return null;
     const weight = valueFor(values, inputs[1]) orelse return null;
+    // A fused linear is algebraically a matrix product; its RHS need not be
+    // an immutable checkpoint. Computed operands (notably K/V) must remain live
+    // device operands, never private packed weights keyed by buffer identity.
+    if (!parameterBackedMatrix(graph, inputs[1], mutable_parameters) and !weightRequiresPlannedLinear(cb, weight)) {
+        const lhs_shape = [_]i64{ @intCast(rows), @intCast(in_dim) };
+        const rhs_shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
+        const output = try cb.primDotGeneral(input, weight, &lhs_shape, &rhs_shape, &.{1}, &.{1}, &.{}, &.{});
+        if (!has_bias) {
+            errdefer cb.free(output);
+            return try promoteMetalOutputIfNeeded(cb, output);
+        }
+        defer cb.free(output);
+        const bias = valueFor(values, inputs[2]) orelse return null;
+        const shape = [_]i64{ @intCast(rows), @intCast(out_dim) };
+        const expanded = try cb.primBroadcastInDim(bias, &shape, &.{1}, &.{@intCast(out_dim)});
+        defer cb.free(expanded);
+        const biased = try cb.add(output, expanded);
+        errdefer cb.free(biased);
+        return try promoteMetalOutputIfNeeded(cb, biased);
+    }
     try validatePlannedLinearOp(cb, weight, rows, in_dim, out_dim, op_plan);
     if (has_bias) {
         const bias = valueFor(values, inputs[2]) orelse return null;
@@ -14728,7 +15116,7 @@ fn executeRuntimeDotGeneral(
         const in_dim = positiveI64ToUsize(lhs_shape[1]) orelse return null;
         const out_dim = positiveI64ToUsize(rhs_shape[0]) orelse return null;
         if (rhs_shape[1] == lhs_shape[1]) {
-            return executeRuntimeLinear(cb, values, inputs, rows, in_dim, out_dim, false, op_plan);
+            return executeRuntimeLinear(graph, cb, values, inputs, rows, in_dim, out_dim, false, op_plan, null);
         }
     }
     const output = cb.primDotGeneral(lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch) catch |err| switch (err) {
@@ -15214,10 +15602,7 @@ fn executeRuntimeRope(
 ) !?CT {
     const input = valueFor(values, inputs[0]) orelse return null;
     const rope_dim: usize = if (attrs.rope_dim > 0) attrs.rope_dim else attrs.head_dim;
-    const position_offset = if (exec_state.options.attention) |attn|
-        attn.total_sequence_len - attn.query_sequence_len
-    else
-        attrs.position_offset;
+    const position_offset = (try interpreter.ropePositionOverride(exec_state.options.attention)) orelse attrs.position_offset;
     return cb.rope(
         input,
         attrs.seq_len,
@@ -15485,8 +15870,8 @@ fn executeRuntimeAdd(
     output_hint: ?CT,
 ) !?CT {
     const dim = tensorElementCount(output_shape) orelse return null;
-    if (try executeRuntimeScaledAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim)) |result| return result;
-    if (try executeRuntimeMultiplyAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim)) |result| return result;
+    if (try executeRuntimeScaledAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim, output_hint)) |result| return result;
+    if (try executeRuntimeMultiplyAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim, output_hint)) |result| return result;
     const lhs_operand = runtimeBinaryOperand(graph, values, inputs[0], output_shape) orelse return null;
     const rhs_operand = runtimeBinaryOperand(graph, values, inputs[1], output_shape) orelse return null;
     if (!binaryBroadcastResultMatches(lhs_operand.shape, rhs_operand.shape, output_shape)) return null;
@@ -15543,6 +15928,21 @@ fn runtimeBinaryOperand(
     return null;
 }
 
+/// Try an exact target first, then preserve the original tuned route when
+/// that target's representation/layout is unsupported. Resource/encode errors
+/// propagate; only an explicit no-submission decline permits another attempt.
+fn executeDecoderWithOutputHint(cb: *const ComputeBackend, comptime method: anytype, request: anytype) !?CT {
+    var configured = request;
+    while (true) {
+        const output = method(cb, &configured) catch |err| switch (err) {
+            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+            else => return err,
+        };
+        if (output != null or configured.output == null) return output;
+        configured.output = null;
+    }
+}
+
 fn executeRuntimeScaledAddFromDeferredMul(
     graph: *const Graph,
     cb: *const ComputeBackend,
@@ -15550,6 +15950,7 @@ fn executeRuntimeScaledAddFromDeferredMul(
     inputs: []const NodeId,
     output_shape: ml.graph.Shape,
     dim: usize,
+    output_hint: ?CT,
 ) !?CT {
     if (inputs.len < 2) return null;
     if (pendingDeferredScaleMul(graph, values, inputs[0], output_shape)) |lhs_scaled| {
@@ -15568,32 +15969,28 @@ fn executeRuntimeScaledAddFromDeferredMul(
     if (pendingDeferredScaleMul(graph, values, inputs[0], output_shape)) |scaled| {
         const scaled_lhs = valueFor(values, scaled.source_id) orelse return null;
         const residual = valueFor(values, inputs[1]) orelse return null;
-        const output = cb.decoderRuntimeApplyScaledAddScale(&.{
+        const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyScaledAddScale, ops_mod.DecoderRuntimeApplyScaledAddScaleRequest{
+            .output = output_hint,
             .lhs = scaled_lhs,
             .rhs = residual,
             .dim = dim,
             .lhs_scale = scaled.scale,
             .output_scale = 1.0,
-        }) catch |err| switch (err) {
-            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
-            else => return err,
-        };
+        });
         if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
         return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
     }
     if (pendingDeferredScaleMul(graph, values, inputs[1], output_shape)) |scaled| {
         const scaled_lhs = valueFor(values, scaled.source_id) orelse return null;
         const residual = valueFor(values, inputs[0]) orelse return null;
-        const output = cb.decoderRuntimeApplyScaledAddScale(&.{
+        const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyScaledAddScale, ops_mod.DecoderRuntimeApplyScaledAddScaleRequest{
+            .output = output_hint,
             .lhs = scaled_lhs,
             .rhs = residual,
             .dim = dim,
             .lhs_scale = scaled.scale,
             .output_scale = 1.0,
-        }) catch |err| switch (err) {
-            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
-            else => return err,
-        };
+        });
         if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
         return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
     }
@@ -15607,18 +16004,19 @@ fn executeRuntimeMultiplyAddFromDeferredMul(
     inputs: []const NodeId,
     output_shape: ml.graph.Shape,
     dim: usize,
+    output_hint: ?CT,
 ) !?CT {
     if (inputs.len < 2) return null;
     if (pendingDeferredElementwiseMul(graph, values, inputs[0], output_shape)) |mul| {
         if (pendingDeferredElementwiseMul(graph, values, inputs[1], output_shape)) |rhs_mul| {
-            return try executeDeferredElementwiseMultiplyAdd2(cb, values, mul, rhs_mul, dim);
+            return try executeDeferredElementwiseMultiplyAdd2(cb, values, mul, rhs_mul, dim, output_hint);
         }
         const addend = valueFor(values, inputs[1]) orelse return null;
-        return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim);
+        return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim, output_hint);
     }
     if (pendingDeferredElementwiseMul(graph, values, inputs[1], output_shape)) |mul| {
         const addend = valueFor(values, inputs[0]) orelse return null;
-        return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim);
+        return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim, output_hint);
     }
     return null;
 }
@@ -15629,6 +16027,7 @@ fn executeDeferredElementwiseMultiplyAdd2(
     lhs_mul: DeferredElementwiseMul,
     rhs_mul: DeferredElementwiseMul,
     dim: usize,
+    output_hint: ?CT,
 ) !?CT {
     var lhs0 = valueFor(values, lhs_mul.lhs_id) orelse return null;
     var rhs0 = valueFor(values, lhs_mul.rhs_id) orelse return null;
@@ -15668,16 +16067,14 @@ fn executeDeferredElementwiseMultiplyAdd2(
             }
         }
     }
-    const output = cb.decoderRuntimeApplyMultiplyAdd2(&.{
+    const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyMultiplyAdd2, ops_mod.DecoderRuntimeApplyMultiplyAdd2Request{
+        .output = output_hint,
         .lhs0 = lhs0,
         .rhs0 = rhs0,
         .lhs1 = lhs1,
         .rhs1 = rhs1,
         .dim = dim,
-    }) catch |err| switch (err) {
-        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
-        else => return err,
-    };
+    });
     if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
 
     const lhs_product = cb.multiply(lhs0, rhs0) catch |err| switch (err) {
@@ -15703,6 +16100,7 @@ fn executeDeferredElementwiseMultiplyAdd(
     mul: DeferredElementwiseMul,
     addend: CT,
     dim: usize,
+    output_hint: ?CT,
 ) !?CT {
     var lhs = valueFor(values, mul.lhs_id) orelse return null;
     var rhs = valueFor(values, mul.rhs_id) orelse return null;
@@ -15733,15 +16131,13 @@ fn executeDeferredElementwiseMultiplyAdd(
             }
         }
     }
-    const output = cb.decoderRuntimeApplyMultiplyAdd(&.{
+    const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyMultiplyAdd, ops_mod.DecoderRuntimeApplyMultiplyAddRequest{
+        .output = output_hint,
         .lhs = lhs,
         .rhs = rhs,
         .addend = residual,
         .dim = dim,
-    }) catch |err| switch (err) {
-        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
-        else => return err,
-    };
+    });
     if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
 
     const multiplied = cb.multiply(lhs, rhs) catch |err| switch (err) {
@@ -16438,6 +16834,7 @@ fn materializePartitionConstants(
     node_ids: []const NodeId,
     reachable: []const bool,
     device_id: DeviceId,
+    physical_frame: ?*@import("../execution/physical_buffers.zig").Frame,
 ) !void {
     for (node_ids) |node_id| {
         const i: usize = @intCast(node_id);
@@ -16445,7 +16842,10 @@ fn materializePartitionConstants(
         if (values[i] != null) continue;
         const node = graph.node(node_id);
         const materialized = switch (node.op) {
-            .constant => |attrs| try executeRuntimeConstant(graph, cb, node.output_shape, attrs),
+            .constant => |attrs| if (physical_frame) |frame|
+                (try frame.materializeLiteral(cb, node_id)) orelse try executeRuntimeConstant(graph, cb, node.output_shape, attrs)
+            else
+                try executeRuntimeConstant(graph, cb, node.output_shape, attrs),
             .fused_zero_tensor => |attrs| try executeRuntimeZeroTensor(cb, attrs.rows, attrs.out_dim),
             else => null,
         } orelse continue;
@@ -16760,6 +17160,7 @@ fn copyPartitionGraphOutputsToOwnedStorage(
     values: []?CT,
     view: buffer_plan_mod.PartitionBufferView,
     rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
+    physical_frame: ?*@import("../execution/physical_buffers.zig").Frame,
     stats: ?*PartitionExecutor.ExecutionStats,
 ) !void {
     if (comptime !build_options.enable_metal) return;
@@ -16769,9 +17170,32 @@ fn copyPartitionGraphOutputsToOwnedStorage(
         const index: usize = @intCast(slot_view.slot.node_id);
         if (index >= values.len) return error.InvalidBufferPlan;
         const ct = values[index] orelse continue;
-        const owned_ct = (try metal_compute_mod.MetalCompute.cloneOutputTensorOwned(cb, ct)) orelse continue;
+        // Constants have an explicitly declared independent publication bank.
+        // Consume it after the partition frame drains, before considering the
+        // legacy opaque output copy. Its lease carries the same current Frame.
+        var declared_publication = false;
+        const owned_ct = publication: {
+            if (physical_frame) |frame| {
+                if (try frame.publishLiteralOutput(cb, slot_view.slot.node_id, ct)) |published| {
+                    declared_publication = true;
+                    break :publication published;
+                }
+                if (frame.pool.completeOwnedPayload() != null) {
+                    if (frame.pool.literal_store) |store| {
+                        if (index < store.publications.len and store.publications[index] != null)
+                            return error.PreparedPhysicalLiteralChanged;
+                    }
+                }
+            }
+            break :publication (try metal_compute_mod.MetalCompute.cloneOutputTensorOwned(cb, ct)) orelse continue;
+        };
         values[index] = owned_ct;
-        if (stats) |s| s.graph_output_owned_copies += 1;
+        if (!declared_publication) {
+            if (stats) |stats_value| {
+                stats_value.graph_output_owned_copies += 1;
+                stats_value.opaque_graph_output_copies += 1;
+            }
+        }
         // Free the recyclable original unless the caller provided it
         // (runtime input) or another node's value slot still aliases the
         // same CT handle (metadata aliases share CTs across nodes).
@@ -19594,6 +20018,15 @@ test "metal partition executor runtime frame eligibility recognizes layer triple
 
     var stats: PartitionExecutor.ExecutionStats = .{};
     recordRuntimeFrameEligibilityStats(&stats, eligibility);
+    try std.testing.expect(stats.metal_region_policy_observed);
+    var diagnostics = @import("../execution/diagnostics.zig").Diagnostics{};
+    diagnostics.configure(true);
+    diagnostics.publish(.{ .execution = stats });
+    const retained_policy = diagnostics.snapshot().?.report.?.metal_region_policy orelse return error.MissingActualRegionPolicy;
+    diagnostics.configure(false);
+    try std.testing.expectEqual(.corresponding_program_instrumented_metal_region_planner, retained_policy.scope);
+    try std.testing.expectEqual(@as(u64, 1), retained_policy.missing_model_metadata);
+    try std.testing.expectEqual(@as(u64, 0), retained_policy.missing_qkv);
     try std.testing.expectEqual(@as(u64, 1), stats.runtime_frame_candidates);
     try std.testing.expectEqual(@as(u64, 0), stats.runtime_frame_eligible);
     try std.testing.expectEqual(@as(u64, 1), stats.runtime_frame_ineligible_missing_model_metadata);
@@ -22300,4 +22733,215 @@ test "metal partition lifetime sweep preserves inputs to later native partitions
     const final = try sweepExpiredValuesThroughNode(a, &g, &cb, &values, &devices, &.{late}, 0, late, 0, last_use, null, .empty, .empty, .{});
     try std.testing.expectEqual(@as(usize, 1), final);
     try std.testing.expect(values[input] == null);
+}
+
+fn expectCachedPreparedParameters(comptime rebind_slot: bool) !void {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const dim = 64;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input_node = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{ 1, dim }));
+    const weight_node = try builder.parameter("encoder.layer.0.attention.self.query_proj.weight", ml.graph.Shape.init(.f32, &.{ dim, dim }));
+    const transpose = try builder.transpose(weight_node, &.{ 1, 0 });
+    const output_node = try graph.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 0,
+        } },
+        .output_shape = ml.graph.Shape.init(.f32, &.{ 1, dim }),
+        .inputs = .{ input_node, transpose, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try graph.markOutput(output_node);
+    const seeds = try partition_mod.allocTensorDescriptorSeeds(a, &graph);
+    defer a.free(seeds);
+    try partition_mod.seedAllParameterResidency(seeds, &graph, .metal, 0);
+    var store = initEmptyMetalWeightStore(a);
+    defer deinitEmptyMetalWeightStore(&store, a);
+    var compute = try metal_compute_mod.MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    var backend = compute.computeBackend();
+    if (!backend.decoderRuntimeReady()) return error.ExpectedMetalDecoderRuntime;
+    var runtime = try @import("runtime.zig").Runtime.initWithOptions(a, &graph, &backend, .partitioned, .{ .tensor_descs = seeds });
+    defer runtime.deinit();
+    var input_data: [dim]f32 = @splat(0.125);
+    var first_data: [dim * dim]f32 = @splat(0.125);
+    var second_data: [dim * dim]f32 = @splat(0.25);
+    const input = try backend.ensureDeviceResidentOwned(try backend.fromFloat32Shape(&input_data, &.{ 1, dim }));
+    defer backend.free(input);
+    const first_weight = try backend.ensureDeviceResidentOwned(try backend.fromFloat32Shape(&first_data, &.{ dim, dim }));
+    defer backend.free(first_weight);
+    const second_weight = try backend.ensureDeviceResidentOwned(try backend.fromFloat32Shape(&second_data, &.{ dim, dim }));
+    defer backend.free(second_weight);
+    try std.testing.expect(first_weight != second_weight);
+    var native_store = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitEmptyNativeWeightStore(&native_store, a);
+    var native = native_compute.NativeCompute.init(a, &native_store, null);
+    defer native.deinit();
+    const reference = native.computeBackend();
+    const reference_input = try reference.fromFloat32Shape(&input_data, &.{ 1, dim });
+    defer reference.free(reference_input);
+    const reference_weight = try reference.fromFloat32Shape(&second_data, &.{ dim, dim });
+    defer reference.free(reference_weight);
+    const reference_product = try reference.linearNoBias(reference_input, reference_weight, 1, dim, dim);
+    defer reference.free(reference_product);
+    const expected = try reference.toFloat32(reference_product, a);
+    defer a.free(expected);
+    for (if (rebind_slot) [_]CT{ second_weight, second_weight, second_weight } else [_]CT{ first_weight, second_weight, second_weight }, 0..) |weight, step| {
+        var result = try runtime.execute(a, &graph, .{
+            .runtime_inputs = &.{ .{ .node_id = input_node, .value = input }, .{ .node_id = weight_node, .value = weight } },
+            .collect_partition_stats = true,
+            .planned_device_execution = true,
+        });
+        defer result.deinit(&runtime);
+        if (result.stats.runtime_region_plan_dispatches == 0) return error.ExpectedActualPreparedMetalRegion;
+        try std.testing.expectEqual(@as(usize, 1), result.outputs.len);
+        if (result.backendFor(&runtime, 0).kind() != .metal) return error.ExpectedActualMetalOutput;
+        const actual = try result.backendFor(&runtime, 0).toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        if (step == 0) {
+            for (actual) |value| try std.testing.expectApproxEqAbs(@as(f32, if (rebind_slot) 2 else 1), value, 0.00001);
+            if (result.stats.runtime_prepare_slot_calls == 0) return error.ExpectedColdMetalSlotPreparation;
+            if (rebind_slot) {
+                const slot = (try backend.decoderRuntimeEnsureLinearSlot(&.{ .weight = second_weight, .bias = null, .in_dim = dim, .out_dim = dim })) orelse return error.ExpectedCachedMetalSlot;
+                var zero_data: [dim]f32 = @splat(0);
+                const zero_bias = try backend.fromFloat32Shape(&zero_data, &.{dim});
+                defer backend.free(zero_bias);
+                metal_runtime_mod.clearRawLinearSlot(compute.provider_impl, slot);
+                if (!try backend.decoderRuntimePrepareLinear(&.{ .slot = slot, .weight = first_weight, .bias = zero_bias, .in_dim = dim, .out_dim = dim })) return error.ExpectedReboundMetalSlot;
+                // Prove the real slot now contains A, while the graph's public
+                // parameter remains B. Shape checks alone cannot distinguish it.
+                const rebound = (try backend.decoderRuntimeApplyLinear(&.{ .slot = slot, .input = input, .in_dim = dim, .out_dim = dim })) orelse return error.ExpectedReboundMetalProjection;
+                defer backend.free(rebound);
+                const rebound_values = try backend.toFloat32(rebound, a);
+                defer a.free(rebound_values);
+                // This private raw preparation may select its reduced-weight
+                // schedule (observed A=0.99993896). This is a binding oracle,
+                // not precision parity: discriminate A from the independently
+                // computed B. The final Runtime=2 precision gate is unchanged.
+                for (rebound_values, expected) |value, second| {
+                    try std.testing.expect(std.math.isFinite(value));
+                    const first = second * 0.5; // first_data is exactly B/2
+                    try std.testing.expect(@abs(value - first) < @abs(value - second));
+                }
+            }
+        } else {
+            // Both shape and graph remain identical. Only a legitimate public
+            // runtime parameter value changes; cached slot IDs cannot replace it.
+            for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+            if (step == 2 and result.stats.runtime_prepare_slot_cache_hits == 0) return error.ExpectedUnchangedPreparedMetalSlotReuse;
+        }
+    }
+}
+
+test "Metal public cached graph runtime refreshes same-shaped weight bindings and reuses unchanged preparation" {
+    try expectCachedPreparedParameters(false);
+}
+
+test "Metal public cached graph runtime rejects rebound same-shaped prepared slots" {
+    try expectCachedPreparedParameters(true);
+}
+
+/// The proof preserves current command/encoder policy. Turning a required
+/// facility off invalidates eligibility rather than silently choosing an
+/// allocating compatibility path after an exact admission has been granted.
+pub fn ownedFramePolicyAvailable() bool {
+    return !metalPartitionFrameDisabled() and !metalPartitionRuntimeCommandsDisabled() and !runtimeRegionPlanDisabled();
+}
+
+fn executeSynchronousPhysicalRegions(allocator: std.mem.Allocator, graph: *const Graph, cb: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, values: []?CT, devices: []DeviceId, device_id: DeviceId, options: interpreter.ExecuteOptions, stats: ?*PartitionExecutor.ExecutionStats) !bool {
+    const profile = options.region_execution_profile orelse return false;
+    if (profile.profile != .synchronous) return false;
+    const frame = options.physical_frame orelse return false;
+    if (frame.pool.regions.len == 0) return false;
+    if (frame.pool.region_execution_profile != .synchronous or !profile.held or profile.phase != .active) return error.RegionExecutionProfileChanged;
+    try profile.validate(.{ .operation = .graph_execution, .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .program = graph });
+    // A missing member can never fall back after the region recolored output
+    // lifetimes. Mixed partitions keep their original frames before selection.
+    for (nodes) |node| {
+        if (!reachable[node]) continue;
+        if (graph.node(node).op == .parameter) {
+            if (values[node] == null) return error.MissingValue;
+            continue;
+        }
+        const installed = frame.pool.regionForNode(node) orelse return error.PreparedRegionBoundaryChanged;
+        const backend = frame.pool.backends[installed.backend_index];
+        if (backend.ptr != cb.ptr or backend.vtable != cb.vtable) return error.PreparedRegionOwnerChanged;
+    }
+    const binding = @import("../execution/region_binding.zig");
+    const kernel = @import("../execution/kernel_route.zig");
+    for (nodes) |node| {
+        if (!reachable[node] or graph.node(node).op == .parameter) continue;
+        const installed = frame.pool.regionAtEntry(node) orelse continue;
+        if (installed.owner.input_nodes.len > binding.max_inputs) return error.PreparedRegionBindingChanged;
+        var facts: [binding.max_inputs]kernel.Binding = undefined;
+        var inputs: [binding.max_inputs]CT = undefined;
+        const count = installed.owner.input_nodes.len;
+        try frame.pool.regionExecutionFacts(installed.owner, facts[0..count]);
+        for (installed.owner.input_nodes, facts[0..count], inputs[0..count]) |input, fact, *value| {
+            // Immutable facts own their exact retained source CT. Consuming
+            // this capability avoids replacing it with a fresh parameter
+            // wrapper from ordinary materialization. Runtime activation facts
+            // still consume this invocation's actual values table.
+            value.* = if (fact == .tensor) fact.tensor.value else values[input] orelse return error.MissingValue;
+        }
+        for (installed.outputs) |output| if (values[output.slot.node] != null) return error.PreparedRegionOutputMismatch;
+        var produced = try frame.executeRegion(installed, facts[0..count], inputs[0..count]);
+        defer produced.deinit();
+        for (installed.outputs, 0..) |output, index| {
+            values[output.slot.node] = try produced.take(index);
+            devices[output.slot.node] = device_id;
+        }
+        if (stats) |actual| {
+            actual.runtime_region_plan_dispatches += 1;
+            actual.runtime_region_plan_active_regions += 1;
+            actual.runtime_region_plan_covered_nodes += installed.owner.covered_nodes.len;
+            actual.runtime_region_plan_elided_nodes += installed.owner.covered_nodes.len - 1;
+        }
+    }
+    _ = allocator;
+    return true;
+}
+
+test "shared grouped projection matcher preserves rank one legacy activation and unreachable slice selection" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{4}));
+    const q = try builder.parameter("q", ml.graph.Shape.init(.f32, &.{ 2, 4 }));
+    const k = try builder.parameter("k", ml.graph.Shape.init(.f32, &.{ 2, 4 }));
+    const v = try builder.parameter("v", ml.graph.Shape.init(.f32, &.{ 2, 4 }));
+    const qk = try builder.concat(q, k, 0);
+    const qkv = try builder.concat(qk, v, 0);
+    const linear = try builder.linearNoBias(input, qkv, 1, 4, 6);
+    for (0..3) |index| try graph.markOutput(try builder.sliceLastDim(linear, @intCast(index * 2), @intCast((index + 1) * 2)));
+    const extra = try builder.sliceLastDim(linear, 0, 2);
+    const values = try a.alloc(?CT, graph.nodeCount());
+    defer a.free(values);
+    @memset(values, null);
+    const node_ids = try a.alloc(NodeId, graph.nodeCount());
+    defer a.free(node_ids);
+    for (node_ids, 0..) |*node, id| node.* = @intCast(id);
+    const reachable = try a.alloc(bool, graph.nodeCount());
+    defer a.free(reachable);
+    @memset(reachable, true);
+    reachable[extra] = false;
+    const skipped = try a.alloc(bool, graph.nodeCount());
+    defer a.free(skipped);
+    @memset(skipped, false);
+    const original = matchGroupedLinearQkvSlicePatternAt(&graph, values, node_ids, linear, reachable, skipped) orelse return error.MissingLegacyGroupedProjection;
+    try std.testing.expectEqual(input, original.input_id);
+    try std.testing.expectEqual(@as(usize, 1), original.rows);
+    try std.testing.expectEqual(q, original.q_weight_id);
+    try std.testing.expectEqual(k, original.k_weight_id);
+    try std.testing.expectEqual(v, original.v_weight_id);
+    try std.testing.expect(@import("../ops/kernel_descriptor.zig").projectionHead(&graph) == null);
 }

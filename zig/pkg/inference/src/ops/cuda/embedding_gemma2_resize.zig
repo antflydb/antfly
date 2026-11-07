@@ -23,33 +23,46 @@ const Buffer = buffers.DeviceBuffer;
 const driver = @import("driver.zig");
 const memory = @import("../../runtime/tier/memory.zig");
 const processing = @import("antfly_image").processing;
+const prepared = @import("prepared_cache.zig");
+const CacheQuota = @import("cache_quota.zig").Quota;
+const Cleanup = @import("../../execution/cleanup_context.zig").Context;
 pub const Key = struct { width: u32, height: u32, target_width: u32, target_height: u32, resident: bool };
 pub const Plan = struct {
     key: Key,
     x: processing.BicubicAxis,
     y: processing.BicubicAxis,
     device: [6]Buffer = @splat(.{}),
-    lease: ?memory.AdmissionLease = null,
+    quota: CacheQuota = .none,
     bytes: usize,
     fn deinit(self: *Plan, ctx: *Context) void {
-        for (&self.device) |*b| b.free(ctx);
-        self.releaseHost();
-    }
-    fn releaseHost(self: *Plan) void {
+        // Only the legacy raw replacement caller reaches this private helper.
+        // It supplies no current cleanup authority for an admitted prepared bank.
+        self.quota.validateLegacyRaw() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        for (&self.device) |*buffer| _ = buffer.freeChecked(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         self.x.deinit();
         self.y.deinit();
-        if (self.lease) |*lease| lease.release();
+        self.quota.releaseLegacyRawAfterSdkDeath() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    }
+    fn deinitWithCleanup(self: *Plan, ctx: *Context, current: Cleanup) !void {
+        try self.quota.validateCleanup(current);
+        for (&self.device) |*buffer| _ = try buffer.freeChecked(ctx);
+        try self.releaseHost(current);
+    }
+    fn releaseHost(self: *Plan, current: Cleanup) !void {
+        self.x.deinit();
+        self.y.deinit();
+        try self.quota.releaseAfterSdkDeath(current);
     }
 };
 const Source = struct {
     host: buffers.HostBuffer = .{},
     event: driver.CUevent = null,
     pending: bool = false,
-    lease: ?memory.AdmissionLease = null,
+    quota: CacheQuota = .none,
     fn wait(self: *Source, ctx: *Context) !void {
         if (self.pending) {
             try ctx.makeCurrent();
-            try ctx.driver.check(ctx.driver.fns.cuEventSynchronize(self.event));
+            try ctx.driver.check(ctx.synchronizeEventResult(self.event));
             self.pending = false;
         }
     }
@@ -64,6 +77,27 @@ pub const Cache = struct {
     bytes: usize = 0,
     hits: usize = 0,
     misses: usize = 0,
+    pub fn request(key: Key) prepared.Request {
+        return .{ .resize = .{ .width = key.width, .height = key.height, .target_width = key.target_width, .target_height = key.target_height, .resident = key.resident } };
+    }
+    pub const Footprint = struct { retained_bytes: usize, temporary_bytes: usize };
+    pub fn footprint(key: Key) !Footprint {
+        const x = try processing.planPillowBicubicAxis(key.width, key.target_width);
+        const y = try processing.planPillowBicubicAxis(key.height, key.target_height);
+        return .{ .retained_bytes = try std.math.add(usize, x.retained_bytes, y.retained_bytes), .temporary_bytes = @max(x.temporary_bytes, y.temporary_bytes) };
+    }
+    pub fn contains(self: *const Cache, key: Key) bool {
+        for (self.plans) |entry| if (entry) |value| if (std.meta.eql(value.key, key)) return true;
+        return false;
+    }
+    pub fn victimsFor(self: *const Cache, key: Key) !u4 {
+        if (self.contains(key)) return 0;
+        const geometry = try footprint(key);
+        if (geometry.retained_bytes > plan_limit) return error.ResourceLimitExceeded;
+        if (try std.math.add(usize, self.bytes, geometry.retained_bytes) > plan_limit) return 15;
+        const index = self.next_plan % self.plans.len;
+        return if (self.plans[index] != null) @as(u4, 1) << @intCast(index) else 0;
+    }
     pub fn plan(self: *Cache, a: std.mem.Allocator, ctx: *Context, key: Key) !*const Plan {
         for (&self.plans) |*entry| if (entry.*) |*value| {
             if (std.meta.eql(value.key, key)) {
@@ -71,19 +105,35 @@ pub const Cache = struct {
                 return value;
             }
         };
+        const geometry = try footprint(key);
+        const bytes = geometry.retained_bytes;
+        if (bytes > plan_limit) return error.ResourceLimitExceeded;
+        const slot = &self.plans[self.next_plan % self.plans.len];
+        const over = try std.math.add(usize, self.bytes, bytes) > plan_limit;
+        // An actual Stage's exact targeted carrier must have retired victims
+        // outside all lanes before publishing the bound funding table.
+        if (ctx.prepared_cache_funding != null and (slot.* != null or over)) return error.PreparedCacheVictimChanged;
+        // A legacy unbound invocation cannot mint outside-execution authority
+        // for an independently prepared victim. Its actual Stage must detach
+        // that victim using the targeted cold carrier first.
+        if (ctx.prepared_cache_funding == null) {
+            if (over) {
+                for (self.plans) |value| if (value) |plan_value| {
+                    if (plan_value.quota == .prepared) return error.UnpreparedCacheAdmission;
+                };
+            } else if (slot.*) |value| if (value.quota == .prepared) return error.UnpreparedCacheAdmission;
+        }
+        var lease: prepared.Lease = .{};
+        errdefer lease.releaseAfterSdkDeath();
+        if (ctx.prepared_cache_funding != null) lease = try prepared.acquire(ctx, request(key), .{ .host_scratch_bytes = bytes, .backend_scratch_bytes = bytes });
         var x = try processing.buildPillowBicubicAxis(a, key.width, key.target_width, key.resident);
         errdefer x.deinit();
         var y = try processing.buildPillowBicubicAxis(a, key.height, key.target_height, key.resident);
         errdefer y.deinit();
         const data = [_][]const u8{ std.mem.sliceAsBytes(x.starts), std.mem.sliceAsBytes(x.offsets), std.mem.sliceAsBytes(x.weights), std.mem.sliceAsBytes(y.starts), std.mem.sliceAsBytes(y.offsets), std.mem.sliceAsBytes(y.weights) };
-        var bytes: usize = 0;
-        for (data) |slice| bytes = try std.math.add(usize, bytes, slice.len);
-        if (bytes > plan_limit) return error.ResourceLimitExceeded;
-        const slot = &self.plans[self.next_plan % self.plans.len];
-        if (slot.* != null or self.bytes + bytes > plan_limit) {
-            // Geometry churn alone may evict. Never release in-flight plans.
+        if (slot.* != null or over) {
             try ctx.synchronize();
-            if (self.bytes + bytes > plan_limit) {
+            if (over) {
                 for (&self.plans) |*entry| if (entry.*) |*value| {
                     value.deinit(ctx);
                     entry.* = null;
@@ -95,18 +145,22 @@ pub const Cache = struct {
                 slot.* = null;
             }
         }
-        var lease = try acquire(ctx, .{ .host_scratch_bytes = bytes, .backend_scratch_bytes = bytes });
-        errdefer if (lease) |*active| active.release();
+        if (ctx.prepared_cache_funding == null) lease = try prepared.acquire(ctx, request(key), .{ .host_scratch_bytes = bytes, .backend_scratch_bytes = bytes });
         var device: [6]Buffer = @splat(.{});
         errdefer {
-            ctx.synchronize() catch {};
-            for (&device) |*b| b.free(ctx);
+            if (lease.funded()) {
+                ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                for (&device) |*b| _ = b.freeChecked(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            } else {
+                ctx.synchronize() catch {};
+                for (&device) |*b| b.free(ctx);
+            }
         }
         for (&device, data) |*b, slice| {
-            b.* = try Buffer.alloc(ctx, slice.len);
+            b.* = try Buffer.allocWithPurpose(ctx, slice.len, .model_cache);
             try b.copyFromHost(ctx, slice);
         }
-        slot.* = .{ .key = key, .x = x, .y = y, .device = device, .bytes = bytes, .lease = lease };
+        slot.* = .{ .key = key, .x = x, .y = y, .device = device, .bytes = bytes, .quota = lease.publishQuota() };
         self.bytes += bytes;
         self.next_plan += 1;
         self.misses += 1;
@@ -114,51 +168,91 @@ pub const Cache = struct {
     }
     pub fn uploadSource(self: *Cache, ctx: *Context, destination: Buffer, bytes: []const u8) !void {
         if (bytes.len > source_limit) return error.ResourceLimitExceeded;
-        const slot = &self.sources[self.next_source % self.sources.len];
+        const index = self.next_source % self.sources.len;
+        const slot = &self.sources[index];
+        const grow = slot.host.len < bytes.len;
+        if (grow and ctx.prepared_cache_funding != null and (slot.host.ptr != null or slot.quota.hasLease())) return error.PreparedCacheVictimChanged;
+        if (grow and ctx.prepared_cache_funding == null) slot.quota.validateLegacyRaw() catch return error.UnpreparedCacheAdmission;
+        var lease: prepared.Lease = .{};
+        errdefer lease.releaseAfterSdkDeath();
+        if (grow and ctx.prepared_cache_funding != null) lease = try prepared.acquire(ctx, .{ .source = .{ .index = @intCast(index), .bytes = bytes.len } }, .{ .host_scratch_bytes = bytes.len });
         try slot.wait(ctx);
         if (slot.event == null) slot.event = try ctx.createStreamEvent();
-        if (slot.host.len < bytes.len) {
+        if (grow) {
             slot.host.free(ctx);
-            if (slot.lease) |*lease| lease.release();
-            slot.lease = null;
-            var lease = try acquire(ctx, .{ .host_scratch_bytes = bytes.len });
-            errdefer if (lease) |*active| active.release();
+            slot.quota.releaseLegacyRawAfterSdkDeath() catch @import("antfly_platform").inference_process_supervisor.restartWorker(); // Bound path proved empty above.
+            if (ctx.prepared_cache_funding == null) lease = try prepared.acquire(ctx, .{ .source = .{ .index = @intCast(index), .bytes = bytes.len } }, .{ .host_scratch_bytes = bytes.len });
             slot.host = try buffers.HostBuffer.alloc(ctx, bytes.len);
-            slot.lease = lease;
+            slot.quota = lease.publishQuota();
         }
         @memcpy(slot.host.bytes()[0..bytes.len], bytes);
         // On an event-record error a full drain preserves source lifetime.
-        errdefer ctx.synchronize() catch {};
+        errdefer if (ctx.prepared_cache_funding != null) {
+            ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        } else {
+            ctx.synchronize() catch {};
+        };
         try destination.copyFromHost(ctx, slot.host.constBytes()[0..bytes.len]);
         try ctx.recordEvent(slot.event);
         slot.pending = true;
         self.next_source += 1;
     }
+    pub fn retirementLeaseCount(self: *const Cache, controller: *?*memory.AdmissionController) !usize {
+        const quotas = @import("cache_retirement.zig");
+        var count: usize = 0;
+        for (self.plans) |entry| if (entry) |value| {
+            count += try quotas.scanLease(value.quota.peek(), controller);
+        };
+        for (self.sources) |source| count += try quotas.scanLease(source.quota.peek(), controller);
+        return count;
+    }
+    pub fn parkRetirementLeases(self: *Cache, quotas: *@import("cache_retirement.zig").PreparedQuotas) void {
+        for (&self.plans) |*entry| if (entry.*) |*value| value.quota.park(quotas);
+        for (&self.sources) |*source| source.quota.park(quotas);
+    }
+    pub fn validateCleanup(self: *const Cache, current: Cleanup) !void {
+        for (self.plans) |entry| if (entry) |value| try value.quota.validateCleanup(current);
+        for (self.sources) |source| try source.quota.validateCleanup(current);
+    }
     pub fn clear(self: *Cache, ctx: *Context) !void {
+        return self.clearWithCleanup(ctx, .{ .outside_execution = true });
+    }
+    pub fn clearWithCleanup(self: *Cache, ctx: *Context, current: Cleanup) !void {
+        try self.validateCleanup(current);
         if (self.next_plan == 0 and self.sources[0].event == null and self.sources[1].event == null) return;
         try ctx.synchronize();
-        for (&self.plans) |*entry| if (entry.*) |*value| value.deinit(ctx);
+        try self.clearRetiredWithCleanup(ctx, current);
+    }
+    /// Actual exclusive owner already established completion. Typed detach
+    /// parks every lease first; this body then contains no supplier callbacks.
+    pub fn clearRetired(self: *Cache, ctx: *Context) !void {
+        return self.clearRetiredWithCleanup(ctx, .{ .outside_execution = true });
+    }
+    pub fn clearRetiredWithCleanup(self: *Cache, ctx: *Context, current: Cleanup) !void {
+        try self.validateCleanup(current);
+        for (&self.plans) |*entry| if (entry.*) |*value| {
+            for (&value.device) |*device| _ = try device.freeChecked(ctx);
+            try value.releaseHost(current);
+            entry.* = null;
+        };
         for (&self.sources) |*source| {
-            source.host.free(ctx);
-            ctx.destroyEvent(source.event);
-            if (source.lease) |*lease| lease.release();
+            try source.host.freeChecked(ctx);
+            try ctx.destroyEventChecked(&source.event);
+            try source.quota.releaseAfterSdkDeath(current);
+            source.* = .{};
         }
         self.* = .{};
     }
     pub fn releaseAfterContextDestroyed(self: *Cache, ctx: *Context) void {
-        for (&self.plans) |*entry| if (entry.*) |*value| value.releaseHost();
+        for (&self.plans) |*entry| if (entry.*) |*value| value.releaseHost(.{ .outside_execution = true }) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         // cuMemFreeHost remains callable until the driver is unloaded.
         for (&self.sources) |*source| {
             source.host.free(ctx);
-            if (source.lease) |*lease| lease.release();
+            source.quota.releaseOutsideExecution();
         }
         self.* = .{};
     }
 };
-fn acquire(ctx: *Context, amounts: memory.AdmissionAmounts) !?memory.AdmissionLease {
-    const admission = ctx.video_cache_budget.admission orelse return null;
-    return try admission.controller.tryAcquire(.gpu, admission.limits, amounts, admission.check_live_memory);
-}
 test "embeddinggemma2 resize policy keys include native pixel policy and bounded staging" {
     try std.testing.expect(!std.meta.eql(Key{ .width = 100, .height = 100, .target_width = 96, .target_height = 96, .resident = false }, Key{ .width = 100, .height = 100, .target_width = 96, .target_height = 96, .resident = true }));
     try std.testing.expectEqual(@as(usize, 2), @as(Cache, .{}).sources.len);
@@ -223,6 +317,9 @@ test "embeddinggemma2 resize cache reuses uploads and fences only reused source 
     Mock.host_next = 0;
     var controller = memory.AdmissionController{};
     var ctx: Context = undefined;
+    ctx.prepared_cache_funding = null;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     ctx.ctx = @ptrFromInt(1);
     ctx.stream = @ptrFromInt(2);
     ctx.stats = .{};
@@ -244,6 +341,8 @@ test "embeddinggemma2 resize cache reuses uploads and fences only reused source 
     const key = Key{ .width = 64, .height = 48, .target_width = 32, .target_height = 32, .resident = true };
     const first = try cache.plan(std.testing.allocator, &ctx, key);
     const ptr = first.device[0].ptr;
+    for (first.device) |buffer| try std.testing.expectEqual(@import("allocation_budget.zig").OwnedPurpose.model_cache, buffer.allocation_purpose);
+    try std.testing.expectEqual(@as(u64, @intCast(cache.bytes)), ctx.device_allocations.snapshot().purpose_live[@backingInt(@import("allocation_budget.zig").OwnedPurpose.model_cache)]);
     try std.testing.expectEqual(@as(usize, 6), Mock.uploads);
     try std.testing.expectEqual(ptr, (try cache.plan(std.testing.allocator, &ctx, key)).device[0].ptr);
     try std.testing.expectEqual(@as(usize, 6), Mock.uploads);

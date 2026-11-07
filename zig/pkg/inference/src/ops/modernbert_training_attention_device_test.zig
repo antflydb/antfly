@@ -16,7 +16,7 @@
 //! Metal ModernBERT training attention against the CPU reference.
 const std = @import("std");
 const build_options = @import("build_options");
-const reference = @import("modernbert_training_attention.zig");
+const reference = @import("range_attention_reference.zig");
 const ops = @import("ops.zig");
 const Device = @import("../graph/resident_training_fixture.zig").Device;
 

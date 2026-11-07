@@ -36,6 +36,7 @@ const projector_format_mod = @import("projector_format.zig");
 
 const ComputeBackend = ops.ComputeBackend;
 const CT = ops.CT;
+const prompt_rows = @import("../execution/decoder_prefill.zig");
 
 const default_spatial_merge_size: usize = @intCast(
     projector_format_mod.gemma4_spatial_merge_size,
@@ -51,6 +52,10 @@ pub const ProjectedImages = struct {
     batches_executed: usize = 0,
     max_batch_executed: usize = 0,
 
+    pub fn promptRows(self: *const ProjectedImages) prompt_rows.ProjectedInputRows {
+        return .{ .rows_per_item = self.tokens_per_image, .width = self.hidden_size, .source = .{ .host = self.embeddings } };
+    }
+
     pub fn deinit(self: *ProjectedImages) void {
         self.allocator.free(self.embeddings);
         self.allocator.free(self.tokens_per_image);
@@ -59,6 +64,9 @@ pub const ProjectedImages = struct {
 
 /// Owned projected rows in input order. The creating backend must outlive this value.
 pub const ResidentProjectedImages = struct {
+    /// Semantic producer attestation only. Physical provenance and lifetime
+    /// still require the actual backend/runtime owner checks at handoff.
+    pub const OutputOwnership = enum { unknown, completed_fresh_destination };
     allocator: std.mem.Allocator,
     backend: *const ComputeBackend,
     embeddings: CT,
@@ -66,6 +74,11 @@ pub const ResidentProjectedImages = struct {
     hidden_size: usize,
     batches_executed: usize,
     max_batch_executed: usize,
+    output_ownership: OutputOwnership = .unknown,
+
+    pub fn promptRows(self: *const ResidentProjectedImages) prompt_rows.ProjectedInputRows {
+        return .{ .rows_per_item = self.tokens_per_image, .width = self.hidden_size, .source = .{ .resident = self.embeddings } };
+    }
 
     pub fn deinit(self: *ResidentProjectedImages) void {
         self.backend.free(self.embeddings);
@@ -73,6 +86,59 @@ pub const ResidentProjectedImages = struct {
     }
 };
 const ResidentImage = struct { embeddings: CT, tokens: usize };
+
+/// Own one projected still-image input across prompt expansion/assembly.
+/// Resident math starts at the original early phase. A host request is only
+/// prepared after video prompt expansion; this retains original failure and
+/// allocation order rather than executing a producer merely to query a shape.
+pub const PromptImageInput = struct {
+    backend: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    projector: *ProjectorStore,
+    images: []const []const u8,
+    data: union(enum) { empty, host_pending, host: ProjectedImages, resident: ResidentProjectedImages },
+
+    pub fn begin(backend: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, images: []const []const u8) !PromptImageInput {
+        const placement = prompt_rows.PromptEmbeddingRows.projectionPlacement(backend, images.len, 8, platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GENERATION_IMAGE_HOST", false));
+        return .{ .backend = backend, .allocator = allocator, .projector = projector, .images = images, .data = switch (placement) {
+            .none => .empty,
+            .host => .host_pending,
+            .resident => .{ .resident = try encodeProjectedImagesResident(backend, allocator, projector, images) },
+        } };
+    }
+
+    pub fn prepareHost(self: *PromptImageInput) !void {
+        if (self.data == .host_pending) self.data = .{ .host = try encodeProjectedImages(self.backend, self.allocator, self.projector, self.images) };
+    }
+
+    pub fn rows(self: *const PromptImageInput) !?prompt_rows.ProjectedInputRows {
+        return switch (self.data) {
+            .empty => null,
+            .host_pending => error.ProjectedInputNotPrepared,
+            .host => |*value| value.promptRows(),
+            .resident => |*value| value.promptRows(),
+        };
+    }
+
+    /// Register at the original later host-projection phase, before video
+    /// prompt retirement. The single owner remains safe if a prior error skips
+    /// that phase; deinit below then consumes whatever was actually prepared.
+    pub fn releaseHost(self: *PromptImageInput) void {
+        if (self.data == .host) {
+            self.data.host.deinit();
+            self.data = .empty;
+        }
+    }
+
+    pub fn deinit(self: *PromptImageInput) void {
+        switch (self.data) {
+            .host => |*value| value.deinit(),
+            .resident => |*value| value.deinit(),
+            .empty, .host_pending => {},
+        }
+        self.data = .empty;
+    }
+};
 
 pub const ProjectedAudio = struct {
     allocator: std.mem.Allocator,
@@ -410,6 +476,10 @@ fn ownVideoRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, source:
 pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8, max_tokens: usize) !ProjectedVideo {
     if (comptime !@import("build_options").enable_cuda or @import("builtin").os.tag != .linux) return error.UnsupportedVideoBackend;
     if (cb.kind() != .cuda or !cb.supportsCopyRows2D() or cb.vtable.sliceRows2D == null) return error.UnsupportedVideoBackend;
+    var cache_scope = if (cb.embedding_stage) |stage| try stage.videoCache(cb, bytes, max_tokens) else ops.EmbeddingCacheScope{};
+    defer cache_scope.close();
+    var consumer_scope = if (cb.embedding_stage) |stage| try stage.videoConsumer(cb) else ops.EmbeddingCacheScope{};
+    defer consumer_scope.close();
     const video = @import("../ops/cuda/video.zig");
     const cuda = @import("../ops/cuda/cuda_compute.zig");
     const compute: *cuda.CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -448,7 +518,7 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
         fn ready(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const c: *cuda.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
-            try c.ctx.driver.check(c.ctx.driver.fns.cuEventSynchronize(self.staging_event));
+            try c.ctx.driver.check(c.ctx.synchronizeEventResult(self.staging_event));
         }
         fn flush(self: *@This()) !void {
             if (self.pending_count == 0) return;
@@ -760,10 +830,24 @@ pub fn encodeEmbeddingGemma2Raster(cb: *const ComputeBackend, allocator: std.mem
 
 /// Video uses the pinned 140-token policy rather than the image 280-token policy.
 pub fn embeddingGemma2VideoGeometry(width: u32, height: u32) struct { width: u32, height: u32, tokens: usize } {
+    const g = embeddingGemma2VideoGeometryFull(width, height);
+    return .{ .width = @intCast(g.width), .height = @intCast(g.height), .tokens = g.tokenCount() };
+}
+
+fn embeddingGemma2VideoGeometryFull(width: u32, height: u32) Geometry {
     var cfg = embeddingGemma2ImageConfig();
     cfg.max_image_tokens = 140;
-    const g = targetGeometry(cfg, width, height);
-    return .{ .width = @intCast(g.width), .height = @intCast(g.height), .tokens = g.tokenCount() };
+    return targetGeometry(cfg, width, height);
+}
+/// Same immutable geometry and selected-frame accounting as actual consume.
+pub fn embeddingGemma2VideoCacheRecipe(probe: @import("../ops/cuda/video.zig").EmbeddingProbe, max_tokens: usize) !@import("../ops/cuda/prepared_cache.zig").VideoRecipe {
+    const g = embeddingGemma2VideoGeometryFull(if (probe.display_width != 0) probe.display_width else probe.sequence.width, if (probe.display_height != 0) probe.display_height else probe.sequence.height);
+    const rows = try std.math.mul(usize, probe.samples, g.tokenCount());
+    const markers = try std.math.mul(usize, probe.samples, 2);
+    if (try std.math.add(usize, try std.math.add(usize, rows, markers), 2) > max_tokens) return error.EmbeddingInputTooLong;
+    const result: @import("../ops/cuda/prepared_cache.zig").VideoRecipe = .{ .sequence = probe.sequence, .samples = probe.samples, .unique_frames = probe.unique_frames, .resize = .{ .width = if (probe.raster_width != 0) probe.raster_width else probe.sequence.width, .height = if (probe.raster_height != 0) probe.raster_height else probe.sequence.height, .target_width = @intCast(g.width), .target_height = @intCast(g.height), .resident = true }, .grid_x = g.grid_x, .grid_y = g.grid_y };
+    try result.validate();
+    return result;
 }
 
 /// Input is the lib/video centered NHWC patch contract, one borrowed frame.
@@ -932,6 +1016,117 @@ fn embeddingGemma2ImageConfig() Config {
     };
 }
 
+const AudioCacheRecipe = @import("../ops/cuda/prepared_cache.zig").AudioRecipe;
+fn audioCacheConfig(cfg: AudioConfig) AudioCacheRecipe {
+    return .{
+        .count = 0,
+        .hidden = cfg.audio_hidden,
+        .output_hidden = cfg.output_hidden,
+        .intermediate = cfg.intermediate_size,
+        .blocks = cfg.block_count,
+        .heads = cfg.head_count,
+        .mel_bins = cfg.mel_bins,
+        .conv_kernel = cfg.conv_kernel_size,
+        .norm_eps_bits = @bitCast(cfg.layer_norm_eps),
+        .residual_bits = @bitCast(cfg.residual_weight),
+        .chunk = cfg.attention_chunk_size,
+        .context_left = cfg.attention_context_left,
+        .logit_cap_bits = @bitCast(cfg.attention_logit_cap),
+        .invalid_logits_bits = @bitCast(cfg.attention_invalid_logits_value),
+        .exclude_farthest = cfg.exclude_farthest_key,
+        .frontend_device = false,
+        .force_dft = false,
+        .force_unfused = false,
+        .host_ops_empty = false,
+        .graph_allowed = false,
+        .packed_layers = 0,
+    };
+}
+
+test "audio cache recipe shares exact execution key and original HF packed names" {
+    const cfg = embeddingGemma2AudioConfig();
+    const recipe = audioCacheConfig(cfg);
+    const segments = [_]usize{ 11, 17, 5 };
+    const Legacy = struct {
+        fn key(value: AudioConfig, key_segments: []const usize, key_start: usize, key_end: usize) u64 {
+            var legacy = std.hash.Wyhash.init(0x616e74666c796175);
+            legacy.update(std.mem.sliceAsBytes(key_segments));
+            std.hash.autoHash(&legacy, .{ key_start, key_end });
+            std.hash.autoHash(&legacy, .{ value.audio_hidden, value.intermediate_size, value.head_count, value.conv_kernel_size, @as(u32, @bitCast(value.layer_norm_eps)), @as(u32, @bitCast(value.residual_weight)), value.attention_chunk_size, value.attention_context_left, @as(u32, @bitCast(value.attention_logit_cap)), @as(u32, @bitCast(value.attention_invalid_logits_value)), value.exclude_farthest_key });
+            return legacy.final();
+        }
+    };
+    const start: usize = 0;
+    const end: usize = 12;
+    try std.testing.expectEqual(Legacy.key(cfg, &segments, start, end), recipe.key(&segments, start, end));
+    try std.testing.expect(recipe.key(&segments, 0, 12) != recipe.key(&segments, 0, 6));
+    for (0..12) |layer| for ([_][]const u8{ "q", "k", "v" }, 0..) |component, index| {
+        var original: [128]u8 = undefined;
+        const logical = try std.fmt.bufPrint(&original, "a.blk.{d}.attn_{s}.weight", .{ layer, component });
+        const expected = try @import("embedding_gemma2_media_weights.zig").name(std.testing.allocator, logical);
+        defer std.testing.allocator.free(expected);
+        var actual: [128]u8 = undefined;
+        try std.testing.expectEqualStrings(expected, try AudioCacheRecipe.qkvWeightName(&actual, layer, index));
+    };
+}
+
+/// Values are collected under the actual caller's Stage owner, before any
+/// feature/subsample tensor exists. The Stage certifies and retains that owner
+/// and rebuilds backend-dependent requests after every cold admission window.
+pub fn embeddingGemma2AudioCacheRecipe(cb: *const ComputeBackend, prepared: []const *const PreparedAudio) !AudioCacheRecipe {
+    return audioCacheRecipe(cb, embeddingGemma2AudioConfig(), prepared);
+}
+fn audioCacheRecipe(cb: *const ComputeBackend, cfg: AudioConfig, prepared: []const *const PreparedAudio) !AudioCacheRecipe {
+    if (cb.kind() != .cuda or prepared.len == 0 or prepared.len > 4) return error.UnsupportedPreparedAudioCache;
+    var recipe = audioCacheConfig(cfg);
+    recipe.count = @intCast(prepared.len);
+    for (prepared, 0..) |audio_input, index| {
+        if (audio_input.mel_bins != recipe.mel_bins) return error.InvalidTensorShape;
+        recipe.frames[index] = audio_input.frames;
+    }
+    try recipe.validate();
+    const host = audioHostOps();
+    recipe.frontend_device = !host.features and supportsGemma4LogMel(cb);
+    recipe.force_dft = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_AUDIO_DFT");
+    recipe.force_unfused = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_AUDIO_UNFUSED");
+    recipe.host_ops_empty = std.meta.eql(host, AudioHostOps{});
+    recipe.depthwise_cached = !host.dwconv and !host.resident and (cb.vtable.depthwiseCausalConv1d != null or (prepared.len > 1 and cb.vtable.depthwiseCausalConv1dSegmented != null));
+    recipe.graph_allowed = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null;
+    if (cb.vtable.linearPackedNamed == null or host.clamp or !audioQkvFits(try recipe.rows(), recipe.hidden)) return recipe;
+    for (0..recipe.blocks) |layer| {
+        var specs: [3]ClampSpec = undefined;
+        var supported = true;
+        for ([_][]const u8{ "q", "k", "v" }, 0..) |component, index| {
+            var prefix_buffer: [128]u8 = undefined;
+            const prefix = try std.fmt.bufPrint(&prefix_buffer, "a.blk.{d}.attn_{s}", .{ layer, component });
+            switch (try loadResidentScalarClampSpec(cb, prefix)) {
+                .spec => |spec| specs[index] = spec,
+                .unsupported => {
+                    supported = false;
+                    break;
+                },
+            }
+        }
+        if (!supported) continue;
+        for (specs[1..]) |spec| if (spec.input_min != specs[0].input_min or spec.input_max != specs[0].input_max) {
+            supported = false;
+            break;
+        };
+        if (supported) recipe.packed_layers |= @as(u16, 1) << @intCast(layer);
+    }
+    return recipe;
+}
+
+fn beginAudioCache(cb: *const ComputeBackend, cfg: AudioConfig, prepared: []const *const PreparedAudio) !ops.EmbeddingCacheScope {
+    if (cb.kind() != .cuda) return .{};
+    const stage = cb.embedding_stage orelse return .{}; // explicit legacy/nonStage route
+    if (stage.audio_cache_fn == null) return .{};
+    // Invalid/empty input keeps its original numerical validation result and
+    // creates no cache payload. Supported actual prepared inputs have rows.
+    for (prepared) |value| if (value.frames == 0) return .{};
+    return stage.audioCache(cb, try audioCacheRecipe(cb, cfg, prepared), &.{});
+}
+
 fn embeddingGemma2AudioConfig() AudioConfig {
     return .{
         .text_hidden = 512,
@@ -971,6 +1166,8 @@ pub fn encodeEmbeddingGemma2Pcm(cb: *const ComputeBackend, a: std.mem.Allocator,
 pub const ResidentEncodedAudio = struct { embeddings: CT, tokens: usize };
 pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const *const PreparedAudio) !ResidentProjectedImages {
     if (prepared.len == 0 or prepared.len > 4) return error.InvalidInputShape;
+    var cache_scope = try beginAudioCache(cb, embeddingGemma2AudioConfig(), prepared);
+    defer cache_scope.close();
     const storage = try cb.audioStorage(true);
     defer if (storage) {
         _ = cb.audioStorage(false) catch false;
@@ -1007,6 +1204,8 @@ fn audioFeatureCohort(cb: *const ComputeBackend, a: std.mem.Allocator, prepared:
 }
 
 pub fn encodePreparedEmbeddingGemma2AudioResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, prepared: *const PreparedAudio) !ResidentEncodedAudio {
+    var cache_scope = try beginAudioCache(cb, embeddingGemma2AudioConfig(), &.{prepared});
+    defer cache_scope.close();
     var weights = ProjectorWeights.initHuggingFace(cb, allocator);
     defer weights.deinit();
     var features = try audioFeaturesFromPrepared(cb, allocator, prepared);
@@ -1362,9 +1561,12 @@ pub fn encodeEmbeddingGemma2AudioResidentBounded(cb: *const ComputeBackend, allo
 }
 
 fn encodeSingleAudioResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, audio_bytes: []const u8) !ResidentEncodedAudio {
+    var cache_scope = ops.EmbeddingCacheScope{};
+    defer cache_scope.close();
     var features = if (store.huggingface and cb.kind() == .cuda) bounded: {
         var prepared = try prepareAudioCpuBounded(allocator, audio_bytes, cfg.audio_decode_options, cfg.mel_bins, cfg.reject_audio_truncation, !audioHostOps().features and supportsGemma4LogMel(cb), cfg.max_audio_samples, cfg.max_audio_decode_working_bytes, true);
         defer prepared.deinit();
+        cache_scope = try beginAudioCache(cb, cfg, &.{&prepared});
         break :bounded try audioFeaturesFromPrepared(cb, allocator, &prepared);
     } else try prepareGemma4AudioFeatures(cb, allocator, audio_bytes, cfg);
     defer features.deinit();
@@ -2046,7 +2248,7 @@ fn gemma4LogMelTensor(
 fn audioFrontendConstant(cb: *const ComputeBackend, allocator: std.mem.Allocator, kind: []const u8, data: []const f32, shape: []const i32, fft_length: usize, frame_length: usize, mel_bins: usize) !CT {
     _ = allocator;
     var key_buf: [192]u8 = undefined;
-    const key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.frontend.f32.v1.{s}.{d}.{d}.{d}", .{ kind, fft_length, frame_length, mel_bins });
+    const key = try AudioCacheRecipe.frontendKey(&key_buf, kind, fft_length, frame_length, mel_bins);
     if (try cb.modelConstant(key, null)) |hit| return hit;
     const source = try deviceResidentFromFloat32(cb, data, shape);
     return publishAudioConstant(cb, key, source, true);
@@ -2894,6 +3096,21 @@ fn encodePreparedImagesWithWeights(cb: *const ComputeBackend, allocator: std.mem
     return .{ .allocator = allocator, .embeddings = try embeddings.toOwnedSlice(allocator), .tokens_per_image = lengths, .hidden_size = cfg.text_hidden, .batches_executed = batches, .max_batch_executed = maximum };
 }
 
+fn handoffCacheTensor(raw: *anyopaque, stage: *const ops.EmbeddingStageControl) anyerror!void {
+    const value: *CT = @ptrCast(@alignCast(raw));
+    try stage.handoffCacheInput(value);
+}
+fn bindCacheTensor(cb: *const ComputeBackend, value: *CT, node: *ops.EmbeddingCacheInputs) !ops.EmbeddingCacheScope {
+    node.* = .{ .ptr = @ptrCast(value), .prepare_fn = handoffCacheTensor };
+    if (cb.kind() == .cuda) if (cb.embedding_stage) |stage| return stage.cacheInputs(cb, node);
+    return .{};
+}
+fn beginImageCache(cb: *const ComputeBackend, view: image.ImageU8, target: Geometry, inputs: []const *CT) !ops.EmbeddingCacheScope {
+    if (cb.kind() != .cuda) return .{};
+    const stage = cb.embedding_stage orelse return .{};
+    return stage.imageCache(cb, .{ .width = view.width, .height = view.height, .stride = try view.rowStride(), .source_capacity = view.data.len, .target_width = @intCast(target.width), .target_height = @intCast(target.height) }, inputs);
+}
+
 fn encodePreparedImagesResidentWithWeights(cb: *const ComputeBackend, a: std.mem.Allocator, weights: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage, options: ImageBatchOptions) !ResidentProjectedImages {
     try options.validate();
     var execution_cfg = cfg;
@@ -2909,8 +3126,11 @@ fn encodePreparedImagesResidentWithWeights(cb: *const ComputeBackend, a: std.mem
         length.* = item.geometry.tokenCount();
         total = try std.math.add(usize, total, length.*);
     }
-    const tensor = (try cb.allocUninitF32Shape(&.{ std.math.cast(i32, total) orelse return error.InvalidImageBatch, @intCast(cfg.text_hidden) })) orelse return error.ResidentImageOperationUnavailable;
+    var tensor = (try cb.allocUninitF32Shape(&.{ std.math.cast(i32, total) orelse return error.InvalidImageBatch, @intCast(cfg.text_hidden) })) orelse return error.ResidentImageOperationUnavailable;
     errdefer cb.free(tensor);
+    var cache_node: ops.EmbeddingCacheInputs = undefined;
+    var cache_inputs = try bindCacheTensor(cb, &tensor, &cache_node);
+    defer cache_inputs.close();
     var rows: usize = 0;
     var offset: usize = 0;
     var batches: usize = 0;
@@ -2927,7 +3147,7 @@ fn encodePreparedImagesResidentWithWeights(cb: *const ComputeBackend, a: std.mem
         batches += 1;
         maximum = @max(maximum, count);
     }
-    return .{ .allocator = a, .backend = cb, .embeddings = tensor, .tokens_per_image = lengths, .hidden_size = cfg.text_hidden, .batches_executed = batches, .max_batch_executed = maximum };
+    return .{ .allocator = a, .backend = cb, .embeddings = tensor, .tokens_per_image = lengths, .hidden_size = cfg.text_hidden, .batches_executed = batches, .max_batch_executed = maximum, .output_ownership = .completed_fresh_destination };
 }
 
 pub fn encodePreparedEmbeddingGemma2ImagesResident(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const PreparedImage, options: ImageBatchOptions) !ResidentProjectedImages {
@@ -3026,7 +3246,7 @@ fn encodePreparedImageBatchResident(cb: *const ComputeBackend, allocator: std.me
         errdefer if (combined) |tensor| cb.free(tensor);
         for (prepared, 0..) |item, index| {
             try cb.checkExecutionControl();
-            const row = try prepareCudaImageHidden(cb, allocator, store, cfg, item);
+            const row = try prepareCudaImageHidden(cb, allocator, store, cfg, item, if (combined) |*value| value else null);
             if (combined) |previous| {
                 defer cb.free(row);
                 const next = try cb.concatRows2D(allocator, previous, row, index * sequence, sequence, cfg.vision_hidden);
@@ -3060,7 +3280,7 @@ fn prepareDeviceBatchPatches(cb: *const ComputeBackend, a: std.mem.Allocator, cf
     if (prepared.len == 1 and cb.kind() == .metal) if (prepared[0].source) |view| {
         if (try @import("../ops/metal_compute.zig").MetalCompute.prepareEmbeddingImagePatches(cb, view, @intCast(geometry.width), @intCast(geometry.height))) |patches| return patches;
     };
-    const destination = (try cb.allocUninitF32Shape(&.{ @intCast(prepared.len * sequence), @intCast(dim) })) orelse return error.ResidentImageOperationUnavailable;
+    var destination = (try cb.allocUninitF32Shape(&.{ @intCast(prepared.len * sequence), @intCast(dim) })) orelse return error.ResidentImageOperationUnavailable;
     errdefer cb.free(destination);
     if (cb.kind() == .metal and prepared.len > 1) async_batch: {
         var views: [8]image.ImageU8 = undefined;
@@ -3074,6 +3294,8 @@ fn prepareDeviceBatchPatches(cb: *const ComputeBackend, a: std.mem.Allocator, cf
         try cb.checkExecutionControl();
         if (!std.meta.eql(geometry, item.geometry)) return error.IncompatibleImageBatch;
         if (item.source) |view| {
+            var cache_scope = if (view.format == .rgb8) try beginImageCache(cb, view, geometry, &.{&destination}) else ops.EmbeddingCacheScope{};
+            defer cache_scope.close();
             if (cb.kind() == .metal) {
                 if (try @import("../ops/metal_compute.zig").MetalCompute.prepareEmbeddingImagePatches(cb, view, @intCast(geometry.width), @intCast(geometry.height))) |patches| {
                     defer cb.free(patches);
@@ -3099,9 +3321,12 @@ fn prepareDeviceBatchPatches(cb: *const ComputeBackend, a: std.mem.Allocator, cf
     return destination;
 }
 
-fn prepareCudaImageHidden(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, prepared: PreparedImage) !CT {
+fn prepareCudaImageHidden(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, prepared: PreparedImage, prior: ?*CT) !CT {
     const geometry = prepared.geometry;
     if (prepared.source) |view| {
+        const inputs: []const *CT = if (prior) |value| &.{value} else &.{};
+        var cache_scope = if (view.format == .rgb8) try beginImageCache(cb, view, geometry, inputs) else ops.EmbeddingCacheScope{};
+        defer cache_scope.close();
         if (view.format == .rgb8) if (try cb.preprocessEmbeddingGemma2ImagePatches(view.data, view.width, view.height, try view.rowStride(), @intCast(geometry.width), @intCast(geometry.height))) |patches| {
             defer cb.free(patches);
             const dim = cfg.patch_size * cfg.patch_size * 3;
@@ -3137,6 +3362,11 @@ fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.m
     var hidden = positioned;
     var hidden_live = true;
     errdefer if (hidden_live) cb.free(hidden);
+    var cache_scope = ops.EmbeddingCacheScope{};
+    if (cb.kind() == .cuda) if (cb.embedding_stage) |stage| {
+        cache_scope = try stage.visionCache(cb, .{ .batch = batch, .grid_x = geometry.grid_x, .grid_y = geometry.grid_y, .allow_yield = output == null }, &.{&hidden});
+    };
+    defer cache_scope.close();
     if (cfg.embedding_gemma2_f32_attention) if (cb.vtable.embeddingRotaryPrepare) |prepare| try prepare(cb.ptr, .{ .vision = true, .dim = @intCast(cfg.vision_hidden / cfg.head_count), .x = @intCast(geometry.grid_x), .y = @intCast(geometry.grid_y), .theta = cfg.rope_theta });
     const previous = @import("../ops/metal_compute.zig").MetalCompute.requireEmbeddingVisionPlan(cb, cfg.require_prepared_vision);
     defer _ = @import("../ops/metal_compute.zig").MetalCompute.requireEmbeddingVisionPlan(cb, previous);
@@ -3389,24 +3619,6 @@ fn layerNormRowsInPlace(
     }
 }
 
-fn addBiasFromTensor(
-    allocator: std.mem.Allocator,
-    store: *ProjectorWeights,
-    data: []f32,
-    rows: usize,
-    dim: usize,
-    name: []const u8,
-) !void {
-    _ = allocator;
-    var bias = try store.tensorF32(name);
-    defer bias.deinit();
-    if (data.len != rows * dim or bias.data.len != dim) return error.InvalidTensorShape;
-    for (0..rows) |row| {
-        const base = row * dim;
-        for (0..dim) |i| data[base + i] += bias.data[i];
-    }
-}
-
 fn parseConfig(file: *const gguf_format.File) !Config {
     const view = gguf_metadata.View.init(file);
     const arch = view.getString("general.architecture") orelse return error.InvalidGgufProjector;
@@ -3508,7 +3720,7 @@ const AudioLayerInputs = struct {
         if (store == null and per_dim_scales.len != cfg.block_count) return error.InvalidTensorShape;
         const cached = if (store) |weights| weights.gguf == null else false;
         var key_buf: [192]u8 = undefined;
-        const rel_key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.relative.v1.{d}.{d}", .{ cfg.attention_context_left, cfg.audio_hidden });
+        const rel_key = try audioCacheConfig(cfg).towerKey(&key_buf, .relative, 0);
         const rel_in = if (cached) (try cb.modelConstant(rel_key, null)) orelse try prepareAudioRelative(cb, allocator, cfg, rel_key) else try prepareAudioRelative(cb, allocator, cfg, null);
         errdefer cb.free(rel_in);
 
@@ -3519,7 +3731,7 @@ const AudioLayerInputs = struct {
         const valid_ct = try deviceResidentFromFloat32(cb, valid, &valid_shape);
         errdefer cb.free(valid_ct);
 
-        const ones_key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.ones.v1.{d}", .{cfg.output_hidden});
+        const ones_key = try audioCacheConfig(cfg).towerKey(&key_buf, .ones, 0);
         const ones = if (cached) (try cb.modelConstant(ones_key, null)) orelse try prepareAudioOnes(cb, allocator, cfg, ones_key) else try prepareAudioOnes(cb, allocator, cfg, null);
         errdefer cb.free(ones);
 
@@ -3535,7 +3747,7 @@ const AudioLayerInputs = struct {
             scales.deinit(allocator);
         }
         for (0..cfg.block_count) |layer| {
-            const key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.query_scale.v1.{d}.{d}", .{ layer, head_dim });
+            const key = try audioCacheConfig(cfg).towerKey(&key_buf, .query_scale, layer);
             var hit = if (cached) try cb.modelConstant(key, null) else null;
             errdefer if (hit) |tensor| cb.free(tensor);
             const host = if (hit != null) try allocator.alloc(f32, 0) else blk: {
@@ -3743,11 +3955,7 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
     values[3] = inputs.segment_starts orelse inputs.valid_ct;
     values[4] = inputs.segment_valid orelse inputs.valid_ct;
     @memcpy(values[5..17], inputs.scales);
-    var key = std.hash.Wyhash.init(0x616e74666c796175);
-    key.update(std.mem.sliceAsBytes(inputs.segments));
-    std.hash.autoHash(&key, .{ start, end });
-    std.hash.autoHash(&key, .{ cfg.audio_hidden, cfg.intermediate_size, cfg.head_count, cfg.conv_kernel_size, @as(u32, @bitCast(cfg.layer_norm_eps)), @as(u32, @bitCast(cfg.residual_weight)), cfg.attention_chunk_size, cfg.attention_context_left, @as(u32, @bitCast(cfg.attention_logit_cap)), @as(u32, @bitCast(cfg.attention_invalid_logits_value)), cfg.exclude_farthest_key });
-    return cb.audioExecution(key.final(), &values, &run, Run.call);
+    return cb.audioExecution(audioCacheConfig(cfg).key(inputs.segments, start, end), &values, &run, Run.call);
 }
 fn audioLayer(
     cb: *const ComputeBackend,
@@ -3953,7 +4161,7 @@ fn packedAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Proje
     const clipped = if (specs[0].clipsInput()) try clampScalarCt(cb, a, input, rows, width, specs[0].input_min, specs[0].input_max) else input;
     defer if (clipped != input) cb.free(clipped);
     const packed_rows = (try cb.linearPackedNamed(clipped, &.{ names[0], names[1], names[2] }, &.{ width, width, width }, rows, width)) orelse return null;
-    if (cb.vtable.gemma4AudioPackedAttention != null and !audioHostOps().attention and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV")) return .{ .interleaved = .{ .tensor = packed_rows, .specs = specs } };
+    if (cb.vtable.regions.audio_attention.packedLocalRelative != null and !audioHostOps().attention and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV")) return .{ .interleaved = .{ .tensor = packed_rows, .specs = specs } };
     defer cb.free(packed_rows);
     return .{ .separate = try splitAudioQkv(cb, a, packed_rows, rows, width, specs) };
 }
@@ -3986,7 +4194,7 @@ fn audioSelfAttention(
     const rows = valid_mask.len;
     var buf: [128]u8 = undefined;
     var key_buf: [192]u8 = undefined;
-    const rel_key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.relative_key.v1.{d}.{d}.{d}", .{ layer, cfg.attention_context_left, cfg.audio_hidden });
+    const rel_key = try audioCacheConfig(cfg).towerKey(&key_buf, .relative_key, layer);
     const cache_relative = store.gguf == null;
     const rel = if (cache_relative) (try cb.modelConstant(rel_key, null)) orelse blk: {
         const source = try linearNoBiasMaybeClipped(cb, allocator, store, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden);
@@ -4013,7 +4221,7 @@ fn audioSelfAttention(
                     }
                 }
                 const validity = if (params.segmented) inputs.segment_valid.? else inputs.valid_ct;
-                if (try cb.vtable.gemma4AudioPackedAttention.?(cb.ptr, interleaved.tensor, interleaved.tensor, interleaved.tensor, rel, inputs.scales[layer], validity, params)) |result| {
+                if (try cb.vtable.regions.audio_attention.packedLocalRelative.?(cb.ptr, interleaved.tensor, interleaved.tensor, interleaved.tensor, rel, inputs.scales[layer], validity, params)) |result| {
                     defer cb.free(result);
                     audioProfileMark(.attn_kernel);
                     return linearNoBiasMaybeClipped(cb, allocator, store, result, try fmt(&buf, "a.blk.{d}.attn_out", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);
@@ -4562,7 +4770,7 @@ fn depthwiseConvWeightCt(
         }
         fn call(self: @This()) !CT {
             var key_buf: [256]u8 = undefined;
-            const key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.depthwise.v1.{s}.{d}.{d}", .{ self.name, self.kernel_size, self.hidden });
+            const key = try AudioCacheRecipe.depthwiseKey(&key_buf, self.name, self.kernel_size, self.hidden);
             const cache = self.store.huggingface and !audioHostOps().resident and (self.cb.kind() == .metal or self.cb.kind() == .cuda);
             if (cache) if (try self.cb.modelConstant(key, null)) |hit| return hit;
             // CUDA resident checkpoint weights can be BF16, but transpose and
@@ -4585,7 +4793,8 @@ fn depthwiseConvWeightCt(
             }
             var weight = try self.store.tensorF32(self.name);
             defer weight.deinit();
-            if (weight.data.len != self.kernel_size * self.hidden or weight.shape.len < 2) return error.InvalidTensorShape;
+            const elements = try AudioCacheRecipe.validateDepthwiseSource(weight.shape, self.kernel_size, self.hidden, self.store.gguf == null);
+            if (weight.data.len != elements) return error.InvalidTensorShape;
             const d0: usize = @intCast(weight.shape[0]);
             const d1: usize = @intCast(weight.shape[1]);
             const shape = [_]i32{ @intCast(self.kernel_size), @intCast(self.hidden) };
@@ -5148,50 +5357,6 @@ fn patchEmbedBatchTensor(
     return cb.primReshape(transposed, &.{ @intCast(batch * patch_count), @intCast(cfg.vision_hidden) });
 }
 
-fn patchEmbedHuggingFaceCt(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, pixel_values: []const f32, geometry: Geometry) !CT {
-    const scaled = try allocator.dupe(f32, pixel_values);
-    defer allocator.free(scaled);
-    for (scaled) |*value| value.* = 2.0 * (value.* - 0.5);
-    return patchEmbedHuggingFaceScaledCt(cb, allocator, store, cfg, scaled, geometry);
-}
-
-fn patchEmbedHuggingFaceScaledCt(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, scaled_pixels: []const f32, geometry: Geometry) !CT {
-    const patch_count = geometry.grid_x * geometry.grid_y;
-    const patch_dim = cfg.patch_size * cfg.patch_size * 3;
-    const pixels = try allocator.alloc(f32, patch_count * patch_dim);
-    defer allocator.free(pixels);
-    for (0..geometry.grid_y) |gy| for (0..geometry.grid_x) |gx| {
-        const base = (gy * geometry.grid_x + gx) * patch_dim;
-        for (0..cfg.patch_size) |py| for (0..cfg.patch_size) |px| for (0..3) |channel| {
-            pixels[base + (py * cfg.patch_size + px) * 3 + channel] = scaled_pixels[channel * geometry.width * geometry.height + (gy * cfg.patch_size + py) * geometry.width + gx * cfg.patch_size + px];
-        };
-    };
-    const input = try cb.fromFloat32Shape(pixels, &.{ @intCast(patch_count), @intCast(patch_dim) });
-    defer cb.free(input);
-    const weight = try projectorLinearWeightCt(cb, allocator, store, "v.patch_embd.weight", patch_dim, cfg.vision_hidden);
-    return cb.linearNoBias(input, weight, patch_count, patch_dim, cfg.vision_hidden);
-}
-
-fn addHuggingFacePositionEmbeddingsCt(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, patches: CT, geometry: Geometry) !CT {
-    const table = try store.residentWeight("v.position_embd.weight");
-    defer cb.free(table);
-    const expected = [_]i64{ 2, @intCast(cfg.position_embeddings_per_axis), @intCast(cfg.vision_hidden) };
-    if (!((try cb.tensorShapeMatches(table, &expected)) orelse false)) return error.InvalidPositionEmbeddingShape;
-    const total = geometry.grid_x * geometry.grid_y;
-    const x_ids = try allocator.alloc(i64, total);
-    defer allocator.free(x_ids);
-    const y_ids = try allocator.alloc(i64, total);
-    defer allocator.free(y_ids);
-    fillHfPositionRowIds(x_ids, y_ids, geometry, cfg.position_embeddings_per_axis);
-    const x_pos = try cb.embeddingLookup(table, x_ids, total, cfg.vision_hidden);
-    defer cb.free(x_pos);
-    const y_pos = try cb.embeddingLookup(table, y_ids, total, cfg.vision_hidden);
-    defer cb.free(y_pos);
-    const position = try cb.add(x_pos, y_pos);
-    defer cb.free(position);
-    return cb.add(patches, position);
-}
-
 fn fillHfPositionRowIds(x_ids: []i64, y_ids: []i64, geometry: Geometry, positions_per_axis: usize) void {
     std.debug.assert(x_ids.len == geometry.grid_x * geometry.grid_y and y_ids.len == x_ids.len);
     for (0..geometry.grid_y) |y| for (0..geometry.grid_x) |x| {
@@ -5703,15 +5868,6 @@ fn rmsNormHeadChunksNoScale(
     return cb.fromFloat32Shape(input_data, &shape);
 }
 
-fn swapRopeQuarters(cb: *const ComputeBackend, input: CT, chunks: usize, head_dim: usize) !CT {
-    const shape = [_]i64{ @intCast(chunks), 2, 2, @intCast(head_dim / 4) };
-    const view = try cb.primReshape(input, &shape);
-    defer cb.free(view);
-    const swapped = try cb.primTranspose(view, &.{ 0, 2, 1, 3 }, &shape);
-    defer cb.free(swapped);
-    return cb.primReshape(swapped, &.{ @intCast(chunks), @intCast(head_dim) });
-}
-
 fn apply2dRope(
     data: []f32,
     rows: usize,
@@ -6118,37 +6274,6 @@ fn rmsNormNoScaleCt(
     };
     defer cb.free(weight);
     return cb.rmsNorm(input, weight, dim, eps);
-}
-
-fn applyOptionalStandardization(
-    allocator: std.mem.Allocator,
-    store: anytype,
-    pooled: []f32,
-    cfg: Config,
-) !void {
-    var scale = loadTensorF32(store, "v.std_scale") catch |err| switch (err) {
-        error.TensorNotFound => null,
-        else => return err,
-    };
-    var bias = loadTensorF32(store, "v.std_bias") catch |err| switch (err) {
-        error.TensorNotFound => null,
-        else => return err,
-    };
-    _ = allocator;
-    defer if (scale) |*s| s.deinit();
-    defer if (bias) |*b| b.deinit();
-    if (scale == null and bias == null) return;
-    if (scale == null or bias == null) return error.InvalidStandardizationTensorShape;
-    if (scale.?.data.len != cfg.vision_hidden or bias.?.data.len != cfg.vision_hidden) {
-        return error.InvalidStandardizationTensorShape;
-    }
-    const rows = pooled.len / cfg.vision_hidden;
-    for (0..rows) |row| {
-        const base = row * cfg.vision_hidden;
-        for (0..cfg.vision_hidden) |h| {
-            pooled[base + h] = (pooled[base + h] - bias.?.data[h]) * scale.?.data[h];
-        }
-    }
 }
 
 /// A 1-D projector tensor (norm weight, bias, scale) of `len` elements: the
@@ -7132,7 +7257,10 @@ test "gemma4 resident vision CUDA parity on hardware" {
     try populateGemma4VisionTestWeights(&weights);
     var reference = native.NativeCompute.init(allocator, &weights, null);
     defer reference.deinit();
-    var compute = try cuda.CudaCompute.init(allocator);
+    var compute = cuda.CudaCompute.init(allocator) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     try checkGemma4VisionResidency(compute.computeBackend(), reference.computeBackend());
 }
@@ -7628,7 +7756,10 @@ test "gemma4 video compact rows survive accumulator reuse on CUDA" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
     const cuda = @import("../ops/cuda/cuda_compute.zig");
-    var compute = try cuda.CudaCompute.init(a);
+    var compute = cuda.CudaCompute.init(a) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     const cb = compute.computeBackend();
     const values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
@@ -8268,7 +8399,10 @@ test "embeddinggemma2 CUDA BF16 depthwise preparation widens before transpose an
     var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
     defer store.deinitOwned();
     try populateBf16DepthwiseWeight(&store);
-    var compute = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.init(a);
+    var compute = @import("../ops/cuda/cuda_compute.zig").CudaCompute.init(a) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     compute.capability_profile = .embedding_gemma2;
     var it = store.resident_weights.iterator();
@@ -8346,7 +8480,7 @@ fn checkBatchedPatchPreparation(cb: ComputeBackend, _: ComputeBackend) !void {
     const actual = try cb.toFloat32(batch, a);
     defer a.free(actual);
     for (prepared, 0..) |item, i| {
-        const singleton = try prepareCudaImageHidden(&cb, a, &weights, cfg, item);
+        const singleton = try prepareCudaImageHidden(&cb, a, &weights, cfg, item, null);
         defer cb.free(singleton);
         const expected = try cb.toFloat32(singleton, a);
         defer a.free(expected);
@@ -9620,4 +9754,104 @@ test "gemma4 decoded PCM frontend matches encoded audio without codec work" {
     defer a.free(pcm_frames);
     try std.testing.expectEqualSlices(f32, encoded_frames, pcm_frames);
     try std.testing.expectEqualSlices(f32, encoded.samples, decoded.samples);
+}
+
+test "embedding video cache recipe shares actual140geometry and exact selected-frame token bound" {
+    const sequence: @import("../ops/cuda/video.zig").Sequence = .{ .width = 160, .height = 96, .coded_width = 160, .coded_height = 96, .surfaces = 4, .codec = 4, .display_left = 0, .display_top = 0, .matrix = 1, .full_range = 0 };
+    const actual = embeddingGemma2VideoGeometry(160, 96);
+    const full = embeddingGemma2VideoGeometryFull(160, 96);
+    const exact = 9 * (actual.tokens + 2) + 2;
+    const recipe = try embeddingGemma2VideoCacheRecipe(.{ .sequence = sequence, .samples = 9, .unique_frames = 9 }, exact);
+    try std.testing.expectEqual(actual.width, recipe.resize.target_width);
+    try std.testing.expectEqual(actual.height, recipe.resize.target_height);
+    try std.testing.expectEqual(full.grid_x, recipe.grid_x);
+    try std.testing.expectEqual(full.grid_y, recipe.grid_y);
+    try std.testing.expectEqual(@as(u6, 9), recipe.unique_frames);
+    try std.testing.expectError(error.EmbeddingInputTooLong, embeddingGemma2VideoCacheRecipe(.{ .sequence = sequence, .samples = 9, .unique_frames = 9 }, exact - 1));
+    try std.testing.expectError(error.InvalidPreparedVideoRecipe, embeddingGemma2VideoCacheRecipe(.{ .sequence = sequence, .samples = 0, .unique_frames = 0 }, exact));
+}
+
+test "video cold qualification preserves original row limit and independent wide aspect full partial eligibility" {
+    const Cache = @import("../ops/cuda/embedding_gemma2_execution.zig");
+    const Vision = @import("../ops/cuda/embedding_gemma2_vision.zig");
+    const original = embeddingGemma2VideoGeometryFull(160, 96);
+    try std.testing.expectEqual(@as(usize, 45), original.grid_x);
+    try std.testing.expectEqual(@as(usize, 27), original.grid_y);
+    const original_sequence = original.grid_x * original.grid_y;
+    try std.testing.expectEqual(@as(usize, 4860), 4 * original_sequence);
+    const empty: Cache.Cache = .{};
+    const rejected: @import("../ops/cuda/prepared_cache.zig").Arena = .{ .kind = .vision, .batch = 4, .sequence = original_sequence, .grid_x = original.grid_x, .grid_y = original.grid_y, .sizes = try Vision.scratchSizes(4 * original_sequence, true, true) };
+    try std.testing.expect(try empty.selectArena(rejected) == null);
+    var partial = rejected;
+    partial.batch = 2;
+    partial.sizes = try Vision.scratchSizes(2 * original_sequence, true, true);
+    try std.testing.expect(try empty.selectArena(partial) != null);
+    const wide = embeddingGemma2VideoGeometryFull(2048, 128);
+    try std.testing.expectEqual(@as(usize, 141), wide.grid_x);
+    try std.testing.expectEqual(@as(usize, 6), wide.grid_y);
+    for ([_]usize{ 4, 2 }) |batch| {
+        const sequence = wide.grid_x * wide.grid_y;
+        const request: @import("../ops/cuda/prepared_cache.zig").Arena = .{ .kind = .vision, .batch = batch, .sequence = sequence, .grid_x = wide.grid_x, .grid_y = wide.grid_y, .sizes = try Vision.scratchSizes(batch * sequence, true, true) };
+        const selected = (try empty.selectArena(request)).?;
+        try std.testing.expect(selected.bytes <= Cache.arena_limit);
+        try std.testing.expect(batch * sequence <= Cache.graph_rows_limit);
+    }
+}
+
+fn checkPromptImageInputOwnership(a: std.mem.Allocator) !void {
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const expected = [_]f32{ 1, 2, 3, 4 };
+    // Adoption/destruction operate on actual allocated producer payloads. No
+    // producer is invoked, so the unused borrowed projector is never accessed.
+    inline for (.{ false, true }) |resident| {
+        var input = PromptImageInput{ .backend = &cb, .allocator = a, .projector = undefined, .images = &.{}, .data = .empty };
+        defer input.deinit();
+        var counts: ?[]usize = try a.dupe(usize, &.{2});
+        defer if (counts) |value| a.free(value);
+        if (resident) {
+            var tensor: ?CT = try cb.fromFloat32Shape(&expected, &.{ 2, 2 });
+            defer if (tensor) |value| cb.free(value);
+            input.data = .{ .resident = .{ .allocator = a, .backend = &cb, .embeddings = tensor.?, .tokens_per_image = counts.?, .hidden_size = 2, .batches_executed = 1, .max_batch_executed = 1 } };
+            tensor = null;
+        } else {
+            var values: ?[]f32 = try a.dupe(f32, &expected);
+            defer if (values) |value| a.free(value);
+            input.data = .{ .host = .{ .allocator = a, .embeddings = values.?, .tokens_per_image = counts.?, .hidden_size = 2 } };
+            values = null;
+        }
+        counts = null;
+        const rows = (try input.rows()).?;
+        try std.testing.expectEqualSlices(usize, &.{2}, rows.rows_per_item);
+        try std.testing.expectEqual(@as(usize, 2), rows.width);
+        if (resident) {
+            try std.testing.expect(rows.source == .resident);
+            // The host-phase cleanup does not shorten resident payload life.
+            input.releaseHost();
+            const values = try cb.toFloat32((try input.rows()).?.source.resident, a);
+            defer a.free(values);
+            try std.testing.expectEqualSlices(f32, &expected, values);
+        } else {
+            try std.testing.expect(rows.source == .host);
+            try std.testing.expectEqualSlices(f32, &expected, rows.source.host);
+            input.releaseHost();
+            input.releaseHost();
+            try std.testing.expect((try input.rows()) == null);
+        }
+        input.deinit();
+        try std.testing.expect((try input.rows()) == null);
+    }
+    var pending = PromptImageInput{ .backend = &cb, .allocator = a, .projector = undefined, .images = &.{}, .data = .host_pending };
+    defer pending.deinit();
+    try std.testing.expectError(error.ProjectedInputNotPrepared, pending.rows());
+    pending.deinit();
+    try std.testing.expect((try pending.rows()) == null);
+}
+
+test "typed prompt image input preserves actual host resident phase lifetimes and allocation failure ownership" {
+    try checkPromptImageInputOwnership(std.testing.allocator);
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, checkPromptImageInputOwnership, .{});
 }

@@ -21,6 +21,11 @@ from pathlib import Path
 from unittest import mock
 import copy
 import unittest
+import json
+import base64
+import hashlib
+import tempfile
+import types
 
 if __package__:
     from . import compare
@@ -29,6 +34,113 @@ else:
 
 
 class ComparisonContracts(unittest.TestCase):
+    def test_text_prepare_never_reads_or_hashes_media(self):
+        tokenizer = mock.Mock()
+        tokenizer.encode.side_effect = lambda text: types.SimpleNamespace(ids=list(range(len(text.split()))))
+        package = types.SimpleNamespace(Tokenizer=mock.Mock())
+        package.Tokenizer.from_file.return_value = tokenizer
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "text-suite.json"
+            # No artifacts directory, media oracle, image or audio exists.
+            with mock.patch.dict(sys.modules, {"tokenizers": package}), mock.patch.object(compare.reference, "sha256", side_effect=AssertionError("media hash attempted")):
+                compare.prepare(root, None, output, text_only=True)
+            suite = json.loads(output.read_text())
+        self.assertEqual(suite["evaluation_scope"], "text-only")
+        self.assertEqual(suite["assets"], {})
+        self.assertEqual(suite["case_selection"], [case["name"] for case in suite["cases"]])
+        self.assertTrue(all("text" in case and "oracle" not in case for case in suite["cases"]))
+        self.assertEqual([len(case["token_ids"]) for case in suite["cases"][2:5]], [128, 512, 8192])
+        self.assertIn("decision", suite)
+        self.assertIn("retrieval", suite)
+
+    def test_prepare_cli_allows_absent_artifacts_only_with_explicit_text_scope(self):
+        argv = ["compare.py", "--backend", "prepare", "--model-dir", "model", "--output", "suite.json"]
+        with mock.patch.object(sys, "argv", argv + ["--text-only"]), mock.patch.object(compare, "prepare") as prepared:
+            compare.main()
+            prepared.assert_called_once_with(Path("model"), None, Path("suite.json"), True)
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(compare, "prepare") as prepared:
+            with self.assertRaises(SystemExit):
+                compare.main()
+            prepared.assert_not_called()
+
+    def test_full_prepare_still_requires_real_media_oracle(self):
+        tokenizer = mock.Mock()
+        tokenizer.encode.side_effect = lambda text: types.SimpleNamespace(ids=list(range(len(text.split()))))
+        package = types.SimpleNamespace(Tokenizer=mock.Mock())
+        package.Tokenizer.from_file.return_value = tokenizer
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(sys.modules, {"tokenizers": package}):
+            root = Path(directory)
+            with self.assertRaises(FileNotFoundError):
+                compare.prepare(root, root / "missing-media", root / "suite.json")
+            self.assertFalse((root / "suite.json").exists())
+
+    def test_text_scope_retains_unknown_duplicate_and_media_selection_errors(self):
+        text = {"name": "query", "text": "x", "token_ids": [1]}
+        media = {"name": "image", "token_ids": [2]}
+        suite = {"cases": [text, media]}
+        self.assertEqual(compare.select_cases(suite, None, text_only=True)["cases"], [text])
+        self.assertEqual(compare.select_cases(suite, ["query"], text_only=True)["cases"], [text])
+        for names in (["missing"], ["query", "query"], ["image"], ["image", "query"]):
+            with self.subTest(names=names), self.assertRaises(ValueError):
+                compare.select_cases(suite, names, text_only=True)
+        with self.assertRaises(ValueError):
+            compare.select_cases({"cases": [media]}, None, text_only=True)
+        # Default full mode still selects actual media.
+        self.assertEqual(compare.select_cases(suite, ["image"])["cases"], [media])
+
+    def test_text_torch_media_boundary_imports_nothing_optional(self):
+        with mock.patch("builtins.__import__", side_effect=AssertionError("optional media import")):
+            self.assertEqual(compare.load_torch_media(Path("model"), {"cases": [{"name": "text", "text": "x"}]}), (None, None, None))
+            with self.assertRaises(ValueError):
+                compare.load_torch_media(Path("model"), {"cases": [{"name": "unknown"}]})
+
+    def test_image_only_media_boundary_does_not_import_or_open_audio(self):
+        image = mock.Mock()
+        image.open.return_value.convert.return_value = "actual-image"
+        processor = mock.Mock()
+        processor.from_pretrained.return_value = "actual-processor"
+        original_import = __import__
+        def import_guard(name, *args, **kwargs):
+            if name in ("wave", "numpy"):
+                raise AssertionError("unselected audio dependency")
+            return original_import(name, *args, **kwargs)
+        for name in ("image", "text_image", "image_text"):
+            with self.subTest(name=name):
+                image.reset_mock()
+                processor.reset_mock()
+                suite = {"cases": [{"name": name}], "assets": {"image.png": {"path": "image-path"}}}
+                with mock.patch.dict(sys.modules, {"PIL": types.SimpleNamespace(Image=image), "transformers": types.SimpleNamespace(AutoProcessor=processor)}), mock.patch("builtins.__import__", side_effect=import_guard):
+                    self.assertEqual(compare.load_torch_media(Path("model"), suite), ("actual-processor", "actual-image", None))
+                image.open.assert_called_once_with("image-path")
+                processor.from_pretrained.assert_called_once_with(Path("model"), local_files_only=True)
+
+    def test_image_content_order_and_integrity_need_no_unselected_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "image.png"
+            payload = b"exact transported image bytes"
+            image.write_bytes(payload)
+            suite = {"assets": {"image.png": {"path": str(image), "sha256": hashlib.sha256(payload).hexdigest()}}}
+            for name, order in (("image", ["media"]), ("text_image", ["text", "media"]), ("image_text", ["media", "text"])):
+                with self.subTest(name=name):
+                    parts = compare.media_parts(suite, name)
+                    self.assertEqual([part["type"] for part in parts], order)
+                    media = next(part for part in parts if part["type"] == "media")
+                    self.assertEqual(base64.b64decode(media["data"]), payload)
+                    self.assertEqual(media["mime_type"], "image/png")
+                    if name != "image":
+                        self.assertEqual(next(part for part in parts if part["type"] == "text")["text"], "Describe this image.")
+            image.write_bytes(b"changed")
+            for name in ("image", "text_image", "image_text"):
+                with self.subTest(changed=name), self.assertRaisesRegex(ValueError, "media asset changed"):
+                    compare.media_parts(suite, name)
+
+    def test_selected_media_still_fails_without_requested_asset(self):
+        processor = mock.Mock()
+        with mock.patch.dict(sys.modules, {"PIL": types.SimpleNamespace(Image=mock.Mock()), "transformers": types.SimpleNamespace(AutoProcessor=processor)}):
+            with self.assertRaises(KeyError):
+                compare.load_torch_media(Path("model"), {"cases": [{"name": "image"}], "assets": {}})
+
     def test_post_declares_bounded_inference_budget_and_transport_timeout(self):
         with mock.patch.object(
             compare.urllib.request, "urlopen", return_value=io.BytesIO(b'{"ok":true}')
@@ -266,6 +378,184 @@ class PrecisionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 compare.execution_precision(backend, "bfloat16")
 
+
+
+class PlatformObservationContracts(unittest.TestCase):
+    def test_linux_swap_counters_have_two_real_fields(self):
+        with mock.patch.object(compare.sys, "platform", "linux"), mock.patch.object(
+            compare.Path, "read_text", return_value="pswpin 7\npswpout 11\npgpgout 99\n"
+        ), mock.patch.object(compare.subprocess, "check_output") as commands:
+            self.assertEqual(compare.vm_counter_order(), ["pswpin", "pswpout"])
+            self.assertEqual(compare.vm_counters(), [7, 11])
+            commands.assert_not_called()
+        with mock.patch.object(compare.sys, "platform", "linux"), mock.patch.object(
+            compare.Path, "read_text", return_value="pswpin 7\n"
+        ), self.assertRaises(ValueError):
+            compare.vm_counters()
+
+    def test_darwin_counter_order_and_commands_are_preserved(self):
+        with mock.patch.object(compare.sys, "platform", "darwin"), mock.patch.object(
+            compare.subprocess, "check_output", return_value="Pageouts: 2.\nSwapins: 3.\nSwapouts: 4.\n"
+        ) as command:
+            self.assertEqual(compare.vm_counter_order(), ["pageouts", "swapins", "swapouts"])
+            self.assertEqual(compare.vm_counters(), [2, 3, 4])
+            self.assertEqual(command.call_args.args[0], ["vm_stat"])
+
+    def test_linux_conditions_observe_host_swap_affinity_and_nested_quota(self):
+        files = {
+            "/proc/vmstat": "pswpin 7\npswpout 11\n",
+            "/proc/meminfo": "MemTotal: 1000 kB\nSwapTotal: 200 kB\nSwapFree: 150 kB\n",
+            "/proc/cpuinfo": "processor : 0\nmodel name : fixture CPU\n",
+            "/proc/sys/kernel/random/boot_id": "fixture-boot",
+            "/proc/self/cgroup": "0::/fixture\n",
+            "/sys/fs/cgroup/cpu.max": "max 100000",
+            "/sys/fs/cgroup/fixture/cpu.max": "200000 100000",
+        }
+        with mock.patch.object(compare.sys, "platform", "linux"), mock.patch.object(
+            compare.Path, "read_text", autospec=True, side_effect=lambda path: files[str(path)]
+        ), mock.patch.object(compare.Path, "is_file", autospec=True, side_effect=lambda path: str(path) in files), mock.patch.object(
+            compare.os, "sched_getaffinity", create=True, return_value={1, 3}
+        ), mock.patch.object(compare.subprocess, "check_output") as commands:
+            result = compare.conditions("native")
+        commands.assert_not_called()
+        self.assertEqual(result["swap"], {"total_bytes": 200 * 1024, "free_bytes": 150 * 1024})
+        self.assertEqual(result["host_identity"]["boot_id"], "fixture-boot")
+        self.assertEqual(result["thread_budget"]["affinity"], [1, 3])
+        self.assertEqual(len(result["thread_budget"]["cgroup_cpu_max"]), 2)
+        self.assertEqual(result["device_identity"], {"status": "observed", "kind": "cpu"})
+
+    def test_cuda_requires_observed_sole_device_driver_and_visibility(self):
+        row = "GPU-fixture, Example GPU, 580.1, 0000:01:00.0, 1000\n"
+        with mock.patch.dict(compare.os.environ, {}, clear=True), mock.patch.object(
+            compare.subprocess, "check_output", return_value=row
+        ) as command:
+            result = compare.cuda_identity()
+            self.assertEqual(result["status"], "observed")
+            self.assertEqual(result["driver_version"], "580.1")
+            self.assertEqual(command.call_args.kwargs["timeout"], 10)
+        for missing in ("N/A", "[N/A]"):
+            with mock.patch.dict(compare.os.environ, {}, clear=True), mock.patch.object(
+                compare.subprocess, "check_output", return_value=row.replace("1000", missing)
+            ):
+                observed = compare.cuda_identity()
+                self.assertEqual(observed["status"], "observed")
+                self.assertIsNone(observed["memory_mib"])
+                self.assertEqual(observed["memory_capacity_status"], "unavailable")
+                self.assertIn(missing, observed["query_output"])
+        for output in ("", row + row, "GPU-fixture, name, , pci, N/A\n", row.replace("1000", "unknown"), row.replace("1000", "0")):
+            with mock.patch.object(compare.subprocess, "check_output", return_value=output):
+                self.assertEqual(compare.cuda_identity()["status"], "unavailable")
+        with mock.patch.object(compare.subprocess, "check_output", side_effect=FileNotFoundError()):
+            self.assertEqual(compare.cuda_identity()["status"], "unavailable")
+        with mock.patch.dict(compare.os.environ, {"CUDA_VISIBLE_DEVICES": "1"}), mock.patch.object(
+            compare.subprocess, "check_output", return_value=row
+        ):
+            self.assertEqual(compare.cuda_identity()["status"], "unavailable")
+
+    def test_metal_requires_actual_single_gpu_inventory(self):
+        with mock.patch.object(compare.subprocess, "check_output", return_value='{"SPDisplaysDataType":[{"sppci_model":"Apple fixture","spdisplays_metal":"supported"}]}'):
+            self.assertEqual(compare.metal_identity()["status"], "observed")
+        with mock.patch.object(compare.subprocess, "check_output", return_value='{"SPDisplaysDataType":[]}'):
+            self.assertEqual(compare.metal_identity()["status"], "unavailable")
+
+
+
+class AssetRelocationContracts(unittest.TestCase):
+    def test_selected_media_relocates_without_mutating_suite_or_unused_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            payload = b"exact original image bytes"
+            (root / "image.png").write_bytes(payload)
+            suite = {"revision": compare.reference.REVISION, "cases": [
+                {"name": "text", "text": "unchanged", "token_ids": [1]},
+                {"name": "image", "token_ids": [2], "oracle": [0.25, 0.75]},
+                {"name": "audio", "token_ids": [3]}],
+                "assets": {"image.png": {"path": "/old-machine/image.png", "sha256": hashlib.sha256(payload).hexdigest()},
+                           "audio.wav": {"path": "/unselected/audio.wav", "sha256": "0" * 64}}}
+            before = copy.deepcopy(suite)
+            selected = compare.select_cases(suite, ["image"])
+            with mock.patch.object(compare.reference, "sha256", wraps=compare.reference.sha256) as hashed:
+                relocated, proof = compare.relocate_assets(selected, root)
+            self.assertEqual(suite, before)
+            self.assertIs(relocated["cases"], selected["cases"])
+            self.assertEqual(relocated["cases"][0]["oracle"], [0.25, 0.75])
+            self.assertEqual(relocated["assets"]["image.png"]["path"], str(root / "image.png"))
+            self.assertEqual(relocated["assets"]["audio.wav"], suite["assets"]["audio.wav"])
+            self.assertEqual(hashed.call_args_list, [mock.call(root / "image.png")])
+            self.assertTrue(proof["applied"])
+            self.assertEqual(proof["assets"][0]["original_path"], "/old-machine/image.png")
+            self.assertEqual(base64.b64decode(compare.media_parts(relocated, "image")[0]["data"]), payload)
+
+    def test_default_and_selected_text_scope_never_resolve_or_hash_assets(self):
+        suite = {"cases": [{"name": "text", "text": "unchanged"}], "assets": {"unsafe/unused": {}}}
+        with mock.patch.object(compare.reference, "sha256", side_effect=AssertionError("asset hash in text scope")), mock.patch.object(Path, "resolve", side_effect=AssertionError("asset path in text scope")):
+            self.assertEqual(compare.relocate_assets(suite, None), (suite, None))
+            relocated, proof = compare.relocate_assets(suite, Path("missing-root"))
+        self.assertIs(relocated, suite)
+        self.assertFalse(proof["applied"])
+        self.assertEqual(proof["assets"], [])
+
+    def test_media_relocation_rejects_unsafe_unknown_names_and_unknown_cases(self):
+        for name in ("../image.png", "/image.png", "nested/image.png", "nested\\image.png", "video.mp4"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "unsafe or unsupported"):
+                compare.relocate_assets({"cases": [{"name": "image"}], "assets": {name: {}}}, Path("unused"))
+        with self.assertRaisesRegex(ValueError, "does not support"):
+            compare.relocate_assets({"cases": [{"name": "unimplemented-media"}], "assets": {}}, Path("unused"))
+
+    def test_relocation_requires_exact_payload_and_rejects_symlink_or_missing_asset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            payload = b"actual pinned bytes"
+            suite = {"cases": [{"name": "image"}], "assets": {"image.png": {"path": "/old-machine/image.png", "sha256": hashlib.sha256(payload).hexdigest()}}}
+            for declaration in (None, {}, {"path": "x", "sha256": "G" * 64}):
+                with self.subTest(declaration=declaration), self.assertRaisesRegex(ValueError, "declaration"):
+                    compare.relocate_assets(dict(suite, assets={"image.png": declaration}), root)
+            with self.assertRaisesRegex(ValueError, "missing"):
+                compare.relocate_assets(suite, root)
+            path = root / "image.png"
+            path.write_bytes(b"different payload")
+            with self.assertRaisesRegex(ValueError, "changed"):
+                compare.relocate_assets(suite, root)
+            path.unlink()
+            other = root / "other.png"
+            other.write_bytes(payload)
+            path.symlink_to(other)
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                compare.relocate_assets(suite, root)
+
+    def test_runtime_cli_keeps_original_suite_bytes_sha_and_records_relocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            assets = root / "assets"
+            assets.mkdir()
+            payload = b"transported exact image bytes"
+            (assets / "image.png").write_bytes(payload)
+            model = root / "model"
+            model.mkdir()
+            (model / "embeddinggemma2_receipt.json").write_text("{}")
+            suite_path = root / "suite.json"
+            raw = json.dumps({"revision": compare.reference.REVISION, "cases": [{"name": "image", "token_ids": [2], "oracle": [1.0, 0.0]}], "assets": {"image.png": {"path": "/other-host/image.png", "sha256": hashlib.sha256(payload).hexdigest()}}}, indent=3).encode()
+            suite_path.write_bytes(raw)
+            output = root / "result.json"
+            def native(args, suite, result):
+                self.assertEqual(suite["assets"]["image.png"]["path"], str(assets / "image.png"))
+                self.assertEqual(suite["cases"][0]["oracle"], [1.0, 0.0])
+                result["cases"] = {"image": {"vector": [1.0, 0.0]}}
+            argv = ["compare.py", "--backend", "native", "--model-dir", str(model), "--binary", str(root / "image"), "--suite", str(suite_path), "--asset-root", str(assets), "--output", str(output), "--iterations", "1", "--warmups", "0"]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(compare, "native", side_effect=native), mock.patch.object(compare, "conditions", return_value={}):
+                compare.main()
+            result = json.loads(output.read_text())
+            self.assertEqual(suite_path.read_bytes(), raw)
+            self.assertEqual(result["suite_sha256"], hashlib.sha256(raw).hexdigest())
+            self.assertTrue(result["asset_relocation"]["applied"])
+            self.assertEqual(result["asset_relocation"]["assets"][0]["sha256"], hashlib.sha256(payload).hexdigest())
+            self.assertEqual(result["status"], "pass")
+
+    def test_prepare_rejects_runtime_asset_root_without_preparation(self):
+        argv = ["compare.py", "--backend", "prepare", "--model-dir", "model", "--output", "out", "--text-only", "--asset-root", "assets"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(compare, "prepare") as prepared, self.assertRaises(SystemExit):
+            compare.main()
+        prepared.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

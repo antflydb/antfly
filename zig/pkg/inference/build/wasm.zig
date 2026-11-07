@@ -43,6 +43,11 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
     const b = ctx.b;
     const is_wasm64 = std.mem.eql(u8, ctx.backend.wasm_memory_model, "wasm64");
     const wasm_target = resolveTarget(ctx);
+    const wasm_tile_mod = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/tile/src/mod.zig" })),
+        .target = wasm_target,
+        .optimize = .safe,
+    });
     const wasm_root = if (is_wasm64)
         "src/wasm_entry_wasm64.zig"
     else
@@ -156,6 +161,8 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
     wasm_lib.root_module.addImport("antfly_media", wasm_audio_mod.import_table.get("antfly_media").?);
     wasm_lib.root_module.addImport("inference_tokenizer", wasm_tokenizer_mod);
     wasm_lib.root_module.addImport("inference_hf_tokenizer", wasm_hf_tokenizer_mod);
+    wasm_linalg_mod.addImport("antfly_tile", wasm_tile_mod);
+    wasm_lib.root_module.addImport("antfly_tile", wasm_tile_mod);
     wasm_lib.root_module.addImport("inference_linalg", wasm_linalg_mod);
     wasm_lib.root_module.addImport("antfly_image", wasm_image_mod);
     @import("antfly_video").support.attach(b, wasm_lib.root_module, b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/video" })), .{
@@ -176,6 +183,12 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
     });
     wasm_lib.root_module.addImport("antfly_document_runs", wasm_document_runs_mod);
     wasm_lib.root_module.addImport("antfly_platform", wasm_platform_mod);
+    wasm_lib.root_module.addImport("antfly_document_runs", b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/readers/src/document_runs.zig" })),
+        .target = wasm_target,
+        .optimize = .safe,
+        .single_threaded = true,
+    }));
     const wasm_decisions_mod = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/decisions/root.zig" })),
         .target = wasm_target,

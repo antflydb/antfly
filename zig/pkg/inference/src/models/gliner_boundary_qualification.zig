@@ -317,6 +317,22 @@ const fastino_gliner25_base_v1_lengths = LengthContract{
     .padded_sequence_tokens = .{ .min = 14, .max = 218 },
 };
 
+// Bare-entity overlap_allow is the same already-qualified span/head arithmetic
+// followed by the shared decoder's keep-all postprocess. The independent
+// base_overlap_allow_reference.json binds the original CPU source, exact base
+// weights, six cross-label entities and their scores. Hardware acceptance of
+// this extension is tracked separately from the historical flat evidence.
+// Keep the existing base geometry envelope; do not widen precision/backend or
+// mixed/specialty feature combinations through the shared base feature array.
+const base_overlap_allow_features = Features.initMany(&.{
+    .entities,          .decoder_auto,  .word_whitespace, .overlap_allow,
+    .offset_codepoints, .single_window, .confidence,      .spans,
+});
+const base_overlap_allow_entries = [_]Entry{
+    .{ .identity = fastino_gliner25_base_v1, .backend = .native, .features = base_overlap_allow_features, .lengths = fastino_gliner25_base_v1_lengths },
+    .{ .identity = fastino_gliner25_base_v1, .backend = .metal, .features = base_overlap_allow_features, .lengths = fastino_gliner25_base_v1_lengths },
+};
+
 // Long-document windowed execution, reviewed 2026-09-18. Evidence:
 //
 //  - Design: gliner_boundary_long_executor.zig's executor tokenizes and
@@ -785,7 +801,7 @@ fn metalBatchEntries() [2 + family_profiles.len]Entry {
     for (&entries) |*entry| entry.lengths.request_items = .{ .min = 2, .max = metal_batch_items };
     return entries;
 }
-const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries() ++ composed_window_entries ++ transformersWrapperEntries() ++ cuda_base_entries ++ cudaMultilingualEntries() ++ cudaBatchEntries() ++ metalBatchEntries());
+const production_entries: []const Entry = &(base_production_entries ++ base_overlap_allow_entries ++ multilingualEntries() ++ composed_window_entries ++ transformersWrapperEntries() ++ cuda_base_entries ++ cudaMultilingualEntries() ++ cudaBatchEntries() ++ metalBatchEntries());
 
 comptime {
     // Each entry's five digests are hex-validated one character at a time
@@ -1426,4 +1442,93 @@ test "Metal boundary FP32 batch rows retain per-item geometry and reject unquali
     var long = composed_window_lengths;
     long.request_items = Range.exact(2);
     try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, require(fastino_gliner25_base_v1, .metal, composed_window_features, long));
+}
+
+test "base allow-overlap qualification preserves exact identity backend features and original geometry bounds" {
+    const a = std.testing.allocator;
+    const fixture = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(a, "base_overlap_allow_reference.json");
+    defer a.free(fixture);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(fixture, &digest, .{});
+    try std.testing.expectEqualStrings("abb3791b6c4ba363cd6cb47a492c05f7fa3c49ee2869b7566484218062e0c98d", &std.fmt.bytesToHex(digest, .lower));
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, fixture, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    const captured_model = object.get("model").?.object;
+    try std.testing.expectEqualStrings("72ac19b486cd4557424c8d61114e7530c243e9b0", captured_model.get("revision").?.string);
+    try std.testing.expectEqualStrings(&fastino_gliner25_base_v1.weight.sha256, captured_model.get("files").?.object.get("model.safetensors").?.object.get("sha256").?.string);
+    try std.testing.expectEqualStrings("3c913c7369301133d3b7699252074c4303ada50e", object.get("reference").?.object.get("source_revision").?.string);
+    const request_json = try std.json.Stringify.valueAlloc(a, object.get("request").?, .{});
+    defer a.free(request_json);
+    var request = try @import("../extractors/extraction_v2.zig").parseJson(a, request_json, .{});
+    defer request.deinit();
+    const required = try @import("../extractors/gliner_boundary_qualification.zig").requiredFeatures(&request, null);
+    inline for (@typeInfo(Feature).@"enum".field_values) |value| {
+        const feature: Feature = @fromBackingInt(value);
+        try std.testing.expectEqual(base_overlap_allow_features.contains(feature), required.contains(feature));
+    }
+    for ([_]Backend{ .native, .metal }) |backend| {
+        try require(fastino_gliner25_base_v1, backend, required, fastino_gliner25_base_v1_lengths);
+        var mixed = required;
+        mixed.insert(.classification_single);
+        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(fastino_gliner25_base_v1, backend, mixed));
+        mixed = required;
+        mixed.insert(.schema_descriptions);
+        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(fastino_gliner25_base_v1, backend, mixed));
+        var oversized = fastino_gliner25_base_v1_lengths;
+        oversized.document_bytes = Range.exact(oversized.document_bytes.max + 1);
+        try std.testing.expectError(error.GlinerBoundaryDocumentBytesLimitExceeded, require(fastino_gliner25_base_v1, backend, required, oversized));
+        oversized = fastino_gliner25_base_v1_lengths;
+        oversized.padded_sequence_tokens = Range.exact(oversized.padded_sequence_tokens.max + 1);
+        try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(fastino_gliner25_base_v1, backend, required, oversized));
+        for ([_]bundle.Identity{ fastino_gliner25_base_v1_fp16_encoder, fastino_gliner25_base_v1_transformers, fastino_gliner25_multi_v1, fastino_gliner25_multi_decide }) |other|
+            try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(other, backend, required));
+        var changed = fastino_gliner25_base_v1;
+        changed.weight.sha256[0] = '0';
+        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(changed, backend, required));
+    }
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(fastino_gliner25_base_v1, .cuda, required));
+    // Each label is decoded separately: overlapping cross-label source spans
+    // survive independently, exactly as the original public reference records.
+    const decode = @import("../pipelines/gliner_boundary_decode.zig");
+    const entities = object.get("expected_entities").?.array.items;
+    try std.testing.expectEqual(@as(usize, 6), entities.len);
+    const text = request.items[0].text;
+    var overlap = false;
+    for (entities, 0..) |entity, i| {
+        const entry = entity.object;
+        const span_start: usize = @intCast(entry.get("start").?.integer);
+        const span_end: usize = @intCast(entry.get("end").?.integer);
+        try std.testing.expectEqualStrings(entry.get("text").?.string, text[span_start..span_end]);
+        const candidates = [_]decode.Candidate{.{ .start = span_start, .end = span_end, .probability = @floatCast(entry.get("score").?.float), .source_index = i }};
+        const selected = try decode.resolveOverlaps(a, &candidates, .allow, .{});
+        defer a.free(selected);
+        try std.testing.expectEqualSlices(decode.Candidate, &candidates, selected);
+        for (entities[0..i]) |prior| {
+            const other_start: usize = @intCast(prior.object.get("start").?.integer);
+            const other_end: usize = @intCast(prior.object.get("end").?.integer);
+            overlap = overlap or @max(span_start, other_start) < @min(span_end, other_end);
+        }
+    }
+    try std.testing.expect(overlap);
+}
+
+test "allow-overlap postprocess retains bounded crossings nesting adjacency and exact tie order" {
+    const a = std.testing.allocator;
+    const decode = @import("../pipelines/gliner_boundary_decode.zig");
+    const candidates = [_]decode.Candidate{
+        .{ .start = 0, .end = 10, .probability = 0.5, .source_index = 0 },
+        .{ .start = 0, .end = 4, .probability = 0.75, .source_index = 1 },
+        .{ .start = 3, .end = 8, .probability = 0.75, .source_index = 2 },
+        .{ .start = 0, .end = 10, .probability = 1, .source_index = 3 },
+        .{ .start = 10, .end = 12, .probability = 0.5, .source_index = 4 },
+    };
+    const selected = try decode.resolveOverlaps(a, &candidates, .allow, .{ .max_candidates = candidates.len });
+    defer a.free(selected);
+    try std.testing.expectEqual(@as(usize, 4), selected.len);
+    for (selected, [_]usize{ 3, 1, 2, 4 }) |entry, expected| try std.testing.expectEqual(expected, entry.source_index);
+    try std.testing.expectError(error.ExtractionCandidateLimitExceeded, decode.resolveOverlaps(a, &candidates, .allow, .{ .max_candidates = candidates.len - 1 }));
+    var invalid = candidates;
+    invalid[0].probability = std.math.nan(f32);
+    try std.testing.expectError(error.NonFiniteBoundaryScore, decode.resolveOverlaps(a, &invalid, .allow, .{}));
 }

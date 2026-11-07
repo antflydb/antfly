@@ -143,6 +143,11 @@ test "friendly alias refs parse as public model refs" {
         if (!std.mem.eql(u8, entry.alias, "bge-m3")) try std.testing.expect(!std.mem.eql(u8, "auto", ref.variant));
         if (std.mem.eql(u8, entry.alias, "bge-m3")) {
             try std.testing.expectEqualStrings("auto", ref.variant);
+        } else if (std.mem.startsWith(u8, entry.alias, "lightonocr3-")) {
+            const selection = try download.parseVariantRevision(ref.variant);
+            try std.testing.expectEqualStrings("safetensors", selection.variant);
+            try std.testing.expect(selection.revision != null);
+            try std.testing.expect(immutableHubRevision(selection.revision.?));
         } else {
             try std.testing.expectEqualStrings("gguf", ref.variant);
         }

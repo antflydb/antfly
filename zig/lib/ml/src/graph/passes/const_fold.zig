@@ -1155,7 +1155,7 @@ fn rebuild(
 
     // Return id_map trimmed to original count for caller use.
     const caller_map = try allocator.alloc(NodeId, orig_count);
-    @memcpy(caller_map, id_map[0..orig_count]);
+    for (caller_map, 0..) |*id, i| id.* = id_map[resolve(redirect, @intCast(i))];
     allocator.free(id_map);
 
     return .{ .graph = new_graph, .id_map = caller_map, .num_folded = num_folded };

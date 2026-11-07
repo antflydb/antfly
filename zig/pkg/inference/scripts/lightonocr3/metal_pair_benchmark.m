@@ -989,7 +989,7 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
     if(pair_variant>=56&&pair_variant<=62){
         static id<MTLComputePipelineState>pipelines[7];termite_metal_decode_runtime*r=pair_runtime;
         if(!pipelines[0]){MTLCompileOptions*o=[MTLCompileOptions new];o.languageVersion=MTLLanguageVersion4_0;o.mathMode=MTLMathModeSafe;NSError*err=nil;
-            id<MTLLibrary>lib=[r->device newLibraryWithSource:[termite_metal_lightonocr3_tensor_source() stringByAppendingString:pair_prefill_source()] options:o error:&err];
+            id<MTLLibrary>lib=[r->device newLibraryWithSource:[termite_metal_tensor_program_source() stringByAppendingString:pair_prefill_source()] options:o error:&err];
             if(!lib){fprintf(stderr,"prefill TG: %s\n",err.localizedDescription.UTF8String);return -1;}
             for(size_t i=0;i<7;i++)pipelines[i]=termite_metal_make_pipeline(r->device,lib,[NSString stringWithFormat:@"pair_prefill_gate%zu_%zu_%zu",i<3?4ul<<i:8ul<<((i-3)%2),i<3?16ul:32ul,i<5?8ul:16ul]);
         }
@@ -1188,13 +1188,13 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
             @"\n#define G(N) kernel void pair_gate##N(device float*x[[buffer(0)]],device "
             @"bfloat*g[[buffer(1)]],device bfloat*u[[buffer(2)]],device float*gb[[buffer(3)]],device "
             @"float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant Params&p[[buffer(6)]],uint2 "
-            @"group[[threadgroup_position_in_grid]]){termite_lightonocr3_gate_up_small_body<N>(x,g,u,gb,ub,y,"
+            @"group[[threadgroup_position_in_grid]]){antfly_mpp_gate_up_f32<N>(x,g,u,gb,ub,y,"
             @"p,group); }\nG(8) G(64)\n";
         extra = [extra stringByReplacingOccurrencesOfString:@"G(8) G(64)"
                                                  withString:pair_variant == 17 ? @"G(8)" : @"G(64)"];
         NSError *error = nil;
         pair_gate_library = [r->device
-            newLibraryWithSource:[termite_metal_lightonocr3_tensor_source() stringByAppendingString:extra]
+            newLibraryWithSource:[termite_metal_tensor_program_source() stringByAppendingString:extra]
                          options:options
                            error:&error];
         if (!pair_gate_library) {

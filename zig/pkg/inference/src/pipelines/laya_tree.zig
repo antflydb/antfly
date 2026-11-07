@@ -109,12 +109,23 @@ pub const Row = struct {
 /// each root segment (`parents[s] == -1`) starts an independent tree, and no
 /// segment outside the trunk may itself be a root.
 pub fn validate(row: Row, max_len: usize, max_packed_len: usize, max_options: usize) !void {
+    return validateImpl(row, max_len, max_packed_len, max_options, true);
+}
+
+/// Same numerical-input predicates without the task-only question-index map.
+/// Seven tensor inputs do not contain that implicit arange; this view remains
+/// borrowed synchronously and is never published as an owning Row.
+pub fn validateTensorView(row: Row, max_len: usize, max_packed_len: usize, max_options: usize) !void {
+    return validateImpl(row, max_len, max_packed_len, max_options, false);
+}
+
+fn validateImpl(row: Row, max_len: usize, max_packed_len: usize, max_options: usize, comptime task_indices: bool) !void {
     const n = row.ids.len;
     if (n == 0 or n > max_packed_len or row.positions.len != n or row.segments.len != n or row.kinds.len != n) return error.InvalidLayaPackedRow;
     if (row.parents.len == 0 or row.parents.len > n or row.parents[0] != -1) return error.InvalidLayaPackedRow;
     for (row.parents[1..], 1..) |parent, s| if (parent != -1 and (parent < 0 or parent >= s)) return error.InvalidLayaPackedRow;
     const q = row.anchors.len;
-    if (q == 0 or row.width < 2 or row.width > max_options or row.markers.len != q * row.width or row.question_index.len != q) return error.InvalidLayaPackedRow;
+    if (q == 0 or row.width < 2 or row.width > max_options or row.markers.len != q * row.width or (task_indices and row.question_index.len != q)) return error.InvalidLayaPackedRow;
     for (row.segments, row.positions, row.kinds) |segment, position, kind| {
         if (segment < 0 or segment >= row.parents.len or position < 0 or position >= max_len) return error.InvalidLayaPackedRow;
         const is_root = row.parents[@intCast(segment)] == -1;
@@ -301,6 +312,7 @@ pub fn ranges(a: std.mem.Allocator, row: Row, first: usize) ![]u32 {
         i = end;
     }
     const out = try a.alloc(u32, (row.ids.len - first) * 6);
+    errdefer a.free(out);
     @memset(out, 0);
     // Trees are contiguous: a tree runs from its root segment's first token
     // to the next root segment's first token.

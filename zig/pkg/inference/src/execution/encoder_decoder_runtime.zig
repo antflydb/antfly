@@ -1,0 +1,436 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Encoder/decoder stage placement. Tasks keep token acceptance, stopping and
+//! text publication; this owner keeps hidden activations in a shared context.
+const std = @import("std");
+const backends = @import("../backends/backends.zig");
+const session_mod = @import("../backends/session.zig");
+const Control = @import("../execution_control.zig").InferenceExecutionControl;
+const Incremental = @import("architecture_session.zig").IncrementalDecoderAdapter;
+
+pub const EncoderOutputs = union(enum) {
+    host: []backends.Tensor,
+    resident: struct { values: session_mod.ResidentOutputs, shape: [3]i64, incremental_receiver: ?Incremental.Receiver = null },
+
+    pub fn deinit(self: *EncoderOutputs, allocator: std.mem.Allocator) void {
+        self.deinitWithCleanup(allocator, .{ .outside_execution = true });
+    }
+    pub fn deinitWithBoundary(self: *EncoderOutputs, allocator: std.mem.Allocator, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
+        self.deinitWithCleanup(allocator, .{ .boundary = boundary });
+    }
+    fn deinitWithCleanup(self: *EncoderOutputs, allocator: std.mem.Allocator, current: @import("cleanup_context.zig").Context) void {
+        switch (self.*) {
+            .host => |values| {
+                for (values) |*value| value.deinit();
+                allocator.free(values);
+            },
+            .resident => |*value| if (current.outside_execution) value.values.deinit() else value.values.deinitWithBoundary(current.boundary),
+        }
+    }
+};
+
+/// Qualification precedes encoder execution: a rejected pair takes its host
+/// reference once. Merged-cache decoders have a separate stateful contract.
+pub fn supportsResidentPair(encoder: backends.Session, decoder: backends.Session, controlled: bool) bool {
+    const source = encoder.shared_compute_context orelse return false;
+    if (decoder.shared_compute_context != source) return false;
+    if (encoder.vtable.runResident == null or decoder.vtable.runResidentInputs == null) return false;
+    if (controlled and (encoder.vtable.runResidentWithControl == null or decoder.vtable.runResidentInputsWithControl == null)) return false;
+    const outputs = encoder.outputInfo();
+    if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 3) return false;
+    const logits = decoder.outputInfo();
+    if (logits.len != 1 or logits[0].dtype != .f32 or logits[0].shape.len != 3) return false;
+    if (decoder.inputInfo().len > 4) return false;
+    var tokens = false;
+    var hidden = false;
+    for (decoder.inputInfo()) |input| {
+        if (std.mem.eql(u8, input.name, "input_ids")) {
+            if (tokens or input.dtype != .i64 or input.shape.len != 2) return false;
+            tokens = true;
+        } else if (std.mem.eql(u8, input.name, "encoder_hidden_states")) {
+            if (hidden or input.dtype != .f32 or input.shape.len != 3) return false;
+            hidden = true;
+        } else if ((std.mem.eql(u8, input.name, "encoder_attention_mask") or std.mem.eql(u8, input.name, "decoder_attention_mask"))) {
+            if (input.dtype != .i64 or input.shape.len != 2) return false;
+        } else return false;
+    }
+    return tokens and hidden;
+}
+
+/// The optional synchronous dispatch capability has the existing run method;
+/// its task classification stays in its caller and is never stored here.
+pub fn encode(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control) !EncoderOutputs {
+    return encodeWithPermit(allocator, encoder, decoder, inputs, dispatch, control, null);
+}
+
+/// A preprocessing permit may transfer its lease into resident encoder outputs.
+/// Host reference execution preserves the caller's existing permit lifetime.
+pub fn encodeWithPermit(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit) !EncoderOutputs {
+    return encodeOptions(allocator, encoder, decoder, inputs, dispatch, control, supplied, false);
+}
+
+/// An incremental consumer explicitly opts into its typed cache receiver. A
+/// stateless full-prefix task must never inherit a native KV route implicitly.
+pub fn encodeForIncrementalWithPermit(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit) !EncoderOutputs {
+    return encodeOptions(allocator, encoder, decoder, inputs, dispatch, control, supplied, true);
+}
+
+const EncoderRoute = struct {
+    dispatched: bool,
+    resident: bool,
+    incremental: ?Incremental.Receiver,
+};
+fn encoderRoute(encoder: backends.Session, decoder: backends.Session, dispatch: anytype, control: ?Control, allow_incremental: bool) EncoderRoute {
+    const dispatched = if (comptime @TypeOf(dispatch) == @TypeOf(null)) false else if (comptime @typeInfo(@TypeOf(dispatch)) == .optional) dispatch != null else true;
+    const incremental = if (allow_incremental) Incremental.qualify(encoder, decoder) else null;
+    return .{ .dispatched = dispatched, .incremental = incremental, .resident = supportsResidentDispatch(dispatch) and (incremental != null or supportsResidentPair(encoder, decoder, control != null)) };
+}
+
+/// The owning task calls this before its model/provider lane. Qualification is
+/// shared with execution; host fallbacks allocate no resident metadata. A typed
+/// dispatcher prepares its own exact execution, so its preprocessing permit is
+/// left unchanged. Supplied execution itself only validates this prepayment.
+pub fn prepareEncoderPermit(encoder: backends.Session, decoder: backends.Session, dispatch: anytype, control: ?Control, allow_incremental: bool, permit: *session_mod.RunPermit) !void {
+    if (permit.session.ptr != encoder.ptr or permit.session.vtable != encoder.vtable) return error.InvalidStagePermit;
+    const selected = encoderRoute(encoder, decoder, dispatch, control, allow_incremental);
+    if (selected.resident and !selected.dispatched) try permit.prepareResidentOutputRetirement();
+}
+
+fn encodeOptions(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit, allow_incremental: bool) !EncoderOutputs {
+    if (supplied) |permit| if (permit.session.ptr != encoder.ptr or permit.session.vtable != encoder.vtable) return error.InvalidStagePermit;
+    const selected = encoderRoute(encoder, decoder, dispatch, control, allow_incremental);
+    const dispatched = selected.dispatched;
+    const incremental = selected.incremental;
+    if (selected.resident) {
+        var own_permit: ?session_mod.RunPermit = null;
+        defer if (own_permit) |*owned| owned.deinit();
+        const permit: ?*session_mod.RunPermit = if (dispatched) supplied else supplied orelse blk: {
+            own_permit = try encoder.admitInputs(inputs, allocator, control);
+            break :blk &own_permit.?;
+        };
+        if (!dispatched) if (permit) |owner| {
+            if (own_permit != null) try prepareEncoderPermit(encoder, decoder, dispatch, control, allow_incremental, owner) else try owner.validateResidentOutputRetirement();
+        };
+        var values = if (dispatched)
+            (try callResidentDispatch(dispatch, allocator, encoder, permit, inputs, control)) orelse return error.UnexpectedResidentStageDecline
+        else
+            (try permit.?.runResidentWithControl(inputs, allocator, control)) orelse return error.UnexpectedResidentStageDecline;
+        errdefer values.deinit();
+        if (values.resource_lease == null) if (permit) |owner| {
+            values.resource_lease = owner.lease;
+            owner.lease = null;
+        };
+        if (values.outputs.len != 1) return error.InvalidEncoderOutput;
+        const shape = try values.backend.tensorShape(values.outputs[0], allocator);
+        defer allocator.free(shape);
+        if (shape.len != 3 or shape[0] != 1 or shape[1] <= 0 or shape[2] <= 0) return error.InvalidEncoderOutput;
+        return .{ .resident = .{ .values = values, .shape = .{ shape[0], shape[1], shape[2] }, .incremental_receiver = incremental } };
+    }
+    return encodeHost(allocator, encoder, inputs, dispatch, control, supplied);
+}
+
+/// A custom dispatcher without the typed capability chooses the existing
+/// host route before encoder work. Its public scheduling policy is never bypassed.
+fn supportsResidentDispatch(dispatch: anytype) bool {
+    const T = @TypeOf(dispatch);
+    if (comptime T == @TypeOf(null)) return true;
+    if (comptime @typeInfo(T) == .optional) return if (dispatch) |selected| supportsResidentDispatch(selected) else true;
+    const Receiver = if (@typeInfo(T) == .pointer) @typeInfo(T).pointer.child else T;
+    if (comptime @hasDecl(Receiver, "supportsResident") and @hasDecl(Receiver, "runResident")) return dispatch.supportsResident();
+    return false;
+}
+
+fn callResidentDispatch(dispatch: anytype, allocator: std.mem.Allocator, encoder: backends.Session, permit: ?*session_mod.RunPermit, inputs: []const backends.Tensor, control: ?Control) !?session_mod.ResidentOutputs {
+    const T = @TypeOf(dispatch);
+    if (comptime T == @TypeOf(null)) return null;
+    if (comptime @typeInfo(T) == .optional) return if (dispatch) |selected| callResidentDispatch(selected, allocator, encoder, permit, inputs, control) else null;
+    const Receiver = if (@typeInfo(T) == .pointer) @typeInfo(T).pointer.child else T;
+    if (comptime @hasDecl(Receiver, "runResident")) return dispatch.runResident(allocator, encoder, permit, null, inputs, control);
+    return error.UnsupportedResidentDispatch;
+}
+
+fn encodeHost(allocator: std.mem.Allocator, encoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit) !EncoderOutputs {
+    if (comptime @TypeOf(dispatch) != @TypeOf(null)) {
+        if (comptime @typeInfo(@TypeOf(dispatch)) == .optional) {
+            if (dispatch) |selected| return .{ .host = try selected.run(allocator, encoder, supplied, null, inputs, control) };
+        } else return .{ .host = try dispatch.run(allocator, encoder, supplied, null, inputs, control) };
+    }
+    return .{ .host = if (supplied) |permit| try permit.runWithControl(inputs, allocator, control) else try encoder.runWithControl(inputs, allocator, control) };
+}
+
+/// Address-stable borrowed inputs for the common full-prefix decoder ABI.
+/// Initialize in place and keep this owner alive until synchronous execution
+/// returns; only the optional all-ones query mask needs an allocation.
+pub const DecoderInputs = struct {
+    allocator: std.mem.Allocator,
+    storage: [4]session_mod.StageInput = undefined,
+    host_storage: [4]backends.Tensor = undefined,
+    count: usize = 0,
+    token_shape: [2]i64,
+    encoder_mask_shape: [2]i64,
+    query_mask: ?[]i64 = null,
+
+    pub fn init(self: *DecoderInputs, allocator: std.mem.Allocator, signature: []const backends.TensorInfo, tokens: []const i64, mask: []const i64, hidden: session_mod.StageInput) !void {
+        self.* = .{ .allocator = allocator, .token_shape = .{ 1, std.math.cast(i64, tokens.len) orelse return error.ResourceLimitExceeded }, .encoder_mask_shape = .{ 1, std.math.cast(i64, mask.len) orelse return error.ResourceLimitExceeded } };
+        errdefer self.deinit();
+        if (signature.len > self.storage.len) return error.InvalidDecoderInput;
+        for (signature) |info| {
+            const input: session_mod.StageInput = if (std.mem.eql(u8, info.name, "input_ids")) .{ .host = .{
+                .name = info.name,
+                .data = @constCast(std.mem.sliceAsBytes(tokens)),
+                .shape = &self.token_shape,
+                .dtype = .i64,
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            } } else if (std.mem.eql(u8, info.name, "encoder_attention_mask")) .{ .host = .{
+                .name = info.name,
+                .data = @constCast(std.mem.sliceAsBytes(mask)),
+                .shape = &self.encoder_mask_shape,
+                .dtype = .i64,
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            } } else if (std.mem.eql(u8, info.name, "decoder_attention_mask")) blk: {
+                if (self.query_mask == null) {
+                    self.query_mask = try allocator.alloc(i64, tokens.len);
+                    @memset(self.query_mask.?, 1);
+                }
+                break :blk .{ .host = .{ .name = info.name, .data = std.mem.sliceAsBytes(self.query_mask.?), .shape = &self.token_shape, .dtype = .i64, .allocator = allocator, .owns_data = false, .owns_shape = false } };
+            } else if (std.mem.eql(u8, info.name, "encoder_hidden_states")) switch (hidden) {
+                .host => |value| .{ .host = value.borrowedView(info.name) },
+                .resident => |value| .{ .resident = value },
+            } else return error.InvalidDecoderInput;
+            self.storage[self.count] = input;
+            self.count += 1;
+        }
+    }
+
+    pub fn deinit(self: *DecoderInputs) void {
+        if (self.query_mask) |mask| self.allocator.free(mask);
+        self.* = undefined;
+    }
+
+    pub fn stageInputs(self: *const DecoderInputs) []const session_mod.StageInput {
+        return self.storage[0..self.count];
+    }
+
+    pub fn hostInputs(self: *DecoderInputs) ![]const backends.Tensor {
+        for (self.storage[0..self.count], self.host_storage[0..self.count]) |value, *host| host.* = switch (value) {
+            .host => |tensor| tensor,
+            .resident => return error.ExpectedHostEncoder,
+        };
+        return self.host_storage[0..self.count];
+    }
+};
+
+/// A reading task without an artifact vocabulary hint keeps its existing host
+/// output contract. Qualification happens before the encoder is dispatched.
+pub fn outputVocabulary(decoder: backends.Session) ?usize {
+    const outputs = decoder.outputInfo();
+    if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 3 or outputs[0].shape[2] <= 0) return null;
+    return std.math.cast(usize, outputs[0].shape[2]);
+}
+
+pub fn encodeForFinalRow(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control) !EncoderOutputs {
+    if (outputVocabulary(decoder) == null) return encodeHost(allocator, encoder, inputs, dispatch, control, null);
+    return encode(allocator, encoder, decoder, inputs, dispatch, control);
+}
+
+/// Only the final vocabulary row crosses the output boundary. The encoder and
+/// every preceding decoder activation remain with their producing backend.
+pub fn finalGreedyToken(allocator: std.mem.Allocator, decoder: backends.Session, encoder: *const EncoderOutputs, tokens: []const i64, mask: []const i64, vocab: usize, control: ?Control) !i32 {
+    const values = try finalVocabularyRow(allocator, decoder, encoder, tokens, mask, vocab, control);
+    defer allocator.free(values);
+    // Preserve the reference's first-index tie and NaN comparison behavior.
+    var best: usize = 0;
+    for (values[1..], 1..) |value, index| if (value > values[best]) {
+        best = index;
+    };
+    return std.math.cast(i32, best) orelse error.LogitsSizeMismatch;
+}
+
+pub fn finalVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Session, encoder: *const EncoderOutputs, tokens: []const i64, mask: []const i64, vocab: usize, control: ?Control) ![]f32 {
+    const resident = switch (encoder.*) {
+        .resident => |*value| value,
+        .host => return error.ExpectedResidentEncoder,
+    };
+    if (tokens.len == 0 or vocab == 0 or resident.shape[1] != mask.len) return error.InvalidInputShape;
+    var inputs: DecoderInputs = undefined;
+    try inputs.init(allocator, decoder.inputInfo(), tokens, mask, .{ .resident = .{ .value = resident.values.outputs[0], .backend = resident.values.backend, .shape = &resident.shape } });
+    defer inputs.deinit();
+    var outputs = (try decoder.runStageInputsWithControl(inputs.stageInputs(), allocator, control)) orelse return error.UnexpectedResidentStageDecline;
+    defer outputs.deinit();
+    var operation_scope: @import("backend_operation.zig").Scope = undefined;
+    try @import("backend_operation.zig").enterInto(outputs.backend, null, outputs.backend.operationToken(), .legacy_unknown_frame, &operation_scope);
+    var operation_succeeded = false;
+    defer {
+        if (operation_succeeded) operation_scope.finish() catch @import("antfly_platform").inference_process_supervisor.restartWorker() else operation_scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    }
+    if (outputs.outputs.len != 1) return error.InvalidDecoderOutput;
+    const expected = [_]i64{ 1, @intCast(tokens.len), std.math.cast(i64, vocab) orelse return error.ResourceLimitExceeded };
+    if (try outputs.backend.tensorShapeMatches(outputs.outputs[0], &expected)) |matches| {
+        if (!matches) return error.InvalidDecoderOutput;
+    } else {
+        const actual = try outputs.backend.tensorShape(outputs.outputs[0], allocator);
+        defer allocator.free(actual);
+        if (!std.mem.eql(i64, &expected, actual)) return error.InvalidDecoderOutput;
+    }
+    if (control) |active| try active.check();
+    var guard = if (control) |active| try active.enterUninterruptible(decoder.interruption()) else null;
+    defer if (guard) |*scope| scope.deinit();
+    const row = try outputs.backend.sliceRows2D(allocator, outputs.outputs[0], tokens.len - 1, 1, vocab);
+    defer outputs.backend.free(row);
+    const values = try outputs.backend.toFloat32(row, allocator);
+    errdefer allocator.free(values);
+    if (values.len != vocab) return error.InvalidDecoderOutput;
+    if (control) |active| try active.check();
+    operation_succeeded = true;
+    return values;
+}
+
+test "encoder decoder resident stages retain hidden state and materialize only the final vocabulary row" {
+    const a = std.testing.allocator;
+    const build = @import("build_options");
+    const imported = @import("../backends/imported_onnx_session.zig");
+    const audit_mod = @import("transfer_audit.zig");
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try @import("testing/encoder_decoder.zig").write(a, temp.dir, "encoder.onnx", true);
+    try @import("testing/encoder_decoder.zig").write(a, temp.dir, "decoder.onnx", false);
+    const encoder_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..], "encoder.onnx" });
+    defer a.free(encoder_path);
+    const decoder_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..], "decoder.onnx" });
+    defer a.free(decoder_path);
+    var input = try backends.Tensor.initFloat32(a, "features", &.{ 1, 2, 4 }, &.{ -2, 1, 2, -1, 3, -1, 1, 0 });
+    defer input.deinit();
+    for ([_]backends.BackendType{ .native, .metal, .cuda }) |kind| {
+        if (kind == .metal) {
+            if (comptime !build.enable_metal) continue;
+            if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) continue;
+        }
+        if (kind == .cuda and comptime !build.enable_cuda) continue;
+        var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+        defer std.debug.assert(std.meta.eql(controller.snapshot(), @import("../runtime/tier/memory.zig").AdmissionAmounts{}));
+        var encoder = imported.createSessionWithOptions(a, encoder_path, kind, .{ .graph_runtime_strategy = .compiled_preferred }) catch |err| switch (err) {
+            error.CudaUnavailable, error.NoCudaDevices => continue,
+            else => return err,
+        };
+        var encoder_open = true;
+        defer if (encoder_open) encoder.close();
+        var decoder = try imported.createSessionWithOptions(a, decoder_path, kind, .{ .graph_runtime_strategy = .compiled_preferred, .shared_backend_ctx = encoder.shared_compute_context });
+        defer decoder.close();
+        encoder.run_admission = .{ .controller = &controller, .backend_class = if (kind == .native) .cpu else .gpu, .limits = .{}, .static_workspace_bytes = 1, .check_live_memory = false };
+        const control = Control{ .native_call_policy = .in_process };
+        try std.testing.expect(supportsResidentPair(encoder, decoder, true));
+        var encoded = blk: {
+            var audit = audit_mod.Audit{ .forbid_activation_readbacks = true };
+            try audit_mod.begin(&audit);
+            defer audit_mod.end();
+            var permit = try encoder.admitInputs(&.{input}, a, null);
+            defer permit.deinit();
+            try prepareEncoderPermit(encoder, decoder, null, control, false, &permit);
+            var result = try encodeWithPermit(a, encoder, decoder, &.{input}, null, control, &permit);
+            errdefer result.deinit(a);
+            try std.testing.expect(permit.lease == null);
+            try std.testing.expect(result.resident.values.resource_lease != null);
+            try std.testing.expect(result == .resident);
+            try std.testing.expectEqual(@as(u64, 0), audit.download_bytes);
+            try std.testing.expectEqual(@as(u64, 0), audit.host_access_bytes);
+            break :blk result;
+        };
+        defer encoded.deinit(a);
+        encoder.close();
+        encoder_open = false;
+        for (0..3) |_| {
+            var audit = audit_mod.Audit{};
+            const token = blk: {
+                try audit_mod.begin(&audit);
+                defer audit_mod.end();
+                break :blk try finalGreedyToken(a, decoder, &encoded, &.{ 0, 1 }, &.{ 1, 1 }, 4, control);
+            };
+            try std.testing.expectEqual(@as(i32, 1), token);
+            if (kind != .native) try std.testing.expectEqual(@as(u64, 4 * @sizeOf(f32)), audit.download_bytes);
+        }
+        const retained = try encoded.resident.values.backend.toFloat32(encoded.resident.values.outputs[0], a);
+        defer a.free(retained);
+        try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 0, 3, 0, 1, 0 }, retained);
+        if (kind == .native) {
+            const Case = struct {
+                fn run(allocator: std.mem.Allocator, target: backends.Session, values: *const EncoderOutputs) !void {
+                    const token = try finalGreedyToken(allocator, target, values, &.{ 0, 1 }, &.{ 1, 1 }, 4, null);
+                    try std.testing.expectEqual(@as(i32, 1), token);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(a, Case.run, .{ decoder, @as(*const EncoderOutputs, &encoded) });
+        }
+    }
+}
+
+test "decoder input owner borrows real token hidden and encoder mask storage and owns only query mask" {
+    const a = std.testing.allocator;
+    const shape = [_]i64{ 1, 2 };
+    const signature = [_]backends.TensorInfo{
+        .{ .name = "input_ids", .dtype = .i64, .shape = &shape },
+        .{ .name = "encoder_attention_mask", .dtype = .i64, .shape = &shape },
+        .{ .name = "decoder_attention_mask", .dtype = .i64, .shape = &shape },
+        .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{ 1, 2, 4 } },
+    };
+    const tokens = [_]i64{ 7, 9 };
+    const mask = [_]i64{ 1, 0 };
+    var hidden = try backends.Tensor.initFloat32(a, "original_hidden", &.{ 1, 2, 4 }, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    defer hidden.deinit();
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator, infos: []const backends.TensorInfo, ids: []const i64, encoder_mask: []const i64, encoded: backends.Tensor) !void {
+            var inputs: DecoderInputs = undefined;
+            try inputs.init(allocator, infos, ids, encoder_mask, .{ .host = encoded });
+            defer inputs.deinit();
+            const host = try inputs.hostInputs();
+            try std.testing.expect(host[0].data.ptr == std.mem.sliceAsBytes(ids).ptr);
+            try std.testing.expect(host[1].data.ptr == std.mem.sliceAsBytes(encoder_mask).ptr);
+            try std.testing.expect(host[3].data.ptr == encoded.data.ptr);
+            try std.testing.expectEqualSlices(i64, &.{ 1, 1 }, host[2].asInt64());
+            try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, host[0].shape);
+            try std.testing.expectEqualStrings("encoder_hidden_states", host[3].name);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Case.run, .{ @as([]const backends.TensorInfo, &signature), @as([]const i64, &tokens), @as([]const i64, &mask), hidden });
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, hidden.asFloat32());
+    try std.testing.expectEqualSlices(i64, &.{ 7, 9 }, &tokens);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 0 }, &mask);
+}
+
+test "encoder cold preparation shares host fallback and typed dispatcher qualification" {
+    const Fixture = struct {
+        fn kind(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn run(_: *anyopaque, _: []const backends.Tensor, _: std.mem.Allocator) ![]backends.Tensor {
+            return error.UnexpectedRun;
+        }
+        fn close(_: *anyopaque) void {}
+        const table = backends.Session.VTable{ .backend = kind, .inputInfo = info, .outputInfo = info, .run = run, .close = close };
+    };
+    const Dispatch = struct {
+        fn supportsResident(_: *@This()) bool {
+            return false;
+        }
+        fn runResident(_: *@This(), _: std.mem.Allocator, _: backends.Session, _: ?*session_mod.RunPermit, _: ?*std.atomic.Mutex, _: []const backends.Tensor, _: ?Control) !?session_mod.ResidentOutputs {
+            return error.UnexpectedRun;
+        }
+    };
+    var marker: u8 = 0;
+    const session = backends.Session{ .ptr = &marker, .vtable = &Fixture.table };
+    var permit = session_mod.RunPermit{ .session = session, .lease = null };
+    defer permit.deinit();
+    try prepareEncoderPermit(session, session, null, null, false, &permit);
+    try std.testing.expect(permit.output_retirement_shell == null);
+    var dispatcher = Dispatch{};
+    try prepareEncoderPermit(session, session, &dispatcher, null, true, &permit);
+    try std.testing.expect(permit.output_retirement_shell == null);
+    try std.testing.expect(!encoderRoute(session, session, &dispatcher, null, true).resident);
+}

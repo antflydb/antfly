@@ -55,6 +55,15 @@ pub const HiddenActivation = enum {
     }
 };
 
+/// HF stores these derived integer buffers alongside learned parameters.
+/// Runtime positions/types come from each request and configuration instead.
+pub fn isDerivedBufferName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "embeddings.position_ids") or
+        std.mem.eql(u8, name, "embeddings.token_type_ids") or
+        std.mem.endsWith(u8, name, ".embeddings.position_ids") or
+        std.mem.endsWith(u8, name, ".embeddings.token_type_ids");
+}
+
 /// BERT model configuration loaded from config.json.
 pub const Config = struct {
     model_type: ModelType = .bert,
