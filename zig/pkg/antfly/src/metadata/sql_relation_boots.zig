@@ -54,7 +54,55 @@ pub const Registration = struct {
     instance: [16]u8,
 };
 
+/// Fixed metadata-only maintenance scope. It carries no row key, projection,
+/// SQL principal or caller-authored Owner grant.
+pub const MaintenanceRequest = struct {
+    owner_group_id: u64,
+    namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace,
+    descriptor: @import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor,
+    schema_digest: [32]u8,
+    indexes_digest: [32]u8,
+
+    pub fn validate(self: @This()) !void {
+        try self.descriptor.validate();
+        if (self.descriptor.kind != .temporary or self.owner_group_id == 0 or self.namespace.table_id == 0 or self.namespace.shard_id == 0 or self.namespace.range_id == 0 or
+            std.mem.allEqual(u8, &self.schema_digest, 0) or std.mem.allEqual(u8, &self.indexes_digest, 0)) return error.InvalidSqlRelationPersistence;
+    }
+    pub fn requireTable(self: @This(), table: @import("table_manager.zig").TableRecord) !void {
+        try self.validate();
+        var digest: [32]u8 = undefined;
+        if (table.table_id != self.namespace.table_id or table.sql_persistence == null or !table.sql_persistence.?.eql(self.descriptor)) return error.SqlRelationOwnerChanged;
+        std.crypto.hash.Blake3.hash(table.schema_json, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &self.schema_digest)) return error.CatalogGenerationChanged;
+        std.crypto.hash.Blake3.hash(table.indexes_json, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &self.indexes_digest)) return error.CatalogGenerationChanged;
+    }
+};
+pub const MaintenanceLease = struct {
+    request: MaintenanceRequest,
+    metadata_group_id: u64,
+    metadata_incarnation: [32]u8,
+    binding: @import("../system_catalog/temporary_source_binding.zig").Binding,
+    expires_at_ms: u64,
+    native_pin: @import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin,
+    boot_generation: u64,
+    execution_instance: [16]u8,
+
+    pub fn requireFor(self: @This(), request: MaintenanceRequest, now_ms: u64) !void {
+        try request.validate();
+        try self.binding.validate();
+        try self.native_pin.validate();
+        if (self.boot_generation == 0 or std.mem.allEqual(u8, &self.execution_instance, 0) or
+            self.native_pin.table_id != request.namespace.table_id or self.native_pin.shard_id != request.namespace.shard_id or self.native_pin.range_id != request.namespace.range_id or self.native_pin.data_generation != request.descriptor.data_generation or
+            !std.mem.eql(u8, &self.execution_instance, &request.descriptor.generation_instance)) return error.SqlTemporaryRelationNotOwned;
+        if (!std.meta.eql(self.request, request) or self.metadata_group_id == 0 or self.binding.group != self.metadata_group_id or
+            !std.mem.eql(u8, &std.fmt.bytesToHex(self.binding.backend.incarnation, .lower), &self.metadata_incarnation) or
+            !self.binding.namespace.owner.eql(request.descriptor.owner.?) or self.expires_at_ms <= now_ms) return error.SqlTemporaryRelationNotOwned;
+    }
+};
+
 pub const Observation = struct {
+    maintenance: ?MaintenanceLease = null,
     restore_terminal: ?@import("sql_relation_restore_terminal.zig").Proof = null,
     data_version_ready: ?bool = null,
     record: ?Record,
@@ -74,6 +122,7 @@ pub const Observation = struct {
     lost_generation: ?@import("sql_relation_recovery.zig").RetiredGeneration = null,
 
     pub fn jsonStringify(self: Observation, writer: anytype) !void {
+        if (self.maintenance != null) return writer.write(.{ .record = self.record, .registration_current = self.registration_current, .initialized = self.initialized, .maintenance = self.maintenance });
         if (self.restore_terminal != null) return writer.write(.{ .record = self.record, .registration_current = self.registration_current, .restore_terminal = self.restore_terminal });
         if (self.data_version_ready) |ready| return writer.write(.{ .record = self.record, .registration_current = self.registration_current, .data_version_ready = ready });
         if (self.retired_group != null or self.native_retired_image != null or self.native_group_active) return writer.write(.{ .record = self.record, .registration_current = self.registration_current, .after = self.after, .retired_group = self.retired_group, .native_group_active = self.native_group_active, .native_retired_image = self.native_retired_image });
@@ -115,6 +164,7 @@ pub const AbandonedTemporaryPage = struct {
 };
 
 pub const Query = struct {
+    maintenance: ?MaintenanceRequest = null,
     restore_terminal: ?@import("sql_relation_restore_terminal.zig").Query = null,
     required_data_version: ?u16 = null,
     retired_group: ?u64 = null,
@@ -137,7 +187,7 @@ pub const Query = struct {
     pub fn jsonStringify(self: Query, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Query).@"struct".field_names) |field| {
-            if (comptime std.mem.eql(u8, field, "restore_terminal") or std.mem.eql(u8, field, "required_data_version") or std.mem.eql(u8, field, "binding_table") or std.mem.eql(u8, field, "report_group") or std.mem.eql(u8, field, "creation_scope") or std.mem.eql(u8, field, "temporary_namespaces") or std.mem.eql(u8, field, "temporary_retirement") or std.mem.eql(u8, field, "lost_generation") or std.mem.eql(u8, field, "lost_temporary") or std.mem.eql(u8, field, "temporary_abandonment") or std.mem.eql(u8, field, "unpublished_retirement") or std.mem.eql(u8, field, "unpublished_group") or std.mem.eql(u8, field, "recovery_capture") or std.mem.eql(u8, field, "retired_group")) {
+            if (comptime std.mem.eql(u8, field, "maintenance") or std.mem.eql(u8, field, "restore_terminal") or std.mem.eql(u8, field, "required_data_version") or std.mem.eql(u8, field, "binding_table") or std.mem.eql(u8, field, "report_group") or std.mem.eql(u8, field, "creation_scope") or std.mem.eql(u8, field, "temporary_namespaces") or std.mem.eql(u8, field, "temporary_retirement") or std.mem.eql(u8, field, "lost_generation") or std.mem.eql(u8, field, "lost_temporary") or std.mem.eql(u8, field, "temporary_abandonment") or std.mem.eql(u8, field, "unpublished_retirement") or std.mem.eql(u8, field, "unpublished_group") or std.mem.eql(u8, field, "recovery_capture") or std.mem.eql(u8, field, "retired_group")) {
                 if (@field(self, field) != null) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));

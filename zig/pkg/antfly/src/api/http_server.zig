@@ -1780,6 +1780,7 @@ pub const ApiHttpServerConfig = struct {
     relational_index_claims: ?@import("relational_index_owner_execution.zig").ClaimPort = null,
     relational_index_control: ?@import("relational_index_owner_execution.zig").ControlPort = null,
     schema_validation_preparation: ?@import("schema_validation_preparation.zig").Port = null,
+    native_relation_maintenance: ?@import("native_relation_maintenance.zig").Port = null,
     table_retirement_preparation: ?@import("table_retirement_preparation.zig").Port = null,
     row_policy_install: ?@import("row_policy_install.zig").Port = null,
     online_merge_io: ?@import("online_merge_io.zig").Port = null,
@@ -6402,6 +6403,30 @@ pub const ApiHttpServer = struct {
             if (table.relational_retirement_json.len != 0) .retirement else .serving,
             .{ .deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s },
         )) return;
+        if (table.sql_persistence) |descriptor| if (descriptor.kind == .temporary) {
+            // Initial empty native schemas are atomically enforced. Later
+            // validation/rewrite work owns its closed job; a daemon cannot
+            // borrow the connected principal's row authority to backfill it.
+            const port = self.cfg.native_relation_maintenance orelse return error.ConstraintActivationUnavailable;
+            const fixed = @import("native_relation_maintenance.zig");
+            const state = port.execute(self.alloc, table.name, try fixed.requestFor(table, owner), .{
+                .deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s,
+                .setting_admin = true,
+                .schema_validation_authority = true,
+                .fk_generation_publication_authority = true,
+            }) catch |err| switch (err) {
+                error.SqlTemporaryRelationNotOwned, error.SqlRelationRecoveryIncomplete, error.SqlRelationOwnerUnavailable, error.StorageReadTemporarilyUnavailable => return error.ConstraintActivationPending,
+                else => return err,
+            };
+            // Every path has already advanced the scheduling cursor. Pending
+            // or failed coverage remains owned by its actual job, and cannot
+            // starve the next unrelated range or become an enforced receipt.
+            return switch (state) {
+                .enforced => {},
+                .pending => error.ConstraintActivationPending,
+                .invalid => error.ConstraintActivationNotReady,
+            };
+        };
         if (try @import("relational_witness_ddl.zig").cleanup(self.alloc, snapshot.tables, table)) |replacement| {
             defer metadata_table_manager.freeTable(self.alloc, replacement);
             // An unpublished initial child is deliberately absent from
@@ -43387,7 +43412,7 @@ test "api http server coordinated batch outcomes retain prepared names and confl
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.snapshots_released += 1;
         }
-        fn lookup(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, _: read_gate.ReadConsistency) !?table_reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?table_reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.read_failure) |err| return err;
             const value = (try self.db.lookup(allocator, key, opts)) orelse return null;
@@ -63935,4 +63960,58 @@ test "SQL relation lifetime captured retirement delivery selects exact native st
     fixture.ordinary_expected = true;
     try std.testing.expectError(error.TestExpectedOrdinaryRaftRouting, server.executeCapturedFkGenerationSource(a, wrong, source_request, context));
     try std.testing.expect(fixture.raft_calls > 0);
+}
+
+test "SQL relation lifetime TEMP maintenance keeps closed pending work from starving the next owner" {
+    const a = std.testing.allocator;
+    const P = @import("antfly_local_sources").common_topology_records.RelationPersistence;
+    const fixed = @import("native_relation_maintenance.zig");
+    const ownership = @import("group_work_ownership.zig");
+    const owner: P.Owner = .{ .issuer_node_id = 9, .connection_id = @splat('a'), .wire_epoch = @splat(2), .execution_instance = @splat(3), .connection_generation = 1, .principal_digest = @splat(4) };
+    const descriptor: P.Descriptor = .{ .kind = .temporary, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(5), .data_generation = 1, .owner = owner };
+    const Fixture = struct {
+        calls: [2]usize = @splat(0),
+        invalid: bool = false,
+        tables: [2]metadata_table_manager.TableRecord = .{ .{ .table_id = 7, .name = "first", .schema_json = "{}", .sql_persistence = descriptor }, .{ .table_id = 8, .name = "second", .schema_json = "{}", .sql_persistence = descriptor } },
+        ranges: [2]metadata_table_manager.RangeRecord = .{ .{ .table_id = 7, .group_id = 71, .start_key = "" }, .{ .table_id = 8, .group_id = 81, .start_key = "" } },
+        fn cast(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn snapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
+            const self = cast(raw);
+            return .{ .status = try status(raw), .tables = &self.tables, .ranges = &self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn raft(_: *anyopaque, _: u64) bool {
+            return false;
+        }
+        fn native(_: *anyopaque, _: std.mem.Allocator, selected: ownership.NativeSelection, _: api_operation.RequestContext) !bool {
+            return selected.descriptor.eql(descriptor) and selected.purpose == .serving;
+        }
+        fn run(raw: *anyopaque, _: std.mem.Allocator, table: []const u8, request: fixed.Request, context: api_operation.RequestContext) !fixed.Result {
+            const self = cast(raw);
+            try fixed.requireAuthority(context);
+            const index: usize = if (std.mem.eql(u8, table, "first")) 0 else if (std.mem.eql(u8, table, "second")) 1 else return error.TestUnexpectedResult;
+            try request.requireTable(self.tables[index]);
+            self.calls[index] += 1;
+            if (index == 0) return if (self.invalid) .invalid else .pending;
+            return .enforced;
+        }
+        fn row(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnexpectedRowAccess;
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(a, .{ .native_relation_maintenance = .{ .ptr = &fixture, .execute_fn = Fixture.run }, .relational_maintenance_leadership = .{ .ptr = &fixture, .vtable = &.{ .is_local_leader = Fixture.raft, .native_local = Fixture.native } } }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .control_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.free } }, .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.row, .scan = undefined, .query = undefined } }, .{ .ptr = &fixture, .vtable = &.{ .batch = undefined } });
+    defer server.deinit();
+    try std.testing.expectError(error.ConstraintActivationPending, server.advanceRelationalActivationOnce());
+    try server.advanceRelationalActivationOnce();
+    try std.testing.expectEqual([2]usize{ 1, 1 }, fixture.calls);
+    fixture.invalid = true;
+    try std.testing.expectError(error.ConstraintActivationNotReady, server.advanceRelationalActivationOnce());
+    try server.advanceRelationalActivationOnce();
+    try std.testing.expectEqual([2]usize{ 2, 2 }, fixture.calls);
 }

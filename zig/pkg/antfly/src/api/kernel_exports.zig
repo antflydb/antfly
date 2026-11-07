@@ -1240,7 +1240,7 @@ test "API kernel combined privacy profile rejects34 and mismatched types before 
     var handle: ?*anyopaque = null;
     var request_alloc: ?*const abi.memory_abi.Allocator = null;
     var context: CreateContext = .{
-        .abi_version = 34,
+        .abi_version = 35,
         .owner_alloc = &owner_alloc,
         // A rejected profile/contract must never dereference these inputs.
         .cfg = @ptrFromInt(1),
@@ -1254,6 +1254,8 @@ test "API kernel combined privacy profile rejects34 and mismatched types before 
         .out_handle = &handle,
         .out_request_alloc = &request_alloc,
     };
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(create(&context)));
+    context.abi_version = 34;
     try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(create(&context)));
     context.abi_version = 33;
     try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(create(&context)));

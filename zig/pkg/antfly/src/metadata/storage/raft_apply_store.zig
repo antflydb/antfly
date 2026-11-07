@@ -22799,6 +22799,41 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         _ = try self.standbyRelationActivationTxn(&txn, group, topology_protocol.sql_relation_persistence_version);
+        if (query.maintenance) |selected| {
+            try selected.validate();
+            inline for (@typeInfo(sql_relation_boots.Query).@"struct".field_names) |field| {
+                if (comptime !std.mem.eql(u8, field, "maintenance") and !std.mem.eql(u8, field, "limit")) if (@field(query, field) != null) return error.InvalidSqlRelationPersistence;
+            }
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const table = (try self.getTableTxn(a, &txn, group, selected.namespace.table_id)) orelse return error.TableNotFound;
+            try selected.requireTable(table);
+            const resource = (try system_catalog_storage.getById(a, &txn, group, .table, table.table_id)) orelse return error.CatalogGenerationChanged;
+            const namespace = (try system_catalog_storage.getById(a, &txn, group, .namespace, resource.value.parent_id)) orelse return error.SqlTemporaryRelationNotOwned;
+            const owner = namespace.value.sql_temporary_owner orelse return error.SqlTemporaryRelationNotOwned;
+            if (!owner.eql(selected.descriptor.owner.?)) return error.SqlTemporaryRelationNotOwned;
+            if (try table_retirement.member(&txn, group, table.table_id) != null or
+                try scope_retirement.member(&txn, group, .table, table.table_id) != null or try scope_retirement.member(&txn, group, .namespace, namespace.value.id) != null)
+                return error.SqlTemporaryRelationNotOwned;
+            const sources = @import("../../system_catalog/temporary_source_binding.zig");
+            const binding = (try sources.read(a, &txn, group, namespace.value.id)) orelse return error.SqlTemporaryRelationNotOwned;
+            try binding.requireNamespace(.{ .database_id = namespace.value.parent_id, .namespace_id = namespace.value.id, .owner = owner });
+            const source = (try SqlLocks.scopes.read(a, &txn, .{ .home = .metadata, .group = group, .incarnation = binding.backend.incarnation }, binding.backend)) orelse return error.SqlTemporaryRelationNotOwned;
+            const now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+            if (!try binding.shouldFence(source) or source.releasing or source.registration.lease.expires_at_ms <= now_ms) return error.SqlTemporaryRelationNotOwned;
+            const ids = try self.indexedTableRangeIdsBoundedTxn(a, &txn, group, table.table_id, 1);
+            if (ids.len != 1 or ids[0] != selected.owner_group_id) return error.SqlRelationOwnerChanged;
+            var key: [320]u8 = undefined;
+            const range = try decodeRangeRecord(a, try txn.get(try rangeKeyForGroup(&key, group, ids[0])));
+            if (metadata_table_manager.rangeDocIdentityShardId(range) != selected.namespace.shard_id or metadata_table_manager.rangeDocIdentityRangeId(range) != selected.namespace.range_id) return error.IdentityNamespaceMismatch;
+            const boot = try self.requireReadySqlRelationTxn(&txn, group, selected.descriptor);
+            const initialized = (try self.sqlRelationInitializedBindingTxn(a, &txn, group, .{ .node = boot.node_id, .binding_table = table.table_id })) orelse return error.SqlRelationRecoveryIncomplete;
+            try self.requireSqlRelationInitializedBootTxn(&txn, group, initialized);
+            const grant: sql_relation_boots.MaintenanceLease = .{ .request = selected, .metadata_group_id = group, .metadata_incarnation = boot.identity.metadata_incarnation, .binding = binding, .expires_at_ms = source.registration.lease.expires_at_ms, .native_pin = try @import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin.fromBinding(initialized.binding), .boot_generation = boot.generation, .execution_instance = boot.instance };
+            try grant.requireFor(selected, now_ms);
+            return std.json.Stringify.valueAlloc(alloc, sql_relation_boots.Observation{ .record = boot, .registration_current = true, .initialized = initialized, .maintenance = grant }, .{});
+        }
         if (query.restore_terminal) |selection| {
             inline for (@typeInfo(sql_relation_boots.Query).@"struct".field_names) |field| {
                 if (comptime !std.mem.eql(u8, field, "restore_terminal") and !std.mem.eql(u8, field, "limit")) if (@field(query, field) != null) return error.InvalidSqlRelationPersistence;
@@ -77655,4 +77690,99 @@ test "SQL native generation retirement counted publication rejoins exact loss pr
         }
     };
     try @import("../sql_relation_recovery_store.zig").testRetainedNativeLossCustody(Observer);
+}
+
+test "SQL scope retirement TEMP maintenance joins live metadata source separately from its native Boot" {
+    const backing = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const local = @import("antfly_local_sources");
+    const P = local.common_topology_records.RelationPersistence;
+    const L = @import("../../system_catalog/lock_authority.zig");
+    const sources = @import("../../system_catalog/temporary_source_binding.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-maintenance-source", .{tmp.sub_path});
+    const group = group_ids.main_metadata_group_id;
+    const incarnation = "07070707070707070707070707070707".*;
+    const seed: [32]u8 = @splat(7);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const root: local.storage_db_root_signing_identity.State = .{ .root_incarnation = 11, .seed = seed, .public_key = pair.public_key.toBytes() };
+    const identity: store_root_enrollment.Identity = .{ .metadata_incarnation = incarnation, .node_id = 1, .store_id = 1, .root_incarnation = root.root_incarnation, .public_key = root.public_key };
+    const boot: sql_relation_boots.Record = .{ .node_id = 1, .identity = identity, .reporter_incarnation = 1, .generation = 2, .instance = @splat(8), .claim_digest = @splat(9), .unclean_restart = false, .phase = .ready };
+    // Standalone connection node zero and API executor six are intentionally
+    // distinct from physical data node one and native Boot instance eight.
+    const owner: P.Owner = .{ .issuer_node_id = 0, .connection_id = @splat('a'), .wire_epoch = @splat(2), .execution_instance = @splat(6), .connection_generation = 1, .principal_digest = @splat(3) };
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "table:maintenance", .schema_json = "{\"version\":1}", .desired_replica_count = 1, .sql_persistence = .{ .kind = .temporary, .owner_node_id = 1, .owner_store_id = 1, .generation_instance = boot.instance, .data_generation = 1, .owner = owner } };
+    const range: metadata.RangeRecord = .{ .table_id = 7, .group_id = 43, .range_id = 43, .doc_identity_shard_id = 43, .doc_identity_range_id = 43, .start_key = "" };
+    var namespace_name: [72]u8 = undefined;
+    const namespace: system_catalog.Resource = .{ .kind = .namespace, .id = 10, .parent_id = system_catalog.default_database_id, .name = try owner.namespace(&namespace_name), .sql_temporary_owner = owner };
+    const backend: L.locks.Backend = .{ .incarnation = @splat(7), .id = @splat(4), .fence = 1 };
+    const frame: L.scopes.Command = .{ .sequence = 1, .nonce = @splat(5), .executor = owner.execution_instance };
+    const registration: L.scopes.Registration = .{ .group = group, .lease = .{ .backend = backend, .database = system_catalog.default_database_id, .node = 0, .principal = @splat(3), .expires_at_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60000 }, .connection = owner.connection_id, .nonce = @splat(6), .standalone = true };
+    const authority: L.Context = .{ .a = a, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database = system_catalog.default_database_id, .standalone = true, .maintenance = true };
+    const ns: L.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = backend.incarnation };
+    var request: sql_relation_boots.MaintenanceRequest = .{ .owner_group_id = range.group_id, .namespace = .{ .table_id = table.table_id, .shard_id = 43, .range_id = 43 }, .descriptor = table.sql_persistence.?, .schema_digest = undefined, .indexes_digest = undefined };
+    std.crypto.hash.Blake3.hash(table.schema_json, &request.schema_digest, .{});
+    std.crypto.hash.Blake3.hash(table.indexes_json, &request.indexes_digest, .{});
+    const proof = try @import("../sql_relation_attestation.zig").SignedBinding.sign(.{ .kind = .initialized, .metadata_group_id = group, .boot_generation = boot.generation, .identity = identity, .reporter_incarnation = boot.reporter_incarnation, .binding = .{ .descriptor = table.sql_persistence.?, .native_instance = boot.instance, .table_id = table.table_id, .shard_id = 43, .range_id = 43, .physical_root_incarnation = 91, .schema_version = 1, .schema_digest = try restore_staging.runtimeSchemaDigestForTable(a, table.schema_json), .catalog_generation = 1, .catalog_fingerprint = @splat(4) } }, root);
+    for (0..2) |pass| {
+        var store = try RaftApplyStore.init(backing, .{ .root_dir = path });
+        defer store.deinit();
+        if (pass == 0) {
+            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+            {
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                const reporter: metadata.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 1, .replica_root_incarnation = root.root_incarnation, .replica_root_public_key = root.public_key, .schema_reader = metadata_table_manager.SchemaReaderCapabilities.current, .role = "data", .live = true, .relational_topology_protocol_version = metadata_table_manager.native_relation_protocol_version };
+                _ = try store.writeStoreComponentsTxn(&txn, group, reporter.store_id, reporter, false, null, null);
+                try txn.commit();
+            }
+            try store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = try std.json.Stringify.valueAlloc(a, try store_root_enrollment.Request.sign(identity, seed), .{}) });
+            {
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                var key: [320]u8 = undefined;
+                try txn.put(try sql_relation_boots.key(&key, group, boot.node_id), try std.json.Stringify.valueAlloc(a, boot, .{}));
+                try L.scopes.register(a, &txn, ns, registration, authority);
+                _ = try L.scopes.begin(a, &txn, ns, backend, frame, authority);
+                const binding = try sources.prepare(a, &txn, group, namespace, .{ .group = group, .backend = backend, .command = frame, .database = system_catalog.default_database_id, .principal = registration.lease.principal, .standalone = true });
+                try sources.stage(a, &txn, binding);
+                try L.scopes.finish(a, &txn, ns, backend, frame, authority);
+                var resources = [_]system_catalog.Resource{ namespace, .{ .kind = .table, .id = table.table_id, .parent_id = namespace.id, .name = "maintenance", .storage_name = table.name } };
+                const meta = try system_catalog_storage.readMeta(a, &txn, group);
+                try system_catalog_storage.applyDelta(a, &txn, group, .{ .upserts = &resources, .removes = &.{}, .next_id = 11 }, meta, @splat(1));
+                const encoded = try encodeTableRecord(a, table);
+                const prepared: RaftApplyStore.PreparedTableRecordWrite = .{ .identity = .{ .table_id = table.table_id, .name = table.name }, .value = encoded, .previous_name = null, .lake_value = null, .column_identity_value = null, .retire_previous_attributes = false, .sequence_defaults = null, .foreign_key_dependencies = null, .object_change = null, .source_changed = true, .fingerprint = policyTableSchemaRecordDigest(table) };
+                try store.writePreparedTableRecordTxn(&txn, group, try tableKeyForGroup(&key, group, table.table_id), prepared);
+                try txn.commit();
+            }
+            try store.applyStandaloneCommand(group, .{ .upsert_range = range });
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try store.stageSqlRelationInitializedBindingTxn(&txn, group, proof);
+            try txn.commit();
+        }
+        const bytes = try store.sqlRelationBootJson(a, group, .{ .maintenance = request });
+        const observed = try std.json.parseFromSliceLeaky(sql_relation_boots.Observation, a, bytes, .{});
+        try observed.maintenance.?.requireFor(request, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+        try std.testing.expectEqual(@as(u64, 0), observed.maintenance.?.binding.namespace.owner.issuer_node_id);
+        try std.testing.expectEqual(@as(u64, 1), observed.record.?.node_id);
+        var foreign = request;
+        foreign.descriptor.owner.?.connection_generation += 1;
+        try std.testing.expectError(error.SqlRelationOwnerChanged, store.sqlRelationBootJson(a, group, .{ .maintenance = foreign }));
+        foreign = request;
+        foreign.schema_digest[0] ^= 1;
+        try std.testing.expectError(error.CatalogGenerationChanged, store.sqlRelationBootJson(a, group, .{ .maintenance = foreign }));
+        try std.testing.expectError(error.InvalidSqlRelationPersistence, store.sqlRelationBootJson(a, group, .{ .maintenance = request, .node = 1 }));
+        if (pass == 1) {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try L.scopes.fence(a, &txn, ns, backend, .close, authority);
+            try txn.commit();
+            try std.testing.expectError(error.SqlTemporaryRelationNotOwned, store.sqlRelationBootJson(a, group, .{ .maintenance = request }));
+        }
+    }
 }

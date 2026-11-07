@@ -3663,7 +3663,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
     }
 
+    const PublishedRestoreControl = struct {
+        group_id: u64,
+        scope: [32]u8,
+        plan_id: [16]u8,
+        admission: ?struct {
+            host: @import("antfly_local_sources").common_topology_records.RelationPersistence.Context,
+            boot: @import("antfly_local_sources").common_topology_records.RelationPersistence.Boot,
+        } = null,
+    };
+
     const ReadControls = struct {
+        native_published_restore: ?PublishedRestoreControl = null,
         native_route: ?metadata_api.CatalogRouteFence = null,
         native_lock_cleanup: bool = false,
         native_decision_owner: ?@import("antfly_local_sources").storage_transactions.ExternalDecisionOwner = null,
@@ -4200,7 +4211,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
     };
 
-    pub const RestoreDescriptorUse = enum { read, mutate, resolve };
+    pub const RestoreDescriptorUse = enum { read, mutate, resolve, published_control };
     pub const RestoreDescriptorRecovery = struct {
         const VTable = struct { recover: @FieldType(RestoreDescriptorRecovery, "recover_fn") };
         const Boundary = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
@@ -4223,7 +4234,8 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// descriptor; ordinary named-table discovery is never an alternative.
     pub fn resolveRestoreDescriptor(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: ?[16]u8, use: RestoreDescriptorUse, context: @import("antfly_local_sources").api_operation.RequestContext) !OwnedRestoreDescriptor {
         try context.ensureActive();
-        var descriptor = if (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) |cached| cached else blk: {
+        const cached = if (use == .published_control) null else try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope);
+        var descriptor = if (cached) |value| value else blk: {
             const plan = plan_id orelse return error.RestoreStagingScopeChanged;
             if (std.mem.allEqual(u8, &plan, 0)) return error.RestoreStagingScopeChanged;
             const recovery = self.restore_descriptor_recovery orelse return error.RestoreStagingScopeChanged;
@@ -6087,6 +6099,103 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
     };
 
+    fn requireNativeMaintenanceLease(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, request: @import("native_relation_maintenance.zig").Request, context: request_operation.RequestContext) !@import("../metadata/sql_relation_boots.zig").MaintenanceLease {
+        try @import("native_relation_maintenance.zig").requireAuthority(context);
+        const observed = try self.catalog.sqlRelationBinding(a, .{ .maintenance = request }, context.deadline_ns);
+        const grant = observed.maintenance orelse return error.SqlTemporaryRelationNotOwned;
+        try grant.requireFor(request, platform_time.realtimeNs() / std.time.ns_per_ms);
+        const initialized = observed.initialized orelse return error.SqlRelationRecoveryIncomplete;
+        try initialized.verify();
+        const observed_pin = try @import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin.fromBinding(initialized.binding);
+        if (!grant.native_pin.eql(observed_pin) or grant.boot_generation != initialized.boot_generation or !std.mem.eql(u8, &grant.execution_instance, &initialized.binding.native_instance)) return error.SqlRelationOwnerChanged;
+        const boot = try self.requireCurrentNativeBoot(request.descriptor, observed);
+        if (boot.phase != .ready or !observed.registration_current or grant.metadata_group_id != initialized.metadata_group_id or
+            !std.mem.eql(u8, &grant.metadata_incarnation, &boot.identity.metadata_incarnation)) return error.SqlRelationRecoveryIncomplete;
+        return grant;
+    }
+
+    /// Closed maintenance on the exact current live TEMP image. The retained
+    /// private control owner is reused; no row key/options/SQL Owner is accepted.
+    /// Initial empty schemas are already atomically enforced, and pending
+    /// schema/rewrite work remains exclusively owned by its genuine job.
+    pub fn advanceNativeTemporaryMaintenance(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, table: []const u8, request: @import("native_relation_maintenance.zig").Request, input: request_operation.RequestContext) !@import("native_relation_maintenance.zig").Result {
+        const fixed = @import("native_relation_maintenance.zig");
+        try fixed.requireAuthority(input);
+        try request.validate();
+        var context = try platformDeadlineContext(input);
+        context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), platform_time.monotonicNs() +| 2 * std.time.ns_per_s);
+        context.deadline_io = null;
+        const grant = try self.requireNativeMaintenanceLease(a, request, context);
+        const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+        try grant.requireFor(request, now_ms);
+        const lease_budget_ns = std.math.mul(u64, grant.expires_at_ms - now_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+        context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), platform_time.monotonicNs() +| lease_budget_ns);
+        context.deadline_io = null;
+        var descriptor = try self.loadDescriptorWithDeadline(a, request.owner_group_id, table, context.deadline_ns);
+        defer descriptor.deinit(a);
+        const view = descriptor.view();
+        try request.requireTable(.{ .table_id = view.identity.table_id, .name = table, .sql_persistence = view.sql_persistence, .schema_json = view.schema_json, .indexes_json = view.indexes_json });
+        if (!request.namespace.eql(.{ .table_id = view.identity.table_id, .shard_id = view.identity.shard_id, .range_id = view.identity.range_id })) return error.IdentityNamespaceMismatch;
+        const proof = try self.nativeProofForDescriptor(view, .{ .execution_deadline_ns = context.deadline_ns, .cancellation = context.cancellation });
+        if (proof.metadata_group_id != grant.metadata_group_id) return error.SqlRelationOwnerChanged;
+        var lease = try self.acquireDescriptorWithMode(request.owner_group_id, table, descriptor.path, view, false, .resident, .{ .native_initialized = proof.initialized, .native_boot_observed = true, .execution_deadline_ns = context.deadline_ns, .cancellation = context.cancellation });
+        defer lease.deinit();
+        const binding = try lease.owner().nativeRelationBinding(a, table);
+        const actual_pin = try @import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin.fromBinding(binding);
+        if (!actual_pin.eql(grant.native_pin) or !binding.descriptor.eql(request.descriptor) or !std.mem.eql(u8, &binding.native_instance, &grant.execution_instance) or
+            !std.mem.eql(u8, &binding.schema_digest, &try @import("../metadata/restore_staging.zig").runtimeSchemaDigestForTable(a, view.schema_json))) return error.SqlRelationOwnerChanged;
+        var state: fixed.Result = .enforced;
+        const status_request = try table_reads.encodeStorageKernelLookupRequest(a, "", .{ .relational_activation_json = "{\"mode\":\"status\"}", .execution_deadline_ns = context.deadline_ns, .cancellation = context.cancellation });
+        defer a.free(status_request);
+        const status_response: ?client.VersionedResponse = lease.owner().lookupJson(table, status_request) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (status_response) |output| {
+            var response = output;
+            defer response.deinit();
+            var status = try std.json.parseFromSlice(struct { state: @import("antfly_local_sources").storage_db_relational_integrity_activation_contract.State, schema_version: u32, schema_digest: [32]u8 }, a, response.bytes(), .{ .ignore_unknown_fields = true });
+            defer status.deinit();
+            if (status.value.schema_version != binding.schema_version or !std.mem.eql(u8, &status.value.schema_digest, &binding.schema_digest)) return error.PreparedGenerationChanged;
+            state = switch (status.value.state) {
+                .enforced => .enforced,
+                .validating => .pending,
+                .invalid => .invalid,
+            };
+        } else if (try @import("antfly_local_sources").api_relational_integrity_commit.requiresActivation(a, view.schema_json)) state = .pending;
+        if (state == .enforced) {
+            try context.ensureActive();
+            const fresh = try self.requireNativeMaintenanceLease(a, request, context);
+            if (!std.meta.eql(fresh.binding, grant.binding)) return error.SqlTemporaryRelationNotOwned;
+            if (!fresh.native_pin.eql(actual_pin) or fresh.boot_generation != grant.boot_generation or !std.mem.eql(u8, &fresh.execution_instance, &binding.native_instance)) return error.SqlRelationOwnerChanged;
+            const gc_request = try table_reads.encodeStorageKernelLookupRequest(a, "", .{ .relational_topology_json = "{\"mode\":\"generation_gc\"}", .execution_deadline_ns = context.deadline_ns, .cancellation = context.cancellation });
+            defer a.free(gc_request);
+            var gc_response = try lease.owner().lookupJson(table, gc_request);
+            defer gc_response.deinit();
+            var gc = try std.json.parseFromSlice(?@import("antfly_local_sources").storage_db_relational_integrity_generation_retirement.GcCommand, a, gc_response.bytes(), .{ .allocate = .alloc_always });
+            defer gc.deinit();
+            if (gc.value) |value| {
+                var command = value;
+                command.owner_group_id = request.owner_group_id;
+                if (!command.namespace.eql(request.namespace)) return error.IdentityNamespaceMismatch;
+                const batch = try std.json.Stringify.valueAlloc(a, db_types.BatchRequest{ .relational_generation_gc = command }, .{});
+                defer a.free(batch);
+                try context.ensureActive();
+                var applied = try lease.owner().batchJson(table, batch);
+                applied.deinit();
+            }
+        }
+        try context.ensureActive();
+        const final = try self.requireNativeMaintenanceLease(a, request, context);
+        if (!std.meta.eql(final.binding, grant.binding)) return error.SqlTemporaryRelationNotOwned;
+        if (!final.native_pin.eql(actual_pin) or final.boot_generation != grant.boot_generation or !std.mem.eql(u8, &final.execution_instance, &binding.native_instance)) return error.SqlRelationOwnerChanged;
+        const after = try lease.owner().nativeRelationBinding(a, table);
+        if (!after.descriptor.eql(binding.descriptor) or !(try @import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin.fromBinding(after)).eql(try @import("antfly_local_sources").common_topology_records.RelationPersistence.PhysicalPin.fromBinding(binding)) or
+            after.schema_version != binding.schema_version or after.catalog_generation != binding.catalog_generation or
+            !std.mem.eql(u8, &after.schema_digest, &binding.schema_digest) or !std.mem.eql(u8, &after.catalog_fingerprint, &binding.catalog_fingerprint)) return error.PreparedGenerationChanged;
+        return state;
+    }
+
     /// Only fixed metadata-control observations are exposed, never arbitrary
     /// row keys/projections. The caller separately holds the job permission.
     pub fn lookupNativeFkControl(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group: u64, table: []const u8, kind: NativeFkRead, context: request_operation.RequestContext) !?table_read_source.LookupResponse {
@@ -6491,7 +6600,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (proposer) |replicated| {
             try replicated.submit(batch.req, request);
         } else {
-            _ = try self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, batch.req, descriptor);
+            _ = try self.batchGroupLocalWithDescriptorAndControls(alloc, group_id, table_name, batch.req, descriptor, .{ .execution_deadline_ns = request.deadline_ns, .execution_io = request.deadline_io, .cancellation = request.cancellation });
         }
         const followup = if (input.action == .publish or input.action == .cancel or input.action == .install_generation_admissions or input.action == .install_native_empty) input else input.statusRead();
         var committed = try self.prepareRestoreOwnerControl(alloc, group_id, table_name, descriptor, followup, options, request);
@@ -6553,6 +6662,28 @@ pub const ProvisionedKernelOwnerSource = struct {
         return result;
     }
 
+    fn publishedRestoreSelection(group_id: u64, input: @import("restore_owner.zig").Request) ?PublishedRestoreControl {
+        if (input.action != .publish or input.scope.native_empty_origin == null) return null;
+        return .{ .group_id = group_id, .scope = input.scope.digest(), .plan_id = input.scope.plan_id };
+    }
+
+    fn publishedRestoreBatchSelection(a: std.mem.Allocator, group_id: u64, descriptor: descriptor_contract.Descriptor, req: db_types.BatchRequest) !?PublishedRestoreControl {
+        if (descriptor.sql_persistence == null or descriptor.restore_bootstrap_json.len == 0 or req.restore_staging == null or req.restore_staging.? != .finish or req.restore_staging.?.finish.phase != .published) return null;
+        var bootstrap = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, a, descriptor.restore_bootstrap_json, .{});
+        defer bootstrap.deinit();
+        const scope = bootstrap.value.scope;
+        if (scope.native_empty_origin == null) return null;
+        const captured = req.restore_staging_scope orelse return error.RestoreStagingScopeChanged;
+        if (!std.mem.eql(u8, &captured, &scope.digest()) or !std.mem.eql(u8, &req.restore_staging.?.finish.scope, &captured)) return error.RestoreStagingScopeChanged;
+        if (req.restore_staging_plan_id) |plan| if (!std.mem.eql(u8, &plan, &scope.plan_id)) return error.RestoreStagingScopeChanged;
+        const empty: db_types.BatchRequest = .{};
+        inline for (@typeInfo(db_types.BatchRequest).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "restore_staging") and !std.mem.eql(u8, field, "restore_staging_scope") and !std.mem.eql(u8, field, "restore_staging_plan_id") and !std.mem.eql(u8, field, "timestamp_ns"))
+                if (!std.meta.eql(@field(req, field), @field(empty, field))) return error.InvalidBatchRequest;
+        }
+        return .{ .group_id = group_id, .scope = captured, .plan_id = scope.plan_id };
+    }
+
     fn prepareRestoreOwnerControl(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
@@ -6565,7 +6696,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !std.json.Parsed(@import("restore_owner.zig").Prepared) {
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         defer alloc.free(path);
-        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, false, .resident, .{ .execution_deadline_ns = request.deadline_ns, .execution_io = request.deadline_io, .cancellation = request.cancellation });
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, false, .resident, .{ .execution_deadline_ns = request.deadline_ns, .execution_io = request.deadline_io, .cancellation = request.cancellation, .native_published_restore = if (descriptor.sql_persistence != null) publishedRestoreSelection(group_id, input) else null });
         defer lease.deinit();
         return prepareRestoreOwnerControlOnLease(alloc, &lease, table_name, input, options, request);
     }
@@ -6713,15 +6844,34 @@ pub const ProvisionedKernelOwnerSource = struct {
         var region = std.heap.ArenaAllocator.init(self.alloc);
         defer region.deinit();
         var creation_scope: ?@import("../metadata/sql_relation_attestation.zig").CreationScope = null;
+        var restore_table: []const u8 = "";
         var restore_scope: ?@import("antfly_local_sources").storage_db_restore_staging_contract.Scope = null;
         if (descriptor.restore_bootstrap_json.len != 0) {
             const bootstrap = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, region.allocator(), descriptor.restore_bootstrap_json, .{ .allocate = .alloc_always });
             restore_scope = bootstrap.scope;
+            restore_table = bootstrap.table_name;
             creation_scope = .{ .plan_id = bootstrap.scope.plan_id, .plan_digest = bootstrap.scope.plan_digest };
+        }
+        const published = controls.native_published_restore;
+        if (published) |selected| {
+            if (controls.native_initialization or controls.native_adoption != null or controls.native_uninitialized != null or controls.native_empty_host != null or controls.native_empty_admission != null or controls.native_route != null or controls.historical_raft_apply or controls.durable_catalog) return error.InvalidSqlRelationPersistence;
+            const scope = restore_scope orelse return error.RestoreStagingScopeChanged;
+            if (native.kind != .unlogged or scope.native_empty_origin == null or
+                !std.mem.eql(u8, &scope.digest(), &selected.scope) or !std.mem.eql(u8, &scope.plan_id, &selected.plan_id)) return error.RestoreStagingScopeChanged;
+            var current = try self.resolveRestoreDescriptor(region.allocator(), selected.group_id, restore_table, selected.scope, selected.plan_id, .published_control, .{ .deadline_ns = controls.execution_deadline_ns, .deadline_io = controls.execution_io, .cancellation = controls.cancellation orelse db_types.CancellationToken.none });
+            defer current.deinit(region.allocator());
+            const actual = current.descriptor;
+            if (actual.lsm_root_generation != descriptor.lsm_root_generation or !actual.identity.eql(descriptor.identity) or
+                !std.meta.eql(actual.sql_persistence, descriptor.sql_persistence) or !std.meta.eql(actual.table_storage, descriptor.table_storage) or
+                !std.mem.eql(u8, actual.schema_json, descriptor.schema_json) or !std.mem.eql(u8, actual.indexes_json, descriptor.indexes_json) or
+                !std.mem.eql(u8, actual.restore_bootstrap_json, descriptor.restore_bootstrap_json)) return error.RestoreStagingScopeChanged;
         }
         const observed = try self.catalog.sqlRelationBinding(self.alloc, .{ .node = native.owner_node_id, .binding_table = descriptor.identity.table_id, .creation_scope = creation_scope }, controls.execution_deadline_ns);
         const current_boot = try self.requireCurrentNativeBoot(native, observed);
-        const boot = if (restore_scope != null and restore_scope.?.native_empty_origin != null)
+        const boot = if (published != null) published_boot: {
+            if (current_boot.phase != .ready and current_boot.phase != .recovering) return error.SqlRelationOwnerChanged;
+            break :published_boot current_boot;
+        } else if (restore_scope != null and restore_scope.?.native_empty_origin != null)
             try requireHiddenEmptyBoot(descriptor, restore_scope.?, observed)
         else switch (current_boot.phase) {
             .ready => current_boot,
@@ -6738,10 +6888,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         lock(&self.mutex);
         const host = self.sql_persistence_host;
         const ready = self.sql_persistence_ready;
+        const draining = self.sql_persistence_draining;
         self.mutex.unlock();
-        const recovering_empty = boot.phase == .recovering and restore_scope != null and restore_scope.?.native_empty_origin != null;
-        if (!ready and !recovering_empty) return error.SqlRelationRecoveryIncomplete;
-        var actual = if (recovering_empty)
+        if (published != null and (draining or (host != null and host.?.standby))) return error.SqlRelationOwnerChanged;
+        const recovering_empty = boot.phase == .recovering and published == null and restore_scope != null and restore_scope.?.native_empty_origin != null;
+        const recovering_published = boot.phase == .recovering and published != null;
+        if (!ready and !recovering_empty and !recovering_published) return error.SqlRelationRecoveryIncomplete;
+        var actual = if (recovering_empty or recovering_published)
             @import("antfly_local_sources").common_topology_records.RelationPersistence.Context{ .node_id = boot.identity.node_id, .store_id = boot.identity.store_id, .execution_instance = boot.instance, .generation_instance = native.generation_instance, .data_generation = native.data_generation }
         else
             host orelse return error.SqlRelationOwnerChanged;
@@ -6827,11 +6980,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         // Private schema/index/restore controls already hold their metadata
         // purpose. They still need the same initialized-image proof as user
         // opens. Fetch it before entering the owner registry mutex.
-        if (descriptor.sql_persistence != null and controls.native_initialized == null and !controls.native_initialization and controls.native_adoption == null) {
+        if (descriptor.sql_persistence != null and (controls.native_initialized == null or controls.native_published_restore != null) and !controls.native_initialization and controls.native_adoption == null) {
             const proof = try self.nativeProofForDescriptor(descriptor, controls);
             controls.native_initialized = proof.initialized;
             controls.native_boot_observed = true;
-            if (proof.boot.phase == .recovering) {
+            if (controls.native_published_restore) |*published| {
+                const native = descriptor.sql_persistence.?;
+                published.admission = .{
+                    .host = .{ .node_id = native.owner_node_id, .store_id = native.owner_store_id, .execution_instance = proof.boot.instance, .generation_instance = native.generation_instance, .data_generation = native.data_generation },
+                    .boot = proof.boot.boot(),
+                };
+            }
+            if (proof.boot.phase == .recovering and controls.native_published_restore == null) {
                 controls.native_empty_admission = proof.empty_target orelse return error.SqlRelationRecoveryIncomplete;
                 const native = descriptor.sql_persistence.?;
                 controls.native_empty_host = .{ .node_id = native.owner_node_id, .store_id = native.owner_store_id, .execution_instance = proof.boot.instance, .generation_instance = native.generation_instance, .data_generation = native.data_generation };
@@ -6867,6 +7027,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer lease.deinit();
         if (lease.entry.catalog_deferred and !controls.allow_deferred_catalog and !controls.historical_raft_apply)
             return error.StorageReadTemporarilyUnavailable;
+        if (controls.native_published_restore != null) {
+            const expected = controls.native_initialized orelse return error.SqlRelationRecoveryIncomplete;
+            const actual = try lease.owner().nativeRelationBinding(self.alloc, table_name);
+            const persistence = @import("antfly_local_sources").common_topology_records.RelationPersistence;
+            if (!actual.descriptor.eql(expected.descriptor) or !std.mem.eql(u8, &actual.native_instance, &expected.native_instance) or
+                !(try persistence.PhysicalPin.fromBinding(actual)).eql(try persistence.PhysicalPin.fromBinding(expected))) return error.SqlRelationOwnerChanged;
+        }
         try controls.check();
         return lease;
     }
@@ -7042,11 +7209,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         controls: ReadControls,
     ) !Lease {
         if (descriptor.sql_persistence != null and controls.historical_raft_apply) return error.InvalidSqlRelationPersistence;
+        if (controls.native_published_restore) |published| {
+            if (published.admission == null or controls.native_initialized == null or !controls.native_boot_observed) return error.InvalidSqlRelationPersistence;
+        }
         const exclusive = admission != .shared;
         if (!self.mutex.tryLock()) return error.StorageKernelOwnerTransitionRequired;
         defer self.mutex.unlock();
         if (self.quiescing) return error.Canceled;
-        if (descriptor.sql_persistence) |native| if (controls.native_adoption == null and controls.native_empty_host == null and controls.native_uninitialized == null and !self.sql_persistence_ready and
+        if (descriptor.sql_persistence) |native| if (controls.native_adoption == null and controls.native_empty_host == null and controls.native_uninitialized == null and controls.native_published_restore == null and !self.sql_persistence_ready and
             !(self.sql_persistence_draining and (controls.native_decision_owner != null or controls.native_lock_cleanup)))
         {
             if (self.sql_persistence_draining) return error.SqlRelationOwnerChanged;
@@ -7192,8 +7362,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 if (!std.mem.eql(u8, &recovering.execution_instance, &controls.native_initialized.?.native_instance)) return error.SqlRelationOwnerChanged;
             }
             if (controls.native_uninitialized != null and (!controls.native_initialization or controls.native_adoption != null or controls.native_empty_host != null)) return error.InvalidSqlRelationPersistence;
-            var host = if (controls.native_uninitialized) |initial| initial.host else if (controls.native_empty_host) |reset| reset else if (controls.native_adoption) |recovery| recovery.host else self.sql_persistence_host orelse return error.SqlRelationOwnerChanged;
-            var boot = if (controls.native_uninitialized) |initial| initial.boot else if (controls.native_empty_host) |reset| @import("antfly_local_sources").common_topology_records.RelationPersistence.Boot{ .instance = reset.execution_instance, .unclean_restart = true, .initializing = true } else if (controls.native_adoption) |recovery| recovery.boot else self.sql_persistence_boot orelse return error.SqlRelationOwnerChanged;
+            var host = if (controls.native_published_restore) |published| published.admission.?.host else if (controls.native_uninitialized) |initial| initial.host else if (controls.native_empty_host) |reset| reset else if (controls.native_adoption) |recovery| recovery.host else self.sql_persistence_host orelse return error.SqlRelationOwnerChanged;
+            var boot = if (controls.native_published_restore) |published| published.admission.?.boot else if (controls.native_uninitialized) |initial| initial.boot else if (controls.native_empty_host) |reset| @import("antfly_local_sources").common_topology_records.RelationPersistence.Boot{ .instance = reset.execution_instance, .unclean_restart = true, .initializing = true } else if (controls.native_adoption) |recovery| recovery.boot else self.sql_persistence_boot orelse return error.SqlRelationOwnerChanged;
             boot.initialized = controls.native_initialized;
             boot.initializing = controls.native_initialization;
             if (boot.initialized) |binding| if (!binding.descriptor.eql(lifetime) or binding.table_id != descriptor.identity.table_id or
@@ -8750,6 +8920,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         req: db_types.BatchRequest,
         descriptor: ?descriptor_contract.Descriptor,
     ) !?void {
+        return self.batchGroupLocalWithDescriptorAndControls(alloc, group_id, table_name, req, descriptor, .{});
+    }
+
+    fn batchGroupLocalWithDescriptorAndControls(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_types.BatchRequest,
+        descriptor: ?descriptor_contract.Descriptor,
+        input_controls: ReadControls,
+    ) !?void {
         try @import("sql_graph_vote.zig").require(alloc, self.catalog, table_name, req, null);
         if (self.replication_write_gate) |gate| try gate.check();
         var replication_mutation = if (self.hot_standby_async_mirror) |mirror|
@@ -8761,7 +8943,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer alloc.free(request_json);
         const private_path = if (descriptor != null) try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id }) else null;
         defer if (private_path) |path| alloc.free(path);
-        var lease = if (descriptor) |owned| try self.acquireDescriptor(group_id, table_name, private_path.?, owned) else try self.acquire(group_id, table_name);
+        var controls = input_controls;
+        if (descriptor) |owned| controls.native_published_restore = try publishedRestoreBatchSelection(alloc, group_id, owned, req);
+        var lease = if (descriptor) |owned| try self.acquireDescriptorWithMode(group_id, table_name, private_path.?, owned, false, .resident, controls) else try self.acquire(group_id, table_name);
         defer lease.deinit();
         const logged = lease.entry.sql_persistence == null;
         if (logged) try self.preflightHotStandbyMirrorSyncCommit();
@@ -9398,7 +9582,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             defer descriptor.deinit(alloc);
             const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
             defer alloc.free(path);
-            return self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation });
+            return self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation, .native_published_restore = try publishedRestoreBatchSelection(alloc, group_id, descriptor.view(), req) });
         }
         if (req.transaction) |txn| switch (txn) {
             .resolve, .acknowledge, .acknowledge_many => if (try self.acquireHiddenTransactionOwner(group_id, table_name)) |lease| return lease,
@@ -13383,7 +13567,7 @@ test "SQL relation lifetime native retirement preparation captures only exact in
     const attestation = @import("../metadata/sql_relation_attestation.zig");
     const services = @import("../storage/kernel_runtime_services.zig");
     const a = std.testing.allocator;
-    const schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}}}";
+    const schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"unique_constraints\":[{\"name\":\"pk\",\"columns\":[\"id\"]}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}}}";
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/retirement-capture", .{tmp.sub_path});
@@ -13402,6 +13586,9 @@ test "SQL relation lifetime native retirement preparation captures only exact in
         ranges: [1]@import("../metadata/table_manager.zig").RangeRecord = .{.{ .table_id = 7, .group_id = 72, .range_id = 272, .doc_identity_shard_id = 172, .doc_identity_range_id = 272, .start_key = "", .end_key = null }},
         observation: boots.Observation = .{ .record = null, .registration_current = false },
         boot_reads: usize = 0,
+        maintenance_live: bool = true,
+        maintenance_foreign: bool = false,
+        maintenance_expires_ms: u64 = std.math.maxInt(u64),
         change_boot_on_read: ?usize = null,
         fn admin(raw: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -13410,6 +13597,15 @@ test "SQL relation lifetime native retirement preparation captures only exact in
         fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
         fn boot(raw: *anyopaque, _: std.mem.Allocator, query: boots.Query, _: ?u64) !boots.Observation {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (query.maintenance) |selected| {
+                try selected.requireTable(self.tables[0]);
+                if (!self.maintenance_live) return error.SqlTemporaryRelationNotOwned;
+                const owner = self.tables[0].sql_persistence.?.owner.?;
+                var observed = self.observation;
+                observed.maintenance = .{ .request = selected, .metadata_group_id = 1, .metadata_incarnation = observed.record.?.identity.metadata_incarnation, .expires_at_ms = self.maintenance_expires_ms, .native_pin = try P.PhysicalPin.fromBinding(observed.initialized.?.binding), .boot_generation = observed.record.?.generation, .execution_instance = observed.record.?.instance, .binding = .{ .namespace = .{ .database_id = 1, .namespace_id = 2, .owner = owner }, .group = 1, .backend = .{ .incarnation = @splat(0xbb), .id = @splat(7), .fence = 1 }, .registration_nonce = @splat(4), .source_principal = @splat(5), .standalone = false, .creation_command = .{ .sequence = 1, .nonce = @splat(6), .executor = owner.execution_instance } } };
+                if (self.maintenance_foreign) observed.maintenance.?.binding.namespace.owner.connection_id[0] ^= 1;
+                return observed;
+            }
             if (query.node != 9 or query.binding_table != 7) return error.SqlRelationOwnerChanged;
             self.boot_reads += 1;
             if (self.change_boot_on_read == self.boot_reads) self.observation.record.?.generation += 1;
@@ -13478,6 +13674,31 @@ test "SQL relation lifetime native retirement preparation captures only exact in
     try source.validateNativeRoute(route);
     _ = try source.currentNativeInitialized(route, false);
     _ = try source.nativeProofForDescriptor(descriptor, .{});
+    const maintenance = @import("native_relation_maintenance.zig");
+    const maintenance_request = try maintenance.requestFor(fixture.tables[0], fixture.ranges[0]);
+    try std.testing.expectEqual(maintenance.Result.enforced, try source.advanceNativeTemporaryMaintenance(a, "rows", maintenance_request, request_context));
+    try std.testing.expectError(error.Forbidden, source.advanceNativeTemporaryMaintenance(a, "rows", maintenance_request, .{}));
+    fixture.maintenance_live = false;
+    try std.testing.expectError(error.SqlTemporaryRelationNotOwned, source.advanceNativeTemporaryMaintenance(a, "rows", maintenance_request, request_context));
+    fixture.maintenance_live = true;
+    fixture.maintenance_foreign = true;
+    try std.testing.expectError(error.SqlTemporaryRelationNotOwned, source.advanceNativeTemporaryMaintenance(a, "rows", maintenance_request, request_context));
+    fixture.maintenance_foreign = false;
+    fixture.maintenance_expires_ms = 1;
+    try std.testing.expectError(error.SqlTemporaryRelationNotOwned, source.advanceNativeTemporaryMaintenance(a, "rows", maintenance_request, request_context));
+    fixture.maintenance_expires_ms = std.math.maxInt(u64);
+    const maintenance_good_initialized = fixture.observation.initialized.?;
+    var maintenance_wrong_image = binding;
+    maintenance_wrong_image.physical_root_incarnation += 1;
+    fixture.observation.initialized = try attestation.SignedBinding.sign(.{ .kind = .initialized, .metadata_group_id = 1, .boot_generation = 1, .identity = identity, .reporter_incarnation = 1, .binding = maintenance_wrong_image }, root);
+    try std.testing.expectError(error.SqlRelationOwnerChanged, source.advanceNativeTemporaryMaintenance(a, "rows", maintenance_request, request_context));
+    fixture.observation.initialized = maintenance_good_initialized;
+    var forged_request = maintenance_request;
+    forged_request.descriptor.owner.?.connection_id[0] ^= 1;
+    try std.testing.expectError(error.SqlRelationOwnerChanged, source.advanceNativeTemporaryMaintenance(a, "rows", forged_request, request_context));
+    var expired_maintenance = request_context;
+    expired_maintenance.deadline_ns = platform_time.monotonicNs() -| 1;
+    try std.testing.expectError(error.DeadlineExceeded, source.advanceNativeTemporaryMaintenance(a, "rows", maintenance_request, expired_maintenance));
     {
         var captured = try source.captureNativeRetirementPreparation(a, 72, "rows", expected, request_context);
         defer captured.deinit(a);
@@ -13528,6 +13749,7 @@ test "SQL relation lifetime native retirement preparation captures only exact in
     var cold = try source.captureNativeRetirementPreparation(a, 72, "rows", expected, request_context);
     defer cold.deinit(a);
     try std.testing.expectEqualDeep(binding, cold.native_proof.initialized);
+    try std.testing.expectEqual(maintenance.Result.enforced, try source.advanceNativeTemporaryMaintenance(a, "rows", maintenance_request, request_context));
     {
         // Exercise the Source dispatch through an actual initialized CABI
         // owner after cold reopen. This component installs a real fence; the
@@ -13558,4 +13780,161 @@ test "SQL relation lifetime native retirement preparation captures only exact in
     // Even cold private capture does not turn a bare public TEMP read into
     // an owning SQL connection's row authority.
     try std.testing.expectError(error.SqlRelationOwnerChanged, ProvisionedKernelOwnerSource.lookupGroupLocal(&source, a, 72, "rows", "", .{ .relational_integrity_catalog = true }, .read_index));
+}
+
+test "SQL relation lifetime published native restore control authenticates current CABI image while normal reads remain fenced" {
+    const local = @import("antfly_local_sources");
+    const P = local.common_topology_records.RelationPersistence;
+    const staging = local.storage_db_restore_staging_contract;
+    const boots = @import("../metadata/sql_relation_boots.zig");
+    const attestation = @import("../metadata/sql_relation_attestation.zig");
+    const services = @import("../storage/kernel_runtime_services.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(parent);
+    const root_path = try std.fmt.allocPrint(a, "{s}/published-native", .{parent});
+    defer a.free(root_path);
+    const owner_path = try std.fmt.allocPrint(a, "{s}/group-172/table-db", .{root_path});
+    defer a.free(owner_path);
+    var io = std.testing.io;
+    const borrow = services.executor.Borrow.init(&io);
+    var context: client.Context = .{};
+    try std.testing.expectEqual(abi.Status.ok, services.antfly_storage_context_create_with_runtime(&.{ .io = &borrow }, &context.handle));
+    defer context.deinit();
+    const instance = (try context.metrics()).execution_instance;
+    var source = ProvisionedKernelOwnerSource.init(a, root_path, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    _ = source.withStorageContextHandle(context.handle);
+    defer source.deinit();
+    try source.admitRelationHost(.{ .node_id = 9, .store_id = 11, .execution_instance = instance, .generation_instance = instance, .data_generation = 1 }, .{ .instance = instance, .unclean_restart = false });
+    var public_schema = try local.schema_mod.parseValidatedTableSchema(a, "{}");
+    defer public_schema.deinit(a);
+    const runtime_schema = try local.schema_mod.deriveRuntimeTableSchema(a, public_schema);
+    defer local.storage_schema.freeSchema(a, runtime_schema);
+    const encoded_schema = try local.storage_schema.serializeSchema(a, runtime_schema);
+    defer a.free(encoded_schema);
+    const schema_digest = staging.digest(encoded_schema);
+    var descriptor: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 7, .shard_id = 172, .range_id = 272 },
+        .schema_json = "{}",
+        .indexes_json = "{}",
+        .sql_persistence = P.Descriptor{ .kind = .unlogged, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = instance, .data_generation = 1 },
+    };
+    const scope: staging.Scope = .{
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .source_artifact_digest = @splat(0),
+        .source_namespace = .{ .table_id = 0, .shard_id = 0, .range_id = 0 },
+        .target_namespace = .{ .table_id = descriptor.identity.table_id, .shard_id = descriptor.identity.shard_id, .range_id = descriptor.identity.range_id },
+        .target_schema_digest = schema_digest,
+        .empty_generation = true,
+        .native_empty_origin = .{ .schema_only_snapshot = .{ .manifest_digest = @splat(4), .schema_digest = schema_digest, .source_table_id = 5 } },
+    };
+    const install: local.storage_db_native_empty_generation.Install = .{ .scope = scope.digest(), .origin = scope.native_empty_origin.?, .transitions = &.{} };
+    const bootstrap: staging.OwnerBootstrap = .{ .scope = scope, .table_name = "rows", .schema_json = "{}", .indexes_json = "{}", .byte_range = .{ .start = "", .end = "" }, .native_empty_source = .{ .origin = scope.native_empty_origin.?, .expected_install_digest = try install.digest() } };
+    try bootstrap.validate();
+    const encoded_bootstrap = try std.json.Stringify.valueAlloc(a, bootstrap, .{});
+    defer a.free(encoded_bootstrap);
+    descriptor.restore_bootstrap_json = encoded_bootstrap;
+    var initializing = try source.acquireDescriptorWithMode(172, "rows", owner_path, descriptor, true, .transient, .{ .native_initialization = true });
+    const binding = try initializing.owner().nativeRelationBinding(a, "rows");
+    initializing.requestTransientRetirement();
+    initializing.deinit();
+    const root = try local.storage_db_root_signing_identity.loadOrCreate(a, io, root_path);
+    const identity: @import("../metadata/store_root_enrollment.zig").Identity = .{ .metadata_incarnation = @splat('p'), .node_id = 9, .store_id = 11, .root_incarnation = root.root_incarnation, .public_key = root.public_key };
+
+    const Fixture = struct {
+        descriptor: descriptor_contract.Descriptor,
+        expected_scope: [32]u8,
+        expected_plan: [16]u8,
+        published: bool = true,
+        calls: usize = 0,
+        value: boots.Observation,
+        fn boot(raw: *anyopaque, _: std.mem.Allocator, query: boots.Query, _: ?u64) !boots.Observation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (query.node != 9 or query.binding_table != 7) return error.SqlRelationOwnerChanged;
+            return self.value;
+        }
+        fn recover(raw: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, selected_scope: [32]u8, plan: [16]u8, use: ProvisionedKernelOwnerSource.RestoreDescriptorUse, input: request_operation.RequestContext) !ProvisionedKernelOwnerSource.OwnedRestoreDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try input.ensureActive();
+            self.calls += 1;
+            if (!self.published or use != .published_control or group != 172 or !std.mem.eql(u8, table, "rows") or !std.mem.eql(u8, &selected_scope, &self.expected_scope) or !std.mem.eql(u8, &plan, &self.expected_plan)) return error.RestoreStagingScopeChanged;
+            var result = self.descriptor;
+            result.schema_json = try alloc.dupe(u8, self.descriptor.schema_json);
+            errdefer alloc.free(result.schema_json);
+            result.indexes_json = try alloc.dupe(u8, self.descriptor.indexes_json);
+            errdefer alloc.free(result.indexes_json);
+            result.restore_bootstrap_json = try alloc.dupe(u8, self.descriptor.restore_bootstrap_json);
+            errdefer alloc.free(result.restore_bootstrap_json);
+            result.initial_range = try descriptor_contract.cloneInitialRange(alloc, self.descriptor.initial_range);
+            return .{ .descriptor = result };
+        }
+    };
+    var fixture: Fixture = .{ .descriptor = descriptor, .expected_scope = scope.digest(), .expected_plan = scope.plan_id, .value = .{
+        .record = .{ .node_id = 9, .identity = identity, .reporter_incarnation = 1, .generation = 1, .instance = instance, .claim_digest = @splat(6), .unclean_restart = false, .phase = .recovering },
+        .registration_current = true,
+        .initialized = try attestation.SignedBinding.sign(.{ .kind = .initialized, .metadata_group_id = 1, .boot_generation = 1, .identity = identity, .reporter_incarnation = 1, .binding = binding, .creation_scope = .{ .plan_id = scope.plan_id, .plan_digest = scope.plan_digest } }, root),
+        .attempt = .{ .number = 1, .digest = @splat(7) },
+    } };
+    var callbacks = table_catalog.emptyCatalogSource().vtable.*;
+    callbacks.sql_relation_boot = Fixture.boot;
+    source.catalog = .{ .ptr = &fixture, .vtable = &callbacks };
+    _ = source.withRestoreDescriptorRecovery(.{ .ptr = &fixture, .recover_fn = Fixture.recover });
+    source.sql_persistence_ready = false;
+    const selected: ProvisionedKernelOwnerSource.ReadControls = .{ .native_published_restore = .{ .group_id = 172, .scope = scope.digest(), .plan_id = scope.plan_id } };
+    // The image comes from the real compiled owner. The component callback
+    // models only a committed metadata observation, never a physical ACK.
+    const proof = try source.nativeProofForDescriptor(descriptor, selected);
+    try std.testing.expectEqualDeep(binding, proof.initialized);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expect(proof.empty_target == null);
+    // Reopen the initialized image through the actual CABI owner. Publication
+    // authority remains the callback's concern; this asserts only owner open.
+    {
+        var opened = try source.acquireDescriptorWithMode(172, "rows", owner_path, descriptor, false, .resident, selected);
+        defer opened.deinit();
+        try std.testing.expectEqualDeep(binding, try opened.owner().nativeRelationBinding(a, "rows"));
+    }
+    const observed_calls = fixture.calls;
+    // A resident hidden descriptor must not suppress the fresh published cut.
+    fixture.published = false;
+    try std.testing.expectError(error.RestoreStagingScopeChanged, source.nativeProofForDescriptor(descriptor, selected));
+    try std.testing.expectEqual(observed_calls + 1, fixture.calls);
+    fixture.published = true;
+    try std.testing.expectError(error.SqlRelationRecoveryIncomplete, source.nativeProofForDescriptor(descriptor, .{}));
+    fixture.published = false;
+    try std.testing.expectError(error.RestoreStagingScopeChanged, source.nativeProofForDescriptor(descriptor, selected));
+    fixture.published = true;
+    var wrong = selected;
+    wrong.native_published_restore.?.scope[0] ^= 1;
+    try std.testing.expectError(error.RestoreStagingScopeChanged, source.nativeProofForDescriptor(descriptor, wrong));
+    wrong = selected;
+    wrong.native_published_restore.?.group_id += 1;
+    try std.testing.expectError(error.RestoreStagingScopeChanged, source.nativeProofForDescriptor(descriptor, wrong));
+    const good = fixture.value.initialized;
+    var wrong_binding = binding;
+    wrong_binding.range_id += 1;
+    fixture.value.initialized = try attestation.SignedBinding.sign(.{ .kind = .initialized, .metadata_group_id = 1, .boot_generation = 1, .identity = identity, .reporter_incarnation = 1, .binding = wrong_binding, .creation_scope = .{ .plan_id = scope.plan_id, .plan_digest = scope.plan_digest } }, root);
+    // A correctly signed proof for another physical namespace is insufficient.
+    try std.testing.expectError(error.SqlRelationOwnerChanged, source.nativeProofForDescriptor(descriptor, selected));
+    wrong_binding = binding;
+    wrong_binding.physical_root_incarnation ^= 1;
+    fixture.value.initialized = try attestation.SignedBinding.sign(.{ .kind = .initialized, .metadata_group_id = 1, .boot_generation = 1, .identity = identity, .reporter_incarnation = 1, .binding = wrong_binding, .creation_scope = .{ .plan_id = scope.plan_id, .plan_digest = scope.plan_digest } }, root);
+    // A fresh canonical signature cannot substitute another physical image
+    // for the actual resident compiled owner retained above.
+    try std.testing.expectError(error.SqlRelationOwnerChanged, source.acquireDescriptorWithMode(172, "rows", owner_path, descriptor, false, .resident, selected));
+    fixture.value.initialized = good;
+    fixture.value.registration_current = false;
+    try std.testing.expectError(error.SqlRelationOwnerChanged, source.nativeProofForDescriptor(descriptor, selected));
+    fixture.value.registration_current = true;
+    var finish: db_types.BatchRequest = .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } }, .restore_staging_scope = scope.digest(), .restore_staging_plan_id = scope.plan_id };
+    try std.testing.expect((try ProvisionedKernelOwnerSource.publishedRestoreBatchSelection(a, 172, descriptor, finish)) != null);
+    finish.deletes = &.{"must-not-delete"};
+    try std.testing.expectError(error.InvalidBatchRequest, ProvisionedKernelOwnerSource.publishedRestoreBatchSelection(a, 172, descriptor, finish));
+    finish.deletes = &.{};
+    finish.restore_staging.?.finish.phase = .canceled;
+    try std.testing.expect((try ProvisionedKernelOwnerSource.publishedRestoreBatchSelection(a, 172, descriptor, finish)) == null);
 }

@@ -7,6 +7,7 @@ import os
 import signal
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 import requests
@@ -18,6 +19,87 @@ from conftest import (
     StandaloneAntflyServer,
     resolve_binary_path,
 )
+
+
+def _restore_failure_context(server):
+    """Failure-only public status observations; never fetch plans or secrets."""
+    deadline = time.monotonic() + 8
+
+    def get(path):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("diagnostic budget")
+        with requests.get(
+            server.api_url + path, timeout=min(1, remaining), stream=True
+        ) as response:
+            if response.status_code != 200:
+                return {"http_status": response.status_code}
+            body = bytearray()
+            # One-byte chunks keep even a slow response under the absolute
+            # budget; timeout alone would restart on every received packet.
+            for chunk in response.iter_content(chunk_size=1):
+                if time.monotonic() >= deadline or len(body) + len(chunk) > 32768:
+                    raise TimeoutError("bounded diagnostic body")
+                body.extend(chunk)
+            return json.loads(body)
+
+    def summary(job):
+        result = {}
+        for key in ("job_id", "phase"):
+            value = job.get(key)
+            if isinstance(value, str) and len(value) <= 128:
+                result[key] = value
+        for key in (
+            "attempt_id",
+            "published_table_count",
+            "completed_table_count",
+            "total_table_count",
+        ):
+            if type(job.get(key)) is int:
+                result[key] = job[key]
+        if type(job.get("cancel_requested")) is bool:
+            result["cancel_requested"] = job["cancel_requested"]
+        # Never print arbitrary source/connection/location strings, results or
+        # captured plans. Retain only a bounded enum-style retry error code.
+        error = job.get("error")
+        if isinstance(error, str):
+            result["error"] = (
+                error if error.isidentifier() and len(error) <= 96 else "non_code_error"
+            )
+        return result
+
+    observed = {"restore_jobs": []}
+    try:
+        page = get("/restore/jobs?limit=4")
+        if not isinstance(page, dict) or not isinstance(page.get("jobs"), list):
+            observed["listing"] = (
+                page.get("http_status", "invalid_shape")
+                if isinstance(page, dict)
+                else "invalid_shape"
+            )
+        else:
+            for job in page["jobs"][:4]:
+                if not isinstance(job, dict):
+                    continue
+                item = summary(job)
+                job_id = job.get("job_id")
+                if isinstance(job_id, str) and 0 < len(job_id) <= 128:
+                    status = get("/restore/jobs/" + quote(job_id, safe=""))
+                    item["status"] = (
+                        summary(status)
+                        if isinstance(status, dict) and "job_id" in status
+                        else {"http_status": status.get("http_status", "invalid_shape")}
+                        if isinstance(status, dict)
+                        else "invalid_shape"
+                    )
+                observed["restore_jobs"].append(item)
+    except Exception as error:
+        observed["diagnostic_error"] = type(error).__name__
+    print(
+        "native lifetime restore failure context="
+        + json.dumps(observed, sort_keys=True)[:4096],
+        flush=True,
+    )
 
 
 REFERENCE = json.loads(
@@ -249,6 +331,14 @@ def test_unlogged_originals_preserve_clean_rows_and_reset_real_process_loss(case
                 ) and time.monotonic() < deadline:
                     time.sleep(0.05)
                     continue
+                if response.status_code not in (200, 202):
+                    print(
+                        "native lifetime SQL failure status="
+                        + str(response.status_code)
+                        + " body="
+                        + json.dumps(result, sort_keys=True)[:4096],
+                        flush=True,
+                    )
                 assert response.status_code in (200, 202), (
                     statement,
                     response.status_code,
@@ -588,4 +678,8 @@ def test_unlogged_originals_preserve_clean_rows_and_reset_real_process_loss(case
         assert len(sql(f"SELECT id FROM {table}", read=True)["rows"]) == 1
         failed = False
     finally:
-        server.stop(test_failed=failed)
+        try:
+            if failed:
+                _restore_failure_context(server)
+        finally:
+            server.stop(test_failed=failed)

@@ -39,7 +39,9 @@ pub const StatusDetail = error_abi.Detail;
 // Config callbacks add exact reserved-retirement owner preparation.
 // Main privacy fields compose with exact reserved-retirement capture.
 // Borrowed StatusSource adds exact native node/store endpoint discovery.
-pub const abi_version: u32 = 35;
+// Fixed native TEMP maintenance callback and published restore control selection.
+// Neither operation grants row execution capability.
+pub const abi_version: u32 = 36;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -297,6 +299,7 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     try std.testing.expect(!validContext(CallContext, 32, @sizeOf(CallContext)));
     try std.testing.expect(!validContext(CallContext, 33, @sizeOf(CallContext)));
     try std.testing.expect(!validContext(CallContext, 34, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, 35, @sizeOf(CallContext)));
     try std.testing.expect(!validContext(CallContext, abi_version, @sizeOf(CallContext) - 1));
 
     var table: FunctionTable = undefined;
@@ -304,7 +307,7 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     table.struct_size = @sizeOf(FunctionTable);
     table.capabilities = Capability.core;
     try std.testing.expect(validFunctionTable(&table, Capability.core));
-    table.abi_version = abi_version - 1; // Previous API34 lacks the combined main privacy contract.
+    table.abi_version = abi_version - 1; // API35 lacks the fixed native maintenance callback.
     try std.testing.expect(!validFunctionTable(&table, Capability.core));
     table.abi_version = abi_version;
     table.struct_size = functionTableFieldEnd("authorize_sql_lock");

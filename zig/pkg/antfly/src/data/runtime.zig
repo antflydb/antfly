@@ -8431,6 +8431,7 @@ pub const DataServer = struct {
         api_server_cfg.relational_index_claims = self.relationalIndexClaimPort();
         api_server_cfg.relational_index_control = self.relationalIndexControlPort();
         api_server_cfg.schema_validation_preparation = self.schemaValidationPreparationPort();
+        api_server_cfg.native_relation_maintenance = .{ .ptr = self, .execute_fn = nativeRelationMaintenanceControl };
         api_server_cfg.row_policy_install = .{ .ptr = self, .execute_fn = installRowPolicyControl };
         // Distributed session/publication routes may resolve to another data
         // owner, including a hidden initial-FK child not yet publicly listed.
@@ -12877,28 +12878,17 @@ pub const DataServer = struct {
                 } else break :blk null;
             }
             if (comptime !linked_storage) return error.InvalidSqlRelationPersistence;
-            captured = try recoverRestoreDescriptor(self, alloc, group_id, table_name, input.scope.digest(), input.scope.plan_id, restoreOwnerDescriptorUse(input.action), context);
+            captured = recoverRestoreDescriptor(self, alloc, group_id, table_name, input.scope.digest(), input.scope.plan_id, restoreOwnerDescriptorUse(input.action), context) catch |err| {
+                reportRestoreOwnerFailure("descriptor", group_id, input, null, err);
+                return err;
+            };
             const native = captured.?.descriptor.sql_persistence orelse return error.GroupLeaderUnavailable;
             if (input.native_execution) |hint| if (!hint.eql(native)) return error.SqlRelationOwnerChanged;
             break :blk null;
         };
         if (local_term != null) try self.waitDataReadSafeWithCancellation(group_id, "restore-owner", 30_000, context.cancellation);
         try context.ensureActive();
-        if (input.action == .publish) {
-            // Native serving admission follows the authoritative all-table
-            // metadata decision. A request body cannot publish a hidden root.
-            var snapshot = (try self.status_source.linearizableSnapshot(context)) orelse return error.MetadataSnapshotUnavailable;
-            defer self.status_source.freeAdminSnapshot(&snapshot);
-            const table = for (snapshot.tables) |candidate| {
-                if (candidate.table_id == input.scope.target_namespace.table_id and std.mem.eql(u8, candidate.name, table_name)) break candidate;
-            } else return error.RestoreStagingInProgress;
-            _ = table;
-            for (snapshot.ranges) |range| {
-                if (range.group_id == group_id and range.table_id == input.scope.target_namespace.table_id and
-                    antfly.metadata.table_manager.rangeDocIdentityShardId(range) == input.scope.target_namespace.shard_id and
-                    antfly.metadata.table_manager.rangeDocIdentityRangeId(range) == input.scope.target_namespace.range_id) break;
-            } else return error.RestoreStagingScopeChanged;
-        }
+        if (input.action == .publish) try self.requirePublishedRestorePosition(alloc, table_name, group_id, input.scope.target_namespace, null, null, context);
         if (comptime linked_storage) return self.restoreOwnerControlCompiled(alloc, table_name, group_id, input, context, local_term, if (captured) |*value| value.descriptor else null);
         var lease = try self.liveRuntimeWriteSource().leaseRestoreStagingOwner(alloc, table_name, group_id, input.scope.digest(), true);
         defer lease.release(alloc);
@@ -13111,6 +13101,15 @@ pub const DataServer = struct {
     fn applyFkGenerationControl(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: antfly.db.types.BatchRequest, term: ?u64) !void {
         if (term) |value| return self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{ .discovery = .cached, .required_local_term = value });
         return (self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable).applyFkGenerationNative(alloc, group_id, table_name, req);
+    }
+
+    fn nativeRelationMaintenanceControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, request: antfly.public_api.native_relation_maintenance.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.native_relation_maintenance.Result {
+        try antfly.public_api.native_relation_maintenance.requireAuthority(context);
+        try request.validate();
+        if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const source = try self.ensureKernelOwnerSource();
+        return source.advanceNativeTemporaryMaintenance(alloc, table_name, request, context);
     }
 
     fn tableRetirementPreparationControl(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: antfly.public_api.table_retirement_preparation.Request, context: antfly.public_api.operation.RequestContext) ![]u8 {
@@ -14700,6 +14699,31 @@ pub const DataServer = struct {
         return (try Await.run(read_source, scratch, group_id, table_name, request, bundle_digest)) orelse error.RowPolicyReceiptNotFound;
     }
 
+    /// Borrow one authoritative indexed generation. Table and range are from
+    /// the same retained cut; repeated owner finalization neither copies nor
+    /// scans the catalog, and a missing compact capability fails closed.
+    fn requirePublishedRestorePosition(self: *DataServer, _: std.mem.Allocator, table_name: []const u8, group_id: u64, namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace, expected: ?@import("antfly_local_sources").common_topology_records.TableRecord, captured: ?@import("antfly_local_sources").common_topology_records.RangeRecord, context: antfly.public_api.operation.RequestContext) !void {
+        try context.ensureActive();
+        const routing = self.status_source.routingSource() orelse return error.MetadataSnapshotUnavailable;
+        const acquire = routing.acquire_generation orelse return error.MetadataSnapshotUnavailable;
+        const generation = try acquire(routing.projection.ptr, context.deadline_ns, true);
+        defer generation.release();
+        const indexed = &generation.indexed;
+        const table_index = indexed.table_id_indexes.get(namespace.table_id) orelse return error.RestoreStagingInProgress;
+        const table = indexed.snapshot.value.tables[table_index];
+        if (!std.mem.eql(u8, table.name, table_name)) return error.RestoreStagingScopeChanged;
+        if (expected) |value| if (!antfly.metadata.table_manager.tableDefinitionsEqual(value, table)) return error.RestoreStagingScopeChanged;
+        const range_index = indexed.group_indexes.get(group_id) orelse return error.RestoreStagingScopeChanged;
+        const range = indexed.snapshot.value.ranges[range_index];
+        if (range.table_id != namespace.table_id or antfly.metadata.table_manager.rangeDocIdentityShardId(range) != namespace.shard_id or
+            antfly.metadata.table_manager.rangeDocIdentityRangeId(range) != namespace.range_id) return error.RestoreStagingScopeChanged;
+        if (captured) |value| {
+            if (!std.mem.eql(u8, range.start_key, value.start_key) or ((range.end_key == null) != (value.end_key == null)) or
+                !std.mem.eql(u8, range.end_key orelse "", value.end_key orelse "")) return error.RestoreStagingScopeChanged;
+        }
+        try context.ensureActive();
+    }
+
     fn recoverRestoreDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: [16]u8, use: antfly.public_api.ProvisionedKernelOwnerSource.RestoreDescriptorUse, context: antfly.public_api.operation.RequestContext) !antfly.public_api.ProvisionedKernelOwnerSource.OwnedRestoreDescriptor {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
@@ -14708,15 +14732,28 @@ pub const DataServer = struct {
         var job = try std.json.parseFromSlice(@import("../metadata/restore_staging.zig").Job, alloc, bytes, .{});
         defer job.deinit();
         if (!std.mem.eql(u8, &job.value.plan.id, &plan_id)) return error.RestoreStagingScopeChanged;
+        if (use == .published_control and job.value.state != .published) return error.RestoreStagingInProgress;
         switch (job.value.state) {
             .preparing_sources => return error.RestoreStagingInProgress,
             .importing, .validating => {},
-            .cutover, .activating, .published => if (use != .resolve) return error.RestoreStagingScopeChanged,
+            .cutover, .activating, .published => if (use != .resolve and use != .published_control) return error.RestoreStagingScopeChanged,
             .canceling, .canceled => if (use != .resolve) return error.RestoreStagingCanceled,
         }
         var descriptor = try self.restoreDescriptorFromJob(alloc, job.value, group_id, table_name, scope);
         errdefer descriptor.deinit(alloc);
         descriptor.descriptor.restore_cancel_recovery = job.value.state == .canceling or job.value.state == .canceled;
+        if (use == .published_control) {
+            const target = for (job.value.plan.targets) |candidate| {
+                if (candidate.table.table_id == descriptor.descriptor.identity.table_id) break candidate;
+            } else return error.RestoreStagingScopeChanged;
+            const range = for (target.ranges) |candidate| {
+                if (candidate.group_id == group_id) break candidate;
+            } else return error.RestoreStagingScopeChanged;
+            var expected = target.table;
+            expected.restore_backup_id = "";
+            expected.restore_location = "";
+            try self.requirePublishedRestorePosition(alloc, table_name, group_id, .{ .table_id = descriptor.descriptor.identity.table_id, .shard_id = descriptor.descriptor.identity.shard_id, .range_id = descriptor.descriptor.identity.range_id }, expected, range, context);
+        }
         // Confirm current authority after decoding the immutable plan. A
         // cancellation/publication racing this read cannot reopen admission.
         const current = (try self.status_source.getRestoreStagingProgress(alloc, plan_id, context)) orelse return error.RestoreStagingScopeChanged;
@@ -14770,6 +14807,18 @@ pub const DataServer = struct {
         }
     }
 
+    fn reportRestoreOwnerFailure(comptime boundary: []const u8, group: u64, input: antfly.public_api.restore_owner.Request, phase: ?@import("../metadata/restore_staging.zig").State, err: anyerror) void {
+        if (comptime @import("builtin").mode != .debug) return;
+        const Trace = struct {
+            var count: std.atomic.Value(u8) = .init(0);
+        };
+        var observed = Trace.count.load(.monotonic);
+        while (observed < 4) {
+            observed = Trace.count.cmpxchgWeak(observed, observed + 1, .monotonic, .monotonic) orelse break;
+        } else return;
+        std.debug.print("restore owner failed boundary={s} job={} phase={s} owner={} action={s} error={s}\n", .{ boundary, std.mem.readInt(u64, input.scope.plan_id[0..8], .little), if (phase) |value| @tagName(value) else "unobserved", group, @tagName(input.action), @errorName(err) });
+    }
+
     fn restoreOwnerControlCompiled(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, input: antfly.public_api.restore_owner.Request, context: antfly.public_api.operation.RequestContext, local_term: ?u64, captured_descriptor: ?@import("../storage/kernel_owner_descriptor.zig").Descriptor) !antfly.public_api.restore_owner.Response {
         const metadata_staging = @import("../metadata/restore_staging.zig");
         const owner = try self.ensureKernelOwnerSource();
@@ -14807,7 +14856,10 @@ pub const DataServer = struct {
         };
         var proposal: Proposal = .{ .server = self, .alloc = alloc, .table_name = table_name, .group_id = group_id, .term = local_term orelse 0, .scope = input.scope.digest() };
         const options: antfly.public_api.ProvisionedKernelOwnerSource.RestoreOwnerOptions = .{ .secret_store = self.api_server_cfg.secret_store, .node_config = self.api_server_cfg.node_config };
-        var result = try owner.restoreOwnerControl(alloc, group_id, table_name, descriptor, input, if (local_term != null) .{ .ptr = &proposal, .propose = Proposal.propose } else null, options, context);
+        var result = owner.restoreOwnerControl(alloc, group_id, table_name, descriptor, input, if (local_term != null) .{ .ptr = &proposal, .propose = Proposal.propose } else null, options, context) catch |err| {
+            reportRestoreOwnerFailure("effect", group_id, input, progress.state, err);
+            return err;
+        };
         if (input.action == .install_native_empty) {
             if (local_term != null or descriptor.sql_persistence == null) return error.InvalidSqlRelationPersistence;
             const runtime = try self.ensureBackendRuntime();
@@ -37961,6 +38013,18 @@ fn consumerTests() type {
                 progress: stages.Progress,
                 job_reads: usize = 0,
                 progress_reads: usize = 0,
+                public_tables: [1]@import("antfly_local_sources").common_topology_records.TableRecord,
+                public_ranges: [1]@import("antfly_local_sources").common_topology_records.RangeRecord,
+                public_present: bool = true,
+                fn generation(raw: *anyopaque, _: ?u64, authoritative: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expect(authoritative);
+                    return antfly.public_api.table_catalog.RoutingGeneration.create(std.testing.allocator, .{ .tables = if (self.public_present) &self.public_tables else &.{}, .ranges = if (self.public_present) &self.public_ranges else &.{} }, .{});
+                }
+                fn noSnapshot(_: *anyopaque, _: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+                    return error.TestUnexpectedGenericCatalogRead;
+                }
+                fn freeSnapshot(_: *anyopaque, _: *antfly.metadata_api.CatalogRoutingSnapshot) void {}
                 fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
                     return error.TestUnexpectedGenericCatalogRead;
                 }
@@ -37977,11 +38041,16 @@ fn consumerTests() type {
                     return self.progress;
                 }
             };
-            var probe: Probe = .{ .job = .{ .plan = plan, .plan_digest = digest, .state = .activating, .revision = 7 }, .progress = .{ .state = .activating, .revision = 7 } };
+            var probe: Probe = .{ .job = .{ .plan = plan, .plan_digest = digest, .state = .activating, .revision = 7 }, .progress = .{ .state = .activating, .revision = 7 }, .public_tables = .{table}, .public_ranges = .{range} };
             // Exercise the actual metadata-backed receiver descriptor path. No Raft
             // route, physical initialization or serving proof is supplied by this unit.
             var server: DataServer = undefined;
-            server.status_source = .{ .ptr = &probe, .vtable = &.{ .status = Probe.status, .get_restore_staging = Probe.jobRead, .get_restore_staging_progress = Probe.progressRead } };
+            server.status_source = .{ .ptr = &probe, .vtable = &.{
+                .status = Probe.status,
+                .get_restore_staging = Probe.jobRead,
+                .get_restore_staging_progress = Probe.progressRead,
+            } };
+            server.status_source.routing = .{ .acquire_generation = Probe.generation, .projection = .{ .ptr = &probe, .snapshot = Probe.noSnapshot, .free_snapshot = Probe.freeSnapshot }, .authority = .{ .ptr = &probe, .linearizable_snapshot = Probe.noSnapshot } };
             server.provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a);
             defer server.provisioned_storage.deinit();
             try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, .mutate, .{}));
@@ -38005,6 +38074,24 @@ fn consumerTests() type {
                 try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.requireRestoreOwnerControlPhase(action, .activating));
                 try DataServer.requireRestoreOwnerControlPhase(action, .importing);
             }
+            probe.job.state = .published;
+            probe.progress = .{ .state = .published, .revision = probe.job.revision };
+            {
+                var published = try DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, .published_control, .{});
+                defer published.deinit(a);
+                try std.testing.expect(published.descriptor.sql_persistence.?.eql(native));
+            }
+            probe.public_present = false;
+            try std.testing.expectError(error.RestoreStagingInProgress, DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, .published_control, .{}));
+            probe.public_present = true;
+            probe.public_tables[0].sql_persistence.?.data_generation += 1;
+            try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, .published_control, .{}));
+            probe.public_tables[0] = table;
+            probe.public_ranges[0].doc_identity_range_id += 1;
+            try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, .published_control, .{}));
+            probe.public_ranges[0] = range;
+            probe.job.state = .activating;
+            try std.testing.expectError(error.RestoreStagingInProgress, DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, .published_control, .{}));
             try DataServer.requireRestoreOwnerControlPhase(.install_native_empty, .published);
             try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.requireRestoreOwnerControlPhase(.install_generation_admissions, .published));
         }
