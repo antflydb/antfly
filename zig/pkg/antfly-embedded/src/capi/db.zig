@@ -7012,7 +7012,8 @@ fn executePreparedEmbeddedSqlWithHandoff(handle: *Handle, table_name: []const u8
         if (value.failed) return error.SqlTransactionAborted;
         if (value.active and (compiled.statement == .create_table or compiled.statement == .drop_table or compiled.statement == .catalog_ddl or compiled.statement == .policy_ddl)) return error.UnsupportedSqlExecution;
     }
-    var adapter = sql.Adapter(antfly){ .preparation_handoff = handoff, .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
+    var adapter = sql.Adapter(antfly){ .preparation_allocator = temporary, .preparation_handoff = handoff, .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
+    defer adapter.deinitPreparation();
     var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
     var result = sql.runtime.execute(handle.alloc, adapter.backend(), compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {
         if (err == error.SqlNotNullViolation or err == error.SqlUntranslatableCharacter) out_buf.* = try stringifyJson(.{ .@"error" = error_context.diagnostic(err) });
@@ -10989,6 +10990,17 @@ test "capi owned relational postimages transfer once across equivalent layouts a
                     var owned = @import("../storage/db/owned_relational_rows.zig").OwnedRows.init(backing);
                     defer owned.deinit();
                     try owned.prepare(null, schema, catalog, input);
+                    const normalized = (try owned.normalize(schema, backing)).?;
+                    defer {
+                        for (normalized) |write| {
+                            backing.free(write.key);
+                            backing.free(write.value);
+                            for (write.json_null_fields) |name| backing.free(name);
+                            if (write.json_null_fields.len != 0) backing.free(write.json_null_fields);
+                        }
+                        backing.free(normalized);
+                    }
+                    try std.testing.expect(owned.matchesWrites(normalized));
                 }
             };
             try std.testing.checkAllAllocationFailures(a, Fault.run, .{ plan.schema.?, plan.catalog.plan().*, request });
@@ -11085,6 +11097,9 @@ test "capi SQL owned normalization releases admission and rejects metadata chang
         const parsed = try std.json.parseFromSlice(std.json.Value, a, output.ptr.?[0..output.len], .{});
         defer parsed.deinit();
         try std.testing.expectEqual(@as(usize, if (scenario == .primary_change) 1 else 0), parsed.value.object.get("rows").?.array.items.len);
+        // Normalization and commit must share one authority, so successful
+        // autocommit does not detach a second time to pack the same postimage.
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
     }
 }
 

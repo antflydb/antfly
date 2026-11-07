@@ -541,6 +541,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite standalone snapshots",
         "issue1015",
         "capi SQL",
+        "capi owned relational postimages",
+        "text merge file provenance resolves deletion races",
         "capi path gate",
         "storage owner runtime status",
         "storage owner remote content source",

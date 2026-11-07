@@ -7833,7 +7833,15 @@ test "capi native allocator proof admits a slow stable proof after the retry dea
         const result = fixture.call(operation);
         if (probe.failure) |err| return err;
         try std.testing.expectEqual(h.capi.ErrorCode.ok, result);
-        try std.testing.expectEqual(@as(u64, if (operation == .read) 0 else 1), stats.mutation_admission_count - admissions_before);
+        // SQL releases admission to prepare its owned relational postimage,
+        // then re-enters once to validate/commit. Both physical entries are
+        // counted; neither may repeat this stable allocator proof.
+        const admissions: u64 = switch (operation) {
+            .read => 0,
+            .batch => 1,
+            .sql => 2,
+        };
+        try std.testing.expectEqual(admissions, stats.mutation_admission_count - admissions_before);
         if (operation != .read) try std.testing.expect(stats.mutation_admission_ns - admission_ns_before >= std.time.ns_per_s);
         try std.testing.expectEqual(h.capi.ErrorCode.ok, h.capi.lastErrorCode());
         try std.testing.expectEqual(@as(usize, 1), probe.captures);

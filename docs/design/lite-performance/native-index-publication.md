@@ -595,10 +595,9 @@ Transferred regions retain their allocator receiver through commit cleanup;
 primary/index effects and predicates still use the ordinary atomic mutation
 pipeline. SQL's request allocator accounts for retained preparation. Active
 sessions, coordinated constraints, generated-provider templates and split-shadow
-work retain their authoritative paths. Normalization/RETURNING currently has a
-separate preparation phase; sharing its row authority is further work. The
+work retain their authoritative paths. The initial
 [Debug receipt](owned-relational-rows-debug.json) records ownership/fault tests
-and SDK validation, without claiming final performance qualification.
+and SDK validation; normalization sharing follows below.
 
 ## Prepared merge activation under active writes
 
@@ -618,3 +617,23 @@ starving completed work. The [Debug receipt](prepared-merge-publication-debug.js
 records five applied merges with no discards during the current-only hot-write
 diagnostic, plus lifecycle and file-backed lookup validation. This is not final
 performance qualification.
+
+## Shared SQL normalization and commit authority
+
+Eligible autocommit relational normalization prepares owned packed rows outside
+writer admission and renders SQL postimages from that authority. The SQL request
+retains the authority until final mutation cleanup. Commit matches the exact row
+bytes and JSON-null provenance together with namespace/incarnation, schema and
+index-catalog witnesses before consuming it once. Normalization and RETURNING
+therefore do not require another row pack solely to commit the same values.
+Changed conflict postimages and unsupported preparation use the independently
+validated path. Active transaction sessions retain their existing session-owned
+staging rather than borrowing a shorter SQL request lifetime.
+
+Admission counters count physical entries: a SQL mutation can enter, release for
+CPU preparation, and re-enter to validate and publish. The slow-proof regression
+still requires one allocator proof capture and immediate subsequent reuse.
+Allocation-failure normalization cleanup and file-backed merge lookup are included
+in the default C API gate. The [current Debug receipt](shared-sql-authority-debug.json)
+records the full C API/native gates and SDK checks. Final optimized performance
+qualification remains separate.

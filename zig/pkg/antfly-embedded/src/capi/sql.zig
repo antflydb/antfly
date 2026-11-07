@@ -138,6 +138,44 @@ pub fn Adapter(comptime native: type) type {
         read_only: bool = false,
         outcome_transaction_id: ?types.TxnId = null,
         preparation_handoff: ?PreparationHandoff = null,
+        preparation_allocator: ?std.mem.Allocator = null,
+        normalized_plans: std.ArrayListUnmanaged(*@import("../storage/db/prepared_document_batch.zig").Plan) = .empty,
+
+        pub fn deinitPreparation(self: *Self) void {
+            const a = self.preparation_allocator orelse return;
+            for (self.normalized_plans.items) |plan| {
+                plan.deinit();
+                a.destroy(plan);
+            }
+            self.normalized_plans.deinit(a);
+        }
+
+        fn normalizePreparedRows(self: *Self, db: *DB, output: std.mem.Allocator, table: catalog.Table, writes: []const types.BatchWrite) !?[]types.BatchWrite {
+            const handoff = self.preparation_handoff orelse return null;
+            const a = self.preparation_allocator orelse return null;
+            // The request budget bounds all retained authorities. Individual
+            // plans also enforce row/byte bounds before doing expensive work.
+            const RowPlan = @import("../storage/db/prepared_document_batch.zig").Plan;
+            var captured = (try RowPlan.captureIncludingRelational(a, db)) orelse return null;
+            var retained = false;
+            defer if (!retained) captured.deinit();
+            if (captured.relational == null) return null;
+            try handoff.release_admission(handoff.ptr, table.physical_name);
+            const normalized: anyerror!?[]types.BatchWrite = blk: {
+                captured.prepareWithIo(.{ .writes = writes }, @import("handles.zig").handleLockIo()) catch |err| break :blk err;
+                break :blk captured.relational.?.normalize(captured.schema.?, output);
+            };
+            const root = try handoff.reacquire_admission(handoff.ptr);
+            self.handle = root;
+            self.db = root.database();
+            const result = (try normalized) orelse return null;
+            const plan = try a.create(RowPlan);
+            errdefer a.destroy(plan);
+            try self.normalized_plans.append(a, plan);
+            plan.* = captured;
+            retained = true;
+            return result;
+        }
 
         pub fn backend(self: *Self) catalog.Backend {
             return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
@@ -1122,6 +1160,8 @@ pub fn Adapter(comptime native: type) type {
                 const session = try self.db.openDocumentReadSession(alloc, writes[0].key, writes[0].key, .{ .limit = 1, .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version } });
                 return images.merge(alloc, input, try adapter_owner.normalizeOwnedRows(session, alloc, table, writes));
             }
+            if (try adapter_owner.normalizePreparedRows(self.db, alloc, table, writes)) |normalized|
+                return images.merge(alloc, input, normalized);
             const session = try self.db.openRelationalReadSession(alloc, writes[0].key, writes[0].key, .{
                 .limit = 1,
                 .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version },
@@ -1183,7 +1223,15 @@ pub fn Adapter(comptime native: type) type {
             const RowPlan = @import("../storage/db/prepared_document_batch.zig").Plan;
             var owned_rows: ?RowPlan = null;
             defer if (owned_rows) |*plan| plan.deinit();
-            if (table.storage_mode == .relational) if (adapter_owner.preparation_handoff) |handoff| {
+            var reused_rows: ?*RowPlan = null;
+            for (adapter_owner.normalized_plans.items) |plan| {
+                if (!std.meta.eql(plan.namespace, self.db.core.identity_namespace) or plan.incarnation != self.db.root_incarnation) continue;
+                if (plan.relational) |*rows| if (rows.matchesWrites(request.writes) and try plan.matches(self.db)) {
+                    reused_rows = plan;
+                    break;
+                };
+            }
+            if (reused_rows == null and table.storage_mode == .relational) if (adapter_owner.preparation_handoff) |handoff| {
                 owned_rows = try RowPlan.captureIncludingRelational(alloc, self.db);
                 if (owned_rows) |*plan| {
                     try handoff.release_admission(handoff.ptr, table.physical_name);
@@ -1201,7 +1249,7 @@ pub fn Adapter(comptime native: type) type {
             var primary_committed = false;
             // Named tables commit to their own database, which holds the marker.
             const receipt_table: ?[]const u8 = if (self.handle != null) self.table_name else null;
-            @import("db.zig").trackedBatchWithPreparedDocuments(self.db, request, &primary_committed, receipt_table, if (owned_rows) |*plan| plan else null) catch |err| {
+            @import("db.zig").trackedBatchWithPreparedDocuments(self.db, request, &primary_committed, receipt_table, reused_rows orelse (if (owned_rows) |*plan| plan else null)) catch |err| {
                 // A confirmed primary write wins: later uncertainty in derived
                 // or control publication leaves it committed, not unknown.
                 if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;

@@ -78,6 +78,54 @@ pub const OwnedRows = struct {
         self.complete = true;
     }
 
+    /// Render SQL's normalized postimage from the very same packed authority
+    /// that commit will consume. Updating the exact byte witness is permitted
+    /// only here, from that authority; arbitrary caller postimages still fail
+    /// matchesWrites and must be prepared independently.
+    pub fn normalize(self: *OwnedRows, schema: registry.SchemaView, output: Allocator) !?[]types.BatchWrite {
+        if (!self.complete) return null;
+        const normalized = try output.alloc(types.BatchWrite, self.writes.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (normalized[0..initialized]) |write| {
+                output.free(write.key);
+                output.free(write.value);
+                for (write.json_null_fields) |name| output.free(name);
+                if (write.json_null_fields.len != 0) output.free(write.json_null_fields);
+            }
+            output.free(normalized);
+        }
+        const retained = self.inputs.allocator();
+        var output_bytes: usize = 0;
+        for (self.writes, self.rows, normalized) |*write, maybe_row, *out| {
+            const row = &(maybe_row orelse return error.InvalidArgument);
+            const json = (try row.extracted.logicalJson()) orelse return error.InvalidArgument;
+            output_bytes = std.math.add(usize, output_bytes, json.len +| write.key.len) catch return error.RelationalRowResultTooLarge;
+            if (output_bytes > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
+            const typed = try row.typedView(schema.tableSchema().*, schema.physicalLayout());
+            var names: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer names.deinit(output);
+            for (write.json_null_fields) |name| {
+                const ordinal = typed.ordinalForName(name) orelse return error.InvalidBatchRequest;
+                const cell = (try typed.findCell(ordinal)) orelse continue;
+                if (!cell.is_null) try names.append(output, name);
+            }
+            out.* = blk: {
+                const key = try output.dupe(u8, write.key);
+                errdefer output.free(key);
+                const value = try output.dupe(u8, json);
+                errdefer output.free(value);
+                const nulls = try types.cloneJsonNullFields(output, names.items);
+                break :blk .{ .key = key, .value = value, .json_null_fields = nulls };
+            };
+            // Transfer the completed result before fallible witness copies.
+            initialized += 1;
+            write.value = try retained.dupe(u8, out.value);
+            write.json_null_fields = try types.cloneJsonNullFields(retained, out.json_null_fields);
+        }
+        return normalized;
+    }
+
     pub fn matchesWrites(self: *const OwnedRows, writes: []const types.BatchWrite) bool {
         if (!self.complete or self.writes.len != writes.len) return false;
         for (self.writes, writes, self.rows) |owned, actual, row| {
