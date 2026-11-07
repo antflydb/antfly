@@ -12406,6 +12406,11 @@ pub const NativeFile = struct {
                 // instead of freeing it, so a savepoint rollback can restore
                 // it verbatim.
                 const undo_key = try self.allocator.dupe(u8, owned.key);
+                // If `append` below fails (e.g. the allocator-v4 injected
+                // failure test), `undo_key` has no other owner yet -- nothing
+                // reachable from `writes.undo` or the map references it, so
+                // without this it leaks on every such failure.
+                errdefer self.allocator.free(undo_key);
                 try writes.undo.append(self.allocator, .{ .root = @backingInt(root), .key = undo_key, .previous = old });
             } else {
                 self.allocator.free(old.key);
@@ -12426,6 +12431,9 @@ pub const NativeFile = struct {
             writes.count += 1;
             if (recording) {
                 const undo_key = try self.allocator.dupe(u8, owned.key);
+                // Same leak as the `found_existing` branch above: `append`
+                // failing here must not strand this dupe.
+                errdefer self.allocator.free(undo_key);
                 try writes.undo.append(self.allocator, .{ .root = @backingInt(root), .key = undo_key, .previous = null });
             }
         }

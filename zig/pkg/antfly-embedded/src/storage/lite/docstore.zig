@@ -1643,14 +1643,29 @@ pub const Store = struct {
     /// Guarded by mutex. Secret publication failures fence every adapter until reopen.
     secret_store_uncertain: bool = false,
     mutex: PublicationMutex = .{},
-    /// Set under `mutex` by `releaseStoreMutexForSync` right before it
-    /// unlocks for a group's durability-barrier syscall, cleared under
-    /// `mutex` by `reacquireStoreMutexAfterSync` right after it relocks.
-    /// `mutex` being unlockable during that window is the whole point of
-    /// WS2's pipelining, but nothing else may begin a native transaction,
-    /// allocate/reclaim/retire pages, or publish a checkpoint on `file`
-    /// while a commit is suspended there -- see `lockStoreExclusive`.
-    commit_in_sync: bool = false,
+    /// Count of groups currently in their released-for-sync window:
+    /// incremented under `mutex` by `releaseStoreMutexForSync` right before
+    /// it unlocks for a group's durability-barrier syscall, decremented
+    /// under `mutex` by `reacquireStoreMutexAfterSync` right after it
+    /// relocks. A plain bool is wrong here: WS2's pipelining lets group G+1
+    /// acquire the mutex (plain `lockStore`, not exclusive) and release it
+    /// for its own sync *while G's own sync is still outstanding*, so two
+    /// release windows can be open at once; whichever of the two reacquires
+    /// first must not tell a waiter "no commit is suspended" while the
+    /// other's fsync is still in flight. `mutex` being unlockable during
+    /// this window is the whole point of WS2's pipelining, but nothing else
+    /// may begin a native transaction, allocate/reclaim/retire pages, or
+    /// publish a checkpoint on `file` while any commit is suspended there
+    /// -- see `lockStoreExclusive`.
+    commit_in_sync: usize = 0,
+    /// Count of callers currently blocked in `lockStoreExclusive`'s wait
+    /// loop. `releaseStoreMutexForSync` checks this before releasing: once
+    /// non-zero, a new group's own sync no longer overlaps another's --
+    /// it holds `mutex` through its own `syncData` instead -- so a
+    /// continuous stream of new foreground groups can no longer keep
+    /// `commit_in_sync` non-zero forever and starve the exclusive waiter
+    /// (vacuum/reclaim/etc). See `SyncExclusiveGate`.
+    exclusive_waiting: std.atomic.Value(usize) = .init(0),
     writer_mutex: std.Io.Mutex = .init,
     writer_ready: platform_sync.BroadcastCondition = .init,
     generation_lock: std.Io.RwLock = .init,
@@ -1922,6 +1937,25 @@ pub const Store = struct {
         self.stopRideAlongFlush();
         if (self.artifact_registry) |registry| registry.detach();
         self.stopMaintenance();
+        // `forceDrainDurable` above only forces a durable `applyMutationGroup`
+        // for a group still sitting in the queue; it is a no-op when nothing
+        // is queued (`commit_head == null`). That leaves exactly the case a
+        // ride-along write already applied *non-durably* (`durable_header !=
+        // null`) with nothing new landing behind it to ride a sync -- still
+        // only in `self.file`'s in-memory header, not on disk, with no
+        // foreground group ever going to form and carry it durable (this
+        // handle is closing). `submitMutationWithDurability`'s doc comment
+        // names close() as one of the barriers ride-along work becomes
+        // durable at (design doc §3.2a); see the regression test below
+        // (`commitRideAlong` then immediate `close()`, nothing queued).
+        // Placed after `stopRideAlongFlush`/`stopMaintenance` above, not
+        // before: with every background committer on this file now
+        // stopped, nothing can land another non-durable commit behind this
+        // sync and leave `durable_header` set again with nothing left to
+        // clear it.
+        if (!self.read_only) self.syncIndexContents() catch |err| {
+            std.log.warn("lite close: final durability sync failed, closing anyway: {s}", .{@errorName(err)});
+        };
         if (self.workspace_reclaimer) |identity| self.resource_manager.?.unregisterReclaimer(identity);
         std.debug.assert(self.retired_generations == null);
         if (self.read_generation) |generation| std.debug.assert(generation.references == 0);
@@ -3522,32 +3556,72 @@ pub const Store = struct {
         // on this group's hooks.
         //
         // The released window is not just "no lock held": `commit_in_sync`
-        // (set by `releaseStoreMutexForSync` before it unlocks, cleared by
-        // `reacquireStoreMutexAfterSync` after it relocks, both still under
-        // the mutex) marks that this file has a commit suspended mid-
-        // publish. Every other path that would begin a transaction,
-        // allocate/reclaim pages, or publish a checkpoint on this file
-        // waits out that window after taking the mutex instead of
+        // (incremented by `releaseStoreMutexForSync` before it unlocks,
+        // decremented by `reacquireStoreMutexAfterSync` after it relocks,
+        // both still under the mutex) marks that this file has a commit
+        // suspended mid-publish. Every other path that would begin a
+        // transaction, allocate/reclaim pages, or publish a checkpoint on
+        // this file waits out that window after taking the mutex instead of
         // proceeding -- see `lockStoreExclusive`. Readers and new `Txn`
         // staging (which only touch in-memory `TransactionWrites`, not
         // `self.file`'s page/allocator state) are unaffected: they keep
         // using plain `lockStore`.
-        try self.file.commitTransactionWithDurability(durable, .{ .context = self, .release = releaseStoreMutexForSync, .reacquire = reacquireStoreMutexAfterSync });
+        //
+        // `sync_gate` is stack-local to this one call (never shared across
+        // commits, unlike `self`): it records whether this specific commit's
+        // `releaseStoreMutexForSync` actually released the mutex, so the
+        // matching `reacquireStoreMutexAfterSync` for the very same call
+        // knows whether to relock. Two different commits' gates are never
+        // confused with each other, since each owns its own stack frame.
+        var sync_gate: SyncExclusiveGate = .{ .store = self };
+        try self.file.commitTransactionWithDurability(durable, .{ .context = &sync_gate, .release = releaseStoreMutexForSync, .reacquire = reacquireStoreMutexAfterSync });
     }
 
+    /// Per-commit state threaded through one `commitTransactionWithDurability`
+    /// call's `release`/`reacquire` pair. See `applyMutationGroup`'s
+    /// `sync_gate` and `releaseStoreMutexForSync`'s fairness check.
+    const SyncExclusiveGate = struct {
+        store: *Store,
+        /// Set by `releaseStoreMutexForSync` when it chooses not to release
+        /// the mutex (an exclusive waiter is pending); the matching
+        /// `reacquireStoreMutexAfterSync` must then skip relocking, since
+        /// this call never unlocked in the first place.
+        held_through_sync: bool = false,
+    };
+
     fn releaseStoreMutexForSync(context: *anyopaque) void {
-        const self: *Store = @ptrCast(@alignCast(context));
-        self.commit_in_sync = true;
+        const gate: *SyncExclusiveGate = @ptrCast(@alignCast(context));
+        const self = gate.store;
+        // Fairness: once some caller is blocked in `lockStoreExclusive`
+        // (vacuum, reclaim, close, ...), stop a *new* group's sync from
+        // overlapping another's -- a continuous stream of new foreground
+        // groups, each winning the reacquire race before the waiter's next
+        // spin, would otherwise starve it indefinitely (the
+        // write-amplification/crash-sweep "online vacuum ... group-commit
+        // mutations keep landing" failure). This one commit pays for its
+        // own `syncData` under the mutex instead of pipelining with the
+        // next, so the waiter is guaranteed to run once this commit's own
+        // `applyMutationGroup` call finishes and releases the mutex at its
+        // outer `defer`, rather than racing a never-ending queue of new
+        // groups' release windows.
+        if (self.exclusive_waiting.load(.monotonic) != 0) {
+            gate.held_through_sync = true;
+            return;
+        }
+        self.commit_in_sync += 1;
         self.mutex.unlock();
     }
 
     fn reacquireStoreMutexAfterSync(context: *anyopaque) void {
-        const self: *Store = @ptrCast(@alignCast(context));
+        const gate: *SyncExclusiveGate = @ptrCast(@alignCast(context));
+        if (gate.held_through_sync) return; // Never released; still held.
+        const self = gate.store;
         // Bypasses `lockStoreExclusive`'s own wait-on-`commit_in_sync` loop
-        // on purpose: this call is the one that clears the flag, so waiting
-        // on it here would deadlock against itself.
+        // on purpose: this call is the one that decrements the count, so
+        // waiting on it here would deadlock against itself.
         self.mutex.lock();
-        self.commit_in_sync = false;
+        std.debug.assert(self.commit_in_sync > 0);
+        self.commit_in_sync -= 1;
     }
 
     fn writerSlotAvailable(self: *Store) bool {
@@ -5806,10 +5880,19 @@ fn lockStore(store: *Store) void {
 /// WS2's pipelining.
 ///
 /// Never call this from `reacquireStoreMutexAfterSync`: that call is what
-/// clears `commit_in_sync`, so waiting on it there is a guaranteed deadlock.
+/// decrements `commit_in_sync`, so waiting on it there is a guaranteed
+/// deadlock.
+///
+/// Registers in `exclusive_waiting` for the whole wait (not just the spin
+/// loop body) so `releaseStoreMutexForSync` sees intent as early as
+/// possible: see that function's fairness comment for why this is what
+/// stops a continuous stream of new foreground groups from starving this
+/// call forever.
 fn lockStoreExclusive(store: *Store) void {
+    _ = store.exclusive_waiting.fetchAdd(1, .monotonic);
+    defer _ = store.exclusive_waiting.fetchSub(1, .monotonic);
     store.mutex.lock();
-    while (store.commit_in_sync) {
+    while (store.commit_in_sync != 0) {
         store.mutex.unlock();
         antfly_platform.time.yieldNow();
         store.mutex.lock();
@@ -5819,9 +5902,13 @@ fn lockStoreExclusive(store: *Store) void {
 /// `tryLock` counterpart to `lockStoreExclusive`, for the opportunistic
 /// "skip this turn if contended" call sites: an in-flight group's released
 /// sync window counts as contended the same way a held mutex already does.
+/// Deliberately does not touch `exclusive_waiting`: this call never blocks,
+/// so it never needs the fairness escalation a genuine wait does, and
+/// marking intent here would needlessly slow every new group's commit for
+/// a caller that is about to give up anyway.
 fn tryLockStoreExclusive(store: *Store) bool {
     if (!store.mutex.tryLock()) return false;
-    if (store.commit_in_sync) {
+    if (store.commit_in_sync != 0) {
         store.mutex.unlock();
         return false;
     }
@@ -7600,6 +7687,44 @@ test "lite closing a store with only ride-along work (no foreground write) does 
     try std.testing.expectEqualStrings("rode along", value orelse return error.TestExpectedEqual);
 }
 
+test "lite close() makes a synchronously-applied non-durable commit durable with nothing queued behind it" {
+    // Distinct from the "only ride-along work" test above: that one leaves
+    // the write sitting in the group-commit *queue* (`stageRideAlong`'s
+    // ticket), which `forceDrainDurable` is built to drain. `commitRideAlong`
+    // instead returns only once `applyMutationGroup` has already applied the
+    // write non-durably (`durable_header` set) with no further sync -- by
+    // the time it returns, there is nothing left queued at all.
+    // `forceDrainDurable`'s "no group queued" branch is then a no-op, so
+    // close() needs its own final sync of whatever `self.file` already
+    // holds non-durably, not just a drain of anything still pending.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "close-synchronous-ride-along.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{});
+    var store_open = true;
+    defer if (store_open) store.close();
+
+    const Context = struct {
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            try file.putDocument("sync-ride-only", "landed non-durably");
+        }
+    };
+    var ctx: u8 = 0;
+    try store.commitRideAlong(&ctx, Context.apply);
+    try std.testing.expect(store.file.durable_header != null);
+
+    store.close();
+    store_open = false;
+
+    var reopened = try Store.open(alloc, path, true);
+    defer reopened.close();
+    const value = try reopened.file.getDocumentAlloc(alloc, "sync-ride-only");
+    defer if (value) |bytes| alloc.free(bytes);
+    try std.testing.expectEqualStrings("landed non-durably", value orelse return error.TestExpectedEqual);
+}
+
 test "lite ride-along idle-flush timer alone makes N ride-alongs durable with exactly 1 sync" {
     // Barrier (a) in isolation, with no foreground write and no close():
     // the background `rideAlongFlushLoop` itself must lead the queue once
@@ -7954,7 +8079,7 @@ test "lite maintenance is excluded, not just serialized by luck, during a group'
     // A is paused inside its own gated fsync with self.mutex released (the
     // whole point of WS2's pipelining) but commit_in_sync still marking
     // this file's commit as suspended mid-publish.
-    try std.testing.expect(store.commit_in_sync);
+    try std.testing.expect(store.commit_in_sync != 0);
 
     const MaintWorker = struct {
         store: *Store,
@@ -7976,7 +8101,7 @@ test "lite maintenance is excluded, not just serialized by luck, during a group'
         try std.testing.expect(!worker_b.done.load(.acquire));
         std.Thread.yield() catch {};
     }
-    try std.testing.expect(store.commit_in_sync);
+    try std.testing.expect(store.commit_in_sync != 0);
     try std.testing.expect(!worker_b.done.load(.acquire));
 
     Gate.proceed.store(true, .release);
@@ -7987,7 +8112,7 @@ test "lite maintenance is excluded, not just serialized by luck, during a group'
     joined_b = true;
     try worker_b.result;
 
-    try std.testing.expect(!store.commit_in_sync);
+    try std.testing.expect(store.commit_in_sync == 0);
 
     var read = try store.beginRead();
     defer read.abort();
