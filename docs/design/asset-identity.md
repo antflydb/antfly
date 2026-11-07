@@ -128,14 +128,27 @@ has one, and a later connection or provider change on that source never has
 to re-key anything. `identity.namespace` is immutable once set: a PUT that
 omits `identity` leaves it exactly as it was (never clears it by omission),
 and a PUT that tries to change an already-set namespace is rejected (409).
-A PUT that changes connection or config on a source with **no** namespace
-yet still re-keys every row, exactly as it always has — nothing before this
-field existed separated identity from connection/config — but the response
-now says `rekeys: true`. Setting a namespace for the first time on an
-already-populated source is accounted the same way: it's the one
-unavoidable re-key that adopting this feature on existing data costs, and
-it's worth stating plainly rather than hiding it, since a provider change
-bundled with that adoption will still delete-and-reinsert that one time.
+
+An existing source adopting a namespace for the first time does not have to
+re-key, either. `LegacyNamespace(sourceID, items)` (`sync.go`) derives the
+one namespace that reproduces that source's *current* keys:
+`strings.TrimSuffix(item.ID, "/"+relativeKey)`, which is the same for every
+item of one source (it depends only on the connection and config that
+produced them, never on an individual item), so it is computed once and
+checked for agreement across every item given, erroring rather than
+silently picking one if they disagree. Adopting exactly that namespace makes
+`IdentityKey` equal the legacy `RecordKey` for every existing row, so a PUT
+that sets it — even bundled with the connection/config change that moves
+the source, as `migrate-local` does in one request — reports `rekeys:
+false`. The response is accurate either way: the server verifies the claim
+itself, against the source's connection as it stood *before* this request's
+own change, with a bounded (`Preview`-limited) enumeration, rather than
+inferring `rekeys` from whether a namespace happened to be empty before.
+Adopting any other namespace (or a namespace that cannot be verified —
+every item disagreeing, or the existing connection being unreachable) is
+treated as a real re-key, `rekeys: true`, exactly as a bare connection/config
+change with no namespace involved still is for a source that has never had
+one.
 
 Connectors expose `relative_key` relative to the source's own configured
 root, not the bucket or shared store: S3 and GCS strip their configured
@@ -155,22 +168,34 @@ exactly as before.
 `migrate-local` loses its own identity logic entirely — there wasn't much to
 lose, since the right behavior is for it to do nothing special: it sends a
 normal `PUT` with the new connection and config, plus `identity` if the
-source doesn't have a namespace yet (defaulting it to the source's own ID,
-the same default a brand new source gets), then syncs through the ordinary
-pipeline. Because `--to-prefix` is required to produce the same
+source doesn't have a namespace yet, then syncs through the ordinary
+pipeline. The namespace it sends is not an opaque, newly invented value: it
+enumerates the local store once more (cheap — a directory listing, not a
+copy) and derives `LegacyNamespace` from the connection and config the
+source is *leaving*, before the PUT's own connection change takes effect.
+Because `--to-prefix` is required to produce the same
 `objects/sha256/<digest>[.ext]` relative layout the local store itself uses
-(stripped of each side's own prefix the same way), a source that already
-has a namespace is never re-keyed by a provider change migrate-local
-performs — rows update in place. Its warning is now conditional and
-honest about the two separate things that determine the outcome: whether
-*this run* assigned a namespace (the one unavoidable re-key, printed as such
-after the run, not guessed beforehand), and — regardless of that — whether
-the destination table's own `document_extraction` config declares
+(stripped of each side's own prefix the same way), that derived namespace
+reproduces every row's current key exactly, so an existing source's first
+migration does not re-key anything — the server's own verification agrees,
+and the response says `rekeys: false`. (An empty local store, with nothing
+published yet, has nothing to preserve either way, so it falls back to the
+source's own ID, the same default a brand new source gets.) A source that
+already has a namespace keeps it untouched, as always. Its notice is
+conditional and honest about what it can and cannot promise: in the
+ordinary case (`rekeys: false`) it says rows updated in place, and states —
+regardless of that — that whether derived data also survived depends on the
+destination table's own `document_extraction` config declaring
 `checksum_algorithm` for this source's rows, which `migrate-local` has no
 way to see or confirm: it is server/Zig-side configuration, not anything
 visible in a source profile. Without it, Antfly still recomputes derived
 data for a row whose location metadata changed, even when `migrate-local`
-kept that row's ID exactly the same.
+kept that row's ID exactly the same. A `rekeys: true` response is reported
+too, but should not happen for an ordinary first migration from a source
+with consistent existing keys; if the server could not confirm the adopted
+namespace is safe (for example its existing items disagreed on a legacy
+prefix, or its prior connection could not be reached to check), the notice
+says a re-key happened rather than silently claiming otherwise.
 
 ## Compatibility
 
@@ -197,16 +222,27 @@ kept that row's ID exactly the same.
   row's own persisted fields (`source.item_id`, `source.relative_key`) under
   the owning source's namespace, never trusting an externally supplied key
   (`TestSourceRowRecomputesIdentityUnderTheOwningNamespace`).
-- The full `PUT` lifecycle — auto-namespace at creation, rejection of a
-  namespace change, omission preserving the existing value, and the
-  `rekeys` accounting in each case — is exercised end to end against the
-  real service handler in `TestServiceSourceIdentityNamespaceLifecycle`.
-- `TestMigrateLocalAdoptsNamespaceAndRekeysExactlyOnce` runs the real
+- `LegacyNamespace` reproduces every existing row's legacy key for a
+  connector that reports an explicit relative key (S3-like) and one that
+  falls back to its native ID (Drive/GitHub-like)
+  (`TestLegacyNamespaceReproducesExistingKeys`), and rejects both an empty
+  item set and items that disagree on their prefix rather than silently
+  picking one (`TestLegacyNamespaceRejectsDisagreementAndEmptyInput`).
+- The full `PUT` lifecycle — auto-namespace at creation, an arbitrary
+  namespace re-keying (verified against the connector, not assumed from
+  "namespace was empty"), rejection of a namespace change, omission
+  preserving the existing value — is exercised end to end against the real
+  service handler in `TestServiceSourceIdentityNamespaceLifecycle`; the
+  corrected, opposite case — adopting the EXACT legacy prefix never
+  re-keys, even bundled with a connection change in the same PUT — is
+  `TestServiceAdoptingExactLegacyPrefixNeverRekeys`.
+- `TestMigrateLocalWithNoNamespaceKeepsRowIdentity` runs the real
   Runner/Publisher pipeline: a source synced once while still on `local`
   (so it predates `identity.namespace`, like a real pre-upgrade deployment)
-  is migrated to S3; the legacy key's row is gone, the new key's row is the
-  only one present, and both the PUT response and `IdentityNotice` report
-  the one-time rekey.
+  is migrated to S3; the row's key is identical before and after, and both
+  the PUT response and `IdentityNotice` confirm no re-key happened.
+  `TestMigrateLocalIdentityNoticeStatesTheChecksumAlgorithmRequirement`
+  pins the notice's exact wording for both outcomes.
 - Zig: `checksum_algorithm` unset keeps `metadataFingerprintAlloc`
   byte-for-byte equal to the old formula
   (`"...ignores config without checksum_algorithm, byte for byte"`); once
@@ -247,9 +283,11 @@ all: it prevents the rekey, so there is nothing to copy.
 
 **Provider-neutral IDs for every source.** Giving every source a
 provider-independent ID (rather than an opt-in namespace) looks simpler but
-re-keys every row of every existing source immediately, as a one-time
-migration with no opt-out, instead of letting only a source that actually
-changes provider pay that cost, once, only when it happens.
+forces a migration across every existing source at once, with no opt-out,
+instead of letting adoption happen per source, on its own schedule -- and,
+since adoption can derive the exact namespace that already reproduces a
+source's current keys, usually without even the one-time cost a blunter
+migration would impose.
 
 **A global content-digest cache.** A cache mapping content digests to
 already-computed derived artifacts, shared across sources and even across
@@ -276,9 +314,10 @@ be reconciled. A source with only a weak checksum simply leaves
 `checksum_algorithm` unset and keeps today's location-based behavior; an
 ordinary transfer-integrity check some provider happens to expose stays an
 ordinary row field, not identity. Moving to a stronger algorithm later is a
-new enum value and a config change, which correctly re-extracts once, the
-same one-time cost namespace adoption already asks for on the
-antfly-source side.
+new enum value and a config change, which correctly re-extracts once --
+this is the one place in the design that still has an unavoidable one-time
+cost, now that adopting a namespace on the antfly-source side usually does
+not (see `identity.namespace`'s `LegacyNamespace` derivation above).
 
 ## Out of scope
 
@@ -333,42 +372,46 @@ never stopped.
 A source was synced once on a `local` connection (no `identity.namespace`
 yet, like a real pre-upgrade deployment); extraction, chunking, and
 embedding all ran for real (confirmed by a real match from both full-text
-and semantic search). A plain `PUT` then gave it a namespace with no
-connection change (`rekeys: true`, as designed): the row's ID changed once,
-and extraction/embedding ran again for the new ID, since there was no prior
-state to skip against under it -- the one unavoidable cost of adopting this
-feature, exactly as documented above. From that point, `migrate-local`
-moved the source from the local store to MinIO (the actual destination
-objects, read back and hashed, matched; `rekeys: false`, as designed, and
-its printed `IdentityNotice` said rows updated in place):
+and semantic search). `migrate-local` then moved it straight to MinIO in
+one step, over the live `serve` instance's admin API: it derived
+`LegacyNamespace` from the local store's current enumeration, sent it in
+the same `PUT` as the connection/config change, and the server's own
+verification agreed -- `rekeys: false` -- so this, the source's first-ever
+provider change, never re-keyed anything (the actual destination objects
+were independently read back and hashed and matched):
 
 - The extraction-fetch log added for this proof (`document extraction
   fetching source`, in both `enrichment_runtime.zig` and
   `mutation_materialization.zig`) recorded **zero** new fetches across the
-  move: 2 before, 2 after.
+  move: 1 before, 1 after.
 - `skip_by_hash_count` on the table's `document_vectors` index went from
   0 to 2 across the same move: one skip for `document_extraction`'s own
   fingerprint, one for the chunk-sourced embedding's content hash --
   exactly the two producers this task's checks traced.
 - The row's ID was byte-for-byte identical before and after
-  (`.../records/91afc9b3...`); only `source.uri` changed, from
-  `local:///...` to `s3://asset-identity/...`.
-- Full-text search (`"Joseon"`) and semantic search
-  (`"Korean dynasties history"`) both still returned that same row,
+  (`.../records/ee2d74315f...`); only `source.uri` changed, from
+  `local:///...` to `s3://asset-identity2/...`. The adopted namespace,
+  visible in the service's own profile afterward, was exactly
+  `local://job/<source>/assets` -- `LegacyNamespace`'s derivation from the
+  connection/config the source was leaving, matching what the source's
+  prior key already encoded.
+- Full-text search and semantic search both still returned that same row,
   unchanged, immediately after the move.
 
 A file's content was then changed in place at the same S3 key (bypassing
 antfly-source's own write path, to isolate a pure content change from a
-location change) and resynced: the extraction-fetch count advanced to 3,
-the extraction generation advanced, and full-text search found the new
-text -- a real, measured recompute, under the same row ID throughout.
+location change) and resynced: the extraction-fetch count advanced from 1
+to 2, the extraction generation advanced, and full-text search found the
+new text -- a real, measured recompute, under the same row ID throughout.
 
 Finally, the row's declared digest was corrupted directly (a well-formed
 but wrong 64-hex-character value) and the artifact reprocessed: extraction
 fetched the real bytes, hashed them, and failed with exactly
 `last_error_code: "DocumentChecksumMismatch"` / `"declared checksum does
 not match the downloaded bytes"` -- not a silent skip, not stale output
-kept alive. A separately-tried malformed (wrong-length) digest produced
-`InvalidChecksumDigest` instead, confirming the second named failure path
-for real as well. Restoring the correct digest and reprocessing converged
-cleanly again, with no residual error.
+kept alive. Restoring the correct digest and reprocessing converged cleanly
+again, with no residual error. A separately-tried malformed (wrong-length)
+digest, in the first (pre-correction) pass of this same real run, produced
+`InvalidChecksumDigest` instead -- unaffected by the `identity.namespace`
+correction above, since it is purely about Zig-side checksum validation,
+so it was not repeated in the corrected re-run.
