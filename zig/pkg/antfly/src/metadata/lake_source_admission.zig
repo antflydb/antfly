@@ -117,6 +117,8 @@ test "native source admission fences stale observations and preserves acknowledg
     const cut: Cut = .{ .desired = @splat(5), .store = @splat(6), .generation = 1, .reader_token = @splat(7), .state = ref, .wal_lsn = 10, .base_lsn = 8, .created_ms = 1000, .refresh_after_ms = 301000, .expires_ms = 721000, .cursor_ttl_ms = 300000 };
     state = try state.admit(1, "uuid", cut);
     try std.testing.expect(state.current.?.canIssue(2000, 300000));
+    // A newly configured longer cursor lifetime requires a new retained cut.
+    try std.testing.expect(!state.current.?.canIssue(2000, max_cursor_ms));
     try std.testing.expect(!state.current.?.canIssue(500000, 300000));
     state = try state.acknowledge(11);
     try std.testing.expect(state.current == null);

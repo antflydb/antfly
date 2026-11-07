@@ -53,6 +53,12 @@ pub fn executeWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local
 }
 pub fn executeScopedWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, delivery: ?local.api_query_response.Delivery, scope: ?*Scope) !?local.api_query.QueryResponse {
     return executePinned(a, server, table, req, request, delivery, false, scope) catch |err| switch (err) {
+        error.IndexRebuilding => rebuilding: {
+            // A failed capture or expired cut needs an independent, keyed
+            // wakeup even when the periodic inventory sweep is busy.
+            server.requestLakePublication(table.name) catch {};
+            break :rebuilding error.IndexRebuilding;
+        },
         error.ExternalLakeIndexNotPublished, error.ExternalLakeIndexUnavailable => error.IndexRebuilding,
         error.LakeIndexArtifactUnavailable, error.InvalidLogicalRowIdentity, error.ExternalLakeIndexDefinitionChanged, error.ExternalLakeIndexStoreChanged, error.ExternalLakeIndexCredentialsChanged, error.ExternalLakeIndexSourceChanged, error.ExternalLakeSnapshotMismatch => changed: {
             try server.requestLakePublication(table.name);
@@ -352,7 +358,9 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     defer if (!transferred) if (prepared.manifest_pin) |pin| pin.release();
     // Publication bindings retain &store.implementation: initialize the store
     // at its final heap address before selecting/binding any publication.
-    prepared.store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+    // Owned queries reference already durable state. Enforce their no-upload
+    // contract through a read-only artifact store, including fresh requests.
+    prepared.store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null or prepared.native_cut != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
     const store = &prepared.store;
     defer if (!transferred) store.deinit();
     store.implementation.cloud_io = server.embedding_provider_runtime.io;
@@ -480,7 +488,7 @@ pub fn refreshOwnedCut(backing: A, server: *server_api.ApiHttpServer, table: loc
     const native_owner = (try source_owner.activate(a, server, table, request)) orelse return;
     const retained_api = @import("lake_retained_cut.zig");
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
-    if (native_owner.current) |cut| if (now < cut.refresh_after_ms and std.mem.eql(u8, &cut.desired, &local.metadata_lake_index_catalog.desiredFingerprint(table))) {
+    if (native_owner.current) |cut| if (now < cut.refresh_after_ms and cut.canIssue(now, retained_api.configuredTtl(server.cfg.node_config)) and std.mem.eql(u8, &cut.desired, &local.metadata_lake_index_catalog.desiredFingerprint(table))) {
         var store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
         defer store.deinit();
         var artifacts = store.artifactStore();

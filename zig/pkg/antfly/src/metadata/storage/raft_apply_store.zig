@@ -15158,12 +15158,12 @@ pub const RaftApplyStore = struct {
         const bytes = try @import("../lake_index_lifecycle.zig").encode(self.alloc, state);
         defer self.alloc.free(bytes);
         try txn.put(try lakeIndexLifecycleKeyForGroup(&buffer, group_id, table_id), bytes);
-        if (state.source_owner != null) {
-            const view = @import("../lake_source_owner_view.zig");
-            const projected = try view.encode(self.alloc, .{ .dropped = state.dropped, .owner = state.source_owner });
-            defer self.alloc.free(projected);
-            try txn.put(try lakeSourceOwnerKeyForGroup(&buffer, group_id, table_id), projected);
-        }
+        // Materialize absence too: unowned sources must not decode retained
+        // lifecycle history on every query just to discover no native owner.
+        const view = @import("../lake_source_owner_view.zig");
+        const projected = try view.encode(self.alloc, .{ .dropped = state.dropped, .owner = state.source_owner });
+        defer self.alloc.free(projected);
+        try txn.put(try lakeSourceOwnerKeyForGroup(&buffer, group_id, table_id), projected);
     }
     fn synchronizeLakeIndexLifecycleTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord) !void {
         // Legacy/native tables without lake state don't create maintenance rows.
@@ -41529,10 +41529,14 @@ test "metadata.lake reader authority survives DROP and snapshots without changin
     published.lake_index_catalog_json = try lake.encode(ca, ready);
     try store.applyStandaloneCommand(group_id, .{ .compare_and_replace_table = .{ .expected = building, .replacement = published } });
     var control = try lifecycle.parse(ca, try store.getLakeIndexLifecycle(ca, group_id, 4));
+    const owner_view = @import("../lake_source_owner_view.zig");
+    var owner_key: [160]u8 = undefined;
+    const unowned = try store.store.get(ca, try lakeSourceOwnerKeyForGroup(&owner_key, group_id, 4));
+    try std.testing.expect(unowned.len < 128);
+    try std.testing.expect((try owner_view.parse(ca, unowned)).owner == null);
     const source_scope: lifecycle.SourceScope = .{ .object_generation = table.object_storage_generation, .desired = signature.desired, .owner = @splat(8) };
     try store.applyStandaloneCommand(group_id, .{ .mutate_lake_index_lifecycle = .{ .table_id = 4, .expected_revision = control.revision, .mutation = .{ .configure_source = .{ .scope = source_scope, .state = .{ .kind = .managed_iceberg, .owner = source_scope.owner, .signing_key = @splat(9), .object_generation = table.object_storage_generation, .source = @splat(7) } } } } });
     control = try lifecycle.parse(ca, try store.getLakeIndexLifecycle(ca, group_id, 4));
-    const owner_view = @import("../lake_source_owner_view.zig");
     const compact = try store.getLakeSourceOwner(ca, group_id, 4);
     try std.testing.expect(std.mem.indexOf(u8, compact, "publications") == null);
     try std.testing.expectEqualSlices(u8, &source_scope.owner, &(try owner_view.parse(ca, compact)).owner.?.owner);

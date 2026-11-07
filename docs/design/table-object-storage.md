@@ -97,7 +97,8 @@ acknowledged WAL watermark and the current reusable serving-cut reference.
 A compact projection is written in the same native transaction as lifecycle
 state, so fresh queries do not transfer retained publication history. Native
 snapshots include both projections; older checkpoints reconstruct the compact
-view on the metadata owner. Every accepted write advances or invalidates that
+view on the metadata owner. Absence is materialized too, keeping unowned sources
+on a small point read. Every accepted write advances or invalidates that
 record before acknowledgment.
 Catalog changes invalidate it before returning success. If remote commitment
 succeeds but native acknowledgment fails, the API reports `state: unknown`
@@ -131,6 +132,8 @@ the publication reader through twice the cursor TTL plus a refresh margin,
 atomically with accepting the image reference. Existing generation and metadata
 bounds can impose explicit backpressure at high publication rates. Refresh happens
 before the remaining retention horizon becomes too short for a new cursor.
+Increasing the configured cursor lifetime forces refresh when the existing
+horizon cannot cover it; unavailable cuts also trigger keyed reconciliation.
 Raw captured WAL heads cannot substitute for retained row images when their
 underlying roots can be collected independently.
 

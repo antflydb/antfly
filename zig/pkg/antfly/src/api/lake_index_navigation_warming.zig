@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bounded startup planning warmup. Only immutable navigation enters shared
-//! caches; reader capabilities, posting data and source rows remain query-owned.
+//! Bounded startup warming. Authenticated immutable navigation and search blocks
+//! enter process-accounted caches; reader capabilities remain query-owned.
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const artifacts = @import("lake_index_aggregate_artifact.zig");
@@ -123,7 +123,7 @@ const PageWarm = struct {
     working_set: *WorkingSet,
     scratch: A = undefined,
     pub fn child(self: *PageWarm, ref: tree.Ref) !void {
-        // Warm at most one additional interior level. A large fan-out cannot
+        // Warm at most three additional levels. A large fan-out cannot
         // turn a startup hint into a scan of the archive or all leaf pages.
         if (self.navigation.depth == 3 or self.count == self.children.len) return;
         self.children[self.count] = .{ .domain = self.navigation.domain, .ref = ref, .text_segments = self.navigation.text_segments, .depth = self.navigation.depth + 1 };

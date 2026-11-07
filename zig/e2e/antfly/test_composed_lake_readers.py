@@ -91,12 +91,16 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         monkeypatch.setenv("COMPOSED_GCS_TOKEN", token)
         record_property("artifact_prefix", f"gs://{gcs_bucket}/{gcs_prefix}")
     publication_blocked = False
+    cursor_retention_ms = 300_000
     original = conftest._write_remote_content_e2e_config
 
     def configured(root, **kwargs):
         path = original(root, **kwargs)
         config = json.loads(path.read_text())
         config["deployment_mode"] = "standalone"
+        config.setdefault("lake_indexes", {})["query_cursors"] = {
+            "retention_ms": cursor_retention_ms
+        }
         if owned:
             config.setdefault("lake_indexes", {})["serving_cuts"] = {"enabled": True}
         config["lake_cache"] = {
@@ -633,6 +637,33 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 seen.update(ids)
                 cursor = page.get("next_source_cursor")
             assert seen == expected
+        # A longer configured TTL must refresh an owned cut immediately,
+        # rather than leave fresh queries unavailable until its old refresh time.
+        # Both modes use the same one-hour TTL for the measurements below.
+        cursor_retention_ms = 3_600_000
+        server.restart()
+        wait_query("history", {**text, "limit": 1})
+        wait_query("current", {**text, "limit": 1})
+        _, longer = call("POST", "/query", query)
+        assert len(longer["hits"]["hits"]) == 7
+        if owned:
+            encoded = longer["next_source_cursor"].split(":")[4]
+            envelope = json.loads(
+                base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+            )
+            assert (
+                3_500_000
+                < envelope["expires_ms"] - envelope["issued_ms"]
+                <= cursor_retention_ms
+            )
+        # Increasing the new-cursor horizon must preserve already-issued cuts.
+        _, old_page = call(
+            "POST", "/query", {**query, "source_cursor": first["next_source_cursor"]}
+        )
+        old_ids = {h["_source"]["id"] for h in old_page["hits"]["hits"]}
+        assert old_ids and old_ids <= (set(range(100)) | {extra_id}) - {1, 2}
+        assert not old_ids & {h["_source"]["id"] for h in first["hits"]["hits"]}
+        record_property("cursor_ttl_refresh", True)
         # Opt-in qualification runs after correctness assertions. "Cold" is
         # the first query after process restart, with the durable cache kept;
         # this does not flush OS/provider caches or qualify the full archive.
