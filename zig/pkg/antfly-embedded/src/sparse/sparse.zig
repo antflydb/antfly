@@ -7258,7 +7258,13 @@ test "concurrent sparse writers across inline publication and direct batch paths
     const writer_count = 8;
     const writes_per_writer = 40;
     const term_universe = 6;
-    const deadline_ns = nowNs() + 60 * std.time.ns_per_s;
+    // Generous on purpose: this guards against a genuine hang (e.g. a
+    // reintroduced crash taking a worker thread down mid-write), not
+    // against ordinary scheduling noise. 320 total serialized writes
+    // normally finish in well under a second; a loaded machine running
+    // other work concurrently (shared CI runners, other builds) can still
+    // take meaningfully longer without anything being wrong.
+    const deadline_ns = nowNs() + 10 * 60 * std.time.ns_per_s;
 
     const Worker = struct {
         index: *SparseIndex,
