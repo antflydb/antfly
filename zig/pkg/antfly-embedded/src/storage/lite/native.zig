@@ -1119,7 +1119,14 @@ test "lite allocator v4 overwrite reuses pages across reopen" {
         try file.putDocument("doc", value);
         try file.putCatalogRecord("catalog", value);
     }
-    try std.testing.expect(file.activeCheckpoint().page_count < before + 32);
+    // Each of these 160 bare commits reserves its own fresh manifest page
+    // (`reserveBareCommitManifestPage` -- always a fresh id, never a reused
+    // one, by design: see `PageAllocator.allocateFresh`), on top of the
+    // pre-WS1(b) growth this bound already allowed for. Retirement reclaims
+    // those pages for later reuse, bounded per commit, so growth is still
+    // bounded, not unbounded -- just within a wider margin that accounts
+    // for up to one extra page per commit in this window.
+    try std.testing.expect(file.activeCheckpoint().page_count < before + 32 + 160);
     const got = (try file.getDocumentAlloc(a, "doc")).?;
     defer a.free(got);
     try std.testing.expectEqualSlices(u8, value, got);
@@ -6965,10 +6972,9 @@ pub const NativeFile = struct {
         next.page_count = page_allocator.next_page_id;
 
         try page_allocator.flush();
+        try self.reserveBareCommitManifestPage(&page_allocator);
         try self.persistAllocator(&page_allocator, &next);
-        try self.syncIfRequired();
-
-        try self.publishCheckpoint(next, false);
+        try self.publishBareCommit(&page_allocator, &next);
         return page_id;
     }
 
@@ -7194,9 +7200,9 @@ pub const NativeFile = struct {
         next.free_map_root_page = try pages.allocate();
         next.page_count = pages.next_page_id;
         try pages.flush();
+        try self.reserveBareCommitManifestPage(pages);
         try self.persistAllocator(pages, &next);
-        try self.syncIfRequired();
-        try self.publishCheckpoint(next, false);
+        try self.publishBareCommit(pages, &next);
     }
 
     pub fn appendIndexCatalogRecord(self: *NativeFile, key: []const u8, suffix: []const u8) !void {
@@ -7388,11 +7394,12 @@ pub const NativeFile = struct {
 
         if (self.transaction_pages == null) {
             try page_allocator.flush();
+            try self.reserveBareCommitManifestPage(page_allocator);
             try self.persistAllocator(page_allocator, &next);
-            try self.syncIfRequired();
+            try self.publishBareCommit(page_allocator, &next);
+        } else {
+            try self.publishCheckpoint(next, false);
         }
-
-        try self.publishCheckpoint(next, false);
     }
 
     fn transactionCatalogEntry(self: *NativeFile, root: CatalogRoot, key: []const u8, scratch: *[65536]u8) !?CatalogEntry {
@@ -7573,10 +7580,9 @@ pub const NativeFile = struct {
         next.page_count = page_allocator.next_page_id;
 
         try page_allocator.flush();
+        try self.reserveBareCommitManifestPage(&page_allocator);
         try self.persistAllocator(&page_allocator, &next);
-        try self.syncIfRequired();
-
-        try self.publishCheckpoint(next, false);
+        try self.publishBareCommit(&page_allocator, &next);
     }
 
     fn renameCatalogRecordForRoot(self: *NativeFile, root: CatalogRoot, old_key: []const u8, new_key: []const u8) !void {
@@ -7652,10 +7658,9 @@ pub const NativeFile = struct {
         next.page_count = page_allocator.next_page_id;
 
         try page_allocator.flush();
+        try self.reserveBareCommitManifestPage(&page_allocator);
         try self.persistAllocator(&page_allocator, &next);
-        try self.syncIfRequired();
-
-        try self.publishCheckpoint(next, false);
+        try self.publishBareCommit(&page_allocator, &next);
     }
 
     pub fn getCatalogRecordAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
@@ -8812,11 +8817,12 @@ pub const NativeFile = struct {
 
         if (self.transaction_pages == null) {
             try page_allocator.flush();
+            try self.reserveBareCommitManifestPage(page_allocator);
             try self.persistAllocator(page_allocator, &next);
-            try self.syncIfRequired();
+            try self.publishBareCommit(page_allocator, &next);
+        } else {
+            try self.publishCheckpoint(next, false);
         }
-
-        try self.publishCheckpoint(next, false);
         if (directory.indexed) {
             deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
             self.namespace_directory_cache = .empty;
@@ -8909,10 +8915,12 @@ pub const NativeFile = struct {
         next.page_count = pages.next_page_id;
         if (self.transaction_pages == null) {
             next.free_map_root_page = try pages.allocate();
+            try self.reserveBareCommitManifestPage(pages);
             try self.persistAllocator(pages, &next);
-            try self.syncIfRequired();
+            try self.publishBareCommit(pages, &next);
+        } else {
+            try self.publishCheckpoint(next, false);
         }
-        try self.publishCheckpoint(next, false);
     }
 
     fn decodeKey(payload: []const u8) ![]const u8 {
@@ -12482,6 +12490,40 @@ pub const NativeFile = struct {
         return self.commitTransactionWithDurability(true);
     }
 
+    /// Reserve a manifest page for a bare (no caller-owned transaction)
+    /// commit, right before it calls `persistAllocator` -- the same place
+    /// `flushTransactionWrites` reserves its own (see that call site's
+    /// comment for why this must run before `persistAllocator` finalizes
+    /// `page_count`, and why the reservation is always a fresh page id,
+    /// never a reused one). Every hand-rolled bare-commit tail below calls
+    /// this instead of going straight to a presynced publish, so a small
+    /// bare commit gets the same shot at the one-sync manifest path a
+    /// transactional commit does.
+    fn reserveBareCommitManifestPage(self: *NativeFile, pages: *PageAllocator) !void {
+        if (manifest_commits_enabled and !self.no_sync and
+            !self.manifest_builder.overflowed and self.manifest_builder.reserved_page == null)
+        {
+            self.manifest_builder.reserved_page = try pages.allocateFresh();
+        }
+    }
+
+    /// The single manifest-build-and-publish tail every durable commit
+    /// reaches, bare or transactional: note any pages this commit pulled
+    /// from the free list (`PageWriteBatch.flushCount`'s hook already noted
+    /// every page actually written, regardless of caller), try to build a
+    /// manifest covering everything written since the last durable
+    /// checkpoint, then publish -- one `syncData` when the manifest fits,
+    /// the historical presynced two-sync fallback otherwise.
+    /// `commitTransactionWithDurability` reaches the equivalent tail via
+    /// `flushTransactionWrites` for transactional commits, so this is the
+    /// one place manifest/presynced publication logic lives either way.
+    fn publishBareCommit(self: *NativeFile, pages: *PageAllocator, next: *CheckpointSlot) !void {
+        if (manifest_commits_enabled) try self.manifest_builder.noteReused(self.allocator, &pages.reused);
+        const manifest_prepared = if (manifest_commits_enabled) try self.tryBuildCommitManifest(next) else false;
+        if (!manifest_prepared) try self.syncIfRequired();
+        try self.publishCheckpoint(next.*, manifest_prepared);
+    }
+
     pub fn commitTransactionWithDurability(self: *NativeFile, durable: bool) !void {
         defer self.artifact_lease_transaction = false;
         defer self.allocator_certificate_staged = false;
@@ -14700,17 +14742,18 @@ test "lite native recovery falls back past a torn higher-sequence slot" {
 }
 
 // WS1(b) required tests, restored (and extended) now that
-// manifest_commits_enabled is true. Bare `file.putDocument`/
-// `putDocumentBatch` calls with no open transaction never reach
-// commitTransactionWithDurability at all -- indexed_reclamation files
-// route them through putIndexedDocumentBatch's own hand-rolled
-// publishCheckpoint(next, false) (always presynced, pre-dating and
-// independent of this feature; see "lite native durable commit costs
-// two syncs after dropping the active_checkpoint hint" above, which
-// still correctly asserts 2 there). Every test below wraps its writes
-// in an explicit beginTransaction/commitTransaction pair so `putDocument`
-// takes the staged-transaction path instead and actually exercises
-// flushTransactionWrites/tryBuildCommitManifest.
+// manifest_commits_enabled is true. A bare `file.putDocument`/
+// `putDocumentBatch` call (no open transaction) used to route
+// indexed_reclamation files through `putIndexedDocumentBatch`'s own
+// hand-rolled `publishCheckpoint(next, false)` -- always presynced, never
+// a manifest. It now calls `reserveBareCommitManifestPage` /
+// `publishBareCommit` at the same spot, the bare-commit equivalent of
+// `flushTransactionWrites`'s own reservation and
+// `commitTransactionWithDurability`'s own `tryBuildCommitManifest`/publish
+// tail (see "lite native durable commit costs one sync after dropping the
+// active_checkpoint hint" above). Every test below still wraps its writes
+// in an explicit beginTransaction/commitTransaction pair to exercise that
+// transactional path directly, rather than the bare path's own.
 
 test "lite native small durable commit builds a manifest and costs one sync" {
     const allocator = std.testing.allocator;
@@ -15153,10 +15196,15 @@ test "lite native file appends page and publishes checkpoint" {
         var file = try NativeFile.create(allocator, path);
         defer file.close();
 
+        // `allocatePage` is a bare (no caller-owned transaction) commit, so
+        // it now reserves a manifest page for its own single-fsync publish
+        // (see `reserveBareCommitManifestPage`) -- one more page than the
+        // data page plus free map alone: `+3`, not the pre-WS1(b) `+2`.
+        // `allocatePage`'s other callers below inherit the same `+3`.
         const page_id = try file.allocatePage("hello native page");
         try std.testing.expectEqual(reserved_header_pages, page_id);
         try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
-        try std.testing.expectEqual(reserved_header_pages + 2, file.activeCheckpoint().page_count);
+        try std.testing.expectEqual(reserved_header_pages + 3, file.activeCheckpoint().page_count);
         try std.testing.expectEqual(reserved_header_pages + 1, file.activeCheckpoint().free_map_root_page);
 
         const page = try file.readPagePayloadAlloc(allocator, page_id);
@@ -15167,7 +15215,7 @@ test "lite native file appends page and publishes checkpoint" {
     const report = try inspect(allocator, std.testing.io, path);
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(@as(u64, 1), report.commit_sequence);
-    try std.testing.expectEqual(reserved_header_pages + 2, report.page_count);
+    try std.testing.expectEqual(reserved_header_pages + 3, report.page_count);
 }
 
 test "lite native file reopens allocated pages" {
@@ -15188,7 +15236,7 @@ test "lite native file reopens allocated pages" {
     var reopened = try NativeFile.open(allocator, path, true);
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
-    try std.testing.expectEqual(reserved_header_pages + 2, reopened.activeCheckpoint().page_count);
+    try std.testing.expectEqual(reserved_header_pages + 3, reopened.activeCheckpoint().page_count);
     const page = try reopened.readPagePayloadAlloc(allocator, reserved_header_pages);
     defer allocator.free(page);
     try std.testing.expectEqualStrings("persisted", page);
@@ -15246,7 +15294,7 @@ test "lite native file publishes checkpoint without rewriting static header" {
     try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
 }
 
-test "lite native durable commit costs two syncs after dropping the active_checkpoint hint" {
+test "lite native durable commit costs one sync after dropping the active_checkpoint hint" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -15257,11 +15305,17 @@ test "lite native durable commit costs two syncs after dropping the active_check
     defer file.close();
     const before = file.test_sync_calls.load(.monotonic);
     try file.putDocument("doc", "durable");
-    // One sync for the data pages (flushTransactionWrites/syncIfRequired in
-    // commitTransactionWithDurability), one for the inactive recovery slot
-    // (publishCheckpoint). The active_checkpoint hint byte is no longer
-    // written or synced, so this is 2, not the historical 3.
-    try std.testing.expectEqual(@as(u64, 2), file.test_sync_calls.load(.monotonic) - before);
+    // A bare `putDocument` (no caller-owned transaction) used to route
+    // through `putIndexedDocumentBatch`'s own hand-rolled, always-presynced
+    // publish -- 2 syncs. It now reserves and builds a commit manifest for
+    // this small commit too (`reserveBareCommitManifestPage` /
+    // `publishBareCommit`), so the single `syncIfRequired` inside
+    // `publishCheckpoint` is the only barrier left: 1 sync, not 2.
+    try std.testing.expectEqual(@as(u64, 1), file.test_sync_calls.load(.monotonic) - before);
+
+    const slot = file.activeCheckpoint();
+    try std.testing.expect(!slot.presynced);
+    try std.testing.expect(slot.manifest_page != 0);
 }
 
 test "lite native durability_policy durable commit survives reopen" {
@@ -15278,7 +15332,9 @@ test "lite native durability_policy durable commit survives reopen" {
             file.setDurabilityPolicy(policy);
             const before = file.test_sync_calls.load(.monotonic);
             try file.putDocument("doc", "durable via syncData");
-            try std.testing.expectEqual(@as(u64, 2), file.test_sync_calls.load(.monotonic) - before);
+            // Same single-sync manifest commit as above: bare putDocument
+            // now reaches the one-sync path, not the historical 2.
+            try std.testing.expectEqual(@as(u64, 1), file.test_sync_calls.load(.monotonic) - before);
             try std.testing.expect((try file.check()).valid);
         }
         var reopened = try NativeFile.open(allocator, path, true);
@@ -15353,8 +15409,8 @@ test "lite native file permits concurrent readers" {
     var reader_b = try NativeFile.open(allocator, path, true);
     defer reader_b.close();
 
-    try std.testing.expectEqual(reserved_header_pages + 2, reader_a.activeCheckpoint().page_count);
-    try std.testing.expectEqual(reserved_header_pages + 2, reader_b.activeCheckpoint().page_count);
+    try std.testing.expectEqual(reserved_header_pages + 3, reader_a.activeCheckpoint().page_count);
+    try std.testing.expectEqual(reserved_header_pages + 3, reader_b.activeCheckpoint().page_count);
 }
 
 test "lite native file active writer permits readers but blocks second writer" {
@@ -15374,7 +15430,7 @@ test "lite native file active writer permits readers but blocks second writer" {
 
     var reader = try NativeFile.open(allocator, path, true);
     defer reader.close();
-    try std.testing.expectEqual(reserved_header_pages + 2, reader.activeCheckpoint().page_count);
+    try std.testing.expectEqual(reserved_header_pages + 3, reader.activeCheckpoint().page_count);
 
     const report = try inspect(allocator, std.testing.io, path);
     try std.testing.expect(report.valid);
@@ -15775,8 +15831,10 @@ test "lite native hot commits remain append only until explicit vacuum" {
 
     // Commits carry forward already-known free pages but never perform a
     // whole-file reachability walk. Explicit vacuum is the bounded place where
-    // obsolete history is reclaimed.
-    try std.testing.expectEqual(before_size + 4 * default_page_size, after_size);
+    // obsolete history is reclaimed. One of those pages is now the bare
+    // commit's own reserved manifest page (`reserveBareCommitManifestPage`):
+    // 5 pages, not the pre-WS1(b) 4.
+    try std.testing.expectEqual(before_size + 5 * default_page_size, after_size);
     const report = try file.check();
     try std.testing.expect(report.valid);
 
@@ -15895,7 +15953,9 @@ test "lite native document store spills large values into value pages" {
         defer file.close();
         const value_pages = std.math.divCeil(usize, large.len, file.maxValuePagePayloadBytes()) catch unreachable;
         try file.putDocument("doc:large", large);
-        try std.testing.expectEqual(@as(u64, @intCast(reserved_header_pages + 4 + value_pages)), file.activeCheckpoint().page_count);
+        // +1 over the pre-WS1(b) count for the bare commit's own reserved
+        // manifest page (`reserveBareCommitManifestPage`).
+        try std.testing.expectEqual(@as(u64, @intCast(reserved_header_pages + 5 + value_pages)), file.activeCheckpoint().page_count);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -16017,7 +16077,9 @@ test "lite native document batch publishes one checkpoint" {
             .{ .key = "doc:c", .is_delete = true },
         });
         try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
-        try std.testing.expectEqual(reserved_header_pages + 4, file.activeCheckpoint().page_count);
+        // +1 over the pre-WS1(b) count for the bare commit's own reserved
+        // manifest page (`reserveBareCommitManifestPage`).
+        try std.testing.expectEqual(reserved_header_pages + 5, file.activeCheckpoint().page_count);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -16206,10 +16268,14 @@ test "lite native check validates committed root chains" {
     try std.testing.expectEqual(@as(u64, 2), report.record_count);
     try std.testing.expectEqual(@as(u64, 2), report.live_file_count);
     try std.testing.expect(report.live_bytes > 0);
-    try std.testing.expectEqual(@as(u64, default_page_size * 11), report.file_size);
+    // +2 over the pre-WS1(b) file_size for the two bare commits' own
+    // reserved manifest pages (`reserveBareCommitManifestPage`) -- neither
+    // reachable from the live document/catalog chains `compact_size`
+    // follows, so both land in `reclaimable_bytes` instead.
+    try std.testing.expectEqual(@as(u64, default_page_size * 13), report.file_size);
     try std.testing.expectEqual(@as(u64, default_page_size * 10), report.compact_size);
     try std.testing.expectEqual(@as(u64, 0), report.tail_bytes);
-    try std.testing.expectEqual(@as(u64, default_page_size), report.reclaimable_bytes);
+    try std.testing.expectEqual(@as(u64, default_page_size * 3), report.reclaimable_bytes);
 }
 
 test "lite native check validates committed index catalog root chain" {
@@ -16239,9 +16305,12 @@ test "lite native check validates committed index catalog root chain" {
     try std.testing.expectEqual(@as(u64, 3), report.record_count);
     try std.testing.expectEqual(@as(u64, 3), report.live_file_count);
     try std.testing.expect(report.live_bytes > 0);
-    try std.testing.expectEqual(@as(u64, default_page_size * 15), report.file_size);
+    // +3 over the pre-WS1(b) file_size for the three bare commits' own
+    // reserved manifest pages (`reserveBareCommitManifestPage`); all three
+    // land in `reclaimable_bytes`, same reasoning as the test above.
+    try std.testing.expectEqual(@as(u64, default_page_size * 18), report.file_size);
     try std.testing.expectEqual(@as(u64, default_page_size * 13), report.compact_size);
-    try std.testing.expectEqual(@as(u64, default_page_size * 2), report.reclaimable_bytes);
+    try std.testing.expectEqual(@as(u64, default_page_size * 5), report.reclaimable_bytes);
 
     const index_file = (try file.getIndexCatalogRecordAlloc(allocator, "index/files/hbc/postings.bin")).?;
     defer allocator.free(index_file);
@@ -16774,16 +16843,28 @@ test "lite native free map cannot reclaim previous checkpoint pages" {
         try std.testing.expectEqualStrings("invalid_free_map", report.issue.?);
     }
 
-    // The free-map-vs-fallback-checkpoint cross-check only needs to run once
-    // per open handle: this process's own commits can only ever reuse pages
-    // that a previously verified free map already declared free, so
-    // re-scanning every checkpoint slot's full reachable set on every single
-    // mutation would make ingest quadratic in the number of commits.
-    // Corruption written out of band (as above) is instead caught the next
-    // time the file is opened and its free map is trusted again.
+    // WS1(b): "v2" above was a small bare commit, so it built a manifest
+    // covering every page it wrote, including the free-map page corrupted
+    // above. On reopen, `recoverActiveCheckpoint` verifies that manifest
+    // against current disk content before adopting the active slot: the
+    // corrupted free-map page's CRC no longer matches, so recovery rejects
+    // "v2"'s checkpoint outright and falls back to the previous,
+    // uncorrupted one ("v1"), truncating the file to its prefix -- the
+    // same "torn slot falls back to the previous checkpoint" path a crash
+    // mid-commit takes. The corruption is caught at open now, earlier than
+    // the deferred `validateFreePagesSafeForCheckpointSlots` safety net
+    // this test originally exercised for a presynced (non-manifest) commit.
     var reopened = try NativeFile.open(allocator, path, false);
     defer reopened.close();
-    try std.testing.expectError(error.InvalidNativeFreeMap, reopened.putDocument("doc:1", "v3"));
+    {
+        const recovered = (try reopened.getDocumentAlloc(allocator, "doc:1")).?;
+        defer allocator.free(recovered);
+        try std.testing.expectEqualStrings("v1", recovered);
+    }
+    try reopened.putDocument("doc:1", "v3");
+    const value = (try reopened.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("v3", value);
 }
 
 test "lite native check reports corrupted committed document page" {
