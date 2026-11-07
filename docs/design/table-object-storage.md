@@ -72,6 +72,57 @@ The native catalog owns existence, logical naming, schema, indexes, and table
 incarnation. In distributed mode it retains metadata consensus. Removing data
 Raft does not remove metadata authority or coordinated publication.
 
+### Planned authoritative serving cuts
+
+Request-local preparation reuse retains the current remote authority checks.
+The next serving design moves those checks to the authoritative native owner
+for sources whose complete write path Antfly controls. This is planned work,
+not a property of the reader-sharing implementation.
+
+Eligible sources are managed Iceberg behind an enforced writer gateway and
+sealed immutable Parquet manifests. An immutable-file prefix is insufficient:
+its membership can still change. Shared external catalogs retain fresh catalog
+coordination or an explicit bounded-staleness contract.
+
+The native owner persists source identity, incarnation, ownership epoch,
+acknowledged WAL watermark and the current reusable serving-cut reference.
+Every accepted write advances or invalidates that record before acknowledgment.
+Catalog changes invalidate it before returning success. Admission of a rebuilt
+cut compares the epoch captured before observing catalog/WAL state, and cannot
+regress the acknowledged watermark. An unavailable replacement cut returns a
+retryable rebuilding response rather than serving an older acknowledged state.
+The checks belong inside the native metadata transaction, including table
+incarnation checks. Distributed mutation and warming obey leader ownership.
+
+Activation must fence all writers, including standalone, SQL, CDC and older
+processes. Conditional WAL/catalog ownership prevents an unfenced writer from
+successfully appending after activation; a separate advisory lease is not enough.
+Only the gateway holds vendor write credentials. Ownership transitions must
+preserve valid old cursors or drain them explicitly. Unconfigured sources keep
+their existing remote checks; failure to establish a fence cannot silently
+enable this mode.
+
+Publication and write acceptance construct reusable immutable state references
+containing the published generation and bounded pending row images. Queries
+issue authenticated cursor references to that state and a WAL position, without
+uploading another retained image or cursor envelope. Cursor validation still
+checks current permissions, incarnation, recipe, ownership and expiry. Reader
+leases protect published generations through every issued cursor's expiry;
+state images and their row groups must live at least as long. Refresh happens
+before the remaining retention horizon becomes too short for a new cursor.
+Raw captured WAL heads cannot substitute for retained row images when their
+underlying roots can be collected independently.
+
+The owner warms the admitted cut's bounded working set: navigation, dictionaries,
+postings, row locators and replacement-key indexes. Existing process accounting,
+eviction and cancellation apply; warming yields to foreground work and stops
+when the admitted generation changes. Query execution merges pinned readers
+directly, fetches remote blocks on misses and hydrates winning hits. These
+optimizations must preserve unfiltered replacement probes and exact pagination.
+External-writer freshness, vector overlays and unsupported cursor shapes keep
+their established paths until separately qualified. Warm fixture latency targets
+do not qualify full-archive performance or scale-to-zero startup.
+
 External lake sidecars retain one metadata authority: a builder first commits a
 pending attempt through definition CAS, renews its fence, uploads immutable
 artifacts, and publishes through the exact admitted CAS. Upload completion is
