@@ -1366,3 +1366,10 @@ identities may switch when coded/display geometry, depth, SAR and color policy
 agree. Later parameter-set redefinitions or incompatible policy switches return
 `UnsupportedDynamicVideoConfig` before any frame is published; sparse VideoToolbox
 restarts currently use the initial configuration.
+
+HEVC sparse restarts discover IRAPs with one bounded NAL-header pass through the
+last selected packet, including pictures omitted from container sync hints.
+Only actual IRAP indexes are retained; compressed picture payloads are skipped.
+Generation admission uses an allocation-free MP4 metadata probe. Execution owns
+one bounded inspection scope shared by timestamp selection and decoding, under
+request cancellation and the reserved host scratch envelope.

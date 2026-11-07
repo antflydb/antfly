@@ -45,9 +45,23 @@ pub fn plan(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []const u
         reader: *media.mp4.Reader,
         fn irap(self: @This(), index: usize) !bool {
             try self.reader.input.control.check();
-            var lease = try self.reader.readPacket(index);
-            defer lease.deinit();
-            return isIrap(lease.bytes, self.reader.track.nal_length_bytes);
+            const packet = self.reader.packets[index];
+            const length = self.reader.track.nal_length_bytes;
+            if (length == 0 or length > 4) return error.InvalidVideoPacket;
+            var cursor: usize = 0;
+            while (cursor < packet.size) {
+                if (packet.size - cursor < length + @as(usize, 2)) return error.InvalidVideoPacket;
+                var prefix = try self.reader.input.read(packet.offset + cursor, length + @as(usize, 2));
+                defer prefix.deinit();
+                var size: usize = 0;
+                for (prefix.bytes[0..length]) |byte| size = (size << 8) | byte;
+                cursor += length;
+                if (size < 2 or size > packet.size - cursor) return error.InvalidVideoPacket;
+                const kind = (prefix.bytes[length] >> 1) & 0x3f;
+                if (kind < 32) return kind >= 16 and kind <= 23;
+                cursor += size;
+            }
+            return false;
         }
     };
     return planPackets(a, reader.packets, selected, Probe{ .reader = reader });
@@ -60,21 +74,25 @@ pub fn plan(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []const u
 fn planPackets(a: std.mem.Allocator, packets: []const media.mp4.Packet, selected: []const usize, probe: anytype) ![]Run {
     var runs: std.ArrayList(Run) = .empty;
     errdefer runs.deinit(a);
-    var irap: std.AutoHashMapUnmanaged(usize, bool) = .empty;
-    defer irap.deinit(a);
+    // Container sync flags can omit open-GOP entry points. Probe every packet
+    // header once up to the last target and retain only actual IRAP indexes.
+    var iraps: std.ArrayList(usize) = .empty;
+    defer iraps.deinit(a);
+    var inspected: usize = 0;
     for (selected) |target| {
         if (target >= packets.len) return error.InvalidPacketIndex;
+        if (target + 1 < inspected) return error.InvalidPacketIndex;
+        while (inspected <= target) : (inspected += 1) {
+            if (try probe.irap(inspected)) try iraps.append(a, inspected);
+        }
         var start: ?usize = null;
         // Without any IRAP preceding it in presentation too, this is a leading
         // picture at the start of a stream: the latest IRAP is the best available.
         var fallback: ?usize = null;
-        var candidate = target + 1;
-        while (candidate > 0) {
-            candidate -= 1;
-            if (!packets[candidate].sync) continue;
-            const entry = try irap.getOrPut(a, candidate);
-            if (!entry.found_existing) entry.value_ptr.* = try probe.irap(candidate);
-            if (!entry.value_ptr.*) continue;
+        var position = iraps.items.len;
+        while (position > 0) {
+            position -= 1;
+            const candidate = iraps.items[position];
             if (fallback == null) fallback = candidate;
             if (packets[candidate].pts <= packets[target].pts) {
                 start = candidate;
@@ -140,4 +158,27 @@ test "A leading picture at the start of a stream uses the only IRAP there is" {
     const runs = try planPackets(a, &packets, &.{1}, TestProbe{ .iraps = &.{0} });
     defer a.free(runs);
     try std.testing.expectEqualSlices(Run, &.{.{ .first = 0, .last = 1 }}, runs);
+}
+
+test "HEVC restarts discover unflagged CRA pictures with one probe per packet" {
+    const a = std.testing.allocator;
+    const packets = [_]media.mp4.Packet{ testPacket(0, true), testPacket(1, false), testPacket(4, false), testPacket(3, false), testPacket(5, false) };
+    const Probe = struct {
+        count: *usize,
+        fn irap(self: @This(), index: usize) !bool {
+            self.count.* += 1;
+            return index == 0 or index == 2;
+        }
+    };
+    var count: usize = 0;
+    const runs = try planPackets(a, &packets, &.{ 1, 4 }, Probe{ .count = &count });
+    defer a.free(runs);
+    try std.testing.expectEqualSlices(Run, &.{.{ .first = 0, .last = 4 }}, runs);
+    try std.testing.expectEqual(packets.len, count);
+    const trailing = try planPackets(a, &packets, &.{4}, TestProbe{ .iraps = &.{ 0, 2 } });
+    defer a.free(trailing);
+    try std.testing.expectEqualSlices(Run, &.{.{ .first = 2, .last = 4 }}, trailing);
+    const leading = try planPackets(a, &packets, &.{3}, TestProbe{ .iraps = &.{ 0, 2 } });
+    defer a.free(leading);
+    try std.testing.expectEqualSlices(Run, &.{.{ .first = 0, .last = 3 }}, leading);
 }

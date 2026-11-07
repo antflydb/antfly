@@ -200,6 +200,8 @@ test "VideoToolbox HEVC decodes selected pictures from a sparse open timeline" {
         }
     };
     var count: Count = .{};
+    // Prove restart discovery uses the bitstream even when all hints are absent.
+    for (reader.packets) |*packet| packet.sync = false;
     const last = reader.packets.len - 1;
     const receipt = try decodeTo(a, &reader, &.{ last, 0, last / 2 }, .{}, .{ .context = &count, .accept = Count.accept });
     try std.testing.expectEqual(@as(usize, 3), count.hits);

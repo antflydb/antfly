@@ -21,13 +21,12 @@ const display = @import("display.zig");
 
 /// True when the clip's first decodable track belongs on the WebM lane. A clip
 /// the MP4 reader can't open isn't claimed; its own route reports the failure.
-pub fn usesWebmLane(a: std.mem.Allocator, bytes: []const u8) bool {
-    // Most clips aren't AV1. Settle those without building a packet index.
+pub fn usesWebmLane(_: std.mem.Allocator, bytes: []const u8) bool {
+    // Most clips aren't AV1. Neither this fast check nor the metadata probe
+    // allocates an index; the chosen route owns full validation under admission.
     if (!moovMentionsAv1(bytes)) return false;
-    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-route" };
-    var reader = media.mp4.Reader.init(a, &source, limits) catch return false;
-    defer reader.deinit();
-    return reader.track.codec == .av1;
+    const track = media.mp4.probeTrack(bytes, limits, .{}) catch return false;
+    return track.codec == .av1;
 }
 
 /// Walks top-level boxes only. A false positive just costs the full parse below.
@@ -159,6 +158,9 @@ test "AV1 MP4 keeps its packets and display metadata on the WebM lane" {
     const a = std.testing.allocator;
     const bytes = @embedFile("../testdata/av1-mp4.mp4");
     try std.testing.expect(usesWebmLane(a, bytes));
+    var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expect(usesWebmLane(denied.allocator(), bytes));
+    try std.testing.expectEqual(@as(usize, 0), denied.allocated_bytes);
     try std.testing.expect(!usesWebmLane(a, @embedFile("../testdata/mjpeg.mov")));
     try std.testing.expect(!moovMentionsAv1(@embedFile("../testdata/hevc-mp4.mp4")));
     try std.testing.expect(!moovMentionsAv1("not an mp4 at all"));

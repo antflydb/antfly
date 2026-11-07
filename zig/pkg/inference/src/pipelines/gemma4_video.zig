@@ -30,6 +30,7 @@ const sampling: embedding_video.Sampling = .{ .timestamps = .{} };
 
 /// Decoder and indexing memory, shared through one pool per request.
 const portable_pool_bytes: u64 = 512 * 1024 * 1024;
+const inspection_bytes: usize = 64 * 1024 * 1024;
 /// Prepared model-sized frames, plus one displayed frame at the source pixel limit.
 const portable_frame_bytes: usize = 96 * 1024 * 1024 + 48 * 1024 * 1024;
 /// Reserved through generation admission before any portable video work starts.
@@ -89,8 +90,9 @@ fn scratchEstimate(bytes: usize, tier: memory.ResidencyTier) memory.Estimate {
     return .{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = bytes, .scratch_tier = tier };
 }
 
-/// Host indexing plus the prepared and displayed frames, without a portable decoder.
-const apple_hevc_host_bytes: usize = 64 * 1024 * 1024 + portable_frame_bytes;
+/// Retained inspection, one packet plus the native sample copy, and prepared
+/// and displayed frames. VideoToolbox surfaces have a separate device budget.
+const apple_hevc_host_bytes: usize = inspection_bytes + 32 * 1024 * 1024 + portable_frame_bytes;
 
 pub const Reservation = struct {
     host_bytes: usize = portable_host_bytes,
@@ -100,14 +102,16 @@ pub const Reservation = struct {
 
 /// What this clip's route will hold on a host without NVDEC. Unreadable clips keep
 /// the portable reservation; decoding reports what's wrong with them.
-pub fn reservation(a: std.mem.Allocator, bytes: []const u8) Reservation {
+pub fn reservation(_: std.mem.Allocator, bytes: []const u8) Reservation {
+    return reservationControlled(bytes, .{});
+}
+
+fn reservationControlled(bytes: []const u8, control: Control) Reservation {
     if (@import("builtin").os.tag != .macos) return .{};
-    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-reservation" };
-    var input = embedding_video.PacketInput.init(a, &source, bytes) catch return .{};
-    defer input.deinit();
-    const reader = &input.reader;
-    if (reader.track.codec != .hevc or !video.apple_hevc.hasParameterSets(reader.track.codec_config)) return .{};
-    const surfaces = video.apple_hevc.surfaceBytes(reader.track) catch return .{};
+    const adapter = control.imageWorkControl();
+    const track = media.mp4.probeTrack(bytes, video.mp4_coded.limits, .{ .context = adapter.context, .check_fn = adapter.check_fn }) catch return .{};
+    if (track.codec != .hevc) return .{};
+    const surfaces = video.apple_hevc.surfaceBytes(track) catch return .{};
     if (surfaces > video.apple_hevc.max_surface_bytes) return .{};
     return .{ .host_bytes = apple_hevc_host_bytes, .surface_bytes = std.math.cast(usize, surfaces) orelse return .{} };
 }
@@ -127,7 +131,8 @@ pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Alloca
         defer permit.deinit();
         return encodePortable(cb, a, projector, bytes);
     }
-    var permit = try admission.acquire(false, reservation(a, bytes));
+    try cb.checkExecutionControl();
+    var permit = try admission.acquire(false, reservationControlled(bytes, cb.execution_control orelse .{}));
     defer permit.deinit();
     return encodePortable(cb, a, projector, bytes);
 }
@@ -271,8 +276,11 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
     // the request's cancellation and deadline between selected frames too.
     const control = cb.execution_control orelse Control{};
     // VideoToolbox surfaces are a separate budget from decoder heap memory.
-    var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes, .device_bytes = video.apple_hevc.max_surface_bytes } };
-    const timestamps = embedding_video.selectedPresentationUs(a, bytes, control, sampling, &pool) catch |err| return inputError(err);
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes - inspection_bytes, .device_bytes = video.apple_hevc.max_surface_bytes } };
+    var inspection = embedding_video.InspectionScope{ .allocator = a, .limit = inspection_bytes };
+    defer inspection.deinit();
+    const configuration = embedding_video.Configuration{ .sampling = sampling, .pool = &pool, .inspection_scope = &inspection };
+    const timestamps = embedding_video.selectedConfiguredPresentationUs(a, bytes, control, configuration) catch |err| return inputError(err);
     defer a.free(timestamps);
     var frames = try projector_mod.PortableVideoFrames.init(cb, a, projector, timestamps.len);
     defer frames.deinit();
@@ -281,6 +289,7 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
         .observer = .{ .context = &observer, .accept = Observer.accept },
         .sampling = sampling,
         .pool = &pool,
+        .inspection_scope = &inspection,
     }) catch |err| return inputError(err);
     return frames.project(timestamps);
 }
@@ -611,4 +620,28 @@ test "HEVC inband SAR agrees across admission planning and decoded presentation"
             try std.testing.expect(record.seen != 0);
         }
     }
+}
+
+test "HEVC admission probes metadata without allocations or sample inspection" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    inline for (.{ "hevc-10bit.mp4", "hevc-sar-inband.mp4", "hevc-multi-sps.mp4" }) |name| {
+        const fixture = @embedFile("../testdata/video/codecs/" ++ name);
+        const expected = reservation(a, fixture);
+        try std.testing.expect(expected.surface_bytes != 0);
+        try std.testing.expectEqualDeep(expected, reservation(denied.allocator(), fixture));
+        // Admission never reads samples, even for in-band configuration.
+        const corrupted = try a.dupe(u8, fixture);
+        defer a.free(corrupted);
+        var cursor: usize = 0;
+        while (cursor + 8 <= corrupted.len) {
+            const size = std.mem.readInt(u32, corrupted[cursor..][0..4], .big);
+            if (size < 8 or size > corrupted.len - cursor) break;
+            if (std.mem.eql(u8, corrupted[cursor + 4 ..][0..4], "mdat")) @memset(corrupted[cursor + 8 ..][0 .. size - 8], 0xff);
+            cursor += size;
+        }
+        try std.testing.expectEqualDeep(expected, reservation(denied.allocator(), corrupted));
+    }
+    try std.testing.expectEqual(@as(usize, 0), denied.allocated_bytes);
 }

@@ -1315,6 +1315,34 @@ fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, co
 
 /// Presentation time of each selected picture, in microseconds from the first
 /// picture. Slots match the slots delivered to a FrameObserver for this sampling.
+pub fn selectedConfiguredPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: Control, configuration: Configuration) ![]i64 {
+    const scope = configuration.inspection_scope orelse return selectedPresentationUs(a, bytes, control, configuration.sampling, configuration.pool);
+    try control.check();
+    _ = try scope.inspect(bytes, null, control, configuration, false);
+    const entry = scope.find(bytes, null, configuration).?;
+    const selected = entry.selected.?;
+    const output = try a.alloc(i64, selected.len);
+    errdefer a.free(output);
+    var first: i64 = std.math.maxInt(i64);
+    if (entry.webm) {
+        for (entry.webm_index.?.pictures) |picture| {
+            try control.check();
+            first = @min(first, picture.pts);
+        }
+        for (selected, output) |id, *value| value.* = @divFloor(entry.webm_index.?.pictures[id].pts - first, 1000);
+    } else {
+        for (entry.reader.packets) |packet| {
+            try control.check();
+            first = @min(first, packet.pts);
+        }
+        for (selected, output) |id, *value| {
+            const ticks = @as(i128, entry.reader.packets[id].pts) - first;
+            value.* = std.math.cast(i64, @divFloor(ticks * std.time.us_per_s, entry.reader.track.timescale)) orelse return error.TimestampOverflow;
+        }
+    }
+    return output;
+}
+
 pub fn selectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) ![]i64 {
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-timestamps", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
@@ -5722,4 +5750,57 @@ test "HEVC borrowed readers and inspection scopes share active SPS geometry" {
     // Borrowed metadata and ownership belong to the caller, never to the scope.
     try std.testing.expectEqual(initial.ptr, reader.track.codec_config.ptr);
     try std.testing.expect(!reader.track.hevc_policy_validated);
+}
+
+test "video inspection shares timestamps and decode metadata and honors cancellation" {
+    const a = std.testing.allocator;
+    inline for (.{ "hevc-multi-sps.mp4", "av1.mp4", "h264.mp4" }) |name| {
+        const bytes = @embedFile("../testdata/video/codecs/" ++ name);
+        var scope = InspectionScope{ .allocator = a };
+        defer scope.deinit();
+        const configuration = Configuration{ .inspection_scope = &scope, .sampling = .{ .timestamps = .{} } };
+        const expected = try selectedPresentationUs(a, bytes, .{}, configuration.sampling, null);
+        defer a.free(expected);
+        const actual = try selectedConfiguredPresentationUs(a, bytes, .{}, configuration);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(i64, expected, actual);
+        const entry = scope.find(bytes, null, configuration).?;
+        const reads = entry.source.reads;
+        const retained = scope.retainedBytes();
+        const again = try selectedConfiguredPresentationUs(a, bytes, .{}, configuration);
+        defer a.free(again);
+        try std.testing.expectEqualSlices(i64, actual, again);
+        try std.testing.expectEqual(@as(usize, 1), scope.count);
+        try std.testing.expectEqual(reads, entry.source.reads);
+        try std.testing.expectEqual(retained, scope.retainedBytes());
+        if (!std.mem.startsWith(u8, name, "hevc") or @import("builtin").os.tag == .macos) {
+            const Count = struct {
+                frames: usize = 0,
+                fn accept(raw: *anyopaque, _: usize, _: video.preparation.BorrowedFrame, _: video.preparation.Options, _: media.source.Control) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.frames += 1;
+                }
+            };
+            var count: Count = .{};
+            var observed = configuration;
+            observed.observer = .{ .context = &count, .accept = Count.accept };
+            try observeConfigured(a, bytes, null, .{}, observed);
+            try std.testing.expectEqual(actual.len, count.frames);
+            try std.testing.expectEqual(@as(usize, 1), scope.count);
+            try std.testing.expectEqual(reads, entry.source.reads);
+        }
+        try std.testing.expectError(error.Timeout, selectedConfiguredPresentationUs(a, bytes, .{ .deadline_ns = 0 }, configuration));
+    }
+    var cancelled = InspectionScope{ .allocator = a };
+    defer cancelled.deinit();
+    try std.testing.expectError(error.Timeout, selectedConfiguredPresentationUs(a, @embedFile("../testdata/video/codecs/hevc-multi-sps.mp4"), .{ .deadline_ns = 0 }, .{ .inspection_scope = &cancelled }));
+    try std.testing.expectEqual(@as(usize, 0), cancelled.count);
+    var bounded = InspectionScope{ .allocator = a, .limit = 1 };
+    defer bounded.deinit();
+    const result = selectedConfiguredPresentationUs(a, @embedFile("../testdata/video/codecs/hevc-multi-sps.mp4"), .{}, .{ .inspection_scope = &bounded });
+    if (result) |unexpected| {
+        a.free(unexpected);
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expect(err == error.ResourceLimitExceeded or err == error.OutOfMemory or err == error.SharedAdmissionExceeded);
+    try std.testing.expectEqual(@as(usize, 0), bounded.count);
 }
