@@ -1237,6 +1237,17 @@ test "Moondream readers route natively only with native checkpoint artifacts" {
     // closed without loading anything.
     const support = try probeManifest(allocator, model_dir, man);
     try std.testing.expectEqual(UnsupportedReason.unsupported_moondream_artifacts, support.unsupported);
+    if (comptime @import("build_options").enable_native) {
+        // Absence is an unsupported capability, but allocation/operational
+        // failures at the same publication boundary must remain errors.
+        var fail0 = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, moondream_reader_mod.probeModelDir(fail0.allocator(), model_dir));
+        try std.testing.expect(fail0.has_induced_failure);
+    }
+    const non_directory = try std.fs.path.join(allocator, &.{ parent, "moondream-file" });
+    defer allocator.free(non_directory);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "moondream-file", .data = "not a model directory" });
+    try std.testing.expectEqual(UnsupportedReason.unsupported_moondream_artifacts, (try probeManifest(allocator, non_directory, man)).unsupported);
     var session_manager = backends.SessionManager.init(allocator);
     try std.testing.expectError(
         error.UnsupportedMoondreamArtifacts,

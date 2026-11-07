@@ -403,8 +403,10 @@ fn collectLargestDenseTensorSamples(
 
     const limit = @min(candidates.items.len, 16);
     for (candidates.items[0..limit]) |candidate| {
+        const name = try allocator.dupe(u8, candidate.name);
+        errdefer allocator.free(name);
         try out.append(allocator, .{
-            .name = try allocator.dupe(u8, candidate.name),
+            .name = name,
             .tensor_type = candidate.tensor_type,
             .byte_len = candidate.byte_len,
         });
@@ -419,7 +421,7 @@ fn collectQuantizedTensorSamples(
     for (file.tensors) |tensor| {
         if (!tensor.tensor_type.isQuantized()) continue;
         if (out.items.len >= 16) break;
-        try out.append(allocator, try allocator.dupe(u8, tensor.name));
+        try appendOwnedInspectionName(allocator, out, tensor.name);
     }
 }
 
@@ -505,17 +507,19 @@ pub fn collectNormalizedGgufNames(
             }
         }
         if (packed_moe_expert_tensor and packed_moe.items.len < 16) {
-            try packed_moe.append(allocator, try allocator.dupe(u8, tensor.name));
+            try appendOwnedInspectionName(allocator, packed_moe, tensor.name);
         }
         if (!packed_moe_expert_tensor and shouldRecordUnmappedGgufTensor(arch_config, tensor.name, normalized, unmapped.items.len)) {
-            try unmapped.append(allocator, try allocator.dupe(u8, tensor.name));
+            try appendOwnedInspectionName(allocator, unmapped, tensor.name);
         }
     }
 }
 
 fn putNameIfAbsent(allocator: std.mem.Allocator, names: *std.StringHashMapUnmanaged(void), name: []const u8) !void {
     if (names.contains(name)) return;
-    try names.put(allocator, try allocator.dupe(u8, name), {});
+    const owned = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned);
+    try names.put(allocator, owned, {});
 }
 
 fn shouldRecordUnmappedGgufTensor(arch_config: ArchConfig, raw_name: []const u8, normalized_name: []const u8, current_count: usize) bool {
@@ -844,7 +848,13 @@ fn appendMissingWeight(
     name: []const u8,
 ) !void {
     if (names.contains(name)) return;
-    try missing.append(allocator, try allocator.dupe(u8, name));
+    try appendOwnedInspectionName(allocator, missing, name);
+}
+
+fn appendOwnedInspectionName(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]const u8), name: []const u8) !void {
+    const owned = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned);
+    try out.append(allocator, owned);
 }
 
 pub fn tensorTypeSupported(tensor_type: gguf_mod.tensor_types.TensorType) bool {
@@ -2143,4 +2153,52 @@ test "Jina legacy adapter discovery owns incomplete pair cleanup" {
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     try std.testing.expectError(error.IncompleteJinaV5Adapter, jinaRetrievalAdapterPaths(a, root, .{ .allocator = a }));
+}
+
+fn inspectionReportNameOwnershipScenario(allocator: std.mem.Allocator) !void {
+    var dimensions = [_]u64{ 32, 32 };
+    var tensors = [_]gguf_mod.format.TensorInfo{
+        .{ .name = "token_embd.weight", .dimensions = &dimensions, .tensor_type = .{ .known = .F32 }, .offset = 0, .data_offset = 0 },
+        .{ .name = "blk.0.attn_q.weight", .dimensions = &dimensions, .tensor_type = .{ .known = .Q4_0 }, .offset = 0, .data_offset = 0 },
+        .{ .name = "blk.0.ffn_gate_exps.weight", .dimensions = &dimensions, .tensor_type = .{ .known = .Q4_0 }, .offset = 0, .data_offset = 0 },
+        .{ .name = "blk.0.unknown_fixture.weight", .dimensions = &dimensions, .tensor_type = .{ .known = .F32 }, .offset = 0, .data_offset = 0 },
+        .{ .name = "token_embd.weight", .dimensions = &dimensions, .tensor_type = .{ .known = .F32 }, .offset = 0, .data_offset = 0 },
+    };
+    const file = gguf_mod.format.File{
+        .header = .{ .version = 3, .tensor_count = tensors.len, .metadata_count = 0 },
+        .metadata = &.{},
+        .tensors = &tensors,
+        .alignment = 32,
+        .data_region_offset = 0,
+    };
+    var report = try buildGgufInspectionReportFromFile(allocator, .{ .gpt = .{
+        .family = .llama,
+        .hidden_size = 32,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 1,
+        .intermediate_size = 64,
+    } }, &file, false);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 5), report.tensor_count);
+    try std.testing.expectEqual(@as(usize, 2), report.quantized_tensor_samples.len);
+    try std.testing.expectEqual(@as(usize, 3), report.dense_tensor_samples.len);
+    try std.testing.expectEqual(@as(usize, 1), report.unmapped_tensor_names.len);
+    try std.testing.expectEqualStrings("blk.0.unknown_fixture.weight", report.unmapped_tensor_names[0]);
+    try std.testing.expectEqual(@as(usize, 1), report.packed_moe_expert_tensors.len);
+    try std.testing.expectEqualStrings("blk.0.ffn_gate_exps.weight", report.packed_moe_expert_tensors[0]);
+    try std.testing.expect(report.missing_required_tensors.len > 0);
+    for (report.dense_tensor_samples) |sample| for (tensors) |source| {
+        try std.testing.expect(sample.name.ptr != source.name.ptr);
+    };
+    // A repeated normalized key is a no-op; each returned sample still owns
+    // its independent name and every partial failure is reclaimed.
+    try std.testing.expect(report.quantized_tensor_samples[1].ptr != report.packed_moe_expert_tensors[0].ptr);
+}
+
+test "GGUF inspection report owns names across container growth and duplicate normalized keys" {
+    try inspectionReportNameOwnershipScenario(std.testing.allocator);
+}
+
+test "GGUF inspection report unwinds every owned name and container allocation failure" {
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, inspectionReportNameOwnershipScenario, .{});
 }

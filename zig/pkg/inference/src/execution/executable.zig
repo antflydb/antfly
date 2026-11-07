@@ -677,8 +677,10 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
         defer executable.deinit();
         const placement = &executable.runtime.plan.?.base;
         const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
-        // Native owns both typed axis-one gathers; ReLU and softmax retain
-        // their selected placement. Count the actual prepared dispatch routes.
+        // This caller uses the ordinary assigned physical plan, not a retained
+        // input-qualified PreparedRoutes variant. Inspect its actual KernelPlans
+        // and the numerical dispatch counters; the root owns no route selection.
+        try std.testing.expect(pool.selection == null);
         for ([_]@TypeOf(first){ first, host }) |original| {
             const node = program.id_map[original];
             const kernel = pool.kernels[node] orelse return error.MissingPreparedGather;
@@ -686,7 +688,6 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
             try std.testing.expectEqual(@as(u8, 1), kernel.descriptor.operation.gather.axis);
             try std.testing.expectEqual(.i32, kernel.descriptor.input_shapes[1].dtype);
             try std.testing.expectEqual(ops.BackendKind.native, pool.backends[kernel.backend_index].kind());
-            try std.testing.expect(pool.preparedKernelRoute(node) != null);
         }
         const activation_kernel = pool.kernels[program.id_map[activation]] orelse return error.MissingPreparedActivation;
         try std.testing.expect(activation_kernel.descriptor.operation == .unary);
@@ -695,12 +696,8 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
         const softmax_kernel = pool.kernels[program.id_map[resident]] orelse return error.MissingPreparedSoftmax;
         try std.testing.expect(softmax_kernel.descriptor.operation == .softmax);
         try std.testing.expectEqual(ops.BackendKind.metal, pool.backends[softmax_kernel.backend_index].kind());
-        for ([_]@TypeOf(first){ activation, resident }) |original| {
-            try std.testing.expect(pool.preparedKernelRoute(program.id_map[original]) != null);
-        }
         var prepared_dispatches: u64 = 0;
-        for (pool.kernels, 0..) |kernel, node| if (kernel != null) {
-            try std.testing.expect(pool.preparedKernelRoute(@intCast(node)) != null);
+        for (pool.kernels) |kernel| if (kernel != null) {
             prepared_dispatches += 1;
         };
         try std.testing.expectEqual(@as(u64, 4), prepared_dispatches);

@@ -1699,6 +1699,9 @@ pub const Session = struct {
         // state still owns this physical model. Cold publication sets pointers
         // only after the lifetime has reached its final address.
         execution_gate: std.atomic.Mutex = .unlocked,
+        /// The same retained physical owner holds the ready FIFO and its gate.
+        /// Aggregate teardown cannot invalidate a retained session's waiter.
+        cohort_scheduler: @import("../runtime/embedding_scheduler.zig").Scheduler = .{},
         retirement_sink_mutex: std.atomic.Mutex = .unlocked,
         retirement_sink: ?@import("../execution/retirement_sink.zig").Ref = null,
         owner: *anyopaque,
@@ -3104,11 +3107,14 @@ pub const Session = struct {
         return self.model_lifetime.?;
     }
 
-    /// Cold loading/publication only. Every numerical caller uses this same
-    /// lane; retained model state keeps the mutex alive through final unlock.
+    /// Cold loading/publication only. Publish the model-owned FIFO and gate
+    /// together; retained model state keeps both alive through final leave.
+    /// Explicitly borrowed external pairs remain caller-owned unless this
+    /// method promotes the session to its own physical execution owner.
     pub fn installOwnedExecutionGate(self: *Session, allocator: std.mem.Allocator) !void {
         const lifetime = try self.ensureModelLifetime(allocator);
         self.execution_gate = &lifetime.execution_gate;
+        self.cohort_scheduler = &lifetime.cohort_scheduler;
     }
 
     pub fn attachResourcePin(self: *Session, allocator: std.mem.Allocator, pin: ModelLifetime.ResourcePin) !void {
@@ -9980,9 +9986,9 @@ fn freshExecutionGeometryCase(a: std.mem.Allocator) !void {
     var session_open = true;
     defer if (session_open) session.close();
     try session.installOwnedExecutionGate(a);
-    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
-    defer std.debug.assert(scheduler.head == null and scheduler.tail == null);
-    session.cohort_scheduler = &scheduler;
+    const scheduler = session.cohort_scheduler.?;
+    defer if (session_open) std.debug.assert(scheduler.head == null and scheduler.tail == null);
+    try std.testing.expectEqual(&session.model_lifetime.?.cohort_scheduler, scheduler);
     session.output_geometry = .{ .input_name = "x", .width = 4 };
     session.run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 * 1024 }, .static_workspace_bytes = 64, .check_live_memory = false };
     var input = try Tensor.initFloat32(a, "x", &.{ 1, 2, 4 }, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
@@ -10046,6 +10052,7 @@ fn freshExecutionGeometryCase(a: std.mem.Allocator) !void {
         try std.testing.expectEqual(@as(usize, 1), outputs.len);
         try std.testing.expectEqualSlices(f32, &.{ -1, -2, -3, -4, -5, -6, -7, -8 }, outputs[0].asFloat32());
     };
+    try std.testing.expect(scheduler.head == null and scheduler.tail == null);
     session.close();
     session_open = false;
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
@@ -10057,4 +10064,119 @@ test "fresh execution permits resolve actual prepared geometry before B while pr
 
 test "fresh execution geometry preparation unwinds every actual Native owner allocation failure" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, freshExecutionGeometryCase, .{});
+}
+
+fn ownedExecutionCohortCase(a: std.mem.Allocator) !void {
+    const Scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler;
+    const Probe = struct {
+        closes: usize = 0,
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closes += 1;
+        }
+        const table = Session.VTable{
+            .run = DeadlineProbeSession.run,
+            .inputInfo = DeadlineProbeSession.inputInfo,
+            .outputInfo = DeadlineProbeSession.outputInfo,
+            .backend = DeadlineProbeSession.backend,
+            .close = close,
+        };
+    };
+    const control = InferenceExecutionControl{};
+    var probe = Probe{};
+    var external_gate: std.atomic.Mutex = .unlocked;
+    var external_scheduler = Scheduler{};
+    var failed_probe = Probe{};
+    var failed = Session{ .ptr = &failed_probe, .vtable = &Probe.table, .execution_gate = &external_gate, .cohort_scheduler = &external_scheduler };
+    var fail0 = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, failed.installOwnedExecutionGate(fail0.allocator()));
+    try std.testing.expect(fail0.has_induced_failure);
+    try std.testing.expect(failed.model_lifetime == null);
+    try std.testing.expectEqual(&external_gate, failed.execution_gate.?);
+    try std.testing.expectEqual(&external_scheduler, failed.cohort_scheduler.?);
+    failed.close();
+    try std.testing.expectEqual(@as(usize, 1), failed_probe.closes);
+    // Explicit cold promotion replaces the complete borrowed pair, never
+    // mixing an owned gate with the external scheduler or taking ownership of it.
+    var session = Session{ .ptr = &probe, .vtable = &Probe.table, .execution_gate = &external_gate, .cohort_scheduler = &external_scheduler };
+    var session_open = true;
+    defer if (session_open) session.close();
+    try session.installOwnedExecutionGate(a);
+    const lifetime = session.model_lifetime.?;
+    const gate = session.execution_gate.?;
+    const scheduler = session.cohort_scheduler.?;
+    try std.testing.expectEqual(&lifetime.execution_gate, gate);
+    try std.testing.expectEqual(&lifetime.cohort_scheduler, scheduler);
+    try std.testing.expect(gate != &external_gate and scheduler != &external_scheduler);
+    const copied = session;
+    {
+        var first = Scheduler.Waiter{};
+        try copied.selectReadyCohort(gate, control, &first);
+        defer copied.leaveSelectedCohort(&first);
+        try std.testing.expectEqual(scheduler, first.owner.?);
+        try std.testing.expectEqual(&first, scheduler.head.?);
+        // Reinstallation is idempotent and does not reset a ready FIFO.
+        try session.installOwnedExecutionGate(a);
+        try std.testing.expectEqual(gate, session.execution_gate.?);
+        try std.testing.expectEqual(scheduler, session.cohort_scheduler.?);
+        try std.testing.expectEqual(&first, scheduler.head.?);
+        try copied.acquireSelectedCohort(control, &first);
+        try std.testing.expect(scheduler.ownsAcquired(&first, gate));
+        copied.releaseSelectedCohortGate(&first);
+    }
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var cancelled = Scheduler.Waiter{};
+    try std.testing.expectError(error.Cancelled, copied.selectReadyCohort(gate, .{ .check_fn = Cancel.check }, &cancelled));
+    try std.testing.expect(cancelled.owner == null and scheduler.head == null and scheduler.tail == null);
+    var retained: ?*Session.ModelLifetime = lifetime.retain();
+    defer if (retained) |pin| pin.release();
+    session.close();
+    session_open = false;
+    try std.testing.expectEqual(@as(usize, 0), probe.closes);
+    // A retained physical Model owns BOTH pointers after its publishing Session
+    // closes, including the final ready selection and gate unlock.
+    {
+        var after_close = Scheduler.Waiter{};
+        try copied.selectReadyCohort(gate, control, &after_close);
+        defer copied.leaveSelectedCohort(&after_close);
+        try copied.acquireSelectedCohort(control, &after_close);
+        try std.testing.expect(scheduler.ownsAcquired(&after_close, gate));
+        copied.releaseSelectedCohortGate(&after_close);
+    }
+    try std.testing.expect(scheduler.head == null and scheduler.tail == null);
+    retained.?.release();
+    retained = null;
+    try std.testing.expectEqual(@as(usize, 1), probe.closes);
+    try std.testing.expect(external_scheduler.head == null and external_scheduler.tail == null);
+    try std.testing.expect(external_gate.tryLock());
+    external_gate.unlock();
+    // A Session which keeps an explicit external pair never owns or destroys
+    // that pair. The pre-existing external scheduling contract stays unchanged.
+    var borrowed_probe = Probe{};
+    const borrowed = Session{ .ptr = &borrowed_probe, .vtable = &Probe.table, .execution_gate = &external_gate, .cohort_scheduler = &external_scheduler };
+    {
+        var waiter = Scheduler.Waiter{};
+        try borrowed.selectReadyCohort(&external_gate, control, &waiter);
+        defer borrowed.leaveSelectedCohort(&waiter);
+        try borrowed.acquireSelectedCohort(control, &waiter);
+        try std.testing.expect(external_scheduler.ownsAcquired(&waiter, &external_gate));
+        borrowed.releaseSelectedCohortGate(&waiter);
+    }
+    borrowed.close();
+    try std.testing.expectEqual(@as(usize, 1), borrowed_probe.closes);
+    try std.testing.expect(external_scheduler.head == null and external_scheduler.tail == null);
+    try std.testing.expect(external_gate.tryLock());
+    external_gate.unlock();
+}
+
+test "owned execution gate publishes the retained Model FIFO before Runtime and preserves external scheduling ownership" {
+    try ownedExecutionCohortCase(std.testing.allocator);
+}
+
+test "owned execution cohort construction unwinds every allocation failure without publishing a partial pair" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, ownedExecutionCohortCase, .{});
 }

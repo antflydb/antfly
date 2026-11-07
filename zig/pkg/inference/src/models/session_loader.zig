@@ -395,9 +395,9 @@ pub fn loadPreferredWithArtifacts(
     }
 
     if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
-    // Missing isolation and caller budget caps are expected policy decisions,
+    // Allocation failure, missing isolation and caller budget caps are expected resource decisions,
     // rather than corrupt artifacts or session import failures.
-    if (first_err) |err| if (err == error.ProcessIsolationRequired or err == error.MemoryBudgetExceeded or
+    if (first_err) |err| if (err == error.OutOfMemory or err == error.ProcessIsolationRequired or err == error.MemoryBudgetExceeded or
         err == error.ResourceLimitExceeded or err == error.ResourceTemporarilyUnavailable) return err;
     std.log.err("loadModel({s}) failed: no backend accepted model", .{model_dir});
     std.log.err("manifest paths onnx={?s} visual={?s} audio={?s} text_projection={?s} visual_projection={?s} audio_projection={?s}", .{

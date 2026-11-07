@@ -663,10 +663,6 @@ pub const Runtime = struct {
             .tokenizer_resource_lease = tokenizer_resource_lease,
             .resource_lease = assets.session.resource_lease,
         };
-        // The same ready FIFO bounds admitted work before every model's
-        // actual execution gate; no resource supplier runs under that gate.
-        model.session.cohort_scheduler = &model.embedding_cohort_scheduler;
-
         // One final owner is installed before borrowing shared state. Every
         // subsequent failure closes the session/worker before freeing it.
         assets_owned = false;
@@ -770,10 +766,6 @@ pub const Runtime = struct {
     // Stateful GPU backends retain one model-level execution lane until
     // per-request resident frames and caches are independently owned.
     embedding_session_lock: std.atomic.Mutex = .unlocked,
-    /// Stateful GPU pipelines share mutable command-frame and resident-slot
-    /// state within a loaded model. Keep one model-local lane while allowing
-    /// independent models to overlap.
-    embedding_cohort_scheduler: @import("../runtime/embedding_scheduler.zig").Scheduler = .{},
     /// CUDA boundary requests execute serially on this session. Queue before
     /// reserving their full device scratch ceiling, without holding a provider
     /// lock during admission/eviction. Every waiter retains a loaded-model handle.
@@ -1930,7 +1922,7 @@ test "loaded runtime owned asset construction unwinds model and shared state at 
             try std.testing.expect(model.shared_prefetch != null);
             try std.testing.expect(model.native_generate_coordinator != null);
             try std.testing.expectEqual(&model.session.model_lifetime.?.execution_gate, model.session.execution_gate.?);
-            try std.testing.expectEqual(&model.embedding_cohort_scheduler, model.session.cohort_scheduler.?);
+            try std.testing.expectEqual(&model.session.model_lifetime.?.cohort_scheduler, model.session.cohort_scheduler.?);
             model.deinit();
             model_live = false;
             try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
@@ -2157,11 +2149,13 @@ test "primary model preparation loads without a serving registry and preserves i
     var source = backends.SessionManager{ .allocator = a, .preferred_backends = &.{.native} };
     const original = source;
     const model = try loadPrimary(a, directory, &source, .{ .host = Host.unmanaged(), .component_sessions = &source, .executor_io = std.testing.io }, null);
-    defer a.destroy(model);
-    defer model.deinit();
+    var model_storage_live = true;
+    defer if (model_storage_live) a.destroy(model);
+    var model_live = true;
+    defer if (model_live) model.deinit();
     try std.testing.expectEqual(backends.BackendType.native, model.session.backend());
     try std.testing.expectEqual(&model.session.model_lifetime.?.execution_gate, model.session.execution_gate.?);
-    try std.testing.expectEqual(&model.embedding_cohort_scheduler, model.session.cohort_scheduler.?);
+    try std.testing.expectEqual(&model.session.model_lifetime.?.cohort_scheduler, model.session.cohort_scheduler.?);
     try std.testing.expect(model.hf_tok != null);
     const ids = try model.hf_tok.?.tokenizer().encode(a, "hello");
     defer a.free(ids);
@@ -2173,6 +2167,25 @@ test "primary model preparation loads without a serving registry and preserves i
         }
     };
     try std.testing.expectError(error.Cancelled, loadPrimary(a, "/missing-cancelled-model", &source, .{ .host = Host.unmanaged(), .component_sessions = &source, .executor_io = std.testing.io }, .{ .check_fn = Cancel.check }));
+    const retained_session = model.session;
+    const retained = retained_session.model_lifetime.?.retain();
+    defer retained.release();
+    const scheduler = retained_session.cohort_scheduler.?;
+    const gate = retained_session.execution_gate.?;
+    model.deinit();
+    model_live = false;
+    a.destroy(model);
+    model_storage_live = false;
+    // The aggregate storage has physically died. The retained Model still
+    // owns the complete execution pair through the final leave.
+    try std.testing.expectEqual(&retained.cohort_scheduler, scheduler);
+    try std.testing.expectEqual(&retained.execution_gate, gate);
+    var waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
+    try retained_session.selectReadyCohort(gate, .{}, &waiter);
+    defer retained_session.leaveSelectedCohort(&waiter);
+    try retained_session.acquireSelectedCohort(.{}, &waiter);
+    try std.testing.expect(scheduler.ownsAcquired(&waiter, gate));
+    retained_session.releaseSelectedCohortGate(&waiter);
 }
 
 pub const ChunkPlanningAssets = struct {

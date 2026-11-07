@@ -57389,6 +57389,15 @@ const CompleteMetalRegularRopeBudget = struct {
         const domain = self.domain.retain();
         defer domain.release();
         self.deinit();
+        // A ready group can already be detached by the typed Domain worker,
+        // whose final CPU ledger refund then completes outside collector.poll.
+        // All Frame/result/route owners have closed; preserve the exact zero
+        // invariant after that bounded CPU settlement, without waiting on GPU.
+        const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(2));
+        while (!std.meta.eql(memory.AdmissionAmounts{}, domain.controller.snapshot()) and std.Io.Clock.awake.now(std.testing.io).nanoseconds < deadline.nanoseconds) {
+            _ = @import("../execution/resource_retirement.zig").poll();
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        }
         try std.testing.expectEqual(memory.AdmissionAmounts{}, domain.controller.snapshot());
     }
 };

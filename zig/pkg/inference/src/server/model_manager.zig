@@ -14411,6 +14411,8 @@ fn admittedLoaderOwnerScenario(a: std.mem.Allocator, path: []const u8, component
             const owner = session.model_lifetime orelse return error.MissingAdmittedModelOwner;
             try std.testing.expect(session.execution_gate != null);
             try std.testing.expectEqual(&owner.execution_gate, session.execution_gate.?);
+            try std.testing.expect(session.cohort_scheduler != null);
+            try std.testing.expectEqual(&owner.cohort_scheduler, session.cohort_scheduler.?);
             // Exercise actual cold final-resource allocation before policy and
             // the failure edge AFTER it attached real admission and a Model pin.
             try std.testing.expect(owner.prepared_final_resources != null);
