@@ -476,6 +476,14 @@ visibility, receipt watermark, expiry, cancellation and the reader/snapshot leas
 Readers are request-local, never shared across principals or unrelated requests.
 Vector and named-component execution keep their existing preparation path.
 
+The prepared store must be constructed at its final address before publication
+selection: cloud-generation bindings retain a pointer to its inline object-store
+implementation, including during cleanup. Moving an already bound store leaves
+that pointer dangling. Mutable overlay wrappers belong to individual executions;
+retained overlays may build their physical suppression mask in a leaf's scratch
+arena, so the shared prepared reader must never retain that mask after the leaf
+returns. WAL-cache pins retain their separately owned masks as before.
+
 Overlay windows grow with observed suppression, up to the existing 128-row
 physical batch limit. Unfiltered indexed probes still cover every replacement
 key, including matching buffered rows, tombstones and newer nonmatching rows.
@@ -528,3 +536,17 @@ counts and duplicate-free pagination after later accepted writes and a process
 restart. Fresh requests must see the new ACK while the first cursor keeps its
 original cut. Released
 rc.10 performs seven source/publication preparations on that same fixture.
+
+The fixture keeps a later CDC batch pending by revoking only warehouse write
+access before acceptance. WAL admission remains writable. It resumes both the
+original published cut and the later nonempty WAL cut after restart, checks the
+exact distinct IDs, and checks reuse across several resumed leaf calls. Its GCS
+variant requires explicit qualification bucket/prefix/token-file settings and
+verifies that both retained publications contain cloud-generation maps. The
+credential is resolved through a secret reference; it is absent from the config.
+
+Set `ANTFLY_E2E_COMPOSED_PROFILE_ROUNDS=5` for opt-in measurements of the first
+query after restart and five warm queries, including sampled server RSS and CPU.
+These use the fixture's small corpus, retain durable/OS caches, and must run
+without competing compilers. They supplement correctness checks; they do not
+qualify full-archive performance or a regional managed deployment.

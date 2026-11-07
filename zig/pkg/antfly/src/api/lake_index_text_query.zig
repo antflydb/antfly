@@ -61,6 +61,7 @@ pub fn executeScopedWithDelivery(a: A, server: *server_api.ApiHttpServer, table:
         },
         error.NativeLakeTextCorpusTooLarge, error.LakeOverlayTooLarge, error.ArtifactReadBudgetExceeded => error.QueryCandidateBudgetExceeded,
         error.IndexNotFound => error.InvalidQueryRequest,
+        error.OutOfMemory => if (scope) |owner| (if (owner.budget.exhausted) error.QueryCandidateBudgetExceeded else err) else err,
         error.Canceled => canceled: {
             // Recover the request deadline after a provider-only boolean adapter.
             try request.ensureActive();
@@ -255,7 +256,10 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     context = lease.readContext();
     try server.prepareLakeCache();
     const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .retained_catalog_metadata = if (retained) |cut| cut.catalog_metadata else null, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
-    var store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+    // Publication bindings retain &store.implementation: initialize the store
+    // at its final heap address before selecting/binding any publication.
+    prepared.store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+    const store = &prepared.store;
     defer if (!transferred) store.deinit();
     store.implementation.cloud_io = server.embedding_provider_runtime.io;
     var wal_cut: ?@import("lake_wal_cut_cache.zig").Pin = null;
@@ -336,7 +340,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     var selected = blk: {
         const publication_started = @import("antfly_platform").time.monotonicNs();
         defer request_profile.record(&server.lake_query_metrics, .publication, publication_started);
-        break :blk (try @import("lake_index_selection.zig").selectCachedWithLease(ca, sql_table, &source, &store, context, .required, &server.lake_read_cache, lease)) orelse return error.ExternalLakeIndexUnavailable;
+        break :blk (try @import("lake_index_selection.zig").selectCachedWithLease(ca, sql_table, &source, store, context, .required, &server.lake_read_cache, lease)) orelse return error.ExternalLakeIndexUnavailable;
     };
     defer if (!transferred) selected.deinit();
 
@@ -346,7 +350,6 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     prepared.schema = schema;
     prepared.state = state;
     prepared.lease = lease;
-    prepared.store = store;
     prepared.wal_cut = wal_cut;
     prepared.overlay = overlay;
     prepared.pending = retained_pending;
@@ -6290,4 +6293,15 @@ test "external lake composed prepared readers fence identity expiry visibility a
     var other = req;
     other.remote_snapshot = "request-lake:2";
     try std.testing.expect((try scope.find(table, other)) == null);
+}
+
+test "external lake composed prepared budget exhaustion fails without retaining readers" {
+    var scope = Scope.init(std.testing.allocator);
+    defer scope.deinit();
+    scope.budget.limit = 1;
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "events" };
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, executeScopedWithDelivery(std.testing.allocator, undefined, table, .{}, .{}, null, &scope));
+    try std.testing.expect(scope.budget.exhausted);
+    try std.testing.expectEqual(@as(usize, 0), scope.len);
+    try std.testing.expectEqual(@as(usize, 0), scope.budget.live);
 }
