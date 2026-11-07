@@ -183,3 +183,126 @@ final class StoreProtocol: URLProtocol, @unchecked Sendable {
   await queue.resume(token)
   await queue.waitUntilIdle()
 }
+
+@Suite(.serialized) struct HistoryDestinationTests {
+  @Test @MainActor func deleteFollowsOriginalDestinationAndCancelsEveryQueuedCopy() async throws {
+    let directory = try testDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    HistoryDeleteProtocol.hosts = []
+    HistoryDeleteProtocol.failure = false
+    let options = URLSessionConfiguration.ephemeral
+    options.protocolClasses = [HistoryDeleteProtocol.self]
+    let session = URLSession(configuration: options)
+    let store = Store(
+      directory: directory, registerHotkey: false,
+      historyUpload: { _, _ in Issue.record("Deleted history uploaded") },
+      clientFactory: { try AntflyClient(configuration: $0, session: session) })
+    store.config.retainHistory = true
+    store.config.server = "https://original.example"
+    await store.recordHistory(historyEntry(), snapshot: store.config)
+    let id = store.history[0].id
+    try await store.outbox?.enqueue(
+      store.history[0],
+      destination: HistoryDestination(server: "https://copy.example", table: "second"))
+    store.config.server = "https://new.example"
+    store.config.table = "new"
+    try await store.deleteRetainedHistory()
+    #expect(store.history.isEmpty)
+    #expect(Set(HistoryDeleteProtocol.hosts) == ["original.example", "copy.example"])
+    #expect(await store.outbox?.status().pending == 0)
+    let restarted = try HistoryOutbox(
+      directory: directory.appendingPathComponent("outbox"), paused: true,
+      upload: { _, _ in Issue.record("Deleted job resurrected") })
+    #expect(await restarted.destinations(for: [id]).isEmpty == true)
+  }
+  @Test @MainActor func failedRemoteDeletionKeepsLocalRecoveryButCannotResumeUploads() async throws
+  {
+    let directory = try testDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    HistoryDeleteProtocol.failure = true
+    defer { HistoryDeleteProtocol.failure = false }
+    let options = URLSessionConfiguration.ephemeral
+    options.protocolClasses = [HistoryDeleteProtocol.self]
+    let session = URLSession(configuration: options)
+    let store = Store(
+      directory: directory, registerHotkey: false,
+      historyUpload: { _, _ in Issue.record("Deletion failure resumed an upload") },
+      clientFactory: { try AntflyClient(configuration: $0, session: session) })
+    store.config.retainHistory = true
+    await store.recordHistory(historyEntry(), snapshot: store.config)
+    do {
+      try await store.deleteRetainedHistory()
+      Issue.record("Expected remote failure")
+    } catch is ServerFailure {}
+    #expect(store.history.count == 1)
+    #expect(await store.outbox?.status().pending == 0)
+    await store.outbox?.resume()
+    await store.outbox?.waitUntilIdle()
+  }
+  @Test @MainActor func damagedOutboxDoesNotPreventLocalRetentionOrDeletion() async throws {
+    let directory = try testDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let queueDirectory = directory.appendingPathComponent("outbox")
+    try FileManager.default.createDirectory(at: queueDirectory, withIntermediateDirectories: true)
+    try Data(count: 8 * 1024 * 1024 + 1).write(
+      to: queueDirectory.appendingPathComponent("oversized.json"))
+    HistoryDeleteProtocol.failure = false
+    let options = URLSessionConfiguration.ephemeral
+    options.protocolClasses = [HistoryDeleteProtocol.self]
+    let session = URLSession(configuration: options)
+    let store = Store(
+      directory: directory, registerHotkey: false,
+      clientFactory: { try AntflyClient(configuration: $0, session: session) })
+    #expect(store.outbox == nil)
+    store.config.retainHistory = true
+    await store.recordHistory(historyEntry(), snapshot: store.config)
+    let file = directory.appendingPathComponent("history.json")
+    #expect(try JSONDecoder().decode([HistoryEntry].self, from: Data(contentsOf: file)).count == 1)
+    try await store.deleteRetainedHistory()
+    #expect(try JSONDecoder().decode([HistoryEntry].self, from: Data(contentsOf: file)).isEmpty)
+  }
+
+}
+private final class HistoryDeleteProtocol: URLProtocol, @unchecked Sendable {
+  nonisolated(unsafe) static var hosts: [String] = []
+  nonisolated(unsafe) static var failure = false
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+  override func startLoading() {
+    Self.hosts.append(request.url!.host!)
+    let response = HTTPURLResponse(
+      url: request.url!, statusCode: Self.failure ? 503 : 200,
+      httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
+    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+    client?.urlProtocol(self, didLoad: Data("{}".utf8))
+    client?.urlProtocolDidFinishLoading(self)
+  }
+  override func stopLoading() {}
+}
+
+@Test @MainActor func legacyArchiveRecoversQueuedDestinationBeforeUploadsResume() async throws {
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  var config = Configuration()
+  config.retainHistory = true
+  config.server = "https://new.example"
+  try JSONEncoder().encode(config).write(to: directory.appendingPathComponent("settings.json"))
+  let entry = historyEntry()
+  try JSONEncoder().encode([entry]).write(to: directory.appendingPathComponent("history.json"))
+  let original = HistoryDestination(server: "https://original.example", table: "original")
+  let queue = try HistoryOutbox(
+    directory: directory.appendingPathComponent("outbox"), paused: true,
+    upload: { _, _ in Issue.record("Preparation queue dispatched") })
+  try await queue.enqueue(entry, destination: original)
+  let probe = HistoryProbe()
+  await probe.release()
+  let store = Store(
+    directory: directory, registerHotkey: false, historyUpload: { await probe.upload($0, to: $1) })
+  await store.outbox?.waitUntilIdle()
+  #expect(store.history.first?.destination == original)
+  #expect(await probe.destinations == [original])
+  let saved = try JSONDecoder().decode(
+    [HistoryEntry].self,
+    from: Data(contentsOf: directory.appendingPathComponent("history.json")))
+  #expect(saved.first?.destination == original)
+}

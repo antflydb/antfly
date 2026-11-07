@@ -120,3 +120,29 @@ import Testing
     }
   }
 }
+
+@Test func hostedDiscoveryPreservesSharedCleanupAndRuntimeDiscoveryClearsIt() throws {
+  let catalog = try JSONDecoder().decode(
+    ModelCatalog.self,
+    from: Data(
+      """
+      {"data":[
+        {"id":"connections/openai/models/whisper-1","task":"transcribe","dictation":{"live_preview":false,"recognition_hints":false,"text_cleanup":true}},
+        {"id":"connections/local-inference/models/openai/whisper-tiny","task":"transcribe","dictation":{"live_preview":false,"recognition_hints":false,"text_cleanup":false}},
+        {"id":"generators/cleanup","task":"generate"},
+        {"id":"transcribers/whisper","task":"transcribe"}
+      ]}
+      """.utf8))
+  var preset = Preset(id: "test", name: "Test")
+  preset.cleanupModel = "generators/cleanup"
+  preset.selectTranscriber(catalog.data[0])
+  #expect(preset.usesNamedTranscriber && preset.cleanupModel == "generators/cleanup")
+  #expect(preset.cleanupChoices(from: catalog.data).map(\.id) == ["generators/cleanup"])
+  var config = Configuration()
+  config.presets[0] = preset
+  config.selectedPreset = preset.id
+  #expect(try Configuration.decode(JSONEncoder().encode(config)).presets[0].usesNamedTranscriber)
+  preset.selectTranscriber(catalog.data[1])
+  #expect(!preset.usesNamedTranscriber && preset.cleanupModel.isEmpty)
+  #expect(catalog.transcriber("whisper")?.id == "transcribers/whisper")
+}

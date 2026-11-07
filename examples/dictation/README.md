@@ -74,7 +74,10 @@ named transcriber (`transcribers/whisper`) and a named generator (`cleanup`) to
 use the same cleanup path as Apple. A raw local Whisper model also works; its
 cleanup field then uses a raw local generator model, as in the runtime's existing
 `/dictate` contract. The cleanup picker offers only named generators for named transcribers; changing
-to a raw runtime transcriber clears the named cleanup selection. Named Whisper
+to a raw runtime transcriber clears the named cleanup selection. Discovered hosted
+connection transcribers advertise shared text cleanup and preserve named generators;
+runtime connections retain their raw-model cleanup contract. The selected routing
+is saved with the preset, so it also works after restarting offline. Named Whisper
 transcribers accept named cleanup generators,
 including Apple or hosted generators. The gateway preserves Whisper dictionary
 hints and decoding options on the recognition stage.
@@ -100,15 +103,24 @@ return after granting access. Cancel setup keeps the previous shortcut. This act
 saves only the shortcut; other unsaved settings and credentials are not changed.
 **Keyboard settings** opens the Globe-key preferences without changing them.
 
+Server edits debounce discovery and cancel obsolete requests. HTTP failures show
+the bounded structured server error and retry guidance rather than a generic
+readiness message. Full WAV conversion runs off the UI actor only for clip upload,
+retry, or explicit audio retention; successful live sessions use just their PCM tail.
+Release-to-result timing includes conversion and finalization. Live-processing
+backpressure can disable live processing without discarding the complete recording.
+
 Settings also provide clickable Fn/Control/Option/Shift/Command buttons, a live shortcut
 label, **Record shortcut**, **Modifiers only**, and **Reset to Fn**. During selection,
 dictation is paused and captured keystrokes are consumed locally. Release your
 keys to accept the selection, or press Escape to cancel. Save settings to apply;
-a registration failure preserves the previous working shortcut. Common editing
+a registration failure preserves the previous working shortcut. Settings and
+credentials still save when shortcut permission is missing; the shortcut status
+shows the remaining setup step. Reapplying an active shortcut is idempotent. Common editing
 and system commands such as Command-C/Command-V cannot replace dictation shortcuts.
 
 Modifier-only and Fn combinations use a dedicated global keyboard event loop and
-need macOS Accessibility access. Click **Enable keyboard & paste access**, grant
+need macOS Accessibility access. Click **Set up shortcut & paste access**, grant
 access in System Settings, then return or save settings again. If macOS also opens
 its emoji picker, set **Press Globe key to → Do Nothing** under Keyboard settings.
 The app never changes system keyboard preferences or grants itself permissions.
@@ -214,13 +226,20 @@ History and audio retention are off by default:
   insertion status. Network uploads run independently of recording and retry with
   backoff across app restarts. The durable outbox holds at most 500 jobs / 64 MiB,
   preserving each original server and table without storing credentials. History
-  sync status is separate from dictation status. Upload local history can also
+  sync status is separate from dictation status. A separate revision-fenced archive
+  writer keeps local retention and deletion working even if the optional outbox
+  cannot open. Upload local history can also
   retry writes by stable document ID without creating duplicates.
 - The table's full-text index searches final transcript text. Search results are
   shown as the server's JSON response, including document IDs and sources.
 - Clear local history removes the local cache. Delete local history and matching
-  Antfly documents pauses uploads, removes matching pending jobs, and deletes the
-  cached entries' remote IDs before resuming. Turning history retention off removes
+  Antfly documents pauses uploads, cancels all matching pending jobs, and deletes
+  the cached entries at their original server/table destinations before resuming.
+  A remote deletion failure keeps local entries available for retry, but canceled
+  uploads cannot restart automatically. Manual uploads also preserve destinations.
+  Legacy archives recover destinations from pending jobs; already uploaded legacy
+  entries without destination metadata bind once to the configuration that loads
+  them, since their earlier destination cannot be reconstructed. Turning history retention off removes
   pending uploads and the local archive. Older remote
   records beyond the local 500-entry window need normal Antfly table management.
 - Audio retention keeps only `last-recording.wav` locally, never in Antfly. Saving
@@ -300,3 +319,12 @@ Manual macOS smoke test:
    snapshot and search a saved transcript. Export JSON and confirm no credentials.
 8. Stop the server, retry, deny Accessibility, or choose a conflicting shortcut;
    verify copyable recovery and the previous working shortcut remain available.
+
+Validation can build a separate signed bundle without replacing a running app:
+
+```bash
+APP_OUTPUT_DIR="$PWD/.build/validation-app" ./build-app.sh
+```
+
+Use a stable `SIGNING_IDENTITY` for repeated local installs if available. Replacing
+an ad hoc signed bundle can invalidate its existing macOS Accessibility grant.

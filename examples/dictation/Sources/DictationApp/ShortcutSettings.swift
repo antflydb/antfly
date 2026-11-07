@@ -141,6 +141,9 @@ struct ShortcutSettings: View {
         Button("Keyboard settings…") { store.openKeyboardSettings() }
       }
       if !store.shortcutSetupStatus.isEmpty { Text(store.shortcutSetupStatus).font(.caption) }
+      if !store.shortcutStatus.isEmpty {
+        Text(store.shortcutStatus).font(.caption).textSelection(.enabled)
+      }
       Text("Setup saves only your selected shortcut. Other edits still use Save settings.").font(
         .caption
       ).foregroundStyle(.secondary)

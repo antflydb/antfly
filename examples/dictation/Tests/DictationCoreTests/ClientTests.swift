@@ -45,7 +45,9 @@ final class FixtureProtocol: URLProtocol, @unchecked Sendable {
     do {
       _ = try await client().models()
       Issue.record("Expected HTTP failure")
-    } catch is DictationError {}
+    } catch let error as ServerFailure {
+      #expect(error.status == 403 && error.message == "denied")
+    }
   }
   @Test func dictationConsumesTranscriptAndCompletedEvents() async throws {
     FixtureProtocol.reply = { request in
@@ -154,6 +156,35 @@ final class FixtureProtocol: URLProtocol, @unchecked Sendable {
     }
     _ = try await client().appendSessionEvents(
       "session", audio: Data([0, 0, 0, 0]), sampleRate: 16000)
+  }
+  @Test func dictationPreservesStructuredHTTPFailureAndRetryAdvice() async throws {
+    FixtureProtocol.reply = { _ in
+      (
+        429, "application/json",
+        "{\"error\":{\"code\":\"InferenceCapacityUnavailable\",\"message\":\"No free inference slot\"}}"
+      )
+    }
+    do {
+      _ = try await client().dictate(
+        audio: Data([1]), preset: Configuration().presets[0], dictionary: []
+      ) { _ in }
+      Issue.record("Expected overload")
+    } catch let error as ServerFailure {
+      #expect(error.status == 429 && error.code == "InferenceCapacityUnavailable")
+      #expect(error.message == "No free inference slot")
+      #expect(error.localizedDescription.contains("retry"))
+    }
+  }
+  @Test func dictationBoundsUnstructuredHTTPErrorPages() async throws {
+    FixtureProtocol.reply = { _ in (400, "text/html", String(repeating: "x", count: 100_000)) }
+    do {
+      _ = try await client().dictate(
+        audio: Data([1]), preset: Configuration().presets[0], dictionary: []
+      ) { _ in }
+      Issue.record("Expected bad request")
+    } catch let error as ServerFailure {
+      #expect(error.status == 400 && error.message.count == 2048)
+    }
   }
 
 }

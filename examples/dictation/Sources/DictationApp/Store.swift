@@ -27,7 +27,8 @@ import SwiftUI
   @Published var working = false
   @Published var historySyncStatus = "History sync idle."
   @Published var historyWorking = false
-  private let hotkey: Hotkey?
+  @Published private(set) var shortcutStatus = ""
+  private let hotkey: (any ShortcutManaging)?
   private var overlay: RecordingOverlay?
   private var live: LiveDictation?
   private var plan: ProcessingPlan?
@@ -43,7 +44,9 @@ import SwiftUI
   private var previewTask: Task<Void, Never>?
   private var cadenceTask: Task<Void, Never>?
   private var timeoutTask: Task<Void, Never>?
-  private var generation = UUID()
+  private(set) var generation = UUID()
+  private(set) var discoveryTask: Task<Void, Never>?
+  private var discoveryGeneration = UUID()
   private var registered: DictationCore.KeyboardShortcut?
   @Published var capturingShortcut = false
   @Published private(set) var shortcutSetupPending = false
@@ -51,16 +54,24 @@ import SwiftUI
   private let keyboardAccess: @MainActor () -> Bool
   private let keyboardAccessRequest: @MainActor () -> Void
   private let settingsOpener: @MainActor (String) -> Void
-  private var retryAudio: Data?
+  private let credentialReader: @MainActor (String) -> String
+  private let credentialWriter: @MainActor (String, String) throws -> Void
+  private var retryRecording: PCMRecording?
   private var retryPreset: Preset?
   private let clientFactory: (@Sendable (Configuration) throws -> AntflyClient)?
   private let directory: URL
+  private let archive: HistoryArchive
   private var settingsFile: URL { directory.appendingPathComponent("settings.json") }
   private var historyFile: URL { directory.appendingPathComponent("history.json") }
   init(
     directory storageDirectory: URL? = nil, registerHotkey: Bool = true,
     historyUpload: HistoryOutbox.Upload? = nil,
     clientFactory: (@Sendable (Configuration) throws -> AntflyClient)? = nil,
+    shortcutManager: (any ShortcutManaging)? = nil,
+    credentialReader: @escaping @MainActor (String) -> String = { Credentials.read(server: $0) },
+    credentialWriter: @escaping @MainActor (String, String) throws -> Void = {
+      try Credentials.save($0, server: $1)
+    },
     keyboardAccess: @escaping @MainActor () -> Bool = { AXIsProcessTrusted() },
     keyboardAccessRequest: @escaping @MainActor () -> Void = {
       let options =
@@ -73,11 +84,15 @@ import SwiftUI
     self.keyboardAccessRequest = keyboardAccessRequest
     self.settingsOpener = settingsOpener
     self.clientFactory = clientFactory
-    self.directory =
+    self.credentialReader = credentialReader
+    self.credentialWriter = credentialWriter
+    let directory =
       storageDirectory
       ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
       .appendingPathComponent("AntflyDictation")
-    hotkey = registerHotkey ? Hotkey() : nil
+    self.directory = directory
+    archive = HistoryArchive(file: directory.appendingPathComponent("history.json"))
+    hotkey = shortcutManager ?? (registerHotkey ? Hotkey() : nil)
     do {
       try FileManager.default.createDirectory(
         at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -94,18 +109,24 @@ import SwiftUI
       try registerShortcut()
       message =
         "Ready. \(config.toggle ? "Press" : "Hold") \(config.effectiveShortcut.label) to dictate."
-    } catch { message = error.localizedDescription }
+    } catch {
+      shortcutStatus = error.localizedDescription
+      message = error.localizedDescription
+    }
     do {
       outbox = try HistoryOutbox(
-        directory: self.directory.appendingPathComponent("outbox"), paused: true,
+        directory: self.directory.appendingPathComponent("outbox"), paused: true, archive: archive,
         upload: historyUpload ?? { entry, destination in
           let token = await MainActor.run { Credentials.read(server: destination.server) }
           try await AntflyClient(server: destination.server, token: token).saveHistory(
             entry, table: destination.table)
         }, changed: { [weak self] status in await self?.updateHistoryStatus(status) })
-      if config.retainHistory { Task { await outbox?.resume() } }
     } catch { historySyncStatus = "History sync unavailable: " + error.localizedDescription }
-    token = registerHotkey ? Credentials.read(server: config.server) : ""
+    if config.retainHistory {
+      let legacyDestination = HistoryDestination(server: config.server, table: config.table)
+      Task { await restoreHistoryDestinations(legacyDestination: legacyDestination) }
+    }
+    token = registerHotkey ? credentialReader(config.server) : ""
     hotkey?.changed = { [weak self] down in self?.shortcut(down: down) }
     hotkey?.interrupted = { [weak self] in if self?.state != .idle { self?.cancel() } }
     if registerHotkey {
@@ -120,17 +141,20 @@ import SwiftUI
       refreshModels()
     }
   }
-  private func client(_ snapshot: Configuration? = nil) throws -> AntflyClient {
+  private func client(_ snapshot: Configuration? = nil, token suppliedToken: String? = nil) throws
+    -> AntflyClient
+  {
     let settings = snapshot ?? config
     if let clientFactory { return try clientFactory(settings) }
     return try AntflyClient(
-      server: settings.server, token: Credentials.read(server: settings.server))
+      configuration: settings, token: suppliedToken ?? credentialReader(settings.server))
   }
   private func registerShortcut() throws {
     let shortcut = try config.effectiveShortcut.validated()
     guard registered != shortcut || hotkey?.isAvailable == false else { return }
     try hotkey?.register(shortcut)
     registered = shortcut
+    shortcutStatus = "Shortcut active: " + shortcut.label
   }
   func refreshShortcutAccess() {
     guard state == .idle, !capturingShortcut else { return }
@@ -143,7 +167,7 @@ import SwiftUI
     do {
       try registerShortcut()
       message = "Shortcut ready: " + config.effectiveShortcut.label
-    } catch { message = error.localizedDescription }
+    } catch { shortcutStatus = error.localizedDescription }
   }
   func captureShortcut(_ capturing: Bool) {
     if capturing { cancelShortcutSetup() }
@@ -184,7 +208,7 @@ import SwiftUI
       let shortcut = try config.effectiveShortcut.validated()
       saved.effectiveShortcut = shortcut
       let bytes = try JSONEncoder().encode(saved.validated())
-      try hotkey?.register(shortcut)
+      if registered != shortcut || hotkey?.isAvailable == false { try hotkey?.register(shortcut) }
       do { try write(bytes, to: settingsFile) } catch {
         do {
           if let previous { try hotkey?.register(previous) } else { hotkey?.unregister() }
@@ -201,6 +225,7 @@ import SwiftUI
       }
       config.effectiveShortcut = shortcut
       registered = shortcut
+      shortcutStatus = "Shortcut active: " + shortcut.label
       shortcutSetupPending = false
       shortcutSetupStatus =
         "\(shortcut.label) is enabled and saved. \(config.toggle ? "Press" : "Hold") \(shortcut.label) to dictate."
@@ -216,11 +241,15 @@ import SwiftUI
     try data.write(to: url, options: .atomic)
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
   }
-  private func persistSettings() throws {
+  private func persistSettings() throws -> String? {
     config = try config.validated()
-    try registerShortcut()
-    try Credentials.save(token, server: config.server)
+    try credentialWriter(token, config.server)
     try write(JSONEncoder().encode(config), to: settingsFile)
+    var shortcutIssue: String?
+    do { try registerShortcut() } catch {
+      shortcutIssue = error.localizedDescription
+      shortcutStatus = error.localizedDescription
+    }
     if !config.retainHistory {
       history = []
       historyRevision += 1
@@ -233,18 +262,20 @@ import SwiftUI
         }
         do {
           try await outbox?.discardAll()
-          try await outbox?.storeArchive([], revision: revision)
+          try await archive.store([], revision: revision)
         } catch { historySyncStatus = error.localizedDescription }
       }
     } else {
       Task { await outbox?.resume() }
     }
     if !config.retainAudio { try removeAudio() }
+    return shortcutIssue
   }
   func save() {
     perform {
-      try self.persistSettings()
-      self.message = "Settings saved locally. Publish a snapshot to save them in Antfly."
+      let issue = try self.persistSettings()
+      self.message =
+        "Settings saved locally." + (issue.map { " Shortcut needs attention: " + $0 } ?? "")
     }
   }
   private func perform(_ body: () throws -> Void) {
@@ -278,11 +309,13 @@ import SwiftUI
       target = InsertionTarget.capture()
       let preset = snapshot.preset(for: target?.bundleID)
       let effective = try ProcessingPlan(
-        preset: preset, model: models.first(where: { $0.id == preset.model }))
+        preset: preset, model: ModelCatalog(data: models).transcriber(preset.model))
       plan = effective
       processingNote = effective.explanation
       processingWarning = ""
-      if let error = models.first(where: { $0.id == preset.model })?.dictation?.readiness_error {
+      if let error = ModelCatalog(data: models).transcriber(preset.model)?.dictation?
+        .readiness_error
+      {
         throw DictationError.invalid("Transcriber unavailable on this server: " + error)
       }
       selected = preset
@@ -299,7 +332,7 @@ import SwiftUI
       liveFailure = nil
       preview = ""
       result = ""
-      retryAudio = nil
+      retryRecording = nil
       message = "Recording · \(preset.name) · \(snapshot.server)"
       timeoutTask = Task { [weak self] in
         try? await Task.sleep(for: .seconds(600))
@@ -336,16 +369,11 @@ import SwiftUI
             }
           } catch {
             guard let self, generation == run, !Task.isCancelled else { return }
-            liveFailure = error.localizedDescription
-            if let live { await live.cancel() }
-            live = nil
-            processingNote =
-              preset.processingStrategy != .incremental
-              ? "Live processing failed. The recorded clip will use the same transcriber on release."
-              : "Incremental processing failed. Your recording remains available for retry."
-            processingWarning = processingNote
-            message = processingNote
-            while !Task.isCancelled && state == .recording {
+            guard
+              await recoverLiveFailure(
+                error.localizedDescription, pipeline: live, run: run, preset: preset)
+            else { return }
+            while !Task.isCancelled && generation == run && state == .recording {
               try? await Task.sleep(for: .milliseconds(750))
               _ = try? buffer.drain()
             }
@@ -393,45 +421,76 @@ import SwiftUI
       message = error.localizedDescription
     }
   }
+  /// The old pipeline can take time to close its network session. Never let its
+  /// continuation mutate a later recording after that suspension.
+  func recoverLiveFailure(_ detail: String, pipeline: LiveDictation?, run: UUID, preset: Preset)
+    async -> Bool
+  {
+    guard generation == run, !Task.isCancelled else { return false }
+    await pipeline?.cancel()
+    guard generation == run, !Task.isCancelled else { return false }
+    liveFailure = detail
+    live = nil
+    processingNote =
+      preset.processingStrategy != .incremental
+      ? "Live processing failed. The recorded clip will use the same transcriber on release."
+      : "Incremental processing failed. Your recording remains available for retry."
+    processingWarning = processingNote
+    message = processingNote
+    return true
+  }
   func finish() {
     guard state == .recording, let mic = microphone, let preset = selected,
       let snapshot = recordingConfig
     else { return }
+    let releasedAt = ProcessInfo.processInfo.systemUptime
     mic.stop()
     cadenceTask?.cancel()
     microphone = nil
     if plan?.session != true { previewTask?.cancel() }
     timeoutTask?.cancel()
     do {
-      let audio = try mic.wav()
-      guard audio.count > 44 else {
+      let recording = try mic.recording()
+      guard !recording.samples.isEmpty else {
         throw DictationError.invalid("No microphone audio was captured.")
       }
-      retryAudio = audio
+      retryRecording = recording
       retryPreset = preset
-      if snapshot.retainAudio {
-        try write(audio, to: directory.appendingPathComponent("last-recording.wav"))
-      }
-      if plan?.session == true {
-        let pump = previewTask
-        let run = generation
-        runSubmission(preset: preset, snapshot: snapshot, destination: target) { [self] in
-          await pump?.value
+      let pump = plan?.session == true ? previewTask : nil
+      let usesSession = plan?.session == true
+      let run = generation
+      runSubmission(preset: preset, snapshot: snapshot, destination: target, releasedAt: releasedAt)
+      { [self] in
+        // Successful sessions need only the final PCM tail, never a full WAV copy.
+        var audio: Data?
+        if snapshot.retainAudio {
+          audio = try await recording.encoded()
           try Task.checkCancellation()
-          guard self.generation == run else { throw CancellationError() }
-          if let pipeline = self.live {
-            return try await pipeline.finish(mic.buffer.drain())
+          guard generation == run else { throw CancellationError() }
+          let file = directory.appendingPathComponent("last-recording.wav")
+          let candidate = try await RecordingArchive.stage(audio!, in: directory)
+          defer { try? FileManager.default.removeItem(at: candidate) }
+          try Task.checkCancellation()
+          guard generation == run else { throw CancellationError() }
+          if FileManager.default.fileExists(atPath: file.path) {
+            _ = try FileManager.default.replaceItemAt(file, withItemAt: candidate)
+          } else {
+            try FileManager.default.moveItem(at: candidate, to: file)
           }
-          guard preset.processingStrategy != .incremental else {
-            throw DictationError.invalid(self.liveFailure ?? "Incremental processing failed.")
-          }
-          let connection = try self.client(snapshot)
-          return try await connection.dictate(
-            audio: audio, preset: preset, dictionary: snapshot.dictionary,
-            events: { [weak self] in await self?.receive($0, run: run) }, progress: { _ in })
         }
-      } else {
-        submit(audio: audio, preset: preset, snapshot: snapshot, destination: target)
+        await pump?.value
+        try Task.checkCancellation()
+        guard generation == run else { throw CancellationError() }
+        if usesSession, let pipeline = live { return try await pipeline.finish(mic.buffer.drain()) }
+        if usesSession && preset.processingStrategy == .incremental {
+          throw DictationError.invalid(liveFailure ?? "Incremental processing failed.")
+        }
+        if audio == nil { audio = try await recording.encoded() }
+        try Task.checkCancellation()
+        guard generation == run else { throw CancellationError() }
+        return try await client(snapshot).dictate(
+          audio: audio!, preset: preset, dictionary: snapshot.dictionary,
+          events: { [weak self] in await self?.receive($0, run: run) }, progress: { _ in })
       }
     } catch {
       previewTask?.cancel()
@@ -454,16 +513,19 @@ import SwiftUI
   }
   private func runSubmission(
     preset: Preset, snapshot: Configuration, destination: InsertionTarget?,
+    releasedAt: TimeInterval? = nil,
     operation: @escaping @MainActor () async throws -> DictationResult
   ) {
     state = .processing
+    result = ""
+    canRecoverRaw = false
     phase = .transcribing
     message = phase.label
     let run = generation
     requestTask = Task { [weak self] in
       guard let self else { return }
       do {
-        let released = ProcessInfo.processInfo.systemUptime
+        let released = releasedAt ?? ProcessInfo.processInfo.systemUptime
         var output = try await operation()
         if output.timing == nil { output.timing = DictationTiming() }
         output.timing?.afterRelease = ProcessInfo.processInfo.systemUptime - released
@@ -481,9 +543,11 @@ import SwiftUI
           if let destination {
             do {
               try await destination.paste(output.text)
+              guard generation == run, !Task.isCancelled else { return }
               status = "paste_sent"
               message = "Paste sent. Transcript remains available to copy."
             } catch {
+              guard generation == run, !Task.isCancelled else { return }
               status = "insertion_failed"
               message = error.localizedDescription
             }
@@ -504,7 +568,7 @@ import SwiftUI
           await recordHistory(entry, snapshot: snapshot)
         }
         guard generation == run else { return }
-        if !snapshot.retainAudio { retryAudio = nil }
+        if !snapshot.retainAudio { retryRecording = nil }
         state = .idle
         phase =
           output.raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .noSpeech : .ready
@@ -518,7 +582,7 @@ import SwiftUI
         if let failure = error as? DictationError, let original = failure.rawTranscript {
           preview = original
           canRecoverRaw = !original.isEmpty
-          if !snapshot.retainAudio { retryAudio = nil }
+          if !snapshot.retainAudio { retryRecording = nil }
         }
         let transcriptionFailed = result.isEmpty
         if snapshot.retainHistory && transcriptionFailed {
@@ -605,27 +669,39 @@ import SwiftUI
       message = phase.label
     } catch { message = error.localizedDescription }
   }
-  func refreshModels() {
-    let snapshot = config
-    Task { [weak self] in
+  func refreshModels() { scheduleDiscovery(debounce: false, loadCredentials: false) }
+  private func scheduleDiscovery(debounce: Bool, loadCredentials: Bool) {
+    discoveryTask?.cancel()
+    discoveryGeneration = UUID()
+    let revision = discoveryGeneration
+    var snapshot = config
+    snapshot.server = snapshot.server.trimmingCharacters(in: .whitespacesAndNewlines)
+    discoveryTask = Task { [weak self] in
       do {
-        guard let self else { return }
-        let data = try await client(snapshot).models()
+        if debounce { try await Task.sleep(for: .milliseconds(350)) }
+        try Task.checkCancellation()
+        guard let self, discoveryGeneration == revision else { return }
+        _ = try snapshot.validated()
+        if loadCredentials && token.isEmpty { token = credentialReader(snapshot.server) }
+        let data = try await client(snapshot, token: token).models()
+        try Task.checkCancellation()
         let catalog = try JSONDecoder().decode(ModelCatalog.self, from: Data(data.utf8))
-        guard config.server == snapshot.server else { return }
+        guard discoveryGeneration == revision else { return }
         models = catalog.data
       } catch { /* Explicit Discover models surfaces connection/readiness errors. */  }
     }
   }
   func connectionChanged() {
     models = []
-    token = Credentials.read(server: config.server)
-    refreshModels()
+    token = ""
+    scheduleDiscovery(debounce: true, loadCredentials: true)
   }
   func processingDescription(_ preset: Preset) -> String {
     do {
-      return try ProcessingPlan(preset: preset, model: models.first { $0.id == preset.model })
-        .explanation
+      return try ProcessingPlan(
+        preset: preset, model: ModelCatalog(data: models).transcriber(preset.model)
+      )
+      .explanation
     } catch { return error.localizedDescription }
   }
   func cancel() {
@@ -652,11 +728,12 @@ import SwiftUI
     microphone?.stop()
     microphone = nil
     state = .idle
-    retryAudio = nil
+    retryRecording = nil
     message = "Canceled remaining work."
   }
   func retry() {
-    guard state == .idle, !working, let audio = retryAudio, let original = retryPreset else {
+    guard state == .idle, !working, let recording = retryRecording, let original = retryPreset
+    else {
       message = "No failed recording retained in memory."
       return
     }
@@ -667,7 +744,15 @@ import SwiftUI
       generation = UUID()
       // Use corrected settings, but never reuse a stale insertion target.
       settings.autoPaste = false
-      submit(audio: audio, preset: preset, snapshot: settings, destination: nil)
+      let run = generation
+      runSubmission(preset: preset, snapshot: settings, destination: nil) { [self] in
+        let audio = try await recording.encoded()
+        try Task.checkCancellation()
+        guard generation == run else { throw CancellationError() }
+        return try await client(settings).dictate(
+          audio: audio, preset: preset, dictionary: settings.dictionary,
+          events: { [weak self] in await self?.receive($0, run: run) }, progress: { _ in })
+      }
     } catch { message = error.localizedDescription }
   }
   func copy(_ text: String) {
@@ -687,8 +772,10 @@ import SwiftUI
     }
   }
   func discover() {
+    discoveryTask?.cancel()
+    discoveryGeneration = UUID()
     run {
-      self.discovery = try await self.client().models()
+      self.discovery = try await self.client(token: self.token).models()
       self.models = try JSONDecoder().decode(ModelCatalog.self, from: Data(self.discovery.utf8))
         .data
       self.message =
@@ -703,7 +790,7 @@ import SwiftUI
   }
   func publish() {
     run {
-      try self.persistSettings()
+      _ = try self.persistSettings()
       try await self.client().saveSettings(self.config)
       self.message = "Settings snapshot published to Antfly."
     }
@@ -718,8 +805,8 @@ import SwiftUI
       incoming.table = current.table
       incoming.profile = current.profile
       self.config = incoming
-      self.token = Credentials.read(server: incoming.server)
-      try self.persistSettings()
+      self.token = self.credentialReader(incoming.server)
+      _ = try self.persistSettings()
       self.message = "Settings replaced from Antfly."
     }
   }
@@ -731,20 +818,23 @@ import SwiftUI
   /// Enqueue waits for durable local persistence only, never for the remote upload.
   func recordHistory(_ entry: HistoryEntry, snapshot: Configuration) async {
     guard config.retainHistory else { return }
+    var entry = entry
+    entry.destination =
+      entry.destination ?? HistoryDestination(server: snapshot.server, table: snapshot.table)
     history.insert(entry, at: 0)
     history = Array(history.prefix(500))
     historyRevision += 1
     let revision = historyRevision
     let archive = history
-    guard let outbox else {
-      historySyncStatus = "History sync unavailable; transcript remains in this session."
-      return
-    }
     do {
-      try await outbox.storeArchive(archive, revision: revision)
+      try await self.archive.store(archive, revision: revision)
+      guard let outbox else {
+        historySyncStatus = "Transcript saved locally; history sync unavailable."
+        return
+      }
       guard config.retainHistory else { return }
       try await outbox.enqueue(
-        entry, destination: HistoryDestination(server: snapshot.server, table: snapshot.table))
+        entry, destination: entry.destination!)
     } catch { historySyncStatus = "Local history / sync error: " + error.localizedDescription }
   }
   private func runHistory(_ action: @escaping @MainActor () async throws -> Void) {
@@ -770,36 +860,82 @@ import SwiftUI
       }
       for entry in self.history {
         try await outbox.enqueue(
-          entry, destination: HistoryDestination(server: snapshot.server, table: snapshot.table))
+          entry,
+          destination: entry.destination
+            ?? HistoryDestination(server: snapshot.server, table: snapshot.table))
       }
       await outbox.resume()
     }
   }
   func clearHistory() {
-    runHistory {
-      let snapshot = try self.config.validated()
-      let ids = Set(self.history.map(\.id))
-      let pauseToken = await self.outbox?.pause()
-      do {
-        try await self.client(snapshot).deleteHistory(ids: Array(ids), table: snapshot.table)
-        try await self.outbox?.discard(
-          ids: ids, destination: HistoryDestination(server: snapshot.server, table: snapshot.table))
-        self.history.removeAll { ids.contains($0.id) }
-        self.historyRevision += 1
-        try await self.outbox?.storeArchive(self.history, revision: self.historyRevision)
-        if let pauseToken { await self.outbox?.resume(pauseToken) }
-      } catch {
-        if let pauseToken { await self.outbox?.resume(pauseToken) }
-        throw error
+    runHistory { try await self.deleteRetainedHistory() }
+  }
+  /// Stop uploads before reading queue destinations. Cancel every matching job
+  /// before issuing remote deletes, so a partial failure or restart cannot
+  /// implicitly upload a transcript that the user asked to delete.
+  func deleteRetainedHistory() async throws {
+    let snapshot = try config.validated()
+    let entries = history
+    let ids = Set(entries.map(\.id))
+    guard !ids.isEmpty else { return }
+    let pauseToken = await outbox?.pause()
+    do {
+      let pending = await outbox?.destinations(for: ids) ?? [:]
+      var groups: [HistoryDestination: Set<String>] = [:]
+      for entry in entries {
+        var destinations = pending[entry.id] ?? []
+        if let original = entry.destination { destinations.insert(original) }
+        if destinations.isEmpty {
+          // Legacy archives have no recoverable destination once an upload has
+          // completed. Bind these once to the configuration that loaded them.
+          destinations.insert(HistoryDestination(server: snapshot.server, table: snapshot.table))
+        }
+        for destination in destinations { groups[destination, default: []].insert(entry.id) }
+      }
+      try await outbox?.discard(ids: ids)
+      for (destination, matching) in groups {
+        var connection = snapshot
+        connection.server = destination.server
+        connection.table = destination.table
+        try await client(connection).deleteHistory(
+          ids: Array(matching).sorted(), table: destination.table)
+      }
+      history.removeAll { ids.contains($0.id) }
+      historyRevision += 1
+      try await archive.store(history, revision: historyRevision)
+      if let pauseToken { await outbox?.resume(pauseToken) }
+      historySyncStatus = "Matching history deleted from its original destinations."
+    } catch {
+      if let pauseToken { await outbox?.resume(pauseToken) }
+      throw error
+    }
+  }
+  private func restoreHistoryDestinations(legacyDestination: HistoryDestination) async {
+    let pending = await outbox?.destinations(for: Set(history.map(\.id))) ?? [:]
+    guard config.retainHistory else { return }
+    var migrated = false
+    for index in history.indices where history[index].destination == nil {
+      history[index].destination =
+        pending[history[index].id]?.sorted {
+          ($0.server, $0.table) < ($1.server, $1.table)
+        }.first ?? legacyDestination
+      migrated = true
+    }
+    if migrated {
+      historyRevision += 1
+      do { try await archive.store(history, revision: historyRevision) } catch {
+        historySyncStatus = "Could not migrate history destinations: " + error.localizedDescription
       }
     }
+    guard config.retainHistory else { return }
+    await outbox?.resume()
   }
   func clearLocalHistory() {
     history = []
     historyRevision += 1
     let revision = historyRevision
     Task {
-      do { try await outbox?.storeArchive([], revision: revision) } catch {
+      do { try await archive.store([], revision: revision) } catch {
         historySyncStatus = error.localizedDescription
       }
     }
@@ -825,8 +961,8 @@ import SwiftUI
       perform {
         let imported = try Configuration.decode(Data(contentsOf: url))
         self.config = imported
-        self.token = Credentials.read(server: imported.server)
-        try self.persistSettings()
+        self.token = self.credentialReader(imported.server)
+        _ = try self.persistSettings()
         self.message = "Settings imported."
       }
     }

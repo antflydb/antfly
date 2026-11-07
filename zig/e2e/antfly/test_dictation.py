@@ -79,6 +79,14 @@ def test_named_dictation_cleanup_and_streaming(tmp_path, provider):
         def log_message(self, *_args):
             pass
 
+        def do_GET(self):
+            if self.path.endswith("/models"):
+                self.reply(
+                    {"object": "list", "data": [{"id": "whisper-1", "object": "model"}]}
+                )
+            else:
+                self.send_error(404)
+
         def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"]))
             if self.path.endswith("/dictate"):
@@ -183,6 +191,19 @@ def test_named_dictation_cleanup_and_streaming(tmp_path, provider):
                         "inference": {"admission": {"max_concurrent_requests": 1}}
                     },
                     "transcribers": {"speech": transcriber},
+                    "connections": {
+                        "hosted-speech": {
+                            "kind": "inference",
+                            "capabilities": ["models.transcribe"],
+                            "inference": {
+                                "provider": "openai",
+                                "url": base + "/v1",
+                                "api_key": "fixture",
+                            },
+                        }
+                    }
+                    if provider == "openai"
+                    else {},
                     "generators": {
                         **(
                             {"native-cleanup": {"provider": "apple", "max_tokens": 256}}
@@ -246,6 +267,26 @@ def test_named_dictation_cleanup_and_streaming(tmp_path, provider):
         assert "Antfly" in prompt and "Slack" in prompt and "Keep it brief" in prompt
         if provider == "antfly":
             assert state["recognition"][-1]["dictionary"] == ["Antfly"]
+
+        if provider == "openai":
+            hosted = next(
+                item
+                for item in catalog.json()["data"]
+                if item["id"] == "connections/hosted-speech/models/whisper-1"
+            )
+            assert hosted["dictation"]["text_cleanup"] is True
+            assert hosted["dictation"]["stable_segments"] is False
+            hosted_result = requests.post(
+                server.url + "/ai/v1/dictate",
+                data=frame(
+                    {**request, "model": hosted["id"], "audio": "attachment:0"}, audio
+                ),
+                headers={"Content-Type": "application/vnd.antfly.attachments.v1"},
+                timeout=40,
+            )
+            assert hosted_result.status_code == 200, hosted_result.text
+            assert hosted_result.json()["text"] == "Antfly."
+            assert hosted_result.json()["transcript"]["text"] == expected_raw
 
         # Final session segments reuse shared cleanup without recognizing audio again.
         recognized_before = len(state["recognition"])

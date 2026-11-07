@@ -37,19 +37,23 @@ public actor HistoryOutbox {
   private var holds: Set<UUID> = []
   private var paused: Bool { !enabled || !holds.isEmpty }
   private var lastError: String?
-  private var archiveRevision: UInt64 = 0
+  private let archive: HistoryArchive
   private var idleWaiters: [CheckedContinuation<Void, Never>] = []
   private let maxJobs = 500
   private let maxBytes = 64 * 1024 * 1024
 
   public init(
-    directory: URL, paused: Bool = false, upload: @escaping Upload,
+    directory: URL, paused: Bool = false, archive: HistoryArchive? = nil, upload: @escaping Upload,
     sleep: @escaping @Sendable (UInt64) async throws -> Void = {
       try await Task.sleep(nanoseconds: $0)
     },
     changed: @escaping @Sendable (Status) async -> Void = { _ in }
   ) throws {
     self.directory = directory
+    self.archive =
+      archive
+      ?? HistoryArchive(
+        file: directory.deletingLastPathComponent().appendingPathComponent("history.json"))
     self.upload = upload
     self.sleep = sleep
     self.changed = changed
@@ -90,6 +94,15 @@ public actor HistoryOutbox {
     jobSizes = sizes
   }
   public func status() -> Status { Status(pending: jobs.count, error: lastError) }
+  /// Pending jobs are authoritative for archives created before destinations
+  /// were stored with entries. A transcript may have more than one queued copy.
+  public func destinations(for ids: Set<String>) -> [String: Set<HistoryDestination>] {
+    var result: [String: Set<HistoryDestination>] = [:]
+    for job in jobs where ids.contains(job.entry.id) {
+      result[job.entry.id, default: []].insert(job.destination)
+    }
+    return result
+  }
   public func enqueue(_ entry: HistoryEntry, destination: HistoryDestination) async throws {
     var config = Configuration()
     config.server = destination.server
@@ -165,13 +178,8 @@ public actor HistoryOutbox {
     try await discard(ids: Set(jobs.map { $0.entry.id }))
   }
   /// Revision fencing keeps a delayed write from resurrecting locally cleared history.
-  public func storeArchive(_ entries: [HistoryEntry], revision: UInt64) throws {
-    guard revision >= archiveRevision else { return }
-    let file = directory.deletingLastPathComponent().appendingPathComponent("history.json")
-    let data = try JSONEncoder().encode(entries)
-    try data.write(to: file, options: .atomic)
-    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
-    archiveRevision = revision
+  public func storeArchive(_ entries: [HistoryEntry], revision: UInt64) async throws {
+    try await archive.store(entries, revision: revision)
   }
   public func waitUntilIdle() async {
     if jobs.isEmpty && worker == nil { return }

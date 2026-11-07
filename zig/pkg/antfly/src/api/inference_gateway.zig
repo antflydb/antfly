@@ -1657,6 +1657,25 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
                     var tasks_list = std.array_list.Managed(Json).init(a);
                     try tasks_list.append(.{ .string = @tagName(task) });
                     try item.object.put(a, "tasks", .{ .array = tasks_list });
+                    if (task == .transcribe) {
+                        if (server.cfg.node_config) |config| if (config.connections.get(id)) |configured| {
+                            if (configured.inference) |settings| {
+                                // Hosted connections use gateway orchestration;
+                                // Antfly connections forward to a runtime whose
+                                // cleanup model contract is independent.
+                                const hosted = !std.mem.eql(u8, settings.provider, "antfly");
+                                try item.object.put(a, "dictation", try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, .{
+                                    .recorded_clips = true,
+                                    .cleanup = true,
+                                    .live_preview = false,
+                                    .stable_segments = false,
+                                    .text_cleanup = hosted,
+                                    .recognition_hints = false,
+                                    .executor = settings.provider,
+                                }, .{}), .{}));
+                            }
+                        };
+                    }
                 }
                 try item.object.put(a, "availability", connection.object.get("status") orelse .{ .string = "unknown" });
                 try item.object.put(a, "freshness", listed.object.get("freshness") orelse .{ .string = "cached" });

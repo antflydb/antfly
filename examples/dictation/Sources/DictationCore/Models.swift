@@ -3,6 +3,8 @@
 
 import Foundation
 
+public enum TranscriberRoute: String, Codable, Sendable { case gateway, runtime }
+
 public enum DictationError: Error, LocalizedError {
   case invalid(String)
   public var errorDescription: String? {
@@ -31,6 +33,7 @@ public struct Preset: Codable, Identifiable, Equatable, Sendable {
   public var mode: DictationMode?
   public var processing: ProcessingStrategy?
   public var livePreview: Bool
+  public var transcriberRoute: TranscriberRoute?
   public init(id: String, name: String, style: String = "clean", context: String = "") {
     self.id = id
     self.name = name
@@ -49,13 +52,20 @@ public struct Preset: Codable, Identifiable, Equatable, Sendable {
 extension Preset {
   /// Shared cleanup is a gateway feature of named transcribers. Runtime model
   /// requests retain their existing raw-model cleanup contract.
-  public var usesNamedTranscriber: Bool { model.hasPrefix("transcribers/") || !model.contains("/") }
+  public var usesNamedTranscriber: Bool {
+    if let transcriberRoute { return transcriberRoute == .gateway }
+    return model.hasPrefix("transcribers/") || model.hasPrefix("connections/")
+      || !model.contains("/")
+  }
   public func cleanupChoices(from catalog: [DiscoveredModel]) -> [DiscoveredModel] {
     usesNamedTranscriber
       ? catalog.filter { $0.task == "generate" && $0.id.hasPrefix("generators/") } : []
   }
   public mutating func selectTranscriber(_ selection: DiscoveredModel) {
     model = selection.id
+    transcriberRoute =
+      selection.dictation?.text_cleanup == true || model.hasPrefix("transcribers/")
+      ? .gateway : .runtime
     if selection.dictation?.live_preview == false { livePreview = false }
     if !usesNamedTranscriber && cleanupModel.hasPrefix("generators/") { cleanupModel = "" }
   }
@@ -182,8 +192,11 @@ public struct HistoryEntry: Codable, Identifiable, Equatable, Sendable {
   public var raw: String
   public var text: String
   public var status: String
+  /// Absent only for archives written before destinations were retained.
+  public var destination: HistoryDestination?
   public init(
-    preset: String, model: String, application: String, raw: String, text: String, status: String
+    preset: String, model: String, application: String, raw: String, text: String, status: String,
+    destination: HistoryDestination? = nil
   ) {
     self.preset = preset
     self.model = model
@@ -191,6 +204,7 @@ public struct HistoryEntry: Codable, Identifiable, Equatable, Sendable {
     self.raw = raw
     self.text = text
     self.status = status
+    self.destination = destination
   }
 }
 
@@ -240,4 +254,8 @@ public struct DiscoveredModel: Decodable, Identifiable, Sendable {
 }
 public struct ModelCatalog: Decodable, Sendable {
   public var data: [DiscoveredModel]
+  public init(data: [DiscoveredModel]) { self.data = data }
+  public func transcriber(_ identifier: String) -> DiscoveredModel? {
+    data.first { $0.id == identifier || $0.id == "transcribers/" + identifier }
+  }
 }

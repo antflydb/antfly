@@ -11,13 +11,14 @@ public actor AntflyClient {
   public init(
     server: String, token: String = "", session: URLSession? = nil, maxConcurrentRequests: Int = 1
   ) throws {
-    guard (1...2).contains(maxConcurrentRequests) else {
-      throw DictationError.invalid("Choose one or two concurrent inference requests.")
-    }
-    inferenceGate = InferenceGate(capacity: maxConcurrentRequests)
     var config = Configuration()
     config.server = server
-    config = try config.validated()
+    config.concurrentRequests = maxConcurrentRequests
+    try self.init(configuration: config, token: token, session: session)
+  }
+  public init(configuration: Configuration, token: String = "", session: URLSession? = nil) throws {
+    let config = try configuration.validated()
+    inferenceGate = InferenceGate(capacity: config.concurrentRequests ?? 1)
     origin = URL(string: config.server)!
     self.token = token
     let settings = URLSessionConfiguration.ephemeral
@@ -40,8 +41,7 @@ public actor AntflyClient {
     try Task.checkCancellation()
     guard let http = response as? HTTPURLResponse, allowed.contains(http.statusCode) else {
       let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-      throw DictationError.invalid(
-        "Antfly HTTP \(code): \(String(decoding: data.prefix(2048), as: UTF8.self))")
+      throw ServerFailure(response: response, status: code, body: data)
     }
     return data
   }
@@ -116,9 +116,14 @@ public actor AntflyClient {
     do {
       let (bytes, response) = try await session.bytes(for: upload)
       guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-        throw DictationError.invalid(
-          "Dictation request failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)). Check model readiness and connection."
-        )
+        var body = Data()
+        for try await byte in bytes {
+          try Task.checkCancellation()
+          body.append(byte)
+          if body.count >= ServerFailure.maxBodyBytes { break }
+        }
+        bytes.task.cancel()
+        throw ServerFailure(response: response, body: body)
       }
       guard http.value(forHTTPHeaderField: "Content-Type")?.contains("text/event-stream") == true
       else {
@@ -226,8 +231,7 @@ public actor AntflyClient {
       upload.setValue(AttachmentEnvelope.contentType, forHTTPHeaderField: "Content-Type")
       let (bytes, response) = try await session.data(for: upload)
       guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-        throw DictationError.invalid(
-          "Transcription append failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)).")
+        throw ServerFailure(response: response, body: bytes)
       }
       data = bytes
     }

@@ -19,7 +19,7 @@ cd "$(dirname "$0")"
 mkdir -p .build/clang .build/cache .build/modules
 export CLANG_MODULE_CACHE_PATH="$PWD/.build/clang"
 swift build -c release --cache-path "$PWD/.build/cache" -Xswiftc -module-cache-path -Xswiftc "$PWD/.build/modules"
-app="$PWD/dist/Antfly Dictation.app"
+app="${APP_OUTPUT_DIR:-$PWD/dist}/Antfly Dictation.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 # SwiftPM's native and Xcode build engines have different product layouts.
 bin_dir="$(swift build -c release --show-bin-path --cache-path "$PWD/.build/cache")"

@@ -373,3 +373,15 @@ Then prompt it with the outcome, for example "Add push-to-talk dictation to my E
 - [Local Model Compatibility](/docs/guides/supported-models) to pick a larger Whisper checkpoint or a different cleanup generator.
 - [Index Recorded Calls and Podcasts](/docs/guides/transcription) to transcribe recordings at write time and search them with timestamps.
 - [Multimodal Search](/docs/guides/multimodal) to index the transcripts you collect so they are searchable next to everything else.
+
+The desktop app saves connection and preset settings even when shortcut permission
+is pending; shortcut activation has its own visible status. Discovery requests are
+debounced and superseded requests are canceled. The parallel-processing setting
+controls actual client admission (one or two inference requests), and HTTP failures
+include bounded server diagnostics. Discovered hosted transcribers support shared
+named cleanup, while runtime connections keep their raw-model contract.
+
+Retained history records its original server and table. Deletion cancels matching
+queued uploads across all destinations before remote deletion; remote failures keep
+local entries available for retry. Successful live sessions avoid full-clip WAV
+encoding, and clip encoding runs off the UI actor with cancellation support.

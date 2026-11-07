@@ -208,7 +208,14 @@ struct SettingsView: View {
               Text(
                 "Automatic uses only advertised capabilities. Incremental requires final recognition segments; Rewrite needs the complete utterance. The selected engine never changes automatically."
               ).font(.caption)
-              TextField("Transcriber model or alias", text: $preset.model)
+              TextField(
+                "Transcriber model or alias",
+                text: Binding(
+                  get: { preset.model },
+                  set: {
+                    preset.model = $0
+                    preset.transcriberRoute = nil
+                  }))
               Menu("Choose discovered transcriber") {
                 ForEach(store.models.filter { $0.task == "transcribe" }) { model in
                   Button("\(model.id) · \(model.executor ?? "runtime")") {

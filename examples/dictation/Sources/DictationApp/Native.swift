@@ -44,13 +44,23 @@ import Security
   }
 }
 
-@MainActor final class Hotkey {
+@MainActor protocol ShortcutManaging: AnyObject {
+  var changed: ((Bool) -> Void)? { get set }
+  var interrupted: (() -> Void)? { get set }
+  var isAvailable: Bool { get }
+  func register(_ shortcut: KeyboardShortcut) throws
+  func unregister()
+  func setSuspended(_ value: Bool)
+}
+
+@MainActor final class Hotkey: ShortcutManaging {
   private let resources = HotkeyResources()
   var changed: ((Bool) -> Void)?
   var interrupted: (() -> Void)?
   private var suspended = false
   private var pressed = false
   private var bindingVersion = UUID()
+  private var binding: KeyboardShortcut?
   private func receive(_ down: Bool) {
     guard !suspended, down != pressed else { return }
     pressed = down
@@ -75,6 +85,7 @@ import Security
       }, events.count, &events, Unmanaged.passUnretained(self).toOpaque(), &resources.handler)
   }
   func unregister() {
+    binding = nil
     bindingVersion = UUID()
     pressed = false
     if let reference = resources.reference {
@@ -97,6 +108,7 @@ import Security
   }
   func register(_ requested: KeyboardShortcut) throws {
     let shortcut = try requested.validated()
+    guard binding != shortcut || !isAvailable else { return }
     let version = UUID()
     if shortcut.usesEventTap {
       let next = try GlobalShortcutTap(shortcut: shortcut) { [weak self] action in
@@ -134,6 +146,7 @@ import Security
       resources.tap = nil
     }
     bindingVersion = version
+    binding = shortcut
     pressed = false
   }
 }
@@ -145,6 +158,7 @@ final class SpeechAudioBuffer: @unchecked Sendable {
   private var recording = Data()
   private var pending = Data()
   private var overflow = false
+  private var previewOverflow = false
   private var failure: String?
   func fail(_ message: String) {
     lock.lock()
@@ -167,7 +181,11 @@ final class SpeechAudioBuffer: @unchecked Sendable {
       return
     }
     recording.append(data)
-    if pending.count < 8 * 1024 * 1024 { pending.append(data) } else { overflow = true }
+    if pending.count + data.count <= 8 * 1024 * 1024 {
+      pending.append(data)
+    } else {
+      previewOverflow = true
+    }
   }
   func drain() throws -> Data {
     lock.lock()
@@ -176,6 +194,13 @@ final class SpeechAudioBuffer: @unchecked Sendable {
     guard !overflow else {
       throw DictationError.invalid(
         "Recording or live preview exceeded its buffer limit. Stop and retry a shorter recording.")
+    }
+    if previewOverflow {
+      previewOverflow = false
+      pending.removeAll(keepingCapacity: true)
+      throw DictationError.invalid(
+        "Live audio processing fell behind. The complete recording remains available for clip processing."
+      )
     }
     let result = pending
     pending.removeAll(keepingCapacity: true)
@@ -318,41 +343,11 @@ final class CaptureConverter: @unchecked Sendable {
     conversion?.finish()
     conversion = nil
   }
-  func wav() throws -> Data {
-    let samples = try buffer.all()
-    var data = Data()
-    func ascii(_ text: String) { data.append(contentsOf: text.utf8) }
-    func u16(_ value: UInt16) {
-      var v = value.littleEndian
-      withUnsafeBytes(of: &v) { data.append(contentsOf: $0) }
-    }
-    func u32(_ value: UInt32) {
-      var v = value.littleEndian
-      withUnsafeBytes(of: &v) { data.append(contentsOf: $0) }
-    }
-    var pcm = Data(capacity: samples.count / 2)
-    samples.withUnsafeBytes { raw in
-      for value in raw.bindMemory(to: Float.self) {
-        let bounded = value.isFinite ? max(-1, min(1, value)) : 0
-        var encoded = Int16((bounded * 32767).rounded()).littleEndian
-        withUnsafeBytes(of: &encoded) { pcm.append(contentsOf: $0) }
-      }
-    }
-    ascii("RIFF")
-    u32(UInt32(pcm.count + 36))
-    ascii("WAVEfmt ")
-    u32(16)
-    u16(1)
-    u16(1)
-    u32(UInt32(sampleRate))
-    u32(UInt32(sampleRate) * 2)
-    u16(2)
-    u16(16)
-    ascii("data")
-    u32(UInt32(pcm.count))
-    data.append(pcm)
-    return data
+  func recording() throws -> PCMRecording {
+    PCMRecording(samples: try buffer.all(), sampleRate: sampleRate)
   }
+  func wav() throws -> Data { try recording().wav() }
+
 }
 
 @MainActor struct InsertionTarget {
