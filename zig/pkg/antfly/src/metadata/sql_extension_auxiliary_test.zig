@@ -111,8 +111,8 @@ test "SQL extension standalone auxiliary registry owns actual native creation co
             const incarnation = "01010101010101010101010101010101".*;
             try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
             try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, protocol.Activation{ .version = protocol.current_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
-            try std.testing.expectEqual(@as(u64, 0), try store.standaloneRevision());
-            try store.replaceStandaloneCatalog(group, 0, &.{}, &.{}, aux);
+            const bootstrap_revision = try store.standaloneRevision();
+            try store.replaceStandaloneCatalog(group, bootstrap_revision, &.{}, &.{}, aux);
             const before = try snapshot(&store, a);
             try std.testing.expect(before.installed == null);
             try std.testing.expectEqual(@as(usize, 2), before.packages.len);

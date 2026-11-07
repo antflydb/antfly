@@ -46,6 +46,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL extension native package controls preserve explicit defaults and retained promotions across cold backup",
         "SQL extension standalone auxiliary registry owns actual native creation comments and cold membership",
         "SQL extension promotion observations distinguish evicted outcomes from losing CAS",
+        "SQL extension operator controls remain outside immutable package artifacts",
+        "standalone metadata released JSON replay verifies imported ranges and preserves auxiliary state",
+        "SQL extension auxiliary presence preserves opaque records and recognizes escaped controls",
     };
     const extension_store_tests = b.addTest(.{
         .root_module = options.metadata_storage_test_mod,

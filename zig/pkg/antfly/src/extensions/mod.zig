@@ -347,42 +347,48 @@ pub fn scanPackageStoreAlloc(alloc: std.mem.Allocator, io: std.Io, root_path: []
     return try out.toOwnedSlice(alloc);
 }
 
-/// Explicit operator-owned CAS requests. Startup replay retains the old outcome.
+pub const max_sql_control_file_bytes = 1024 * 1024;
+
+/// Explicit operator requests live beside, never inside, the immutable store.
+/// Startup replay retains the old outcome; package artifacts are not commands.
 pub fn scanSqlControlPromotionsAlloc(alloc: std.mem.Allocator, io: std.Io, root_path: []const u8) ![]sql_package.Promotion {
-    var root = std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true }) catch |err| switch (err) {
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(cwd);
+    const normalized = try std.fs.path.resolveAlloc(alloc, &.{ cwd, root_path });
+    defer alloc.free(normalized);
+    const path = try std.fmt.allocPrint(alloc, "{s}.sql-controls.json", .{normalized});
+    defer alloc.free(path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_sql_control_file_bytes)) catch |err| switch (err) {
         error.FileNotFound => return &.{},
+        error.StreamTooLong => return error.SqlProgramLimitExceeded,
         else => return err,
     };
-    defer root.close(io);
-    var walker = try root.walk(alloc);
-    defer walker.deinit();
-    var requests: std.ArrayListUnmanaged(sql_package.Promotion) = .empty;
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice([]const sql_package.Promotion, alloc, bytes, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    if (parsed.value.len > sql_package.max_versions) return error.SqlProgramLimitExceeded;
+    const requests = try alloc.alloc(sql_package.Promotion, parsed.value.len);
+    var initialized: usize = 0;
     errdefer {
-        for (requests.items) |request| {
+        for (requests[0..initialized]) |request| {
             alloc.free(request.name);
             alloc.free(request.version);
         }
-        requests.deinit(alloc);
+        alloc.free(requests);
     }
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file or !std.mem.eql(u8, std.fs.path.basename(entry.path), "sql-control.json")) continue;
-        if (requests.items.len == sql_package.max_versions) return error.SqlProgramLimitExceeded;
-        const bytes = try root.readFileAlloc(io, entry.path, alloc, .limited(64 * 1024));
-        defer alloc.free(bytes);
-        var parsed = try std.json.parseFromSlice(sql_package.Promotion, alloc, bytes, .{ .allocate = .alloc_always });
-        defer parsed.deinit();
-        try parsed.value.validate();
-        for (requests.items) |prior| if (std.mem.eql(u8, prior.name, parsed.value.name)) return error.DuplicateSqlExtensionControl;
-        const name = try alloc.dupe(u8, parsed.value.name);
+    for (parsed.value, 0..) |request, i| {
+        try request.validate();
+        for (parsed.value[0..i]) |prior| if (std.mem.eql(u8, prior.name, request.name)) return error.DuplicateSqlExtensionControl;
+        const name = try alloc.dupe(u8, request.name);
         errdefer alloc.free(name);
-        const version = try alloc.dupe(u8, parsed.value.version);
+        const version = try alloc.dupe(u8, request.version);
         errdefer alloc.free(version);
-        var owned = parsed.value;
-        owned.name = name;
-        owned.version = version;
-        try requests.append(alloc, owned);
+        requests[i] = request;
+        requests[i].name = name;
+        requests[i].version = version;
+        initialized += 1;
     }
-    return requests.toOwnedSlice(alloc);
+    return requests;
 }
 pub fn freeSqlControlPromotions(alloc: std.mem.Allocator, requests: []sql_package.Promotion) void {
     for (requests) |request| {
@@ -2644,4 +2650,77 @@ test "extension lifecycle bound members retain public scope without accepting pa
         .object_name = "search",
         .table_name = "other",
     }).validate());
+}
+
+test "SQL extension operator controls remain outside immutable package artifacts" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const store = try std.fs.path.join(a, &.{ root, "extensions" });
+    defer a.free(store);
+    try tmp.dir.createDirPath(io, "extensions/opaque");
+    const manifest: PackageManifest = .{ .name = "opaque", .version = "1", .digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111", .install = .{ .scopes_supported = &.{.cluster} }, .artifacts = &.{.{ .kind = .asset, .path = "sql-control.json" }} };
+    try manifest.validate();
+    const manifest_bytes = try std.json.Stringify.valueAlloc(a, manifest, .{});
+    defer a.free(manifest_bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "extensions/opaque/extension.json", .data = manifest_bytes });
+    const ordinary_asset = "ordinary non-JSON package artifact, never operator intent";
+    try tmp.dir.writeFile(io, .{ .sub_path = "extensions/opaque/sql-control.json", .data = ordinary_asset });
+    const absent = try scanSqlControlPromotionsAlloc(a, io, store);
+    defer freeSqlControlPromotions(a, absent);
+    try std.testing.expectEqual(@as(usize, 0), absent.len);
+    const before = try scanPackageStoreAlloc(a, io, store);
+    defer freePackageStoreEntries(a, before);
+    try std.testing.expectEqual(@as(usize, 1), before.len);
+    const request: sql_package.Promotion = .{ .name = "vector", .identity = sql_package.controlIdentity("vector"), .expected_generation = 1, .version = "2", .package_digest = @splat(1), .nonce = @splat(2) };
+    const bytes = try std.json.Stringify.valueAlloc(a, [_]sql_package.Promotion{request}, .{});
+    defer a.free(bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "extensions.sql-controls.json", .data = bytes });
+    const dotted = try std.fmt.allocPrint(a, "{s}/./", .{store});
+    defer a.free(dotted);
+    const loaded = try scanSqlControlPromotionsAlloc(a, io, dotted);
+    defer freeSqlControlPromotions(a, loaded);
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualDeep(request, loaded[0]);
+    const after = try scanPackageStoreAlloc(a, io, store);
+    defer freePackageStoreEntries(a, after);
+    try std.testing.expectEqual(@as(usize, 1), after.len);
+    try std.testing.expectEqualStrings(before[0].manifest.name, after[0].manifest.name);
+    try std.testing.expectEqualStrings(before[0].manifest.artifacts[0].path, after[0].manifest.artifacts[0].path);
+    const untouched = try tmp.dir.readFileAlloc(io, "extensions/opaque/sql-control.json", a, .limited(1024));
+    defer a.free(untouched);
+    try std.testing.expectEqualStrings(ordinary_asset, untouched);
+    var package_dir = try tmp.dir.openDir(io, "extensions", .{ .iterate = true });
+    defer package_dir.close(io);
+    var walker = try package_dir.walk(a);
+    defer walker.deinit();
+    var files: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind == .directory) continue;
+        try std.testing.expect(entry.kind == .file);
+        try std.testing.expect(std.mem.eql(u8, entry.path, "opaque/extension.json") or std.mem.eql(u8, entry.path, "opaque/sql-control.json"));
+        files += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), files);
+    const duplicate = try std.json.Stringify.valueAlloc(a, [_]sql_package.Promotion{ request, request }, .{});
+    defer a.free(duplicate);
+    try tmp.dir.writeFile(io, .{ .sub_path = "extensions.sql-controls.json", .data = duplicate });
+    try std.testing.expectError(error.DuplicateSqlExtensionControl, scanSqlControlPromotionsAlloc(a, io, store));
+    const too_many: [sql_package.max_versions + 1]sql_package.Promotion = @splat(request);
+    const count_bytes = try std.json.Stringify.valueAlloc(a, too_many, .{});
+    defer a.free(count_bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "extensions.sql-controls.json", .data = count_bytes });
+    try std.testing.expectError(error.SqlProgramLimitExceeded, scanSqlControlPromotionsAlloc(a, io, store));
+    const oversized = try a.alloc(u8, max_sql_control_file_bytes + 1);
+    defer a.free(oversized);
+    @memset(oversized, ' ');
+    try tmp.dir.writeFile(io, .{ .sub_path = "extensions.sql-controls.json", .data = oversized });
+    try std.testing.expectError(error.SqlProgramLimitExceeded, scanSqlControlPromotionsAlloc(a, io, store));
+    try tmp.dir.writeFile(io, .{ .sub_path = "extensions.sql-controls.json", .data = "[]" });
+    const empty = try scanSqlControlPromotionsAlloc(a, io, store);
+    defer freeSqlControlPromotions(a, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }

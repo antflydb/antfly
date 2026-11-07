@@ -9976,9 +9976,9 @@ pub const ApiHttpServer = struct {
         if (routes.Routes.matchExtensionSqlControl(path)) |selected| {
             for (snapshot.sql_extension_controls) |control| {
                 if (std.mem.eql(u8, control.name, selected.name))
-                    return contextualJsonResponse(self.alloc, 200, control.publicProjection());
+                    return try contextualJsonResponse(self.alloc, 200, control.publicProjection());
             }
-            return contextualJsonErrorResponse(self.alloc, 404, "SQL extension control not found");
+            return try contextualJsonErrorResponse(self.alloc, 404, "SQL extension control not found");
         }
         if (routes.Routes.matchExtensionPackageVersion(path)) |package_version| {
             const package = findExtensionPackageVersion(&snapshot, package_version.name, package_version.version) orelse {

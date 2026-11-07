@@ -2254,6 +2254,27 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.sqlTriggerSnapshot(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .sql_extension_registration_preflight => |input| {
+                    handle.store.prepareExtensionPackageRegistration(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
+                .sql_extension_default_preflight => |input| {
+                    const value = handle.store.prepareSqlExtensionDefault(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_extension_control => |name| {
+                    const value = handle.store.getSqlExtensionControl(a, group_id, name) catch |err| break :blk storageOwnerStatusFromError(err);
+                    defer if (value) |control| {
+                        var owned = control;
+                        owned.deinitOwned(a);
+                    };
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_extension_controls => {
+                    const value = handle.store.listSqlExtensionControls(a, group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    defer handle.store.freeSqlExtensionControls(a, value);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .sql_extension_snapshot => |input| {
                     if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };

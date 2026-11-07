@@ -1558,6 +1558,27 @@ pub const RaftApplyStore = struct {
         alloc.free(values);
     }
 
+    pub fn prepareExtensionPackageRegistration(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, record: extension_domain.PackageManifest) !void {
+        _ = try self.catalogProjection(bool, alloc, group_id, .{ .sql_extension_registration_preflight = record });
+    }
+
+    pub fn prepareSqlExtensionDefault(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: extension_domain.sql_package.Promotion) !extension_domain.sql_package.PromotionReceipt {
+        return self.catalogProjection(extension_domain.sql_package.PromotionReceipt, alloc, group_id, .{ .sql_extension_default_preflight = request });
+    }
+
+    pub fn getSqlExtensionControl(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8) !?extension_domain.sql_package.PackageControl {
+        return self.catalogProjection(?extension_domain.sql_package.PackageControl, alloc, group_id, .{ .sql_extension_control = name });
+    }
+
+    pub fn listSqlExtensionControls(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]extension_domain.sql_package.PackageControl {
+        return self.catalogProjection([]extension_domain.sql_package.PackageControl, alloc, group_id, .sql_extension_controls);
+    }
+
+    pub fn freeSqlExtensionControls(_: *RaftApplyStore, alloc: std.mem.Allocator, values: []extension_domain.sql_package.PackageControl) void {
+        for (values) |*value| value.deinitOwned(alloc);
+        alloc.free(values);
+    }
+
     pub fn listInstalledExtensions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]extension_domain.InstalledExtension {
         return try self.projectionWithAllocator([]extension_domain.InstalledExtension, alloc, .{ .kind = .installed_extensions, .group_id = group_id });
     }
@@ -1791,6 +1812,66 @@ fn consumerTests() type {
     const implementation_only = @hasDecl(@import("antfly_source_root"), "implementation_tests_only") and @import("antfly_source_root").implementation_tests_only;
     if (!(@import("builtin").is_test and !implementation_only)) return struct {};
     const Suite = struct {
+        test "SQL extension native adapter preserves control rejection identities and owned cold receipts" {
+            const a = std.testing.allocator;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var directory = std.testing.tmpDir(.{});
+            defer directory.cleanup();
+            const root = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/extension-controls-cabi", .{directory.sub_path});
+            const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+            const Factory = struct {
+                fn package(version: []const u8, digest: []const u8) extension_domain.PackageManifest {
+                    return .{
+                        .name = "vector",
+                        .version = version,
+                        .digest = digest,
+                        .relocatable = true,
+                        .artifacts = &.{.{ .kind = .wasm, .path = "module.wasm", .digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }},
+                        .install = .{ .scopes_supported = &.{.embedded_db}, .runtimes = &.{.{ .name = "sql", .mode = .wasm, .artifact = "module.wasm" }} },
+                        .sql = .{ .default_version = "1", .exports = &.{.{ .name = "control_marker", .runtime = "sql", .export_name = "control_marker", .arguments = &.{.{ .type = .{ .scalar = .int64 } }}, .result = .{ .scalar = .int64 }, .strict = true, .volatility = .immutable }} },
+                    };
+                }
+            };
+            const one = Factory.package("1", "1111111111111111111111111111111111111111111111111111111111111111");
+            const two = Factory.package("2", "2222222222222222222222222222222222222222222222222222222222222222");
+            for ([_]bool{ false, true }) |cold| {
+                var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+                defer store.deinit();
+                if (!cold) {
+                    const incarnation = "01010101010101010101010101010101".*;
+                    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+                    try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(scratch, topology_protocol.Activation{ .version = topology_protocol.sql_extension_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+                    try store.prepareExtensionPackageRegistration(scratch, group, one);
+                    try store.applyStandaloneCommand(group, .{ .upsert_extension_package = one });
+                    try store.prepareExtensionPackageRegistration(scratch, group, two);
+                    try store.applyStandaloneCommand(group, .{ .upsert_extension_package = two });
+                }
+                var changed = one;
+                changed.digest = two.digest;
+                try std.testing.expectError(error.InvalidSqlExtensionPackageMutation, store.prepareExtensionPackageRegistration(scratch, group, changed));
+                var current = (try store.getSqlExtensionControl(a, group, "vector")).?;
+                defer current.deinitOwned(a);
+                const request: extension_domain.sql_package.Promotion = .{ .name = "vector", .identity = current.identity, .expected_generation = 1, .version = "2", .package_digest = try extension_domain.sql_package.digest(two.digest), .nonce = @splat(9) };
+                const predicted = try store.prepareSqlExtensionDefault(scratch, group, request);
+                if (!cold) try store.applyStandaloneCommand(group, .{ .promote_sql_extension_default = request });
+                var stale = request;
+                stale.nonce = @splat(10);
+                try std.testing.expectError(error.SqlExtensionControlConflict, store.prepareSqlExtensionDefault(scratch, group, stale));
+                var changed_nonce = request;
+                changed_nonce.version = "1";
+                changed_nonce.package_digest = try extension_domain.sql_package.digest(one.digest);
+                try std.testing.expectError(error.SqlExtensionPromotionNonceConflict, store.prepareSqlExtensionDefault(scratch, group, changed_nonce));
+                const controls = try store.listSqlExtensionControls(a, group);
+                defer store.freeSqlExtensionControls(a, controls);
+                try std.testing.expectEqual(@as(usize, 1), controls.len);
+                try controls[0].validate();
+                try std.testing.expectEqualStrings("2", controls[0].default_version);
+                try std.testing.expectEqualDeep(predicted, controls[0].promotions[0]);
+                try std.testing.expect((try store.getSqlExtensionControl(scratch, group, "missing")) == null);
+            }
+        }
         test "native metadata job state projections preserve CAS quotas cursors and cold ownership" {
             const a = std.testing.allocator;
             var directory = std.testing.tmpDir(.{});

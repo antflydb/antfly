@@ -1572,8 +1572,9 @@ const LocalStandaloneMetadata = struct {
     fn applyJobCommandLocked(self: *LocalStandaloneMetadata, command: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !void {
         const store = self.lifecycle_store orelse return error.UnsupportedOperation;
         try store.applyStandaloneCommand(group_ids.main_metadata_group_id, command);
-        self.epoch = @max(1, try store.standaloneRevision());
-        self.durable_revision = self.epoch;
+        const state = try store.standaloneRevisionState();
+        self.epoch = @max(1, state.projection_revision);
+        self.durable_revision = state.revision;
     }
 
     /// CDC status/progress commands (replication source status upserts,
@@ -1807,7 +1808,7 @@ const LocalStandaloneMetadata = struct {
             }
         }
         try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_restore_staging = bytes });
-        try self.reloadLifecycleProjectionLocked();
+        try self.refreshLifecycleProjectionLocked();
         if (try store.loadRestoreStaging(alloc, group_ids.main_metadata_group_id, command.value.id)) |result| {
             var loaded = result;
             defer loaded.deinit();
@@ -16410,6 +16411,82 @@ test "standalone catalog remote apply outage preserves committed creation and re
     try std.testing.expect(metadata.findTableByNameLocked("unrelated") != null);
     try std.testing.expect(metadata.findTableByNameLocked("rejected") == null);
     try std.testing.expectEqual(admitted_revision + 1, metadata.durable_revision);
+}
+
+test "standalone catalog restore receipt progress preserves routes until structural publication" {
+    const Staging = @import("../metadata/restore_staging.zig");
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", scratch);
+    const path = try std.fmt.allocPrint(scratch, "{s}/catalog.json", .{root});
+    var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer runtime.deinit();
+    var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
+    defer metadata.deinit();
+    try LocalStandaloneMetadata.createTable(&metadata, a, "serving", .{});
+    const Submit = struct {
+        fn run(m: *LocalStandaloneMetadata, alloc: std.mem.Allocator, command: Staging.Command) !Staging.Job {
+            const encoded = try std.json.Stringify.valueAlloc(alloc, command, .{});
+            const result = try LocalStandaloneMetadata.applyRestoreStaging(m, alloc, encoded, .{});
+            return std.json.parseFromSliceLeaky(Staging.Job, alloc, result, .{ .allocate = .alloc_always });
+        }
+    };
+    const table: antfly.metadata.TableRecord = .{ .table_id = 11, .name = "restored", .schema_json = "{}" };
+    const range: antfly.metadata.RangeRecord = .{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" };
+    const target: Staging.Target = .{ .source_table_id = 1, .table = table, .ranges = &.{range}, .catalog_binding = .{ .kind = .table, .id = 11, .parent_id = system_catalog.default_namespace_id, .name = "restored", .storage_name = table.name } };
+    const plan: Staging.Plan = .{ .id = @splat(7), .cohort_digest = @splat(9), .targets = &.{target} };
+    try plan.validate(scratch);
+    const digest = try plan.digest(scratch);
+    var job = try Submit.run(&metadata, scratch, .{ .id = plan.id, .action = .reserve, .plan = plan });
+    try std.testing.expectEqual(.importing, job.state);
+    try std.testing.expect(metadata.findTableByNameLocked(table.name) == null);
+    const store = metadata.lifecycle_store.?;
+    const reserved = try store.standaloneRevisionState();
+    const reloads = metadata.lifecycle_projection_reloads;
+    var before = (try antfly.public_api.table_catalog.authoritativeTableRoutingSnapshot(a, metadata.catalogSource(), "serving", null)).?;
+    defer before.deinit(a);
+    // Actual API job updates still advance durable CAS, but cannot change the
+    // route stamp consumed by a different live participant's final admission.
+    for (0..3) |attempt| {
+        const body = try std.fmt.allocPrint(scratch, "{{\"job_id\":42,\"phase\":\"running\",\"attempt_id\":{d}}}", .{attempt + 1});
+        try LocalStandaloneMetadata.restoreJobsPut(&metadata, "\x00\x00__api_restore_jobs__:000000000000002a", body, 1);
+    }
+    const after_jobs = try store.standaloneRevisionState();
+    try std.testing.expectEqual(reserved.revision + 3, after_jobs.revision);
+    try std.testing.expectEqual(reserved.projection_revision, after_jobs.projection_revision);
+    try std.testing.expectEqual(reserved.projection_revision, metadata.epoch);
+    var receipt: Staging.OwnerReceipt = .{ .group_id = 701, .range_id = 701, .plan_digest = digest, .completion_digest = @splat(3) };
+    const imported: Staging.Command = .{ .id = plan.id, .action = .imported, .expected_revision = job.revision, .receipt = receipt };
+    job = try Submit.run(&metadata, scratch, imported);
+    try std.testing.expectEqual(.validating, job.state);
+    _ = try Submit.run(&metadata, scratch, imported); // Lost reply replay.
+    receipt.completion_digest = @splat(4);
+    job = try Submit.run(&metadata, scratch, .{ .id = plan.id, .action = .validated, .expected_revision = job.revision, .receipt = receipt });
+    const progress = try store.standaloneRevisionState();
+    try std.testing.expectEqual(after_jobs.revision + 3, progress.revision);
+    try std.testing.expectEqual(reserved.projection_revision, progress.projection_revision);
+    try std.testing.expectEqual(reloads, metadata.lifecycle_projection_reloads);
+    var after = (try antfly.public_api.table_catalog.authoritativeTableRoutingSnapshot(a, metadata.catalogSource(), "serving", null)).?;
+    defer after.deinit(a);
+    try std.testing.expectEqual(before.snapshot.value.catalog_revision, after.snapshot.value.catalog_revision);
+    try std.testing.expectEqual(before.table_id, after.table_id);
+    try std.testing.expectEqual(before.topology_epoch, after.topology_epoch);
+    const before_route = before.resolveRouteForKey("").?;
+    const after_route = after.resolveRouteForKey("").?;
+    try std.testing.expectEqualDeep(before.fenceForRoute(before_route), after.fenceForRoute(after_route));
+    // Real public definition publication remains structural and refreshes the
+    // manager: a control-only fast path must never certify a stale catalog.
+    job = try Submit.run(&metadata, scratch, .{ .id = plan.id, .action = .publish, .expected_revision = job.revision });
+    try std.testing.expectEqual(.published, job.state);
+    const published = try store.standaloneRevisionState();
+    try std.testing.expect(published.projection_revision > progress.projection_revision);
+    try std.testing.expectEqual(published.projection_revision, metadata.epoch);
+    try std.testing.expect(metadata.lifecycle_projection_reloads > reloads);
+    try std.testing.expectEqual(table.table_id, metadata.findTableByNameLocked(table.name).?.table_id);
 }
 
 test "standalone metadata replay refreshes colliding revisions and only publishes complete effects" {

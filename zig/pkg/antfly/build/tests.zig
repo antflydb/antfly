@@ -6119,6 +6119,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone standby catalog create rejects before contended locks",
             "offline migration rejects authoritative metadata",
             "standalone catalog remote apply outage preserves committed creation and retry authority",
+            "standalone catalog restore receipt progress preserves routes until structural publication",
             "standalone metadata replay refreshes colliding revisions and only publishes complete effects",
             "standalone native SQL connection enrolls the real durable producer before lending temporary ownership",
             "standalone metadata advertises a linearizable owned snapshot",

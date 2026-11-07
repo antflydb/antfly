@@ -53,6 +53,40 @@ test "SQL relation persistence native failures preserve every stable boundary id
 }
 
 const mappings = [_]Mapping{
+    .{ .status = .duplicate_shape_name, .err = error.DuplicateShapeName },
+    .{ .status = .generated_artifact_shape_required, .err = error.GeneratedArtifactShapeRequired },
+    .{ .status = .no_supported_scopes, .err = error.NoSupportedScopes },
+    .{ .status = .scope_must_not_name_table, .err = error.ScopeMustNotNameTable },
+    .{ .status = .unknown_shape_reference, .err = error.UnknownShapeReference },
+    .{ .status = .unsupported_manifest_api_version, .err = error.UnsupportedManifestApiVersion },
+    .{ .status = .unsupported_package_kind, .err = error.UnsupportedPackageKind },
+    .{ .status = .catalog_revision_exhausted, .err = error.CatalogRevisionExhausted },
+    .{ .status = .duplicate_sql_extension_export, .err = error.DuplicateSqlExtensionExport },
+    .{ .status = .duplicate_sql_extension_version, .err = error.DuplicateSqlExtensionVersion },
+    .{ .status = .inconsistent_sql_extension_control, .err = error.InconsistentSqlExtensionControl },
+    .{ .status = .invalid_package_digest, .err = error.InvalidPackageDigest },
+    .{ .status = .invalid_sql_extension_artifact, .err = error.InvalidSqlExtensionArtifact },
+    .{ .status = .invalid_sql_extension_control, .err = error.InvalidSqlExtensionControl },
+    .{ .status = .invalid_sql_extension_dependency, .err = error.InvalidSqlExtensionDependency },
+    .{ .status = .invalid_sql_extension_record, .err = error.InvalidSqlExtensionRecord },
+    .{ .status = .invalid_sql_extension_runtime, .err = error.InvalidSqlExtensionRuntime },
+    .{ .status = .invalid_sql_extension_package_mutation, .err = error.InvalidSqlExtensionPackageMutation },
+    .{ .status = .duplicate_sql_extension_control, .err = error.DuplicateSqlExtensionControl },
+    .{ .status = .sql_dependent_extension_object, .err = error.SqlDependentExtensionObject },
+    .{ .status = .sql_duplicate_extension, .err = error.SqlDuplicateExtension },
+    .{ .status = .sql_duplicate_function, .err = error.SqlDuplicateFunction },
+    .{ .status = .sql_extension_control_conflict, .err = error.SqlExtensionControlConflict },
+    .{ .status = .sql_extension_dependency_cycle, .err = error.SqlExtensionDependencyCycle },
+    .{ .status = .sql_extension_promotion_nonce_conflict, .err = error.SqlExtensionPromotionNonceConflict },
+    .{ .status = .sql_extension_schema_mismatch, .err = error.SqlExtensionSchemaMismatch },
+    .{ .status = .sql_extension_unavailable, .err = error.SqlExtensionUnavailable },
+    .{ .status = .sql_extension_update_path_unavailable, .err = error.SqlExtensionUpdatePathUnavailable },
+    .{ .status = .sql_extension_version_unavailable, .err = error.SqlExtensionVersionUnavailable },
+    .{ .status = .sql_function_return_type_changed, .err = error.SqlFunctionReturnTypeChanged },
+    .{ .status = .sql_required_extension_not_installed, .err = error.SqlRequiredExtensionNotInstalled },
+    .{ .status = .sql_undefined_extension, .err = error.SqlUndefinedExtension },
+    .{ .status = .unsupported_sql_extension_object, .err = error.UnsupportedSqlExtensionObject },
+    .{ .status = .sql_extension_owned_object, .err = error.SqlExtensionOwnedObject },
     .{ .status = .raft_apply_writer_unavailable, .err = error.RaftApplyWriterUnavailable },
     .{ .status = .invalid_sql_relation_persistence, .err = error.InvalidSqlRelationPersistence },
     .{ .status = .sql_relation_owner_changed, .err = error.SqlRelationOwnerChanged },
@@ -1484,4 +1518,13 @@ test "external terminal ACK preserves invalid participant failure identity" {
     try std.testing.expectEqualStrings("InvalidParticipant", failure.errorName());
     failure.boundary_version = abi.abi_version - 1;
     try std.testing.expectError(error.InvalidBoundaryFailureIdentity, validateFailureEnvelope(value, &failure, abi.abi_version));
+}
+
+test "SQL extension lifecycle boundary identities retain exact rejections" {
+    const errors = [_]anyerror{ error.CatalogRevisionExhausted, error.DuplicateSqlExtensionExport, error.DuplicateSqlExtensionVersion, error.InconsistentSqlExtensionControl, error.InvalidPackageDigest, error.InvalidSqlExtensionArtifact, error.InvalidSqlExtensionControl, error.InvalidSqlExtensionDependency, error.InvalidSqlExtensionRecord, error.InvalidSqlExtensionRuntime, error.InvalidSqlExtensionPackageMutation, error.DuplicateSqlExtensionControl, error.SqlDependentExtensionObject, error.SqlDuplicateExtension, error.SqlDuplicateFunction, error.SqlExtensionControlConflict, error.SqlExtensionDependencyCycle, error.SqlExtensionPromotionNonceConflict, error.SqlExtensionSchemaMismatch, error.SqlExtensionUnavailable, error.SqlExtensionUpdatePathUnavailable, error.SqlExtensionVersionUnavailable, error.SqlFunctionReturnTypeChanged, error.SqlRequiredExtensionNotInstalled, error.SqlUndefinedExtension, error.UnsupportedSqlExtensionObject, error.SqlExtensionOwnedObject, error.DuplicateShapeName, error.GeneratedArtifactShapeRequired, error.NoSupportedScopes, error.ScopeMustNotNameTable, error.UnknownShapeReference, error.UnsupportedManifestApiVersion, error.UnsupportedPackageKind };
+    for (errors, 986..) |err, ordinal| {
+        const status = statusFromError(err);
+        try std.testing.expectEqual(@as(u32, @intCast(ordinal)), @backingInt(status));
+        try std.testing.expectError(err, statusToError(status));
+    }
 }

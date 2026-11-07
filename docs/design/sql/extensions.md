@@ -56,14 +56,15 @@ registered, the control is pending. Only that package's omitted-version lookup
 fails; explicit versions and unrelated packages remain usable. Registering the
 exact pending target resolves its digest atomically with the version row.
 
-To promote a registered version, an operator writes one `sql-control.json` in the
-configured package store. Existing package-store synchronization reads these
-files after registering all manifests. The JSON request contains `name`,
+To promote registered versions, an operator writes a JSON request array in the
+single sibling file `<normalized package-store root>.sql-controls.json`, for
+example `/var/lib/antfly/extensions.sql-controls.json` beside the immutable
+`/var/lib/antfly/extensions` directory. Existing package-store synchronization
+reads this file after registering all manifests. The file is bounded to 1MiB
+and 256 requests, with no duplicate package names. Each request contains `name`,
 `identity` (the current control's 32-byte identity), `expected_generation`,
 `version`, `package_digest` (the exact 32-byte immutable manifest digest), and a
-nonzero 16-byte `nonce`. Byte arrays use JSON integer arrays. There must be at
-most one such file per package. This local operator surface is not exposed to
-database-admin SQL credentials.
+nonzero 16-byte `nonce`. Byte arrays use JSON integer arrays. This local operator surface is not exposed to database-admin SQL credentials.
 
 Promotion compares the exact prior identity/generation and target digest. Its
 control update and bounded 64-entry retained receipt ring commit atomically.
@@ -100,3 +101,8 @@ exercise the original comment statement, administrator override, attenuated-key
 denial, NULL removal and cold observations. Native outcome and public receipt
 recovery checks verify the same durable resource state; comment handling does
 not create a separate in-memory or package-manifest metadata authority.
+
+Operator request files are outside the immutable package tree and are not copied
+as extension code during seed backup/restore. Durable controls and their retained
+receipts travel in the catalog. Existing package artifacts named
+`sql-control.json` remain ordinary files and are never interpreted as requests.

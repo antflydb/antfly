@@ -5072,6 +5072,48 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-extension-lifecycle-public-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-extension-originals-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-extension-lifecycle-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-sql-extension-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-extension-callable-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-package-callable-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-extension-lifecycle-postgres": {
+      "command": [
+        "python3",
+        "scripts/generate_sql_extension_lifecycle_reference.py",
+        "--check"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -7628,8 +7670,30 @@
     },
     {
       "id": "sql-0148",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Qualified configured-package SQL lifecycle, using generic owned immutable WASM packages rather than upstream PostgreSQL extension payloads. The unchanged COMMENT executes through authenticated public SQL, retains the immutable extension/member identities, publishes the exact text, and removes it with SQL NULL across cold restart. A read-attenuated credential is refused while Antfly's existing explicit database-administrator override is independently exercised and revoked; this is not a claim that PostgreSQL database ownership equals Antfly administration.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/sql_extension_store_test.zig",
+          "test": "SQL extension native outcomes abort staged effects and preserve exact membership across cold reopen",
+          "gate": "sql-extension-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL package native callbacks retain strict lazy typed execution and preparation-only lookup",
+          "gate": "sql-extension-callable-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0149",
@@ -19179,53 +19243,273 @@
     },
     {
       "id": "sql-0754",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Qualified configured-package SQL lifecycle, using generic owned immutable WASM packages rather than upstream PostgreSQL extension payloads. The unchanged IF NOT EXISTS installs the configured package default and a genuine typed WASM scalar member; repeating it emits the expected notice and preserves its installed identity and version across a full cold restart.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/sql_extension_store_test.zig",
+          "test": "SQL extension native outcomes abort staged effects and preserve exact membership across cold reopen",
+          "gate": "sql-extension-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL package native callbacks retain strict lazy typed execution and preparation-only lookup",
+          "gate": "sql-extension-callable-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0755",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Qualified configured-package SQL lifecycle, using generic owned immutable WASM packages rather than upstream PostgreSQL extension payloads. The unchanged IF NOT EXISTS WITH SCHEMA public uses the existing namespace identity for its genuine typed WASM export, retains installation identity on repetition, and preserves schema, owner and member bindings across cold restart.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/sql_extension_store_test.zig",
+          "test": "SQL extension native outcomes abort staged effects and preserve exact membership across cold reopen",
+          "gate": "sql-extension-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL package native callbacks retain strict lazy typed execution and preparation-only lookup",
+          "gate": "sql-extension-callable-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0756",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Qualified configured-package SQL lifecycle, using generic owned immutable WASM packages rather than upstream PostgreSQL extension payloads. The unchanged CREATE selects the explicitly configured default version, publishes genuine typed WASM exports in the same native catalog transaction, and preserves complete installation/member/owner identities across cold restart. No semver-latest guess or extension-name shim supplies availability.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/sql_extension_store_test.zig",
+          "test": "SQL extension native outcomes abort staged effects and preserve exact membership across cold reopen",
+          "gate": "sql-extension-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL package native callbacks retain strict lazy typed execution and preparation-only lookup",
+          "gate": "sql-extension-callable-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0757",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Qualified configured-package SQL lifecycle, using generic owned immutable WASM packages rather than upstream PostgreSQL extension payloads. The unchanged VERSION declaration installs exactly the requested available immutable package and its actual WASM member; duplicate, unavailable-version and direct owned-member mutations are refused with unchanged state. The native fault gate separately proves post-effect transaction abort and cold exact replay without orphan members.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/sql_extension_store_test.zig",
+          "test": "SQL extension native outcomes abort staged effects and preserve exact membership across cold reopen",
+          "gate": "sql-extension-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL package native callbacks retain strict lazy typed execution and preparation-only lookup",
+          "gate": "sql-extension-callable-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0758",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Qualified configured-package SQL lifecycle, using generic owned immutable WASM packages rather than upstream PostgreSQL extension payloads. The unchanged conditional VERSION declaration retains an existing installation and its current executable generation rather than replacing it with the requested version. Both native execution and PostgreSQL independently qualify configured package availability and IF NOT EXISTS behavior.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/sql_extension_store_test.zig",
+          "test": "SQL extension native outcomes abort staged effects and preserve exact membership across cold reopen",
+          "gate": "sql-extension-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL package native callbacks retain strict lazy typed execution and preparation-only lookup",
+          "gate": "sql-extension-callable-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0759",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Qualified configured-package SQL lifecycle, using generic owned immutable WASM packages rather than upstream PostgreSQL extension payloads. The unchanged quoted package name and explicit version resolve through the generic package registry and install a real typed WASM member with stable owner, namespace and membership across cold restart. This does not qualify upstream UUID generation functions.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/sql_extension_store_test.zig",
+          "test": "SQL extension native outcomes abort staged effects and preserve exact membership across cold reopen",
+          "gate": "sql-extension-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL package native callbacks retain strict lazy typed execution and preparation-only lookup",
+          "gate": "sql-extension-callable-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0760",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Qualified configured-package SQL lifecycle, using generic owned immutable WASM packages rather than upstream PostgreSQL extension payloads. The unchanged explicit UPDATE follows the declared indirect version path, retains the extension and compatible routine identities, advances executable generations, changes actual WASM results, and rejects prepared bindings captured before replacement. Rejected updates preserve complete installed state.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/sql_extension_store_test.zig",
+          "test": "SQL extension native outcomes abort staged effects and preserve exact membership across cold reopen",
+          "gate": "sql-extension-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL package native callbacks retain strict lazy typed execution and preparation-only lookup",
+          "gate": "sql-extension-callable-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0761",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Qualified configured-package SQL lifecycle, using generic owned immutable WASM packages rather than upstream PostgreSQL extension payloads. The unchanged UPDATE without TO resolves the explicit package-control default, follows the real indirect declared transition path, and durably publishes the new typed WASM generation without changing immutable installation/member identities.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/sql_extension_store_test.zig",
+          "test": "SQL extension native outcomes abort staged effects and preserve exact membership across cold reopen",
+          "gate": "sql-extension-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL package native callbacks retain strict lazy typed execution and preparation-only lookup",
+          "gate": "sql-extension-callable-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0762",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Qualified configured-package SQL lifecycle, using generic owned immutable WASM packages rather than upstream PostgreSQL extension payloads. The unchanged DROP removes the installation and exact owned callable membership in one native transaction. Subsequent ordinary lookup cannot execute the removed function, and cold reopen preserves the retired installation without replaying its body.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/sql_extension_store_test.zig",
+          "test": "SQL extension native outcomes abort staged effects and preserve exact membership across cold reopen",
+          "gate": "sql-extension-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL package native callbacks retain strict lazy typed execution and preparation-only lookup",
+          "gate": "sql-extension-callable-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0763",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Qualified configured-package SQL lifecycle, using generic owned immutable WASM packages rather than upstream PostgreSQL extension payloads. The unchanged conditional CASCADE removes the configured installation and dependent extension/member closure after RESTRICT is independently refused. Accepted lost replies recover the same retained nonce and scope warm and cold without reinstalling or re-executing the package. External stored-view cascades remain outside the supported named-routine domain and receive no credit.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/sql_extension_store_test.zig",
+          "test": "SQL extension native outcomes abort staged effects and preserve exact membership across cold reopen",
+          "gate": "sql-extension-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL package native callbacks retain strict lazy typed execution and preparation-only lookup",
+          "gate": "sql-extension-callable-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_extension_integration_test.zig",
+          "test": "mounted SQL extension originals own real WASM members and retain exact lifecycle outcomes across cold restart",
+          "gate": "sql-extension-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0764",

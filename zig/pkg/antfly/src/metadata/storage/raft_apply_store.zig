@@ -5883,7 +5883,7 @@ test "relational index publication standalone projection revision rejects corrup
         defer txn.abort();
         try RaftApplyStore.advanceStandaloneRevisionWithProjection(&txn, false);
         const bytes = (try RaftApplyStore.standaloneProjectionRevisionBytesTxn(&txn)).?;
-        try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, bytes[0..8], .little));
+        try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, bytes[0..8], .little));
         const durable = (try RaftApplyStore.stagingGet(&txn, RaftApplyStore.standalone_revision_key)).?;
         try std.testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, durable[0..8], .little));
         try RaftApplyStore.advanceStandaloneRevisionWithProjection(&txn, true);
@@ -19553,6 +19553,18 @@ pub const RaftApplyStore = struct {
         try advanceStandaloneRevisionWithProjection(txn, true);
     }
 
+    fn standaloneRestoreProgressOnly(self: *RaftApplyStore, bytes: []const u8) bool {
+        // Only closed receipt actions are projection-neutral. Reservation,
+        // source/fence changes, publication and cancellation stay conservative.
+        const Header = struct { action: @FieldType(restore_staging.Command, "action") };
+        var parsed = std.json.parseFromSlice(Header, self.alloc, bytes, .{ .ignore_unknown_fields = true }) catch return false;
+        defer parsed.deinit();
+        return switch (parsed.value.action) {
+            .imported, .validated, .source_handoff_checked, .old_fenced, .canceled, .parent_fenced, .parent_activated, .target_admissions_activated => true,
+            .reserve, .cancel_reservation, .begin_cutover, .begin_activation, .publish, .begin_cancel, .finish_cancel, .freeze_rewrite, .rewrite_source_ready => false,
+        };
+    }
+
     fn advanceStandaloneRevisionWithProjection(txn: *docstore.DocStore.Txn, changes_projection: bool) !void {
         const raw = try stagingGet(txn, standalone_revision_key);
         if (raw != null and raw.?.len != 8) return error.InvalidStandaloneCatalog;
@@ -19677,6 +19689,8 @@ pub const RaftApplyStore = struct {
         try advanceStandaloneRevisionWithProjection(&txn, switch (command) {
             .ack_relational_index_publication => index_ack_source_before.? != try relation_reconciliation.readSourceRevision(&txn, group_id),
             .apply_schema_validation, .apply_table_retirement, .apply_scope_retirement, .apply_store_report_update => outcomeChangesCatalog(outcome.projection_signals.items),
+            .apply_restore_staging => |bytes| !self.standaloneRestoreProgressOnly(bytes) or outcomeChangesCatalog(outcome.projection_signals.items),
+            .upsert_restore_job => outcomeChangesCatalog(outcome.projection_signals.items),
             // Runtime report timestamps and source watermarks are durable
             // observations, not new table/range/catalog identities. Still
             // invalidate if the accepted receiver emitted a structural change.
@@ -20202,9 +20216,11 @@ pub const RaftApplyStore = struct {
             try relation_reconciliation.advanceTrackedSource(&txn, group_id);
         }
         if (update.auxiliary_json) |auxiliary| {
-            var parsed = try std.json.parseFromSlice(StandaloneCatalogAuxiliary, self.alloc, auxiliary, .{ .ignore_unknown_fields = true });
-            defer parsed.deinit();
-            try (extension_domain.sql_package.Registry{ .packages = parsed.value.extension_packages, .controls = parsed.value.sql_extension_controls }).validateControls();
+            if (try sqlExtensionAuxiliaryPresent(auxiliary)) {
+                var parsed = try std.json.parseFromSlice(StandaloneCatalogAuxiliary, self.alloc, auxiliary, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                try (extension_domain.sql_package.Registry{ .packages = parsed.value.extension_packages, .controls = parsed.value.sql_extension_controls }).validateControls();
+            }
             try txn.put(standalone_catalog_key, auxiliary);
         }
         if (bootstrap and update.auxiliary_json == null) return error.InvalidStandaloneCatalog;
@@ -78415,6 +78431,13 @@ fn verifySqlExtensionControlsCheckpointTxn(alloc: std.mem.Allocator, txn: *docst
                 try control.validate();
                 var key: [256]u8 = undefined;
                 if (!std.mem.eql(u8, item.key, try sqlExtensionControlKeyForGroup(&key, group, control.name))) return error.InvalidCatalogRecord;
+            } else {
+                const package = try std.json.parseFromSliceLeaky(extension_domain.PackageManifest, a, item.value, .{ .ignore_unknown_fields = true });
+                if (package.sql != null) {
+                    try package.validate();
+                    var key: [256]u8 = undefined;
+                    if (!std.mem.eql(u8, item.key, try extensionPackageKeyForGroup(&key, group, package.name, package.version))) return error.InvalidCatalogRecord;
+                }
             }
         }
     }
@@ -78423,8 +78446,10 @@ fn verifySqlExtensionControlsCheckpointTxn(alloc: std.mem.Allocator, txn: *docst
         try (extension_domain.sql_package.Registry{ .packages = try RaftApplyStore.sqlExtensionPackagesTxn(a, txn, group.*), .controls = try RaftApplyStore.sqlExtensionControlsTxn(a, txn, group.*) }).validateControls();
     }
     if (try RaftApplyStore.stagingGet(txn, RaftApplyStore.standalone_catalog_key)) |bytes| {
-        const auxiliary = try std.json.parseFromSliceLeaky(RaftApplyStore.StandaloneCatalogAuxiliary, a, bytes, .{ .ignore_unknown_fields = true });
-        try (extension_domain.sql_package.Registry{ .packages = auxiliary.extension_packages, .controls = auxiliary.sql_extension_controls }).validateControls();
+        if (try sqlExtensionAuxiliaryPresent(bytes)) {
+            const auxiliary = try std.json.parseFromSliceLeaky(RaftApplyStore.StandaloneCatalogAuxiliary, a, bytes, .{ .ignore_unknown_fields = true });
+            try (extension_domain.sql_package.Registry{ .packages = auxiliary.extension_packages, .controls = auxiliary.sql_extension_controls }).validateControls();
+        }
     }
 }
 
@@ -78454,4 +78479,80 @@ test "metadata.lake query-only ownership reserves global row without a table" {
     try RaftApplyStore.installSnapshotFromRaft(&store, a, 22, 10, snapshot);
     const restored = try lifecycle.parse(ca, try store.getLakeIndexLifecycle(ca, 22, 0));
     try std.testing.expectEqual(@as(u64, 100), restored.stores[0].query_until_ms);
+}
+
+/// Probe only feature presence, without interpreting released opaque non-SQL
+/// auxiliary records as current package manifests. Scanner/key/depth memory is
+/// fixed; unknown values are skipped rather than allocated into a DOM.
+fn sqlExtensionAuxiliaryPresent(bytes: []const u8) !bool {
+    const SqlValue = struct {
+        present: bool = false,
+        pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+            const present = try source.peekNextTokenType() != .null;
+            try source.skipValue();
+            return .{ .present = present };
+        }
+    };
+    const Package = struct { sql: SqlValue = .{} };
+    const Packages = struct {
+        present: bool = false,
+        pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() != .array_begin) {
+                if (try source.peekNextTokenType() == .object_begin) return .{ .present = (try std.json.innerParse(Package, a, source, options)).sql.present };
+                try source.skipValue();
+                return .{};
+            }
+            _ = try source.next();
+            var present = false;
+            while (try source.peekNextTokenType() != .array_end) {
+                if (!present and try source.peekNextTokenType() == .object_begin) {
+                    present = (try std.json.innerParse(Package, a, source, options)).sql.present;
+                } else try source.skipValue();
+            }
+            _ = try source.next();
+            return .{ .present = present };
+        }
+    };
+    const Controls = struct {
+        present: bool = false,
+        pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                try source.skipValue();
+                return .{};
+            }
+            if (try source.peekNextTokenType() != .array_begin) {
+                try source.skipValue();
+                return .{ .present = true };
+            }
+            _ = try source.next();
+            const present = try source.peekNextTokenType() != .array_end;
+            while (try source.peekNextTokenType() != .array_end) try source.skipValue();
+            _ = try source.next();
+            return .{ .present = present };
+        }
+    };
+    const Probe = struct { extension_packages: Packages = .{}, sql_extension_controls: Controls = .{} };
+    var scratch: [8192]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+    var parsed = std.json.parseFromSlice(Probe, fixed.allocator(), bytes, .{ .ignore_unknown_fields = true, .max_value_len = 4096 }) catch |err| switch (err) {
+        error.OutOfMemory, error.ValueTooLong => return error.SqlProgramLimitExceeded,
+        else => return err,
+    };
+    defer parsed.deinit();
+    return parsed.value.extension_packages.present or parsed.value.sql_extension_controls.present;
+}
+
+test "SQL extension auxiliary presence preserves opaque records and recognizes escaped controls" {
+    try std.testing.expect(!try sqlExtensionAuxiliaryPresent("{\"epoch\":42,\"extension_packages\":[{\"name\":\"preserved\"}]}"));
+    try std.testing.expect(!try sqlExtensionAuxiliaryPresent("{\"extension_packages\":[{\"sql\":null}],\"sql_extension_controls\":[]}"));
+    try std.testing.expect(!try sqlExtensionAuxiliaryPresent("{\"opaque\":\"sql_extension_controls\"}"));
+    try std.testing.expect(try sqlExtensionAuxiliaryPresent("{\"extension_packages\":[{\"sq\\u006c\":{}}]}"));
+    try std.testing.expect(try sqlExtensionAuxiliaryPresent("{\"sql_extension_c\\u006fntrols\":[{}]}"));
+    try std.testing.expect(try sqlExtensionAuxiliaryPresent("{\"sql_extension_controls\":{}}"));
+    const payload = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'x');
+    const auxiliary = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .unknown = payload, .extension_packages = .{.{ .name = "preserved" }} }, .{});
+    defer std.testing.allocator.free(auxiliary);
+    try std.testing.expect(!try sqlExtensionAuxiliaryPresent(auxiliary));
 }

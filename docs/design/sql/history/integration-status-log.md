@@ -149,3 +149,14 @@ UNLOGGED process originals remain unresolved until the four matching-production
 real-process campaigns pass. Current counts are 941 implemented /133 rejected /
 463 superseded /49 unresolved. No killed-process, native image or whole-release
 credit is inferred from the trigger result.
+
+
+### Configured WASM extension lifecycle and comments
+
+The eleven unchanged originals `sql-0148` and `sql-0754`–`sql-0763` qualify the generic configured-package extension lifecycle: CREATE and IF NOT EXISTS, schema/version selection, explicit and default indirect UPDATE, DROP RESTRICT/CASCADE over extension/callable membership, and COMMENT/NULL removal. Each installed member is a genuine typed core WASM function. Complete identity, generation, owner, namespace, digest and dependency postimages survive actual native cold restart. The native journal fault gate aborts a semantic-looking error after staged effects, proves no orphan extension/member/outcome, and cold-replays the exact immutable request once.
+
+Qualification passed the audited five-test Debug public gate and two-test embedded callable gate in R310, all seven strict physical metadata tests in R311, and the fresh PostgreSQL 18.6 oracle for all eleven exact statements in R307. Every owning native subgate had zero skips, failures and leaks. The added checks cover exact C ABI rejection identities, owned cold receipts, default-control promotion and checkpoint custody, standalone native creation and comment removal, operator-file separation, and preservation of released opaque document auxiliary metadata. The R310 combined build was interrupted during an independent restore-driver test and had a test-only manifest fixture failure; its passing public and callable subgates qualify their own results. The corrected metadata fixture and its full owning build passed separately. No whole-build or unrelated restore credit is inferred.
+
+PostgreSQL 18.6 uses owned private control files and ordinary real scalar members, with two actual stop/start cycles. Native execution uses owned content-addressed WASM artifacts, strict typed admission and one retained compiled runtime per statement/artifact. This supports package lifecycle under configured availability; it does not implement upstream GIS, cryptography, UUID or vector payloads, nor qualify external stored-view cascades. Read-only credentials are denied; Antfly's existing explicit database-administrator management override is tested separately from PostgreSQL's ordinary nonadministrator role and preserves the immutable creator identity.
+
+Only these eleven unresolved-to-implemented dispositions change: 952 implemented /133 rejected /463 superseded /38 unresolved. Native TEMP/UNLOGGED process recovery cases, the remaining publication/subscription work and whole-release readiness remain independently held. No inventory/source/reference hash or SQL statement is changed to obtain this count.

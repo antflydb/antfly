@@ -379,6 +379,12 @@ pub const TriggerPolicySchemaPreparation = struct {
 };
 
 pub const CatalogProjectionRequest = union(enum) {
+    // Closed extension-family projections use the existing owned JSON CABI.
+    // Preflight is read-only; the accepted mutation retains its decoder floor.
+    sql_extension_registration_preflight: @import("../../extensions/mod.zig").PackageManifest,
+    sql_extension_default_preflight: @import("../../extensions/mod.zig").sql_package.Promotion,
+    sql_extension_control: []const u8,
+    sql_extension_controls: void,
     sql_extension_snapshot: @import("../../system_catalog/sql_extensions.zig").SnapshotRequest,
     sql_extension_outcome: @import("../../system_catalog/sql_extensions.zig").OutcomeRequest,
     read_store: struct { store_id: u64, reports: bool },
