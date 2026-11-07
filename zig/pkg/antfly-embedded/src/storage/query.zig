@@ -507,7 +507,7 @@ pub fn executeStorageKernelPreflight(
 /// Coarse temporal plan/export/fold operation. No physical pointers escape this
 /// owner. All intermediate allocations have one bounded request lifetime.
 pub fn executeTemporalQuery(alloc: std.mem.Allocator, db: *db_mod.DB, body: []const u8, control: @import("../search/query.zig").ExecutionControl) ![]u8 {
-    if (body.len > contract.temporal_max_bytes) return error.QueryCandidateBudgetExceeded;
+    if (body.len > contract.temporal_max_bytes) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_budget, .{});
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -537,7 +537,7 @@ pub fn executeTemporalQuery(alloc: std.mem.Allocator, db: *db_mod.DB, body: []co
     var scan_budget = db_mod.algebraic.index.TemporalScanBudget{ .control = execution };
     const ctx: db_mod.aggregations.Context = .{ .control = execution, .gap_fill_budget = &budget, .temporal_materializations_exact = true, .temporal_scan_budget = &scan_budget };
     if (wire.shards_json) |json| {
-        if (json.len > contract.temporal_max_bytes) return error.QueryCandidateBudgetExceeded;
+        if (json.len > contract.temporal_max_bytes) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_budget, .{});
         const shards = try std.json.parseFromSliceLeaky([]const contract.TemporalShard, a, json, .{});
         for (shards) |shard| if (!std.mem.eql(u8, shard.signature, signature) or shard.partials.len != requests.len) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_schema_changed, .{});
         const results = try a.alloc(db_mod.aggregations.SearchAggregationResult, requests.len);
@@ -547,11 +547,11 @@ pub fn executeTemporalQuery(alloc: std.mem.Allocator, db: *db_mod.DB, body: []co
             for (shards) |shard| {
                 const cells = shard.partials[i];
                 total_cells += cells.len;
-                if (total_cells > contract.temporal_max_cells) return error.QueryCandidateBudgetExceeded;
+                if (total_cells > contract.temporal_max_cells) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_budget, .{});
                 try partials.appendSlice(a, cells);
             }
             try execution.check();
-            var merged = try db_mod.algebraic.distributed.mergePartialsAlloc(a, partials.items);
+            var merged = try db_mod.algebraic.distributed.mergePartialsWithControlAlloc(a, partials.items, execution);
             defer merged.deinit(a);
             results[i] = (try db_mod.aggregations.temporalAggregationFromDistributedPartialsAlloc(a, entry.index, request, constraints, merged, ctx)) orelse return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_materialization_declined, .{});
         }
@@ -563,13 +563,13 @@ pub fn executeTemporalQuery(alloc: std.mem.Allocator, db: *db_mod.DB, body: []co
     for (requests, 0..) |request, i| {
         partials[i] = (try db_mod.aggregations.temporalPartialsAlloc(a, entry.index, db.core.store, request, constraints, ctx)) orelse return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_materialization_declined, .{});
         total_cells += partials[i].len;
-        if (total_cells > contract.temporal_max_cells) return error.QueryCandidateBudgetExceeded;
+        if (total_cells > contract.temporal_max_cells) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_budget, .{});
     }
     try execution.check();
     const response = try std.json.Stringify.valueAlloc(alloc, contract.TemporalShard{ .signature = signature, .partials = partials }, .{});
     if (response.len > contract.temporal_max_bytes) {
         alloc.free(response);
-        return error.QueryCandidateBudgetExceeded;
+        return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_budget, .{});
     }
     return response;
 }

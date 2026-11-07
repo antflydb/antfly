@@ -83,6 +83,8 @@ pub const containsDateHistogram = contract.containsDateHistogram;
 
 pub const Context = struct {
     gap_fill_budget: ?*contract.GapFillBudget = null,
+    /// Scoped to one histogram; nested histograms establish their own reservation.
+    histogram_budget_reserved: ?*bool = null,
     temporal_materializations_exact: bool = false,
     temporal_scan_budget: ?*algebraic_mod.index.TemporalScanBudget = null,
     control: @import("../../search/query.zig").ExecutionControl = .{},
@@ -231,9 +233,14 @@ fn computeSingleAggregation(
     if (!std.mem.eql(u8, request.type, "date_histogram")) return computeSingleAggregationImpl(alloc, request, hits, ctx, allow_algebraic);
     try contract.validateTemporalRequests(&.{request});
     try ctx.control.check();
-    var result = try computeSingleAggregationImpl(alloc, request, hits, ctx, allow_algebraic);
+    var reserved = false;
+    var controlled = ctx;
+    controlled.histogram_budget_reserved = &reserved;
+    var result = try computeSingleAggregationImpl(alloc, request, hits, controlled, allow_algebraic);
     errdefer result.deinit(alloc);
-    try completeDateHistogram(alloc, request, &result, ctx);
+    // Scan and temporal folds reserve and complete their primary extent before
+    // pipelines. Never regenerate buckets removed by a pipeline afterward.
+    if (!reserved and request.date_bounds_start.len > 0) try completeDateHistogram(alloc, request, &result, controlled);
     return result;
 }
 
@@ -241,22 +248,14 @@ fn computeSingleAggregation(
 pub fn completeDateHistogram(alloc: Allocator, request: SearchAggregationRequest, result: *SearchAggregationResult, ctx: Context) anyerror!void {
     try ctx.control.check();
     try contract.validateTemporalRequests(&.{request});
-    const interval = try parseDateInterval(request);
-    if (request.date_bounds_start.len == 0 and request.date_bounds_end.len == 0) return;
+    if (request.min_doc_count != 0) return;
     const dt = @import("../../datetime.zig");
-    const start = dt.parseRfc3339ToSignedNs(request.date_bounds_start) orelse return error.InvalidAggregation;
-    const end = dt.parseRfc3339ToSignedNs(request.date_bounds_end) orelse return error.InvalidAggregation;
-    if (start >= end or request.min_doc_count != 0) return error.InvalidAggregation;
-    // Pipelines must run after gap generation; bounded series currently accepts
-    // primary metrics only, rather than producing incorrect pipeline values.
-    for (request.aggregations) |child| if (contract.isPipelineAggregation(child.type)) return error.InvalidAggregation;
-    const first_key = try search_agg_mod.truncateSignedToInterval(start, interval);
-    const last_key = try search_agg_mod.truncateSignedToInterval(end - 1, interval);
-    const keys = try fillDateHistogramBucketKeys(alloc, first_key, last_key, interval);
+    var present = try alloc.alloc(i128, result.buckets.len);
+    defer alloc.free(present);
+    for (result.buckets, 0..) |bucket, i| present[i] = dt.parseRfc3339ToSignedNs(std.mem.trim(u8, bucket.key_json, "\"")) orelse return error.InvalidAggregation;
+    std.mem.sort(i128, present, {}, std.sort.asc(i128));
+    const keys = try dateHistogramExtentKeysAlloc(alloc, request, present, ctx);
     defer alloc.free(keys);
-    var local_budget = contract.GapFillBudget{};
-    const budget = ctx.gap_fill_budget orelse &local_budget;
-    try budget.charge(keys.len, request.aggregations.len);
     var buckets: std.ArrayList(SearchAggregationBucket) = .empty;
     errdefer {
         for (buckets.items) |*bucket| bucket.deinit(alloc);
@@ -306,6 +305,31 @@ pub fn completeDateHistogram(alloc: Allocator, request: SearchAggregationRequest
     if (result.buckets.len > 0) alloc.free(result.buckets);
     result.buckets = &.{};
     result.buckets = try buckets.toOwnedSlice(alloc);
+}
+
+/// Reserve the complete presentation extent before constructing metric results.
+/// Explicit bounds extend populated buckets; they never filter observations.
+fn dateHistogramExtentKeysAlloc(a: Allocator, request: SearchAggregationRequest, present: []const i128, ctx: Context) ![]i128 {
+    try ctx.control.check();
+    if (request.min_doc_count != 0) return a.dupe(i128, present);
+    const interval = try parseDateInterval(request);
+    var first: ?i128 = if (present.len > 0) present[0] else null;
+    var last: ?i128 = if (present.len > 0) present[present.len - 1] else null;
+    if (request.date_bounds_start.len > 0) {
+        const dt = @import("../../datetime.zig");
+        const lo = try search_agg_mod.truncateSignedToInterval(dt.parseRfc3339ToSignedNs(request.date_bounds_start).?, interval);
+        const hi = try search_agg_mod.truncateSignedToInterval(dt.parseRfc3339ToSignedNs(request.date_bounds_end).? - 1, interval);
+        first = if (first) |value| @min(value, lo) else lo;
+        last = if (last) |value| @max(value, hi) else hi;
+    }
+    const keys = if (first) |lo| try fillDateHistogramBucketKeys(a, lo, last.?, interval) else try a.alloc(i128, 0);
+    errdefer a.free(keys);
+    if (ctx.histogram_budget_reserved == null or !ctx.histogram_budget_reserved.?.*) {
+        var local = contract.GapFillBudget{};
+        try (ctx.gap_fill_budget orelse &local).charge(keys.len, request.aggregations.len);
+        if (ctx.histogram_budget_reserved) |reserved| reserved.* = true;
+    }
+    return keys;
 }
 
 fn computeSingleAggregationImpl(
@@ -495,6 +519,7 @@ fn computeAlgebraicAggregation(
     // Older algebraic plans understand equality constraints only. A typed
     // source range must never be reinterpreted as a scalar constraint.
     for (ctx.algebraic_constraints) |constraint| if (constraint.time_range != null) return null;
+    if (std.mem.eql(u8, request.type, "date_histogram") and request.date_bounds_start.len > 0) return null;
 
     if (isAlgebraicMetricType(request.type)) {
         const op = algebraic_mod.algebra.Op.parse(request.type) orelse return null;
@@ -3809,7 +3834,7 @@ pub fn algebraicDateHistogramAggregationFromDistributedPartialsAlloc(
 ) !?SearchAggregationResult {
     var result = (try algebraicDateHistogramAggregationFromDistributedPartialsImpl(alloc, index, request, constraints, merged)) orelse return null;
     errdefer result.deinit(alloc);
-    try completeDateHistogram(alloc, request, &result, .{});
+    if (request.date_bounds_start.len > 0) try completeDateHistogram(alloc, request, &result, .{});
     return result;
 }
 
@@ -6953,7 +6978,10 @@ fn computeNumericMetricAggregation(
 
     for (hits) |hit| {
         const stored = hit.stored_data orelse continue;
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
         defer parsed.deinit();
         const value = extractValueAtPath(parsed.value, request.field) orelse continue;
         accumulateNumericJsonValue(value, &sum, &sum_squares, &count, &min_value, &max_value);
@@ -7677,7 +7705,10 @@ fn computeDateHistogramAggregation(
 
     for (hits) |hit| {
         const stored = hit.stored_data orelse continue;
-        const value = extractTimestampFieldFromStoredJson(alloc, stored, request.field) catch null;
+        const value = extractTimestampFieldFromStoredJson(alloc, stored, request.field) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
         if (value) |ns| {
             try agg.collect(ns);
             const bucket_key = try search_agg_mod.truncateSignedToInterval(ns, interval);
@@ -7697,45 +7728,36 @@ fn computeDateHistogramAggregation(
         kept += 1;
     }
 
-    const keys = if (request.min_doc_count == 0 and kept > 0)
-        try fillDateHistogramBucketKeys(alloc, present_keys[0], present_keys[present_keys.len - 1], interval)
-    else blk: {
-        var filtered = try alloc.alloc(i128, kept);
-        var idx: usize = 0;
-        for (present_keys) |key| {
-            const count = agg.getCount(key);
-            if (request.min_doc_count > 0 and count < @as(u64, @intCast(request.min_doc_count))) continue;
-            filtered[idx] = key;
-            idx += 1;
-        }
-        break :blk filtered;
-    };
+    const filtered = try alloc.alloc(i128, kept);
+    defer alloc.free(filtered);
+    var filtered_count: usize = 0;
+    for (present_keys) |key| {
+        if (request.min_doc_count > 0 and agg.getCount(key) < @as(u64, @intCast(request.min_doc_count))) continue;
+        filtered[filtered_count] = key;
+        filtered_count += 1;
+    }
+    const keys = try dateHistogramExtentKeysAlloc(alloc, request, filtered, ctx);
     defer if (keys.len > 0) alloc.free(keys);
 
     var buckets = try alloc.alloc(SearchAggregationBucket, keys.len);
+    var filled: usize = 0;
     errdefer {
-        for (buckets[0..keys.len]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..filled]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (keys, 0..) |key, idx| {
+        try ctx.control.check();
         const formatted = try formatRfc3339Bucket(alloc, key);
         defer alloc.free(formatted);
-        const nested = blk: {
-            if (child_aggs.primary.len == 0) break :blk try alloc.alloc(SearchAggregationResult, 0);
-            if (grouped.get(key)) |list| {
-                break :blk try computeSearchAggregationsAtDepth(alloc, child_aggs.primary, .{
-                    .alloc = alloc,
-                    .hits = list.items,
-                    .total_hits = @intCast(list.items.len),
-                }, ctx, false);
-            }
-            break :blk try alloc.alloc(SearchAggregationResult, 0);
-        };
-        buckets[idx] = .{
-            .key_json = try std.fmt.allocPrint(alloc, "\"{s}\"", .{formatted}),
-            .count = @intCast(agg.getCount(key)),
-            .aggregations = nested,
-        };
+        const key_json = try std.json.Stringify.valueAlloc(alloc, formatted, .{});
+        errdefer alloc.free(key_json);
+        const nested = if (child_aggs.primary.len > 0) try computeSearchAggregationsAtDepth(alloc, child_aggs.primary, .{
+            .alloc = alloc,
+            .hits = if (grouped.get(key)) |list| list.items else &.{},
+            .total_hits = if (grouped.get(key)) |list| @intCast(list.items.len) else 0,
+        }, ctx, false) else try alloc.alloc(SearchAggregationResult, 0);
+        buckets[idx] = .{ .key_json = key_json, .count = @intCast(agg.getCount(key)), .aggregations = nested };
+        filled += 1;
     }
     try applyPipelineAggregations(alloc, child_aggs.pipeline, &buckets);
 
@@ -16515,6 +16537,14 @@ fn foldTemporalPartialsAlloc(a: Allocator, index: *algebraic_mod.index.Index, pl
                 return (@import("../../datetime.zig").parseRfc3339ToSignedNs(left.bucket_start).?) < (@import("../../datetime.zig").parseRfc3339ToSignedNs(right.bucket_start).?);
             }
         }.less);
+        var reserved = false;
+        var histogram_ctx = controlled;
+        if (shape.groupCount() > 0 or histogram_ctx.histogram_budget_reserved == null) histogram_ctx.histogram_budget_reserved = &reserved;
+        const present = try a.alloc(i128, group.points.items.len);
+        defer a.free(present);
+        for (group.points.items, 0..) |point, i| present[i] = @import("../../datetime.zig").parseRfc3339ToSignedNs(point.bucket_start).?;
+        const extent = try dateHistogramExtentKeysAlloc(a, shape.histogram, present, histogram_ctx);
+        a.free(extent);
         var points = std.ArrayList(SearchAggregationBucket).empty;
         errdefer {
             for (points.items) |*point| point.deinit(a);
@@ -16530,7 +16560,7 @@ fn foldTemporalPartialsAlloc(a: Allocator, index: *algebraic_mod.index.Index, pl
         }
         var histogram: SearchAggregationResult = .{ .name = shape.histogram.name, .field = shape.histogram.field, .type = shape.histogram.type, .buckets = try points.toOwnedSlice(a) };
         errdefer histogram.deinit(a);
-        try completeDateHistogram(a, shape.histogram, &histogram, controlled);
+        try completeDateHistogram(a, shape.histogram, &histogram, histogram_ctx);
         if (exceedsAlgebraicResultBucketLimit(index, histogram.buckets.len)) return error.AlgebraicResultBucketLimit;
         if (shape.groupCount() == 0) {
             output.deinit(a);
@@ -16757,4 +16787,49 @@ pub fn temporalPartialsAlloc(a: Allocator, index: *algebraic_mod.index.Index, st
         };
     }
     return try partials.toOwnedSlice(a);
+}
+
+test "time series histogram allocation and in-flight cancellation are failure atomic" {
+    const Fixture = struct {
+        const hits = [_]types.SearchHit{
+            .{ .id = @constCast("a"), .stored_data = @constCast("{\"ts\":\"2026-11-06T12:00:00Z\",\"v\":1}") },
+            .{ .id = @constCast("b"), .stored_data = @constCast("{\"ts\":\"2026-11-06T12:10:00Z\",\"v\":3}") },
+        };
+        const request: SearchAggregationRequest = .{ .name = "points", .type = "date_histogram", .field = "ts", .fixed_interval = "5m", .aggregations = &.{.{ .name = "average", .type = "avg", .field = "v" }} };
+        fn run(alloc: Allocator) !void {
+            const results = try computeSearchAggregations(alloc, &.{request}, .{ .alloc = alloc, .hits = @constCast(&hits), .total_hits = 2 }, .{});
+            defer deinitResults(alloc, results);
+            try std.testing.expectEqual(@as(usize, 3), results[0].buckets.len);
+            try std.testing.expectEqual(@as(i64, 0), results[0].buckets[1].count);
+            try std.testing.expectEqual(@as(usize, 1), results[0].buckets[1].aggregations.len);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    const Counter = struct {
+        left: usize,
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.left == 0) return true;
+            self.left -= 1;
+            return false;
+        }
+    };
+    for (0..30) |stop| {
+        var counter = Counter{ .left = stop };
+        const a = std.testing.allocator;
+        const result = computeSearchAggregations(a, &.{Fixture.request}, .{ .alloc = a, .hits = @constCast(&Fixture.hits), .total_hits = 2 }, .{ .control = .{ .cancellation = .{ .ptr = &counter, .is_cancelled_fn = Counter.cancelled } } }) catch |err| {
+            try std.testing.expectEqual(error.Canceled, err);
+            continue;
+        };
+        deinitResults(a, result);
+    }
+    var budget = contract.GapFillBudget{ .remaining_cells = 5 };
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, computeSearchAggregations(std.testing.allocator, &.{Fixture.request}, .{ .alloc = std.testing.allocator, .hits = @constCast(&Fixture.hits), .total_hits = 2 }, .{ .gap_fill_budget = &budget }));
+    try std.testing.expectEqual(@as(usize, 5), budget.remaining_cells);
+    var pipeline = Fixture.request;
+    pipeline.aggregations = &.{ Fixture.request.aggregations[0], .{ .name = "selected", .type = "bucket_sort", .field = "", .bucket_path = "_count", .sort_order = "desc", .size = 2 } };
+    const selected = try computeSearchAggregations(std.testing.allocator, &.{pipeline}, .{ .alloc = std.testing.allocator, .hits = @constCast(&Fixture.hits), .total_hits = 2 }, .{});
+    defer deinitResults(std.testing.allocator, selected);
+    try std.testing.expectEqual(@as(usize, 2), selected[0].buckets.len);
+    for (selected[0].buckets) |bucket| try std.testing.expectEqual(@as(i64, 1), bucket.count);
 }

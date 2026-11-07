@@ -20995,6 +20995,11 @@ test "time series range proof preserves the exact source predicate" {
         found = true;
     };
     try std.testing.expect(found);
+    var populated = request.req;
+    populated.aggregations_json = "{\"points\":{\"type\":\"date_histogram\",\"field\":\"ts\",\"fixed_interval\":\"300s\",\"min_doc_count\":1,\"sub_aggregations\":{\"average\":{\"type\":\"avg\",\"field\":\"v\"}}}}";
+    const populated_constraints = (try execution.algebraicConstraintsForRequestAlloc(a, populated)) orelse return error.MissingTemporalRangeProof;
+    defer execution.freeAlgebraicConstraints(a, populated_constraints);
+    try std.testing.expectEqual(constraints.len, populated_constraints.len);
     var malformed = request.req;
     malformed.filter_query_json = "{\"date_range\":{\"field\":\"ts\",\"start\":\"2026-11-06T12:00:00Z\",\"end\":\"2026-11-06T12:20:00Z\"},\"term\":{\"path\":\"tenant\",\"value\":\"restricted\"}}";
     const rejected = try execution.algebraicConstraintsForRequestAlloc(a, malformed);

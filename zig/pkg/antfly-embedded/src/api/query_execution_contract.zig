@@ -7567,8 +7567,13 @@ fn temporalMaterializedConstraintsAlloc(a: std.mem.Allocator, req: db_mod.types.
         };
         if (!std.mem.eql(u8, hist.type, "date_histogram") or hist.bucket_origin.len != 0) return null;
         const dt = @import("../datetime.zig");
-        const first = dt.parseRfc3339ToSignedNs(hist.date_bounds_start) orelse return null;
-        const last = dt.parseRfc3339ToSignedNs(hist.date_bounds_end) orelse return null;
+        const source_range = try temporalSourceRangeAlloc(a, req, hist.field) orelse return null;
+        const first = source_range.start_ns;
+        const last = source_range.end_ns;
+        if (first >= last) return null;
+        // Presentation bounds are optional, but when supplied must describe
+        // the same source extent. Disabling gap filling never changes proof.
+        if (hist.date_bounds_start.len > 0 and ((dt.parseRfc3339ToSignedNs(hist.date_bounds_start) orelse return null) != first or (dt.parseRfc3339ToSignedNs(hist.date_bounds_end) orelse return null) != last)) return null;
         const agg = @import("../search/aggregation.zig");
         const interval = agg.parseDateInterval(hist.calendar_interval, hist.fixed_interval, "") catch return null;
         if ((agg.truncateSignedToInterval(first, interval) catch return null) != first or (agg.truncateSignedToInterval(last, interval) catch return null) != last) return null;
@@ -7599,6 +7604,57 @@ fn temporalMaterializedConstraintsAlloc(a: std.mem.Allocator, req: db_mod.types.
     if (!found) return null;
     try constraints.append(a, .{ .field = try a.dupe(u8, field), .value = try a.dupe(u8, ""), .time_range = range });
     return try constraints.toOwnedSlice(a);
+}
+
+fn temporalSourceRangeAlloc(a: std.mem.Allocator, req: db_mod.types.SearchRequest, field: []const u8) !?db_mod.algebraic.ir.TimeRange {
+    if (req.filter_text) |text| if (temporalSourceTextRange(text, field)) |range| return range;
+    if (req.filter_query_json.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, a, req.filter_query_json, .{}) catch return null;
+    defer parsed.deinit();
+    return temporalSourceJsonRange(parsed.value, field);
+}
+
+fn temporalSourceTextRange(query: db_mod.types.TextQuery, field: []const u8) ?db_mod.algebraic.ir.TimeRange {
+    switch (query) {
+        .date_range => |range| {
+            if (!std.mem.eql(u8, range.field, field) or range.start_ns == null or range.end_ns == null or !range.inclusive_start or range.inclusive_end) return null;
+            return .{ .start_ns = range.start_ns.?, .end_ns = range.end_ns.? };
+        },
+        .bool_query => |clauses| {
+            if (!temporalTextFilterCanConsider(query)) return null;
+            for (clauses.must) |child| if (temporalSourceTextRange(child, field)) |range| return range;
+            return null;
+        },
+        else => return null,
+    }
+}
+
+fn temporalSourceJsonRange(value: std.json.Value, field: []const u8) ?db_mod.algebraic.ir.TimeRange {
+    if (value != .object) return null;
+    if (value.object.get("conjuncts")) |children| {
+        if (children != .array) return null;
+        for (children.array.items) |child| if (temporalSourceJsonRange(child, field)) |range| return range;
+    }
+    if (value.object.get("bool")) |clauses| {
+        if (clauses != .object) return null;
+        inline for (.{ "must", "filter" }) |key| if (clauses.object.get(key)) |children| {
+            if (children != .array) return null;
+            for (children.array.items) |child| if (temporalSourceJsonRange(child, field)) |range| return range;
+        };
+    }
+    const predicate = value.object.get("date_range") orelse value.object.get("range") orelse return null;
+    if (predicate != .object) return null;
+    const path = predicate.object.get("field") orelse predicate.object.get("path") orelse return null;
+    if (path != .string) return null;
+    const simple = if (std.mem.startsWith(u8, path.string, "/")) path.string[1..] else path.string;
+    if (!std.mem.eql(u8, simple, field)) return null;
+    const first = predicate.object.get("start_ns") orelse predicate.object.get("start") orelse predicate.object.get("gte") orelse return null;
+    const last = predicate.object.get("end_ns") orelse predicate.object.get("end") orelse predicate.object.get("lt") orelse return null;
+    const dt = @import("../datetime.zig");
+    return .{
+        .start_ns = (if (first == .string) dt.parseRfc3339ToSignedNs(first.string) else dt.rangeNanoseconds(first)) orelse return null,
+        .end_ns = (if (last == .string) dt.parseRfc3339ToSignedNs(last.string) else dt.rangeNanoseconds(last)) orelse return null,
+    };
 }
 
 fn collectTemporalMaterializedPredicate(a: std.mem.Allocator, value: std.json.Value, field: []const u8, range: db_mod.algebraic.ir.TimeRange, found: *bool, out: *std.ArrayListUnmanaged(db_mod.aggregations.FixedConstraint)) anyerror!bool {
@@ -7767,4 +7823,32 @@ pub const TemporalDecline = enum {
     scan_temporal_materialization_declined,
     scan_temporal_schema_changed,
     scan_temporal_owner_unavailable,
+    scan_temporal_budget,
 };
+
+/// Coordinator admission is separate from the exact scan's source budget.
+/// Exhaustion declines an accelerator; it is never a query failure by itself.
+pub const TemporalTransferBudget = struct {
+    remaining_bytes: usize = temporal_max_bytes,
+    remaining_cells: usize = temporal_max_cells,
+    pub fn acceptBytes(self: *@This(), count: usize) bool {
+        if (count > self.remaining_bytes) return false;
+        self.remaining_bytes -= count;
+        return true;
+    }
+    pub fn acceptCells(self: *@This(), count: usize) bool {
+        if (count > self.remaining_cells) return false;
+        self.remaining_cells -= count;
+        return true;
+    }
+};
+
+test "time series distributed transfer declines before exceeding shared budgets" {
+    var budget = TemporalTransferBudget{ .remaining_bytes = 9, .remaining_cells = 3 };
+    try std.testing.expect(budget.acceptBytes(5));
+    try std.testing.expect(!budget.acceptBytes(5));
+    try std.testing.expectEqual(@as(usize, 4), budget.remaining_bytes);
+    try std.testing.expect(budget.acceptCells(2));
+    try std.testing.expect(!budget.acceptCells(2));
+    try std.testing.expect(budget.acceptCells(1));
+}

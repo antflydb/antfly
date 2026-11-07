@@ -379,3 +379,46 @@ it("preserves progress when a later record is malformed at runtime", async () =>
     details: { phase: "validation", bufferedIds: [], mayHaveCommitted: false },
   });
 });
+
+it("keeps SQL source instants typed and selects complete top series", () => {
+  const sql = seriesSQL({ ...options, maxSeries: 1 });
+  expect(sql.statement).toContain('"observed_at"::datetime >= $1::datetime');
+  expect(sql.statement).toContain("COUNT(*) DESC");
+  expect(sql.statement).toContain("IS NOT DISTINCT FROM");
+  expect(sql.statement).toContain('WITH "__antfly_series_selected"');
+  expect(sql.parameters?.at(-1)).toBe(1);
+  expect(sql.statement).not.toMatch(/ORDER BY.*bucket.*LIMIT/);
+  expect(() => seriesSQL({ ...options, bucket: { every: "1ns" } })).not.toThrow();
+});
+
+it("shares executable SQL fixtures with native API tests", () => {
+  const fixture = JSON.parse(
+    readFileSync(
+      new URL("../../../../zig/e2e/antfly/fixtures/time-series-sdk-sql.json", import.meta.url),
+      "utf8"
+    )
+  );
+  for (const item of fixture.cases) {
+    expect(JSON.parse(JSON.stringify(seriesQuery(item.options)))).toEqual(item.query);
+    expect(seriesSQL(item.options)).toEqual(item.sql);
+  }
+});
+
+it("applies explicit SQL zero fill after measurement aggregation", () => {
+  const sql = seriesSQL({
+    ...options,
+    fill: 0,
+    measures: {
+      average: { op: "avg", field: "temperature" },
+      total: { op: "sum", field: "temperature" },
+      readings: { op: "count", field: "temperature" },
+    },
+  });
+  expect(sql.statement).toContain(
+    'COALESCE(AVG("__antfly_series_source"."temperature"), 0) AS "average"'
+  );
+  expect(sql.statement).toContain(
+    'COALESCE(SUM("__antfly_series_source"."temperature"), 0) AS "total"'
+  );
+  expect(sql.statement).toContain('COUNT(*) AS "readings"');
+});

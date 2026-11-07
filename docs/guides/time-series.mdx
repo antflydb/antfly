@@ -148,7 +148,13 @@ ORDER BY device_id, bucket;
 ```
 
 `date_bin` shares exact fixed-duration arithmetic with JSON histograms, including
-origins and offset normalization. JSON metric responses retain 64-bit floating-point
+origins and offset normalization. The SQL helper casts both source timestamps and
+range parameters to datetime, including the preset's JSON string columns. For grouped
+queries using the preset's scalar keyword dimension model, it selects the same top `maxSeries` by observation count and key before
+bucketing, including canonical JSON tuple tie-breaking for composite keyword groups.
+Its selection CTE retains only the bounded series list; it does not materialize the
+entire filtered source. SQL COUNT results follow the SQL API's lossless bigint wire
+representation and can be decimal strings. JSON metric responses retain 64-bit floating-point
 precision, matching SQL floating measurements. Exact decimal SQL values retain
 their separate numeric type semantics. Use `date_trunc('day', observed_at)` for UTC
 calendar grouping. SQL emits populated groups; bounded empty generation is a JSON
@@ -166,7 +172,8 @@ duration strings, such as `'5m'`, rather than PostgreSQL `INTERVAL` values.
 TimescaleDB's [`time_bucket_gapfill`](https://docs.tigerdata.com/api/latest/hyperfunctions/gapfilling/time_bucket_gapfill/)
 is a useful model for the separate gap-generation stage: missing buckets do not
 imply measured zeroes. Antfly's bounded JSON histograms generate missing buckets,
-while SQL currently emits populated groups. Antfly does not currently expose SQL
+while SQL currently emits populated groups. With `fill: 0`, generated SQL applies
+`COALESCE` after measurement aggregation, preserving document counts. Antfly does not currently expose SQL
 `time_bucket_gapfill`, last-observation-carried-forward, or interpolation functions.
 These policies belong after aggregation, so inferred values never become facts
 in an algebraic index. TimescaleDB timezone, calendar, and default-alignment
@@ -217,7 +224,9 @@ Public aggregate recipes can declare `time` and `bucket` along with dimensions,
 operation, and measurement. Fixed buckets align to the epoch. The engine owns
 physical state and only reuses compatible, complete materializations. Grouped
 `terms → date_histogram → metrics` queries reuse the preset when their half-open
-source range aligns to the maintained bucket boundaries. Equivalent fixed widths
+source range aligns to the maintained bucket boundaries. The range proof comes
+from the source predicate, independently of `date_bounds` or empty-bucket presentation;
+`emptyBuckets: false` retains the same indexed access opportunity. Equivalent fixed widths
 such as `5m` and `300s` match. Extra maintained dimensions constrained by exact keyword filters are reduced,
 and those filters are applied, and complete shard states merge before global series
 ranking. A custom origin, unaligned boundary, unsupported predicate, stale index,
@@ -226,8 +235,10 @@ fall back because documents missing those fields may be absent from the material
 `aggregation_execution: "materialized_temporal"` when this path succeeds, or a
 `scan_...` reason when a temporal plan declines.
 
-Execution is bounded to one million maintained cells and 64 MiB of distributed
-partial data. The scan fallback retains its normal source-row limit. Choose
+Execution is bounded to one million maintained cells and 64 MiB of retained distributed
+partial data. Owner exports use bounded parallel fanout, with at most four transport
+buffers alive in a window. Budget exhaustion declines the acceleration attempt
+rather than failing an otherwise valid exact scan. The scan fallback retains its normal source-row limit. Choose
 bounded time ranges and dimensions; the accelerator scans maintained state rather
 than guaranteeing a constant-cost range lookup. TTL reuse additionally requires
 proof that every matching observation remains visible through the query deadline;
@@ -253,8 +264,11 @@ range. It is not a live subscription or an automatically advancing window.
 
 Bounded empty histograms accept metric children only and share a request-wide
 budget of 100,000 generated cells (bucket plus metrics), in addition to the 10,000
-bucket limit per histogram. Nested bucket generation is rejected before execution.
-Cancellation and deadlines are checked while folding and filling.
+bucket limit per histogram. The complete extent is reserved before constructing
+metric results, including on populated scans. Histograms without explicit bounds
+still fill interior gaps when `min_doc_count` is zero. Nested bounded bucket generation
+is rejected before execution. Cancellation and deadlines are checked while folding
+and filling; partially constructed histograms are safely released on failure.
 
 The TypeScript series helpers use the maintained AVG non-null count as an
 internal measurement-presence companion for SUM. The `count` operation counts

@@ -550,6 +550,25 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
     metrics = bucket["sub_aggregations"]["points"]["buckets"][0]["sub_aggregations"]
     assert metrics["total"]["value"] == count
     assert metrics["average"]["avg"] == 1
+    populated = copy.deepcopy(fixture["query"])
+    histogram = populated["aggregations"]["series"]["sub_aggregations"]["points"]
+    histogram.pop("date_bounds")
+    histogram["min_doc_count"] = 1
+    response = api.post("/query", dict(populated, table=name))
+    result = response.get("responses", [response])[0]
+    assert not result.get("error"), response
+    assert result["profile"].get("aggregation_execution") == "materialized_temporal", (
+        result
+    )
+    bucket = result["aggregations"]["series"]["buckets"][0]
+    assert bucket["doc_count"] == count
+    assert len(bucket["sub_aggregations"]["points"]["buckets"]) == 1
+    assert (
+        bucket["sub_aggregations"]["points"]["buckets"][0]["sub_aggregations"]["total"][
+            "value"
+        ]
+        == count
+    )
 
 
 def test_signed_origin_and_bounded_nesting_rejection(stateful_api):
@@ -600,3 +619,272 @@ def test_signed_origin_and_bounded_nesting_rejection(stateful_api):
         {"limit": 0, "aggregations": {"points": nested}},
     )
     assert rejected.status_code == 400, rejected.text
+
+
+def test_histogram_deadline_and_output_budget_remain_safe(stateful_api):
+    api = stateful_api
+    name = f"series_cancel_budget_{time.time_ns()}"
+    finish_create_table(
+        api,
+        name,
+        api._request("POST", f"/tables/{name}", {"num_shards": 1, "schema": _schema()}),
+    )
+    api.batch_write(
+        name,
+        inserts={
+            "a": {"observed_at": "2026-11-06T12:00:00Z", "temperature": 1},
+            "b": {"observed_at": "2026-11-06T12:00:09.999Z", "temperature": 3},
+        },
+        sync_level="full_index",
+    )
+    histogram = {
+        "type": "date_histogram",
+        "field": "observed_at",
+        "fixed_interval": "1ms",
+        "min_doc_count": 0,
+        "date_bounds": {"start": "2026-11-06T12:00:00Z", "end": "2026-11-06T12:00:10Z"},
+        "sub_aggregations": {
+            f"m{i}": {"type": "avg", "field": "temperature"} for i in range(16)
+        },
+    }
+    for metrics in (8, 16):
+        histogram["sub_aggregations"] = {
+            f"m{i}": {"type": "avg", "field": "temperature"} for i in range(metrics)
+        }
+        for timeout in (10, 50, 200):
+            response = api._request(
+                "POST",
+                f"/tables/{name}/query",
+                {
+                    "limit": 0,
+                    "timeout_ms": timeout,
+                    "aggregations": {"points": histogram},
+                },
+            )
+            body = response.json()
+            result = body.get("responses", [body])[0]
+            if metrics == 16:
+                assert response.status_code >= 400 or result.get("error"), response.text
+            elif response.status_code < 400 and not result.get("error"):
+                assert len(result["aggregations"]["points"]["buckets"]) == 10000
+            assert api._request("GET", "/tables").status_code == 200
+
+
+def test_unbounded_histogram_scan_index_gap_equivalence(stateful_api):
+    api = stateful_api
+    output = []
+    for indexed in (False, True):
+        name = f"series_implicit_gap_{indexed}_{time.time_ns()}"
+        config = {"num_shards": 1, "schema": _schema()}
+        if indexed:
+            config["indexes"] = {
+                "series_aggregates": {
+                    "type": "algebraic",
+                    "derive_from_schema": True,
+                    "aggregates": [
+                        {
+                            "name": "count",
+                            "op": "count",
+                            "time": "observed_at",
+                            "bucket": "5m",
+                        },
+                        {
+                            "name": "avg",
+                            "op": "avg",
+                            "measure": "temperature",
+                            "time": "observed_at",
+                            "bucket": "5m",
+                        },
+                    ],
+                }
+            }
+        finish_create_table(api, name, api._request("POST", f"/tables/{name}", config))
+        api.batch_write(
+            name,
+            inserts={
+                "a": {"observed_at": "2026-11-06T12:00:00Z", "temperature": 1},
+                "b": {"observed_at": "2026-11-06T12:10:00Z", "temperature": 3},
+            },
+            sync_level="full_index",
+        )
+        response = api.query_table(
+            name,
+            {
+                "limit": 0,
+                "profile": True,
+                "aggregations": {
+                    "points": {
+                        "type": "date_histogram",
+                        "field": "observed_at",
+                        "fixed_interval": "5m",
+                        "min_doc_count": 0,
+                        "sub_aggregations": {
+                            "avg": {"type": "avg", "field": "temperature"}
+                        },
+                    }
+                },
+            },
+        )
+        output.append(response.get("responses", [response])[0])
+    assert output[0]["aggregations"] == output[1]["aggregations"], output
+    assert len(output[1]["aggregations"]["points"]["buckets"]) == 3
+    assert (
+        output[1]["profile"].get("aggregation_execution") == "materialized_temporal"
+    ), output[1]
+
+
+def test_sdk_generated_sql_matches_group_selection_and_measurements(stateful_api):
+    api = stateful_api
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/time-series-sdk-sql.json").read_text()
+    )
+    name = f"series_sdk_sql_{time.time_ns()}"
+    finish_create_table(
+        api, name, api._request("POST", f"/tables/{name}", fixture["table"])
+    )
+    readings = {
+        "hot1": {
+            "device_id": "hot",
+            "region": "west",
+            "observed_at": "2026-11-06T12:01:00Z",
+            "temperature": 1,
+        },
+        "hot2": {
+            "device_id": "hot",
+            "region": "west",
+            "observed_at": "2026-11-06T12:01:00Z",
+        },
+        **{
+            str(i): {
+                "device_id": key,
+                "region": "west",
+                "observed_at": "2026-11-06T12:01:00Z",
+                "temperature": i,
+            }
+            for i, key in enumerate(("AA\n", "AA ", "zz"))
+        },
+        "east": {
+            "device_id": "excluded",
+            "region": "east",
+            "observed_at": "2026-11-06T12:01:00Z",
+            "temperature": 999,
+        },
+        "outside": {
+            "device_id": "excluded",
+            "region": "west",
+            "observed_at": "2026-11-06T13:00:00Z",
+            "temperature": 999,
+        },
+    }
+    readings.update(
+        {
+            "epoch_hot1": {
+                "device_id": "hot",
+                "region": "west",
+                "observed_at": "1969-12-31T23:51:00Z",
+                "temperature": 2,
+            },
+            "epoch_hot2": {
+                "device_id": "hot",
+                "region": "west",
+                "observed_at": "1969-12-31T23:51:00Z",
+                "temperature": 4,
+            },
+            "epoch_tie1": {
+                "device_id": "AA\n",
+                "region": "west",
+                "observed_at": "1969-12-31T23:51:00Z",
+                "temperature": 0,
+            },
+            "epoch_tie2": {
+                "device_id": "AA ",
+                "region": "west",
+                "observed_at": "1969-12-31T23:51:00Z",
+                "temperature": 5,
+            },
+        }
+    )
+    readings.update(
+        {
+            "missing1": {
+                "device_id": "missing",
+                "region": "zero",
+                "observed_at": "2026-11-06T12:01:00Z",
+            },
+            "missing2": {
+                "device_id": "missing",
+                "region": "zero",
+                "observed_at": "2026-11-06T12:01:00Z",
+            },
+            "measured_zero": {
+                "device_id": "zero",
+                "region": "zero",
+                "observed_at": "2026-11-06T12:01:00Z",
+                "temperature": 0,
+            },
+        }
+    )
+    api.batch_write(name, inserts=readings, sync_level="full_index")
+    for case in fixture["cases"]:
+        response = api.post("/query", dict(case["query"], table=name))
+        result = response.get("responses", [response])[0]
+        expected = []
+        for group in result["aggregations"]["series"]["buckets"]:
+            dimensions = (
+                json.loads(group["key"])
+                if len(case["options"]["groupBy"]) > 1
+                else [group["key"]]
+            )
+            for point in group["sub_aggregations"]["points"]["buckets"]:
+                if point["doc_count"] == 0:
+                    continue
+                metrics = point["sub_aggregations"]
+                average = (
+                    metrics["average"].get("avg")
+                    if metrics["average"].get("count", 0) > 0
+                    else None
+                )
+                total = (
+                    metrics["total"].get("value")
+                    if metrics["__antfly_series_count_total"].get("count", 0) > 0
+                    else None
+                )
+                expected.append(
+                    [
+                        *dimensions,
+                        point["key"],
+                        average if average is not None else case["options"].get("fill"),
+                        total if total is not None else case["options"].get("fill"),
+                        metrics["minimum"].get("value")
+                        if metrics["minimum"].get("value") is not None
+                        else case["options"].get("fill"),
+                        metrics["maximum"].get("value")
+                        if metrics["maximum"].get("value") is not None
+                        else case["options"].get("fill"),
+                        metrics["readings"].get("value"),
+                    ]
+                )
+        sql = dict(case["sql"])
+        sql["statement"] = sql["statement"].replace('"fixture"', f'"{name}"')
+        sql_response = api._request("POST", "/sql", sql)
+        assert sql_response.status_code == 200, (case["name"], sql, sql_response.text)
+        answer = sql_response.json()
+        actual = answer["rows"]
+        # SQL datetime output retains nine fraction digits; normalize only keys.
+        key_position = len(case["options"]["groupBy"])
+        for row in actual:
+            row[key_position] = row[key_position].replace(".000000000Z", "Z")
+            row[-1] = int(row[-1])  # SQL bigint counts use lossless decimal strings.
+        assert actual == expected, (case["name"], actual, expected)
+        assert len({tuple(row[:key_position]) for row in actual}) == 2
+
+    populated = copy.deepcopy(fixture["cases"][0]["query"])
+    hist = populated["aggregations"]["series"]["sub_aggregations"]["points"]
+    hist.pop("date_bounds")
+    hist["min_doc_count"] = 1
+    response = api.post("/query", dict(populated, table=name))
+    populated_result = response.get("responses", [response])[0]
+    assert (
+        populated_result["profile"].get("aggregation_execution")
+        == "materialized_temporal"
+    ), populated_result

@@ -25,10 +25,14 @@ pub fn unit(text: []const u8) ?Unit {
 }
 
 pub fn part(ns: u64, field: Unit) f64 {
-    const seconds = ns / std.time.ns_per_s;
-    const days: i64 = @intCast(seconds / 86400);
+    return partSigned(ns, field);
+}
+
+pub fn partSigned(ns: i128, field: Unit) f64 {
+    const seconds = @divFloor(ns, std.time.ns_per_s);
+    const days: i64 = @intCast(@divFloor(seconds, 86400));
     const civil = civilFromDays(days);
-    const seconds_of_day = seconds % 86400;
+    const seconds_of_day = @as(u64, @intCast(@mod(seconds, 86400)));
     const isodow = @mod(days + 3, 7) + 1;
     return switch (field) {
         .year => @floatFromInt(civil.year),
@@ -37,9 +41,9 @@ pub fn part(ns: u64, field: Unit) f64 {
         .day => @floatFromInt(civil.day),
         .hour => @floatFromInt(seconds_of_day / 3600),
         .minute => @floatFromInt(seconds_of_day % 3600 / 60),
-        .second => @as(f64, @floatFromInt(ns % (60 * std.time.ns_per_s))) / std.time.ns_per_s,
-        .milliseconds => @as(f64, @floatFromInt(ns % (60 * std.time.ns_per_s))) / std.time.ns_per_ms,
-        .microseconds => @as(f64, @floatFromInt(ns % (60 * std.time.ns_per_s))) / std.time.ns_per_us,
+        .second => @as(f64, @floatFromInt(@mod(ns, 60 * std.time.ns_per_s))) / std.time.ns_per_s,
+        .milliseconds => @as(f64, @floatFromInt(@mod(ns, 60 * std.time.ns_per_s))) / std.time.ns_per_ms,
+        .microseconds => @as(f64, @floatFromInt(@mod(ns, 60 * std.time.ns_per_s))) / std.time.ns_per_us,
         .epoch => @as(f64, @floatFromInt(ns)) / std.time.ns_per_s,
         .dow => @floatFromInt(@mod(days + 4, 7)),
         .isodow => @floatFromInt(isodow),
@@ -326,4 +330,12 @@ test "fixed temporal bins preserve offsets precision and floor before origin" {
     try std.testing.expectEqual(@as(i128, -10), binSigned(-1, 10, 0).?);
     try std.testing.expectEqual(@as(u64, 90 * std.time.ns_per_min), durationNs("1h30m").?);
     for ([_][]const u8{ "", "0s", "-1m", "1M", "1.5s", "18446744073709551615w" }) |text| try std.testing.expect(durationNs(text) == null);
+}
+
+test "time series signed datetime parts and calendar bounds agree before epoch" {
+    const ns = parseRfc3339ToSignedNs("1969-12-31T23:59:59.999999999Z").?;
+    try std.testing.expectEqual(@as(f64, 1969), partSigned(ns, .year));
+    try std.testing.expectEqual(@as(f64, 23), partSigned(ns, .hour));
+    try std.testing.expectApproxEqAbs(@as(f64, -0.000000001), partSigned(ns, .epoch), 1e-15);
+    try std.testing.expectEqual(parseRfc3339ToSignedNs("1969-10-01T00:00:00Z").?, truncateSigned(ns, .quarter).?);
 }

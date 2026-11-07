@@ -4703,7 +4703,7 @@ fn dynamicTemplateMatches(
 
 fn inferDynamicTemplateMatchType(value: std.json.Value) ?[]const u8 {
     return switch (value) {
-        .string => |text| if (parseRfc3339ToNs(text) != null or isValidDate(text)) "date" else "string",
+        .string => |text| if (storage_schema.parseRfc3339ToSignedNs(text) != null or isValidDate(text)) "date" else "string",
         .integer, .float, .number_string => "number",
         .bool => "boolean",
         .object => "object",
@@ -6501,7 +6501,7 @@ fn validateStringFormat(format: []const u8, string_value: []const u8) !void {
         return;
     }
     if (std.mem.eql(u8, format, "date-time")) {
-        if (parseRfc3339ToNs(string_value) == null) return error.InvalidBatchRequest;
+        if (storage_schema.parseRfc3339ToSignedNs(string_value) == null) return error.InvalidBatchRequest;
         return;
     }
     if (std.mem.eql(u8, format, "date")) {
@@ -7823,4 +7823,10 @@ test "time series retention accepts standard date-time strings and rejects untyp
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(a,
         \\{"ttl":{"field":"observed_at","duration":"7d"},"document_schemas":{"reading":{"schema":{"type":"object","properties":{"observed_at":{"type":"string"}}}}}}
     ));
+}
+
+test "time series date-time validation accepts signed instants" {
+    try validateStringFormat("date-time", "1969-12-31T23:51:00Z");
+    try validateStringFormat("date-time", "1970-01-01T00:00:00+01:00");
+    try std.testing.expectError(error.InvalidBatchRequest, validateStringFormat("date-time", "1969-02-30T00:00:00Z"));
 }

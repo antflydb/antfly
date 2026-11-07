@@ -4134,9 +4134,9 @@ const Evaluator = struct {
             } else error.SqlTypeMismatch,
             .datetime => blk: {
                 if (value != .string) return error.SqlTypeMismatch;
-                const ns = datetime.parseDateTimeToNs(value.string) orelse return error.InvalidSqlDateTime;
+                const ns = datetime.parseDateTimeToSignedNs(value.string) orelse return error.InvalidSqlDateTime;
                 try self.charge(30);
-                break :blk .{ .string = try datetime.formatDateTimeNsAlloc(self.alloc, ns) };
+                break :blk .{ .string = try datetime.formatDateTimeSignedNsAlloc(self.alloc, ns) };
             },
             .json => if (value == .string) blk: {
                 try self.charge(value.string.len);
@@ -4927,11 +4927,11 @@ const Evaluator = struct {
             .date_part, .date_trunc => {
                 if (first != .string or values[1] != .string) return error.SqlTypeMismatch;
                 const field = datetime.unit(first.string) orelse return error.InvalidSqlParameters;
-                const ns = datetime.parseDateTimeToNs(values[1].string) orelse return error.InvalidSqlDateTime;
-                if (function == .date_part) return .{ .float = datetime.part(ns, field) };
-                const truncated = datetime.truncate(ns, field) orelse return error.InvalidSqlDateTime;
+                const ns = datetime.parseDateTimeToSignedNs(values[1].string) orelse return error.InvalidSqlDateTime;
+                if (function == .date_part) return .{ .float = datetime.partSigned(ns, field) };
+                const truncated = datetime.truncateSigned(ns, field) orelse return error.InvalidSqlDateTime;
                 try self.charge(30);
-                return .{ .string = try datetime.formatDateTimeNsAlloc(self.alloc, truncated) };
+                return .{ .string = try datetime.formatDateTimeSignedNsAlloc(self.alloc, truncated) };
             },
             .to_timestamp => {
                 const seconds = try asFloat(first);

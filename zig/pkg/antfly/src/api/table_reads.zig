@@ -36074,6 +36074,54 @@ fn temporalOwnerBody(alloc: std.mem.Allocator, table_name: []const u8, req: db_m
     }, .{}));
 }
 
+const TemporalOwnerSlot = struct {
+    arena: std.heap.ArenaAllocator,
+    response: ?query_api.QueryResponse = null,
+    err: ?anyerror = null,
+};
+
+fn temporalAttemptDeclined(meta: *query_api.QueryResponseMeta) bool {
+    meta.aggregation_execution = @tagName(local_query_contract.TemporalDecline.scan_temporal_budget);
+    return false;
+}
+
+fn temporalOwnerFallbackError(err: anyerror) bool {
+    return switch (err) {
+        error.UnsupportedQueryRequest, error.InvalidQueryRequest, error.UnexpectedHttpStatus, error.QueryCandidateBudgetExceeded, error.AlgebraicResultBucketLimit => true,
+        else => false,
+    };
+}
+
+fn temporalOwnerErrorDeclined(meta: *query_api.QueryResponseMeta, err: anyerror) bool {
+    if (err == error.QueryCandidateBudgetExceeded or err == error.AlgebraicResultBucketLimit) return temporalAttemptDeclined(meta);
+    meta.aggregation_execution = @tagName(local_query_contract.TemporalDecline.scan_temporal_owner_unavailable);
+    return false;
+}
+
+fn runTemporalOwnerWindow(self: anytype, slots: []TemporalOwnerSlot, group_ids: []const u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency, generations: ?[]const ?u64, io: ?std.Io) void {
+    const Source = @TypeOf(self);
+    const Fiber = struct {
+        fn run(source: Source, slot: *TemporalOwnerSlot, group_id: u64, name: []const u8, request: db_mod.types.SearchRequest, read_consistency: raft_mod.ReadConsistency) void {
+            const arena_alloc = slot.arena.allocator();
+            const body = temporalOwnerBody(arena_alloc, name, request, group_id, null) catch |err| {
+                slot.err = err;
+                return;
+            };
+            slot.response = temporalOwnerCall(source, arena_alloc, group_id, name, request, body, read_consistency) catch |err| {
+                slot.err = err;
+                return;
+            };
+        }
+    };
+    var group: std.Io.Group = .init;
+    for (slots, 0..) |*slot, i| {
+        var group_req = req;
+        if (generations) |items| group_req.identity_read_generation = items[i].?;
+        if (io) |backend| group.async(backend, Fiber.run, .{ self, slot, group_ids[i], table_name, group_req, consistency }) else Fiber.run(self, slot, group_ids[i], table_name, group_req, consistency);
+    }
+    if (io) |backend| group.await(backend) catch {};
+}
+
 fn tryApplyTemporalOwnerAggregations(self: anytype, alloc: std.mem.Allocator, group_ids: []const u64, table_name: []const u8, req: db_mod.types.SearchRequest, meta: *query_api.QueryResponseMeta, consistency: raft_mod.ReadConsistency, generations: ?[]const ?u64) !bool {
     if (group_ids.len == 0 or req.aggregations_json.len == 0 or std.mem.indexOf(u8, req.aggregations_json, "date_histogram") == null) return false;
     const shapes = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
@@ -36097,33 +36145,50 @@ fn tryApplyTemporalOwnerAggregations(self: anytype, alloc: std.mem.Allocator, gr
     const a = arena.allocator();
     meta.aggregation_execution = @tagName(local_query_contract.TemporalDecline.scan_temporal_owner_unavailable);
     const shards = try a.alloc(local_query_contract.TemporalShard, group_ids.len);
-    var cells: usize = 0;
-    var bytes: usize = 0;
-    for (group_ids, 0..) |group_id, i| {
-        var group_req = req;
-        if (generations) |items| group_req.identity_read_generation = items[i].?;
-        const body = try temporalOwnerBody(a, table_name, group_req, group_id, null);
-        var response = (temporalOwnerCall(self, a, group_id, table_name, group_req, body, consistency) catch |err| switch (err) {
-            error.UnsupportedQueryRequest, error.InvalidQueryRequest, error.UnexpectedHttpStatus => return false,
-            else => return err,
-        }) orelse return false;
-        defer response.deinit(a);
-        if (try temporalOwnerDeclined(a, response.json, meta)) return false;
-        bytes += response.json.len;
-        if (bytes > local_query_contract.temporal_max_bytes) return error.QueryCandidateBudgetExceeded;
-        shards[i] = try std.json.parseFromSliceLeaky(local_query_contract.TemporalShard, a, response.json, .{ .allocate = .alloc_always });
-        if (i > 0 and !std.mem.eql(u8, shards[0].signature, shards[i].signature)) return false;
-        for (shards[i].partials) |partials| cells += partials.len;
-        if (cells > local_query_contract.temporal_max_cells) return error.QueryCandidateBudgetExceeded;
+    var transfer = local_query_contract.TemporalTransferBudget{};
+    const io_impl: ?FanoutIo = if (@hasField(@typeInfo(@TypeOf(self)).pointer.child, "io_impl")) self.io_impl else null;
+    const fanout = planFanout(.query, io_impl, group_ids.len);
+    // Keep at most one bounded fanout window of transport buffers alive. Parsed
+    // states are admitted against one request-wide budget before retention.
+    var start: usize = 0;
+    while (start < group_ids.len) : (start += fanout.width) {
+        try local_query_contract.checkQueryDeadline(req);
+        const end = @min(start + fanout.width, group_ids.len);
+        const slots = try alloc.alloc(TemporalOwnerSlot, end - start);
+        defer alloc.free(slots);
+        for (slots) |*slot| slot.* = .{ .arena = .init(alloc) };
+        defer for (slots) |*slot| slot.arena.deinit();
+        runTemporalOwnerWindow(self, slots, group_ids[start..end], table_name, req, consistency, if (generations) |items| items[start..end] else null, if (fanout.parallel) io_impl.?.io() else null);
+        // Prefer cancellation/deadline errors over optimization declines.
+        try local_query_contract.checkQueryDeadline(req);
+        for (slots) |slot| if (slot.err) |err| {
+            if (!temporalOwnerFallbackError(err)) return err;
+        };
+        for (slots, start..end) |*slot, i| {
+            if (slot.err) |err| return temporalOwnerErrorDeclined(meta, err);
+            const response = slot.response orelse return false;
+            if (try temporalOwnerDeclined(a, response.json, meta)) return false;
+            if (!transfer.acceptBytes(response.json.len)) return temporalAttemptDeclined(meta);
+            // Parse in the window arena first: rejected states are never copied
+            // into the retained request arena.
+            const parsed = try std.json.parseFromSliceLeaky(local_query_contract.TemporalShard, slot.arena.allocator(), response.json, .{});
+            var count: usize = 0;
+            for (parsed.partials) |partials| count += partials.len;
+            if (!transfer.acceptCells(count)) return temporalAttemptDeclined(meta);
+            if (i > 0 and !std.mem.eql(u8, shards[0].signature, parsed.signature)) {
+                meta.aggregation_execution = @tagName(local_query_contract.TemporalDecline.scan_temporal_schema_changed);
+                return false;
+            }
+            shards[i] = try std.json.parseFromSliceLeaky(local_query_contract.TemporalShard, a, response.json, .{ .allocate = .alloc_always });
+        }
     }
     const merged_json = try std.json.Stringify.valueAlloc(a, shards, .{});
     var fold_req = req;
     if (generations) |items| fold_req.identity_read_generation = items[0].?;
     const body = try temporalOwnerBody(a, table_name, fold_req, group_ids[0], merged_json);
-    if (body.len > local_query_contract.temporal_max_bytes) return error.QueryCandidateBudgetExceeded;
+    if (body.len > local_query_contract.temporal_max_bytes) return temporalAttemptDeclined(meta);
     var response = (temporalOwnerCall(self, a, group_ids[0], table_name, fold_req, body, consistency) catch |err| switch (err) {
-        error.UnsupportedQueryRequest, error.InvalidQueryRequest, error.UnexpectedHttpStatus => return false,
-        else => return err,
+        else => if (temporalOwnerFallbackError(err)) return temporalOwnerErrorDeclined(meta, err) else return err,
     }) orelse return false;
     defer response.deinit(a);
     if (try temporalOwnerDeclined(a, response.json, meta)) return false;
@@ -36172,4 +36237,46 @@ fn tryApplyCapturedTemporalAggregations(alloc: std.mem.Allocator, req: db_mod.ty
     meta.aggregation_results = results;
     meta.aggregation_execution = "materialized_temporal";
     return true;
+}
+
+test "time series temporal owner fanout bounds waves and joins failures" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const Fixture = struct {
+        io: std.Io,
+        active: std.atomic.Value(u32) = .init(0),
+        peak: std.atomic.Value(u32) = .init(0),
+        calls: std.atomic.Value(u32) = .init(0),
+        fn groupLocalSource(self: *@This()) *@This() {
+            return self;
+        }
+        fn algebraicPartialsGroupLocal(self: *@This(), alloc: std.mem.Allocator, owner: u64, _: []const u8, _: []const u8) !?query_api.QueryResponse {
+            const live = self.active.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            _ = self.peak.fetchMax(live, .monotonic);
+            _ = self.calls.fetchAdd(1, .monotonic);
+            try self.io.sleep(.fromMilliseconds(20), .awake);
+            if (owner == 3) return error.Timeout;
+            return .{ .json = try std.fmt.allocPrint(alloc, "{d}", .{owner}) };
+        }
+    };
+    var fixture = Fixture{ .io = threaded.io() };
+    var slots: [4]TemporalOwnerSlot = undefined;
+    for (&slots) |*slot| slot.* = .{ .arena = .init(a) };
+    defer for (&slots) |*slot| slot.arena.deinit();
+    runTemporalOwnerWindow(&fixture, &slots, &.{ 1, 2, 3, 4 }, "readings", .{}, .stale, null, threaded.io());
+    try std.testing.expect(fixture.peak.load(.monotonic) > 1);
+    try std.testing.expect(fixture.peak.load(.monotonic) <= 4);
+    try std.testing.expectEqual(@as(u32, 0), fixture.active.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 4), fixture.calls.load(.monotonic));
+    try std.testing.expectEqual(error.Timeout, slots[2].err.?);
+    try std.testing.expect(!temporalOwnerFallbackError(error.Timeout));
+    try std.testing.expect(temporalOwnerFallbackError(error.QueryCandidateBudgetExceeded));
+    var meta = query_api.QueryResponseMeta{};
+    try std.testing.expect(!temporalAttemptDeclined(&meta));
+    try std.testing.expectEqualStrings("scan_temporal_budget", meta.aggregation_execution.?);
+    try std.testing.expectEqual(@as(usize, 0), meta.aggregation_results.len);
+    try std.testing.expect(!temporalOwnerErrorDeclined(&meta, error.UnsupportedQueryRequest));
+    try std.testing.expectEqualStrings("scan_temporal_owner_unavailable", meta.aggregation_execution.?);
 }

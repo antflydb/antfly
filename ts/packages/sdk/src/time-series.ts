@@ -27,6 +27,7 @@ export type SeriesBucket =
 export interface SeriesQueryOptions extends SeriesRange {
   table: string;
   bucket: SeriesBucket;
+  /** Keyword dimensions; SQL follows the preset's scalar dimension model. */
   groupBy?: string[];
   measures: Record<string, { op: "count" | "sum" | "avg" | "min" | "max"; field: string }>;
   /** Maximum returned series; the ordinary terms aggregation limit applies. */
@@ -354,35 +355,73 @@ export function seriesBatch(
  * presentation option). Identifier quoting preserves names without SQL injection.
  */
 export function seriesSQL(options: SeriesQueryOptions): SQLRequest {
-  seriesQuery(options);
-  const quote = (name: string) => `"${name.replace(/"/g, '""')}"`;
+  // SQL emits populated buckets, so JSON presentation limits do not apply.
+  seriesQuery({ ...options, emptyBuckets: false });
+  const quote = (name: string) => `"${name.replace(/"/g, '\"\"')}"`;
   const parameters: unknown[] = [options.start, options.end];
   const parameter = (value: unknown) => {
     parameters.push(value);
     return `$${parameters.length}`;
   };
-  const timestamp = quote(options.timestamp);
+  const groupBy = options.groupBy ?? [];
+  const used = new Set([
+    options.table,
+    options.timestamp,
+    ...groupBy,
+    ...Object.keys(options.measures),
+  ]);
+  const internal = (base: string) => {
+    let name = base;
+    while (used.has(name)) name += "_";
+    used.add(name);
+    return quote(name);
+  };
+  const source = internal("__antfly_series_source");
+  const selected = internal("__antfly_series_selected");
+  const selectedCount = internal("__antfly_series_documents");
+  const column = (field: string, prefix = "") => `${prefix}${quote(field)}`;
+  // The preset's logical JSON column is a string. Cast source instants as well
+  // as parameters; textual comparison would order timezone offsets incorrectly.
+  const timestamp = `${column(options.timestamp, `${source}.`)}::datetime`;
   const bucket = options.bucket.every
     ? `date_bin(${parameter(options.bucket.every)}, ${timestamp}, ${parameter(options.bucket.origin ?? "1970-01-01T00:00:00Z")}::datetime)`
     : `date_trunc(${parameter(options.bucket.calendar)}, ${timestamp})`;
-  const dimensions = (options.groupBy ?? []).map(quote);
+  const dimensionFilters = Object.entries(options.dimensions ?? {}).map(
+    ([field, value]) => [field, parameter(value)] as const
+  );
+  const predicates = (prefix = "") =>
+    [
+      `${column(options.timestamp, prefix)}::datetime >= $1::datetime`,
+      `${column(options.timestamp, prefix)}::datetime < $2::datetime`,
+      ...dimensionFilters.map(([field, value]) => `${column(field, prefix)} = ${value}`),
+      ...groupBy.map((field) => `NOT is_missing(${column(field, prefix)})`),
+    ].join(" AND ");
+  const dimensions = groupBy.map((field) => column(field, `${source}.`));
   const columns = [
     ...dimensions,
     `${bucket} AS "bucket"`,
-    ...Object.entries(options.measures).map(
-      ([name, metric]) =>
-        `${metric.op.toUpperCase()}(${metric.op === "count" ? "*" : quote(metric.field)}) AS ${quote(name)}`
-    ),
+    ...Object.entries(options.measures).map(([name, metric]) => {
+      const aggregate = `${metric.op.toUpperCase()}(${metric.op === "count" ? "*" : column(metric.field, `${source}.`)})`;
+      const value =
+        options.fill === 0 && metric.op !== "count" ? `COALESCE(${aggregate}, 0)` : aggregate;
+      return `${value} AS ${quote(name)}`;
+    }),
   ];
-  const predicates = [
-    `${timestamp} >= $1::datetime`,
-    `${timestamp} < $2::datetime`,
-    ...Object.entries(options.dimensions ?? {}).map(
-      ([name, value]) => `${quote(name)} = ${parameter(value)}`
-    ),
-  ];
+  // Composite terms tie-break on their canonical JSON tuple, including escaping.
+  const key = (fields: string[]) =>
+    fields.length === 1
+      ? fields[0]
+      : `concat('[', ${fields.map((field) => `COALESCE(to_jsonb(${field})::text, 'null')`).join(", ',', ")}, ']')`;
+  const topDimensions = groupBy.map(quote);
+  const cte = groupBy.length
+    ? `WITH ${selected} AS (SELECT ${topDimensions.join(", ")}, COUNT(*) AS ${selectedCount} FROM ${quote(options.table)} WHERE ${predicates()} GROUP BY ${topDimensions.join(", ")} ORDER BY COUNT(*) DESC, ${key(topDimensions)} ASC LIMIT ${parameter(options.maxSeries ?? 100)}) `
+    : "";
+  const join = groupBy.length
+    ? ` JOIN ${selected} ON ${groupBy.map((field) => `${column(field, `${source}.`)} IS NOT DISTINCT FROM ${column(field, `${selected}.`)}`).join(" AND ")}`
+    : "";
+  const count = `${selected}.${selectedCount}`;
   return {
-    statement: `SELECT ${columns.join(", ")} FROM ${quote(options.table)} WHERE ${predicates.join(" AND ")} GROUP BY ${[...dimensions, bucket].join(", ")} ORDER BY ${[...dimensions, '"bucket"'].join(", ")}`,
+    statement: `${cte}SELECT ${columns.join(", ")} FROM ${quote(options.table)} AS ${source}${join} WHERE ${predicates(`${source}.`)} GROUP BY ${[...dimensions, bucket, ...(groupBy.length ? [count] : [])].join(", ")} ORDER BY ${[...(groupBy.length ? [`${count} DESC`, `${key(dimensions)} ASC`] : []), bucket].join(", ")}`,
     parameters,
   };
 }
