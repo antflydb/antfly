@@ -30,6 +30,9 @@ pub const Token = struct {
     source: publication.Source,
     inherited_sources: std.ArrayList(publication.Source) = .empty,
     producer_scope_key: []const u8 = "",
+    execution_identity: ?publication.Digest = null,
+    /// Census readers accept any execution; producers explicitly bind even a null revision.
+    execution_bound: bool = false,
     reads: std.ArrayList(publication.ArtifactSource) = .empty,
     preconditions: std.ArrayList(publication.ArtifactSource) = .empty,
     read_key_bytes: usize = 0,
@@ -134,10 +137,15 @@ pub const Token = struct {
     /// Returning ownership avoids resolving and decoding the same proof twice.
     pub fn acceptedProof(self: *Token, alloc: std.mem.Allocator, txn: anytype) !?@import("artifact_producer_provenance.zig").Accepted {
         const selector = try self.command(&.{});
-        return @import("artifact_producer_provenance.zig").readCurrentForSource(alloc, txn, selector, self.source) catch |err| switch (err) {
+        var current = (@import("artifact_producer_provenance.zig").readCurrentForSource(alloc, txn, selector, self.source) catch |err| switch (err) {
             error.EnrichmentSourceChanged => return null,
             else => return err,
-        };
+        }) orelse return null;
+        if (self.execution_bound and !std.meta.eql(self.execution_identity, current.owned.proof.execution_identity)) {
+            current.deinit();
+            return null;
+        }
+        return current;
     }
 
     /// Includes required absences (review overrides and sibling outputs).
@@ -197,6 +205,7 @@ pub const Token = struct {
             .producer_generation = self.producer_generation,
             .producer_artifact_name = self.artifact_name,
             .producer_scope_key = self.producer_scope_key,
+            .execution_identity = self.execution_identity,
             .sources = self.sources(),
             .artifact_sources = self.reads.items,
             .mutation_preconditions = self.preconditions.items,

@@ -134,13 +134,14 @@ pub const Proof = struct {
             self.artifact_sources.len > publication.max_source_documents or
             self.mutation_preconditions.len > publication.max_source_documents - self.artifact_sources.len or self.effects.len == 0 or
             self.effects.len > publication.max_mutations or !std.mem.eql(u8, &self.input_digest, &self.inputCommand().inputDigest())) return error.ArtifactCatalogCorrupt;
-        if (self.execution_identity != null and (self.producer_kind != .index or self.producer_scope_key.len != 0 or
-            self.sources.len != 1 or self.effects.len != 1 or self.effects[0].family != .base_vector)) return error.ArtifactCatalogCorrupt;
+        if (self.execution_identity != null and (self.producer_kind != .index or
+            (self.producer_scope_key.len == 0 and self.sources.len != 1) or self.effects.len != 1 or
+            self.effects[0].family != (if (self.producer_scope_key.len == 0) @as(@FieldType(Effect, "family"), .base_vector) else @as(@FieldType(Effect, "family"), .derived_vector)))) return error.ArtifactCatalogCorrupt;
         for (self.effects) |effect| if (effect.source_index >= self.sources.len or
             (effect.value_digest == null and effect.value_bytes != 0)) return error.ArtifactCatalogCorrupt;
         if (self.origin) |origin| {
             if (!origin.binding.valid() or origin.binding.effect_protocol < 15 or
-                (self.execution_identity != null and origin.binding.effect_protocol < 17) or
+                (self.execution_identity != null and origin.binding.effect_protocol < @as(u16, if (self.producer_scope_key.len == 0) 17 else 18)) or
                 std.mem.allEqual(u8, &origin.source_pin, 0) or std.mem.allEqual(u8, &origin.binding.digest, 0) or
                 std.mem.allEqual(u8, &origin.proof_checksum, 0) or self.mutation_preconditions.len != 0 or
                 origin.selected_bitmap.len != (self.sources.len + 7) / 8) return error.ArtifactCatalogCorrupt;
