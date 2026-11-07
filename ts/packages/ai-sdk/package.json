@@ -34,7 +34,8 @@
   },
   "dependencies": {
     "@antfly/sdk": "workspace:^",
-    "@ai-sdk/provider": "4.0.35"
+    "@ai-sdk/provider": "4.0.35",
+    "@ai-sdk/provider-utils": "5.0.74"
   },
   "peerDependencies": {
     "ai": "^7.0.162",

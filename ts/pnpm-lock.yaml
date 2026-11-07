@@ -424,6 +424,9 @@ importers:
       '@ai-sdk/provider':
         specifier: 4.0.35
         version: 4.0.35
+      '@ai-sdk/provider-utils':
+        specifier: 5.0.74
+        version: 5.0.74(zod@4.6.7)
       '@antfly/sdk':
         specifier: workspace:^
         version: link:../sdk

@@ -1,5 +1,7 @@
+import { APICallError } from "@ai-sdk/provider";
 import { AntflyClient, InferenceAPIError, InferenceClient } from "@antfly/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { getInferenceError } from "../src/asset/errors.js";
 import { assetProviderReference } from "../src/asset/reference.js";
 import { AntflyChatLanguageModel } from "../src/language-model.js";
 
@@ -107,8 +109,9 @@ describe("doGenerate", () => {
     await expect(
       model().doGenerate({ prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }] })
     ).rejects.toSatisfy((error: unknown) => {
-      expect(error).toBeInstanceOf(InferenceAPIError);
-      expect((error as InferenceAPIError).code).toBe("video_limit_exceeded");
+      expect(error).toBeInstanceOf(APICallError);
+      expect(getInferenceError(error)).toBeInstanceOf(InferenceAPIError);
+      expect(getInferenceError(error)?.code).toBe("video_limit_exceeded");
       return true;
     });
   });
@@ -422,13 +425,13 @@ it("replays parallel tool results as ordered individual wire messages", async ()
 
 it("stream cancellation aborts an inference request blocked before its first token", async () => {
   let signal: AbortSignal | undefined;
-  const fetchMock = vi.fn(
-    (_input: unknown, init?: RequestInit) =>
-      new Promise<Response>((_resolve, reject) => {
-        signal = init?.signal ?? undefined;
-        signal?.addEventListener("abort", () => reject(signal?.reason), { once: true });
-      })
-  );
+  const cancel = vi.fn();
+  const fetchMock = vi.fn(async (_input: unknown, init?: RequestInit) => {
+    signal = init?.signal ?? undefined;
+    return new Response(new ReadableStream({ cancel }, { highWaterMark: 0 }), {
+      headers: { "content-type": "text/event-stream" },
+    });
+  });
   vi.stubGlobal("fetch", fetchMock);
   const { stream } = await model().doStream({ prompt: [] });
   const reader = stream.getReader();
@@ -437,6 +440,7 @@ it("stream cancellation aborts an inference request blocked before its first tok
   await reader.cancel("client disconnected");
   expect(signal?.aborted).toBe(true);
   expect(signal?.reason).toBe("client disconnected");
+  expect(cancel).toHaveBeenCalledOnce();
 });
 
 it("retains caller aborts while combining stream cancellation", async () => {

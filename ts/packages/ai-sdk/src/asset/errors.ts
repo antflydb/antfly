@@ -44,8 +44,19 @@ export const ASSET_ERROR_CODES = {
   modelResourceBusy: "MODEL_RESOURCE_BUSY",
 } as const;
 
+/** Recover Antfly details from provider errors and exhausted AI SDK retries. */
+export function getInferenceError(error: unknown): InferenceAPIError | undefined {
+  const seen = new Set<unknown>();
+  for (let depth = 0; depth < 16 && error instanceof Error && !seen.has(error); depth++) {
+    if (error instanceof InferenceAPIError) return error;
+    seen.add(error);
+    error = "lastError" in error ? error.lastError : error.cause;
+  }
+  return undefined;
+}
+
 function codeOf(error: unknown): string | undefined {
-  return error instanceof InferenceAPIError ? error.code : undefined;
+  return getInferenceError(error)?.code;
 }
 
 export function isAssetCode(
@@ -74,7 +85,9 @@ export const isContextManagementWithMedia = (error: unknown) =>
  * backend (503, `VIDEO_BACKEND_UNAVAILABLE`), or shared model-load admission
  * (503, `MODEL_RESOURCE_BUSY`, already a distinct `InferenceCapacityError`).
  */
-export function isRetryableCapacityError(error: unknown): error is InferenceAPIError {
+export function isRetryableCapacityError(error: unknown): boolean {
+  error = getInferenceError(error);
+  if (!(error instanceof InferenceAPIError) || error.retryable === false) return false;
   if (error instanceof InferenceCapacityError) return true;
   return (
     isAssetCode(error, ASSET_ERROR_CODES.sourceCapacityUnavailable) ||
@@ -84,5 +97,6 @@ export function isRetryableCapacityError(error: unknown): error is InferenceAPIE
 
 /** A caller-chosen retry delay for a capacity error that doesn't carry its own `retryAfterMs`. */
 export function retryDelayMs(error: unknown, fallbackMs = 1000): number {
-  return error instanceof InferenceCapacityError ? error.retryAfterMs : fallbackMs;
+  const inference = getInferenceError(error);
+  return inference instanceof InferenceCapacityError ? inference.retryAfterMs : fallbackMs;
 }

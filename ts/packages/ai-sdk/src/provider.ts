@@ -7,7 +7,7 @@ import {
   type SDKConfig,
 } from "@antfly/sdk";
 import type { AuthorizeAsset } from "./asset/reference.js";
-import { AntflyEmbeddingModel } from "./embedding-model.js";
+import { type AntflyEmbeddingLimits, AntflyEmbeddingModel } from "./embedding-model.js";
 import { AntflyChatLanguageModel } from "./language-model.js";
 import { AntflyRerankingModel } from "./reranking-model.js";
 
@@ -17,6 +17,8 @@ export type AntflyProviderOptions = SDKConfig & {
    * `providerReference.antfly` are refused.
    */
   authorizeAsset?: AuthorizeAsset;
+  /** Defaults for all embedding models; override per model when deployments differ. */
+  embedding?: AntflyEmbeddingLimits;
 };
 
 /**
@@ -32,6 +34,7 @@ export interface AntflyLanguageModelOptions {
 
 export interface AntflyProvider extends ProviderV4 {
   languageModel(modelId: string, options?: AntflyLanguageModelOptions): LanguageModelV4;
+  embeddingModel(modelId: string, options?: AntflyEmbeddingLimits): AntflyEmbeddingModel;
   readonly client: AntflyClient;
   readonly inference: InferenceClient;
   // Narrowed from ProviderV4's optional `rerankingModel?`: this provider
@@ -68,8 +71,14 @@ export function createAntfly(options: AntflyProviderOptions): AntflyProvider {
         client,
         authorizeAsset: modelOptions?.authorizeAsset ?? options.authorizeAsset,
       }),
-    embeddingModel: (modelId: string) =>
-      new AntflyEmbeddingModel({ inference, modelId, providerId: "antfly" }),
+    embeddingModel: (modelId: string, limits?: AntflyEmbeddingLimits) =>
+      new AntflyEmbeddingModel({
+        ...options.embedding,
+        ...limits,
+        inference,
+        modelId,
+        providerId: "antfly",
+      }),
     rerankingModel: (modelId: string) =>
       new AntflyRerankingModel({ inference, modelId, providerId: "antfly" }),
     imageModel: (modelId: string): ImageModelV4 => {

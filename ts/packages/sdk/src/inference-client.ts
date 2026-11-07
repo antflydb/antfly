@@ -45,6 +45,7 @@ import type {
 } from "./inference-types.js";
 import type { components, paths } from "./public-api.js";
 import { parseSSEFrames } from "./sse.js";
+import { awaitResponse, decodedResponseStream } from "./streaming-response.js";
 
 function validateContextAttestation(
   request: Omit<GenerateRequest, "stream">,
@@ -80,7 +81,8 @@ export class InferenceAPIError extends Error {
     detail: string,
     readonly retryable: boolean | undefined,
     readonly inputIndex?: number,
-    readonly stage?: string
+    readonly stage?: string,
+    readonly responseHeaders?: Record<string, string>
   ) {
     super(`inference request failed (${status}): ${detail}`);
     this.name = "InferenceAPIError";
@@ -98,8 +100,16 @@ export class InferenceCapacityError extends InferenceAPIError {
   readonly retryAfterMs: number;
   readonly retryable = true as const;
 
-  constructor(details: CompatibleTransientCapacityError) {
-    super(503, details.error, `${details.message} (${details.error})`, true);
+  constructor(details: CompatibleTransientCapacityError, responseHeaders?: Record<string, string>) {
+    super(
+      503,
+      details.error,
+      `${details.message} (${details.error})`,
+      true,
+      undefined,
+      undefined,
+      responseHeaders
+    );
     this.name = "InferenceCapacityError";
     this.code = details.error;
     this.reason = details.reason;
@@ -231,18 +241,22 @@ export class InferenceClient {
     }
   }
 
-  /** Stream chat-completion chunks until the server sends the [DONE] sentinel. */
-  async *generateStream(
+  /** Open and validate SSE headers without waiting for the first event or token. */
+  async openGenerateStream(
     request: Omit<GenerateRequest, "stream">,
     options?: RequestOptions
-  ): AsyncGenerator<GenerateChunk, void, void> {
-    const response = await fetch(`${this.baseUrl}/ai/v1/generate`, {
-      method: "POST",
-      headers: this.requestHeaders(options?.headers, "text/event-stream"),
-      body: JSON.stringify({ ...request, stream: true }),
-      signal: options?.signal,
-    });
-    if (!response.ok) throw await inferenceAPIErrorResponse(response);
+  ): Promise<ReadableStream<GenerateChunk>> {
+    options?.signal?.throwIfAborted();
+    const response = await awaitResponse(
+      fetch(`${this.baseUrl}/ai/v1/generate`, {
+        method: "POST",
+        headers: this.requestHeaders(options?.headers, "text/event-stream"),
+        body: JSON.stringify({ ...request, stream: true }),
+        signal: options?.signal,
+      }),
+      options?.signal
+    );
+    if (!response.ok) throw await inferenceAPIErrorResponse(response, options?.signal);
 
     const contentType = response.headers
       .get("content-type")
@@ -250,17 +264,47 @@ export class InferenceClient {
       ?.trim()
       .toLowerCase();
     if (contentType !== "text/event-stream") {
-      await response.body?.cancel();
+      void response.body?.cancel().catch(() => {});
       throw new Error(
         `Generation stream returned content type ${JSON.stringify(response.headers.get("content-type") ?? "")}`
       );
     }
     if (!response.body) throw new Error("Generation stream returned an empty body");
 
+    return decodedResponseStream(
+      response.body,
+      (bytes) => this.decodeGenerateStream(bytes, request),
+      options?.signal
+    );
+  }
+
+  /** Stream chat-completion chunks until the server sends the [DONE] sentinel. */
+  async *generateStream(
+    request: Omit<GenerateRequest, "stream">,
+    options?: RequestOptions
+  ): AsyncGenerator<GenerateChunk, void, void> {
+    const stream = await this.openGenerateStream(request, options);
+    const reader = stream.getReader();
+    try {
+      while (true) {
+        const next = await reader.read();
+        if (next.done) return;
+        yield next.value;
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+  }
+
+  private async *decodeGenerateStream(
+    body: ReadableStream<Uint8Array>,
+    request: Omit<GenerateRequest, "stream">
+  ): AsyncGenerator<GenerateChunk, void, void> {
     const requiresContextAttestation =
       request.context_management !== undefined || request.kv_cache !== undefined;
     let sawContextAttestation = false;
-    for await (const frame of parseSSEFrames(response.body)) {
+    for await (const frame of parseSSEFrames(body)) {
       if (frame.event === "error") throw new Error(`Generation stream failed: ${frame.data}`);
       if (frame.data.trim() === "[DONE]") {
         if (requiresContextAttestation && !sawContextAttestation) {
@@ -334,7 +378,7 @@ export class InferenceClient {
       signal: options?.signal,
       headers: this.requestHeaders(options?.headers, "application/json"),
     });
-    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!response.ok) throw inferenceAPIError(response.status, error, retryHeaders(response));
     if (!data) throw new Error("Embed failed: unexpected empty response");
     // The current API contract returns the OpenAI-compatible JSON shape.
     return data as EmbedResponse;
@@ -448,7 +492,7 @@ export class InferenceClient {
       signal: options?.signal,
       headers: this.requestHeaders(options?.headers, "application/json"),
     });
-    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!response.ok) throw inferenceAPIError(response.status, error, retryHeaders(response));
     if (!data) throw new Error("Chunk failed: unexpected empty response");
     if (data.object !== "list") throw new Error("Unexpected chunk response type");
     return data;
@@ -464,7 +508,7 @@ export class InferenceClient {
       signal: options?.signal,
       headers: this.requestHeaders(options?.headers, "application/json"),
     });
-    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!response.ok) throw inferenceAPIError(response.status, error, retryHeaders(response));
     if (data?.object !== "chunk.embedding.list")
       throw new Error("Unexpected chunk embedding response");
     return data;
@@ -595,7 +639,7 @@ export class InferenceClient {
         documents,
       },
     });
-    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!response.ok) throw inferenceAPIError(response.status, error, retryHeaders(response));
     if (!data) throw new Error("Rerank failed: unexpected empty response");
     return data;
   }
@@ -647,7 +691,7 @@ export class InferenceClient {
     request: components["schemas"]["InferenceReadRequest"]
   ): Promise<components["schemas"]["InferenceReadResponse"]> {
     const { data, error, response } = await this.client.POST("/ai/v1/read", { body: request });
-    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!response.ok) throw inferenceAPIError(response.status, error, retryHeaders(response));
     if (!data) throw new Error("Read failed: unexpected empty response");
     return data;
   }
@@ -664,7 +708,7 @@ export class InferenceClient {
     const { data, error, response } = await this.client.POST("/ai/v1/extract", {
       body: request,
     });
-    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!response.ok) throw inferenceAPIError(response.status, error, retryHeaders(response));
     if (!data) throw new Error("Extract failed: unexpected empty response");
     if (request.schema_version === 2) {
       validateExtractionV2Response(data, expectedModel, expectedIds);
@@ -677,7 +721,7 @@ export class InferenceClient {
     const { data, error, response } = await this.client.POST("/ai/v1/extract", {
       body: request,
     });
-    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!response.ok) throw inferenceAPIError(response.status, error, retryHeaders(response));
     if (!data) throw new Error("Extract failed: unexpected empty response");
     return data;
   }
@@ -692,7 +736,7 @@ export class InferenceClient {
     const { data, error, response } = await this.client.POST("/ai/v1/decisions", {
       body: request,
     });
-    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!response.ok) throw inferenceAPIError(response.status, error, retryHeaders(response));
     if (!data) throw new Error("Decide failed: unexpected empty response");
     return data;
   }
@@ -802,7 +846,7 @@ export class InferenceClient {
         inputs,
       },
     });
-    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!response.ok) throw inferenceAPIError(response.status, error, retryHeaders(response));
     if (!data) throw new Error("Rewrite failed: unexpected empty response");
     return data;
   }
@@ -830,7 +874,7 @@ export class InferenceClient {
    */
   async listModels(): Promise<ModelsResponse> {
     const { data, error, response } = await this.client.GET("/ai/v1/models");
-    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!response.ok) throw inferenceAPIError(response.status, error, retryHeaders(response));
     if (!data) throw new Error("List models failed: unexpected empty response");
     return data;
   }
@@ -843,7 +887,7 @@ export class InferenceClient {
       signal: options?.signal,
       headers: this.requestHeaders(options?.headers, "application/json"),
     });
-    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!response.ok) throw inferenceAPIError(response.status, error, retryHeaders(response));
     if (!data) throw new Error("List model instances failed: unexpected empty response");
     return data;
   }
@@ -858,7 +902,7 @@ export class InferenceClient {
       signal: options?.signal,
       headers: this.requestHeaders(options?.headers, "application/json"),
     });
-    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!response.ok) throw inferenceAPIError(response.status, error, retryHeaders(response));
     if (!data) throw new Error("Load model instance failed: unexpected empty response");
     return data;
   }
@@ -876,7 +920,7 @@ export class InferenceClient {
         headers: this.requestHeaders(options?.headers, "application/json"),
       }
     );
-    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!response.ok) throw inferenceAPIError(response.status, error, retryHeaders(response));
     if (!data) throw new Error("Unload model instance failed: unexpected empty response");
     return data;
   }
@@ -926,9 +970,13 @@ function validateExtractionV2Response(
   }
 }
 
-function inferenceAPIError(status: number, error: InferenceError | unknown): InferenceAPIError {
+function inferenceAPIError(
+  status: number,
+  error: InferenceError | unknown,
+  responseHeaders?: Record<string, string>
+): InferenceAPIError {
   if (status === 503 && isTransientCapacityError(error)) {
-    return new InferenceCapacityError(error);
+    return new InferenceCapacityError(error, responseHeaders);
   }
   const payload =
     typeof error === "object" && error !== null ? (error as Partial<InferenceError>) : {};
@@ -965,11 +1013,35 @@ function inferenceAPIError(status: number, error: InferenceError | unknown): Inf
       ? payload.input_index
       : undefined;
   const stage = typeof payload.stage === "string" ? payload.stage : undefined;
-  return new InferenceAPIError(status, code, detail, retryable, inputIndex, stage);
+  return new InferenceAPIError(status, code, detail, retryable, inputIndex, stage, responseHeaders);
 }
 
-async function inferenceAPIErrorResponse(response: Response): Promise<InferenceAPIError> {
-  const { text, truncated } = await readLimitedResponseText(response, MAX_INFERENCE_ERROR_BYTES);
+// Retain only valid retry metadata, never arbitrary response headers or bodies.
+function retryHeaders(response: Response): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const name of ["retry-after-ms", "retry-after"]) {
+    const value = response.headers.get(name);
+    if (value === null) continue;
+    if (/^\d+(?:\.\d+)?$/.test(value) && Number.isFinite(Number(value))) headers[name] = value;
+    else if (
+      name === "retry-after" &&
+      /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun),/.test(value) &&
+      Number.isFinite(Date.parse(value))
+    )
+      headers[name] = new Date(value).toUTCString();
+  }
+  return headers;
+}
+
+async function inferenceAPIErrorResponse(
+  response: Response,
+  signal?: AbortSignal
+): Promise<InferenceAPIError> {
+  const { text, truncated } = await readLimitedResponseText(
+    response,
+    MAX_INFERENCE_ERROR_BYTES,
+    signal
+  );
   let error: unknown = {
     error: text.trim() || response.statusText || `HTTP ${response.status}`,
   };
@@ -983,7 +1055,7 @@ async function inferenceAPIErrorResponse(response: Response): Promise<InferenceA
       error: `${response.statusText || `HTTP ${response.status}`} (response body exceeded ${MAX_INFERENCE_ERROR_BYTES} bytes)`,
     };
   }
-  return inferenceAPIError(response.status, error);
+  return inferenceAPIError(response.status, error, retryHeaders(response));
 }
 
 function responseMediaType(response: Response): string {

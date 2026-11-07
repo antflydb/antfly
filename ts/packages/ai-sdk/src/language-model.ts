@@ -8,10 +8,11 @@ import type {
   LanguageModelV4Usage,
   SharedV4Warning,
 } from "@ai-sdk/provider";
-import type { AntflyClient, GenerateRequest, InferenceClient } from "@antfly/sdk";
+import type { AntflyClient, GenerateChunk, GenerateRequest, InferenceClient } from "@antfly/sdk";
 import { abortable, combinedSignal } from "./abort.js";
 import { resolveAuthorizedAsset } from "./asset/catalog.js";
 import { type AuthorizeAsset, decodeAssetReference } from "./asset/reference.js";
+import { providerInferenceError } from "./inference-error.js";
 import {
   type ResolveAssetReference,
   toInferenceMessages,
@@ -45,8 +46,8 @@ export interface AntflyChatLanguageModelOptions {
  * `GenerateRequest`/`GenerateResponse` contract). Built on
  * `@antfly/sdk`'s `InferenceClient` rather than raw `fetch`, so inference
  * errors (including gateway limits such as Local Gemma 4's one-video-per-request
- * cap) surface as `InferenceAPIError`/`InferenceCapacityError` instead of being
- * swallowed.
+ * cap) surface as AI SDK provider errors with the original
+ * `InferenceAPIError`/`InferenceCapacityError` preserved as their cause.
  *
  * Known gaps, honestly documented rather than silently ignored:
  * - `stopSequences` and `seed` are not supported by `InferenceGenerateRequest`
@@ -80,10 +81,14 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
   async doGenerate(options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
     const warnings: SharedV4Warning[] = [];
     const request = await abortable(this.buildRequest(options, warnings), options.abortSignal);
-    const response = await this.inference.generate(request, {
-      signal: options.abortSignal,
-      headers: options.headers,
-    });
+    const response = await this.inference
+      .generate(request, {
+        signal: options.abortSignal,
+        headers: options.headers,
+      })
+      .catch((error) => {
+        throw providerInferenceError(error, "generate");
+      });
     return {
       content: toContent(response),
       finishReason: toFinishReason(response.choices[0]?.finish_reason),
@@ -105,7 +110,12 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
       this.buildRequest({ ...options, abortSignal: signal }, warnings),
       signal
     );
-    const parts = this.streamParts(request, warnings, signal, options.headers);
+    const chunks = await this.inference
+      .openGenerateStream(request, { signal, headers: options.headers })
+      .catch((error) => {
+        throw providerInferenceError(error, "generate");
+      });
+    const parts = this.streamParts(chunks, warnings);
     let cancelled = false;
     return {
       stream: new ReadableStream<LanguageModelV4StreamPart>({
@@ -171,10 +181,8 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
   }
 
   private async *streamParts(
-    request: Omit<GenerateRequest, "stream">,
-    warnings: SharedV4Warning[],
-    signal: AbortSignal | undefined,
-    headers: LanguageModelV4CallOptions["headers"]
+    chunks: ReadableStream<GenerateChunk>,
+    warnings: SharedV4Warning[]
   ): AsyncGenerator<LanguageModelV4StreamPart> {
     yield { type: "stream-start", warnings };
     let sentResponseMetadata = false;
@@ -188,8 +196,12 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
     >();
     let finishReason: LanguageModelV4FinishReason = { unified: "other", raw: undefined };
     let usage: LanguageModelV4Usage = toUsage(undefined);
+    const reader = chunks.getReader();
     try {
-      for await (const chunk of this.inference.generateStream(request, { signal, headers })) {
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        const chunk = next.value;
         if (!sentResponseMetadata) {
           yield {
             type: "response-metadata",
@@ -241,8 +253,11 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
         if (choice.finish_reason) finishReason = toFinishReason(choice.finish_reason);
       }
     } catch (error) {
-      yield { type: "error", error };
+      yield { type: "error", error: providerInferenceError(error, "generate") };
       return;
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
     }
     if (reasoningOpen) yield { type: "reasoning-end", id: reasoningId };
     if (textOpen) yield { type: "text-end", id: textId };

@@ -105,16 +105,18 @@ export async function fetchSourceResponse(
   try {
     const headers = new Headers(init.headers);
     headers.set("accept-encoding", "identity");
-    const pending = Promise.resolve().then(async () => {
+    const pending = Promise.resolve().then(() => {
       signal?.throwIfAborted();
-      const response = await fetchFn(uri, { ...init, headers });
-      if (signal?.aborted) {
-        void discardSourceBody(response.body);
-        throw signal.reason;
-      }
-      return response;
+      return fetchFn(uri, { ...init, headers });
     });
-    const response = await abortable(pending, signal);
+    let response: Response;
+    try {
+      response = await abortable(pending, signal);
+      signal?.throwIfAborted();
+    } catch (error) {
+      void pending.then((value) => discardSourceBody(value.body)).catch(() => {});
+      throw error;
+    }
     // Callers discard HTTP error/HEAD bodies; do not speculatively pull them.
     if (!response.body || init.method === "HEAD" || !response.ok) return response;
     return new Response(sourceStream(response.body, signal), {

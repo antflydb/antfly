@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { type AntflyClient, InferenceCapacityError } from "@antfly/sdk";
+import type { AntflyClient } from "@antfly/sdk";
 import { embedMany, generateText, rerank, streamText, tool } from "ai";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { isRetryableCapacityError, retryDelayMs } from "../src/asset/errors.js";
 import { createChatHistory } from "../src/history.js";
 import { createAntfly } from "../src/provider.js";
 import { createGraphTool } from "../src/tools/graph.js";
@@ -23,8 +24,8 @@ async function withCapacityRetry<T>(run: () => Promise<T>): Promise<T> {
   try {
     return await run();
   } catch (error) {
-    if (!(error instanceof InferenceCapacityError)) throw error;
-    await new Promise((resolve) => setTimeout(resolve, error.retryAfterMs));
+    if (!isRetryableCapacityError(error)) throw error;
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs(error)));
     return await run();
   }
 }

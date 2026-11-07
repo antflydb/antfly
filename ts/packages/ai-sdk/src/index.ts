@@ -12,6 +12,7 @@ export {
 } from "./asset/display-route.js";
 export {
   ASSET_ERROR_CODES,
+  getInferenceError,
   isAssetCode,
   isContextManagementWithMedia,
   isOneVideoPerRequest,
@@ -52,7 +53,11 @@ export {
   type UploadFileResult,
   uploadFile,
 } from "./asset/upload.js";
-export { AntflyEmbeddingModel, type AntflyEmbeddingModelOptions } from "./embedding-model.js";
+export {
+  type AntflyEmbeddingLimits,
+  AntflyEmbeddingModel,
+  type AntflyEmbeddingModelOptions,
+} from "./embedding-model.js";
 export { type AntflyChatHistoryOptions, createChatHistory } from "./history.js";
 export {
   AntflyChatLanguageModel,

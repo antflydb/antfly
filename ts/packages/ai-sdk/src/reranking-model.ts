@@ -6,6 +6,8 @@ import type {
 import { UnsupportedFunctionalityError } from "@ai-sdk/provider";
 import type { InferenceClient } from "@antfly/sdk";
 
+import { providerInferenceError } from "./inference-error.js";
+
 export interface AntflyRerankingModelOptions {
   inference: InferenceClient;
   modelId: string;
@@ -34,15 +36,14 @@ export class AntflyRerankingModel implements RerankingModelV4 {
           "Antfly's /ai/v1/rerank endpoint reranks text or image content parts, not arbitrary JSON objects. Render documents to text first.",
       });
     }
-    const response = await this.inference.rerank(
-      this.modelId,
-      options.query,
-      options.documents.values,
-      {
+    const response = await this.inference
+      .rerank(this.modelId, options.query, options.documents.values, {
         signal: options.abortSignal,
         headers: options.headers,
-      }
-    );
+      })
+      .catch((error) => {
+        throw providerInferenceError(error, "rerank");
+      });
     const ranking = response.data
       .map((item) => ({ index: item.index, relevanceScore: item.score }))
       .sort((a, b) => b.relevanceScore - a.relevanceScore)

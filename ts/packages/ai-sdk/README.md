@@ -1,7 +1,7 @@
 # @antfly/ai-sdk
 
 Antfly provider, tools, chat history persistence and the asset flow for the
-Vercel AI SDK (`ai` >=7.0.162 <8, `zod` >=4.1.8 <5). Requires Node 24+ and `@antfly/sdk` >=0.2.3 <0.3 (including its `/sources` export).
+Vercel AI SDK (`ai` >=7.0.162 <8, `zod` >=4.1.8 <5). Requires Node 24+ and `@antfly/sdk` >=0.2.4 <0.3 (including its `/sources` export).
 
 ```ts
 import { createAntfly, createMemoryTools, createSearchTool, createSqlTool } from "@antfly/ai-sdk";
@@ -37,8 +37,9 @@ Known limitations, documented rather than silently handled: `stopSequences`
 and `seed` have no server-side equivalent and are reported as call warnings;
 `supportedUrls` is empty, so non-image file parts must be inline bytes or an
 asset reference (below), not a remote URL. Gateway errors (e.g. local
-Gemma 4's one-video-per-request limit) surface as `InferenceAPIError` /
-`InferenceCapacityError` from `@antfly/sdk`, not swallowed.
+Gemma 4's one-video-per-request limit) surface as AI SDK `APICallError` values
+whose `cause` preserves the original `InferenceAPIError` / `InferenceCapacityError`
+from `@antfly/sdk`.
 
 ## Asset flow (antfly#1505)
 
@@ -204,5 +205,31 @@ each model against the installed `@ai-sdk/provider` types.
 
 The registry release gate checks the exact minimum SDK version and runs the same
 strict ESM/CommonJS and non-hoisted consumers as package CI, with library checks
-enabled. Publish SDK 0.2.3 before tagging the AI SDK integration; the gate refuses
+enabled. Publish SDK 0.2.4 before tagging the AI SDK integration; the gate refuses
 publication while that SDK release is unavailable.
+
+## Embedding limits and retries
+
+Embedding requests are bounded to 128 inputs and 1 MiB of UTF-8 text by default.
+Set these to the effective limits of your deployment/model (including any lower
+request admission limits). The AI SDK splits `embedMany` calls by both bounds;
+a single oversized input is rejected rather than truncated. Limits can be shared
+at provider creation and overridden for individual models:
+
+```ts
+const antfly = createAntfly({
+  baseUrl: "http://localhost:8080",
+  embedding: { maxEmbeddingsPerCall: 32, maxInputBytesPerCall: 256 * 1024 },
+});
+const model = antfly.embeddingModel("embedding-model", { maxEmbeddingsPerCall: 16 });
+```
+
+Generation, streaming HTTP setup, embedding, and reranking failures use the AI SDK
+retry protocol. Explicit server `retryable: false` responses are never retried;
+otherwise 408, 429, and 5xx responses are retryable by default. Capacity backoff
+and valid `Retry-After` headers are forwarded to the AI SDK's retry policy.
+`getInferenceError(error)` recovers the original Antfly details from provider errors
+or exhausted retries; asset classification helpers and `retryDelayMs` also accept
+these wrappers. Provider errors do not retain request bodies. Streaming HTTP setup
+completes before `doStream` returns, without waiting for a first token. Once tokens
+have begun, stream errors are surfaced to the consumer rather than replaying output.

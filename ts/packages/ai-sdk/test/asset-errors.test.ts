@@ -1,6 +1,7 @@
 import { InferenceAPIError, InferenceCapacityError } from "@antfly/sdk";
 import { describe, expect, it } from "vitest";
 import {
+  getInferenceError,
   isContextManagementWithMedia,
   isOneVideoPerRequest,
   isRetryableCapacityError,
@@ -12,7 +13,7 @@ import {
 } from "../src/asset/errors.js";
 
 function apiError(code: string, status = 400) {
-  return new InferenceAPIError(status, code, code, false);
+  return new InferenceAPIError(status, code, code, undefined);
 }
 
 describe("asset error guards", () => {
@@ -56,4 +57,13 @@ describe("asset error guards", () => {
     expect(retryDelayMs(apiError("InferenceCapacityUnavailable", 429))).toBe(1000);
     expect(retryDelayMs(apiError("InferenceCapacityUnavailable", 429), 2500)).toBe(2500);
   });
+});
+
+it("respects explicit permanent failures and safely unwraps causes", () => {
+  const permanent = new InferenceAPIError(503, "VIDEO_BACKEND_UNAVAILABLE", "unavailable", false);
+  expect(isRetryableCapacityError(new Error("wrapped", { cause: permanent }))).toBe(false);
+  expect(getInferenceError(new Error("wrapped", { cause: permanent }))).toBe(permanent);
+  const cycle = new Error("cycle");
+  cycle.cause = cycle;
+  expect(getInferenceError(cycle)).toBeUndefined();
 });

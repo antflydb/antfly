@@ -87,6 +87,29 @@ for (const [extension, statement] of [
     resolve(consumer, `exports.${extension}`),
     `${statement}\nfor(const name of ['AntflyHTTPError','AntflyResponseError','AntflyClient']) if(typeof sdk[name] !== 'function') throw new Error('SDK foundation missing: '+name);\nif(typeof StandaloneSourcesClient !== 'function') throw new Error('SDK sources subpath missing');\nfor (const key of ['createAntfly','createMemoryTools','createSearchTool','createGraphTool','createSqlTool','createChatHistory','AntflyChatLanguageModel','AntflyEmbeddingModel','AntflyRerankingModel']) { if (typeof integration[key] !== 'function') throw new Error(key); }\n`
   );
+  const runtimeCheck = `
+async function verifyEmbeddingBatching() {
+  const { embedMany } = await import('ai');
+  const batches = [];
+  globalThis.fetch = async request => {
+    const { input } = await request.json();
+    batches.push(input);
+    if (input.length > 2 || input.reduce((n, value) => n + Buffer.byteLength(value), 0) > 5)
+      throw new Error('Embedding bounds were not honored by the AI SDK');
+    return Response.json({ data: input.map((value, index) => ({ index, embedding: [value.length] })) });
+  };
+  const provider = integration.createAntfly({ baseUrl: 'http://inference.test', embedding: { maxEmbeddingsPerCall: 2, maxInputBytesPerCall: 5 } });
+  const result = await embedMany({ model: provider.embeddingModel('model'), values: ['é', 'é', 'é', 'a'], maxRetries: 0 });
+  if (result.embeddings.length !== 4 || batches.length < 2) throw new Error('Embedding batch result incomplete');
+  if (typeof new sdk.InferenceClient({ baseUrl: 'http://inference.test' }).openGenerateStream !== 'function')
+    throw new Error('SDK eager streaming API missing');
+}
+verifyEmbeddingBatching().catch(error => { console.error(error); process.exitCode = 1; });
+`;
+  writeFileSync(
+    resolve(consumer, `exports.${extension}`),
+    readFileSync(resolve(consumer, `exports.${extension}`), "utf8") + runtimeCheck
+  );
   run("node", [`exports.${extension}`]);
 }
 

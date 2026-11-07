@@ -4,9 +4,19 @@ import {
   type EmbeddingModelV4Result,
   UnsupportedFunctionalityError,
 } from "@ai-sdk/provider";
+import { EXPERIMENTAL_EMBEDDING_MODEL_MAX_INPUT_BYTES_PER_CALL } from "@ai-sdk/provider-utils";
 import type { InferenceClient } from "@antfly/sdk";
 
-export interface AntflyEmbeddingModelOptions {
+import { providerInferenceError } from "./inference-error.js";
+
+export interface AntflyEmbeddingLimits {
+  /** Effective deployment/model batch limit; defaults to 128. */
+  maxEmbeddingsPerCall?: number;
+  /** Maximum UTF-8 input bytes per call; defaults to 1 MiB. */
+  maxInputBytesPerCall?: number;
+}
+
+export interface AntflyEmbeddingModelOptions extends AntflyEmbeddingLimits {
   inference: InferenceClient;
   modelId: string;
   providerId?: string;
@@ -17,24 +27,49 @@ export class AntflyEmbeddingModel implements EmbeddingModelV4 {
   readonly specificationVersion = "v4" as const;
   readonly provider: string;
   readonly modelId: string;
-  // The server does not document a maximum batch size for /ai/v1/embed.
-  readonly maxEmbeddingsPerCall: number | undefined = undefined;
+  readonly maxEmbeddingsPerCall: number;
+  readonly [EXPERIMENTAL_EMBEDDING_MODEL_MAX_INPUT_BYTES_PER_CALL]: number;
   readonly supportsParallelCalls = true;
 
   private readonly inference: InferenceClient;
 
   constructor(options: AntflyEmbeddingModelOptions) {
+    this.maxEmbeddingsPerCall = options.maxEmbeddingsPerCall ?? 128;
+    if (!Number.isSafeInteger(this.maxEmbeddingsPerCall) || this.maxEmbeddingsPerCall < 1) {
+      throw new RangeError("maxEmbeddingsPerCall must be a positive safe integer");
+    }
+    const byteLimit = options.maxInputBytesPerCall ?? 1024 * 1024;
+    if (!Number.isSafeInteger(byteLimit) || byteLimit < 1) {
+      throw new RangeError("maxInputBytesPerCall must be a positive safe integer");
+    }
+    this[EXPERIMENTAL_EMBEDDING_MODEL_MAX_INPUT_BYTES_PER_CALL] = byteLimit;
     this.inference = options.inference;
     this.modelId = options.modelId;
     this.provider = options.providerId ?? "antfly";
   }
 
   async doEmbed(options: EmbeddingModelV4CallOptions): Promise<EmbeddingModelV4Result> {
-    const response = await this.inference.embed(this.modelId, options.values, {
-      dimensions: options.dimensions,
-      signal: options.abortSignal,
-      headers: options.headers,
-    });
+    if (options.values.length > this.maxEmbeddingsPerCall) {
+      throw new RangeError(
+        `Embedding batch exceeds maxEmbeddingsPerCall (${this.maxEmbeddingsPerCall})`
+      );
+    }
+    const byteLimit = this[EXPERIMENTAL_EMBEDDING_MODEL_MAX_INPUT_BYTES_PER_CALL];
+    if (
+      options.values.reduce((bytes, value) => bytes + Buffer.byteLength(value, "utf8"), 0) >
+      byteLimit
+    ) {
+      throw new RangeError(`Embedding batch exceeds maxInputBytesPerCall (${byteLimit})`);
+    }
+    const response = await this.inference
+      .embed(this.modelId, options.values, {
+        dimensions: options.dimensions,
+        signal: options.abortSignal,
+        headers: options.headers,
+      })
+      .catch((error) => {
+        throw providerInferenceError(error, "embed");
+      });
     if (response.errors?.length) {
       throw new Error(
         `Antfly embedding request failed for ${response.errors.length} of ${options.values.length} inputs: ${JSON.stringify(response.errors[0])}`
