@@ -359,6 +359,7 @@ from .document_artifact_table_reprocess_response_reprocess_status import (
     DocumentArtifactTableReprocessResponseReprocessStatus,
 )
 from .document_extraction_config import DocumentExtractionConfig
+from .document_extraction_config_checksum_algorithm import DocumentExtractionConfigChecksumAlgorithm
 from .document_extraction_config_route_preset import DocumentExtractionConfigRoutePreset
 from .document_extraction_native_text_config import DocumentExtractionNativeTextConfig
 from .document_extraction_native_text_config_policy import DocumentExtractionNativeTextConfigPolicy
@@ -2998,6 +2999,7 @@ __all__ = (
     "DocumentArtifactTableReprocessResponseReprocess",
     "DocumentArtifactTableReprocessResponseReprocessStatus",
     "DocumentExtractionConfig",
+    "DocumentExtractionConfigChecksumAlgorithm",
     "DocumentExtractionConfigRoutePreset",
     "DocumentExtractionNativeTextConfig",
     "DocumentExtractionNativeTextConfigPolicy",

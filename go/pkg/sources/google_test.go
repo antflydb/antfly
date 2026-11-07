@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -66,6 +67,35 @@ func TestGCSSourcePinsGenerationAndNeverPromotesTruncatedInventory(t *testing.T)
 	require.NoError(t, err)
 	require.False(t, snapshot.Authoritative)
 }
+
+// TestGCSRelativeKeyStripsConfiguredPrefix pins that a GCS item's RelativeKey
+// is relative to the source's own root (its configured prefix), not the
+// bucket: Path keeps the full object name (unchanged, so canonical gs:// URIs
+// are unaffected) while RelativeKey strips config.Prefix, and setting
+// identity.namespace to today's provider-ID prefix must reconstruct the
+// provider ID byte for byte (the invariant IdentityKey relies on). Drive,
+// by contrast, has no path-like root of its own: its items get no explicit
+// RelativeKey and fall back to their native Drive file ID (see
+// relativeKeyFor in document.go), since moving a Drive item across
+// providers is never a meaningful operation to begin with.
+func TestGCSRelativeKeyStripsConfiguredPrefix(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"items":[{"name":"team-a/manual.txt","generation":"123","size":"5","contentType":"text/plain"}]}`)
+	}))
+	defer server.Close()
+	c := &GoogleConnector{ProviderName: ProviderGCS, APIBase: server.URL, HTTPClient: server.Client()}
+	req := Request{Mode: ImportModeSource, SourceNamespace: "job/" + testSourceID, Config: SourceConfig(`{"bucket":"docs","prefix":"team-a/"}`)}
+	inventory, err := c.Enumerate(context.Background(), req)
+	require.NoError(t, err)
+	require.Len(t, inventory.Objects, 1)
+	item := inventory.Objects[0]
+	require.Equal(t, "team-a/manual.txt", item.Path, "Path keeps the full bucket object name")
+	require.Equal(t, "manual.txt", item.RelativeKey, "RelativeKey strips the configured prefix")
+
+	namespace := strings.TrimSuffix(item.ID, "/"+item.RelativeKey)
+	require.Equal(t, item.ID, namespace+"/"+item.RelativeKey)
+}
+
 func TestDriveSourceExportsPinnedRevisionAndRejectsPermissionOrVersionFailure(t *testing.T) {
 	for _, mime := range []string{"application/vnd.google-apps.document", "application/vnd.google-apps.presentation"} {
 		t.Run(mime, func(t *testing.T) {
