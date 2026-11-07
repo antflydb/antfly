@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   FilesV4,
   LanguageModelV4,
@@ -16,7 +17,7 @@ export interface AssetUploadCacheEntry {
   expiresAt?: Date;
 }
 
-/** Caches an uploaded vendor file by content digest and target provider. */
+/** Caches a vendor file by opaque representation identity and target provider. */
 export interface AssetUploadCache {
   get(
     digest: string,
@@ -193,13 +194,28 @@ export function createAssetMiddleware(options: AssetMiddlewareOptions): Language
     );
 
     if (options.allowVendorUpload && options.files) {
+      // A representation ETag is scoped to one asset, not globally to bytes.
+      // Only source metadata supplies the separately verified content digest.
+      // MIME is part of a vendor file's representation as well.
+      const identity = resource.content_sha256
+        ? ["sha256", resource.content_sha256, resource.mime_type]
+        : [
+            "asset",
+            reference.table,
+            reference.key,
+            resource.uri,
+            resource.version,
+            resource.mime_type,
+          ];
+      // Keep capability URLs out of externally implemented cache keys.
+      const cacheIdentity = createHash("sha256").update(JSON.stringify(identity)).digest("hex");
       const files = options.files;
       const entry = await uploadedOnce(
         cache,
-        `${provider}\u0000${resource.version}`,
+        `${provider}\u0000${cacheIdentity}`,
         signal,
         async (sharedSignal) => {
-          const cached = await cache.get(resource.version, provider);
+          const cached = await cache.get(cacheIdentity, provider);
           sharedSignal.throwIfAborted();
           if (cached && (!cached.expiresAt || cached.expiresAt.getTime() > Date.now()))
             return cached;
@@ -212,7 +228,7 @@ export function createAssetMiddleware(options: AssetMiddlewareOptions): Language
           });
           sharedSignal.throwIfAborted();
           const result = { reference: uploaded.providerReference, expiresAt: uploaded.expiresAt };
-          await cache.set(resource.version, provider, result);
+          await cache.set(cacheIdentity, provider, result);
           return result;
         }
       );

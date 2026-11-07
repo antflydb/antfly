@@ -162,3 +162,12 @@ it("preserves the caller's abort reason instead of reporting a timeout", async (
   expect(fetchMock).not.toHaveBeenCalled();
   expect(await readdir(root)).toEqual([]);
 });
+
+it("rejects an empty media upload before source access or file creation", async () => {
+  const { options, fetchMock } = environment();
+  await expect(uploadFile({ ...options, data: new Uint8Array() })).rejects.toThrow(
+    "at least one byte"
+  );
+  expect(fetchMock).not.toHaveBeenCalled();
+  expect(await readdir(root)).toEqual([]);
+});

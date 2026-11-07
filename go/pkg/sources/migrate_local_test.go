@@ -1050,7 +1050,7 @@ func TestMigrateLocalRepointsCatalogForGCSAndSyncsAfterward(t *testing.T) {
 	opts := MigrateLocalOptions{FromPrefix: "assets", ToConnection: "gcs", ToBucket: "testbucket", ToPrefix: "migrated"}
 	result := MigrateLocalResult{SourceID: testSourceID, ToConnection: "gcs", Bucket: "testbucket", ToPrefix: "migrated"}
 
-	result, err = migrateLocalRun(t.Context(), opts, result, source, &LocalConnector{Root: root}, dest, ProviderGCS, service)
+	result, err = migrateLocalRun(t.Context(), opts, result, source, &LocalConnector{Root: root}, dest, ProviderGCS, service, profile.Connections)
 	require.NoError(t, err, "result: %+v", result)
 	require.True(t, result.CatalogRepointed)
 	require.Equal(t, 1, result.Copied)
@@ -1256,4 +1256,154 @@ func TestMigrateLocalVerifiesEmptyObjectDigest(t *testing.T) {
 			require.Equal(t, 1, result.Copied)
 		})
 	}
+}
+
+func TestMigrateLocalPreservesConcurrentSourceEdit(t *testing.T) {
+	opts, service, _, _, _ := migrateLiveFixture(t)
+	changed := false
+	opts.Progress = func(_ MigrateLocalObject) {
+		if changed {
+			return
+		}
+		changed = true
+		service.mu.Lock()
+		updated := service.profile.Sources[0]
+		service.mu.Unlock()
+		updated.Alias = "edited-during-copy"
+		updated.Permissions = &Permissions{Readers: []string{"user:self"}}
+		response, err := serviceAdminCall(t.Context(), service, http.MethodPut, "/v1/sources/"+updated.ID, updated)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, response.status)
+	}
+	_, err := MigrateLocal(t.Context(), opts)
+	require.NoError(t, err)
+	require.True(t, changed)
+	service.mu.Lock()
+	alias := service.profile.Sources[0].Alias
+	service.mu.Unlock()
+	require.Equal(t, "edited-during-copy", alias)
+	service.mu.Lock()
+	require.False(t, service.profile.Sources[0].Permissions.Public)
+	require.Equal(t, []string{"user:self"}, service.profile.Sources[0].Permissions.Readers)
+	service.mu.Unlock()
+}
+
+func TestMigrateLocalRejectsConcurrentAcquisitionChange(t *testing.T) {
+	opts, service, _, _, _ := migrateLiveFixture(t)
+	changed := false
+	opts.Progress = func(_ MigrateLocalObject) {
+		if changed {
+			return
+		}
+		changed = true
+		service.mu.Lock()
+		updated := service.profile.Sources[0]
+		service.mu.Unlock()
+		updated.Config = json.RawMessage(`{"prefix":"changed"}`)
+		out, err := serviceAdminCall(t.Context(), service, http.MethodPut, "/v1/sources/"+updated.ID, updated)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, out.status)
+	}
+	result, err := MigrateLocal(t.Context(), opts)
+	require.ErrorContains(t, err, "source changed during migration")
+	require.False(t, result.CatalogRepointed)
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	require.Equal(t, "local", service.profile.Sources[0].Connection)
+	require.JSONEq(t, `{"prefix":"changed"}`, string(service.profile.Sources[0].Config))
+}
+
+func TestSourceConditionalMutationAndSync(t *testing.T) {
+	_, service, _, _, _ := migrateLiveFixture(t)
+	service.mu.Lock()
+	source := service.profile.Sources[0]
+	service.mu.Unlock()
+	revision := sourceRevision(source)
+	source.Alias = "concurrent edit"
+	out, err := serviceAdminCall(t.Context(), service, http.MethodPut, "/v1/sources/"+source.ID, source, http.Header{"If-Match": {revision}})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, out.status)
+	source.Alias = "stale writer"
+	out, err = serviceAdminCall(t.Context(), service, http.MethodPut, "/v1/sources/"+source.ID, source, http.Header{"If-Match": {revision}})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusPreconditionFailed, out.status)
+	out, err = serviceAdminCall(t.Context(), service, http.MethodPost, "/v1/sync", map[string]any{"source_id": source.ID}, http.Header{"If-Match": {revision}})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusPreconditionFailed, out.status)
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	require.Equal(t, "concurrent edit", service.profile.Sources[0].Alias)
+	require.Nil(t, service.cancel)
+}
+
+func TestMigrateLocalRequiresConditionalCutoverSupport(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		require.Equal(t, "/v1/profile", r.URL.Path)
+		require.Equal(t, http.MethodGet, r.Method)
+		serviceJSON(w, http.StatusOK, Profile{Version: 1})
+	}))
+	defer server.Close()
+	_, err := MigrateLocal(t.Context(), MigrateLocalOptions{Server: server.URL, AdminToken: "test", SourceID: testSourceID, FromConnection: "local", ToConnection: "bucket", ToBucket: "testbucket"})
+	require.ErrorContains(t, err, "does not support conditional source cutover")
+	require.Equal(t, 1, calls)
+}
+
+func TestMigrateLocalRejectsConcurrentConnectionChange(t *testing.T) {
+	for _, name := range []string{"local", "bucket"} {
+		t.Run(name, func(t *testing.T) {
+			opts, service, root, _, _ := migrateLiveFixture(t)
+			replacement := filepath.Join(root, "changed")
+			require.NoError(t, os.MkdirAll(replacement, 0700))
+			t.Setenv("MIGRATE_CHANGED_ACCESS", "replacement-test-access")
+			changed := false
+			opts.Progress = func(_ MigrateLocalObject) {
+				if changed {
+					return
+				}
+				changed = true
+				service.mu.Lock()
+				connection := service.profile.Connections[name]
+				service.mu.Unlock()
+				if name == "local" {
+					connection.LocalRoot = replacement
+				} else {
+					connection.AccessKeyEnv = "MIGRATE_CHANGED_ACCESS"
+				}
+				out, err := serviceAdminCall(t.Context(), service, http.MethodPut, "/v1/connections/"+name, connection)
+				require.NoError(t, err)
+				require.Equal(t, http.StatusOK, out.status)
+			}
+			result, err := MigrateLocal(t.Context(), opts)
+			require.ErrorContains(t, err, "connection")
+			require.ErrorContains(t, err, "changed during migration")
+			require.False(t, result.CatalogRepointed)
+			service.mu.Lock()
+			defer service.mu.Unlock()
+			require.Equal(t, "local", service.profile.Sources[0].Connection)
+		})
+	}
+}
+
+func TestMigrationConnectionFenceIsAtomicAtPutAndSync(t *testing.T) {
+	_, service, root, _, _ := migrateLiveFixture(t)
+	service.mu.Lock()
+	source := service.profile.Sources[0]
+	original := cloneProfile(service.profile).Connections
+	connection := service.profile.Connections["local"]
+	service.mu.Unlock()
+	headers := migrationHeaders(sourceRevision(source), original)
+	replacement := filepath.Join(root, "changed")
+	require.NoError(t, os.MkdirAll(replacement, 0700))
+	connection.LocalRoot = replacement
+	out, err := serviceAdminCall(t.Context(), service, http.MethodPut, "/v1/connections/local", connection)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, out.status)
+	out, err = serviceAdminCall(t.Context(), service, http.MethodPut, "/v1/sources/"+source.ID, source, headers)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusPreconditionFailed, out.status)
+	out, err = serviceAdminCall(t.Context(), service, http.MethodPost, "/v1/sync", map[string]any{"source_id": source.ID}, headers)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusPreconditionFailed, out.status)
 }

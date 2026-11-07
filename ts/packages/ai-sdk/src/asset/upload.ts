@@ -150,6 +150,8 @@ async function uploadWithinDeadline(
     : suppliedMime;
   if (!Object.hasOwn(MIME_EXTENSIONS, mimeType))
     throw new Error(`Unsupported local upload MIME type: ${mimeType}`);
+  if (options.data.byteLength === 0)
+    throw new RangeError("Local media uploads must contain at least one byte");
   if (options.data.byteLength > 256 * 1024 * 1024)
     throw new RangeError("Local uploads may not exceed 256 MiB");
   const profile = await options.sources.profile(options.signal);

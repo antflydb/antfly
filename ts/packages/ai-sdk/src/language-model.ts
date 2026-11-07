@@ -180,7 +180,7 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
     const reasoningId = "reasoning-0";
     const toolCalls = new Map<
       number,
-      { id: string; name: string; args: string; started: boolean }
+      { id?: string; name: string; args: string; started: boolean }
     >();
     let finishReason: LanguageModelV4FinishReason = { unified: "other", raw: undefined };
     let usage: LanguageModelV4Usage = toUsage(undefined);
@@ -217,23 +217,21 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
           const index = toolDelta.index ?? 0;
           let state = toolCalls.get(index);
           if (!state) {
-            state = {
-              id: toolDelta.id ?? `call_${index}`,
-              name: toolDelta.function?.name ?? "",
-              args: "",
-              started: false,
-            };
+            state = { name: "", args: "", started: false };
             toolCalls.set(index, state);
           }
-          if (!state.started && state.name) {
+          if (toolDelta.id && !state.started) state.id = toolDelta.id;
+          if (toolDelta.function?.name) state.name += toolDelta.function.name;
+          const args = toolDelta.function?.arguments ?? "";
+          state.args += args;
+          // Names may span deltas. Arguments mark the boundary; buffer any
+          // early arguments until the provider has supplied both ID and name.
+          if (!state.started && state.id && state.name && state.args.length > 0) {
             yield { type: "tool-input-start", id: state.id, toolName: state.name };
+            yield { type: "tool-input-delta", id: state.id, delta: state.args };
             state.started = true;
-          }
-          if (toolDelta.function?.arguments) {
-            state.args += toolDelta.function.arguments;
-            if (state.started) {
-              yield { type: "tool-input-delta", id: state.id, delta: toolDelta.function.arguments };
-            }
+          } else if (state.started && state.id && args) {
+            yield { type: "tool-input-delta", id: state.id, delta: args };
           }
         }
         if (choice.finish_reason) finishReason = toFinishReason(choice.finish_reason);
@@ -244,9 +242,15 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
     }
     if (reasoningOpen) yield { type: "reasoning-end", id: reasoningId };
     if (textOpen) yield { type: "text-end", id: textId };
-    for (const state of toolCalls.values()) {
-      if (state.started) yield { type: "tool-input-end", id: state.id };
-      yield { type: "tool-call", toolCallId: state.id, toolName: state.name, input: state.args };
+    for (const [index, state] of toolCalls) {
+      if (!state.name) throw new Error("Antfly tool-call stream ended without a function name");
+      const id = state.id ?? `call_${index}`;
+      if (!state.started) {
+        yield { type: "tool-input-start", id, toolName: state.name };
+        if (state.args) yield { type: "tool-input-delta", id, delta: state.args };
+      }
+      yield { type: "tool-input-end", id };
+      yield { type: "tool-call", toolCallId: id, toolName: state.name, input: state.args };
     }
     yield { type: "finish", usage, finishReason };
   }

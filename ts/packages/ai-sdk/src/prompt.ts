@@ -26,9 +26,9 @@ export type ResolveAssetReference = (id: string, signal?: AbortSignal) => Promis
  * inlined: images become `image_url` parts (URL or `data:` URI), and every
  * other media type becomes a base64 `media` part. A file part carrying
  * `providerReference: { antfly: <id> }` becomes the typed `source` content
- * part (antfly#1505's proposed asset flow): the gateway fetches and inlines
- * it server-side, so the source companion's capability URL never appears in
- * this request body. That requires `resolveSource`, supplied by
+ * part (antfly#1505's proposed asset flow): this descriptor goes to the
+ * gateway, which fetches pinned bytes server-side before calling the model.
+ * That requires `resolveSource`, supplied by
  * `AntflyChatLanguageModel` when it was constructed with a `client`.
  */
 export async function toInferenceMessages(
@@ -144,7 +144,8 @@ async function fileToContentPart(
         });
       }
       const resource = await resolveSource(part.data.reference.antfly as string);
-      return { type: "source", source: resource };
+      const { content_sha256: _digest, ...source } = resource;
+      return { type: "source", source };
     }
   }
   const topLevel = part.mediaType.split("/")[0];

@@ -67,10 +67,12 @@ export function createMemoryTools(options: AntflyMemoryToolsOptions): Record<str
         limit: z.number().int().min(1).max(200).optional(),
       })
       .strict(),
-    execute: async ({ query, kind, limit }) => {
+    execute: async ({ query, kind, limit }, { abortSignal }) => {
+      abortSignal?.throwIfAborted();
       const { data, error, response } = await options.client.memoryApi.POST(
         "/memory/v1/spaces/{space}/recall",
         {
+          signal: abortSignal,
           params: { path: { space: options.space }, header: header() },
           body: { query, kind, limit: boundedLimit(limit) },
         }
@@ -99,7 +101,8 @@ export function createMemoryTools(options: AntflyMemoryToolsOptions): Record<str
         sourceUrl: z.string().url().optional(),
       })
       .strict(),
-    execute: async ({ subject, predicate, value, statement, sourceUrl }) => {
+    execute: async ({ subject, predicate, value, statement, sourceUrl }, { abortSignal }) => {
+      abortSignal?.throwIfAborted();
       // Recall only matches memory *assertions*, not raw evidence text, so a
       // useful "remember" call must write both in the same request: evidence
       // is the source text, and the assertion is the structured, recallable
@@ -108,6 +111,7 @@ export function createMemoryTools(options: AntflyMemoryToolsOptions): Record<str
       const { data, error, response } = await options.client.memoryApi.POST(
         "/memory/v1/spaces/{space}/observations",
         {
+          signal: abortSignal,
           params: {
             path: { space: options.space },
             header: { ...header(), "Idempotency-Key": randomUUID() },
@@ -141,10 +145,12 @@ export function createMemoryTools(options: AntflyMemoryToolsOptions): Record<str
         evidenceIds: z.array(z.string().min(1)).min(1).max(100),
       })
       .strict(),
-    execute: async ({ evidenceIds }) => {
+    execute: async ({ evidenceIds }, { abortSignal }) => {
+      abortSignal?.throwIfAborted();
       const { data, error, response } = await options.client.memoryApi.POST(
         "/memory/v1/spaces/{space}/forget",
         {
+          signal: abortSignal,
           params: {
             path: { space: options.space },
             header: { ...header(), "Idempotency-Key": randomUUID() },

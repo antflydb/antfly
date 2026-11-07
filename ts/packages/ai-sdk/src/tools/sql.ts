@@ -84,20 +84,24 @@ export function createSqlTool(options: AntflySqlToolOptions): Record<string, Too
         parameters: z.array(z.unknown()).max(1024).optional(),
       })
       .strict(),
-    execute: async ({ statement, parameters }) => {
+    execute: async ({ statement, parameters }, { abortSignal }) => {
+      abortSignal?.throwIfAborted();
       if (readOnly && !looksReadOnly(statement)) {
         throw new Error(
           "This SQL tool is configured read-only and only accepts SELECT/WITH/SHOW/EXPLAIN/VALUES/TABLE statements. " +
             "(Client-side check only -- see AntflySqlToolOptions.readOnly for what actually enforces this.)"
         );
       }
-      return await options.client.executeSQL({
-        statement,
-        parameters: parameters as never,
-        database: options.database,
-        namespace: options.namespace,
-        limit: options.maxRows ?? 128,
-      });
+      return await options.client.executeSQL(
+        {
+          statement,
+          parameters: parameters as never,
+          database: options.database,
+          namespace: options.namespace,
+          limit: options.maxRows ?? 128,
+        },
+        { signal: abortSignal }
+      );
     },
   });
   return { antfly_sql: sql };

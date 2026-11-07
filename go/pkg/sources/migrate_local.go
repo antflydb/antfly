@@ -220,13 +220,13 @@ func MigrateLocal(ctx context.Context, opts MigrateLocalOptions) (MigrateLocalRe
 // rekeys is the PUT response's own signal (see PutSourceMutation): true only
 // when the source had no identity.namespace before this call.
 type migrateRepointer interface {
-	repoint(ctx context.Context, sourceID string, updated Source) (job SyncJob, rekeys bool, err error)
+	repoint(ctx context.Context, sourceID string, expected migrationSnapshot, updated Source) (job SyncJob, rekeys bool, err error)
 }
 
 // migrateLocalRun is the copy-then-maybe-repoint tail shared by both repoint
 // modes, once each has resolved the source, its connections and a
 // migrateRepointer of its own.
-func migrateLocalRun(ctx context.Context, opts MigrateLocalOptions, result MigrateLocalResult, source Source, local *LocalConnector, dest migrateDestination, toProvider string, repointer migrateRepointer) (MigrateLocalResult, error) {
+func migrateLocalRun(ctx context.Context, opts MigrateLocalOptions, result MigrateLocalResult, source Source, local *LocalConnector, dest migrateDestination, toProvider string, repointer migrateRepointer, connections map[string]Connection) (MigrateLocalResult, error) {
 	// A connection can contain several independent local stores. Validate the
 	// selected source before copying, including on dry runs. After cutover its
 	// config is bucket-shaped, so mop-up runs keep using the original explicit
@@ -284,7 +284,8 @@ func migrateLocalRun(ctx context.Context, opts MigrateLocalOptions, result Migra
 		}
 		updated.Identity.Namespace = namespace
 	}
-	job, rekeys, err := repointer.repoint(ctx, source.ID, updated)
+	snapshot := migrationSnapshot{Source: source, Connections: connections}
+	job, rekeys, err := repointer.repoint(ctx, source.ID, snapshot, updated)
 	if err != nil {
 		return result, err
 	}
@@ -408,7 +409,7 @@ func migrateLocalStopped(ctx context.Context, opts MigrateLocalOptions, result M
 	if err != nil {
 		return result, fmt.Errorf("open destination connection: %w", err)
 	}
-	return migrateLocalRun(ctx, opts, result, source, local, dest, toConnection.Provider, service)
+	return migrateLocalRun(ctx, opts, result, source, local, dest, toConnection.Provider, service, map[string]Connection{opts.FromConnection: fromConnection, opts.ToConnection: toConnection})
 }
 
 // migrateLocalLive repoints over real HTTP against a running serve instance,
@@ -455,7 +456,7 @@ func migrateLocalLive(ctx context.Context, opts MigrateLocalOptions, result Migr
 	if err != nil {
 		return result, fmt.Errorf("open destination connection: %w", err)
 	}
-	return migrateLocalRun(ctx, opts, result, source, local, dest, toConnection.Provider, admin)
+	return migrateLocalRun(ctx, opts, result, source, local, dest, toConnection.Provider, admin, map[string]Connection{opts.FromConnection: fromConnection, opts.ToConnection: toConnection})
 }
 
 // repoint drives the service's own admin surface in-process: it PUTs the
@@ -464,8 +465,15 @@ func migrateLocalLive(ctx context.Context, opts MigrateLocalOptions, result Migr
 // POSTs "/v1/sync" for just that source, so the resync runs through the
 // ordinary Runner/Publisher/MediaReference pipeline with its usual ownership
 // and publication barriers. It polls the resulting job to completion.
-func (s *Service) repoint(ctx context.Context, sourceID string, updated Source) (SyncJob, bool, error) {
-	out, err := serviceAdminCall(ctx, s, http.MethodPut, "/v1/sources/"+sourceID, updated)
+func (s *Service) repoint(ctx context.Context, sourceID string, expected migrationSnapshot, updated Source) (SyncJob, bool, error) {
+	s.mu.Lock()
+	profile := cloneProfile(s.profile)
+	s.mu.Unlock()
+	updated, revision, err := prepareMigrationCutover(profile, expected, updated)
+	if err != nil {
+		return SyncJob{}, false, err
+	}
+	out, err := serviceAdminCall(ctx, s, http.MethodPut, "/v1/sources/"+sourceID, updated, migrationHeaders(revision, expected.Connections))
 	if err != nil {
 		return SyncJob{}, false, err
 	}
@@ -478,7 +486,7 @@ func (s *Service) repoint(ctx context.Context, sourceID string, updated Source) 
 	if err := json.Unmarshal(out.body.Bytes(), &putResponse); err != nil {
 		return SyncJob{}, false, err
 	}
-	out, err = serviceAdminCall(ctx, s, http.MethodPost, "/v1/sync", map[string]any{"source_id": sourceID, "restart": true})
+	out, err = serviceAdminCall(ctx, s, http.MethodPost, "/v1/sync", map[string]any{"source_id": sourceID, "restart": true}, migrationHeaders(sourceRevision(updated), expected.Connections))
 	if err != nil {
 		return SyncJob{}, false, err
 	}
@@ -501,7 +509,7 @@ func (s *Service) repoint(ctx context.Context, sourceID string, updated Source) 
 
 // serviceAdminCall issues one in-process admin request against a Service's
 // own ServeHTTP, exactly like an HTTP client would, without opening a socket.
-func serviceAdminCall(ctx context.Context, s *Service, method, target string, body any) (*controlResponse, error) {
+func serviceAdminCall(ctx context.Context, s *Service, method, target string, body any, headers ...http.Header) (*controlResponse, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -512,6 +520,11 @@ func serviceAdminCall(ctx context.Context, s *Service, method, target string, bo
 	}
 	req.Header.Set("Authorization", "Bearer "+s.token)
 	req.Header.Set("Content-Type", "application/json")
+	for _, extra := range headers {
+		for key, values := range extra {
+			req.Header[key] = values
+		}
+	}
 	out := &controlResponse{header: make(http.Header)}
 	s.ServeHTTP(out, req)
 	return out, nil
@@ -530,7 +543,7 @@ type liveAdminClient struct {
 // retrying forever. A var, not a const, so tests can shrink it.
 var migrateLiveRetryBudget = 2 * time.Minute
 
-func (c *liveAdminClient) call(ctx context.Context, method, path string, body any) (int, []byte, error) {
+func (c *liveAdminClient) call(ctx context.Context, method, path string, body any, headers ...http.Header) (int, []byte, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return 0, nil, err
@@ -541,11 +554,19 @@ func (c *liveAdminClient) call(ctx context.Context, method, path string, body an
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
+	for _, extra := range headers {
+		for key, values := range extra {
+			req.Header[key] = values
+		}
+	}
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
+	if method == http.MethodGet && path == "/v1/profile" && resp.StatusCode == http.StatusOK && resp.Header.Get("X-Antfly-Source-Preconditions") != "1" {
+		return 0, nil, fmt.Errorf("live server does not support conditional source cutover; upgrade antfly-source before migrating")
+	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return 0, nil, err
@@ -556,11 +577,11 @@ func (c *liveAdminClient) call(ctx context.Context, method, path string, body an
 // callSerialized retries a 409 with bounded backoff: serve's own admission
 // serializes this with whatever else is running there, so this waits its
 // turn instead of racing it, and fails clearly if that takes too long.
-func (c *liveAdminClient) callSerialized(ctx context.Context, method, path string, body any) (int, []byte, error) {
+func (c *liveAdminClient) callSerialized(ctx context.Context, method, path string, body any, headers ...http.Header) (int, []byte, error) {
 	deadline := time.Now().Add(migrateLiveRetryBudget)
 	backoff := 500 * time.Millisecond
 	for {
-		status, data, err := c.call(ctx, method, path, body)
+		status, data, err := c.call(ctx, method, path, body, headers...)
 		if err != nil || status != http.StatusConflict {
 			return status, data, err
 		}
@@ -594,8 +615,16 @@ func (c *liveAdminClient) getProfile(ctx context.Context) (Profile, error) {
 	return profile, nil
 }
 
-func (c *liveAdminClient) repoint(ctx context.Context, sourceID string, updated Source) (SyncJob, bool, error) {
-	status, putBody, err := c.callSerialized(ctx, http.MethodPut, "/v1/sources/"+sourceID, updated)
+func (c *liveAdminClient) repoint(ctx context.Context, sourceID string, expected migrationSnapshot, updated Source) (SyncJob, bool, error) {
+	profile, err := c.getProfile(ctx)
+	if err != nil {
+		return SyncJob{}, false, err
+	}
+	updated, revision, err := prepareMigrationCutover(profile, expected, updated)
+	if err != nil {
+		return SyncJob{}, false, err
+	}
+	status, putBody, err := c.callSerialized(ctx, http.MethodPut, "/v1/sources/"+sourceID, updated, migrationHeaders(revision, expected.Connections))
 	if err != nil {
 		return SyncJob{}, false, err
 	}
@@ -608,7 +637,7 @@ func (c *liveAdminClient) repoint(ctx context.Context, sourceID string, updated 
 	if err := json.Unmarshal(putBody, &putResponse); err != nil {
 		return SyncJob{}, false, err
 	}
-	status, data, err := c.callSerialized(ctx, http.MethodPost, "/v1/sync", map[string]any{"source_id": sourceID, "restart": true})
+	status, data, err := c.callSerialized(ctx, http.MethodPost, "/v1/sync", map[string]any{"source_id": sourceID, "restart": true}, migrationHeaders(sourceRevision(updated), expected.Connections))
 	if err != nil {
 		return SyncJob{}, false, err
 	}
@@ -841,4 +870,76 @@ func migrateVerifyDigest(ctx context.Context, dest migrateDestination, key, dige
 		return &RevisionChangedError{Expected: digest, Actual: actual}
 	}
 	return nil
+}
+
+// sourceRevision binds a conditional source PUT to the complete persisted
+// definition. ServeHTTP compares this while holding the mutation lock.
+func sourceRevision(source Source) string {
+	raw, _ := json.Marshal(source)
+	digest := sha256.Sum256(raw)
+	return `"` + hex.EncodeToString(digest[:]) + `"`
+}
+
+// Copying can take hours. Preserve policy, naming and stream edits made in
+// that interval, but fail closed if the acquisition or identity changed.
+func prepareMigrationCutover(profile Profile, expected migrationSnapshot, updated Source) (Source, string, error) {
+	if len(expected.Connections) != 2 {
+		return Source{}, "", fmt.Errorf("migration requires snapshots of both transfer connections")
+	}
+	for name, original := range expected.Connections {
+		current, exists := profile.Connections[name]
+		if !exists || connectionMediaBinding(current) != connectionMediaBinding(original) {
+			return Source{}, "", fmt.Errorf("connection %q changed during migration; cutover was not applied", name)
+		}
+	}
+	for _, current := range profile.Sources {
+		if current.ID != expected.ID {
+			continue
+		}
+		if current.Table != expected.Table || current.Connection != expected.Connection ||
+			current.Publication != expected.Publication || current.Identity != expected.Identity ||
+			!bytes.Equal(current.Config, expected.Config) {
+			return Source{}, "", fmt.Errorf("source changed during migration; copied objects were retained, but cutover was not applied")
+		}
+		revision := sourceRevision(current)
+		current.Connection, current.Config, current.Identity = updated.Connection, updated.Config, updated.Identity
+		return current, revision, nil
+	}
+	return Source{}, "", fmt.Errorf("source was removed during migration; cutover was not applied")
+}
+
+// Include both ends of the transfer in the cutover fence, not only the source.
+type migrationSnapshot struct {
+	Source
+	Connections map[string]Connection
+}
+
+func migrationHeaders(revision string, connections map[string]Connection) http.Header {
+	headers := http.Header{"If-Match": {revision}}
+	if len(connections) > 0 {
+		revisions := make(map[string]string, len(connections))
+		for name, connection := range connections {
+			revisions[name] = connectionMediaBinding(connection)
+		}
+		raw, _ := json.Marshal(revisions)
+		headers.Set("X-Antfly-Migration-Connections", string(raw))
+	}
+	return headers
+}
+
+func migrationConnectionsMatch(profile Profile, header string) bool {
+	if header == "" {
+		return true
+	}
+	var revisions map[string]string
+	if len(header) > 16384 || json.Unmarshal([]byte(header), &revisions) != nil || len(revisions) < 1 || len(revisions) > 2 {
+		return false
+	}
+	for name, revision := range revisions {
+		connection, exists := profile.Connections[name]
+		if !exists || connectionMediaBinding(connection) != revision {
+			return false
+		}
+	}
+	return true
 }

@@ -319,7 +319,14 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/v1/profile" && r.Method == http.MethodGet {
+		w.Header().Set("X-Antfly-Source-Preconditions", "1")
 		serviceJSON(w, 200, s.profile)
+		return
+	}
+	// Migration fences source and connection changes in the same critical
+	// section as PUT/sync admission. No provider I/O is needed for this check.
+	if !migrationConnectionsMatch(s.profile, r.Header.Get("X-Antfly-Migration-Connections")) {
+		serviceError(w, http.StatusPreconditionFailed, "migration_connection_revision_changed")
 		return
 	}
 	if r.URL.Path == "/v1/sync" && r.Method == http.MethodPost {
@@ -332,6 +339,19 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err := serviceDecode(w, r, &input); err != nil {
 			serviceError(w, 400, "invalid_request")
 			return
+		}
+		if condition := r.Header.Get("If-Match"); condition != "" {
+			matches := false
+			for _, source := range s.profile.Sources {
+				if source.ID == input.SourceID && sourceRevision(source) == condition {
+					matches = true
+					break
+				}
+			}
+			if !matches || input.PurgeOnly {
+				serviceError(w, http.StatusPreconditionFailed, "source_revision_changed")
+				return
+			}
 		}
 		if err := s.validateProfile(s.profile); err != nil {
 			serviceError(w, 400, "invalid_source_profile")
@@ -583,6 +603,10 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			var source Source
 			if err := serviceDecode(w, r, &source); err != nil || source.ID != id {
 				serviceError(w, 400, "invalid_source")
+				return
+			}
+			if condition := r.Header.Get("If-Match"); condition != "" && (index < 0 || condition != sourceRevision(next.Sources[index])) {
+				serviceError(w, http.StatusPreconditionFailed, "source_revision_changed")
 				return
 			}
 			if index < 0 {

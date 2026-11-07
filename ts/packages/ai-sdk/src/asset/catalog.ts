@@ -9,6 +9,8 @@ export interface CatalogResource {
   version: string;
   version_kind?: "strong_etag";
   length: number;
+  /** Verified original-byte digest from source metadata, separate from the representation ETag. */
+  content_sha256?: string;
 }
 
 export class AssetNotFoundError extends Error {
@@ -55,8 +57,8 @@ export class AssetMissingResourceError extends Error {
 
 /**
  * Resolves an `AntflyAssetReference` to its catalog row's `content.resource`.
- * Never returns the row's other fields: callers that need provenance should
- * read the row themselves rather than growing this helper's return shape.
+ * Projects only the descriptor and verified original-byte digest used for
+ * cache identity. Other provenance stays on the catalog row.
  */
 export async function resolveCatalogResource(
   client: AntflyClient,
@@ -77,9 +79,23 @@ export async function resolveCatalogResource(
     throw new Error(
       `Catalog lookup failed for ${reference.table}/${reference.key}: HTTP ${response.status}`
     );
-  const resource = (data as { content?: { resource?: unknown } } | undefined)?.content?.resource;
+  const row = data as
+    | { content?: { resource?: unknown }; metadata?: { sha256?: unknown } }
+    | undefined;
+  const resource = row?.content?.resource;
   if (!isCatalogResource(resource)) throw new AssetMissingResourceError(reference);
-  return resource;
+  const digest = row?.metadata?.sha256;
+  return {
+    type: resource.type,
+    uri: resource.uri,
+    mime_type: resource.mime_type,
+    version: resource.version,
+    ...(resource.version_kind ? { version_kind: resource.version_kind } : {}),
+    length: resource.length,
+    ...(typeof digest === "string" && /^[a-fA-F0-9]{64}$/.test(digest)
+      ? { content_sha256: digest.toLowerCase() }
+      : {}),
+  };
 }
 
 function isCatalogResource(value: unknown): value is CatalogResource {

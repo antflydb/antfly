@@ -17482,18 +17482,8 @@ fn processDocumentExtractionAsset(
 
     const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(runtime.alloc, source_url, config_json, config);
     defer if (metadata_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
-    // A stored pre-upgrade (location-based) fingerprint is also an acceptable
-    // match: recomputing it from the row's current fields and finding it
-    // still matches what was stored proves location and metadata have not
-    // changed, exactly as strictly as it always proved that. Without this,
-    // declaring checksum_algorithm would force a one-time re-extraction of
-    // every already-extracted row purely from the fingerprint format
-    // changing, not from anything about the row actually changing.
-    const legacy_fingerprint = if (metadata_fingerprint != null)
-        try document_extraction_mod.metadataFingerprintLegacyAlloc(runtime.alloc, source_url, config_json, config)
-    else
-        null;
-    defer if (legacy_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
+    // Checksum opt-in must establish verified provenance once. Never accept
+    // legacy metadata-only evidence as a digest-verified extraction.
     if (metadata_fingerprint) |fingerprint| {
         if (try skipRuntimeDocumentExtractionByFingerprint(
             runtime,
@@ -17505,18 +17495,6 @@ fn processDocumentExtractionAsset(
             from_generation,
             request.producer_json,
         )) return;
-        if (legacy_fingerprint) |legacy| {
-            if (!std.mem.eql(u8, legacy, fingerprint) and try skipRuntimeDocumentExtractionByFingerprint(
-                runtime,
-                request.doc_key,
-                artifact_name,
-                legacy,
-                existing_state,
-                existing_manifest,
-                from_generation,
-                request.producer_json,
-            )) return;
-        }
     }
 
     // Past this point the declared digest (if any) did not already prove

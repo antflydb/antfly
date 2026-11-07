@@ -481,6 +481,15 @@ resync) is the one step that needs admission, and has two modes:
   start if `serve` (or another `migrate-local` run) already holds that
   directory, rather than racing it.
 
+Live cutover requires a companion advertising conditional source updates
+(`X-Antfly-Source-Preconditions: 1` on `/v1/profile`). Migration re-reads the
+source after copying, preserves concurrent naming, permission and stream edits,
+and rejects concurrent acquisition, identity or transfer-connection changes. Both the source PUT
+and sync admission use an atomic `If-Match` precondition, together with
+configuration digests for both transfer connections; a conflicting edit
+fails cutover without overwriting it. Copied objects remain available for retry.
+Older companions must be upgraded before live migration.
+
 The destination connection must already exist in the repointed-against
 profile (the live server's own, or the one seeded at `--state-dir`); this is
 checked, and fails clearly, before anything is copied. An upload that lands

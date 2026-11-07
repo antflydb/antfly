@@ -17,6 +17,10 @@ paths:
       responses:
         '200':
           description: Current profile; credentials are references only.
+          headers:
+            X-Antfly-Source-Preconditions:
+              description: Version of conditional source cutover support. Migration clients require this advertisement before copying.
+              schema: {type: string, enum: ['1']}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Profile'}
@@ -80,7 +84,16 @@ paths:
       - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
     put:
       operationId: putSource
-      description: Reconfiguration is serialized with sync. The body id must equal the path id.
+      description: Reconfiguration is serialized with sync. The body id must equal the path id. Migration cutover supplies If-Match to reject a changed or removed source with HTTP 412.
+      parameters:
+        - name: If-Match
+          in: header
+          description: Expected source revision for conditional migration cutover.
+          schema: {type: string}
+        - name: X-Antfly-Migration-Connections
+          in: header
+          description: JSON object mapping the two transfer connection names to their expected configuration digests; checked atomically with source mutation or sync admission. A mismatch returns HTTP 412.
+          schema: {type: string}
       requestBody:
         required: true
         content:
@@ -107,6 +120,15 @@ paths:
   /v1/sync:
     post:
       operationId: startSourceSync
+      parameters:
+        - name: If-Match
+          in: header
+          description: Expected revision of source_id at sync admission. A mismatch, missing source_id, or purge_only returns HTTP 412.
+          schema: {type: string}
+        - name: X-Antfly-Migration-Connections
+          in: header
+          description: JSON object mapping both transfer connection names to expected configuration digests. Checked atomically at sync admission; a mismatch returns HTTP 412.
+          schema: {type: string}
       description: >-
         Start one durable sync of the full profile, or of one source with
         source_id. Sync is serialized across the service, so another source's

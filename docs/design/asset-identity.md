@@ -66,15 +66,14 @@ When `checksum_algorithm` is set and the row resolves to a well-formed
 digest, the metadata fingerprint (now v4) hashes the digest, the filename,
 the content type, the native-text policy/quality config, and the extraction
 config — and nothing about location: no `source_url`, `etag`,
-`last_modified`, or `version`. A stored v3 fingerprint (computed before
-`checksum_algorithm` was declared, or before this existed at all) is also
-accepted as a match, recomputed from the row's *current* fields and checked
-alongside the v4 candidate: if it still matches what's stored, the row's
-location and metadata haven't changed since that extraction, exactly as
-strictly as v3 ever proved that on its own. This means declaring
-`checksum_algorithm` on an already-populated source does not force a
-one-time re-extraction of every row; only a row whose location *also*
-changed loses its free pass, which is correct, not a regression.
+`last_modified`, or `version`. Enabling `checksum_algorithm` on an existing
+configuration establishes a new verified identity. Legacy v3 state cannot
+prove that its recorded checksum was checked against the original bytes,
+so opt-in requires one successful download and extraction before v4 reuse.
+After that, unchanged bytes and configuration retain the same v4 identity
+across relocations. No legacy fingerprint is accepted as a shortcut around
+this integrity check. Sources that enable SHA-256 before their initial sync
+avoid the upgrade cost entirely.
 
 The declared digest is not trusted blindly. The bytes extraction actually
 downloads are hashed — using whichever hash the fetch path already computes
@@ -257,7 +256,8 @@ says a re-key happened rather than silently claiming otherwise.
   `metadata.sha256`, leaves a plain field name unaffected, and fails closed
   (no match, not an error) on a path that doesn't resolve
   (`"...checksum_field resolves a dotted path into a source row's nested
-  metadata"`).
+  metadata"`). Literal top-level dotted keys take precedence over nested lookup,
+  preserving existing filename, MIME, checksum, ETag and version bindings.
 
 ## What else this helps
 
@@ -315,8 +315,8 @@ be reconciled. A source with only a weak checksum simply leaves
 ordinary transfer-integrity check some provider happens to expose stays an
 ordinary row field, not identity. Moving to a stronger algorithm later is a
 new enum value and a config change, which correctly re-extracts once --
-this is the one place in the design that still has an unavoidable one-time
-cost, now that adopting a namespace on the antfly-source side usually does
+this and initial opt-in from unverified metadata have a one-time verification
+cost, while adopting a namespace on the antfly-source side usually does
 not (see `identity.namespace`'s `LegacyNamespace` derivation above).
 
 ## Out of scope
