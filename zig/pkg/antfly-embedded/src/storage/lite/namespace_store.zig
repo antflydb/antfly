@@ -153,6 +153,8 @@ const State = struct {
     file_namespace: [32]u8,
     writable: bool,
     pending: std.StringHashMapUnmanaged(native.CatalogMutation) = .empty,
+    preparation_reads: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    detached_preparation: bool = false,
     bound_values: std.StringHashMapUnmanaged(PreparedValue) = .empty,
     participant: ?publication.Participant = null,
     mutations: []native.CatalogMutation = &.{},
@@ -281,17 +283,21 @@ const Txn = struct {
         const state = self.state;
         @import("antfly_platform").sync.lockYielding(&state.read_mutex);
         defer state.read_mutex.unlock();
-        const snapshot = if (state.snapshot) |*value| value else return error.TransactionClosed;
+        if (state.snapshot == null and !state.detached_preparation) return error.TransactionClosed;
         const full = try state.key(ns, key);
         if (state.pending.get(full)) |change| {
             if (change.is_delete) return error.NotFound;
             return if (state.bound_values.get(full)) |value| try value.read() else change.value;
         }
-        return (try snapshot.getIndexCatalogRecordAlloc(state.a(), full)) orelse error.NotFound;
+        if (state.detached_preparation) {
+            const captured = state.preparation_reads.getEntry(full) orelse return error.InvalidDerivedApplyState;
+            return captured.value_ptr.* orelse error.NotFound;
+        }
+        return (try state.snapshot.?.getIndexCatalogRecordAlloc(state.a(), full)) orelse error.NotFound;
     }
     pub fn put(self: *Txn, ns: NS, key: []const u8, value: []const u8) !void {
         if (!self.state.writable) return error.ReadOnly;
-        if (self.state.snapshot == null) return error.TransactionClosed;
+        if (self.state.snapshot == null and !self.state.detached_preparation) return error.TransactionClosed;
         const full = try self.state.key(ns, key);
         const owned = try self.state.a().dupe(u8, value);
         try self.state.pending.put(self.state.a(), full, .{ .key = full, .value = owned });
@@ -303,7 +309,7 @@ const Txn = struct {
     pub fn putPreparedValue(self: *Txn, ns: NS, key: []const u8, value: PreparedValue) !void {
         const state = self.state;
         if (!state.writable) return error.ReadOnly;
-        if (state.snapshot == null) return error.TransactionClosed;
+        if (state.snapshot == null and !state.detached_preparation) return error.TransactionClosed;
         const full = try state.key(ns, key);
         // After both reservations succeed, replacement cannot fail and owns
         // exactly one reference. An allocation error preserves the old value.
@@ -322,7 +328,7 @@ const Txn = struct {
     }
     pub fn delete(self: *Txn, ns: NS, key: []const u8) !void {
         if (!self.state.writable) return error.ReadOnly;
-        if (self.state.snapshot == null) return error.TransactionClosed;
+        if (self.state.snapshot == null and !self.state.detached_preparation) return error.TransactionClosed;
         const full = try self.state.key(ns, key);
         try self.state.pending.put(self.state.a(), full, .{ .key = full, .is_delete = true });
         if (self.state.bound_values.fetchRemove(full)) |removed| {
@@ -330,13 +336,34 @@ const Txn = struct {
             previous.deinit();
         }
     }
+    /// Copy the explicit preparation read set and release the broad native
+    /// snapshot. Later reads may use only these captured values or owned writes.
+    pub fn detachForPreparation(self: *Txn, queries: []const publication.PreparationRead) !publication.NamespaceIdentity {
+        const state = self.state;
+        @import("antfly_platform").sync.lockYielding(&state.read_mutex);
+        defer state.read_mutex.unlock();
+        if (!state.writable or state.detached_preparation or state.pending.count() != 0) return error.InvalidDerivedApplyState;
+        const snapshot = if (state.snapshot) |*value| value else return error.TransactionClosed;
+        for (queries) |query| {
+            const full = try state.key(query.namespace, query.key);
+            if (state.preparation_reads.contains(full)) continue;
+            const value = try snapshot.getIndexCatalogRecordAlloc(state.a(), full);
+            try state.preparation_reads.put(state.a(), full, value);
+        }
+        snapshot.close();
+        state.snapshot = null;
+        state.detached_preparation = true;
+        return state.identity(state.expected);
+    }
+
     pub fn prepareNativePublication(self: *Txn) !publication.Prepared {
         const state = self.state;
         if (!state.writable) return error.ReadOnly;
-        if (state.snapshot == null) return error.TransactionClosed;
+        if (state.snapshot == null and !state.detached_preparation) return error.TransactionClosed;
         try state.prepare();
-        state.snapshot.?.close();
+        if (state.snapshot) |*snapshot| snapshot.close();
         state.snapshot = null;
+        state.detached_preparation = false;
         self.* = undefined;
         return .{ .before = state.identity(state.expected), .after = state.identity(state.next_generation), .participant = .{ .ptr = state, .stage = State.stagePrepared, .validate_fn = State.validatePrepared }, .release_fn = State.releasePrepared };
     }
@@ -345,7 +372,7 @@ const Txn = struct {
         try self.commit();
     }
     pub fn nativeIdentity(self: *Txn) !publication.NamespaceIdentity {
-        if (self.state.snapshot == null) return error.TransactionClosed;
+        if (self.state.snapshot == null and !self.state.detached_preparation) return error.TransactionClosed;
         return self.state.identity(self.state.expected);
     }
     pub fn commitWithNativeIdentity(self: *Txn, participant: ?publication.Participant, out: *publication.NamespaceIdentity) !void {
@@ -358,7 +385,8 @@ const Txn = struct {
     fn commitImpl(self: *Txn, identity_out: ?*publication.NamespaceIdentity) !void {
         const state = self.state;
         if (!state.writable) return error.ReadOnly;
-        if (state.snapshot == null) return error.TransactionClosed;
+        if (state.detached_preparation) return error.InvalidDerivedApplyState;
+        if (state.snapshot == null and !state.detached_preparation) return error.TransactionClosed;
         if (state.pending.count() != 0 or state.participant != null) try state.prepare();
         // No borrowed metadata survives the writer queue. The exact semantic
         // witness, owned mutations and immutable artifacts are sufficient.
@@ -838,4 +866,72 @@ test "native namespace identity follows committed snapshots and prepared generat
     try std.testing.expect(committed.eql(prepared.before.?));
     try std.testing.expect(!prepared.before.?.eql(prepared.after.?));
     try std.testing.expect(committed.eql((try after.nativeIdentity()).?));
+}
+
+test "native namespace preparation releases its broad snapshot and survives producer teardown" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-detached-input.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var owner = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    var owner_live = true;
+    defer if (owner_live) owner.close();
+    owner.maintenance_start_suppressed = true;
+    var backend = try Backend.open(a, &owner, "/indexes/detached", false);
+    var backend_live = true;
+    defer if (backend_live) backend.deinit();
+    {
+        var seed = try backend.beginWrite();
+        errdefer seed.abort();
+        try seed.put(.{}, "frontier", "captured");
+        try seed.commit();
+    }
+    var pending = try backend.beginWrite();
+    var pending_live = true;
+    defer if (pending_live) pending.abort();
+    {
+        var cursor = try pending.openCursor(.{});
+        defer cursor.close();
+        try std.testing.expectError(error.TransactionCursorActive, pending.detachForPreparation(&.{.{ .namespace = .{}, .key = "frontier" }}));
+        try std.testing.expectEqualStrings("captured", try pending.get(.{}, "frontier"));
+    }
+    const before = try pending.detachForPreparation(&.{
+        .{ .namespace = .{}, .key = "frontier" },
+        .{ .namespace = .{}, .key = "absent" },
+    });
+    try std.testing.expectEqualStrings("captured", try pending.get(.{}, "frontier"));
+    try std.testing.expectError(error.NotFound, pending.get(.{}, "absent"));
+    try std.testing.expectError(error.InvalidDerivedApplyState, pending.get(.{}, "uncaptured"));
+    try std.testing.expectError(error.InvalidDerivedApplyState, pending.commit());
+    try pending.put(.{}, "frontier", "published");
+    try pending.put(.{}, "created", "owned");
+    try std.testing.expectEqualStrings("published", try pending.get(.{}, "frontier"));
+    // No source or earlier metadata snapshot retains a data epoch now.
+    const epochs = try @import("reader_epochs.zig").scan(a, std.testing.io, path, owner.file.header.reader_epoch_namespace, (try owner.file.file.stat(std.testing.io)).inode);
+    try std.testing.expect(epochs.data == null);
+    backend.deinit();
+    backend_live = false;
+    owner.close();
+    owner_live = false;
+    var prepared = try pending.prepareNativePublication();
+    pending_live = false;
+    defer prepared.deinit();
+    try std.testing.expect(before.eql(prepared.before.?));
+    var replacement = try docs.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer replacement.close();
+    replacement.maintenance_start_suppressed = true;
+    {
+        var batch = try replacement.beginBatch();
+        errdefer batch.abort();
+        try batch.put("primary", "atomic");
+        try batch.setNativePublication(prepared.participant);
+        try batch.commit();
+    }
+    var current = try Backend.open(a, &replacement, "/indexes/detached", false);
+    defer current.deinit();
+    var read = try current.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("published", try read.get(.{}, "frontier"));
+    try std.testing.expectEqualStrings("owned", try read.get(.{}, "created"));
 }

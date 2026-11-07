@@ -17,6 +17,18 @@ const std = @import("std");
 const abi = @import("../runtime_callback_abi.zig");
 const Source = @import("../segment_source.zig").Source;
 
+/// A captured destination scope has no mutable runtime or broad page fence.
+/// The native host independently rechecks namespace identity and collisions.
+pub const AliasTarget = struct {
+    inode: u64,
+    file_namespace: [32]u8,
+    prefix: []const u8,
+    pub fn require(self: AliasTarget, inode: u64, file_namespace: [32]u8, path: []const u8) !void {
+        if (self.inode != inode or !std.mem.eql(u8, &self.file_namespace, &file_namespace)) return error.StaleArtifactConstruction;
+        try @import("native_publication.zig").requireDestination(self.prefix, path);
+    }
+};
+
 /// An unpublished, independently owned immutable artifact. Linking chooses a
 /// fresh destination under final writer admission; it does not activate an index.
 pub const Prepared = struct {
@@ -26,6 +38,7 @@ pub const Prepared = struct {
     pub const VTable = struct {
         link: *const fn (*anyopaque, []const u8) anyerror!Source,
         prepare_link: ?*const fn (*anyopaque, []const u8) anyerror!Source = null,
+        prepare_link_at: ?*const fn (*anyopaque, AliasTarget, []const u8) anyerror!Source = null,
         stage_link: ?*const fn (*anyopaque, @import("native_publication.zig").View) anyerror!void = null,
         deinit: *const fn (*anyopaque) void,
     };
@@ -36,6 +49,10 @@ pub const Prepared = struct {
     pub fn prepareLink(self: Prepared, path: []const u8) !Source {
         const operation = self.vtable.prepare_link orelse return error.Unsupported;
         return Boundary.call("prepare_link", self.dispatch, operation, .{ self.ptr, path });
+    }
+    pub fn prepareLinkAt(self: Prepared, target: AliasTarget, path: []const u8) !Source {
+        const operation = self.vtable.prepare_link_at orelse return error.Unsupported;
+        return Boundary.call("prepare_link_at", self.dispatch, operation, .{ self.ptr, target, path });
     }
     pub fn stageLink(self: Prepared, view: @import("native_publication.zig").View) !void {
         const operation = self.vtable.stage_link orelse return error.Unsupported;

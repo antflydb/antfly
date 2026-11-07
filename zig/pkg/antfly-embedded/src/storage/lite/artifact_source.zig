@@ -41,7 +41,6 @@ const ArtifactIdentity = struct {
     pub fn hash(_: @This(), key: ArtifactIdentity) u64 {
         var h = std.hash.Wyhash.init(0);
         h.update(key.path);
-        h.update(key.key);
         h.update(std.mem.asBytes(&key.inode));
         h.update(std.mem.asBytes(&key.root));
         h.update(std.mem.asBytes(&key.length));
@@ -49,12 +48,14 @@ const ArtifactIdentity = struct {
         return h.final();
     }
     pub fn eql(_: @This(), a: ArtifactIdentity, b: ArtifactIdentity) bool {
-        return a.inode == b.inode and a.root == b.root and a.length == b.length and std.mem.eql(u8, a.path, b.path) and std.mem.eql(u8, a.key, b.key) and std.mem.eql(u8, a.inline_bytes, b.inline_bytes);
+        return a.inode == b.inode and a.root == b.root and a.length == b.length and std.mem.eql(u8, a.path, b.path) and std.mem.eql(u8, a.inline_bytes, b.inline_bytes);
     }
 };
 
-// Weak entries: only open Sources own references. An existing durable alias
-// keeps its immutable value alive, making root identity safe against page ABA.
+// Weak entries: only open Sources own references. The source's exact durable
+// extent lease prevents root/page ABA, including before a numerical alias is
+// chosen. Logical aliases may share the same immutable value. A hit requires
+// the current alias's actual inode/root/length/inline bytes, never just its name.
 // Never share inode-fenced readers: that would extend a coarse reuse fence.
 var source_pool_mutex: std.atomic.Mutex = .unlocked;
 var source_pool: std.HashMapUnmanaged(ArtifactIdentity, *State, ArtifactIdentity, 80) = .empty;
@@ -1774,4 +1775,50 @@ test "lite resident source handoff bounds weak registration and retained memory 
     try std.testing.expectEqualDeep(checkpoint, store.file.activeCheckpoint());
     working.observe(registry.inode, working.expires_ns);
     try std.testing.expectEqual(@as(usize, 0), working.count);
+}
+
+test "lite immutable construction source pooling follows exact extents across numerical aliases" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/construction-alias-pool.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    var construction = try store.beginArtifactConstruction();
+    defer construction.deinit();
+    const payload: [65536]u8 = @splat('p');
+    try construction.append(&store, &payload);
+    try construction.seal(payload.len);
+    const key = try a.dupe(u8, construction.key);
+    defer a.free(key);
+    var frozen = try construction.prepareSource(&store, key, false);
+    defer frozen.close();
+    const Link = struct {
+        key: []const u8,
+        path: []const u8,
+        fn apply(raw: *anyopaque, file: *native.NativeFile) !void {
+            const request: *@This() = @ptrCast(@alignCast(raw));
+            try file.linkArtifactConstruction(request.key, request.path, payload.len);
+        }
+    };
+    var link: Link = .{ .key = key, .path = "/index/first" };
+    try store.submitIndexMutation(&link, Link.apply, true);
+    link.path = "/index/second";
+    try store.submitIndexMutation(&link, Link.apply, true);
+    var first = try store.openArtifactSource("/index/first");
+    defer first.close();
+    var second = try store.openArtifactSource("/index/second");
+    defer second.close();
+    try std.testing.expectEqual(frozen.ranges.ptr, first.ranges.ptr);
+    try std.testing.expectEqual(frozen.ranges.ptr, second.ranges.ptr);
+    try store.file.putIndexCatalogRecord("/index/first", "different physical value");
+    var changed = try store.openArtifactSource("/index/first");
+    defer changed.close();
+    try std.testing.expect(changed.ranges.ptr != frozen.ranges.ptr);
+    try store.file.deleteIndexCatalogRecord("/index/second");
+    var actual: [32]u8 = undefined;
+    try second.readInto(1024, &actual);
+    try std.testing.expectEqualSlices(u8, payload[1024..][0..actual.len], &actual);
 }

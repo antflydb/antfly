@@ -498,6 +498,9 @@ const NativeArtifactStager = struct {
         }
         try construction.seal(bytes.len);
         pending.* = .{ .alloc = self.alloc, .prefix = prefix, .construction = construction };
+        // Freeze the construction's independently owned source while its
+        // staging owner is live. Alias preparation later borrows no Store.
+        try pending.freezeSource();
         return .{ .ptr = pending, .vtable = &NativePreparedArtifact.vtable };
     }
 
@@ -517,9 +520,10 @@ const InlinePreparedArtifact = struct {
     registry: *artifacts.Registry,
     prefix: []u8,
     inode: u64,
+    file_namespace: [32]u8,
     bytes: *Bytes,
     path: ?[]u8 = null,
-    const vtable: immutable_artifact.Prepared.VTable = .{ .link = link, .prepare_link = prepareLink, .stage_link = stageLink, .deinit = deinit };
+    const vtable: immutable_artifact.Prepared.VTable = .{ .link = link, .prepare_link = prepareLink, .prepare_link_at = prepareLinkAt, .stage_link = stageLink, .deinit = deinit };
 
     const Bytes = artifacts.OwnedBytes;
 
@@ -535,7 +539,7 @@ const InlinePreparedArtifact = struct {
         const prefix = try stager.alloc.dupe(u8, stager.prefix);
         errdefer stager.alloc.free(prefix);
         stager.registry.retainOwner(); // Publication callbacks own a separate reference.
-        state.* = .{ .alloc = stager.alloc, .registry = stager.registry, .prefix = prefix, .inode = inode, .bytes = backing };
+        state.* = .{ .alloc = stager.alloc, .registry = stager.registry, .prefix = prefix, .inode = inode, .file_namespace = owner.file.header.reader_epoch_namespace, .bytes = backing };
         return .{ .ptr = state, .vtable = &vtable };
     }
 
@@ -551,6 +555,18 @@ const InlinePreparedArtifact = struct {
         if (self.path) |old| self.alloc.free(old);
         self.path = owned;
         return self.bytes.source().retainOwned();
+    }
+
+    fn prepareLinkAt(raw: *anyopaque, target: immutable_artifact.AliasTarget, path: []const u8) !SegmentSource {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.prefix.len != 0 or target.prefix.len != 0) try native_publication.requireDestination(self.prefix, target.prefix);
+        try target.require(self.inode, self.file_namespace, path);
+        const destination = try self.alloc.dupe(u8, path);
+        errdefer self.alloc.free(destination);
+        const source = try self.bytes.source().retainOwned();
+        if (self.path) |previous| self.alloc.free(previous);
+        self.path = destination;
+        return source;
     }
 
     fn stageLink(raw: *anyopaque, view: native_publication.View) !void {
@@ -595,63 +611,75 @@ const NativePreparedArtifact = struct {
     alloc: Allocator,
     prefix: []u8,
     construction: artifacts.Construction,
+    file_namespace: [32]u8 = @splat(0),
     pending_link: ?struct { key: []u8, path: []u8, inode: u64, length: usize, source: SegmentSource, registry: *artifacts.Registry } = null,
-    const vtable: immutable_artifact.Prepared.VTable = .{ .link = link, .prepare_link = prepareLink, .stage_link = stageLink, .deinit = deinit };
+    const vtable: immutable_artifact.Prepared.VTable = .{ .link = link, .prepare_link = prepareLink, .prepare_link_at = prepareLinkAt, .stage_link = stageLink, .deinit = deinit };
 
-    fn prepareLink(raw: *anyopaque, path: []const u8) !SegmentSource {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        if (self.pending_link) |*pending| {
-            const owner = pending.registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
-            defer pending.registry.endCallback();
-            var adapter: Store = .{ .allocator = self.alloc, .docs = owner, .namespace_prefix = self.prefix };
-            try validateWritePath(&adapter, path);
-            if ((try owner.file.file.stat(owner.file.runtime())).inode != pending.inode) return error.StaleArtifactConstruction;
-            if (try owner.file.getIndexCatalogRecordSize(path) != null) return error.PathAlreadyExists;
-            // A refused attempt leaves the immutable construction available
-            // for a fresh numerical alias; no lease or WAL was republished.
-            const destination = try self.alloc.dupe(u8, path);
-            errdefer self.alloc.free(destination);
-            const source = try pending.source.retainOwned();
-            self.alloc.free(pending.path);
-            pending.path = destination;
-            return source;
-        }
+    fn freezeSource(self: *@This()) !void {
+        if (self.pending_link != null) return;
         const registry = self.construction.registry orelse return error.InvalidArtifactConstructionState;
         const owner = registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
         defer registry.endCallback();
-        var adapter: Store = .{ .allocator = self.alloc, .docs = owner, .namespace_prefix = self.prefix };
-        try validateWritePath(&adapter, path);
-        // This is an early collision check under final writer admission. The
-        // native transaction checks again before creating the actual alias.
-        if (try owner.file.getIndexCatalogRecordSizeAtCheckpoint(path, owner.file.activeCheckpoint()) != null) return error.PathAlreadyExists;
         const key = try self.alloc.dupe(u8, self.construction.key);
         errdefer self.alloc.free(key);
-        const destination = try self.alloc.dupe(u8, path);
-        errdefer self.alloc.free(destination);
+        const path = try self.alloc.dupe(u8, "");
+        errdefer self.alloc.free(path);
         const inode = self.construction.inode;
         const length = self.construction.length;
-        const source = try self.construction.prepareSource(owner, path, false);
-        var owned = source;
-        errdefer owned.close();
-        const retained = try owned.retainOwned();
-        self.pending_link = .{ .key = key, .path = destination, .inode = inode, .length = length, .source = owned, .registry = registry };
-        return retained;
+        const file_namespace = owner.file.header.reader_epoch_namespace;
+        // Transfer happens only after the final fallible operation succeeds.
+        const source = try self.construction.prepareSource(owner, self.construction.key, false);
+        self.pending_link = .{ .key = key, .path = path, .inode = inode, .length = length, .source = source, .registry = registry };
+        self.file_namespace = file_namespace;
+    }
+
+    fn prepareLinkAt(raw: *anyopaque, target: immutable_artifact.AliasTarget, path: []const u8) !SegmentSource {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const pending = if (self.pending_link) |*value| value else return error.InvalidArtifactConstructionState;
+        if (self.prefix.len != 0 or target.prefix.len != 0) try native_publication.requireDestination(self.prefix, target.prefix);
+        try target.require(pending.inode, self.file_namespace, path);
+        const destination = try self.alloc.dupe(u8, path);
+        errdefer self.alloc.free(destination);
+        const source = try pending.source.retainOwned();
+        self.alloc.free(pending.path);
+        pending.path = destination;
+        return source;
+    }
+
+    fn prepareLink(raw: *anyopaque, path: []const u8) !SegmentSource {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const pending = self.pending_link orelse return error.InvalidArtifactConstructionState;
+        const owner = pending.registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
+        defer pending.registry.endCallback();
+        if (try owner.file.getIndexCatalogRecordSize(path) != null) return error.PathAlreadyExists;
+        return prepareLinkAt(raw, .{ .inode = (try owner.file.file.stat(owner.file.runtime())).inode, .file_namespace = owner.file.header.reader_epoch_namespace, .prefix = self.prefix }, path);
     }
 
     fn stageLink(raw: *anyopaque, view: native_publication.View) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const pending = self.pending_link orelse return error.InvalidArtifactConstructionState;
+        if (pending.path.len == 0) return error.InvalidArtifactConstructionState;
         try view.link(pending.inode, pending.key, pending.path, pending.length);
     }
 
     fn link(raw: *anyopaque, path: []const u8) !SegmentSource {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        const registry = self.construction.registry orelse return error.InvalidArtifactConstructionState;
-        const owner = registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
-        defer registry.endCallback();
-        var adapter: Store = .{ .allocator = self.alloc, .docs = owner, .namespace_prefix = self.prefix };
-        try validateWritePath(&adapter, path);
-        return self.construction.linkSource(owner, path);
+        var source = try prepareLink(raw, path);
+        errdefer source.close();
+        const pending = self.pending_link orelse return error.InvalidArtifactConstructionState;
+        const owner = pending.registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
+        defer pending.registry.endCallback();
+        const Request = struct {
+            artifact: *NativePreparedArtifact,
+            fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+                const request: *@This() = @ptrCast(@alignCast(ptr));
+                var host: @import("publication_host.zig").Host = .{ .file = file, .allocator = request.artifact.alloc, .index_prefix = request.artifact.prefix };
+                try stageLink(request.artifact, host.view());
+            }
+        };
+        var request: Request = .{ .artifact = self };
+        try owner.submitIndexMutation(&request, Request.apply, true);
+        return source;
     }
 
     fn deinit(raw: *anyopaque) void {

@@ -2771,16 +2771,9 @@ pub const IndexWriter = struct {
         /// Release writer serialization before waiting for native admission.
         /// Abort remains independent of the writer's lifetime after detaching.
         pub fn detach(self: *PreparedSegmentReplacement) !void {
-            std.debug.assert(self.active and !self.external_visibility_owned and self.detached_base == null);
+            std.debug.assert(self.active and !self.external_visibility_owned);
             const writer = self.writer.?;
-            const base = @atomicLoad(*IndexSnapshot, &writer.current, .acquire);
-            const revisions = try self.staging_alloc.alloc(u64, base.segments.len);
-            for (base.segments, revisions) |segment, *revision| revision.* = segment.shared.deletion_revision.load(.acquire);
-            self.detached_revisions = revisions;
-            self.detached_base = base.retain();
-            if (self.snapshot.native_resources == null) if (writer.native_resources) |resources| {
-                self.snapshot.native_resources = resources.retained();
-            };
+            std.debug.assert(self.detached_base != null);
             self.writer = null;
             writer.mu.unlock();
         }
@@ -3310,7 +3303,10 @@ pub const IndexWriter = struct {
         defer self.mapped_residency_mu.unlock();
 
         const manager = self.resource_manager orelse return;
-        for (snap.segments) |segment| if (segment.data.isFileBacked()) segment.shared.observeResidency(manager);
+        // Native range/resident sources own their cache/accounting lifetime.
+        // They can be reused through another runtime's manager and are not
+        // mappings. Only actual mmap-backed segments belong to this policy.
+        for (snap.segments) |segment| if (segment.data.isMapped()) segment.shared.observeResidency(manager);
 
         var decision = manager.pressureDecision(.full_text_segment_residency);
         if (decision.action != .shrink_cache or decision.pressure == .normal) return;
@@ -3637,6 +3633,59 @@ pub const IndexWriter = struct {
         prepared.publish();
     }
 
+    /// Immutable input to fallible replacement preparation. This owns its
+    /// exact base/revisions and accounting resources, never a mutable writer.
+    pub const Preparation = struct {
+        alloc: Allocator,
+        base: *IndexSnapshot,
+        revisions: []u64,
+        resources: ?@import("storage/immutable_artifact.zig").BuildResources,
+        next_segment_id: u64,
+        next_epoch: u64,
+
+        pub fn deinit(self: *Preparation) void {
+            self.base.release();
+            self.alloc.free(self.revisions);
+            if (self.resources) |*resources| resources.deinit();
+            self.* = undefined;
+        }
+
+        pub fn requireCurrentRevisions(self: *const Preparation) !void {
+            for (self.base.segments, self.revisions) |segment, revision| {
+                if (segment.shared.deletion_revision.load(.acquire) != revision) return error.EnrichmentWaitCanceled;
+            }
+        }
+
+        pub fn prepareDeleteInfos(self: *const Preparation, a: Allocator, keys: []const []const u8) ![]DeleteInfo {
+            try self.requireCurrentRevisions();
+            const infos = try prepareDeleteInfosFromSnapshot(self.base, a, keys);
+            errdefer freeDeleteInfos(a, infos);
+            try self.requireCurrentRevisions();
+            return infos;
+        }
+
+        pub fn prepareReplacement(self: *const Preparation, scratch: Allocator, old_ids: []const u64, replacements: []ReplacementSegmentData) !PreparedSegmentReplacement {
+            try self.requireCurrentRevisions();
+            var prepared = try buildReplacementFromSnapshot(self, scratch, old_ids, replacements);
+            errdefer prepared.abort();
+            try self.requireCurrentRevisions();
+            return prepared;
+        }
+    };
+
+    pub fn capturePreparation(self: *IndexWriter) !Preparation {
+        self.lockMutex();
+        defer self.mu.unlock();
+        return self.capturePreparationAssumeLocked();
+    }
+
+    fn capturePreparationAssumeLocked(self: *IndexWriter) !Preparation {
+        const base = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        const revisions = try self.alloc.alloc(u64, base.segments.len);
+        for (base.segments, revisions) |segment, *revision| revision.* = segment.shared.deletion_revision.load(.acquire);
+        return .{ .alloc = self.alloc, .base = base.retain(), .revisions = revisions, .resources = if (self.native_resources) |resources| resources.retained() else null, .next_segment_id = self.next_segment_id, .next_epoch = self.next_epoch };
+    }
+
     /// Stage every fallible allocation needed to replace segments while
     /// holding the writer serialization mutex. Callers must publish or abort.
     pub fn prepareSegmentsManyData(self: *IndexWriter, old_ids: []const u64, replacements: []ReplacementSegmentData) !PreparedSegmentReplacement {
@@ -3655,10 +3704,25 @@ pub const IndexWriter = struct {
         old_ids: []const u64,
         replacements: []ReplacementSegmentData,
     ) !PreparedSegmentReplacement {
-        if (old_ids.len == 0 and replacements.len == 0) return error.EmptySegmentReplacement;
-
         self.lockMutex();
         errdefer self.mu.unlock();
+        var inputs = try self.capturePreparationAssumeLocked();
+        defer inputs.deinit();
+        var prepared = try inputs.prepareReplacement(scratch_alloc, old_ids, replacements);
+        prepared.writer = self;
+        return prepared;
+    }
+
+    fn buildReplacementFromSnapshot(
+        self: *const Preparation,
+        scratch_alloc: Allocator,
+        old_ids: []const u64,
+        replacements: []ReplacementSegmentData,
+    ) !PreparedSegmentReplacement {
+        if (old_ids.len == 0 and replacements.len == 0) return error.EmptySegmentReplacement;
+
+        const detached_revisions = try scratch_alloc.dupe(u64, self.revisions);
+        errdefer scratch_alloc.free(detached_revisions);
 
         const replacement_readers = try scratch_alloc.alloc(segment_mod.SegmentReader, replacements.len);
         var replacement_readers_initialized: usize = 0;
@@ -3684,7 +3748,7 @@ pub const IndexWriter = struct {
         for (replacements) |replacement| if (old_set.contains(replacement.id)) {
             try reused_ids.put(scratch_alloc, replacement.id, {});
         };
-        const old = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        const old = self.base;
 
         var keep_count: usize = 0;
         var retire_count: usize = 0;
@@ -3790,8 +3854,11 @@ pub const IndexWriter = struct {
         for (replacements) |replacement| {
             if (replacement.id >= next_segment_id) next_segment_id = replacement.id + 1;
         }
+        new_snap.native_resources = if (self.resources) |resources| resources.retained() else null;
         return .{
-            .writer = self,
+            .writer = null,
+            .detached_base = old.retain(),
+            .detached_revisions = detached_revisions,
             .snapshot = new_snap,
             .retired = retired,
             .reused_ids = reused_ids,
@@ -3921,6 +3988,10 @@ pub const IndexWriter = struct {
     pub fn prepareDeleteInfos(self: *IndexWriter, alloc: Allocator, doc_ids: []const []const u8) ![]DeleteInfo {
         self.lockMutex();
         defer self.mu.unlock();
+        return prepareDeleteInfosFromSnapshot(@atomicLoad(*IndexSnapshot, &self.current, .acquire), alloc, doc_ids);
+    }
+
+    fn prepareDeleteInfosFromSnapshot(snap: *IndexSnapshot, alloc: Allocator, doc_ids: []const []const u8) ![]DeleteInfo {
         var wanted = std.StringHashMapUnmanaged(void).empty;
         defer wanted.deinit(alloc);
         for (doc_ids) |key| if (key.len != 0) {
@@ -3935,7 +4006,6 @@ pub const IndexWriter = struct {
             }
             infos.deinit(alloc);
         }
-        const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
         for (snap.segments) |*seg| {
             var local_ids = std.ArrayListUnmanaged(u32).empty;
             defer local_ids.deinit(alloc);
@@ -4804,6 +4874,48 @@ fn mapTestSegment(segment_bytes: []const u8) !SegmentData {
     );
     @memcpy(mapped, segment_bytes);
     return SegmentData.fromMapped(mapped);
+}
+
+test "native shared segment residency remains source owned across runtime managers" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegment(a, &.{.{ .terms = &.{.{ .term = "shared", .freq = 1, .norm = 8 }} }});
+    defer a.free(bytes);
+    var first = resource_manager_mod.ResourceManager.init(.{});
+    defer first.deinit(a);
+    var second = resource_manager_mod.ResourceManager.init(.{});
+    defer second.deinit(a);
+    const SourceState = struct {
+        bytes: []const u8,
+        closes: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const state: *@This() = @ptrCast(@alignCast(raw));
+            if (offset > state.bytes.len or out.len > state.bytes.len - @as(usize, @intCast(offset))) return error.EndOfStream;
+            @memcpy(out, state.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(raw: *anyopaque) void {
+            const state: *@This() = @ptrCast(@alignCast(raw));
+            state.closes += 1;
+        }
+    };
+    var source: SourceState = .{ .bytes = bytes };
+    {
+        var writer = try IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegmentWithIdData(1, .fromNative(.{ .ranges = .{ .ptr = &source, .length = bytes.len, .read_into = SourceState.read, .close = SourceState.close, .resource_manager = &first } }));
+        writer.attachResourceManager(&first);
+        var fork = try writer.forkImmutable();
+        defer fork.deinit();
+        fork.attachResourceManager(&second);
+        const snapshot_ref = fork.acquireSnapshot();
+        defer snapshot_ref.release();
+        const entry = snapshot_ref.segments[0];
+        try std.testing.expect(entry.data.isFileBacked() and !entry.data.isMapped());
+        try std.testing.expect(entry.shared.residency_manager == null);
+        try std.testing.expect(entry.data.native.resourceManager().? == &first);
+        try std.testing.expectEqual(@as(u64, 0), first.sliceStats(.full_text_segment_residency).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), second.sliceStats(.full_text_segment_residency).used_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), source.closes);
 }
 
 test "external lake shared immutable mapped segments have one residency owner across forks" {
@@ -6688,4 +6800,46 @@ test "native detached publication rebinds exact namespaces after writer shutdown
     replacement_live = false;
     try std.testing.expect(old_owner.references > 1);
     try std.testing.expectEqual(@as(usize, 1), new_owner.references);
+}
+
+fn testOwnedIndexPreparationAfterShutdown(a: Allocator) !void {
+    var writer = try IndexWriter.init(a);
+    var live = true;
+    defer if (live) writer.deinit();
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "old", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+    defer a.free(bytes);
+    try writer.addSegment(bytes);
+    var preparation = try writer.capturePreparation();
+    var seed_live = true;
+    defer if (seed_live) preparation.deinit();
+    writer.deinit();
+    live = false;
+    const infos = try preparation.prepareDeleteInfos(a, &.{"old"});
+    defer IndexWriter.freeDeleteInfos(a, infos);
+    try std.testing.expectEqual(@as(usize, 1), infos.len);
+    var candidate = try preparation.prepareReplacement(a, &.{1}, &.{});
+    defer candidate.abort();
+    try std.testing.expect(candidate.writer == null);
+    try std.testing.expectEqual(@as(usize, 0), candidate.snapshot.segments.len);
+    // The candidate must own its base independently of the preparation seed.
+    preparation.deinit();
+    seed_live = false;
+}
+
+test "owned index preparation survives writer shutdown and allocation faults" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testOwnedIndexPreparationAfterShutdown, .{});
+}
+
+test "owned index preparation rejects deletion changes before building a replacement" {
+    const a = std.testing.allocator;
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "old", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+    defer a.free(bytes);
+    try writer.addSegment(bytes);
+    var preparation = try writer.capturePreparation();
+    defer preparation.deinit();
+    try std.testing.expect(try writer.deleteById("old"));
+    try std.testing.expectError(error.EnrichmentWaitCanceled, preparation.prepareDeleteInfos(a, &.{"old"}));
+    try std.testing.expectError(error.EnrichmentWaitCanceled, preparation.prepareReplacement(a, &.{1}, &.{}));
 }

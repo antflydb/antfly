@@ -1135,14 +1135,27 @@ pub const OwnedForegroundTextPublication = struct {
     config: ForegroundTextProjection,
     claims: ?PreparedForegroundTextMetadata,
     root: @import("../../native_metadata_batch.zig").Prepared,
-    native: *persistent_mod.PersistentIndex.PreparedNativePublication,
+    native: ?*persistent_mod.PersistentIndex.PreparedNativePublication = null,
+    inputs: ?persistent_mod.PersistentIndex.NativePreparation = null,
+    metadata: persistent_mod.PersistentIndex.ReplayPublicationMetadata,
 
     pub fn deinit(self: *@This()) void {
         const a = self.alloc;
-        self.native.deinit();
+        if (self.native) |native| native.deinit();
+        if (self.inputs) |*inputs| inputs.deinit();
         self.root.deinit();
         if (self.claims) |*claims| claims.deinit();
         a.destroy(self);
+    }
+
+    /// Runs with owned immutable inputs only. No catalog, DB/runtime lifetime
+    /// lease, writer mutex or native data epoch is retained by the input seed.
+    pub fn finish(self: *@This(), built: *PreparedTextMapperPublication, delete_keys: []const []const u8) !void {
+        if (self.native != null) return;
+        var inputs = self.inputs orelse return error.InvalidDerivedApplyState;
+        self.inputs = null;
+        defer inputs.deinit();
+        self.native = try inputs.build(built.staged, delete_keys, self.metadata);
     }
 
     pub const Guard = struct {
@@ -1178,7 +1191,8 @@ pub const OwnedForegroundTextPublication = struct {
         var analysis_owned = true;
         defer if (analysis_owned) entry.analysis_mutex.unlockExclusive();
         if (current.generation() != manager.writePlanGeneration() or !manager.foregroundTextServiceableAssumeCatalogLocked(self.config.name)) return null;
-        self.native.bindTarget(&entry.persistent) catch |err| switch (err) {
+        const native = self.native orelse return null;
+        native.bindTarget(&entry.persistent) catch |err| switch (err) {
             error.EnrichmentWaitCanceled => return null,
             else => return err,
         };
@@ -1189,8 +1203,8 @@ pub const OwnedForegroundTextPublication = struct {
     }
 
     pub fn activate(self: *@This(), guard: *const Guard) void {
-        std.debug.assert(self.native.activated);
-        guard.entry.recordCommittedDeletes(self.native.infos);
+        std.debug.assert(self.native.?.activated);
+        guard.entry.recordCommittedDeletes(self.native.?.infos);
         if (self.claims) |*claims| claims.activateAssumeAnalysisLocked(guard.manager, guard.entry);
     }
 };
@@ -21986,7 +22000,7 @@ pub const IndexManager = struct {
     /// Capture an exact native index replacement and root-metadata postimage.
     /// Projection/tokenization has already completed without writer admission.
     /// No mutable DB/index reference survives this function.
-    pub fn prepareOwnedForegroundTextPublication(
+    pub fn captureOwnedForegroundTextPublication(
         self: *IndexManager,
         store: *docstore_mod.DocStore,
         config: ForegroundTextProjection,
@@ -22058,12 +22072,14 @@ pub const IndexManager = struct {
             else => return err,
         };
         errdefer root.deinit();
-        result.* = .{ .alloc = self.alloc, .sequence = next_sequence, .config = config, .claims = claims, .root = root, .native = undefined };
+        result.* = .{ .alloc = self.alloc, .sequence = next_sequence, .config = config, .claims = claims, .root = root, .metadata = undefined };
         const metadata: persistent_mod.PersistentIndex.ReplayPublicationMetadata = .{
             .participant = result.root.participant(),
             .seal = if (authority) |selected_authority| if (self.artifact_projection_root != 0) .{ .root = self.artifact_projection_root, .namespace = selected_authority.namespace, .generation = config.generation, .config_hash = config.config_hash, .applied_sequence = next_sequence } else null else null,
         };
-        result.native = try entry.persistent.prepareOwnedNativePublication(built.staged, delete_keys, null, metadata);
+        _ = delete_keys;
+        result.metadata = metadata;
+        result.inputs = try entry.persistent.captureNativePreparation(built.staged.len);
         return result;
     }
 

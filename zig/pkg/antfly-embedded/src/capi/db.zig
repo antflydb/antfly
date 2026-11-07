@@ -5146,12 +5146,15 @@ pub fn antfly_db_batch(
             const request: *@This() = @ptrCast(@alignCast(raw));
             const plan = request.prepared orelse return;
             try plan.prepareAttempt();
-            const guard = enterHandle(request.handle_ptr, .read) orelse return error.InvalidArgument;
-            defer guard.leave();
-            // Preparation is optional. Mutation admission below preserves the
-            // actual entry error and its retry/outcome classification.
-            if (guard.entry_error != null) return;
-            try plan.stageForegroundText(guard.handle.database());
+            {
+                const guard = enterHandle(request.handle_ptr, .read) orelse return error.InvalidArgument;
+                defer guard.leave();
+                // Preparation is optional. Mutation admission below preserves
+                // the actual entry error and its outcome classification.
+                if (guard.entry_error != null) return;
+                try plan.captureForegroundText(guard.handle.database());
+            }
+            try plan.finishForegroundText();
         }
         fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
@@ -5225,12 +5228,15 @@ pub fn antfly_db_batch_json(
             const request: *@This() = @ptrCast(@alignCast(raw));
             const plan = request.prepared orelse return;
             try plan.prepareAttempt();
-            const guard = enterHandle(request.handle_ptr, .read) orelse return error.InvalidArgument;
-            defer guard.leave();
-            // Preparation is optional. Mutation admission below preserves the
-            // actual entry error and its retry/outcome classification.
-            if (guard.entry_error != null) return;
-            try plan.stageForegroundText(guard.handle.database());
+            {
+                const guard = enterHandle(request.handle_ptr, .read) orelse return error.InvalidArgument;
+                defer guard.leave();
+                // Preparation is optional. Mutation admission below preserves
+                // the actual entry error and its outcome classification.
+                if (guard.entry_error != null) return;
+                try plan.captureForegroundText(guard.handle.database());
+            }
+            try plan.finishForegroundText();
         }
         fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
@@ -10588,29 +10594,33 @@ test "issue1015 concurrent Lite handles sustain primary writes and full-text cat
                 self.failure = err;
             };
         }
+        fn requireOk(self: *@This(), code: capi.ErrorCode, phase: []const u8, ordinal: usize) !void {
+            if (code != .ok) std.debug.print("issue1015 worker={d} phase={s} write={d} code={t} detail={s}\n", .{ self.ordinal, phase, ordinal, code, std.mem.span(capi.lastErrorDetail()) });
+            try std.testing.expectEqual(capi.ErrorCode.ok, code);
+        }
         fn exercise(self: *@This()) !void {
             var handle: ?*anyopaque = null;
             // Exercise all 32 connections and 6,400 writes without paying for
             // a power-loss barrier on every functional progress assertion.
             const options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite, .flags = capi.open_flag_no_sync };
-            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(self.path, &options, &handle));
+            try self.requireOk(antfly_db_create_with_options(self.path, &options, &handle), "create", 0);
             defer antfly_db_close(handle);
             for (0..200) |i| {
                 var request_buffer: [256]u8 = undefined;
                 const request = try std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"k:{d}:{d}\":{{\"search_text\":\"raft snapshot number {d}\"}}}},\"sync_level\":\"write\"}}", .{ self.ordinal, i, i });
                 var output: capi.Buffer = .{};
                 defer antfly_buffer_free(&output);
-                try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{ .ptr = request.ptr, .len = request.len }, &output));
+                try self.requireOk(antfly_db_batch_json(handle, .{ .ptr = request.ptr, .len = request.len }, &output), "write", i);
                 if (i % 50 == 0) {
                     const query = "{\"full_text_search\":{\"match\":{\"field\":\"search_text\",\"text\":\"raft\"}},\"limit\":5}";
                     var hits: capi.Buffer = .{};
                     defer antfly_buffer_free(&hits);
-                    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(handle, .{ .ptr = query.ptr, .len = query.len }, &hits));
+                    try self.requireOk(antfly_db_search_json(handle, .{ .ptr = query.ptr, .len = query.len }, &hits), "search", i);
                 }
             }
             // Primary availability alone is insufficient: every secondary must
             // catch up too, so degradation cannot hide a dead derived worker.
-            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+            try self.requireOk(antfly_db_run_until_idle(handle), "drain", 200);
         }
     };
     var start = std.atomic.Value(bool).init(false);

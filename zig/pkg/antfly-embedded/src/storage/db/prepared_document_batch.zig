@@ -41,8 +41,11 @@ pub const Plan = struct {
     text_guards: []manager_mod.OwnedForegroundTextPublication.Guard = &.{},
     text_candidates: []*persistent.PersistentIndex.PreparedNativePublication = &.{},
     text_selected: []usize = &.{},
+    explicit_deletes: std.StringHashMapUnmanaged(void) = .empty,
+    effects_seen: std.StringHashMapUnmanaged(void) = .empty,
+    ordinal_postimages: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     const Text = struct { config: manager_mod.ForegroundTextProjection, built: manager_mod.PreparedTextMapperPublication, publication: ?*manager_mod.OwnedForegroundTextPublication = null };
-    const Entry = struct { value: []const u8, template: mapper.ExtractedWrite, extracted: ?mapper.ExtractedWrite = null };
+    const Entry = struct { value: []const u8, ordinal_key: []const u8 = &.{}, template: mapper.ExtractedWrite, extracted: ?mapper.ExtractedWrite = null };
 
     /// Called under the short catalog lifetime fence. No borrowed DB pointer
     /// or primary snapshot survives this capture.
@@ -76,6 +79,9 @@ pub const Plan = struct {
         self.alloc.free(self.text_guards);
         self.alloc.free(self.text_candidates);
         self.alloc.free(self.text_selected);
+        self.explicit_deletes.deinit(self.alloc);
+        self.effects_seen.deinit(self.alloc);
+        self.ordinal_postimages.deinit(self.alloc);
         self.rows.deinit(self.alloc);
         self.catalog.release();
         if (self.schema) |*schema| schema.release();
@@ -142,6 +148,8 @@ pub const Plan = struct {
         defer delete_keys.deinit(a);
         var entries = self.rows.iterator();
         while (entries.next()) |entry| {
+            entry.value_ptr.ordinal_key = try @import("../internal_keys.zig").identityDocToOrdinalKeyAlloc(self.inputs.allocator(), entry.key_ptr.*);
+            try self.ordinal_postimages.put(a, entry.value_ptr.ordinal_key, null);
             const value = (try entry.value_ptr.template.logicalJson()) orelse return;
             try docs.append(a, .{ .key = entry.key_ptr.*, .value = value, .root = entry.value_ptr.template.prepared_text_root });
             try delete_keys.append(a, entry.key_ptr.*);
@@ -151,7 +159,15 @@ pub const Plan = struct {
                 return std.mem.order(u8, left.key, right.key) == .lt;
             }
         }.less);
-        for (request.deletes) |key| try delete_keys.append(a, try self.inputs.allocator().dupe(u8, key));
+        for (request.deletes) |key| {
+            const owned = try self.inputs.allocator().dupe(u8, key);
+            try delete_keys.append(a, owned);
+            try self.explicit_deletes.put(a, owned, {});
+        }
+        // Final validation must neither allocate nor scan the remaining input
+        // for every row. These bounds cover only captured keys; unknown keys
+        // are rejected before inserting into the scratch set.
+        try self.effects_seen.ensureTotalCapacity(a, @intCast(self.rows.count() + self.explicit_deletes.count()));
         self.text_delete_keys = try delete_keys.toOwnedSlice(a);
         const count = self.catalog.plan().foreground_text.len;
         self.text_guards = try a.alloc(manager_mod.OwnedForegroundTextPublication.Guard, count);
@@ -166,10 +182,10 @@ pub const Plan = struct {
         }
     }
 
-    /// Called under a short current-runtime read/lifetime fence after posting
-    /// construction. This captures native aliases and exact metadata witnesses,
-    /// then releases every mutable index reference before writer admission.
-    pub fn stageForegroundText(self: *Plan, database: anytype) !void {
+    /// Capture staged artifacts, finite metadata witnesses and immutable index
+    /// inputs under the current-runtime lifetime fence. The caller finishes
+    /// replacement preparation after releasing this fence.
+    pub fn captureForegroundText(self: *Plan, database: anytype) !void {
         if (self.text.items.len == 0 or !try self.matches(database)) return;
         const previous = database.core.store.lastReplaySequence(0);
         var current = try database.core.index_manager.acquireWritePlanSnapshot();
@@ -181,46 +197,59 @@ pub const Plan = struct {
                 if (item.config.matches(config)) break config;
             } else continue;
             item.built.stageNative(config.stager) catch |err| switch (err) {
-                error.EnrichmentWaitCanceled, error.FileBusy => continue,
+                error.EnrichmentWaitCanceled, error.FileBusy, error.StaleArtifactConstruction => continue,
                 else => return err,
             };
-            item.publication = database.core.index_manager.prepareOwnedForegroundTextPublication(database.core.store, item.config, &item.built, self.text_delete_keys, previous) catch |err| switch (err) {
-                error.EnrichmentWaitCanceled, error.FileBusy => null,
+            item.publication = database.core.index_manager.captureOwnedForegroundTextPublication(database.core.store, item.config, &item.built, self.text_delete_keys, previous) catch |err| switch (err) {
+                error.EnrichmentWaitCanceled, error.FileBusy, error.StaleArtifactConstruction => null,
                 else => return err,
             };
         }
     }
 
-    fn matchesEffects(self: *const Plan, request: types.BatchRequest) bool {
-        var count: usize = 0;
-        for (request.writes, 0..) |write, i| {
-            for (request.deletes) |key| {
-                if (std.mem.eql(u8, key, write.key)) break;
-            } else {
-                for (request.writes[i + 1 ..]) |later| {
-                    if (std.mem.eql(u8, later.key, write.key)) break;
-                } else {
-                    const expected = self.rows.get(write.key) orelse return false;
-                    if (!std.mem.eql(u8, expected.value, write.value)) return false;
-                    count += 1;
-                }
-            }
+    /// Finish private replacements after releasing current-runtime admission.
+    pub fn finishForegroundText(self: *Plan) !void {
+        for (self.text.items) |*item| {
+            const publication = item.publication orelse continue;
+            publication.finish(&item.built, self.text_delete_keys) catch |err| switch (err) {
+                error.EnrichmentWaitCanceled, error.FileBusy, error.StaleArtifactConstruction => {
+                    publication.deinit();
+                    item.publication = null;
+                },
+                else => return err,
+            };
         }
-        if (count != self.rows.count()) return false;
-        // Extra captured keys are replacement writes; every effective explicit
-        // delete must also be covered by this publication's deletion plan.
+    }
+
+    /// Convenience for callers already responsible for their runtime lifetime.
+    pub fn stageForegroundText(self: *Plan, database: anytype) !void {
+        try self.captureForegroundText(database);
+        try self.finishForegroundText();
+    }
+
+    /// Compare coalesced authored effects in linear expected time without
+    /// allocation. Final writes win, then explicit deletes, as in preparation.
+    pub fn matchesEffects(self: *Plan, request: types.BatchRequest) bool {
+        self.effects_seen.clearRetainingCapacity();
+        var deletes: usize = 0;
         for (request.deletes) |key| {
-            for (self.text_delete_keys) |captured| {
-                if (std.mem.eql(u8, key, captured)) break;
-            } else return false;
+            if (!self.explicit_deletes.contains(key)) return false;
+            const entry = self.effects_seen.getOrPutAssumeCapacity(key);
+            if (!entry.found_existing) deletes += 1;
         }
-        for (self.text_delete_keys) |key| {
-            if (self.rows.contains(key)) continue;
-            for (request.deletes) |actual| {
-                if (std.mem.eql(u8, key, actual)) break;
-            } else return false;
+        if (deletes != self.explicit_deletes.count()) return false;
+        var count: usize = 0;
+        var cursor = request.writes.len;
+        while (cursor != 0) {
+            cursor -= 1;
+            const write = request.writes[cursor];
+            if (self.effects_seen.contains(write.key)) continue;
+            const expected = self.rows.get(write.key) orelse return false;
+            if (!std.mem.eql(u8, expected.value, write.value)) return false;
+            self.effects_seen.putAssumeCapacity(write.key, {});
+            count += 1;
         }
-        return true;
+        return count == self.rows.count();
     }
 
     /// Bind identities from this primary transaction's authoritative postimage.
@@ -242,30 +271,29 @@ pub const Plan = struct {
             const guard = (try publication.bind(manager)) orelse continue;
             self.text_selected[selected] = index;
             self.text_guards[selected] = guard;
-            self.text_candidates[selected] = publication.native;
+            self.text_candidates[selected] = publication.native.?;
             selected += 1;
         }
         if (selected == 0) return false;
         var read = try store.beginReadTxn();
         defer read.abort();
-        const IdentityView = struct {
-            read: *@TypeOf(read),
-            writes: []const docstore.KVPair,
-            pub fn get(view: *@This(), key: []const u8) ![]const u8 {
-                var index = view.writes.len;
-                while (index != 0) {
-                    index -= 1;
-                    const write = view.writes[index];
-                    if (std.mem.eql(u8, write.key, key)) return write.value;
-                }
-                return view.read.get(key);
-            }
+        // Only captured document-to-ordinal keys participate. The map and
+        // encoded keys were allocated before admission. Scanning metadata once
+        // avoids an O(documents * identity writes) overlay lookup in the gate.
+        var values = self.ordinal_postimages.valueIterator();
+        while (values.next()) |value| value.* = null;
+        for (identity_writes) |write| if (self.ordinal_postimages.getPtr(write.key)) |value| {
+            value.* = write.value;
         };
-        var identities: IdentityView = .{ .read = &read, .writes = identity_writes };
         for (self.text_selected[0..selected]) |index| {
             for (self.text.items[index].built.staged) |*segment| {
                 const ordinals = if (segment.ordinals) |*value| value else return error.InvalidDocIdentity;
-                for (ordinals.keys, ordinals.assigned) |key, *assigned| assigned.* = (try identity.lookupOrdinalTxn(self.alloc, &identities, key)) orelse return error.InvalidDocIdentity;
+                for (ordinals.keys, ordinals.assigned) |key, *assigned| {
+                    const entry = self.rows.get(key) orelse return error.InvalidDocIdentity;
+                    const raw = self.ordinal_postimages.get(entry.ordinal_key).? orelse try read.get(entry.ordinal_key);
+                    if (raw.len != @sizeOf(u32)) return error.InvalidDocIdentity;
+                    assigned.* = std.mem.readInt(u32, raw[0..4], .big);
+                }
                 try ordinals.bind(ordinals.assigned);
             }
         }

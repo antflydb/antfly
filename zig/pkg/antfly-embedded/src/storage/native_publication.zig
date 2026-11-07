@@ -19,6 +19,16 @@
 const std = @import("std");
 const abi = @import("../runtime_callback_abi.zig");
 
+/// All scoped publication paths use the same component and root validation.
+pub fn requireDestination(prefix: []const u8, path: []const u8) !void {
+    if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidNativeIndexPath;
+    if (prefix.len != 0 and (!std.mem.startsWith(u8, path, prefix) or (path.len != prefix.len and path[prefix.len] != '/'))) return error.InvalidNativeIndexPath;
+    if (path.len == prefix.len) return;
+    const start = if (prefix.len == 0) @as(usize, @intFromBool(path[0] == '/')) else prefix.len + 1;
+    var parts = std.mem.splitScalar(u8, path[start..], '/');
+    while (parts.next()) |part| if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.InvalidNativeIndexPath;
+}
+
 pub const Scope = struct {
     inode: u64,
     file_namespace: [32]u8 = @splat(0),
@@ -40,6 +50,24 @@ pub const NamespaceIdentity = struct {
     pub fn eql(self: NamespaceIdentity, other: NamespaceIdentity) bool {
         return std.meta.eql(self, other);
     }
+
+    /// A native vacuum replaces the inode while preserving each unchanged
+    /// namespace's authenticated semantic generation. Retained segment sources
+    /// still own their original extents. This permits rebasing a *loaded*
+    /// snapshot; a prepared publication must retain and validate its exact inode.
+    /// An absent generation cannot establish unchanged namespace contents.
+    pub fn sameRetainedState(self: NamespaceIdentity, other: NamespaceIdentity) bool {
+        if (self.generation == null or other.generation == null) return false;
+        var rebased = self;
+        rebased.inode = other.inode;
+        return rebased.eql(other);
+    }
+};
+
+/// The finite metadata inputs needed after releasing a broad native snapshot.
+pub const PreparationRead = struct {
+    namespace: @import("backend_types.zig").Namespace,
+    key: []const u8,
 };
 
 /// Owned by a prepared namespace transaction until publication completes.
@@ -159,3 +187,22 @@ pub const MetadataTxn = struct {
         try self.view.putMetadata(self.scope, key, value);
     }
 };
+
+test "loaded native namespace rebase preserves semantic and file namespace fences" {
+    const identity: NamespaceIdentity = .{ .inode = 1, .file_namespace = @splat(3), .root = @splat(7), .generation = @splat(11) };
+    var replacement = identity;
+    replacement.inode = 2;
+    try std.testing.expect(!identity.eql(replacement));
+    try std.testing.expect(identity.sameRetainedState(replacement));
+    replacement.generation = @splat(12);
+    try std.testing.expect(!identity.sameRetainedState(replacement));
+    replacement = identity;
+    replacement.file_namespace = @splat(4);
+    try std.testing.expect(!identity.sameRetainedState(replacement));
+    replacement = identity;
+    replacement.root = @splat(8);
+    try std.testing.expect(!identity.sameRetainedState(replacement));
+    replacement = identity;
+    replacement.generation = null;
+    try std.testing.expect(!replacement.sameRetainedState(replacement));
+}

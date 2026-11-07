@@ -129,6 +129,26 @@ fn ParentBox(comptime T: type) type {
             allocator.destroy(self);
         }
 
+        fn detachForPreparation(self: *@This(), queries: []const @import("native_publication.zig").PreparationRead) !@import("native_publication.zig").NamespaceIdentity {
+            platform.sync.lockYielding(&self.mutex);
+            if (self.owner_closed or self.finalizing) {
+                self.mutex.unlock();
+                return error.TransactionClosed;
+            }
+            if (self.child_count != 0) {
+                self.mutex.unlock();
+                return error.TransactionCursorActive;
+            }
+            self.finalizing = true;
+            self.mutex.unlock();
+            defer {
+                platform.sync.lockYielding(&self.mutex);
+                self.finalizing = false;
+                self.mutex.unlock();
+            }
+            return self.handle.detachForPreparation(queries);
+        }
+
         fn prepareNativePublication(self: *@This()) !@import("native_publication.zig").Prepared {
             platform.sync.lockYielding(&self.mutex);
             if (self.owner_closed or self.finalizing) {
@@ -966,6 +986,8 @@ pub const NamespaceWriteTxn = struct {
         append_put: ?*const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror!void,
         open_cursor: ?*const fn (Allocator, *anyopaque, backend_types.Namespace) anyerror!Cursor = null,
+        native_identity: ?*const fn (*anyopaque) anyerror!?@import("native_publication.zig").NamespaceIdentity = null,
+        detach_preparation: ?*const fn (*anyopaque, []const @import("native_publication.zig").PreparationRead) anyerror!@import("native_publication.zig").NamespaceIdentity = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -983,6 +1005,16 @@ pub const NamespaceWriteTxn = struct {
         const operation = self.vtable.commit_publication orelse return error.Unsupported;
         try BoundaryAbi.call("commit_publication", self.boundary_dispatch, operation, .{ self.allocator, self.ptr, participant });
         self.* = undefined;
+    }
+
+    pub fn nativeIdentity(self: *NamespaceWriteTxn) !?@import("native_publication.zig").NamespaceIdentity {
+        const operation = self.vtable.native_identity orelse return null;
+        return try BoundaryAbi.call("native_identity", self.boundary_dispatch, operation, .{self.ptr});
+    }
+
+    pub fn detachForPreparation(self: *NamespaceWriteTxn, queries: []const @import("native_publication.zig").PreparationRead) !@import("native_publication.zig").NamespaceIdentity {
+        const operation = self.vtable.detach_preparation orelse return error.Unsupported;
+        return BoundaryAbi.call("detach_preparation", self.boundary_dispatch, operation, .{ self.ptr, queries });
     }
 
     pub fn prepareNativePublication(self: *NamespaceWriteTxn) !@import("native_publication.zig").Prepared {
@@ -2118,6 +2150,14 @@ pub fn namespaceWriteTxnFrom(
             try unbox(ptr).commitWithPublication(participant);
         }
 
+        fn nativeIdentity(ptr: *anyopaque) anyerror!?@import("native_publication.zig").NamespaceIdentity {
+            return try unbox(ptr).handle.nativeIdentity();
+        }
+
+        fn detachForPreparation(ptr: *anyopaque, queries: []const @import("native_publication.zig").PreparationRead) anyerror!@import("native_publication.zig").NamespaceIdentity {
+            return unbox(ptr).detachForPreparation(queries);
+        }
+
         fn prepareNativePublication(_: Allocator, ptr: *anyopaque) anyerror!@import("native_publication.zig").Prepared {
             return unbox(ptr).prepareNativePublication();
         }
@@ -2165,6 +2205,8 @@ pub fn namespaceWriteTxnFrom(
             .commit_native_identity = if (@hasDecl(Handle, "commitWithNativeIdentity")) vt.commitNativeIdentity else null,
             .commit_publication = if (@hasDecl(Handle, "commitWithPublication")) vt.commitPublication else null,
             .prepare_native_publication = if (@hasDecl(Handle, "prepareNativePublication")) vt.prepareNativePublication else null,
+            .native_identity = if (@hasDecl(Handle, "nativeIdentity")) vt.nativeIdentity else null,
+            .detach_preparation = if (@hasDecl(Handle, "detachForPreparation")) vt.detachForPreparation else null,
             .get = vt.get,
             .get_many_sorted = if (@hasDecl(Handle, "getManySorted")) vt.getManySorted else null,
             .put = vt.put,

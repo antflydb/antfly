@@ -78113,14 +78113,18 @@ test "db owned document preparation transfers effects and rejects changed identi
 }
 
 test "db native foreground text shares the primary commit and binds authoritative document identities" {
-    try testNativeForegroundTextPrimary(false);
+    try testNativeForegroundTextPrimary(false, false);
 }
 
 test "db native foreground text shares dynamic claims across multiple indexes in one primary commit" {
-    try testNativeForegroundTextPrimary(true);
+    try testNativeForegroundTextPrimary(true, false);
 }
 
-fn testNativeForegroundTextPrimary(dynamic: bool) !void {
+test "db native foreground text shares one durable barrier with primary writes and deletes" {
+    try testNativeForegroundTextPrimary(true, true);
+}
+
+fn testNativeForegroundTextPrimary(dynamic: bool, durable: bool) !void {
     const a = std.testing.allocator;
     const lite = @import("../lite/backend.zig");
     const Prepared = @import("prepared_document_batch.zig").Plan;
@@ -78131,7 +78135,7 @@ fn testNativeForegroundTextPrimary(dynamic: bool) !void {
     defer a.free(path);
     var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
     defer host.deinit();
-    var backend = try lite.Handle.createWithOptions(a, path, .{ .exclusive = true, .externally_locked = true, .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    var backend = try lite.Handle.createWithOptions(a, path, .{ .exclusive = true, .externally_locked = true, .no_sync = !durable, .io = std.testing.io, .reclamation = .{ .enabled = false } });
     defer backend.deinit();
     backend.native_docstore.?.maintenance_start_suppressed = true;
     var options: OpenOptions = .{ .backend_runtime = host.ptr(), .executor = .{ .backend = .manual }, .start_index_workers = false, .start_optional_runtimes = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .text_merge = .{ .enabled = false } };
@@ -78146,10 +78150,17 @@ fn testNativeForegroundTextPrimary(dynamic: bool) !void {
     try database.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
     if (dynamic) try database.addIndex(.{ .name = "second", .kind = .full_text, .config_json = "{}" });
     for ([_][]const u8{ "{\"body\":\"alpha résumé 日本語\"}", "{\"body\":\"beta κόσμος\"}" }, 0..) |value, round| {
-        const request: types.BatchRequest = .{ .writes = &.{.{ .key = "one", .value = value }}, .sync_level = .write };
+        const request: types.BatchRequest = .{ .writes = &.{
+            .{ .key = "one", .value = "discarded malformed JSON" },
+            .{ .key = "shadow", .value = "discarded by deletion" },
+            .{ .key = "one", .value = value },
+        }, .deletes = &.{ "shadow", "shadow" }, .sync_level = .write };
         var prepared = (try Prepared.capture(a, &database)).?;
         defer prepared.deinit();
         try prepared.prepare(request);
+        try std.testing.expect(prepared.matchesEffects(request));
+        try std.testing.expect(!prepared.matchesEffects(.{ .writes = &.{.{ .key = "one", .value = "changed" }}, .deletes = &.{"shadow"} }));
+        try std.testing.expect(prepared.matchesEffects(request));
         try std.testing.expectEqual(@as(usize, if (dynamic) 2 else 1), prepared.text.items.len);
         try prepared.stageForegroundText(&database);
         if (prepared.text.items[0].publication == null) {
@@ -78159,11 +78170,13 @@ fn testNativeForegroundTextPrimary(dynamic: bool) !void {
             return error.ForegroundPublicationNotPrepared;
         }
         const before = backend.native_docstore.?.file.activeCheckpoint().commit_sequence;
+        const barriers = backend.native_docstore.?.file.test_durability_syncs.load(.monotonic);
         var committed = false;
         try database.batchTrackedWithPreparedDocuments(request, &committed, null, &prepared);
         try std.testing.expect(committed);
         for (prepared.text.items) |item| if (item.publication != null) return error.ForegroundPublicationNotConsumed;
         try std.testing.expectEqual(before + 1, backend.native_docstore.?.file.activeCheckpoint().commit_sequence);
+        if (durable) try std.testing.expectEqual(@as(u64, 1), backend.native_docstore.?.file.test_durability_syncs.load(.monotonic) - barriers);
         const entry = database.core.index_manager.textIndexEntry("text").?;
         try std.testing.expectEqual(@as(u32, 1), entry.persistent.snapshot().liveDocCount());
         var read = try database.core.store.beginReadTxn();
@@ -78208,10 +78221,12 @@ fn testNativeForegroundTextPrimary(dynamic: bool) !void {
     try deleting.stageForegroundText(&database);
     for (deleting.text.items) |item| if (item.publication == null) return error.ForegroundDeletionNotPrepared;
     const before_deletion = backend.native_docstore.?.file.activeCheckpoint().commit_sequence;
+    const deletion_barriers = backend.native_docstore.?.file.test_durability_syncs.load(.monotonic);
     committed = false;
     try database.batchTrackedWithPreparedDocuments(deletion, &committed, null, &deleting);
     try std.testing.expect(committed);
     try std.testing.expectEqual(before_deletion + 1, backend.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    if (durable) try std.testing.expectEqual(@as(u64, 1), backend.native_docstore.?.file.test_durability_syncs.load(.monotonic) - deletion_barriers);
     try std.testing.expectEqual(@as(u32, 0), entry.persistent.snapshot().liveDocCount());
     try std.testing.expect((try database.get(a, "one")) == null);
     // A foreground postimage cannot cover an older canonical record which its

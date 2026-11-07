@@ -6169,6 +6169,17 @@ const AdmissionFollowupFixture = struct {
         };
     }
 
+    /// Replay lifecycle probes need an outstanding journal entry even when
+    /// the public batch path can publish prepared text with its primary write.
+    fn writeReplaySource(self: *@This(), request: h.db_mod.types.BatchRequest) !void {
+        var lease = try self.connection.acquire();
+        defer self.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const root = try self.connection.owner.refresh();
+        try root.db.batch(request);
+        Owner.notifySourceMutation(self.connection.owner, root.db.core.identity_namespace.table_id, root.db.root_incarnation);
+    }
+
     fn expectWritten(self: *@This(), operation: AdmissionFollowupOperation, written: bool) !void {
         var out: h.capi.Buffer = .{};
         defer api.antfly_buffer_free_zero(&out);
@@ -6692,7 +6703,7 @@ test "capi native asynchronous text merge preserves newer segments and deletion 
     const sources_before = owner.publication_stats.maintenance_source_turns;
     var output: h.capi.Buffer = .{};
     defer api.antfly_buffer_free_zero(&output);
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice("{\"inserts\":{\"new-source-during-merge\":{\"text\":\"new primary source\"}},\"sync_level\":\"write\"}"), &output));
+    try fixture.writeReplaySource(.{ .writes = &.{.{ .key = "new-source-during-merge", .value = "{\"text\":\"new primary source\"}" }}, .sync_level = .write });
     for (0..32) |_| {
         _ = try owner.maintenanceTurn();
         if (owner.publication_stats.maintenance_source_turns > sources_before) break;
@@ -6742,7 +6753,7 @@ test "capi native asynchronous text merge preserves newer segments and deletion 
         owner.test_text_merge_segment_limit = snapshot.segments.len;
     }
     api.antfly_buffer_free_zero(&output);
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice("{\"inserts\":{\"blocked-source-during-merge\":{\"text\":\"capacity must return before this can replay\"}},\"sync_level\":\"write\"}"), &output));
+    try fixture.writeReplaySource(.{ .writes = &.{.{ .key = "blocked-source-during-merge", .value = "{\"text\":\"capacity must return before this can replay\"}" }}, .sync_level = .write });
     // At the current segment limit this new record cannot publish. A ready
     // merge must take an artifact-only turn before replay retries its capacity.
     for (0..8) |_| _ = try owner.maintenanceTurn();
@@ -9138,7 +9149,7 @@ test "capi native maintenance keeps settled text inputs warm across artifact tur
 
     var output: h.capi.Buffer = .{};
     defer api.antfly_buffer_free_zero(&output);
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice("{\"inserts\":{\"next\":{\"text\":\"warm café 東京\"}},\"sync_level\":\"write\"}"), &output));
+    try fixture.writeReplaySource(.{ .writes = &.{.{ .key = "next", .value = "{\"text\":\"warm café 東京\"}" }}, .sync_level = .write });
     const reuses = owner.publication_stats.maintenance_source_runtime_reuses;
     for (0..16) |_| {
         _ = try owner.maintenanceTurnForTest();
@@ -9823,7 +9834,7 @@ test "capi native staged text replay distinguishes foreign index changes from it
         var fixture = try AdmissionFollowupFixture.init("scoped-text-replay-progress", 5000, .batch);
         defer fixture.deinit();
         try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
-        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+        try fixture.writeReplaySource(.{ .writes = &.{.{ .key = "accepted", .value = "{\"text\":\"one admitted write\"}" }}, .sync_level = .write });
         const owner = fixture.connection.owner;
         var target: u64 = 0;
         {
@@ -9924,7 +9935,7 @@ test "capi native staged replay rejects a dropped and recreated target before ac
     var fixture = try AdmissionFollowupFixture.init("staged-replay-replacement", 5000, .batch);
     defer fixture.deinit();
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    try fixture.writeReplaySource(.{ .writes = &.{.{ .key = "accepted", .value = "{\"text\":\"one admitted write\"}" }}, .sync_level = .write });
     const owner = fixture.connection.owner;
     const Probe = struct {
         id: ?*anyopaque,
@@ -10037,7 +10048,9 @@ test "capi native registered replay fragments oversized batches across maintenan
         .value = .fromSlice("{\"text\":\"native fragment canary\"}"),
         .is_delete = false,
     };
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(fixture.id, &writes, writes.len, null, 0, 0, 0));
+    var replay_writes: [1024]h.db_mod.types.BatchWrite = undefined;
+    for (&replay_writes, writes) |*write, source| write.* = .{ .key = source.key.bytes(), .value = source.value.bytes() };
+    try fixture.writeReplaySource(.{ .writes = &replay_writes, .sync_level = .write });
     const owner = fixture.connection.owner;
     var target: u64 = 0;
     {
@@ -10665,7 +10678,7 @@ test "capi native replay publication retains primary epoch after preparing text 
     try std.testing.expectEqual(@as(usize, 1), fixture.connection.owner.current.?.db.core.index_manager.text_indexes.items.len);
     var output: h.capi.Buffer = .{};
     defer api.antfly_buffer_free_zero(&output);
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice("{\"inserts\":{\"later\":{\"text\":\"journal epoch retention canary\"}},\"sync_level\":\"write\"}"), &output));
+    try fixture.writeReplaySource(.{ .writes = &.{.{ .key = "later", .value = "{\"text\":\"journal epoch retention canary\"}" }}, .sync_level = .write });
     const owner = fixture.connection.owner;
     const Probe = struct {
         publications: usize = 0,

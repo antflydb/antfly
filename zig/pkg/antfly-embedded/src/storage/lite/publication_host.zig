@@ -34,14 +34,7 @@ pub const Host = struct {
     }
 
     fn validateDestination(self: *Host, path: []const u8) !void {
-        if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidNativeIndexPath;
-        const prefix = self.index_prefix;
-        if (prefix.len != 0 and (!std.mem.startsWith(u8, path, prefix) or
-            (path.len != prefix.len and path[prefix.len] != '/'))) return error.InvalidNativeIndexPath;
-        if (path.len == prefix.len) return;
-        const start = if (prefix.len == 0) @as(usize, @intFromBool(path[0] == '/')) else prefix.len + 1;
-        var parts = std.mem.splitScalar(u8, path[start..], '/');
-        while (parts.next()) |part| if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.InvalidNativeIndexPath;
+        return publication.requireDestination(self.index_prefix, path);
     }
 
     fn publishNamespace(raw: *anyopaque, plan: publication.NamespacePlan) !void {
