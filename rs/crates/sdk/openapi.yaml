@@ -42594,6 +42594,89 @@ components:
             review:
               type: number
               format: double
+    DeciderCascadeStage:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - decider
+      properties:
+        name:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{1,64}$
+          description: Unique within the cascade; reported in traces.
+        decider:
+          $ref: '#/components/schemas/DeciderConfig'
+          description: Inline typed or generated decider. Cascades and embedding_similarity deciders cannot
+            be stages.
+        when:
+          type: object
+          additionalProperties: false
+          required:
+            - probability_between
+          description: Required on every stage except the first, which must omit it. Inclusive band on
+            the previous stage's answer.
+          properties:
+            question:
+              type: string
+              description: Measure this question only. Omitted, any question in the band escalates.
+            choice:
+              type: string
+              description: For choice questions, measure this value's probability. Omitted, the selected
+                value's probability.
+            probability_between:
+              type: array
+              minItems: 2
+              maxItems: 2
+              items:
+                type: number
+                minimum: 0
+                maximum: 1
+              description: Lower and upper bound, lower strictly below upper. The previous stage must
+                not be verdict_only.
+        on_failure:
+          type: string
+          enum:
+            - fail
+            - keep_previous
+          default: fail
+          description: Defaults to fail, including on the first stage. fail ends the input with this stage's
+            error; keep_previous keeps the previous answer and records the error in the trace, and is
+            allowed only after the first stage.
+    DeciderCascade:
+      type: object
+      additionalProperties: false
+      required:
+        - stages
+      description: Required with decision_method=cascade, which allows no transport, model or rate-limit
+        fields of its own. The first stage answers every input. Each later stage runs only for inputs
+        whose previous answer falls inside its probability band, and all escalating inputs share one call.
+        The final answer is the last answering stage's. Escalation applies to successful answers only;
+        it is not failover. Probabilities are not calibrated across models, so set bands per model on
+        labelled data.
+      properties:
+        stages:
+          type: array
+          minItems: 2
+          maxItems: 4
+          items:
+            $ref: '#/components/schemas/DeciderCascadeStage'
+        budget:
+          type: object
+          additionalProperties: false
+          properties:
+            max_model_calls:
+              type: integer
+              minimum: 1
+              maximum: 8
+              description: Stage invocations allowed per request. Defaults to the stage count and cannot
+                be lower.
+            deadline_ms:
+              type: integer
+              minimum: 1
+              maximum: 600000
+              description: Narrows the caller's deadline for the whole cascade. Checked before each stage
+                and enforced by stage transports.
     DeciderConfig:
       type: object
       additionalProperties: false
@@ -42611,10 +42694,14 @@ components:
             - typed
             - embedding_similarity
             - generated
+            - cascade
           default: typed
           description: Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma
             2 choice and multi_choice questions; rejects score and predicate requests and returns raw
-            cosine similarities.
+            cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate
+            questions only.
+        cascade:
+          $ref: '#/components/schemas/DeciderCascade'
         generator:
           $ref: '#/components/schemas/GeneratorConfig'
           description: Required with decision_method=generated. Provider configuration belongs here rather
@@ -42819,8 +42906,10 @@ components:
       properties:
         decider:
           $ref: '#/components/schemas/DeciderConfig'
-          description: Frozen typed or generated decider configuration. Generated verdict-only thresholds
-            must be zero or one.
+          description: Frozen typed, generated or cascade decider configuration. Standalone generated
+            verdict-only thresholds must be zero or one. Mixed cascades apply shared thresholds to probabilistic
+            stages and require categorical zero-or-one terminal verdicts. A cascade answer is validated
+            against the stage that produced it, and the receipt keeps the response's stage trace.
         template:
           type: string
           minLength: 1
@@ -54945,6 +55034,8 @@ components:
             $ref: '#/components/schemas/DecisionBatchItem'
         usage:
           $ref: '#/components/schemas/DecisionUsage'
+        cascade:
+          $ref: '#/components/schemas/DecisionCascadeTrace'
       description: Single-input responses have answers. Batch responses have data in input order, with
         one named answer array per input and aggregate usage including reported usage from failed items.
         Named gateway batches identify the configured model at the top level and resolved models per successful
@@ -69244,6 +69335,94 @@ components:
         - $ref: '#/components/schemas/TrainedPredicateAnswer'
         - $ref: '#/components/schemas/EmbeddingChoiceAnswer'
         - $ref: '#/components/schemas/EmbeddingMultiChoiceAnswer'
+    DecisionUsage:
+      type: object
+      additionalProperties: false
+      required:
+        - input_tokens
+        - output_tokens
+      properties:
+        estimated:
+          type: boolean
+          description: True for estimated usage, including apportioned shared generated-batch costs and
+            embedding-based estimates. Generated cascades divide shared totals evenly, assigning integer
+            remainders in input order; their request aggregate remains measured.
+        input_tokens:
+          type: integer
+          minimum: 0
+          description: Encoded tokens including repeated input text for split model tasks.
+        output_tokens:
+          type: integer
+          minimum: 0
+          description: Zero for classifiers, which generate no tokens.
+    DecisionCascadeStageTrace:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - decision_method
+        - escalated
+      properties:
+        name:
+          type: string
+        decision_method:
+          type: string
+          enum:
+            - typed
+            - generated
+        model:
+          type: string
+        model_revision:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Immutable model revision reported by this stage, when available.
+        answers:
+          type: array
+          description: This stage's answers. Absent when the stage failed.
+          items:
+            $ref: '#/components/schemas/InferenceDecideAnswer'
+        usage:
+          $ref: '#/components/schemas/DecisionUsage'
+        provenance:
+          type: object
+          additionalProperties: true
+          description: Producer provenance reported for this stage, when present.
+        escalated:
+          type: boolean
+          description: Whether this answer fell inside the next stage's band, sending the input on.
+        error:
+          type: string
+          description: Error code when this stage failed for the input. With on_failure keep_previous,
+            the previous stage's answer stands.
+    DecisionCascadeTrace:
+      type: object
+      additionalProperties: false
+      required:
+        - decider
+        - definition_sha256
+        - answered_by
+        - stages
+      description: Present when a cascade decider answered. Lists the stages that ran for this input,
+        in order. The top-level model and answers come from the answering stage, and usage is the sum
+        over these stages.
+      properties:
+        decider:
+          type: string
+          description: The configured cascade name.
+        definition_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Identity of the cascade definition, excluding credentials. Any change to stages,
+            bands, failure policy or budget changes it.
+        answered_by:
+          type: string
+          description: Name of the stage whose answer is final.
+        stages:
+          type: array
+          minItems: 1
+          maxItems: 4
+          items:
+            $ref: '#/components/schemas/DecisionCascadeStageTrace'
     DecisionBatchItem:
       type: object
       additionalProperties: false
@@ -69269,21 +69448,8 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/InferenceDecideAnswer'
-    DecisionUsage:
-      type: object
-      additionalProperties: false
-      required:
-        - input_tokens
-        - output_tokens
-      properties:
-        input_tokens:
-          type: integer
-          minimum: 0
-          description: Encoded tokens including repeated input text for split model tasks.
-        output_tokens:
-          type: integer
-          minimum: 0
-          description: Zero for classifiers, which generate no tokens.
+        cascade:
+          $ref: '#/components/schemas/DecisionCascadeTrace'
     QueryAdmissionConfig:
       type: object
       additionalProperties: false

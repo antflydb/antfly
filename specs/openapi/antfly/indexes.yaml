@@ -775,7 +775,12 @@ components:
       properties:
         decider:
           $ref: "config.yaml#/components/schemas/DeciderConfig"
-          description: Frozen typed or generated decider configuration. Generated verdict-only thresholds must be zero or one.
+          description: >-
+            Frozen typed, generated or cascade decider configuration. Standalone generated
+            verdict-only thresholds must be zero or one. Mixed cascades apply shared thresholds
+            to probabilistic stages and require categorical zero-or-one terminal verdicts. A
+            cascade answer is validated against the stage that produced it, and the receipt
+            keeps the response's stage trace.
         template:
           type: string
           minLength: 1

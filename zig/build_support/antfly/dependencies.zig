@@ -623,6 +623,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     resolver_mod.addImport("antfly_matcher", matcher_mod);
     resolver_mod.addImport("antfly_hash", hash_mod);
     resolver_mod.addImport("antfly_platform", platform_mod);
+    resolver_mod.addImport("antfly_decisions", @import("../../lib/decisions/build.zig").create(b, b.path("lib/decisions/root.zig")));
     httpx_mod.addImport("antfly-json", json_mod);
     jsonschema_mod.addImport("antfly_regex", regex_mod);
     jsonschema_mod.addImport("antfly-json", json_mod);
