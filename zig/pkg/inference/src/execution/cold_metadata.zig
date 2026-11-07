@@ -143,7 +143,7 @@ pub const Owner = struct {
         const amounts = shared.admittedAmounts();
         if (self.phase != .preparing) return error.MetadataPreparationSealed;
         if (self.shared_preparing != null or self.shared_contributions >= 2) return error.MetadataSharedFloorAlreadyBound;
-        const combined = try (self.shared_metadata_floor orelse .{}).merge(amounts);
+        const combined = try (self.shared_metadata_floor orelse memory.AdmissionAmounts{}).merge(amounts);
         try self.validateAdditional(amounts);
         self.shared_metadata_floor = combined;
         self.shared_identities[self.shared_contributions] = identity;
@@ -165,7 +165,7 @@ pub const Owner = struct {
     }
     fn detachSharedConstruction(self: *Owner, shared: *Shared) !void {
         std.debug.assert(self.shared_preparing == shared);
-        const combined = try (self.shared_metadata_floor orelse .{}).merge(shared.admittedAmounts());
+        const combined = try (self.shared_metadata_floor orelse memory.AdmissionAmounts{}).merge(shared.admittedAmounts());
         self.shared_metadata_floor = combined;
         self.shared_preparing = null;
     }
