@@ -286,11 +286,10 @@ pub fn expandPromptTokensForPreparedImages(
     }
 
     if (image_idx != prepared_images.len) return error.ImagePlaceholderCountMismatch;
-    return .{
-        .allocator = allocator,
-        .token_ids = try token_ids.toOwnedSlice(allocator),
-        .image_offsets = try image_offsets.toOwnedSlice(allocator),
-    };
+    const owned_ids = try token_ids.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_ids);
+    const owned_offsets = try image_offsets.toOwnedSlice(allocator);
+    return .{ .allocator = allocator, .token_ids = owned_ids, .image_offsets = owned_offsets };
 }
 
 pub fn prepareExpandedPromptEmbeddings(
@@ -308,7 +307,7 @@ pub fn prepareExpandedPromptEmbeddings(
     var prepared_images = try allocator.alloc(PreparedImage, images.len);
     defer allocator.free(prepared_images);
     var prepared_count: usize = 0;
-    errdefer {
+    defer {
         for (prepared_images[0..prepared_count]) |*prepared| prepared.deinit();
     }
     for (images, 0..) |image_bytes, idx| {
@@ -316,9 +315,6 @@ pub fn prepareExpandedPromptEmbeddings(
         prepared_images[idx] = try prepareImage(allocator, image_bytes, prep_cfg);
         debugQwenVlStage("prepared image {d} resized={}x{} tokens={d}", .{ idx, prepared_images[idx].resized_width, prepared_images[idx].resized_height, prepared_images[idx].image_token_count });
         prepared_count += 1;
-    }
-    defer {
-        for (prepared_images[0..prepared_count]) |*prepared| prepared.deinit();
     }
 
     debugQwenVlStage("expand prompt tokens", .{});
@@ -333,32 +329,22 @@ pub fn prepareExpandedPromptEmbeddings(
     const base_embeddings = try cb.embeddingLookup(embed_w, expanded.token_ids, expanded.token_ids.len, config.hidden_size);
     defer cb.free(base_embeddings);
 
-    debugQwenVlStage("base embeddings to f32", .{});
-    const hidden_size: usize = config.hidden_size;
-    const prompt_embeddings = try cb.toFloat32(base_embeddings, allocator);
-    defer allocator.free(prompt_embeddings);
-
-    const embedding_scale = config.tokenEmbeddingScale();
-    if (!std.math.approxEqAbs(f32, embedding_scale, 1.0, 1e-6)) {
-        for (prompt_embeddings) |*value| value.* *= embedding_scale;
-    }
-
+    const prefill = @import("../execution/decoder_prefill.zig");
+    var composition = try prefill.PromptEmbeddingRows.init(cb, allocator, base_embeddings, expanded.token_ids.len, config.hidden_size, config.tokenEmbeddingScale());
+    defer composition.deinit();
     for (prepared_images, 0..) |prepared, idx| {
         debugQwenVlStage("encode projected image {d}", .{idx});
-        const projected_ct = try qwen2vl_vision.encodePreparedImageTokensTensor(cb, allocator, config, prep_cfg, prepared);
-        defer cb.free(projected_ct);
-        debugQwenVlStage("projected image {d} to f32", .{idx});
-        const projected = try cb.toFloat32(projected_ct, allocator);
-        defer allocator.free(projected);
-
-        const expected_len = prepared.image_token_count * hidden_size;
-        if (projected.len != expected_len) return error.ImageTokenLengthMismatch;
-        const dst = expanded.image_offsets[idx] * hidden_size;
-        @memcpy(prompt_embeddings[dst..][0..expected_len], projected);
+        const projected = try qwen2vl_vision.encodePreparedImageTokensTensor(cb, allocator, config, prep_cfg, prepared);
+        defer cb.free(projected);
+        const shape = try cb.tensorShape(projected, allocator);
+        defer allocator.free(shape);
+        var elements: usize = 1;
+        for (shape) |dimension| elements = try std.math.mul(usize, elements, std.math.cast(usize, dimension) orelse return error.ImageTokenLengthMismatch);
+        if (elements != try std.math.mul(usize, prepared.image_token_count, config.hidden_size)) return error.ImageTokenLengthMismatch;
+        try composition.replace(.{ .offset = expanded.image_offsets[idx], .rows = prepared.image_token_count, .source = .{ .resident = projected } });
     }
-
-    const embedding_shape = [_]i32{ @intCast(expanded.token_ids.len), @intCast(hidden_size) };
-    const input_embeddings = try cb.fromFloat32Shape(prompt_embeddings, &embedding_shape);
+    debugQwenVlStage("compose prompt embeddings", .{});
+    const input_embeddings = try composition.finish();
     errdefer cb.free(input_embeddings);
 
     return .{
@@ -751,4 +737,53 @@ test "qwen admission image-token bound covers aligned preprocessing" {
         error.InvalidPreprocessorConfig,
         maxImageTokenCount(.{ .min_pixels = 2, .max_pixels = 1 }),
     );
+}
+
+test "qwen prompt expansion owns both transferred arrays through allocation failure" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const images = [_]PreparedImage{
+                .{ .allocator = a, .pixel_values = &.{}, .resized_width = 4, .resized_height = 4, .image_grid_thw = .{ 1, 2, 2 }, .image_token_count = 3 },
+                .{ .allocator = a, .pixel_values = &.{}, .resized_width = 4, .resized_height = 4, .image_grid_thw = .{ 1, 2, 2 }, .image_token_count = 5 },
+            };
+            var expanded = try expandPromptTokensForPreparedImages(a, &.{ 1, 7, 2, 7, 3 }, .{ .image_token_index = 7 }, &images);
+            defer expanded.deinit();
+            try std.testing.expectEqualSlices(i64, &.{ 1, 7, 7, 7, 2, 7, 7, 7, 7, 7, 3 }, expanded.token_ids);
+            try std.testing.expectEqualSlices(usize, &.{ 1, 5 }, expanded.image_offsets);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "qwen prepared images retire once when later prompt preparation fails" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const native = @import("../ops/native_compute.zig");
+            var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+            defer store.deinitOwned();
+            var compute = native.NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const png_1x1 = [_]u8{
+                0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+                0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+                0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+                0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+                0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41,
+                0x54, 0x78, 0xda, 0x63, 0xfc, 0xff, 0x9f, 0xa1,
+                0x1e, 0x00, 0x07, 0x82, 0x02, 0x7f, 0x3d, 0xc8,
+                0x48, 0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+                0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+            };
+            var unexpected = prepareExpandedPromptEmbeddings(&cb, a, .{ .hidden_size = 4, .image_token_index = 7 }, .{ .min_pixels = 16, .max_pixels = 16, .patch_size = 2, .merge_size = 1, .temporal_patch_size = 1 }, &.{1}, &.{ &png_1x1, &png_1x1 }) catch |err| switch (err) {
+                error.ImagePlaceholderCountMismatch => return,
+                else => return err,
+            };
+            defer unexpected.deinit(&cb);
+            return error.ExpectedLaterPromptFailure;
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

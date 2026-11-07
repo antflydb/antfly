@@ -25,6 +25,16 @@ const gguf_tensor_types = @import("../gguf/tensor_types.zig");
 const safetensors = @import("safetensors.zig");
 const c_file = @import("../util/c_file.zig");
 
+var panel_epoch: std.atomic.Value(u64) = .init(1);
+fn nextPanelEpoch() u64 {
+    var before = panel_epoch.load(.monotonic);
+    while (true) {
+        // Exhaustion is unknown coverage, never a recycled representation ID.
+        if (before == std.math.maxInt(u64)) return 0;
+        if (panel_epoch.cmpxchgWeak(before, before + 1, .monotonic, .monotonic)) |actual| before = actual else return before;
+    }
+}
+
 pub const QuantizedStorage = struct {
     pub const PackedExpertView = struct {
         expert_index: u32,
@@ -36,6 +46,76 @@ pub const QuantizedStorage = struct {
     };
 
     pub const PreparedGroupCache = struct {
+        const Owner = struct {
+            allocator: std.mem.Allocator,
+            references: std.atomic.Value(usize) = .init(1),
+            packed_bytes: []u8,
+            partner_keys: [2][]u8,
+            partner_count: u8,
+            backing: ?@import("../runtime/tier/cache.zig").PhysicalBacking = null,
+            retirement_references: std.atomic.Value(usize) = .init(1),
+            creator_deferred: bool = false,
+            retirement_node: @import("../execution/resource_retirement.zig").Node = undefined,
+
+            fn deferCreator(self: *Owner) !void {
+                const backing = if (self.backing) |*value| value else return error.MissingCacheRetirementDomain;
+                std.debug.assert(!self.creator_deferred);
+                self.creator_deferred = true;
+                self.retirement_node = .{ .context = self, .release_fn = finishDeferredCreator };
+                backing.deferCreatorDrop(&self.retirement_node) catch |err| {
+                    self.creator_deferred = false;
+                    return err;
+                };
+            }
+            fn finishDeferredCreator(raw: *anyopaque) callconv(.c) void {
+                const self: *Owner = @ptrCast(@alignCast(raw));
+                std.debug.assert(self.creator_deferred);
+                self.creator_deferred = false;
+                // Actual Source/Manager/final B proved outside all gates.
+                self.release(.{ .outside_execution = true }) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            }
+
+            fn release(self: *Owner, current: @import("../execution/cleanup_context.zig").Context) !void {
+                if (self.backing) |*backing| try backing.validateCleanup(current);
+                // Nonfinal alias drops still validate BEFORE ref mutation.
+                if (self.references.fetchSub(1, .acq_rel) != 1) return;
+                if (self.backing != null and !current.outside_execution) {
+                    const epoch = current.boundary.?;
+                    const boundary = epoch.boundary() catch |err| {
+                        _ = self.references.fetchAdd(1, .release);
+                        return err;
+                    };
+                    self.retirement_references.store(2, .release);
+                    self.retirement_node = .{ .context = self, .release_fn = finishRetirement };
+                    boundary.register(boundary.context, boundary.nonce, &self.retirement_node) catch |err| {
+                        self.retirement_references.store(1, .release);
+                        _ = self.references.fetchAdd(1, .release);
+                        return err;
+                    };
+                }
+                for (self.partner_keys[0..self.partner_count]) |key| self.allocator.free(key);
+                self.allocator.free(self.packed_bytes);
+                // No payload/keys remain in published callback metadata.
+                self.packed_bytes = &.{};
+                self.partner_keys = .{ &.{}, &.{} };
+                self.partner_count = 0;
+                self.dropRetirementReference();
+            }
+            fn finishRetirement(raw: *anyopaque) callconv(.c) void {
+                const self: *Owner = @ptrCast(@alignCast(raw));
+                self.dropRetirementReference();
+            }
+            fn dropRetirementReference(self: *Owner) void {
+                if (self.retirement_references.fetchSub(1, .acq_rel) != 1) return;
+                const allocator = self.allocator;
+                const backing = self.backing;
+                allocator.destroy(self);
+                // Owner header is physically dead too. Exact component
+                // ledger/refund is pure, outside actual B and all gates.
+                if (backing) |held| held.releaseAfterMetadataDeathOutsideExecution();
+            }
+        };
+
         pub const Format = enum {
             panel16_projection_group,
         };
@@ -50,6 +130,42 @@ pub const QuantizedStorage = struct {
         projection_count: u8,
         panel_cols: u16,
         row_blocks: u32,
+        source_epochs: [3]u64 = @splat(0),
+        retention: ?*Owner = null,
+
+        /// Adopt already staged bytes atomically, without a second payload.
+        pub fn adopt(self: *PreparedGroupCache, allocator: std.mem.Allocator) !void {
+            std.debug.assert(self.retention == null);
+            const owner = try allocator.create(Owner);
+            owner.* = .{ .allocator = allocator, .packed_bytes = self.packed_bytes, .partner_keys = self.partner_keys, .partner_count = self.partner_count };
+            self.retention = owner;
+        }
+        fn retain(self: PreparedGroupCache) ?PreparedGroupCache {
+            const owner = self.retention orelse return null;
+            const before = owner.references.fetchAdd(1, .monotonic);
+            std.debug.assert(before > 0);
+            return self;
+        }
+        fn unique(self: PreparedGroupCache) bool {
+            return if (self.retention) |owner| owner.references.load(.acquire) == 1 else true;
+        }
+
+        pub fn ownerMetadataBytes() usize {
+            return @sizeOf(Owner);
+        }
+        pub fn hasPhysicalBacking(self: *const PreparedGroupCache) bool {
+            return if (self.retention) |owner| owner.backing != null else false;
+        }
+        pub fn attachPhysicalBacking(self: *PreparedGroupCache, backing: @import("../runtime/tier/cache.zig").PhysicalBacking) void {
+            const owner = self.retention orelse @panic("group owner missing");
+            std.debug.assert(owner.references.load(.acquire) == 1 and owner.backing == null);
+            // A retained managed group may outlive its source Model/arena.
+            // SAME canonical process allocator owns packed data, keys, header.
+            std.debug.assert(owner.allocator.vtable == std.heap.c_allocator.vtable);
+            std.debug.assert(backing.bytes == self.ownedBytes() + @sizeOf(Owner));
+            owner.allocator = std.heap.c_allocator; // discard irrelevant caller ptr bits before late publication
+            owner.backing = backing;
+        }
 
         pub fn ownedBytes(self: *const PreparedGroupCache) usize {
             var total = self.packed_bytes.len;
@@ -61,9 +177,23 @@ pub const QuantizedStorage = struct {
             return self.partner_keys[0..self.partner_count];
         }
 
+        fn deferCacheCreator(self: *PreparedGroupCache) !void {
+            const owner = self.retention orelse return error.MissingPreparedGroupOwner;
+            try owner.deferCreator();
+            self.* = undefined; // exact creator ref moved, no ref decrement
+        }
+        pub fn validateCleanup(self: *const PreparedGroupCache, current: @import("../execution/cleanup_context.zig").Context) !void {
+            if (self.retention) |owner| if (owner.backing) |*backing| try backing.validateCleanup(current);
+        }
         pub fn deinit(self: *PreparedGroupCache, allocator: std.mem.Allocator) void {
-            for (self.partnerKeys()) |key| allocator.free(key);
-            allocator.free(self.packed_bytes);
+            self.deinitWithCleanup(allocator, .{}) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        }
+        pub fn deinitWithCleanup(self: *PreparedGroupCache, allocator: std.mem.Allocator, current: @import("../execution/cleanup_context.zig").Context) !void {
+            if (self.retention) |owner| try owner.release(current) else {
+                for (self.partnerKeys()) |key| allocator.free(key);
+                allocator.free(self.packed_bytes);
+            }
+            self.* = undefined;
         }
     };
 
@@ -140,6 +270,8 @@ pub const QuantizedStorage = struct {
     raw_bytes: []const u8,
     shape: []const i64,
     source_name: ?[]u8 = null,
+    /// Operation workload supplied by the model adapter; independent of kernel names.
+    dense_workload: ?@import("../ops/dense_projection_policy.zig").Workload = null,
     packed_expert: ?PackedExpertView = null,
     raw_owned: bool = true,
     /// The raw bytes are borrowed from a stable mmap-backed region. This is
@@ -154,7 +286,82 @@ pub const QuantizedStorage = struct {
     raw_mmap_region: ?c_file.MmapRegion = null,
     prepared: PreparedQuantCache = .{},
     prepared_group_cache: ?PreparedGroupCache = null,
+    /// Cache publication/retention only; never held while a numerical program
+    /// executes. Optional replacement declines while an old reader is active,
+    /// preserving exact model-cache charging until the bytes actually retire.
+    prepared_group_mutex: std.atomic.Mutex = .unlocked,
+    panel16_epoch: std.atomic.Value(u64) = .init(0),
     allocator: std.mem.Allocator,
+
+    pub fn retainPreparedGroup(self: *const QuantizedStorage) ?PreparedGroupCache {
+        const mutable = @constCast(self);
+        @import("antfly_platform").sync.lockYielding(&mutable.prepared_group_mutex);
+        defer mutable.prepared_group_mutex.unlock();
+        const cache = self.prepared_group_cache orelse return null;
+        return cache.retain();
+    }
+    pub const GroupDescriptor = struct {
+        format: PreparedGroupCache.Format,
+        packed_bytes: usize,
+        projection_count: u8,
+        panel_cols: u16,
+        row_blocks: usize,
+        source_epochs: [3]u64,
+        keys: [2][]const u8,
+    };
+    /// Pure layout/key comparison while the real cache metadata owner is held.
+    /// No retained alias, mutable owner pointer or lifetime credit escapes.
+    pub fn preparedGroupMatches(self: *const QuantizedStorage, expected: GroupDescriptor) bool {
+        const mutable = @constCast(self);
+        @import("antfly_platform").sync.lockYielding(&mutable.prepared_group_mutex);
+        defer mutable.prepared_group_mutex.unlock();
+        const cache = self.prepared_group_cache orelse return false;
+        for (cache.source_epochs, expected.source_epochs) |saved, current| if (saved == 0 or saved != current) return false;
+        if (cache.format != expected.format or cache.projection_count != expected.projection_count or cache.panel_cols != expected.panel_cols or cache.row_blocks != expected.row_blocks or cache.packed_bytes.len != expected.packed_bytes or cache.partner_count != 2) return false;
+        const keys = cache.partnerKeys();
+        return std.mem.eql(u8, keys[0], expected.keys[0]) and std.mem.eql(u8, keys[1], expected.keys[1]);
+    }
+
+    pub const GroupReplacement = union(enum) { busy, replaced: ?PreparedGroupCache };
+    pub fn replaceUnusedPreparedGroup(self: *QuantizedStorage, replacement: ?PreparedGroupCache) GroupReplacement {
+        return self.replaceUnusedPreparedGroupImpl(replacement, true);
+    }
+    /// Original raw producer cannot silently destroy a modern physical owner.
+    /// Its cold receiving adapter performs the typed detach explicitly.
+    pub fn replaceUnusedUnchargedPreparedGroup(self: *QuantizedStorage, replacement: ?PreparedGroupCache) GroupReplacement {
+        return self.replaceUnusedPreparedGroupImpl(replacement, false);
+    }
+    fn replaceUnusedPreparedGroupImpl(self: *QuantizedStorage, replacement: ?PreparedGroupCache, allow_backed: bool) GroupReplacement {
+        @import("antfly_platform").sync.lockYielding(&self.prepared_group_mutex);
+        defer self.prepared_group_mutex.unlock();
+        if (self.prepared_group_cache) |cache| if (!cache.unique() or (!allow_backed and cache.hasPhysicalBacking())) return .busy;
+        const previous = self.prepared_group_cache;
+        self.prepared_group_cache = replacement;
+        return .{ .replaced = previous };
+    }
+    pub fn commitPreparedGroup(self: *QuantizedStorage, candidate: *?PreparedGroupCache, growth: *@import("../runtime/tier/cache.zig").SharedCache.PreparedGrowth) !void {
+        @import("antfly_platform").sync.lockYielding(&self.prepared_group_mutex);
+        defer self.prepared_group_mutex.unlock();
+        if (self.prepared_group_cache != null) return error.NativeWeightPreparationChanged;
+        var group = candidate.* orelse return error.MissingPreparedGroupOwner;
+        try growth.validatePhysicalBacking();
+        try growth.commit(); // final fallible step, no supplier under this lock
+        group.attachPhysicalBacking(growth.retainCommittedPhysicalBacking());
+        self.prepared_group_cache = group;
+        candidate.* = null;
+    }
+    /// Weak owner identity is compared ONLY under actual metadata exclusion.
+    /// No pointer escapes; a peer retain refuses before any ledger mutation.
+    pub fn commitPreparedGroupUpgrade(self: *QuantizedStorage, expected_owner: usize, growth: *@import("../runtime/tier/cache.zig").SharedCache.PreparedGrowth) !void {
+        @import("antfly_platform").sync.lockYielding(&self.prepared_group_mutex);
+        defer self.prepared_group_mutex.unlock();
+        const group = if (self.prepared_group_cache) |*value| value else return error.NativeWeightPreparationChanged;
+        const owner = group.retention orelse return error.MissingPreparedGroupOwner;
+        if (@intFromPtr(owner) != expected_owner or owner.references.load(.acquire) != 1 or owner.backing != null or owner.allocator.vtable != std.heap.c_allocator.vtable) return error.NativeWeightPreparationChanged;
+        try growth.validatePhysicalBacking();
+        try growth.commit();
+        group.attachPhysicalBacking(growth.retainCommittedPhysicalBacking());
+    }
 
     pub fn preparedBytes(self: *const QuantizedStorage, layout: PreparedQuantLayout) ?[]u8 {
         return self.prepared.get(layout);
@@ -172,10 +379,29 @@ pub const QuantizedStorage = struct {
         row_blocks: u32,
     ) void {
         self.prepared.setOwned(self.allocator, layout, bytes, panel_cols, row_blocks);
+        if (layout == .panel16) self.panel16_epoch.store(nextPanelEpoch(), .release);
     }
 
     pub fn deinit(self: *QuantizedStorage) void {
-        if (self.prepared_group_cache) |*cache| cache.deinit(self.allocator);
+        self.deinitWithCleanup(.{}) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    }
+    pub fn validateCleanup(self: *const QuantizedStorage, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (self.prepared_group_cache) |*cache| try cache.validateCleanup(current);
+    }
+    pub fn retainedGroupLogicalBytes(self: *const QuantizedStorage) usize {
+        return if (self.prepared_group_cache) |*cache| if (cache.hasPhysicalBacking()) cache.ownedBytes() else 0 else 0;
+    }
+    pub fn deinitWithCleanup(self: *QuantizedStorage, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (self.prepared_group_cache) |*cache| try cache.deinitWithCleanup(self.allocator, current);
+        self.deinitStorageAfterGroup();
+    }
+    pub fn deinitDeferringManagedGroup(self: *QuantizedStorage) !void {
+        if (self.prepared_group_cache) |*cache| {
+            if (cache.hasPhysicalBacking()) try cache.deferCacheCreator() else cache.deinit(self.allocator);
+        }
+        self.deinitStorageAfterGroup();
+    }
+    fn deinitStorageAfterGroup(self: *QuantizedStorage) void {
         self.prepared.deinit(self.allocator);
         if (self.raw_mmap_region) |*region| {
             region.deinit();
@@ -230,11 +456,24 @@ test "dense Q8_0 quantization round-trips within one step of each block scale" {
 /// A loaded weight with optional quantization metadata.
 pub const LoadedWeight = struct {
     tensor: Tensor,
+    /// The maintained resident-slot replacement API alone advances this.
+    /// Immutable lazy checkpoint unload/reload retains its separate slot kind.
+    source_version: u64 = 0,
     quantized: bool = false,
     quantized_storage: ?QuantizedStorage = null,
 
     pub fn deinit(self: *LoadedWeight) void {
-        if (self.quantized_storage) |*storage| storage.deinit();
+        self.deinitWithCleanup(.{}) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    }
+    pub fn deinitDeferringManagedGroup(self: *LoadedWeight) !void {
+        if (self.quantized_storage) |*storage| try storage.deinitDeferringManagedGroup();
+        self.tensor.deinit();
+    }
+    pub fn validateCleanup(self: *const LoadedWeight, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (self.quantized_storage) |*storage| try storage.validateCleanup(current);
+    }
+    pub fn deinitWithCleanup(self: *LoadedWeight, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (self.quantized_storage) |*storage| try storage.deinitWithCleanup(current);
         self.tensor.deinit();
     }
 };
@@ -461,92 +700,10 @@ pub fn loadWeightsFromMapping(
 /// Convert a dense scalar tensor to f32 for backends that keep resident weights
 /// in float buffers.
 pub fn convertToF32(allocator: std.mem.Allocator, tensor: *const Tensor) !Tensor {
-    const count = tensor.elementCount();
-    const byte_count = count * @sizeOf(f32);
-    const out_bytes = try allocator.alloc(u8, byte_count);
-    const owned_shape = try allocator.dupe(i64, tensor.shape);
-    const f32_data: [*]f32 = @ptrCast(@alignCast(out_bytes.ptr));
-
-    switch (tensor.dtype) {
-        .f16 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 2;
-                const half: f16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
-                f32_data[i] = @floatCast(half);
-            }
-        },
-        .bf16 => {
-            // bf16: 1 sign bit, 8 exponent bits, 7 mantissa bits
-            // Convert by shifting left 16 bits into f32 format
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 2;
-                const bits: u16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
-                const f32_bits: u32 = @as(u32, bits) << 16;
-                f32_data[i] = @bitCast(f32_bits);
-            }
-        },
-        .f64 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 8;
-                const bits = std.mem.readInt(u64, src_bytes[offset..][0..8], .little);
-                const value: f64 = @bitCast(bits);
-                f32_data[i] = @floatCast(value);
-            }
-        },
-        .i8 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const value: i8 = @bitCast(src_bytes[i]);
-                f32_data[i] = @floatFromInt(value);
-            }
-        },
-        .i16 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 2;
-                const value = std.mem.readInt(i16, src_bytes[offset..][0..2], .little);
-                f32_data[i] = @floatFromInt(value);
-            }
-        },
-        .i32 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 4;
-                const value = std.mem.readInt(i32, src_bytes[offset..][0..4], .little);
-                f32_data[i] = @floatFromInt(value);
-            }
-        },
-        .i64 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 8;
-                const value = std.mem.readInt(i64, src_bytes[offset..][0..8], .little);
-                f32_data[i] = @floatFromInt(value);
-            }
-        },
-        .u8 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| f32_data[i] = @floatFromInt(src_bytes[i]);
-        },
-        .bool_ => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| f32_data[i] = if (src_bytes[i] == 0) 0.0 else 1.0;
-        },
-        else => return error.UnsupportedConversion,
-    }
-
-    return .{
-        .data = out_bytes,
-        .dtype = .f32,
-        .shape = owned_shape,
-        .name = tensor.name,
-        .allocator = allocator,
-        .owns_data = true,
-        .owns_shape = true,
-    };
+    if (tensor.dtype == .f32) return error.UnsupportedConversion;
+    const data = try tensor.toOwnedF32(allocator);
+    errdefer allocator.free(data);
+    return Tensor.initFloat32Owned(allocator, tensor.name, tensor.shape, data);
 }
 
 // -- Tests --
@@ -596,4 +753,209 @@ test "convert i64 token ordering to f32" {
 
     try std.testing.expectEqual(DType.f32, converted.dtype);
     try std.testing.expectEqualSlices(f32, &.{ 0.0, 2048.0, 262143.0 }, converted.asFloat32());
+}
+
+test "dense weight conversion releases every partial allocation" {
+    const a = std.testing.allocator;
+    var bits = [_]u16{ 0x3f80, 0xc000, 0x4040, 0xc080 };
+    const tensor = Tensor{ .data = std.mem.sliceAsBytes(&bits), .dtype = .bf16, .shape = &.{ 2, 2 }, .name = "partial", .allocator = a, .owns_data = false, .owns_shape = false };
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator, source: *const Tensor) !void {
+            var result = try convertToF32(allocator, source);
+            defer result.deinit();
+            try std.testing.expectEqualSlices(f32, &.{ 1, -2, 3, -4 }, result.asFloat32());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{&tensor});
+    var already_f32 = try Tensor.initFloat32(a, "unsupported", &.{1}, &.{7});
+    defer already_f32.deinit();
+    try std.testing.expectError(error.UnsupportedConversion, convertToF32(a, &already_f32));
+    try std.testing.expectEqualSlices(f32, &.{7}, already_f32.asFloat32());
+}
+
+fn exercisePreparedGroupOwnership(a: std.mem.Allocator) !void {
+    var storage = QuantizedStorage{ .tensor_type = .{ .known = .Q4_K }, .raw_bytes = &.{}, .shape = try a.dupe(i64, &.{ 1, 1 }), .raw_owned = false, .allocator = a };
+    var storage_owned = true;
+    defer if (storage_owned) storage.deinit();
+    const bytes = try a.dupe(u8, &.{ 1, 2, 3, 4 });
+    var bytes_owned = true;
+    defer if (bytes_owned) a.free(bytes);
+    const key_b = try a.dupe(u8, "same.b");
+    var key_b_owned = true;
+    defer if (key_b_owned) a.free(key_b);
+    const key_c = try a.dupe(u8, "same.c");
+    var key_c_owned = true;
+    defer if (key_c_owned) a.free(key_c);
+    var staged = QuantizedStorage.PreparedGroupCache{ .format = .panel16_projection_group, .packed_bytes = bytes, .partner_keys = .{ key_b, key_c }, .partner_count = 2, .projection_count = 3, .panel_cols = 16, .row_blocks = 1, .source_epochs = .{ 1, 2, 3 } };
+    try staged.adopt(a);
+    bytes_owned = false;
+    key_b_owned = false;
+    key_c_owned = false;
+    var staged_owned = true;
+    defer if (staged_owned) staged.deinit(a);
+    switch (storage.replaceUnusedPreparedGroup(staged)) {
+        .busy => return error.UnexpectedBusyCache,
+        .replaced => |previous| try std.testing.expect(previous == null),
+    }
+    staged_owned = false;
+    var first = storage.retainPreparedGroup() orelse return error.MissingPreparedGroup;
+    var first_owned = true;
+    defer if (first_owned) first.deinit(a);
+    try std.testing.expect(storage.replaceUnusedPreparedGroup(null) == .busy);
+    try std.testing.expectEqual(@as(usize, 16), first.ownedBytes());
+    var second = storage.retainPreparedGroup() orelse return error.MissingPreparedGroup;
+    defer second.deinit(a);
+    first.deinit(a);
+    first_owned = false;
+    try std.testing.expect(storage.replaceUnusedPreparedGroup(null) == .busy);
+    // The copied program owns its bytes/keys independently of the mutable
+    // storage slot. Managed model teardown separately requires quiescent users.
+    storage.deinit();
+    storage_owned = false;
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, second.packed_bytes);
+    try std.testing.expectEqualStrings("same.b", second.partnerKeys()[0]);
+}
+
+test "prepared quantized group owners pin immutable payload and reject replacement during numerical use" {
+    try exercisePreparedGroupOwnership(std.testing.allocator);
+}
+
+test "prepared quantized group ownership unwinds every metadata allocation failure" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exercisePreparedGroupOwnership, .{});
+}
+
+test "prepared panel identities survive cache epochs without pointer identity reuse" {
+    const a = std.testing.allocator;
+    var first = QuantizedStorage{ .tensor_type = .{ .known = .Q4_K }, .raw_bytes = &.{}, .shape = try a.dupe(i64, &.{ 1, 1 }), .raw_owned = false, .allocator = a };
+    defer first.deinit();
+    var second = QuantizedStorage{ .tensor_type = .{ .known = .Q4_K }, .raw_bytes = &.{}, .shape = try a.dupe(i64, &.{ 1, 1 }), .raw_owned = false, .allocator = a };
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u64, 0), first.panel16_epoch.load(.acquire));
+    first.setPreparedBytes(.panel16, try a.dupe(u8, &.{1}), 16, 1);
+    const original = first.panel16_epoch.load(.acquire);
+    second.setPreparedBytes(.panel16, try a.dupe(u8, &.{1}), 16, 1);
+    try std.testing.expect(original != 0 and second.panel16_epoch.load(.acquire) != original);
+    first.setPreparedBytes(.panel16, try a.dupe(u8, &.{2}), 16, 1);
+    try std.testing.expect(first.panel16_epoch.load(.acquire) != original);
+}
+
+test "Native grouped physical owner holds original Domain through later cleanup both seal orders" {
+    const tier = @import("../runtime/tier/cache.zig");
+    const domain_mod = @import("../runtime/tier/admission_domain.zig");
+    const sinks = @import("../execution/retirement_sink.zig");
+    for ([_]bool{ false, true }) |close_first| {
+        const domain = try domain_mod.Domain.create();
+        defer domain.release();
+        const pin = domain.pin();
+        defer pin.release();
+        var cache = tier.SharedCache.init(.{ .host_limit_bytes = 4096 });
+        defer cache.deinitAdmission();
+        try cache.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = 4096 }, .{});
+        try cache.installRetirementDomainOutsideExecution(&pin);
+        var group = QuantizedStorage.PreparedGroupCache{
+            .format = .panel16_projection_group,
+            .packed_bytes = try std.heap.c_allocator.alloc(u8, 16),
+            .partner_keys = .{ try std.heap.c_allocator.dupe(u8, "k"), try std.heap.c_allocator.dupe(u8, "v") },
+            .partner_count = 2,
+            .projection_count = 3,
+            .panel_cols = 16,
+            .row_blocks = 1,
+        };
+        try group.adopt(std.heap.c_allocator);
+        const bytes = group.ownedBytes() + QuantizedStorage.PreparedGroupCache.ownerMetadataBytes();
+        var growth = try cache.snapshotIndependentGrowthLocked(.host, bytes);
+        defer growth.finishOutsideExecution();
+        try growth.fundOutsideExecution(&pin);
+        try growth.validatePhysicalBacking();
+        try growth.commit();
+        group.attachPhysicalBacking(growth.retainCommittedPhysicalBacking());
+        var retained = group.retain().?;
+        var close_sink = try sinks.Ref.create();
+        defer close_sink.release();
+        var close_guard = try close_sink.enter();
+        defer close_guard.finish();
+        var close_b = try close_guard.retainEpoch();
+        defer close_b.release();
+        var later_sink = try sinks.Ref.create();
+        defer later_sink.release();
+        var later_guard = try later_sink.enter();
+        defer later_guard.finish();
+        var later_c = try later_guard.retainEpoch();
+        defer later_c.release();
+        // Missing authority is failure-atomic even for a nonfinal alias.
+        try std.testing.expectError(error.CacheRetirementCleanupAuthorityRequired, group.deinitWithCleanup(std.heap.c_allocator, .{}));
+        try std.testing.expectEqual(@as(usize, 2), retained.retention.?.references.load(.acquire));
+        const stale = sinks.Epoch{ .record = later_c.record, .nonce = later_c.nonce + 1 };
+        try std.testing.expectError(error.RetirementEpochConsumed, group.deinitWithCleanup(std.heap.c_allocator, .{ .boundary = &stale }));
+        try std.testing.expectEqual(@as(usize, 2), retained.retention.?.references.load(.acquire));
+        var sealed_sink = try sinks.Ref.create();
+        defer sealed_sink.release();
+        var sealed_guard = try sealed_sink.enter();
+        var sealed = try sealed_guard.retainEpoch();
+        defer sealed.release();
+        sealed_guard.finish();
+        try std.testing.expectError(error.RetirementEpochSealed, group.deinitWithCleanup(std.heap.c_allocator, .{ .boundary = &sealed }));
+        try std.testing.expectEqual(@as(usize, 2), retained.retention.?.references.load(.acquire));
+        try group.deinitWithCleanup(std.heap.c_allocator, .{ .boundary = &close_b });
+        cache.noteLogicalPhysicalOwnerRemoval(bytes);
+        try cache.deinitAdmissionWithCleanup(.{ .boundary = &close_b });
+        try std.testing.expectEqual(bytes, pin.controller().snapshot().host_weight_bytes);
+        if (close_first) close_guard.finish();
+        try std.testing.expectEqual(bytes, pin.controller().snapshot().host_weight_bytes);
+        var model: std.atomic.Mutex = .unlocked;
+        try std.testing.expect(model.tryLock());
+        try retained.deinitWithCleanup(std.heap.c_allocator, .{ .boundary = &later_c });
+        // Payload death alone must not refund under the later Model gate.
+        try std.testing.expectEqual(bytes, pin.controller().snapshot().host_weight_bytes);
+        model.unlock();
+        later_guard.finish();
+        if (!close_first) {
+            try std.testing.expectEqual(bytes, pin.controller().snapshot().host_weight_bytes);
+            close_guard.finish();
+        }
+        try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().host_weight_bytes);
+    }
+}
+
+test "Native grouped legacy eviction moves creator until actual outside settlement" {
+    const tier = @import("../runtime/tier/cache.zig");
+    const owner = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer owner.release();
+    const pin = owner.pin();
+    defer pin.release();
+    var cache = tier.SharedCache.init(.{ .host_limit_bytes = 4096 });
+    defer cache.deinitAdmission();
+    try cache.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = 4096 }, .{});
+    try cache.installRetirementDomainOutsideExecution(&pin);
+    var group = QuantizedStorage.PreparedGroupCache{
+        .format = .panel16_projection_group,
+        .packed_bytes = try std.heap.c_allocator.alloc(u8, 16),
+        .partner_keys = .{ &.{}, &.{} },
+        .partner_count = 0,
+        .projection_count = 3,
+        .panel_cols = 16,
+        .row_blocks = 1,
+    };
+    try group.adopt(std.heap.c_allocator);
+    const bytes = group.ownedBytes() + QuantizedStorage.PreparedGroupCache.ownerMetadataBytes();
+    var growth = try cache.snapshotIndependentGrowthLocked(.host, bytes);
+    defer growth.finishOutsideExecution();
+    try growth.fundOutsideExecution(&pin);
+    try growth.validatePhysicalBacking();
+    try growth.commit();
+    group.attachPhysicalBacking(growth.retainCommittedPhysicalBacking());
+    // Legacy reclaim has no current-B capability. Its creator ref moves into
+    // the SAME binding's preowned queue; no payload or charge is dropped here.
+    const physical = group.retention.?;
+    var gate: std.atomic.Mutex = .unlocked;
+    try std.testing.expect(gate.tryLock());
+    try group.deferCacheCreator();
+    cache.noteLogicalPhysicalOwnerRemoval(bytes);
+    try std.testing.expect(physical.creator_deferred);
+    try std.testing.expectEqual(@as(usize, 1), physical.references.load(.acquire));
+    try std.testing.expectEqual(bytes, pin.controller().snapshot().host_weight_bytes);
+    gate.unlock();
+    // Actual Source/Manager releases Model, lane and Native cache locks first.
+    try cache.flushReleasedOutsideExecution();
+    try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().host_weight_bytes);
 }

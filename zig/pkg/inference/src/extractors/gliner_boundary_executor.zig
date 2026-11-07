@@ -17,6 +17,7 @@
 //! Metal group compatible inputs into bounded physical batches; native retains
 //! its qualified serial request execution.
 //! Output is buffered atomically and independently bounded across all inputs.
+const compute_provider = @import("../backends/compute_provider.zig");
 const std = @import("std");
 const wire = @import("extraction_v2.zig");
 const model = @import("../models/gliner_boundary.zig");
@@ -609,7 +610,7 @@ fn testPinnedSmallExecutor(directory: []const u8, converted: bool, metal: bool) 
     defer if (watchdog) |owner| owner.destroy();
     if (watchdog) |owner| try owner.start(std.testing.io);
     const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 180 * std.time.ns_per_s };
-    var managed = try factory.getManagedComputeBackend(session, scratch, null, control);
+    var managed = try compute_provider.acquire(session, scratch, null, control);
     defer managed.deinit();
     const response = try execute(&managed.backend, scratch, &config, tokenizer.tokenizer(), &request, .{ .identity = try factory.getGlinerBoundaryIdentity(session), .control = control });
     defer scratch.free(response);
@@ -707,7 +708,7 @@ fn testWindowBatch(directory: []const u8, metal: bool) !void {
     defer if (watchdog) |owner| owner.destroy();
     if (watchdog) |owner| try owner.start(std.testing.io);
     const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 180 * std.time.ns_per_s };
-    var managed = try factory.getManagedComputeBackend(session, scratch, null, control);
+    var managed = try compute_provider.acquire(session, scratch, null, control);
     defer managed.deinit();
     const options = Options{ .identity = identity, .control = control };
     const result = try execute(&managed.backend, scratch, &config, tokenizer.tokenizer(), &request, options);
@@ -1562,8 +1563,17 @@ test "GPU boundary classification windows fit backend-specific reference reserva
     if (receiver.failure) |err| return err;
     try std.testing.expectEqual(receiver.peak, reserved);
     try std.testing.expect(reserved > metal_reserved);
-    var tight = options;
-    tight.device.max_encoder_device_bytes = reserved - 1;
+    // CUDA may reduce a physical window group while preserving every window.
+    var bounded = options;
+    bounded.device.max_encoder_device_bytes = reserved - 1;
+    const replanned = try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, bounded);
+    try std.testing.expect(replanned > 0 and replanned <= bounded.device.max_encoder_device_bytes);
+    var serial = options;
+    serial.long_document.window_batch_size = 1;
+    const irreducible = try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, serial);
+    try std.testing.expect(irreducible > 0 and irreducible < reserved);
+    var tight = serial;
+    tight.device.max_encoder_device_bytes = irreducible - 1;
     try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, tight));
 }
 
@@ -1608,7 +1618,7 @@ test "CUDA boundary managed Multi-Decide batches windows and recovers after canc
     var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = 256 * 1024 * 1024 };
     defer std.debug.assert(bounded.live == 0);
     const scratch = bounded.allocator();
-    var managed = try factory.getManagedComputeBackend(session, scratch, null, control);
+    var managed = try compute_provider.acquire(session, scratch, null, control);
     defer managed.deinit();
     const options = Options{ .identity = identity, .control = control };
     for ([_]usize{ 0, 2, 8, 32 }) |window_count| {

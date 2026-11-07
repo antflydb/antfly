@@ -150,11 +150,9 @@ fn exerciseGradientParity(a: std.mem.Allocator, use_fused_attention: bool) !void
     try std.testing.expectApproxEqAbs(ref.policy, loss.policy, abs_tol);
     try std.testing.expectApproxEqAbs(ref.reward, loss.reward, abs_tol);
     for (ref.cotangent, loss.gradient) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, abs_tol);
-    const backward_inputs = try scratch.alloc(interpreter.RuntimeInput, combined.len + 1);
-    for (combined, backward_inputs[0..combined.len]) |input, *dst| dst.* = .{ .node_id = program.gradients.id_map[input.node_id], .value = input.value };
     const seed = try cb.fromFloat32Shape(cotangent, &.{ @intCast(l.questions), @intCast(l.options) });
     defer cb.free(seed);
-    backward_inputs[combined.len] = .{ .node_id = program.gradients.id_map[program.seed], .value = seed };
+    const backward_inputs = try interpreter.remapRuntimeInputs(scratch, &.{ combined, &.{.{ .node_id = program.seed, .value = seed }} }, program.gradients.id_map, program.gradients.graph.nodeCount());
     var backward = try train.executeFramed(a, &program.gradients.graph, cb, backward_inputs);
     defer backward.deinit(cb);
     // Past the gradients and the forward logits.

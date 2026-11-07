@@ -51,6 +51,8 @@ pub const UnaryOp = enum {
     is_none,
     is_not_none,
     is_boolean,
+    is_true,
+    is_false,
 };
 
 pub const Expr = union(enum) {
@@ -91,6 +93,7 @@ pub const Slice = struct {
     obj: *Expr,
     start: ?*Expr,
     stop: ?*Expr,
+    step: ?*Expr = null,
 };
 
 pub const BinOpNode = struct {

@@ -60,6 +60,30 @@ pub const EncoderForwardTensorResult = struct {
     seq_len: usize,
 };
 
+/// The reader's original checked patch/feature construction, shared with cold
+/// decoder preparation. This creates no tensors and chooses no numerical path.
+pub fn encoderSequenceLength(cfg: Config, prompt_length: usize) !usize {
+    var side: usize = cfg.image_size;
+    for (cfg.patch_size, cfg.patch_stride, cfg.patch_padding) |patch, stride, padding| {
+        if (stride == 0) return error.InvalidInputShape;
+        const padded = try std.math.add(usize, side, try std.math.mul(usize, padding, 2));
+        if (padded < patch) return error.InvalidInputShape;
+        side = try std.math.add(usize, (padded - patch) / stride, 1);
+    }
+    if (cfg.image_feature_source_count > cfg.image_feature_sources.len) return error.InvalidInputShape;
+    const spatial_tokens = try std.math.mul(usize, side, side);
+    var image_tokens: usize = 0;
+    for (cfg.image_feature_sources[0..cfg.image_feature_source_count]) |source| image_tokens = try std.math.add(usize, image_tokens, switch (source) {
+        .spatial_avg_pool => 1,
+        .temporal_avg_pool, .last_frame => spatial_tokens,
+    });
+    return std.math.add(usize, image_tokens, prompt_length);
+}
+pub fn decoderKvBytes(cfg: Config, batch: usize, rows: usize, capacity: usize) !usize {
+    const length = try std.math.add(usize, rows, capacity);
+    return std.math.mul(usize, try std.math.mul(usize, batch, length), try std.math.mul(usize, cfg.decoder_layers, try std.math.mul(usize, cfg.d_model, 2 * @sizeOf(f32))));
+}
+
 pub const DecoderCrossCache = struct {
     keys: []CT,
     values: []CT,
@@ -196,6 +220,7 @@ test "Florence cache preparation cancels between layers and releases partial ten
 }
 
 pub const DecoderIncrementalCache = struct {
+    assigned: ?*@import("../execution/dense_decoder_schedule.zig").Schedule = null,
     /// Full backing allocations remain owned even when logical rows shrink.
     cross: DecoderCrossCache,
     cross_active: ?DecoderCrossCache = null,
@@ -1153,9 +1178,20 @@ pub fn decoderForwardIncrementalBatchStepFinalHiddenTensor(
     token_ids: []const i64,
     cache: *DecoderIncrementalCache,
 ) !CT {
+    return decoderForwardIncrementalBatchStepWithWeights(control_cb, allocator, config, token_ids, cache, null);
+}
+fn decoderForwardIncrementalBatchStepWithWeights(
+    control_cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    token_ids: []const i64,
+    cache: *DecoderIncrementalCache,
+    held: ?*const PreparedSingleToken.Weights,
+) !CT {
     try control_cb.checkExecutionControl();
     const layer_cb = layerComputeBackend(control_cb);
     const cb = &layer_cb;
+    const assigned = cache.assigned;
     if (cache.cross.keys.len != config.decoder_layers or cache.cross.values.len != config.decoder_layers) return error.InvalidInputShape;
     if (cache.self.keys.len != config.decoder_layers or cache.self.values.len != config.decoder_layers) return error.InvalidInputShape;
 
@@ -1169,9 +1205,9 @@ pub fn decoderForwardIncrementalBatchStepFinalHiddenTensor(
 
     var frame_active = try beginFlorenceMetalFrame(cb, .decode);
     errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
-    var hidden = try applyDecoderEmbeddingsAt(cb, allocator, config, token_ids, batch, 1, old_len);
+    var hidden = try applyDecoderEmbeddingsAtAssigned(cb, allocator, config, token_ids, batch, 1, old_len, assigned, held);
     var hidden_live = true;
-    errdefer if (hidden_live) cb.free(hidden);
+    errdefer if (hidden_live) stepRelease(cb, assigned, hidden);
 
     var buf: [256]u8 = undefined;
     for (0..config.decoder_layers) |layer| {
@@ -1188,21 +1224,28 @@ pub fn decoderForwardIncrementalBatchStepFinalHiddenTensor(
             layer,
             cache,
             &buf,
+            if (held) |weights| &weights.layers[layer] else null,
         );
-        cb.free(hidden);
+        stepRelease(cb, assigned, hidden);
         hidden = new_hidden;
     }
     cache.self.len = new_len;
 
-    if (try tryOptionalWeight(cb, "language_model.model.decoder.layer_norm.weight")) |ln_w| {
+    if (held) |weights| {
+        if (weights.final_norm) |norm| {
+            const normed = try stepNorm(cb, assigned, hidden, norm.w, norm.b, config.d_model);
+            stepRelease(cb, assigned, hidden);
+            hidden = normed;
+        }
+    } else if (try tryOptionalWeight(cb, "language_model.model.decoder.layer_norm.weight")) |ln_w| {
         const ln_b = (try tryOptionalWeight(cb, "language_model.model.decoder.layer_norm.bias")) orelse return error.MissingWeight;
-        const normed = try cb.layerNorm(hidden, ln_w, ln_b, config.d_model, 1e-5);
-        cb.free(hidden);
+        const normed = try stepNorm(cb, assigned, hidden, ln_w, ln_b, config.d_model);
+        stepRelease(cb, assigned, hidden);
         hidden = normed;
     } else if (try tryOptionalWeight(cb, "model.decoder.layer_norm.weight")) |ln_w| {
         const ln_b = (try tryOptionalWeight(cb, "model.decoder.layer_norm.bias")) orelse return error.MissingWeight;
-        const normed = try cb.layerNorm(hidden, ln_w, ln_b, config.d_model, 1e-5);
-        cb.free(hidden);
+        const normed = try stepNorm(cb, assigned, hidden, ln_w, ln_b, config.d_model);
+        stepRelease(cb, assigned, hidden);
         hidden = normed;
     }
 
@@ -1231,6 +1274,15 @@ pub fn decoderLmHeadLogitsRowsFromFinalHiddenTensor(
     hidden: CT,
     rows: usize,
 ) !CT {
+    return decoderLmHeadLogitsRowsWithCustody(true, cb, allocator, config, hidden, rows);
+}
+
+/// The hidden owner stays live in the caller through this synchronous head.
+pub fn decoderLmHeadLogitsFromBorrowedFinalHiddenTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden: CT) !CT {
+    return decoderLmHeadLogitsRowsWithCustody(false, cb, allocator, config, hidden, 1);
+}
+
+fn decoderLmHeadLogitsRowsWithCustody(comptime consume_hidden: bool, cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden: CT, rows: usize) !CT {
     const lm_w = try lmHeadWeight(cb);
     var logits = try cb.linearNoBias(hidden, lm_w, rows, config.d_model, config.vocab_size);
     errdefer cb.free(logits);
@@ -1247,7 +1299,7 @@ pub fn decoderLmHeadLogitsRowsFromFinalHiddenTensor(
             logits = biased;
         }
     }
-    cb.free(hidden);
+    if (consume_hidden) cb.free(hidden);
     return logits;
 }
 
@@ -2814,54 +2866,6 @@ const PaddedWindows = struct {
     window_area: usize,
 };
 
-fn padTokensToWindow(
-    allocator: std.mem.Allocator,
-    tokens: []const f32,
-    batch: usize,
-    height: usize,
-    width: usize,
-    dim: usize,
-    window_size: usize,
-) !PaddedWindows {
-    const pad_w = (window_size - (width % window_size)) % window_size;
-    const pad_h = (window_size - (height % window_size)) % window_size;
-    const padded_h = height + pad_h;
-    const padded_w = width + pad_w;
-    const windows_h = padded_h / window_size;
-    const windows_w = padded_w / window_size;
-    const window_count = batch * windows_h * windows_w;
-    const window_area = window_size * window_size;
-
-    const data = try allocator.alloc(f32, window_count * window_area * dim);
-    @memset(data, 0.0);
-
-    for (0..batch) |b| {
-        for (0..windows_h) |wh| {
-            for (0..windows_w) |ww| {
-                const window_index = ((b * windows_h) + wh) * windows_w + ww;
-                for (0..window_size) |dy| {
-                    for (0..window_size) |dx| {
-                        const src_y = wh * window_size + dy;
-                        const src_x = ww * window_size + dx;
-                        if (src_y >= height or src_x >= width) continue;
-                        const src_token = (b * height * width + src_y * width + src_x) * dim;
-                        const dst_token = (window_index * window_area + dy * window_size + dx) * dim;
-                        @memcpy(data[dst_token..][0..dim], tokens[src_token..][0..dim]);
-                    }
-                }
-            }
-        }
-    }
-
-    return .{
-        .data = data,
-        .padded_h = padded_h,
-        .padded_w = padded_w,
-        .window_count = window_count,
-        .window_area = window_area,
-    };
-}
-
 fn unpadWindowTokens(
     allocator: std.mem.Allocator,
     window_tokens: []const f32,
@@ -3106,27 +3110,46 @@ fn applyDecoderEmbeddingsAt(
     seq_len: usize,
     position_start: usize,
 ) !CT {
+    return applyDecoderEmbeddingsAtAssigned(cb, allocator, config, input_ids, batch, seq_len, position_start, null, null);
+}
+
+fn applyDecoderEmbeddingsAtAssigned(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    position_start: usize,
+    assigned: ?*@import("../execution/dense_decoder_schedule.zig").Schedule,
+    held: ?*const PreparedSingleToken.Weights,
+) !CT {
     const d_model: usize = config.d_model;
     const total = batch * seq_len;
-    const embed_w = try promptEmbedWeight(cb);
-    var hidden = try cb.embeddingLookup(embed_w, input_ids, total, d_model);
+    const embed_w = if (held) |weights| weights.embed else try promptEmbedWeight(cb);
+    var hidden = try stepEmbedding(cb, assigned, embed_w, input_ids, total, d_model);
+    // Position metadata can fail independently of backend tensor allocation.
+    // Keep the current residual owned until final normalization succeeds.
+    errdefer stepRelease(cb, assigned, hidden);
 
-    const pos_ids = try allocator.alloc(i64, total);
-    defer allocator.free(pos_ids);
+    var position_cell: [1]i64 = undefined;
+    const pos_ids = if (assigned != null) position_cell[0..] else try allocator.alloc(i64, total);
+    defer if (assigned == null) allocator.free(pos_ids);
+    if (assigned != null and total != 1) return error.InvalidInputShape;
     for (0..batch) |b| {
         for (0..seq_len) |s| pos_ids[b * seq_len + s] = @intCast(position_start + s + bart_position_offset);
     }
 
-    const pos_emb = try cb.embeddingLookup(try decoderPosWeight(cb), pos_ids, total, d_model);
-    defer cb.free(pos_emb);
-    const with_pos = try cb.add(hidden, pos_emb);
-    cb.free(hidden);
+    const pos_emb = try stepEmbedding(cb, assigned, if (held) |weights| weights.positions else try decoderPosWeight(cb), pos_ids, total, d_model);
+    defer stepRelease(cb, assigned, pos_emb);
+    const with_pos = try stepAdd(cb, assigned, hidden, pos_emb);
+    stepRelease(cb, assigned, hidden);
     hidden = with_pos;
 
-    const ln_w = try decoderLayerNormEmbeddingWeight(cb);
-    const ln_b = try decoderLayerNormEmbeddingBias(cb);
-    const normed = try cb.layerNorm(hidden, ln_w, ln_b, d_model, 1e-5);
-    cb.free(hidden);
+    const ln_w = if (held) |weights| weights.embed_norm.w else try decoderLayerNormEmbeddingWeight(cb);
+    const ln_b = if (held) |weights| weights.embed_norm.b else try decoderLayerNormEmbeddingBias(cb);
+    const normed = try stepNorm(cb, assigned, hidden, ln_w, ln_b, d_model);
+    stepRelease(cb, assigned, hidden);
     return normed;
 }
 
@@ -3419,6 +3442,24 @@ fn decoderBlockWithOptionalCrossCache(
     return result;
 }
 
+/// The real prepared request holds/stamps these CTs before numerical entry.
+/// This lexical adapter borrows them only through the original compound layer;
+/// ordinary callers retain all historical lookup/alias/error/cache behavior.
+fn decoderStepLinearWeights(cb: *const ComputeBackend, layer: usize, comptime role: []const u8, buf: *[256]u8, held: ?*const PreparedSingleToken.Layer, comptime field: []const u8) !LinearWeights {
+    if (held) |weights| {
+        const pair = @field(weights, field);
+        return .{ .weight = pair.w, .bias = pair.b };
+    }
+    return decoderLinearWeights(cb, layer, role, buf);
+}
+fn decoderStepNormWeights(cb: *const ComputeBackend, layer: usize, comptime role: []const u8, buf: *[256]u8, held: ?*const PreparedSingleToken.Layer, comptime field: []const u8) !PreparedSingleToken.Pair {
+    if (held) |weights| return @field(weights, field);
+    // Same ordered old lookups; the original caller's error is preserved.
+    const w = try decoderLayerWeight(cb, layer, role ++ ".weight", buf);
+    const b = try decoderLayerWeight(cb, layer, role ++ ".bias", buf);
+    return .{ .w = w, .b = b };
+}
+
 fn decoderBlockIncrementalCached(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -3431,90 +3472,125 @@ fn decoderBlockIncrementalCached(
     layer: usize,
     cache: *DecoderIncrementalCache,
     buf: *[256]u8,
+    held: ?*const PreparedSingleToken.Layer,
 ) !CT {
     const expected_mask_len = std.math.mul(usize, batch, new_len) catch return error.InvalidInputShape;
     if (new_len != old_len + 1 or self_mask.len != expected_mask_len) return error.InvalidInputShape;
 
+    const assigned = cache.assigned;
     const d_model = config.d_model;
     const num_heads = config.decoder_attention_heads;
     const head_dim = config.decoderHeadDim();
     const ffn_dim = config.decoder_ffn_dim;
     var profile_stage_start = if (florenceDecoderStageFrameProfilingEnabled(cb)) nowNs() else 0;
 
-    const q_self_weights = try decoderLinearWeights(cb, layer, "self_attn.q_proj", buf);
-    const k_self_weights = try decoderLinearWeights(cb, layer, "self_attn.k_proj", buf);
-    const v_self_weights = try decoderLinearWeights(cb, layer, "self_attn.v_proj", buf);
-    const qkv_self = try cb.linearTriple(hidden, q_self_weights.weight, q_self_weights.bias, k_self_weights.weight, k_self_weights.bias, v_self_weights.weight, v_self_weights.bias, batch, d_model, d_model);
-    defer cb.free(qkv_self.first);
+    const q_self_weights = try decoderStepLinearWeights(cb, layer, "self_attn.q_proj", buf, held, "q");
+    const k_self_weights = try decoderStepLinearWeights(cb, layer, "self_attn.k_proj", buf, held, "k");
+    const v_self_weights = try decoderStepLinearWeights(cb, layer, "self_attn.v_proj", buf, held, "v");
+    const qkv_self = try stepTriple(cb, assigned, hidden, q_self_weights, k_self_weights, v_self_weights, batch, d_model);
+    defer stepRelease(cb, assigned, qkv_self.first);
 
-    const cached_pair = try appendSelfCachePair(cb, allocator, &cache.self, &cache.self.keys[layer], &cache.self.values[layer], qkv_self.second, qkv_self.third, batch, old_len, new_len, d_model);
+    const cached_pair = if (assigned != null)
+        try appendPreparedSelfPair(cb, allocator, &cache.self, layer, qkv_self.second, qkv_self.third, batch, old_len, new_len, d_model)
+    else
+        try appendSelfCachePair(cb, allocator, &cache.self, &cache.self.keys[layer], &cache.self.values[layer], qkv_self.second, qkv_self.third, batch, old_len, new_len, d_model);
     const cached_k_ref = cached_pair[0];
     defer cached_k_ref.deinit(cb);
     const cached_v_ref = cached_pair[1];
     defer cached_v_ref.deinit(cb);
 
-    const self_attn = try cb.crossAttention(qkv_self.first, cached_k_ref.tensor, cached_v_ref.tensor, self_mask, batch, 1, new_len, num_heads, head_dim);
-    defer cb.free(self_attn);
-    const self_proj = try decoderLinearProj(cb, self_attn, layer, "self_attn.out_proj", batch, d_model, d_model, buf);
-    defer cb.free(self_proj);
-    const self_res = try cb.add(hidden, self_proj);
+    const self_attn = try stepPrefix(cb, assigned, qkv_self.first, cached_k_ref.tensor, cached_v_ref.tensor, self_mask, batch, new_len, num_heads, head_dim);
+    defer stepRelease(cb, assigned, self_attn);
+    const self_proj = block: {
+        const weights = try decoderStepLinearWeights(cb, layer, "self_attn.out_proj", buf, held, "o");
+        break :block try stepLinear(cb, assigned, self_attn, weights.weight, weights.bias, batch, d_model, d_model);
+    };
+    defer stepRelease(cb, assigned, self_proj);
+    const self_res = try stepAdd(cb, assigned, hidden, self_proj);
+    var self_res_live = true;
+    errdefer if (self_res_live) stepRelease(cb, assigned, self_res);
 
-    const ln0_w = try decoderLayerWeight(cb, layer, "self_attn_layer_norm.weight", buf);
-    const ln0_b = try decoderLayerWeight(cb, layer, "self_attn_layer_norm.bias", buf);
-    const self_normed = try cb.layerNorm(self_res, ln0_w, ln0_b, d_model, 1e-5);
-    cb.free(self_res);
+    const ln0 = try decoderStepNormWeights(cb, layer, "self_attn_layer_norm", buf, held, "self_norm");
+    const ln0_w = ln0.w;
+    const ln0_b = ln0.b;
+    const self_normed = try stepNorm(cb, assigned, self_res, ln0_w, ln0_b, d_model);
+    var self_normed_live = true;
+    errdefer if (self_normed_live) stepRelease(cb, assigned, self_normed);
+    stepRelease(cb, assigned, self_res);
+    self_res_live = false;
     profile_stage_start = try profileFlorenceDecoderStageFrameBoundary(cb, "decoder_self", layer, profile_stage_start);
 
-    const q_cross = try decoderLinearProj(cb, self_normed, layer, "encoder_attn.q_proj", batch, d_model, d_model, buf);
-    defer cb.free(q_cross);
+    const q_cross = block: {
+        const weights = try decoderStepLinearWeights(cb, layer, "encoder_attn.q_proj", buf, held, "cross_q");
+        break :block try stepLinear(cb, assigned, self_normed, weights.weight, weights.bias, batch, d_model, d_model);
+    };
+    defer stepRelease(cb, assigned, q_cross);
     const cross = cache.attentionCross();
-    const cross_attn = try cb.crossAttention(q_cross, cross.keys[layer], cross.values[layer], cache.encoder_mask, batch, 1, cache.enc_seq, num_heads, head_dim);
-    defer cb.free(cross_attn);
-    const cross_proj = try decoderLinearProj(cb, cross_attn, layer, "encoder_attn.out_proj", batch, d_model, d_model, buf);
-    defer cb.free(cross_proj);
-    const cross_res = try cb.add(self_normed, cross_proj);
-    cb.free(self_normed);
+    const cross_attn = try stepPrefix(cb, assigned, q_cross, cross.keys[layer], cross.values[layer], cache.encoder_mask, batch, cache.enc_seq, num_heads, head_dim);
+    defer stepRelease(cb, assigned, cross_attn);
+    const cross_proj = block: {
+        const weights = try decoderStepLinearWeights(cb, layer, "encoder_attn.out_proj", buf, held, "cross_o");
+        break :block try stepLinear(cb, assigned, cross_attn, weights.weight, weights.bias, batch, d_model, d_model);
+    };
+    defer stepRelease(cb, assigned, cross_proj);
+    const cross_res = try stepAdd(cb, assigned, self_normed, cross_proj);
+    var cross_res_live = true;
+    errdefer if (cross_res_live) stepRelease(cb, assigned, cross_res);
+    stepRelease(cb, assigned, self_normed);
+    self_normed_live = false;
 
-    const ln1_w = try decoderLayerWeight(cb, layer, "encoder_attn_layer_norm.weight", buf);
-    const ln1_b = try decoderLayerWeight(cb, layer, "encoder_attn_layer_norm.bias", buf);
-    const cross_normed = try cb.layerNorm(cross_res, ln1_w, ln1_b, d_model, 1e-5);
-    cb.free(cross_res);
+    const ln1 = try decoderStepNormWeights(cb, layer, "encoder_attn_layer_norm", buf, held, "cross_norm");
+    const ln1_w = ln1.w;
+    const ln1_b = ln1.b;
+    const cross_normed = try stepNorm(cb, assigned, cross_res, ln1_w, ln1_b, d_model);
+    var cross_normed_live = true;
+    errdefer if (cross_normed_live) stepRelease(cb, assigned, cross_normed);
+    stepRelease(cb, assigned, cross_res);
+    cross_res_live = false;
     profile_stage_start = try profileFlorenceDecoderStageFrameBoundary(cb, "decoder_cross", layer, profile_stage_start);
 
-    const fc1_weights = try decoderLinearWeights(cb, layer, "fc1", buf);
+    const fc1_weights = try decoderStepLinearWeights(cb, layer, "fc1", buf, held, "fc1");
     if (comptime build_options.enable_cuda) {
         if (cb.kind() == .cuda and platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_BART_FFN")) {
-            errdefer cb.free(cross_normed);
-            const second = try decoderLinearWeights(cb, layer, "fc2", buf);
+            const second = try decoderStepLinearWeights(cb, layer, "fc2", buf, held, "fc2");
             const nw = try decoderLayerWeight(cb, layer, "final_layer_norm.weight", buf);
             const nb = try decoderLayerWeight(cb, layer, "final_layer_norm.bias", buf);
             if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.florenceBartFfn(cb, cross_normed, .{ fc1_weights.weight, fc1_weights.bias, second.weight, second.bias, nw, nb }, batch, d_model, ffn_dim)) |fused| {
-                errdefer cb.free(fused);
+                errdefer stepRelease(cb, assigned, fused);
                 _ = try profileFlorenceDecoderStageFrameBoundary(cb, "decoder_ffn", layer, profile_stage_start);
-                cb.free(cross_normed);
+                stepRelease(cb, assigned, cross_normed);
+                cross_normed_live = false;
                 return fused;
             }
         }
     }
-    const fc1 = try cb.linear(cross_normed, fc1_weights.weight, fc1_weights.bias, batch, d_model, ffn_dim);
-    defer cb.free(fc1);
-    const activated = try florenceExactGelu(cb, fc1);
-    defer cb.free(activated);
+    const fc1 = try stepLinear(cb, assigned, cross_normed, fc1_weights.weight, fc1_weights.bias, batch, d_model, ffn_dim);
+    defer stepRelease(cb, assigned, fc1);
+    const activated = if (assigned) |schedule| try schedule.execute(&.{fc1}, null) else try florenceExactGelu(cb, fc1);
+    defer stepRelease(cb, assigned, activated);
 
-    const fc2_weights = try decoderLinearWeights(cb, layer, "fc2", buf);
-    const ffn_res = if (try cb.linearAdd(activated, fc2_weights.weight, fc2_weights.bias, cross_normed, batch, ffn_dim, d_model)) |fused|
+    const fc2_weights = try decoderStepLinearWeights(cb, layer, "fc2", buf, held, "fc2");
+    const ffn_res = if (assigned) |schedule| prepared: {
+        const second = try schedule.execute(&.{ activated, fc2_weights.weight, fc2_weights.bias }, null);
+        break :prepared try schedule.execute(&.{ cross_normed, second }, null);
+    } else if (try cb.linearAdd(activated, fc2_weights.weight, fc2_weights.bias, cross_normed, batch, ffn_dim, d_model)) |fused|
         fused
     else blk: {
         const fc2 = try cb.linear(activated, fc2_weights.weight, fc2_weights.bias, batch, ffn_dim, d_model);
-        defer cb.free(fc2);
+        defer stepRelease(cb, assigned, fc2);
         break :blk try cb.add(cross_normed, fc2);
     };
-    cb.free(cross_normed);
+    var ffn_res_live = true;
+    errdefer if (ffn_res_live) stepRelease(cb, assigned, ffn_res);
+    stepRelease(cb, assigned, cross_normed);
+    cross_normed_live = false;
 
-    const ln2_w = try decoderLayerWeight(cb, layer, "final_layer_norm.weight", buf);
-    const ln2_b = try decoderLayerWeight(cb, layer, "final_layer_norm.bias", buf);
-    const result = try cb.layerNorm(ffn_res, ln2_w, ln2_b, d_model, 1e-5);
-    cb.free(ffn_res);
+    const ln2 = try decoderStepNormWeights(cb, layer, "final_layer_norm", buf, held, "final_norm");
+    const ln2_w = ln2.w;
+    const ln2_b = ln2.b;
+    const result = try stepNorm(cb, assigned, ffn_res, ln2_w, ln2_b, d_model);
+    stepRelease(cb, assigned, ffn_res);
+    ffn_res_live = false;
     _ = try profileFlorenceDecoderStageFrameBoundary(cb, "decoder_ffn", layer, profile_stage_start);
     return result;
 }
@@ -3717,7 +3793,10 @@ test "LightOnOCR3 CUDA Florence packed self KV preserves page prefixes and retur
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const CudaCompute = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
     const allocator = std.testing.allocator;
-    var compute = try CudaCompute.init(allocator);
+    var compute = CudaCompute.init(allocator) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     const cb = compute.computeBackend();
     const batch = 3;
@@ -3883,24 +3962,6 @@ fn tryOptionalWeight(cb: *const ComputeBackend, name: []const u8) !?CT {
     };
 }
 
-fn backendLinearData(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    input: []const f32,
-    rows: usize,
-    in_dim: usize,
-    out_dim: usize,
-    weight: CT,
-    bias: CT,
-) ![]f32 {
-    const shape = [_]i32{ @intCast(rows), @intCast(in_dim) };
-    const input_ct = try cb.fromFloat32Shape(input, &shape);
-    defer cb.free(input_ct);
-    const out_ct = try cb.linear(input_ct, weight, bias, rows, in_dim, out_dim);
-    defer cb.free(out_ct);
-    return cb.toFloat32(out_ct, allocator);
-}
-
 fn backendLinearNoBiasData(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -4045,17 +4106,6 @@ fn backendNormedExactGeluMlpData(
     const fc2_ct = try cb.linear(activated_ct, fc2_weight, fc2_bias, rows, hidden_dim, in_dim);
     defer cb.free(fc2_ct);
     return cb.toFloat32(fc2_ct, allocator);
-}
-
-fn splitQkv(qkv: []const f32, q: []f32, k: []f32, v: []f32, dim: usize) void {
-    const rows = q.len / dim;
-    for (0..rows) |row| {
-        const src = row * dim * 3;
-        const dst = row * dim;
-        @memcpy(q[dst..][0..dim], qkv[src..][0..dim]);
-        @memcpy(k[dst..][0..dim], qkv[src + dim ..][0..dim]);
-        @memcpy(v[dst..][0..dim], qkv[src + 2 * dim ..][0..dim]);
-    }
 }
 
 fn channelAttention(
@@ -4207,143 +4257,6 @@ fn conv2d(
     }
 
     return .{ .data = out, .height = out_h, .width = out_w };
-}
-
-fn conv2dTokens(
-    allocator: std.mem.Allocator,
-    input: []const f32,
-    batch: usize,
-    in_channels: usize,
-    height: usize,
-    width: usize,
-    weight: []const f32,
-    bias: []const f32,
-    out_channels: usize,
-    kernel: usize,
-    stride: usize,
-    padding: usize,
-) ![]f32 {
-    const out_h = (height + 2 * padding - kernel) / stride + 1;
-    const out_w = (width + 2 * padding - kernel) / stride + 1;
-    const out = try allocator.alloc(f32, batch * out_h * out_w * out_channels);
-
-    for (0..batch) |b| {
-        for (0..out_h) |oy| {
-            for (0..out_w) |ox| {
-                const out_base = ((b * out_h + oy) * out_w + ox) * out_channels;
-                for (0..out_channels) |oc| {
-                    var acc = bias[oc];
-                    for (0..in_channels) |ic| {
-                        for (0..kernel) |ky| {
-                            for (0..kernel) |kx| {
-                                const in_y_signed = @as(isize, @intCast(oy * stride + ky)) - @as(isize, @intCast(padding));
-                                const in_x_signed = @as(isize, @intCast(ox * stride + kx)) - @as(isize, @intCast(padding));
-                                if (in_y_signed < 0 or in_x_signed < 0) continue;
-                                const in_y: usize = @intCast(in_y_signed);
-                                const in_x: usize = @intCast(in_x_signed);
-                                if (in_y >= height or in_x >= width) continue;
-                                const in_idx = ((b * height + in_y) * width + in_x) * in_channels + ic;
-                                const w_idx = (((oc * in_channels + ic) * kernel) + ky) * kernel + kx;
-                                acc += input[in_idx] * weight[w_idx];
-                            }
-                        }
-                    }
-                    out[out_base + oc] = acc;
-                }
-            }
-        }
-    }
-
-    return out;
-}
-
-fn depthwiseConv2d(
-    allocator: std.mem.Allocator,
-    input: []const f32,
-    batch: usize,
-    channels: usize,
-    height: usize,
-    width: usize,
-    weight: []const f32,
-    bias: []const f32,
-    kernel: usize,
-    stride: usize,
-    padding: usize,
-) !Conv2dResult {
-    const out_h = (height + 2 * padding - kernel) / stride + 1;
-    const out_w = (width + 2 * padding - kernel) / stride + 1;
-    const out = try allocator.alloc(f32, batch * channels * out_h * out_w);
-
-    for (0..batch) |b| {
-        for (0..channels) |c| {
-            for (0..out_h) |oy| {
-                for (0..out_w) |ox| {
-                    var acc = bias[c];
-                    for (0..kernel) |ky| {
-                        for (0..kernel) |kx| {
-                            const in_y_signed = @as(isize, @intCast(oy * stride + ky)) - @as(isize, @intCast(padding));
-                            const in_x_signed = @as(isize, @intCast(ox * stride + kx)) - @as(isize, @intCast(padding));
-                            if (in_y_signed < 0 or in_x_signed < 0) continue;
-                            const in_y: usize = @intCast(in_y_signed);
-                            const in_x: usize = @intCast(in_x_signed);
-                            if (in_y >= height or in_x >= width) continue;
-                            const in_idx = ((b * channels + c) * height + in_y) * width + in_x;
-                            const w_idx = (c * kernel + ky) * kernel + kx;
-                            acc += input[in_idx] * weight[w_idx];
-                        }
-                    }
-                    const out_idx = ((b * channels + c) * out_h + oy) * out_w + ox;
-                    out[out_idx] = acc;
-                }
-            }
-        }
-    }
-    return .{ .data = out, .height = out_h, .width = out_w };
-}
-
-fn depthwiseConvTokens(
-    allocator: std.mem.Allocator,
-    input: []const f32,
-    batch: usize,
-    channels: usize,
-    height: usize,
-    width: usize,
-    weight: []const f32,
-    bias: []const f32,
-    kernel: usize,
-    stride: usize,
-    padding: usize,
-) ![]f32 {
-    const out_h = (height + 2 * padding - kernel) / stride + 1;
-    const out_w = (width + 2 * padding - kernel) / stride + 1;
-    const out = try allocator.alloc(f32, batch * out_h * out_w * channels);
-
-    for (0..batch) |b| {
-        for (0..out_h) |oy| {
-            for (0..out_w) |ox| {
-                const out_base = ((b * out_h + oy) * out_w + ox) * channels;
-                for (0..channels) |c| {
-                    var acc = bias[c];
-                    for (0..kernel) |ky| {
-                        for (0..kernel) |kx| {
-                            const in_y_signed = @as(isize, @intCast(oy * stride + ky)) - @as(isize, @intCast(padding));
-                            const in_x_signed = @as(isize, @intCast(ox * stride + kx)) - @as(isize, @intCast(padding));
-                            if (in_y_signed < 0 or in_x_signed < 0) continue;
-                            const in_y: usize = @intCast(in_y_signed);
-                            const in_x: usize = @intCast(in_x_signed);
-                            if (in_y >= height or in_x >= width) continue;
-                            const in_idx = ((b * height + in_y) * width + in_x) * channels + c;
-                            const w_idx = (c * kernel + ky) * kernel + kx;
-                            acc += input[in_idx] * weight[w_idx];
-                        }
-                    }
-                    out[out_base + c] = acc;
-                }
-            }
-        }
-    }
-
-    return out;
 }
 
 fn tokensToImage(
@@ -4544,4 +4457,562 @@ fn nsToMs(ns: u64) f64 {
 
 fn fmtAlloc(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![]u8 {
     return std.fmt.allocPrint(allocator, fmt, args);
+}
+
+fn stepRelease(cb: *const ComputeBackend, assigned: ?*@import("../execution/dense_decoder_schedule.zig").Schedule, value: CT) void {
+    if (assigned) |schedule| schedule.releaseTemporary(cb, value) else cb.free(value);
+}
+fn stepAdd(cb: *const ComputeBackend, assigned: ?*@import("../execution/dense_decoder_schedule.zig").Schedule, a: CT, b: CT) !CT {
+    if (assigned) |schedule| return schedule.execute(&.{ a, b }, null);
+    return cb.add(a, b);
+}
+fn stepNorm(cb: *const ComputeBackend, assigned: ?*@import("../execution/dense_decoder_schedule.zig").Schedule, x: CT, w: CT, b: CT, width: usize) !CT {
+    if (assigned) |schedule| return schedule.execute(&.{ x, w, b }, null);
+    return cb.layerNorm(x, w, b, width, 1e-5);
+}
+fn stepLinear(cb: *const ComputeBackend, assigned: ?*@import("../execution/dense_decoder_schedule.zig").Schedule, x: CT, w: CT, b: CT, rows: usize, width: usize, out: usize) !CT {
+    if (assigned) |schedule| return schedule.execute(&.{ x, w, b }, null);
+    return cb.linear(x, w, b, rows, width, out);
+}
+fn stepTriple(cb: *const ComputeBackend, assigned: ?*@import("../execution/dense_decoder_schedule.zig").Schedule, x: CT, q: LinearWeights, k: LinearWeights, v: LinearWeights, rows: usize, width: usize) !ops.LinearTripleResult {
+    if (assigned) |schedule| return .{ .first = try schedule.execute(&.{ x, q.weight, q.bias }, null), .second = try schedule.execute(&.{ x, k.weight, k.bias }, null), .third = try schedule.execute(&.{ x, v.weight, v.bias }, null) };
+    return cb.linearTriple(x, q.weight, q.bias, k.weight, k.bias, v.weight, v.bias, rows, width, width);
+}
+fn stepEmbedding(cb: *const ComputeBackend, assigned: ?*@import("../execution/dense_decoder_schedule.zig").Schedule, weight: CT, ids: []const i64, rows: usize, width: usize) !CT {
+    if (assigned) |schedule| {
+        if (rows != 1 or ids.len != 1 or schedule.cursor >= schedule.steps.len) return error.DenseScheduleOrderChanged;
+        const node = schedule.graph.node(schedule.steps[schedule.cursor]);
+        if (node.op != .gather) return error.DenseScheduleOrderChanged;
+        return schedule.execute(&.{ weight, schedule.values[node.inputs[1]] orelse return error.MissingValue }, null);
+    }
+    return cb.embeddingLookup(weight, ids, rows, width);
+}
+fn stepPrefix(cb: *const ComputeBackend, assigned: ?*@import("../execution/dense_decoder_schedule.zig").Schedule, q: CT, k: CT, v: CT, mask: []const i64, batch: usize, live: usize, heads: usize, dim: usize) !CT {
+    if (assigned) |schedule| {
+        if (batch != 1 or schedule.cursor >= schedule.steps.len) return error.DenseScheduleOrderChanged;
+        const node = schedule.graph.node(schedule.steps[schedule.cursor]);
+        if (schedule.values[node.inputs[1]] != k or schedule.values[node.inputs[2]] != v) return error.PreparedDensePrefixBindingChanged;
+        const attention = ops.AttentionContext{ .total_sequence_len = live, .query_sequence_len = 1, .kv_sequence_len = live, .dense_attention_prefix = .{ .live_key_rows = live, .mask = mask } };
+        return schedule.execute(&.{ q, k, v }, &attention);
+    }
+    return cb.crossAttention(q, k, v, mask, batch, 1, live, heads, dim);
+}
+fn appendPreparedSelfPair(cb: *const ComputeBackend, a: std.mem.Allocator, cache: *DecoderSelfCache, index: usize, k: CT, v: CT, batch: usize, old_len: usize, new_len: usize, width: usize) ![2]CachedSelfTensor {
+    if (cb.vtable != &@import("../ops/native_compute.zig").vtable_impl or batch != 1 or !cache.preallocated or new_len != old_len + 1 or old_len >= cache.capacity or index >= cache.keys.len or index >= cache.values.len) return error.InvalidInputShape;
+    const key = cache.keys[index] orelse return error.InvalidInputShape;
+    const value = cache.values[index] orelse return error.InvalidInputShape;
+    if (!try cb.copyRows2D(a, key, old_len, k, 0, 1, width) or !try cb.copyRows2D(a, value, old_len, v, 0, 1, width)) return error.UnsupportedDenseSchedule;
+    return .{ .{ .tensor = key }, .{ .tensor = value } };
+}
+
+/// Request-private F32 single-query layer schedule. The final hidden value is
+/// borrowed only by its enclosing scalar request; ordinary vocabulary-head
+/// policy remains outside this graph and retains its original admission floor.
+pub const PreparedSingleToken = struct {
+    const Dense = @import("../execution/dense_decoder_schedule.zig");
+    const Shape = @import("ml").graph.Shape;
+    const Node = @import("ml").graph.NodeId;
+    const Native = @import("../ops/native_compute.zig").NativeCompute;
+    const Cleanup = @import("../execution/cleanup_context.zig").Context;
+    const DomainPin = @import("../runtime/tier/admission_domain.zig").Pin;
+    const Namespace = enum(u1) { language_model, model };
+    const Pair = struct {
+        w: CT,
+        b: CT,
+        // These choices belong to the checkpoint lookup, independently of CT.
+        w_namespace: Namespace = .language_model,
+        b_namespace: Namespace = .language_model,
+    };
+    const Layer = struct { q: Pair, k: Pair, v: Pair, o: Pair, cross_q: Pair, cross_k: Pair, cross_v: Pair, cross_o: Pair, self_norm: Pair, cross_norm: Pair, final_norm: Pair, fc1: Pair, fc2: Pair };
+    const Weights = struct {
+        a: std.mem.Allocator,
+        handles: std.ArrayListUnmanaged(CT) = .empty,
+        embed: CT = undefined,
+        embed_source: u8 = 0,
+        positions: CT = undefined,
+        positions_source: u8 = 0,
+        embed_norm: Pair = undefined,
+        final_norm: ?Pair = null,
+        head: CT = undefined,
+        head_source: u8 = 0,
+        head_bias: ?CT = null,
+        layers: []Layer = &.{},
+        fn fetch(self: *@This(), cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, name: []const u8) !CT {
+            try cb.checkExecutionControl();
+            _ = try Native.prepareTypedWeightOutsideExecution(cb, data, name, pin);
+            const query = Native.authoredResidentSourceQuery(cb, name) catch |err| switch (err) {
+                error.WeightNotFound => return error.MissingWeight,
+                error.UnsupportedAuthoredWeight => return error.UnsupportedDenseSchedule,
+                else => return err,
+            };
+            const shape = query.shape orelse return error.UnsupportedDenseSchedule;
+            if (shape.dtype != .f32 or query.quantized != null) return error.UnsupportedDenseSchedule;
+            const value = try cb.getWeight(name);
+            errdefer cb.free(value);
+            try self.handles.append(self.a, value);
+            return value;
+        }
+        fn optional(self: *@This(), cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, name: []const u8) !?CT {
+            return self.fetch(cb, data, pin, name) catch |err| switch (err) {
+                error.MissingWeight, error.WeightNotFound => null,
+                else => return err,
+            };
+        }
+        const Resolved = struct { value: CT, choice: u8 };
+        fn any(self: *@This(), cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, names: []const []const u8) !Resolved {
+            for (names, 0..) |name, index| if (try self.optional(cb, data, pin, name)) |value| return .{ .value = value, .choice = std.math.cast(u8, index) orelse return error.NameTooLong };
+            return error.MissingWeight;
+        }
+        fn decoder(self: *@This(), cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, layer: usize, suffix: []const u8) !Resolved {
+            var name: [256]u8 = undefined;
+            if (try self.optional(cb, data, pin, try std.fmt.bufPrint(&name, "language_model.model.decoder.layers.{d}.{s}", .{ layer, suffix }))) |value| return .{ .value = value, .choice = 0 };
+            return .{ .value = try self.fetch(cb, data, pin, try std.fmt.bufPrint(&name, "model.decoder.layers.{d}.{s}", .{ layer, suffix })), .choice = 1 };
+        }
+        fn pair(self: *@This(), cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, layer: usize, role: []const u8) !Pair {
+            var suffix: [128]u8 = undefined;
+            const w = try self.decoder(cb, data, pin, layer, try std.fmt.bufPrint(&suffix, "{s}.weight", .{role}));
+            const b = try self.decoder(cb, data, pin, layer, try std.fmt.bufPrint(&suffix, "{s}.bias", .{role}));
+            return .{ .w = w.value, .b = b.value, .w_namespace = @fromBackingInt(@intCast(w.choice)), .b_namespace = @fromBackingInt(@intCast(b.choice)) };
+        }
+        fn init(a: std.mem.Allocator, cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, cfg: Config) !Weights {
+            var self = Weights{ .a = a };
+            errdefer self.deinit(cb, .{ .outside_execution = true });
+            const embedding = try self.any(cb, data, pin, &.{ "language_model.model.shared.weight", "language_model.model.encoder.embed_tokens.weight", "language_model.model.decoder.embed_tokens.weight", "model.decoder.embed_tokens.weight" });
+            self.embed = embedding.value;
+            self.embed_source = embedding.choice;
+            const positions = try self.any(cb, data, pin, &.{ "language_model.model.decoder.embed_positions.weight", "model.decoder.embed_positions.weight" });
+            self.positions = positions.value;
+            self.positions_source = positions.choice;
+            const embed_w = try self.any(cb, data, pin, &.{ "language_model.model.decoder.layernorm_embedding.weight", "model.decoder.layernorm_embedding.weight" });
+            const embed_b = try self.any(cb, data, pin, &.{ "language_model.model.decoder.layernorm_embedding.bias", "model.decoder.layernorm_embedding.bias" });
+            self.embed_norm = .{ .w = embed_w.value, .b = embed_b.value, .w_namespace = @fromBackingInt(@intCast(embed_w.choice)), .b_namespace = @fromBackingInt(@intCast(embed_b.choice)) };
+            self.layers = try a.alloc(Layer, cfg.decoder_layers);
+            for (self.layers, 0..) |*layer, index| layer.* = .{
+                .q = try self.pair(cb, data, pin, index, "self_attn.q_proj"),
+                .k = try self.pair(cb, data, pin, index, "self_attn.k_proj"),
+                .v = try self.pair(cb, data, pin, index, "self_attn.v_proj"),
+                .o = try self.pair(cb, data, pin, index, "self_attn.out_proj"),
+                .cross_q = try self.pair(cb, data, pin, index, "encoder_attn.q_proj"),
+                .cross_k = try self.pair(cb, data, pin, index, "encoder_attn.k_proj"),
+                .cross_v = try self.pair(cb, data, pin, index, "encoder_attn.v_proj"),
+                .cross_o = try self.pair(cb, data, pin, index, "encoder_attn.out_proj"),
+                .self_norm = try self.pair(cb, data, pin, index, "self_attn_layer_norm"),
+                .cross_norm = try self.pair(cb, data, pin, index, "encoder_attn_layer_norm"),
+                .final_norm = try self.pair(cb, data, pin, index, "final_layer_norm"),
+                .fc1 = try self.pair(cb, data, pin, index, "fc1"),
+                .fc2 = try self.pair(cb, data, pin, index, "fc2"),
+            };
+            if (try self.optional(cb, data, pin, "language_model.model.decoder.layer_norm.weight")) |w| {
+                self.final_norm = .{ .w = w, .b = try self.fetch(cb, data, pin, "language_model.model.decoder.layer_norm.bias") };
+            } else if (try self.optional(cb, data, pin, "model.decoder.layer_norm.weight")) |w| self.final_norm = .{ .w = w, .b = try self.fetch(cb, data, pin, "model.decoder.layer_norm.bias"), .w_namespace = .model, .b_namespace = .model };
+            const head = try self.any(cb, data, pin, &.{ "language_model.lm_head.weight", "lm_head.weight", "language_model.model.shared.weight", "model.decoder.embed_tokens.weight" });
+            self.head = head.value;
+            self.head_source = head.choice;
+            self.head_bias = try self.optional(cb, data, pin, "language_model.final_logits_bias");
+            try Native.stampHeldF32WeightSources(cb, data, self.handles.items);
+            for (self.handles.items) |value| _ = try Native.heldF32WeightPrimary(cb, data, value);
+            return self;
+        }
+        fn deinit(self: *@This(), cb: *const ComputeBackend, current: Cleanup) void {
+            for (self.handles.items) |value| cb.freeWithCleanup(value, current);
+            self.handles.deinit(self.a);
+            self.a.free(self.layers);
+        }
+    };
+    pub const SpecSource = struct {
+        program: *const PreparedSingleToken,
+        const Role = Dense.RoleKey;
+        const Kind = @FieldType(Role, "kind");
+        const Resolved = struct {
+            source_kind: @FieldType(Dense.ParameterSpec, "source_kind"),
+            shape: ?@import("ml").graph.Shape = null,
+            source_name: []const u8 = "",
+            value: ?CT = null,
+        };
+        const layer_kinds = [_]Kind{ .self_q, .self_k, .self_v, .self_o, .self_norm, .cross_q, .cross_o, .cross_norm, .fc1, .fc2, .ffn_norm };
+        pub fn header(self: @This()) Dense.ProgramSpec {
+            const p = self.program;
+            const c = p.config;
+            return .{ .family = .florence, .phase = .decode, .geometry = .{ .layers = c.decoder_layers, .width = c.d_model, .heads = c.decoder_attention_heads, .ffn_dim = c.decoder_ffn_dim, .vocab_size = c.vocab_size, .encoder_rows = p.encoder_rows, .capacity = p.capacity, .query_rows = 1 }, .semantics = .{ .epsilon = 1e-5, .activation = .gelu_exact, .norm_order = .post, .position_offset = @intCast(bart_position_offset), .global_final_norm = p.weights.final_norm != null }, .parameters = &.{} };
+        }
+        pub fn len(self: @This()) usize {
+            return 6 + self.program.weights.layers.len * 26 + (if (self.program.weights.final_norm != null) @as(usize, 2) else 0);
+        }
+        fn roleAt(self: @This(), index: usize) !Role {
+            const globals = [_]Role{ .{ .kind = .token_ids }, .{ .kind = .position_ids }, .{ .kind = .embedding, .part = .weight }, .{ .kind = .positions, .part = .weight }, .{ .kind = .embed_norm, .part = .weight }, .{ .kind = .embed_norm, .part = .bias } };
+            if (index < globals.len) return globals[index];
+            const slot = index - globals.len;
+            const layer = slot / 26;
+            const local = slot % 26;
+            if (layer < self.program.weights.layers.len) {
+                if (local < 22) return .{ .kind = layer_kinds[local / 2], .layer = @intCast(layer), .part = if (local % 2 == 0) .weight else .bias };
+                return .{ .kind = ([_]Kind{ .self_slab_k, .self_slab_v, .cross_slab_k, .cross_slab_v })[local - 22], .layer = @intCast(layer) };
+            }
+            if (self.program.weights.final_norm != null and layer == self.program.weights.layers.len and local < 2) return .{ .kind = .final_norm, .part = if (local == 0) .weight else .bias };
+            return error.DenseDefinitionChanged;
+        }
+        fn layerPair(layer: Layer, kind: Kind) !Pair {
+            return switch (kind) {
+                .self_q => layer.q,
+                .self_k => layer.k,
+                .self_v => layer.v,
+                .self_o => layer.o,
+                .self_norm => layer.self_norm,
+                .cross_q => layer.cross_q,
+                .cross_k => layer.cross_k,
+                .cross_v => layer.cross_v,
+                .cross_o => layer.cross_o,
+                .cross_norm => layer.cross_norm,
+                .fc1 => layer.fc1,
+                .fc2 => layer.fc2,
+                .ffn_norm => layer.final_norm,
+                else => error.DenseDefinitionChanged,
+            };
+        }
+        fn pairName(pair: Pair, role: Role, buffer: *[256]u8) ![]const u8 {
+            if (role.part == .value) return error.DenseDefinitionChanged;
+            const namespace = if (role.part == .weight) pair.w_namespace else pair.b_namespace;
+            const prefix = if (namespace == .language_model) "language_model.model.decoder" else "model.decoder";
+            const part = if (role.part == .weight) "weight" else "bias";
+            if (role.layer) |layer| {
+                const suffix = switch (role.kind) {
+                    .self_q => "self_attn.q_proj",
+                    .self_k => "self_attn.k_proj",
+                    .self_v => "self_attn.v_proj",
+                    .self_o => "self_attn.out_proj",
+                    .self_norm => "self_attn_layer_norm",
+                    .cross_q => "encoder_attn.q_proj",
+                    .cross_k => "encoder_attn.k_proj",
+                    .cross_v => "encoder_attn.v_proj",
+                    .cross_o => "encoder_attn.out_proj",
+                    .cross_norm => "encoder_attn_layer_norm",
+                    .fc1 => "fc1",
+                    .fc2 => "fc2",
+                    .ffn_norm => "final_layer_norm",
+                    else => return error.DenseDefinitionChanged,
+                };
+                return std.fmt.bufPrint(buffer, "{s}.layers.{d}.{s}.{s}", .{ prefix, layer, suffix, part });
+            }
+            const suffix = switch (role.kind) {
+                .embed_norm => "layernorm_embedding",
+                .final_norm => "layer_norm",
+                else => return error.DenseDefinitionChanged,
+            };
+            return std.fmt.bufPrint(buffer, "{s}.{s}.{s}", .{ prefix, suffix, part });
+        }
+        fn resolve(self: @This(), role: Role, buffer: *[256]u8) !Resolved {
+            const p = self.program;
+            const g = self.header().geometry;
+            if (role.kind == .token_ids or role.kind == .position_ids) {
+                if (role.layer != null or role.part != .value) return error.DenseDefinitionChanged;
+                return .{ .shape = Shape.init(.i64, &.{1}), .source_kind = .host };
+            }
+            if (role.kind == .self_slab_k or role.kind == .self_slab_v or role.kind == .cross_slab_k or role.kind == .cross_slab_v) {
+                const layer = role.layer orelse return error.DenseDefinitionChanged;
+                if (layer >= g.layers or role.part != .value) return error.DenseDefinitionChanged;
+                const rows = if (role.kind == .self_slab_k or role.kind == .self_slab_v) g.capacity else g.encoder_rows;
+                return .{ .shape = Shape.init(.f32, &.{ @intCast(rows), @intCast(g.width) }), .source_kind = .external };
+            }
+            var value: CT = undefined;
+            var name: []const u8 = undefined;
+            if (role.layer) |layer| {
+                if (layer >= p.weights.layers.len or role.part == .value) return error.DenseDefinitionChanged;
+                const pair = try layerPair(p.weights.layers[layer], role.kind);
+                value = if (role.part == .weight) pair.w else pair.b;
+                name = try pairName(pair, role, buffer);
+            } else switch (role.kind) {
+                .embedding => {
+                    if (role.part != .weight) return error.DenseDefinitionChanged;
+                    value = p.weights.embed;
+                    name = switch (p.weights.embed_source) {
+                        0 => "language_model.model.shared.weight",
+                        1 => "language_model.model.encoder.embed_tokens.weight",
+                        2 => "language_model.model.decoder.embed_tokens.weight",
+                        3 => "model.decoder.embed_tokens.weight",
+                        else => return error.NativeWeightRoleChanged,
+                    };
+                },
+                .positions => {
+                    if (role.part != .weight) return error.DenseDefinitionChanged;
+                    value = p.weights.positions;
+                    name = switch (p.weights.positions_source) {
+                        0 => "language_model.model.decoder.embed_positions.weight",
+                        1 => "model.decoder.embed_positions.weight",
+                        else => return error.NativeWeightRoleChanged,
+                    };
+                },
+                .embed_norm, .final_norm => {
+                    if (role.part == .value) return error.DenseDefinitionChanged;
+                    const pair = if (role.kind == .embed_norm) p.weights.embed_norm else p.weights.final_norm orelse return error.DenseDefinitionChanged;
+                    value = if (role.part == .weight) pair.w else pair.b;
+                    name = try pairName(pair, role, buffer);
+                },
+                else => return error.DenseDefinitionChanged,
+            }
+            return .{ .source_kind = .held_weight, .source_name = name, .value = value };
+        }
+        /// Pure checkpoint-role name sizing. No Native/source query or
+        /// allocation: current held shape/stamp/name validation stays in at().
+        pub fn expectedNameBytes(self: @This()) !usize {
+            var bytes: usize = 0;
+            var buffer: [256]u8 = undefined;
+            for (0..self.len()) |index| {
+                const resolved = try self.resolve(try self.roleAt(index), &buffer);
+                bytes = try std.math.add(usize, bytes, resolved.source_name.len);
+            }
+            return bytes;
+        }
+        pub fn at(self: @This(), index: usize, buffer: *[256]u8) !Dense.ParameterSpec {
+            const role = try self.roleAt(index);
+            const resolved = try self.resolve(role, buffer);
+            const shape = if (resolved.source_kind == .held_weight)
+                try Native.heldF32WeightShapeNamed(&self.program.backend, self.program.source_data, resolved.value.?, resolved.source_name)
+            else
+                resolved.shape.?;
+            if ((shape.numElements() orelse return error.UnsupportedDenseSchedule) <= 0) return error.UnsupportedDenseSchedule;
+            return .{ .role = role, .shape = shape, .source_kind = resolved.source_kind, .source_name = resolved.source_name };
+        }
+        fn bind(self: @This(), a: std.mem.Allocator, spec: *const Dense.ProgramSpec) ![]Dense.BoundParameter {
+            const expected_header = self.header();
+            if (spec.family != expected_header.family or spec.phase != expected_header.phase or !std.meta.eql(spec.geometry, expected_header.geometry) or !std.meta.eql(spec.semantics, expected_header.semantics) or spec.parameters.len != self.len()) return error.DenseDefinitionChanged;
+            const result = try a.alloc(Dense.BoundParameter, spec.parameters.len);
+            errdefer a.free(result);
+            for (spec.parameters, result, 0..) |declared, *bound, index| {
+                if (!std.meta.eql(declared.role, try self.roleAt(index))) return error.DenseDefinitionChanged;
+                var buffer: [256]u8 = undefined;
+                const resolved = try self.resolve(declared.role, &buffer);
+                if (declared.source_kind != resolved.source_kind or !std.mem.eql(u8, declared.source_name, resolved.source_name)) return error.DenseDefinitionChanged;
+                if (resolved.shape) |shape| if (!declared.shape.eq(shape)) return error.DenseDefinitionChanged;
+                bound.* = .{ .role = declared.role, .value = resolved.value, .source_data = if (declared.source_kind == .held_weight) self.program.source_data else null };
+                if (declared.source_kind == .external) {
+                    const root = self.program.roots[declared.role.layer.?];
+                    const value = switch (declared.role.kind) {
+                        .self_slab_k => root.self_k,
+                        .self_slab_v => root.self_v,
+                        .cross_slab_k => root.cross_k,
+                        .cross_slab_v => root.cross_v,
+                        else => return error.DenseDefinitionChanged,
+                    };
+                    bound.value = value;
+                }
+            }
+            return result;
+        }
+    };
+    pub fn specSource(self: *const @This()) !SpecSource {
+        try self.validateCache();
+        return .{ .program = self };
+    }
+    fn validateExtraNames(self: *const @This()) !void {
+        // These projections remain outside the authored Frame and earn no
+        // ProgramSpec coverage. Preserve current named sources before writes.
+        var buffer: [256]u8 = undefined;
+        for (self.weights.layers, 0..) |layer, index| for ([_]Dense.RoleKey{ .{ .kind = .cross_k, .layer = @intCast(index), .part = .weight }, .{ .kind = .cross_k, .layer = @intCast(index), .part = .bias }, .{ .kind = .cross_v, .layer = @intCast(index), .part = .weight }, .{ .kind = .cross_v, .layer = @intCast(index), .part = .bias } }) |role| {
+            const pair = try SpecSource.layerPair(layer, role.kind);
+            const value = if (role.part == .weight) pair.w else pair.b;
+            _ = try Native.heldF32WeightPrimaryNamed(&self.backend, self.source_data, value, try SpecSource.pairName(pair, role, &buffer));
+        };
+        const head_name = switch (self.weights.head_source) {
+            0 => "language_model.lm_head.weight",
+            1 => "lm_head.weight",
+            2 => "language_model.model.shared.weight",
+            3 => "model.decoder.embed_tokens.weight",
+            else => return error.NativeWeightRoleChanged,
+        };
+        _ = try Native.heldF32WeightPrimaryNamed(&self.backend, self.source_data, self.weights.head, head_name);
+        if (self.weights.head_bias) |bias| _ = try Native.heldF32WeightPrimaryNamed(&self.backend, self.source_data, bias, "language_model.final_logits_bias");
+    }
+
+    allocator: std.mem.Allocator,
+    backend: ComputeBackend,
+    source_data: *const anyopaque,
+    config: Config,
+    weights: Weights,
+    cache: ?DecoderIncrementalCache = null,
+    roots: []const struct { self_k: CT, self_v: CT, cross_k: CT, cross_v: CT } = &.{},
+    capacity: usize = 0,
+    encoder_rows: usize = 0,
+    token_rows: usize = 0,
+    schedule: ?*Dense.Schedule = null,
+    token: [1]i64 = .{0},
+    position: [1]i64 = .{bart_position_offset},
+    token_node: Node = 0,
+    position_node: Node = 0,
+    poisoned: bool = false,
+    initialized: bool = false,
+    completed_steps: usize = 0,
+
+    /// All payloads are ordinary private cache roots funded by the ORIGINAL
+    /// task's KV class. Only metadata uses a; Frame banks have separate funding.
+    pub fn create(a: std.mem.Allocator, cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, cfg: Config, rows: usize, capacity: usize) !?*PreparedSingleToken {
+        if (cb.vtable != &@import("../ops/native_compute.zig").vtable_impl or cfg.decoder_layers == 0 or capacity == 0 or rows == 0 or cfg.d_model == 0 or cfg.decoder_attention_heads == 0 or cfg.d_model % cfg.decoder_attention_heads != 0 or cfg.decoder_ffn_dim == 0) return null;
+        if (rows > std.math.maxInt(i32) or capacity > std.math.maxInt(i32) or cfg.d_model > std.math.maxInt(i32) or cfg.decoder_ffn_dim > std.math.maxInt(i32)) return null;
+        const self = try a.create(PreparedSingleToken);
+        errdefer a.destroy(self);
+        self.* = .{ .allocator = a, .backend = cb.withoutSynchronousBorrows(), .source_data = data, .config = cfg, .capacity = capacity, .encoder_rows = rows, .weights = try Weights.init(a, cb, data, pin, cfg) };
+        errdefer self.weights.deinit(cb, .{ .outside_execution = true });
+        const position_shape = (try Native.heldF32WeightPrimary(cb, data, self.weights.positions)).descriptor.shape;
+        const token_shape = (try Native.heldF32WeightPrimary(cb, data, self.weights.embed)).descriptor.shape;
+        if (position_shape.rank() != 2 or token_shape.rank() != 2 or position_shape.dims[1] != cfg.d_model or token_shape.dims[1] != cfg.d_model or token_shape.dims[0] < cfg.vocab_size or (std.math.cast(usize, position_shape.dims[0]) orelse return error.UnsupportedDenseSchedule) < try std.math.add(usize, capacity, @as(usize, @intCast(bart_position_offset)))) return error.UnsupportedDenseSchedule;
+        _ = try decoderKvBytes(cfg, 1, rows, capacity);
+        self.token_rows = std.math.cast(usize, token_shape.dims[0]) orelse return error.UnsupportedDenseSchedule;
+        self.cache = try emptyCache(a, cb, cfg, rows, capacity);
+        errdefer self.cache.?.deinit(cb, a);
+        const Root = @typeInfo(@TypeOf(self.roots)).pointer.child;
+        const roots = try a.alloc(Root, cfg.decoder_layers);
+        for (roots, 0..) |*root, index| root.* = .{ .self_k = self.cache.?.self.keys[index].?, .self_v = self.cache.?.self.values[index].?, .cross_k = self.cache.?.cross.keys[index], .cross_v = self.cache.?.cross.values[index] };
+        self.roots = roots;
+        return self;
+    }
+    fn emptyCache(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: Config, rows: usize, capacity: usize) !DecoderIncrementalCache {
+        const keys = try a.alloc(CT, cfg.decoder_layers);
+        errdefer a.free(keys);
+        const values = try a.alloc(CT, cfg.decoder_layers);
+        errdefer a.free(values);
+        var built: usize = 0;
+        errdefer for (keys[0..built], values[0..built]) |k, v| {
+            cb.free(k);
+            cb.free(v);
+        };
+        const shape = [_]i32{ @intCast(rows), @intCast(cfg.d_model) };
+        for (keys, values) |*k, *v| {
+            k.* = (try cb.allocUninitF32Shape(&shape)) orelse return error.UnsupportedDenseSchedule;
+            v.* = (cb.allocUninitF32Shape(&shape) catch |err| {
+                cb.free(k.*);
+                return err;
+            }) orelse {
+                cb.free(k.*);
+                return error.UnsupportedDenseSchedule;
+            };
+            built += 1;
+        }
+        var self_cache = (try DecoderSelfCache.tryInitPreallocated(cb, a, cfg.decoder_layers, 1, capacity, cfg.d_model)) orelse return error.UnsupportedDenseSchedule;
+        errdefer self_cache.deinit(cb, a);
+        const encoder_mask = try a.alloc(i64, rows);
+        errdefer a.free(encoder_mask);
+        const self_mask = try a.alloc(i64, capacity);
+        @memset(encoder_mask, 1);
+        @memset(self_mask, 1);
+        return .{ .cross = .{ .keys = keys, .values = values }, .self = self_cache, .encoder_mask = encoder_mask, .self_mask = self_mask, .batch = 1, .enc_seq = rows };
+    }
+    pub fn author(self: *@This(), preparation: ?*Dense.Preparation, spec: *const Dense.ProgramSpec, storage: ?*Dense.ProgramSpecStorage) !void {
+        const source = try self.specSource();
+        try self.validateExtraNames();
+        const bound = try source.bind(self.allocator, spec);
+        defer self.allocator.free(bound);
+        if (preparation) |prepared| if (prepared.cached) |definition| {
+            const schedule = try Dense.Schedule.instantiate(self.allocator, &self.backend, definition, bound);
+            errdefer schedule.deinit(.{ .outside_execution = true });
+            const token_node = try definition.parameterNode(.{ .kind = .token_ids });
+            const position_node = try definition.parameterNode(.{ .kind = .position_ids });
+            self.token_node = token_node;
+            self.position_node = position_node;
+            self.schedule = schedule;
+            self.cache.?.assigned = schedule;
+            return;
+        };
+        if (spec.family != .florence or spec.phase != .decode or spec.geometry.query_rows != 1 or spec.semantics.activation != .gelu_exact or spec.semantics.norm_order != .post or spec.semantics.epsilon != 1e-5 or spec.semantics.position_offset != bart_position_offset) return error.DenseDefinitionChanged;
+        var builder = if (storage) |owned| Dense.Builder.initSpecStorage(self.allocator, &self.backend, preparation, owned, bound) else Dense.Builder.initSpec(self.allocator, &self.backend, preparation, spec, bound);
+        defer builder.deinit();
+        const nodes = try Dense.authorSemanticGraph(&builder);
+        self.schedule = try Dense.Schedule.create(&builder);
+        self.token_node = nodes.token_node;
+        self.position_node = nodes.position_node;
+        self.cache.?.assigned = self.schedule;
+    }
+    pub fn prepareInto(self: *@This(), capability: ?@import("../execution/storage_admission.zig").Capability, current: Cleanup) !void {
+        try self.bindInputs(capability, current, true);
+    }
+    fn bindInputs(self: *@This(), capability: ?@import("../execution/storage_admission.zig").Capability, current: Cleanup, first: bool) !void {
+        const Tensor = @import("../backends/tensor.zig").Tensor;
+        var token = Tensor{ .allocator = self.allocator, .name = "decoder.token", .dtype = .i64, .shape = &.{1}, .data = std.mem.asBytes(&self.token), .owns_data = false, .owns_shape = false };
+        var position = Tensor{ .allocator = self.allocator, .name = "decoder.position", .dtype = .i64, .shape = &.{1}, .data = std.mem.asBytes(&self.position), .owns_data = false, .owns_shape = false };
+        const inputs = [_]@import("../execution/host_ingress.zig").Input{ .{ .node_id = self.token_node, .value = &token }, .{ .node_id = self.position_node, .value = &position } };
+        const schedule = self.schedule orelse return error.UnpreparedDenseSchedule;
+        if (first) try schedule.enter(capability, current, &inputs) else {
+            const frame = schedule.frame orelse return error.DenseScheduleNotEntered;
+            for (try frame.rebindNativeProgramHostInputs(&inputs)) |input| schedule.values[input.node_id] = input.value;
+        }
+    }
+    fn validateCache(self: *const @This()) !void {
+        const cache = self.cache orelse return error.UnpreparedDenseSchedule;
+        if (cache.assigned != self.schedule or self.weights.layers.len != self.roots.len) return error.PreparedFlorenceSourceChanged;
+        if (cache.batch != 1 or cache.cross_active != null or !cache.self.preallocated or cache.self.capacity != self.capacity or cache.enc_seq != self.encoder_rows or cache.self_mask.len != self.capacity or cache.encoder_mask.len != self.encoder_rows or cache.self.keys.len != self.roots.len or cache.self.values.len != self.roots.len or cache.cross.keys.len != self.roots.len or cache.cross.values.len != self.roots.len) return error.PreparedFlorenceSourceChanged;
+        for (self.roots, 0..) |root, index| if (cache.self.keys[index] != root.self_k or cache.self.values[index] != root.self_v or cache.cross.keys[index] != root.cross_k or cache.cross.values[index] != root.cross_v) return error.PreparedFlorenceSourceChanged;
+    }
+    pub fn initializeCross(self: *@This(), encoder: CT, rows: usize, control: ?@import("../execution_control.zig").InferenceExecutionControl) !void {
+        try self.validateCache();
+        if (self.initialized or self.poisoned or rows != self.cache.?.enc_seq) return error.PreparedFlorenceSourceChanged;
+        try Native.validateHeldF32WeightSources(&self.backend, self.source_data, self.weights.handles.items);
+        try self.validateExtraNames();
+        const cache = &self.cache.?;
+        for (self.weights.layers, 0..) |layer, index| {
+            if (control) |active| try active.check();
+            const k = try Dense.projectionDescriptor(&self.backend, self.source_data, encoder, layer.cross_k.w, layer.cross_k.b, cache.cross.keys[index], rows, self.config.d_model, self.config.d_model);
+            const v = try Dense.projectionDescriptor(&self.backend, self.source_data, encoder, layer.cross_v.w, layer.cross_v.b, cache.cross.values[index], rows, self.config.d_model, self.config.d_model);
+            if (!Native.canApplyDenseProjectionInto(&self.backend, &k, &.{ encoder, layer.cross_k.w, layer.cross_k.b }, cache.cross.keys[index]) or !Native.canApplyDenseProjectionInto(&self.backend, &v, &.{ encoder, layer.cross_v.w, layer.cross_v.b }, cache.cross.values[index])) return error.UnsupportedDenseSchedule;
+        }
+        errdefer self.poisoned = true;
+        for (self.weights.layers, 0..) |layer, index| {
+            if (control) |active| try active.check();
+            const k = try Dense.projectionDescriptor(&self.backend, self.source_data, encoder, layer.cross_k.w, layer.cross_k.b, cache.cross.keys[index], rows, self.config.d_model, self.config.d_model);
+            const v = try Dense.projectionDescriptor(&self.backend, self.source_data, encoder, layer.cross_v.w, layer.cross_v.b, cache.cross.values[index], rows, self.config.d_model, self.config.d_model);
+            if (!try Native.applyDenseProjectionInto(&self.backend, &k, &.{ encoder, layer.cross_k.w, layer.cross_k.b }, cache.cross.keys[index]) or !try Native.applyDenseProjectionInto(&self.backend, &v, &.{ encoder, layer.cross_v.w, layer.cross_v.b }, cache.cross.values[index])) return error.PreparedFlorenceSourceChanged;
+        }
+        self.initialized = true;
+    }
+    pub fn beginExecution(self: *@This(), current: Cleanup) !void {
+        if (!self.initialized or self.poisoned) return error.UnpreparedDenseSchedule;
+        try self.schedule.?.beginExecution(current);
+    }
+    /// Borrow lasts only until the next step; only the enclosing scalar request
+    /// can consume it through an owning retained header in the shared head call.
+    pub fn stepBorrowed(self: *@This(), token: i64) !CT {
+        return self.stepWithControl(token, null);
+    }
+    pub fn stepWithControl(self: *@This(), token: i64, control: ?@import("../execution_control.zig").InferenceExecutionControl) !CT {
+        // The current caller owns this control only through synchronous math.
+        // Retained backend/Definition/Frame never capture its request pointer.
+        var receiving = self.backend;
+        receiving.execution_control = control;
+        try self.validateCache();
+        const cache = &self.cache.?;
+        if (self.poisoned or !self.initialized or token < 0 or @as(u64, @intCast(token)) >= self.token_rows or cache.self.len >= cache.self.capacity) return error.InvalidInputShape;
+        self.token[0] = token;
+        self.position[0] = std.math.cast(i64, try std.math.add(usize, cache.self.len, bart_position_offset)) orelse return error.InvalidInputShape;
+        errdefer self.poisoned = true;
+        try self.bindInputs(null, .{}, false);
+        self.schedule.?.cursor = 0;
+        const result = try decoderForwardIncrementalBatchStepWithWeights(&receiving, self.allocator, self.config, &.{token}, cache, &self.weights);
+        if (self.schedule.?.cursor != self.schedule.?.steps.len) return error.DenseScheduleOrderChanged;
+        self.completed_steps += 1;
+        return result;
+    }
+    pub fn deinit(self: *@This(), current: Cleanup) void {
+        if (self.schedule) |schedule| schedule.deinit(current);
+        if (self.cache) |*cache| cache.deinit(&self.backend, self.allocator);
+        self.weights.deinit(&self.backend, current);
+        self.allocator.free(self.roots);
+        self.allocator.destroy(self);
+    }
+};
+
+test "Florence private held tuple supplies exact original roles without a repeated provider lookup" {
+    var layer: PreparedSingleToken.Layer = undefined;
+    inline for (@typeInfo(PreparedSingleToken.Layer).@"struct".field_names, 0..) |field, i| {
+        @field(layer, field) = .{ .w = @ptrFromInt(0x1000 + i * 32), .b = @ptrFromInt(0x1010 + i * 32) };
+    }
+    // These are only metadata identities: invoking Native getWeight would
+    // touch invalid ctx16. No numerical/ownership credit is inferred here.
+    const cb = ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &@import("../ops/native_compute.zig").vtable_impl };
+    var buf: [256]u8 = undefined;
+    inline for (.{ .{ "self_attn.q_proj", "q" }, .{ "self_attn.k_proj", "k" }, .{ "self_attn.v_proj", "v" }, .{ "self_attn.out_proj", "o" }, .{ "encoder_attn.q_proj", "cross_q" }, .{ "encoder_attn.k_proj", "cross_k" }, .{ "encoder_attn.v_proj", "cross_v" }, .{ "encoder_attn.out_proj", "cross_o" }, .{ "fc1", "fc1" }, .{ "fc2", "fc2" } }) |entry| {
+        const pair = try decoderStepLinearWeights(&cb, 0, entry[0], &buf, &layer, entry[1]);
+        try std.testing.expectEqual(@field(layer, entry[1]).w, pair.weight);
+        try std.testing.expectEqual(@field(layer, entry[1]).b, pair.bias);
+    }
+    inline for (.{ .{ "self_attn_layer_norm", "self_norm" }, .{ "encoder_attn_layer_norm", "cross_norm" }, .{ "final_layer_norm", "final_norm" } }) |entry| {
+        const pair = try decoderStepNormWeights(&cb, 0, entry[0], &buf, &layer, entry[1]);
+        try std.testing.expectEqual(@field(layer, entry[1]), pair);
+    }
 }

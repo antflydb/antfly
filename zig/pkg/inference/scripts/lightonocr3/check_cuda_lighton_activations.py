@@ -267,7 +267,7 @@ def main():
                         n,
                     )
                     gpu.launch(
-                        "lighton_rms_input_bf16",
+                        "antfly_rms_tree_bf16",
                         (rows, 1),
                         256,
                         pointer(got),

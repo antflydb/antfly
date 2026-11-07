@@ -24,7 +24,10 @@ pub const recipe = "embeddinggemma2-f32-mean-v6-webm-presentation";
 /// this complete execution recipe independently of the qualified F32 route.
 /// Portable MMA broadens BF16 tiled attention beyond the earlier SM89 route;
 /// invalidate earlier CUDA pins rather than mixing scalar/tiled vector recipes.
-pub const cuda_recipe = "embeddinggemma2-cuda-bf16-mean-v3-portable-mma";
+// The actual encoder arithmetic changed from the historical Lt/full-F32
+// route. Invalidate persistent vector/audio identities even for the default
+// zero optimization bits; full-F32 optional fallback has its own policy bit.
+pub const cuda_recipe = "embeddinggemma2-cuda-bf16-mean-v4-vendor-reduction";
 
 pub fn forBackend(artifact_identity: [64]u8, backend: @import("../backends/backends.zig").BackendType) [64]u8 {
     if (backend != .cuda) return artifact_identity;
@@ -402,4 +405,18 @@ test "embeddinggemma2 CUDA portable attention recipe invalidates earlier pinned 
     try std.testing.expect(!std.mem.eql(u8, previous, &current));
     try std.testing.expectEqual(artifacts, forBackend(artifacts, .native));
     try std.testing.expectEqual(current, forCudaPolicy(artifacts, .{}));
+}
+
+test "CUDA fallback arithmetic has a distinct actual embedding identity" {
+    const artifact: [64]u8 = @splat('a');
+    const reduced = forCudaPolicy(artifact, .{});
+    const fallback = forCudaPolicy(artifact, .{ .matmul_arithmetic = .full_f32 });
+    try std.testing.expect(!std.mem.eql(u8, &reduced, &fallback));
+    // Exact A default algorithm: SHA256(v3 portable recipe + NUL + 64 a).
+    // Both new contracts must reject that historical persistent-cache key.
+    const actual_a_default = "08dc114a42e3cd516ba769d293e65e5255ed43944f0577120739916aa49a5f82";
+    try std.testing.expect(!std.mem.eql(u8, actual_a_default, &reduced));
+    try std.testing.expect(!std.mem.eql(u8, actual_a_default, &fallback));
+    const native_identity = forBackend(artifact, .native);
+    try std.testing.expectEqualSlices(u8, &artifact, &native_identity);
 }

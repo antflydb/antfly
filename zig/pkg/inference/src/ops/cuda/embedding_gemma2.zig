@@ -37,6 +37,103 @@ pub const Attention = struct {
     }
 };
 
+/// A numerical operation descriptor, separate from the geometry reused by
+/// RoPE and F32 training contractions. No provider, model name or flag is kept.
+pub const AttentionSchedule = enum(u32) {
+    flash_bf16 = 0,
+    efficient_bf16 = 1,
+
+    pub fn forResolvedMask(shape: Attention, all_tokens_valid: bool) AttentionSchedule {
+        const full_window = shape.local_radius == 0 or shape.seq < shape.local_radius;
+        return if (shape.head_dim <= 256 and all_tokens_valid and full_window) .flash_bf16 else .efficient_bf16;
+    }
+};
+pub const AttentionProgram = struct {
+    shape: Attention,
+    /// Original source extent; shape.seq remains the physical bank stride.
+    source_sequence: u32,
+    /// Borrowed only for this dispatch; retained storage belongs to the Arena.
+    logical_metadata: Buffer = .{},
+    probability_schedule: AttentionSchedule,
+    split_count: u32 = 1,
+
+    pub fn validate(self: AttentionProgram) !void {
+        try self.shape.validate();
+        if ((self.logical_metadata.ptr == 0 and self.logical_metadata.len != 0) or (self.logical_metadata.ptr != 0 and (self.logical_metadata.len != 8 or self.logical_metadata.ptr % 4 != 0))) return error.InvalidEmbeddingGemma2AttentionSchedule;
+        if (self.shape.local_radius > 8192) return error.InvalidEmbeddingGemma2AttentionSchedule;
+        if (self.source_sequence == 0 or self.source_sequence > self.shape.seq) return error.InvalidEmbeddingGemma2AttentionSchedule;
+        if (self.split_count == 0 or self.split_count > 128 or self.split_count > (self.source_sequence + 63) / 64 or
+            (self.probability_schedule == .efficient_bf16 and self.split_count != 1)) return error.InvalidEmbeddingGemma2AttentionSchedule;
+        if (self.shape.batch > 65535 / self.split_count) return error.InvalidEmbeddingGemma2AttentionSchedule;
+        if (self.probability_schedule == .flash_bf16 and self.shape.head_dim > 256)
+            return error.InvalidEmbeddingGemma2AttentionSchedule;
+    }
+    pub fn forResolvedMask(shape: Attention, source_sequence: u32, all_tokens_valid: bool, multiprocessors: i32) !AttentionProgram {
+        try shape.validate();
+        if (source_sequence == 0 or source_sequence > shape.seq) return error.InvalidEmbeddingGemma2AttentionSchedule;
+        if (multiprocessors <= 0) return error.InvalidCudaState;
+        var source = shape;
+        source.seq = source_sequence;
+        const schedule = AttentionSchedule.forResolvedMask(source, all_tokens_valid);
+        var result = AttentionProgram{ .shape = shape, .source_sequence = source_sequence, .probability_schedule = schedule };
+        if (schedule == .flash_bf16) result.split_count = try splitCount(source, multiprocessors);
+        try result.validate();
+        return result;
+    }
+
+    /// Exact backend-free Flash split policy: no allocation, callbacks or hash.
+    /// The caller supplies an actual cold device property, never a GPU name.
+    fn splitCount(shape: Attention, multiprocessors: i32) !u32 {
+        if (multiprocessors <= 0) return error.InvalidCudaState;
+        const sms = try std.math.mul(u32, @intCast(multiprocessors), 2);
+        const blocks = (shape.seq + 63) / 64;
+        const work = try std.math.mul(u32, try std.math.mul(u32, shape.batch, shape.q_heads), blocks);
+        if (@as(f32, @floatFromInt(work)) >= 0.8 * @as(f32, @floatFromInt(sms))) return 1;
+        const limit: u32 = @min(@as(u32, 128), sms, blocks);
+        var efficiency: [128]f32 = @splat(0);
+        var maximum: f32 = 0;
+        for (1..limit + 1) |value| {
+            const n: u32 = @intCast(value);
+            if (n != 1 and (blocks + n - 1) / n == (blocks + n - 2) / (n - 1)) continue;
+            const waves = @as(f32, @floatFromInt(try std.math.mul(u32, work, n))) / @as(f32, @floatFromInt(sms));
+            efficiency[n - 1] = waves / @ceil(waves);
+            maximum = @max(maximum, efficiency[n - 1]);
+        }
+        for (1..limit + 1) |value| {
+            const n: u32 = @intCast(value);
+            if (n != 1 and (blocks + n - 1) / n == (blocks + n - 2) / (n - 1)) continue;
+            if (@as(f64, efficiency[n - 1]) >= 0.85 * @as(f64, maximum)) return n;
+        }
+        return 1;
+    }
+
+    /// Exact live shared span: efficient QK/PV no longer stage K/V; dead
+    /// query/score bytes hold previous F32 output until the next tile barrier.
+    pub fn sharedMemoryBytes(self: AttentionProgram) !u32 {
+        try self.validate();
+        const dim = self.shape.head_dim;
+        const keys: u32 = if (self.probability_schedule == .flash_bf16) 64 else 128;
+        const prefix = if (self.probability_schedule == .efficient_bf16)
+            @max(@as(u32, 16) * dim * 2, 16 * dim * 4 - 16 * keys * 4)
+        else
+            32 * dim * 2;
+        return prefix + 16 * keys * 6 + 6 * 16 * 4;
+    }
+
+    pub const Workspace = struct { output_bytes: usize = 0, lse_offset: usize = 0, total_bytes: usize = 0 };
+    pub fn workspace(self: AttentionProgram) !Workspace {
+        try self.validate();
+        if (self.split_count == 1) return .{};
+        const rows = try std.math.mul(usize, try std.math.mul(usize, self.shape.batch, self.shape.q_heads), self.shape.seq);
+        const count = try std.math.mul(usize, rows, self.split_count);
+        const bytes = try std.math.mul(usize, try std.math.mul(usize, count, self.shape.head_dim), @sizeOf(f32));
+        // Every validated BF16 head has256/512 elements, so F32 rows
+        // already align the LSE region to the256-byte device ABI.
+        const lse_offset = bytes;
+        return .{ .output_bytes = bytes, .lse_offset = lse_offset, .total_bytes = try std.math.add(usize, lse_offset, try std.math.mul(usize, count, @sizeOf(f32))) };
+    }
+};
+
 pub const Stats = struct {
     launches: u64 = 0,
     audio_frontend_fused_launches: u64 = 0,
@@ -46,6 +143,7 @@ pub const Stats = struct {
     audio_batch_layout_launches: u64 = 0,
     cublaslt_matmuls: u64 = 0,
     cublas_f32_matmuls: u64 = 0,
+    cublas_bf16_matmuls: u64 = 0,
     attention_launches: u64 = 0,
     attention_scalar_fallbacks: u64 = 0,
     scalar_matmul_fallbacks: u64 = 0,
@@ -113,9 +211,11 @@ pub const Module = struct {
     scale_rms: driver.CUfunction,
     attention: driver.CUfunction,
     local_flash_attention: driver.CUfunction,
+    efficient_attention_hd256: driver.CUfunction,
+    attention_split_merge: driver.CUfunction,
     attention_softmax: driver.CUfunction,
     matmul: driver.CUfunction,
-    gelu_mul: driver.CUfunction,
+    gelu_product: driver.CUfunction,
     gelu_mul_vjp: driver.CUfunction,
     bf16_to_f32: driver.CUfunction,
     f32_to_bf16: driver.CUfunction,
@@ -130,7 +230,6 @@ pub const Module = struct {
     scale_device_f32_bf16: driver.CUfunction,
     accumulate_f32: driver.CUfunction,
     accumulate_bf16_boundary_f32: driver.CUfunction,
-    gelu_ple: driver.CUfunction,
     residual: driver.CUfunction,
     residual_vjp: driver.CUfunction,
     contrastive_prob: driver.CUfunction,
@@ -142,8 +241,7 @@ pub const Module = struct {
     mean_l2: driver.CUfunction,
     training_mean_l2: driver.CUfunction,
     mean_l2_vjp: driver.CUfunction,
-    mrl_normalize: driver.CUfunction,
-    mrl_normalize_vjp: driver.CUfunction,
+    prefix_normalization: @import("prefix_normalization.zig").Program,
     stats_: Stats = .{},
 
     pub fn init(ctx: *Context) !Module {
@@ -165,7 +263,7 @@ pub const Module = struct {
             .audio_fft512 = try function(ctx, m, "antfly_audio_fft512_f32"),
             .audio_conv_tiled = try function(ctx, m, "antfly_audio_conv_tiled_f32"),
             .audio_conv_bf16 = try function(ctx, m, "antfly_audio_conv_bf16_wmma"),
-            .audio_depthwise_conv = try function(ctx, m, "termite_gemma4_audio_depthwise_causal_conv1d_f32"),
+            .audio_depthwise_conv = try function(ctx, m, "termite_causal_depthwise_f32"),
             .pillow_horizontal = try function(ctx, m, "termite_embedding_gemma2_pillow_horizontal_rgb8"),
             .pillow_vertical_patches = try function(ctx, m, "termite_embedding_gemma2_pillow_vertical_patches_f32"),
             .rms_norm = try function(ctx, m, "termite_embedding_gemma2_rms_norm_bf16"),
@@ -187,9 +285,11 @@ pub const Module = struct {
             .scale_rms = try function(ctx, m, "termite_embedding_gemma2_scale_rms_bf16"),
             .attention = try function(ctx, m, "termite_embedding_gemma2_attention_bf16"),
             .local_flash_attention = try function(ctx, m, "termite_embedding_gemma2_attention_local_flash_bf16"),
+            .efficient_attention_hd256 = try function(ctx, m, "antfly_attention_efficient_bf16_hd256"),
+            .attention_split_merge = try function(ctx, m, "antfly_attention_split_merge_bf16"),
             .attention_softmax = try function(ctx, m, "termite_embedding_gemma2_attention_softmax_bf16"),
             .matmul = try function(ctx, m, "termite_embedding_gemma2_matmul_bf16"),
-            .gelu_mul = try function(ctx, m, "termite_embedding_gemma2_gelu_mul_bf16"),
+            .gelu_product = try function(ctx, m, "termite_embedding_gemma2_gelu_mul_bf16"),
             .gelu_mul_vjp = try function(ctx, m, "termite_embedding_gemma2_gelu_mul_vjp_f32"),
             .bf16_to_f32 = try function(ctx, m, "termite_embedding_gemma2_bf16_to_f32"),
             .f32_to_bf16 = try function(ctx, m, "termite_embedding_gemma2_f32_to_bf16"),
@@ -204,7 +304,6 @@ pub const Module = struct {
             .scale_device_f32_bf16 = try function(ctx, m, "termite_embedding_gemma2_scale_device_f32_bf16"),
             .accumulate_f32 = try function(ctx, m, "termite_embedding_gemma2_accumulate_f32"),
             .accumulate_bf16_boundary_f32 = try function(ctx, m, "termite_embedding_gemma2_accumulate_bf16_boundary_f32"),
-            .gelu_ple = try function(ctx, m, "termite_embedding_gemma2_gelu_ple_bf16"),
             .residual = try function(ctx, m, "termite_embedding_gemma2_residual_bf16"),
             .residual_vjp = try function(ctx, m, "termite_embedding_gemma2_residual_vjp_f32"),
             .contrastive_prob = try function(ctx, m, "termite_embedding_gemma2_contrastive_prob_f32"),
@@ -216,8 +315,7 @@ pub const Module = struct {
             .mean_l2 = try function(ctx, m, "termite_embedding_gemma2_mean_l2_f32"),
             .training_mean_l2 = try function(ctx, m, "termite_embedding_gemma2_training_mean_l2_f32"),
             .mean_l2_vjp = try function(ctx, m, "termite_embedding_gemma2_mean_l2_vjp_f32"),
-            .mrl_normalize = try function(ctx, m, "termite_embedding_gemma2_mrl_normalize_f32"),
-            .mrl_normalize_vjp = try function(ctx, m, "termite_embedding_gemma2_mrl_normalize_vjp_f32"),
+            .prefix_normalization = try @import("prefix_normalization.zig").Program.init(ctx, m),
         };
     }
 
@@ -233,6 +331,9 @@ pub const Module = struct {
 
     pub fn noteCublasLtMatmul(self: *Module) void {
         self.stats_.cublaslt_matmuls += 1;
+    }
+    pub fn noteCublasBf16Matmul(self: *Module) void {
+        self.stats_.cublas_bf16_matmuls += 1;
     }
     pub fn noteCublasF32Matmul(self: *Module) void {
         self.stats_.cublas_f32_matmuls += 1;
@@ -380,7 +481,7 @@ pub const Module = struct {
         var fp = floor;
         var args = [_]?*anyopaque{ @ptrCast(&ip), @ptrCast(&pp), @ptrCast(&mp), @ptrCast(&op), @ptrCast(&hp), @ptrCast(&fp) };
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.audio_logmel, @intCast(frames), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.launchKernel(self.audio_logmel, @intCast(frames), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null);
         self.stats_.launches += 1;
         self.stats_.audio_frontend_fused_launches += 1;
     }
@@ -394,7 +495,7 @@ pub const Module = struct {
         var op = out.ptr;
         var args = [_]?*anyopaque{ @ptrCast(&ip), @ptrCast(&tp), @ptrCast(&op) };
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.audio_fft512, @intCast(frames), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.launchKernel(self.audio_fft512, @intCast(frames), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null);
         self.stats_.audio_fft_launches += 1;
         self.stats_.launches += 1;
     }
@@ -421,7 +522,7 @@ pub const Module = struct {
         var wo: u32 = @intCast(ow);
         var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&wp), @ptrCast(&bp), @ptrCast(&ci), @ptrCast(&co), @ptrCast(&hh), @ptrCast(&ww), @ptrCast(&ho), @ptrCast(&wo) };
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(if (bf16) self.audio_conv_bf16 else self.audio_conv_tiled, @intCast((oh * ow + 15) / 16), @intCast((oc + 15) / 16), @intCast(batch), if (bf16) 32 else 16, if (bf16) 1 else 16, 1, 0, ctx.stream, &args, null));
+        try ctx.launchKernel(if (bf16) self.audio_conv_bf16 else self.audio_conv_tiled, @intCast((oh * ow + 15) / 16), @intCast((oc + 15) / 16), @intCast(batch), if (bf16) 32 else 16, if (bf16) 1 else 16, 1, 0, ctx.stream, &args, null);
         self.stats_.launches += 1;
         if (bf16) self.stats_.audio_conv_bf16_launches += 1 else self.stats_.audio_conv_tiled_launches += 1;
     }
@@ -874,7 +975,16 @@ pub const Module = struct {
         try self.launch1d(ctx, self.vision_rope_pack, &args, count);
     }
 
-    pub fn launchAttention(self: *Module, ctx: *Context, out: Buffer, q: Buffer, k: Buffer, v: Buffer, mask: Buffer, shape: Attention) !void {
+    pub fn launchAttention(self: *Module, ctx: *Context, out: Buffer, q: Buffer, k: Buffer, v: Buffer, mask: Buffer, program: AttentionProgram, workspace: Buffer) !void {
+        try program.validate();
+        if (artifact.hasBf16WmmaCodeFor(ctx.info.compute_major, ctx.info.compute_minor))
+            return self.launchLocalFlashAttention(ctx, out, q, k, v, mask, program, workspace);
+        return self.launchLegacyAttention(ctx, out, q, k, v, mask, program.shape);
+    }
+
+    // Retain the original non-WMMA receiver and its numerical contract for
+    // legacy deployment profiles; do not use it as the new path's own oracle.
+    pub fn launchLegacyAttention(self: *Module, ctx: *Context, out: Buffer, q: Buffer, k: Buffer, v: Buffer, mask: Buffer, shape: Attention) !void {
         try shape.validate();
         const qb = @as(usize, shape.batch) * shape.seq * shape.q_heads * shape.head_dim * 2;
         const kvb = @as(usize, shape.batch) * shape.seq * shape.kv_heads * shape.head_dim * 2;
@@ -901,8 +1011,13 @@ pub const Module = struct {
         self.stats_.attention_launches += 1;
     }
 
-    pub fn launchLocalFlashAttention(self: *Module, ctx: *Context, out: Buffer, q: Buffer, k: Buffer, v: Buffer, mask: Buffer, shape: Attention) !void {
-        try shape.validate();
+    /// Kernel ABI: existing parameters0..15 are unchanged; the optional stable
+    /// logical metadata device pointer is appended at16. Null is legacy math.
+    pub const local_attention_parameter_count = 17;
+    pub const local_attention_metadata_parameter = 16;
+    pub fn launchLocalFlashAttention(self: *Module, ctx: *Context, out: Buffer, q: Buffer, k: Buffer, v: Buffer, mask: Buffer, program: AttentionProgram, workspace: Buffer) !void {
+        try program.validate();
+        const shape = program.shape;
         if (!localFlashAttentionGeometrySupported(shape)) return error.InvalidEmbeddingGemma2Shape;
         const qb = try std.math.mul(usize, @as(usize, shape.batch) * shape.seq * shape.q_heads, shape.head_dim * 2);
         const kvb = try std.math.mul(usize, @as(usize, shape.batch) * shape.seq * shape.kv_heads, shape.head_dim * 2);
@@ -911,49 +1026,48 @@ pub const Module = struct {
         try require(k, kvb);
         try require(v, kvb);
         if (mask.ptr != 0) try require(mask, @as(usize, shape.batch) * shape.seq * 8);
-        const full_tiles = shape.seq / 64;
-        if (full_tiles != 0) {
-            var op = out.ptr;
-            var qp = q.ptr;
-            var kp = k.ptr;
-            var vp = v.ptr;
-            var mp = mask.ptr;
-            var b = shape.batch;
-            var s = shape.seq;
-            var qh = shape.q_heads;
-            var kh = shape.kv_heads;
-            var d = shape.head_dim;
-            var radius = shape.local_radius;
-            var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&qp), @ptrCast(&kp), @ptrCast(&vp), @ptrCast(&mp), @ptrCast(&b), @ptrCast(&s), @ptrCast(&qh), @ptrCast(&kh), @ptrCast(&d), @ptrCast(&radius) };
-            const shared = @as(u32, 16) * shape.head_dim * 2 + 4 * 64 * 16 * 4 + 64 * 16 * 2 + 3 * 64 * 4;
-            try launchShared(ctx, self.local_flash_attention, &args, .{ shape.q_heads, full_tiles, shape.batch }, .{ 512, 1, 1 }, shared);
-            self.stats_.launches += 1;
-        }
-        const tail = shape.seq % 64;
-        if (tail != 0) {
-            var op = out.ptr;
-            var qp = q.ptr;
-            var kp = k.ptr;
-            var vp = v.ptr;
-            var mp = mask.ptr;
-            var b = shape.batch;
-            var s = shape.seq;
-            var qh = shape.q_heads;
-            var kh = shape.kv_heads;
-            var d = shape.head_dim;
-            var radius = shape.local_radius;
-            var query_offset = shape.seq - tail;
-            var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&qp), @ptrCast(&kp), @ptrCast(&vp), @ptrCast(&mp), @ptrCast(&b), @ptrCast(&s), @ptrCast(&qh), @ptrCast(&kh), @ptrCast(&d), @ptrCast(&radius), @ptrCast(&query_offset) };
-            try launch(ctx, self.attention, &args, .{ tail, shape.q_heads, shape.batch }, .{ 32, 1, 1 });
+        const required_workspace = try program.workspace();
+        try require(workspace, required_workspace.total_bytes);
+        const output_bytes = required_workspace.output_bytes;
+        const lse_bytes = required_workspace.total_bytes - required_workspace.lse_offset;
+        const partial_output = Buffer{ .ptr = if (output_bytes == 0) 0 else workspace.ptr, .len = output_bytes };
+        const partial_lse = Buffer{ .ptr = if (lse_bytes == 0) 0 else try std.math.add(u64, workspace.ptr, required_workspace.lse_offset), .len = lse_bytes };
+        try @import("buffer.zig").validateRegions(8, .{ q, k, v, mask, out, partial_output, partial_lse, program.logical_metadata }, .{ qb, kvb, kvb, if (mask.ptr != 0) @as(usize, shape.batch) * shape.seq * 8 else 0, qb, output_bytes, lse_bytes, if (program.logical_metadata.ptr != 0) 8 else 0 }, .{ 2, 2, 2, 8, 2, 256, 4, 4 }, 4);
+
+        var op = out.ptr;
+        var qp = q.ptr;
+        var kp = k.ptr;
+        var vp = v.ptr;
+        var mp = mask.ptr;
+        var b = shape.batch;
+        var seq = shape.seq;
+        var source_seq = program.source_sequence;
+        var qh = shape.q_heads;
+        var kh = shape.kv_heads;
+        var d = shape.head_dim;
+        var radius = shape.local_radius;
+        var schedule = @backingInt(program.probability_schedule);
+        var partial = partial_output.ptr;
+        var lse = partial_lse.ptr;
+        var splits = program.split_count;
+        var logical_metadata = program.logical_metadata.ptr;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&qp), @ptrCast(&kp), @ptrCast(&vp), @ptrCast(&mp), @ptrCast(&b), @ptrCast(&seq), @ptrCast(&source_seq), @ptrCast(&qh), @ptrCast(&kh), @ptrCast(&d), @ptrCast(&radius), @ptrCast(&schedule), @ptrCast(&partial), @ptrCast(&lse), @ptrCast(&splits), @ptrCast(&logical_metadata) };
+        comptime std.debug.assert(local_attention_metadata_parameter + 1 == local_attention_parameter_count);
+        std.debug.assert(args.len == local_attention_parameter_count);
+        const shared = try program.sharedMemoryBytes();
+        const entry = if (program.probability_schedule == .efficient_bf16 and shape.head_dim == 256) self.efficient_attention_hd256 else self.local_flash_attention;
+        try launchShared(ctx, entry, &args, .{ shape.q_heads, (shape.seq + 15) / 16, try std.math.mul(u32, shape.batch, splits) }, .{ 128, 1, 1 }, shared);
+        self.stats_.launches += 1;
+        if (splits > 1) {
+            var merge_args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&partial), @ptrCast(&lse), @ptrCast(&b), @ptrCast(&seq), @ptrCast(&qh), @ptrCast(&d), @ptrCast(&splits) };
+            try launch(ctx, self.attention_split_merge, &merge_args, .{ try std.math.mul(u32, try std.math.mul(u32, shape.batch, shape.q_heads), shape.seq), 1, 1 }, .{ 32, 1, 1 });
             self.stats_.launches += 1;
         }
         self.stats_.attention_launches += 1;
     }
 
     fn localFlashAttentionGeometrySupported(shape: Attention) bool {
-        const local = shape.local_radius == 512 and shape.kv_heads == 2 and shape.head_dim == 256;
-        const global = shape.local_radius == 0 and shape.kv_heads == 1 and shape.head_dim == 512;
-        return shape.q_heads == 4 and (local or global);
+        return shape.q_heads == 4 and ((shape.kv_heads == 2 and shape.head_dim == 256) or (shape.kv_heads == 1 and shape.head_dim == 512));
     }
 
     pub fn launchAttentionSoftmax(self: *Module, ctx: *Context, probs: Buffer, scores: Buffer, mask: Buffer, sequence: u32, query_base: u32, rows: u32, batch_index: u32, heads: u32, tile_capacity: u32) !void {
@@ -962,6 +1076,13 @@ pub const Module = struct {
         try require(scores, try std.math.mul(usize, elements, 4));
         try require(probs, try std.math.mul(usize, elements, 2));
         if (mask.ptr != 0) try require(mask, (@as(usize, batch_index) + 1) * sequence * 8);
+        // Scores/mask are read-only until normalization finishes. Writable
+        // BF16 probabilities cannot alias either input, including partial views.
+        try @import("buffer.zig").validateRegions(3, .{ scores, mask, probs }, .{
+            try std.math.mul(usize, elements, 4),
+            if (mask.ptr == 0) 0 else try std.math.mul(usize, try std.math.mul(usize, @as(usize, batch_index) + 1, sequence), 8),
+            try std.math.mul(usize, elements, 2),
+        }, .{ 4, 8, 2 }, 2);
         var pp = probs.ptr;
         var sp = scores.ptr;
         var mp = mask.ptr;
@@ -991,17 +1112,8 @@ pub const Module = struct {
         self.stats_.scalar_matmul_fallbacks += 1;
     }
 
-    pub fn launchGeluPle(self: *Module, ctx: *Context, out: Buffer, gate: Buffer, ple: Buffer, count: u32) !void {
-        const bytes = @as(usize, count) * 2;
-        try require(out, bytes);
-        try require(gate, bytes);
-        try require(ple, bytes);
-        var op = out.ptr;
-        var gp = gate.ptr;
-        var pp = ple.ptr;
-        var n = count;
-        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&gp), @ptrCast(&pp), @ptrCast(&n) };
-        try self.launch1d(ctx, self.gelu_ple, &args, count);
+    pub inline fn launchGeluPle(self: *Module, ctx: *Context, out: Buffer, gate: Buffer, ple: Buffer, count: u32) !void {
+        return self.launchGeluMul(ctx, out, gate, ple, count);
     }
 
     pub fn launchGeluMul(self: *Module, ctx: *Context, out: Buffer, gate: Buffer, up: Buffer, count: u32) !void {
@@ -1014,7 +1126,7 @@ pub const Module = struct {
         var uptr = up.ptr;
         var n = count;
         var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&gp), @ptrCast(&uptr), @ptrCast(&n) };
-        try self.launch1d(ctx, self.gelu_mul, &args, count);
+        try self.launch1d(ctx, self.gelu_product, &args, count);
     }
 
     pub fn launchGeluMulVjp(self: *Module, ctx: *Context, dgate: Buffer, dup: Buffer, dy: Buffer, gate: Buffer, up: Buffer, count: u32) !void {
@@ -1359,29 +1471,18 @@ pub const Module = struct {
     }
     pub fn launchMrlNormalize(self: *Module, ctx: *Context, out: Buffer, input: Buffer, rows: u32, width: u32) !void {
         if (rows == 0 or rows > 384 or width == 0 or width > 768) return error.InvalidEmbeddingGemma2TrainingShape;
-        try require(input, try std.math.mul(usize, try std.math.mul(usize, rows, 768), @sizeOf(f32)));
-        try require(out, try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32)));
-        var op = out.ptr;
-        var ip = input.ptr;
-        var r = rows;
-        var w = width;
-        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&r), @ptrCast(&w) };
-        try launchShared(ctx, self.mrl_normalize, &args, .{ rows, 1, 1 }, .{ 256, 1, 1 }, 8 * @sizeOf(f32));
-        self.stats_.launches += 1;
+        try self.launchPrefixNormalize(ctx, out, input, .{ .rows = rows, .width = width, .input_stride = 768 });
     }
     pub fn launchMrlNormalizeVjp(self: *Module, ctx: *Context, dinput: Buffer, dout: Buffer, input: Buffer, rows: u32, width: u32, objective_weight: f32) !void {
         if (rows == 0 or rows > 384 or width == 0 or width > 768 or !std.math.isFinite(objective_weight)) return error.InvalidEmbeddingGemma2TrainingShape;
-        try require(dinput, try std.math.mul(usize, try std.math.mul(usize, rows, 768), @sizeOf(f32)));
-        try require(input, try std.math.mul(usize, try std.math.mul(usize, rows, 768), @sizeOf(f32)));
-        try require(dout, try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32)));
-        var dip = dinput.ptr;
-        var dop = dout.ptr;
-        var ip = input.ptr;
-        var r = rows;
-        var w = width;
-        var weight = objective_weight;
-        var args = [_]?*anyopaque{ @ptrCast(&dip), @ptrCast(&dop), @ptrCast(&ip), @ptrCast(&r), @ptrCast(&w), @ptrCast(&weight) };
-        try launchShared(ctx, self.mrl_normalize_vjp, &args, .{ rows, 1, 1 }, .{ 256, 1, 1 }, 16 * @sizeOf(f32));
+        try self.launchPrefixNormalizeVjp(ctx, dinput, dout, input, .{ .rows = rows, .width = width, .input_stride = 768 }, objective_weight);
+    }
+    pub fn launchPrefixNormalize(self: *Module, ctx: *Context, out: Buffer, input: Buffer, shape: @import("prefix_normalization.zig").Geometry) !void {
+        try self.prefix_normalization.normalize(ctx, out, input, shape);
+        self.stats_.launches += 1;
+    }
+    pub fn launchPrefixNormalizeVjp(self: *Module, ctx: *Context, dinput: Buffer, dout: Buffer, input: Buffer, shape: @import("prefix_normalization.zig").Geometry, objective_weight: f32) !void {
+        try self.prefix_normalization.accumulateVjp(ctx, dinput, dout, input, shape, objective_weight);
         self.stats_.launches += 1;
     }
     fn launch1d(self: *Module, ctx: *Context, f: driver.CUfunction, args: []?*anyopaque, n: usize) !void {
@@ -1408,12 +1509,12 @@ fn require(b: Buffer, n: usize) !void {
 }
 fn launch(ctx: *Context, f: driver.CUfunction, args: []?*anyopaque, grid: [3]u32, block: [3]u32) !void {
     try ctx.makeCurrent();
-    try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], 0, ctx.stream, args.ptr, null));
+    try ctx.launchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], 0, ctx.stream, args.ptr, null);
     ctx.noteKernelLaunch();
 }
 fn launchShared(ctx: *Context, f: driver.CUfunction, args: []?*anyopaque, grid: [3]u32, block: [3]u32, shared: u32) !void {
     try ctx.makeCurrent();
-    try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], shared, ctx.stream, args.ptr, null));
+    try ctx.launchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], shared, ctx.stream, args.ptr, null);
     ctx.noteKernelLaunch();
 }
 
@@ -1428,8 +1529,16 @@ test "EmbeddingGemma 2 local flash accepts only supported local and global geome
     const global = Attention{ .batch = 32, .seq = 512, .q_heads = 4, .kv_heads = 1, .head_dim = 512, .local_radius = 0 };
     try std.testing.expect(Module.localFlashAttentionGeometrySupported(local));
     try std.testing.expect(Module.localFlashAttentionGeometrySupported(global));
-    try std.testing.expect(!Module.localFlashAttentionGeometrySupported(.{ .batch = 32, .seq = 512, .q_heads = 4, .kv_heads = 1, .head_dim = 512, .local_radius = 512 }));
-    try std.testing.expect(!Module.localFlashAttentionGeometrySupported(.{ .batch = 32, .seq = 512, .q_heads = 4, .kv_heads = 2, .head_dim = 256, .local_radius = 0 }));
+    // The shared BF16 program now supports both window policies for each
+    // validated head geometry; schedule selection remains independently typed.
+    const clipped_global = Attention{ .batch = 32, .seq = 512, .q_heads = 4, .kv_heads = 1, .head_dim = 512, .local_radius = 512 };
+    try clipped_global.validate();
+    try std.testing.expect(Module.localFlashAttentionGeometrySupported(clipped_global));
+    try std.testing.expectEqual(AttentionSchedule.efficient_bf16, (try AttentionProgram.forResolvedMask(clipped_global, 512, true, 48)).probability_schedule);
+    const full_local = Attention{ .batch = 32, .seq = 512, .q_heads = 4, .kv_heads = 2, .head_dim = 256, .local_radius = 0 };
+    try full_local.validate();
+    try std.testing.expect(Module.localFlashAttentionGeometrySupported(full_local));
+    try std.testing.expectEqual(AttentionSchedule.flash_bf16, (try AttentionProgram.forResolvedMask(full_local, 512, true, 48)).probability_schedule);
     try std.testing.expect(!Module.localFlashAttentionGeometrySupported(.{ .batch = 32, .seq = 512, .q_heads = 2, .kv_heads = 1, .head_dim = 512, .local_radius = 0 }));
 }
 
@@ -1442,7 +1551,10 @@ test "EmbeddingGemma 2 resident contrastive objective bounds logical batch" {
 
 test "embeddinggemma2 CUDA packed column split preserves BF16 bits and row tails" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
-    var ctx = try Context.initDefault();
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer ctx.deinit();
     var module = try Module.init(&ctx);
     defer module.deinit(&ctx);
@@ -1468,7 +1580,10 @@ test "embeddinggemma2 CUDA packed column split preserves BF16 bits and row tails
 
 test "embeddinggemma2 CUDA extended flash matches scalar attention with mask holes and tile tails" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
-    var ctx = try Context.initDefault();
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer ctx.deinit();
     if (!@import("artifact.zig").hasBf16WmmaCodeFor(ctx.info.compute_major, ctx.info.compute_minor)) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -1510,11 +1625,11 @@ test "embeddinggemma2 CUDA extended flash matches scalar attention with mask hol
                     try ctx.synchronize();
                     const clock = std.testing.io;
                     const reference_start = std.Io.Clock.awake.now(clock);
-                    try module.launchAttention(&ctx, expected, q, k, v, mask, shape);
+                    try module.launchLegacyAttention(&ctx, expected, q, k, v, mask, shape);
                     try ctx.synchronize();
                     const reference_ns = std.Io.Clock.awake.now(clock).nanoseconds - reference_start.nanoseconds;
                     const candidate_start = std.Io.Clock.awake.now(clock);
-                    try module.launchLocalFlashAttention(&ctx, actual, q, k, v, mask, shape);
+                    try module.launchLocalFlashAttention(&ctx, actual, q, k, v, mask, .{ .shape = shape, .source_sequence = shape.seq, .probability_schedule = AttentionSchedule.forResolvedMask(shape, mask_kind == 0) }, .{});
                     try ctx.synchronize();
                     const candidate_ns = std.Io.Clock.awake.now(clock).nanoseconds - candidate_start.nanoseconds;
                     std.debug.print("embeddinggemma2 attention_qualification batch={} sequence={} local={} mask={} exact_ns={} flash_ns={}\n", .{ batch, sequence, local, mask_kind, reference_ns, candidate_ns });
@@ -1532,6 +1647,583 @@ test "embeddinggemma2 CUDA extended flash matches scalar attention with mask hol
                     }
                 }
             }
+        }
+    }
+}
+
+test "CUDA BF16 GELU product preserves PLE and FFN adapter outputs and tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try Module.init(&ctx);
+    defer module.deinit(&ctx);
+    const Round = struct {
+        fn bf16(value: f32) u16 {
+            const bits: u32 = @bitCast(value);
+            return @intCast((bits +% (0x7fff + ((bits >> 16) & 1))) >> 16);
+        }
+        fn f32Value(bits: u16) f32 {
+            return @bitCast(@as(u32, bits) << 16);
+        }
+    };
+    var gates: [1033]u16 = undefined;
+    var right: [1033]u16 = undefined;
+    const guards: [1033]u16 = @splat(0x4bad);
+    for (&gates, &right, 0..) |*gate, *value, i| {
+        gate.* = Round.bf16(@as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18)) / 8);
+        value.* = Round.bf16(@as(f32, @floatFromInt(@as(i32, @intCast(i % 29)) - 14)) / 16);
+    }
+    var gate_buffer = try Buffer.alloc(&ctx, @sizeOf(@TypeOf(gates)));
+    defer gate_buffer.free(&ctx);
+    var right_buffer = try Buffer.alloc(&ctx, @sizeOf(@TypeOf(right)));
+    defer right_buffer.free(&ctx);
+    var ple = try Buffer.alloc(&ctx, @sizeOf(@TypeOf(guards)));
+    defer ple.free(&ctx);
+    var ffn = try Buffer.alloc(&ctx, @sizeOf(@TypeOf(guards)));
+    defer ffn.free(&ctx);
+    try gate_buffer.copyFromHost(&ctx, std.mem.sliceAsBytes(&gates));
+    try right_buffer.copyFromHost(&ctx, std.mem.sliceAsBytes(&right));
+    for ([_]u32{ 0, 1, 7, 255, 256, 257, 1025 }) |count| {
+        try ple.copyFromHost(&ctx, std.mem.sliceAsBytes(&guards));
+        try ffn.copyFromHost(&ctx, std.mem.sliceAsBytes(&guards));
+        const before = module.stats_.launches;
+        try module.launchGeluPle(&ctx, ple, gate_buffer, right_buffer, count);
+        try module.launchGeluMul(&ctx, ffn, gate_buffer, right_buffer, count);
+        try std.testing.expectEqual(before + (if (count == 0) @as(u64, 0) else 2), module.stats_.launches);
+        var first: [1033]u16 = undefined;
+        var second: [1033]u16 = undefined;
+        try ple.copyToHost(&ctx, std.mem.sliceAsBytes(&first));
+        try ffn.copyToHost(&ctx, std.mem.sliceAsBytes(&second));
+        try ctx.synchronize();
+        try std.testing.expectEqualSlices(u16, &first, &second);
+        try std.testing.expectEqualSlices(u16, guards[count..], first[count..]);
+        for (first[0..count], 0..) |actual, i| {
+            const x: f64 = Round.f32Value(gates[i]);
+            const gelu = 0.5 * x * (1.0 + std.math.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
+            const rounded = Round.f32Value(Round.bf16(@floatCast(gelu)));
+            const expected = Round.f32Value(Round.bf16(rounded * Round.f32Value(right[i])));
+            try std.testing.expectApproxEqAbs(expected, Round.f32Value(actual), 0.008 * (1 + @abs(expected)));
+        }
+    }
+}
+
+test "embeddinggemma2 CUDA attention softmax refuses read operand overlap before SDK" {
+    var ctx: Context = undefined;
+    var module: Module = undefined;
+    // No SDK state is touched: each invalid output aliases a declared read.
+    const scores: Buffer = .{ .ptr = 4096, .len = 4 * 1024 * 8 };
+    const mask: Buffer = .{ .ptr = 65536, .len = 8 * 8 };
+    try std.testing.expectError(error.InvalidShape, module.launchAttentionSoftmax(&ctx, .{ .ptr = scores.ptr, .len = 2 * 1024 * 8 }, scores, .{}, 8, 0, 8, 0, 1, 1024));
+    try std.testing.expectError(error.InvalidShape, module.launchAttentionSoftmax(&ctx, .{ .ptr = scores.ptr + scores.len - 2, .len = 2 * 1024 * 8 }, scores, .{}, 8, 0, 8, 0, 1, 1024));
+    try std.testing.expectError(error.InvalidShape, module.launchAttentionSoftmax(&ctx, .{ .ptr = mask.ptr + 2, .len = 2 * 1024 * 8 }, scores, mask, 8, 0, 8, 0, 1, 1024));
+}
+
+test "embeddinggemma2 CUDA attention softmax shared reduction reuse preserves uniform tail rows" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try Module.init(&ctx);
+    defer module.deinit(&ctx);
+    const a = std.testing.allocator;
+    const sequence = 846;
+    const rows = sequence;
+    const heads = 12;
+    const tile = 1024;
+    const elements = heads * tile * sequence;
+    const zero = try a.alloc(f32, elements);
+    defer a.free(zero);
+    @memset(zero, 0);
+    var scores = try Buffer.alloc(&ctx, elements * 4);
+    defer scores.free(&ctx);
+    var probs = try Buffer.alloc(&ctx, elements * 2);
+    defer probs.free(&ctx);
+    const actual = try a.alloc(u16, elements);
+    defer a.free(actual);
+    // Exact CPU oracle: exp(0)==1, integer row sum846, one BF16 rounding.
+    // Original arithmetic rounds exponentials before division; ones are exact.
+    const inverse: f32 = 1.0 / @as(f32, sequence);
+    const bits: u32 = @bitCast(inverse);
+    const expected: u16 = @intCast((bits +% (0x7fff + ((bits >> 16) & 1))) >> 16);
+    errdefer ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    try scores.copyFromHost(&ctx, std.mem.sliceAsBytes(zero));
+    for (0..4) |iteration| for (0..4) |batch_index| {
+        // Same generic fullB4 family: four serial single-frame softmax launches,
+        // full846 tail rows and all12heads. No production flags are altered.
+        try module.launchAttentionSoftmax(&ctx, probs, scores, .{}, sequence, 0, rows, 0, heads, tile);
+        try probs.copyToHost(&ctx, std.mem.sliceAsBytes(actual));
+        try ctx.synchronize();
+        for (0..heads) |head| for (0..rows) |row| for (0..sequence) |key| {
+            const value = actual[(head * tile + row) * sequence + key];
+            if (value != expected) {
+                std.debug.print("softmax shared reuse mismatch iteration={} batch={} head={} row={} key={}\n", .{ iteration, batch_index, head, row, key });
+                try std.testing.expectEqual(expected, value);
+            }
+        };
+    };
+}
+
+test "embeddinggemma2 CUDA contrastive shared reduction reuse preserves masked uniform objective and gradients" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try Module.init(&ctx);
+    defer module.deinit(&ctx);
+    const a = std.testing.allocator;
+    const queries = 64;
+    const capacity = 384;
+    const zeros: [capacity]f32 = @splat(0);
+    var targets: [queries]u32 = undefined;
+    const valid = try a.alloc(u8, queries * capacity);
+    defer a.free(valid);
+    const actual = try a.alloc(f32, queries * capacity);
+    defer a.free(actual);
+    const baseline = try a.alloc(f32, queries * capacity);
+    defer a.free(baseline);
+    var buffers: [8]Buffer = @splat(.{});
+    defer for (&buffers) |*buffer| buffer.free(&ctx);
+    const lengths = [_]usize{ queries * 4, capacity * 4, queries * 4, queries * capacity, queries * capacity * 4, queries * 4, queries * 4, capacity * 4 };
+    for (&buffers, lengths) |*buffer, bytes| buffer.* = try Buffer.alloc(&ctx, bytes);
+    errdefer ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    try buffers[0].copyFromHost(&ctx, std.mem.sliceAsBytes(zeros[0..queries]));
+    try buffers[1].copyFromHost(&ctx, std.mem.sliceAsBytes(&zeros));
+    for ([_]bool{ false, true }) |masked| {
+        const candidates: usize = if (masked) capacity else 257;
+        var visible: [queries]usize = @splat(0);
+        for (0..queries) |row| {
+            // Targets cover other warps and candidate tails; lane0 cannot
+            // assume the owning thread has finished probability normalization.
+            targets[row] = @intCast((37 * row + 65) % candidates);
+            for (0..candidates) |c| {
+                const allowed = !masked or c % 7 != 6 or c == targets[row];
+                if (allowed) visible[row] += 1;
+                valid[row * candidates + c] = @intFromBool(allowed);
+            }
+        }
+        try buffers[2].copyFromHost(&ctx, std.mem.sliceAsBytes(&targets));
+        if (masked) try buffers[3].copyFromHost(&ctx, valid[0 .. queries * candidates]);
+        var loss_baseline: [queries]f32 = undefined;
+        for (0..32) |iteration| {
+            try module.launchContrastive(&ctx, buffers[4], buffers[5], buffers[6], buffers[7], buffers[0], buffers[1], if (masked) buffers[3] else .{}, buffers[2], .{ .queries = queries, .candidates = @intCast(candidates), .width = 1, .temperature = 1, .objective_weight = 1 }, 1);
+            try buffers[4].copyToHost(&ctx, std.mem.sliceAsBytes(actual[0 .. queries * candidates]));
+            var losses: [queries]f32 = undefined;
+            var dqueries: [queries]f32 = undefined;
+            var dcandidates: [capacity]f32 = undefined;
+            // Drain earlier D2H submissions before these loop-local stack
+            // arrays can unwind on a later SDK error; success keeps one wait.
+            errdefer ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            try buffers[5].copyToHost(&ctx, std.mem.sliceAsBytes(&losses));
+            try buffers[6].copyToHost(&ctx, std.mem.sliceAsBytes(&dqueries));
+            try buffers[7].copyToHost(&ctx, std.mem.sliceAsBytes(dcandidates[0..candidates]));
+            try ctx.synchronize();
+            // Dot products are exactly0, exp(0)==1, integer sums exact: every
+            // visible F32 probability has an exact CPU division oracle.
+            for (0..queries) |row| {
+                const expected: f32 = 1.0 / @as(f32, @floatFromInt(visible[row]));
+                for (0..candidates) |c| try std.testing.expectEqual(if (valid[row * candidates + c] != 0) expected else @as(f32, 0), actual[row * candidates + c]);
+                // Match the actual loss boundary: F32 normalized probability,
+                // then logf/negation at objective_weight1, not log(N) fusion.
+                const expected_loss: f32 = -@log(expected);
+                // Existing F32 log-softmax/scalar-reference bound from
+                // backends/activations.zig; same-device repeats stay byte exact.
+                try std.testing.expect(@abs(expected_loss - losses[row]) < 1e-5);
+            }
+            for (dqueries) |value| try std.testing.expectEqual(@as(f32, 0), value);
+            for (dcandidates[0..candidates]) |value| try std.testing.expectEqual(@as(f32, 0), value);
+            for (losses) |value| try std.testing.expect(std.math.isFinite(value) and value > 0);
+            if (iteration == 0) {
+                @memcpy(baseline[0 .. queries * candidates], actual[0 .. queries * candidates]);
+                loss_baseline = losses;
+            } else {
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(baseline[0 .. queries * candidates]), std.mem.sliceAsBytes(actual[0 .. queries * candidates]));
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&loss_baseline), std.mem.sliceAsBytes(&losses));
+            }
+        }
+    }
+}
+
+test "embeddinggemma2 CUDA nonzero contrastive objective and both VJPs match independent CPU reference across masked tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try Module.init(&ctx);
+    defer module.deinit(&ctx);
+    const a = std.testing.allocator;
+    const queries = 9;
+    const capacity = 384;
+    const width = 17;
+    const temperature: f32 = 0.5;
+    const objective_weight: f32 = 0.75;
+    const loss_scale: f32 = 1.25;
+    var random = std.Random.DefaultPrng.init(0x133d_846_17);
+    var query_values: [queries * width]f32 = undefined;
+    var candidate_values: [capacity * width]f32 = undefined;
+    // Dyadic inputs make all17-term dots and inverse-temperature2 exact,
+    // independently of CPU/GPU FMA contraction. No host math from GPU output.
+    for (&query_values) |*value| value.* = @as(f32, @floatFromInt(random.random().intRangeLessThan(i32, -8, 9))) / 32;
+    for (&candidate_values) |*value| value.* = @as(f32, @floatFromInt(random.random().intRangeLessThan(i32, -8, 9))) / 32;
+    var targets: [queries]u32 = undefined;
+    var valid: [queries * capacity]u8 = undefined;
+    const offsets = [_]usize{ 0, queries * capacity, queries * capacity + queries, queries * capacity + queries + queries * width };
+    const host_elements = offsets[3] + capacity * width;
+    const actual = try a.alloc(f32, host_elements);
+    defer a.free(actual);
+    const baseline = try a.alloc(f32, host_elements);
+    defer a.free(baseline);
+    const reference = try a.alloc(f64, host_elements);
+    defer a.free(reference);
+    var buffers: [8]Buffer = @splat(.{});
+    defer for (&buffers) |*buffer| buffer.free(&ctx);
+    const allocation_bytes = [_]usize{ queries * width * 4, capacity * width * 4, queries * 4, queries * capacity, queries * capacity * 4, queries * 4, queries * width * 4, capacity * width * 4 };
+    for (&buffers, allocation_bytes) |*buffer, bytes| buffer.* = try Buffer.alloc(&ctx, bytes);
+    // All DMA destinations and input sources have function scope; this drain
+    // runs before any heap free or function-scope input lifetime can end.
+    errdefer ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    try buffers[0].copyFromHost(&ctx, std.mem.sliceAsBytes(&query_values));
+    try buffers[1].copyFromHost(&ctx, std.mem.sliceAsBytes(&candidate_values));
+    const cases = [_]struct { candidates: usize, masked: bool }{
+        .{ .candidates = 257, .masked = false },
+        .{ .candidates = 257, .masked = true },
+        .{ .candidates = 384, .masked = true },
+    };
+    for (cases) |case| {
+        const candidates = case.candidates;
+        const lengths = [_]usize{ queries * candidates, queries, queries * width, candidates * width };
+        @memset(reference, 0);
+        for (0..queries) |row| {
+            targets[row] = @intCast(if (row + 1 == queries) candidates - 1 else (37 * row + 65) % candidates);
+            for (0..candidates) |column| valid[row * candidates + column] = @intFromBool(!case.masked or (row + column) % 11 != 0 or column == targets[row]);
+            // Independent stable F64 softmax; preserve the actual stored F32
+            // probability boundary before loss and derivative calculations.
+            var scores: [capacity]f64 = undefined;
+            var maximum: f64 = -std.math.inf(f64);
+            for (0..candidates) |column| {
+                var dot: f64 = 0;
+                for (0..width) |d| dot += @as(f64, query_values[row * width + d]) * @as(f64, candidate_values[column * width + d]);
+                const score = if (valid[row * candidates + column] != 0) dot / @as(f64, temperature) else -std.math.inf(f64);
+                scores[column] = score;
+                maximum = @max(maximum, score);
+            }
+            var total: f64 = 0;
+            for (0..candidates) |column| {
+                scores[column] = if (valid[row * candidates + column] != 0) @exp(scores[column] - maximum) else 0;
+                total += scores[column];
+            }
+            for (0..candidates) |column| {
+                const probability: f32 = @floatCast(scores[column] / total);
+                reference[row * candidates + column] = probability;
+            }
+            reference[offsets[1] + row] = -@log(reference[row * candidates + targets[row]]) * @as(f64, objective_weight);
+        }
+        // Per-row losses above are weighted but NOT averaged/loss-scaled.
+        // Actual VJPs differentiate the MEAN weighted objective, then apply
+        // loss_scale and inverse temperature exactly once at the final boundary.
+        const gradient_scale: f64 = @as(f64, loss_scale) * @as(f64, objective_weight) / @as(f64, temperature) / queries;
+        for (0..queries) |row| for (0..width) |d| {
+            var sum: f64 = 0;
+            for (0..candidates) |column| {
+                const coefficient = reference[row * candidates + column] - @as(f64, @floatFromInt(@intFromBool(column == targets[row])));
+                sum += coefficient * @as(f64, candidate_values[column * width + d]);
+            }
+            reference[offsets[2] + row * width + d] = sum * gradient_scale;
+        };
+        for (0..candidates) |column| for (0..width) |d| {
+            var sum: f64 = 0;
+            for (0..queries) |row| {
+                const coefficient = reference[row * candidates + column] - @as(f64, @floatFromInt(@intFromBool(column == targets[row])));
+                sum += coefficient * @as(f64, query_values[row * width + d]);
+            }
+            reference[offsets[3] + column * width + d] = sum * gradient_scale;
+        };
+        inline for (.{ 2, 3 }) |role| {
+            var nonzero = false;
+            for (reference[offsets[role]..][0..lengths[role]]) |value| if (@abs(value) > 0.0001) {
+                nonzero = true;
+            };
+            try std.testing.expect(nonzero); // Neither VJP oracle is trivial0.
+        }
+        try buffers[2].copyFromHost(&ctx, std.mem.sliceAsBytes(&targets));
+        if (case.masked) try buffers[3].copyFromHost(&ctx, valid[0 .. queries * candidates]);
+        for (0..16) |iteration| {
+            try module.launchContrastive(&ctx, buffers[4], buffers[5], buffers[6], buffers[7], buffers[0], buffers[1], if (case.masked) buffers[3] else .{}, buffers[2], .{ .queries = queries, .candidates = @intCast(candidates), .width = width, .temperature = temperature, .objective_weight = objective_weight }, loss_scale);
+            for (buffers[4..8], offsets, lengths) |buffer, offset, length| try buffer.copyToHost(&ctx, std.mem.sliceAsBytes(actual[offset..][0..length]));
+            try ctx.synchronize();
+            for (offsets, lengths, 0..) |offset, length, role| {
+                for (reference[offset..][0..length], actual[offset..][0..length], 0..) |expected, got, index| {
+                    if (!std.math.isFinite(got) or @abs(@as(f64, got) - expected) >= 1e-5) {
+                        std.debug.print("contrastive nonzero CPU mismatch C={} masked={} iteration={} role={} index={}\n", .{ candidates, case.masked, iteration, role, index });
+                        try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), got, 1e-5);
+                    }
+                }
+                if (iteration == 0) {
+                    @memcpy(baseline[offset..][0..length], actual[offset..][0..length]);
+                } else try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(baseline[offset..][0..length]), std.mem.sliceAsBytes(actual[offset..][0..length]));
+            }
+        }
+    }
+}
+
+test "CUDA BF16 attention stores unnormalized probabilities before value multiplication" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    const a = std.testing.allocator;
+    var module = try Module.init(&ctx);
+    defer module.deinit(&ctx);
+    const Round = struct {
+        fn bf16(input: f64) u16 {
+            const f: f32 = @floatCast(input);
+            const bits: u32 = @bitCast(f);
+            return @truncate((bits +% (0x7fff + ((bits >> 16) & 1))) >> 16);
+        }
+        fn value(bits: u16) f64 {
+            const f: f32 = @bitCast(@as(u32, bits) << 16);
+            return f;
+        }
+    };
+    for ([_]u32{ 15, 65, 577 }) |sequence| for ([_]u32{ 0, 7, 512 }) |radius| {
+        if (sequence == 577 and radius != 512) continue;
+        const local = radius != 0;
+        const shape = Attention{ .batch = 1, .seq = sequence, .q_heads = 4, .kv_heads = if (local) 2 else 1, .head_dim = if (local) 256 else 512, .local_radius = radius };
+        const q_count = @as(usize, sequence) * shape.q_heads * shape.head_dim;
+        const kv_count = @as(usize, sequence) * shape.kv_heads * shape.head_dim;
+        const host_q = try a.alloc(u16, q_count);
+        defer a.free(host_q);
+        const host_k = try a.alloc(u16, kv_count);
+        defer a.free(host_k);
+        const host_v = try a.alloc(u16, kv_count);
+        defer a.free(host_v);
+        const masks = try a.alloc(i64, sequence);
+        defer a.free(masks);
+        @memset(host_q, 0);
+        @memset(host_k, 0);
+        for (0..sequence) |row| {
+            masks[row] = @intFromBool(row % 7 != 3);
+            for (0..shape.q_heads) |head| host_q[(row * shape.q_heads + head) * shape.head_dim] = Round.bf16(1);
+            for (0..shape.kv_heads) |head| {
+                host_k[(row * shape.kv_heads + head) * shape.head_dim] = Round.bf16(@as(f64, @floatFromInt(@as(i32, @intCast(row % 11)) - 5)) / 4);
+                for (0..shape.head_dim) |d| host_v[(row * shape.kv_heads + head) * shape.head_dim + d] = Round.bf16(@as(f64, @floatFromInt(@as(i32, @intCast((3 * row + 7 * d) % 17)) - 8)) / 8);
+            }
+        }
+        var q = try Buffer.alloc(&ctx, q_count * 2);
+        defer q.free(&ctx);
+        var k = try Buffer.alloc(&ctx, kv_count * 2);
+        defer k.free(&ctx);
+        var v = try Buffer.alloc(&ctx, kv_count * 2);
+        defer v.free(&ctx);
+        var mask = try Buffer.alloc(&ctx, masks.len * @sizeOf(i64));
+        defer mask.free(&ctx);
+        var output = try Buffer.alloc(&ctx, q_count * 2);
+        defer output.free(&ctx);
+        try q.copyFromHost(&ctx, std.mem.sliceAsBytes(host_q));
+        try k.copyFromHost(&ctx, std.mem.sliceAsBytes(host_k));
+        try v.copyFromHost(&ctx, std.mem.sliceAsBytes(host_v));
+        try mask.copyFromHost(&ctx, std.mem.sliceAsBytes(masks));
+        const actual = try a.alloc(u16, q_count);
+        defer a.free(actual);
+        const selected_queries = [_]u32{ 0, 3, 288, 575, 576 };
+        const untouched = Round.bf16(17);
+        if (sequence == 577) {
+            @memset(actual, untouched);
+            try output.copyFromHost(&ctx, std.mem.sliceAsBytes(actual));
+            // Exercise the SAME production scalar/tail entry and ABI without
+            // executing an unnecessary full O(sequence^2) diagnostic sweep.
+            for (selected_queries) |query| {
+                var pointers = [_]u64{ output.ptr, q.ptr, k.ptr, v.ptr, mask.ptr };
+                var b: u32 = 1;
+                var seq = sequence;
+                var qh = shape.q_heads;
+                var kh = shape.kv_heads;
+                var dim = shape.head_dim;
+                var window = radius;
+                var offset = query;
+                var args = [_]?*anyopaque{ &pointers[0], &pointers[1], &pointers[2], &pointers[3], &pointers[4], &b, &seq, &qh, &kh, &dim, &window, &offset };
+                try launch(&ctx, module.attention, &args, .{ 1, shape.q_heads, 1 }, .{ 32, 1, 1 });
+            }
+        } else try module.launchLegacyAttention(&ctx, output, q, k, v, mask, shape);
+        try output.copyToHost(&ctx, std.mem.sliceAsBytes(actual));
+        try ctx.synchronize();
+        var distinct_from_f32 = false;
+        // Independent F64 scalar oracle: exact constructed QK logits, explicit
+        // BF16 value-store node, F32-represented V, and final BF16 output.
+        // This has no dependency on the CUDA traversal/reduction implementation.
+        if (sequence == 577) for (0..sequence) |query| {
+            if (std.mem.indexOfScalar(u32, &selected_queries, @intCast(query)) == null)
+                for (actual[query * shape.q_heads * shape.head_dim ..][0 .. shape.q_heads * shape.head_dim]) |value| try std.testing.expectEqual(untouched, value);
+        };
+        for (0..sequence) |query| for (0..shape.head_dim) |d| {
+            if (sequence == 577 and std.mem.indexOfScalar(u32, &selected_queries, @intCast(query)) == null) continue;
+            const begin = if (radius != 0) query -| radius else 0;
+            const limit = if (radius != 0) @min(@as(usize, sequence), query + radius + 1) else sequence;
+            var numerator: f64 = 0;
+            var unrounded_numerator: f64 = 0;
+            var denominator: f64 = 0;
+            var maximum: f64 = -std.math.inf(f64);
+            var start: usize = begin / 16 * 16;
+            while (start < limit) : (start += 16) {
+                const first = @max(begin, start);
+                const end = @min(limit, start + 16);
+                var next = maximum;
+                for (first..end) |row| if (masks[row] != 0) {
+                    next = @max(next, @as(f64, @floatFromInt(@as(i32, @intCast(row % 11)) - 5)) / 4);
+                };
+                const scale = if (std.math.isFinite(maximum)) @exp(maximum - next) else 0;
+                numerator *= scale;
+                unrounded_numerator *= scale;
+                denominator *= scale;
+                maximum = next;
+                for (first..end) |row| if (masks[row] != 0) {
+                    const score = @as(f64, @floatFromInt(@as(i32, @intCast(row % 11)) - 5)) / 4;
+                    const probability = @exp(score - maximum);
+                    const value = @as(f64, @floatFromInt(@as(i32, @intCast((3 * row + 7 * d) % 17)) - 8)) / 8;
+                    numerator += Round.value(Round.bf16(probability)) * value;
+                    unrounded_numerator += probability * value;
+                    denominator += probability;
+                };
+            }
+            const expected = Round.bf16(numerator / denominator);
+            distinct_from_f32 = distinct_from_f32 or expected != Round.bf16(unrounded_numerator / denominator);
+            for (0..shape.q_heads) |head| {
+                const want = if (masks[query] != 0) expected else @as(u16, 0);
+                try std.testing.expectEqual(want, actual[(query * shape.q_heads + head) * shape.head_dim + d]);
+            }
+        };
+        try std.testing.expect(distinct_from_f32);
+    };
+}
+
+test "BF16 attention schedules derive bounded split workspace from explicit cold device facts" {
+    const local = Attention{ .batch = 1, .seq = 128, .q_heads = 4, .kv_heads = 2, .head_dim = 256, .local_radius = 512 };
+    // Seventeen is a simulated policy input. Production receives the property
+    // solely from the cold driver query; this test never attests a GPU.
+    const program = try AttentionProgram.forResolvedMask(local, local.seq, true, 17);
+    try std.testing.expectEqual(AttentionSchedule.flash_bf16, program.probability_schedule);
+    try std.testing.expectEqual(@as(u32, 2), program.split_count);
+    const workspace = try program.workspace();
+    try std.testing.expectEqual(@as(usize, 1048576), workspace.output_bytes);
+    try std.testing.expectEqual(workspace.output_bytes, workspace.lse_offset);
+    try std.testing.expectEqual(@as(usize, 1052672), workspace.total_bytes);
+    for ([_]i32{ 0, -1 }) |invalid| {
+        try std.testing.expectError(error.InvalidCudaState, AttentionProgram.forResolvedMask(local, local.seq, true, invalid));
+        var global = local;
+        global.head_dim = 512;
+        global.kv_heads = 1;
+        global.local_radius = 0;
+        try std.testing.expectError(error.InvalidCudaState, AttentionProgram.forResolvedMask(global, global.seq, true, invalid));
+    }
+    const masked = try AttentionProgram.forResolvedMask(local, local.seq, false, 17);
+    try std.testing.expectEqual(@as(u32, 22_912), try program.sharedMemoryBytes());
+    try std.testing.expectEqual(@as(u32, 20_864), try masked.sharedMemoryBytes());
+    const global_storage = AttentionProgram{ .shape = .{ .batch = 1, .seq = 303, .q_heads = 4, .kv_heads = 1, .head_dim = 512, .local_radius = 0 }, .source_sequence = 303, .probability_schedule = .efficient_bf16 };
+    try std.testing.expectEqual(@as(u32, 37_248), try global_storage.sharedMemoryBytes());
+    try std.testing.expectEqual(AttentionSchedule.efficient_bf16, masked.probability_schedule);
+    try std.testing.expectEqual(@as(usize, 0), (try masked.workspace()).total_bytes);
+    var exact_window = local;
+    exact_window.seq = exact_window.local_radius;
+    try std.testing.expectEqual(AttentionSchedule.efficient_bf16, (try AttentionProgram.forResolvedMask(exact_window, exact_window.seq, true, 17)).probability_schedule);
+    var padded = local;
+    padded.seq = 4096;
+    const padded_program = try AttentionProgram.forResolvedMask(padded, local.seq, true, 17);
+    try std.testing.expectEqual(program.probability_schedule, padded_program.probability_schedule);
+    try std.testing.expectEqual(program.split_count, padded_program.split_count);
+    try std.testing.expectEqual(local.seq, padded_program.source_sequence);
+    try std.testing.expectEqual(padded.seq, padded_program.shape.seq);
+    try std.testing.expectEqual(@as(usize, 33685504), (try padded_program.workspace()).total_bytes);
+    try std.testing.expectError(error.InvalidEmbeddingGemma2AttentionSchedule, AttentionProgram.forResolvedMask(padded, 0, true, 17));
+    try std.testing.expectError(error.InvalidEmbeddingGemma2AttentionSchedule, AttentionProgram.forResolvedMask(padded, padded.seq + 1, true, 17));
+    var malformed = program;
+    malformed.split_count = 0;
+    try std.testing.expectError(error.InvalidEmbeddingGemma2AttentionSchedule, malformed.workspace());
+    malformed.split_count = 3; // More splits than actual 64-key blocks.
+    try std.testing.expectError(error.InvalidEmbeddingGemma2AttentionSchedule, malformed.workspace());
+    malformed = program;
+    malformed.shape.local_radius = 8193;
+    try std.testing.expectError(error.InvalidEmbeddingGemma2AttentionSchedule, malformed.workspace());
+}
+
+test "CUDA split attention publishes rounded LSE before uniform score shift" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    if (!artifact.hasBf16WmmaCodeFor(ctx.info.compute_major, ctx.info.compute_minor)) return error.SkipZigTest;
+    var module = try Module.init(&ctx);
+    defer module.deinit(&ctx);
+    const a = std.testing.allocator;
+    // Three explicit numerical partitions are valid independently of the cold
+    // device heuristic. Uniform logits make each partition's logsumexp shift
+    // by exactly c, with a single F32 rounding AFTER its published base LSE.
+    const shape = Attention{ .batch = 1, .seq = 177, .q_heads = 4, .kv_heads = 2, .head_dim = 256, .local_radius = 512 };
+    const program = AttentionProgram{ .shape = shape, .source_sequence = shape.seq, .probability_schedule = .flash_bf16, .split_count = 3 };
+    const layout = try program.workspace();
+    const q_count = @as(usize, shape.seq) * shape.q_heads * shape.head_dim;
+    const kv_count = @as(usize, shape.seq) * shape.kv_heads * shape.head_dim;
+    const host_q = try a.alloc(u16, q_count);
+    defer a.free(host_q);
+    const host_k = try a.alloc(u16, kv_count);
+    defer a.free(host_k);
+    const host_v = try a.alloc(u16, kv_count);
+    defer a.free(host_v);
+    const masks = try a.alloc(i64, shape.seq);
+    defer a.free(masks);
+    const baseline = try a.alloc(f32, (layout.total_bytes - layout.lse_offset) / @sizeOf(f32));
+    defer a.free(baseline);
+    const actual = try a.alloc(f32, baseline.len);
+    defer a.free(actual);
+    @memset(host_q, 0);
+    @memset(host_k, 0);
+    @memset(host_v, 0);
+    @memset(masks, 1);
+    for (0..@as(usize, shape.seq) * shape.kv_heads) |row| host_k[row * shape.head_dim] = 0x3f80;
+    var q = try Buffer.alloc(&ctx, q_count * 2);
+    defer q.free(&ctx);
+    var k = try Buffer.alloc(&ctx, kv_count * 2);
+    defer k.free(&ctx);
+    var v = try Buffer.alloc(&ctx, kv_count * 2);
+    defer v.free(&ctx);
+    var mask = try Buffer.alloc(&ctx, masks.len * @sizeOf(i64));
+    defer mask.free(&ctx);
+    var output = try Buffer.alloc(&ctx, q_count * 2);
+    defer output.free(&ctx);
+    var workspace = try Buffer.alloc(&ctx, layout.total_bytes);
+    defer workspace.free(&ctx);
+    // Async host transfers must settle before any host allocation unwinds.
+    defer ctx.synchronize() catch {};
+    try q.copyFromHost(&ctx, std.mem.sliceAsBytes(host_q));
+    try k.copyFromHost(&ctx, std.mem.sliceAsBytes(host_k));
+    try v.copyFromHost(&ctx, std.mem.sliceAsBytes(host_v));
+    try mask.copyFromHost(&ctx, std.mem.sliceAsBytes(masks));
+    const lse = Buffer{ .ptr = try std.math.add(u64, workspace.ptr, layout.lse_offset), .len = baseline.len * @sizeOf(f32) };
+    try module.launchLocalFlashAttention(&ctx, output, q, k, v, mask, program, workspace);
+    try lse.copyToHost(&ctx, std.mem.sliceAsBytes(baseline));
+    try ctx.synchronize();
+    for ([_]f32{ 0.125, 0.25, 0.5, 1, 2, 4, 8, 16 }) |shift| {
+        const bits: u32 = @bitCast(shift);
+        for (0..@as(usize, shape.seq) * shape.q_heads) |row| host_q[row * shape.head_dim] = @truncate(bits >> 16);
+        try q.copyFromHost(&ctx, std.mem.sliceAsBytes(host_q));
+        try module.launchLocalFlashAttention(&ctx, output, q, k, v, mask, program, workspace);
+        try lse.copyToHost(&ctx, std.mem.sliceAsBytes(actual));
+        try ctx.synchronize();
+        for (baseline, actual) |zero, value| {
+            try std.testing.expect(std.math.isFinite(zero));
+            const expected: f32 = @floatCast(@as(f64, zero) + @as(f64, shift));
+            try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(value)));
         }
     }
 }

@@ -1,35 +1,24 @@
 # CUDA Whisper qualification
 
-The native Whisper architecture supports CUDA through device im2col plus GEMM,
-FP16 projection/embedding matrices and immutable cross-attention caches, FP32
-norms and logits, FP16 fused encoder
-attention, split-key FP32 decoder attention, and a compact 16-value
-token-selection readback with a shared suppression bitset and parallel vocabulary
-reduction. Decoder Q/K/V project directly into cache rows; residual sums and layer
-normalization share a kernel. Single-token matrix reads use aligned FP16 pairs,
-and the decoder fuses its existing tanh GELU into the first FFN projection.
-CPU features use a fixed 400-point mixed-radix FFT
-and skip windows wholly inside silent padding. Without cuDNN, encoder
-attention uses the bundled tiled FP16 kernel. The default fatbin carries SM75, SM80 (A100), SM89 (L4), SM90, SM100, SM110,
-and SM120 machine code plus forward-compatible PTX, matching the main bundle.
-The sm89 mode uses its dedicated cubin; portable mode uses PTX 9.2, matching
-the main bundle and its CUDA 13.2 driver requirement. Generate all images with
-CUDA 13.2:
+The native Whisper architecture uses shared NCT convolution, dense projection,
+F32 attention, normalization and row-selection programs. The qualified default
+preserves F32 model matrices, attention and cross-attention caches. Decoder token
+selection reads back a compact statistics record; unsupported selection modes
+retain the full-logit fallback. There is no separate Whisper CUDA module or
+artifact bundle.
+
+Regenerate the shared multiarchitecture artifacts with the pinned CUDA toolkit:
 
 ```sh
-zig/pkg/inference/scripts/whisper/regen-kernels.sh --check
+zig/pkg/inference/scripts/regen-cuda-artifacts.sh --check --all
 ```
 
 From `zig/pkg/inference`, build with `zig build -Dcuda=true
 -Dcuda-artifacts=fatbin -Doptimize=ReleaseFast`. Use worktree-local build caches.
-For numerical regressions, build `test-bin` with those options and
-`-Dtest-filter='Whisper CUDA'`, then run `zig-out/bin/antfly-inference-tests`.
-
 Use `antfly inference transcribe MODEL_DIR AUDIO.wav --backend cuda --language en`
-to require CUDA explicitly. To isolate mixed-precision differences, set
-`ANTFLY_CUDA_WHISPER_F16_WEIGHTS=0` (also retains FP32 cross-attention caches). `ANTFLY_CUDA_WHISPER_CUDNN=0` selects the
-bundled attention fallback. Both switches are diagnostic comparisons, not changes
-to transcription semantics.
+to require CUDA explicitly. Keep precision and attention policy fixed across
+benchmark arms. Historical results below describe their recorded source and
+settings; they do not qualify later revisions or a different precision policy.
 
 The HTTP benchmark uses the unified `/ai/v1/read` endpoint with `audio_options`
 and requires complete recognition before recording latency or WER.
@@ -66,14 +55,14 @@ of L4 or A100 performance.
 ## Design references
 
 - [NVIDIA CUDA memory access guidance](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html): neighboring lanes read neighboring head channels. Decoder attention splits keys into 128-position blocks so short prefixes occupy more than one block per head, then merges partial maxima, denominators, and weighted values in FP32.
-- [NVIDIA cuDNN attention contract](https://docs.nvidia.com/deeplearning/cudnn/latest/operations/Attention.html): the encoder uses supported noncausal FP16 SDPA with 64-channel heads, preserving FP32 output. Vendor attention remains optional.
+- [NVIDIA cuDNN attention contract](https://docs.nvidia.com/deeplearning/cudnn/latest/operations/Attention.html): reduced-precision SDPA is a separate policy whose numerics and performance require qualification.
 - [whisper.cpp](https://github.com/ggml-org/whisper.cpp): development baseline revision `4da27c41cebadb3cbbcd2563e9c7cbc8d84bdcad`. Benchmark its warm HTTP endpoint, with CUDA and flash attention enabled, rather than including process/model startup.
 
 Use Nsight Systems on the real-checkpoint test to inspect kernel execution and
 CUDA API time. Pipeline stage timers enqueue asynchronous GPU work and must not
 be treated as synchronized per-stage GPU measurements. The initial GB10 profile
 identified generic cross attention (57% of GPU time) and a vocabulary-wide serial
-suppression scan as bottlenecks; both have dedicated Whisper implementations.
+suppression scan as bottlenecks; both use shared attention and row-selection families.
 
 On hybrid CPU hosts, pin both servers to the same CPU set and run the client
 on a separate performance core. Record all affinities alongside the results;

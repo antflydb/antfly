@@ -11,8 +11,8 @@
 .address_size 64
 
 	// .globl	lighton_vision_norm_bf16
-// _ZZ24lighton_vision_norm_bf16E4sums has been demoted
-// _ZZ24lighton_vision_norm_bf16E7squares has been demoted
+// _ZZ24lighton_vision_norm_bf16PtPKfS1_S1_jjfE4sums has been demoted
+// _ZZ24lighton_vision_norm_bf16PtPKfS1_S1_jjfE7squares has been demoted
 .global .align 4 .b8 __cudart_i2opi_f[24] = {65, 144, 67, 60, 153, 149, 98, 219, 192, 221, 52, 245, 209, 87, 39, 252, 41, 21, 68, 78, 110, 131, 249, 162};
 
 .visible .entry lighton_vision_norm_bf16(
@@ -30,9 +30,9 @@
 	.reg .b32 	%r<31>;
 	.reg .b64 	%rd<18>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ24lighton_vision_norm_bf16E4sums[1024];
+	.shared .align 4 .b8 _ZZ24lighton_vision_norm_bf16PtPKfS1_S1_jjfE4sums[1024];
 	// demoted variable
-	.shared .align 4 .b8 _ZZ24lighton_vision_norm_bf16E7squares[1024];
+	.shared .align 4 .b8 _ZZ24lighton_vision_norm_bf16PtPKfS1_S1_jjfE7squares[1024];
 
 	ld.param.u64 	%rd5, [lighton_vision_norm_bf16_param_0];
 	ld.param.u64 	%rd8, [lighton_vision_norm_bf16_param_1];
@@ -71,10 +71,10 @@ $L__BB0_3:
 
 $L__BB0_4:
 	shl.b32 	%r18, %r30, 2;
-	mov.u32 	%r19, _ZZ24lighton_vision_norm_bf16E4sums;
+	mov.u32 	%r19, _ZZ24lighton_vision_norm_bf16PtPKfS1_S1_jjfE4sums;
 	add.s32 	%r9, %r19, %r18;
 	st.shared.f32 	[%r9], %f80;
-	mov.u32 	%r20, _ZZ24lighton_vision_norm_bf16E7squares;
+	mov.u32 	%r20, _ZZ24lighton_vision_norm_bf16PtPKfS1_S1_jjfE7squares;
 	add.s32 	%r10, %r20, %r18;
 	st.shared.f32 	[%r10], %f81;
 	bar.sync 	0;
@@ -179,23 +179,23 @@ $L__BB0_18:
 	setp.ne.s32 	%p11, %r30, 0;
 	@%p11 bra 	$L__BB0_20;
 
-	ld.shared.f32 	%f58, [_ZZ24lighton_vision_norm_bf16E4sums+4];
+	ld.shared.f32 	%f58, [_ZZ24lighton_vision_norm_bf16PtPKfS1_S1_jjfE4sums+4];
 	ld.shared.f32 	%f59, [%r9];
 	add.f32 	%f60, %f58, %f59;
 	st.shared.f32 	[%r9], %f60;
 	ld.shared.f32 	%f61, [%r10];
-	ld.shared.f32 	%f62, [_ZZ24lighton_vision_norm_bf16E7squares+4];
+	ld.shared.f32 	%f62, [_ZZ24lighton_vision_norm_bf16PtPKfS1_S1_jjfE7squares+4];
 	add.f32 	%f63, %f62, %f61;
 	st.shared.f32 	[%r10], %f63;
 
 $L__BB0_20:
 	bar.sync 	0;
 	cvt.rn.f32.u32 	%f7, %r16;
-	ld.shared.f32 	%f64, [_ZZ24lighton_vision_norm_bf16E4sums];
+	ld.shared.f32 	%f64, [_ZZ24lighton_vision_norm_bf16PtPKfS1_S1_jjfE4sums];
 	div.rn.f32 	%f8, %f64, %f7;
 	@%p2 bra 	$L__BB0_23;
 
-	ld.shared.f32 	%f65, [_ZZ24lighton_vision_norm_bf16E7squares];
+	ld.shared.f32 	%f65, [_ZZ24lighton_vision_norm_bf16PtPKfS1_S1_jjfE7squares];
 	add.s32 	%r29, %r30, %r2;
 	cvta.to.global.u64 	%rd2, %rd6;
 	cvta.to.global.u64 	%rd3, %rd7;
@@ -372,17 +372,17 @@ $L__BB2_2:
 	ret;
 
 }
-	// .globl	lighton_vision_qkv_rope_bf16
-.visible .entry lighton_vision_qkv_rope_bf16(
-	.param .u64 lighton_vision_qkv_rope_bf16_param_0,
-	.param .u64 lighton_vision_qkv_rope_bf16_param_1,
-	.param .u64 lighton_vision_qkv_rope_bf16_param_2,
-	.param .u64 lighton_vision_qkv_rope_bf16_param_3,
-	.param .u64 lighton_vision_qkv_rope_bf16_param_4,
-	.param .u32 lighton_vision_qkv_rope_bf16_param_5,
-	.param .u32 lighton_vision_qkv_rope_bf16_param_6,
-	.param .u32 lighton_vision_qkv_rope_bf16_param_7,
-	.param .f32 lighton_vision_qkv_rope_bf16_param_8
+	// .globl	antfly_qkv_rope_two_axis_bf16
+.visible .entry antfly_qkv_rope_two_axis_bf16(
+	.param .u64 antfly_qkv_rope_two_axis_bf16_param_0,
+	.param .u64 antfly_qkv_rope_two_axis_bf16_param_1,
+	.param .u64 antfly_qkv_rope_two_axis_bf16_param_2,
+	.param .u64 antfly_qkv_rope_two_axis_bf16_param_3,
+	.param .u64 antfly_qkv_rope_two_axis_bf16_param_4,
+	.param .u32 antfly_qkv_rope_two_axis_bf16_param_5,
+	.param .u32 antfly_qkv_rope_two_axis_bf16_param_6,
+	.param .u32 antfly_qkv_rope_two_axis_bf16_param_7,
+	.param .f32 antfly_qkv_rope_two_axis_bf16_param_8
 )
 {
 	.local .align 4 .b8 	__local_depot3[28];
@@ -396,15 +396,15 @@ $L__BB2_2:
 
 
 	mov.u64 	%SPL, __local_depot3;
-	ld.param.u64 	%rd15, [lighton_vision_qkv_rope_bf16_param_0];
-	ld.param.u64 	%rd16, [lighton_vision_qkv_rope_bf16_param_1];
-	ld.param.u64 	%rd17, [lighton_vision_qkv_rope_bf16_param_2];
-	ld.param.u64 	%rd18, [lighton_vision_qkv_rope_bf16_param_3];
-	ld.param.u64 	%rd19, [lighton_vision_qkv_rope_bf16_param_4];
-	ld.param.u32 	%r43, [lighton_vision_qkv_rope_bf16_param_5];
-	ld.param.u32 	%r44, [lighton_vision_qkv_rope_bf16_param_6];
-	ld.param.u32 	%r45, [lighton_vision_qkv_rope_bf16_param_7];
-	ld.param.f32 	%f31, [lighton_vision_qkv_rope_bf16_param_8];
+	ld.param.u64 	%rd15, [antfly_qkv_rope_two_axis_bf16_param_0];
+	ld.param.u64 	%rd16, [antfly_qkv_rope_two_axis_bf16_param_1];
+	ld.param.u64 	%rd17, [antfly_qkv_rope_two_axis_bf16_param_2];
+	ld.param.u64 	%rd18, [antfly_qkv_rope_two_axis_bf16_param_3];
+	ld.param.u64 	%rd19, [antfly_qkv_rope_two_axis_bf16_param_4];
+	ld.param.u32 	%r43, [antfly_qkv_rope_two_axis_bf16_param_5];
+	ld.param.u32 	%r44, [antfly_qkv_rope_two_axis_bf16_param_6];
+	ld.param.u32 	%r45, [antfly_qkv_rope_two_axis_bf16_param_7];
+	ld.param.f32 	%f31, [antfly_qkv_rope_two_axis_bf16_param_8];
 	add.u64 	%rd1, %SPL, 0;
 	mov.u32 	%r46, %ntid.x;
 	mov.u32 	%r47, %ctaid.x;

@@ -351,7 +351,7 @@ pub fn encodeImage(
         const shape = [_]i32{ @intCast(tokens), @intCast(vd) };
         break :blk try cb.fromFloat32Shape(host, &shape);
     };
-    errdefer cb.free(hidden);
+    defer cb.free(hidden);
 
     for (0..config.vision_num_layers) |layer| {
         try cb.checkExecutionControl();
@@ -369,7 +369,6 @@ pub fn encodeImage(
         cb.free(hidden);
         hidden = normed;
     }
-    defer cb.free(hidden);
 
     const fc1_w = try cb.getWeight(names.projector_fc1_weight);
     defer cb.free(fc1_w);
@@ -611,12 +610,24 @@ pub fn forwardLastLogits(
     if (rows == 0 or embeddings.len != rows * d) return error.InvalidEmbeddingShape;
     const past = kv.tokenCount();
     if (past + rows > config.max_position_embeddings) return error.PromptTooLong;
+    try cb.checkExecutionControl();
+    // This state owns a host KvPool. Valid tail retirement cannot allocate;
+    // restore even a partially completed multi-block append on every failure.
+    errdefer {
+        const current = kv.tokenCount();
+        if (current < past) @panic("Moondream KV changed outside its execution owner");
+        if (current > past) {
+            const removed = kv.manager.truncateSequence(kv.sequence_id, current - past) catch
+                @panic("Moondream owned KV rollback failed");
+            if (removed != current - past) @panic("Moondream owned KV rollback was incomplete");
+        }
+    }
     try kv.manager.appendTokens(kv.sequence_id, @intCast(rows));
     const total = kv.tokenCount();
 
     const shape = [_]i32{ @intCast(rows), @intCast(d) };
     var hidden = try cb.fromFloat32Shape(embeddings, &shape);
-    errdefer cb.free(hidden);
+    defer cb.free(hidden);
 
     for (0..config.num_layers) |layer| {
         try cb.checkExecutionControl();
@@ -624,7 +635,6 @@ pub fn forwardLastLogits(
         cb.free(hidden);
         hidden = next;
     }
-    defer cb.free(hidden);
 
     const last = if (rows == 1) hidden else try cb.sliceRows2D(allocator, hidden, rows - 1, 1, d);
     defer if (rows != 1) cb.free(last);

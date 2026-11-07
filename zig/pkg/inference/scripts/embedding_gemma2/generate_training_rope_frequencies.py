@@ -97,7 +97,7 @@ def main() -> None:
         "--output",
         type=Path,
         default=Path(__file__).resolve().parents[2]
-        / "src/ops/cuda/kernels/embedding_gemma2_training_rope.cuh",
+        / "src/ops/cuda/kernels/rotary_frequency_training.cuh",
     )
     parser.add_argument("--write", action="store_true")
     args = parser.parse_args()

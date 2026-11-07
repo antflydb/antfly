@@ -71,8 +71,8 @@ class TrainingMathArtifactsTest(unittest.TestCase):
             artifacts.mkdir()
             kernels.mkdir()
             source = artifacts / "gliner25_training_math.cu"
-            header = kernels / "gliner25_softmax.cuh"
-            source.write_text('#include "../kernels/gliner25_softmax.cuh"\n')
+            header = kernels / "training_row_softmax.cuh"
+            source.write_text('#include "../kernels/training_row_softmax.cuh"\n')
             header.write_text("first")
             with patch.object(regen, "ARTIFACTS", artifacts):
                 first = regen.artifacts(regen.source_bytes(), b"ptx")

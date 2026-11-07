@@ -44,10 +44,10 @@ pub fn onNative(comptime populate: anytype, comptime check: anytype) !void {
 }
 
 pub fn onMetal(comptime populate: anytype, comptime check: anytype) !void {
+    const allocator = std.testing.allocator;
     if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
     const metal = @import("metal_compute.zig");
-    const allocator = std.testing.allocator;
     var weights = native.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer weights.deinitOwned();
     try populate(&weights);
@@ -79,7 +79,10 @@ pub fn onCuda(comptime populate: anytype, comptime check: anytype) !void {
     try populate(&weights);
     var reference = native.NativeCompute.init(allocator, &weights, null);
     defer reference.deinit();
-    var compute = try cuda.CudaCompute.init(allocator);
+    var compute = cuda.CudaCompute.init(allocator) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     var it = weights.resident_weights.iterator();
     while (it.next()) |entry| {

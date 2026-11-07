@@ -555,8 +555,16 @@ pub fn create(b: *std.Build) ?Artifacts {
     const lib_vectorindex_test_step = b.step("lib-vectorindex-test", "Run standalone lib/vectorindex tests");
     lib_vectorindex_test_step.dependOn(&run_lib_vectorindex_tests.step);
 
+    const shared_tile_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("lib/tile/src/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.step("lib-tile-test", "Run shared portable Tile operation tests").dependOn(&b.addRunArtifact(shared_tile_tests).step);
+
     const vector_kernel_mod = b.createModule(.{ .root_source_file = b.path("lib/vector/src/quantizer.zig"), .target = target, .optimize = optimize });
     vector_kernel_mod.addImport("protobuf", protobuf_mod);
+    vector_kernel_mod.addImport("antfly_tile", shared.tile_mod);
     const vector_kernel_tests = b.addTest(.{ .root_module = vector_kernel_mod, .filters = buildArguments(b) orelse &.{} });
     const run_vector_kernel_tests = b.addRunArtifact(vector_kernel_tests);
     b.step("lib-vector-kernel-test", "Run standalone quantizer kernel tests (no external recall fixtures)").dependOn(&run_vector_kernel_tests.step);

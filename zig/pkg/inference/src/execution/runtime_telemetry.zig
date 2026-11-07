@@ -1,0 +1,265 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Optional backend measurements. Counters are context cumulative; memory is
+//! a gauge with explicit ownership scope. Null means unmeasured, never zero.
+const std = @import("std");
+pub const Counters = struct {
+    kernel_dispatches: ?u64 = null,
+    graph_submissions: ?u64 = null,
+    frame_submissions: ?u64 = null,
+    /// Explicit successful project-owned host synchronization API calls.
+    /// GPU dependencies are separate; implicit vendor/free waits stay opaque.
+    synchronizations: ?u64 = null,
+    physical_allocations: ?u64 = null,
+    physical_frees: ?u64 = null,
+
+    /// A reset/unsupported counter is unknown for this interval. Concurrent
+    /// submissions to the same context remain part of the context interval.
+    pub fn since(self: Counters, before: Counters) Counters {
+        var result: Counters = .{};
+        inline for (@typeInfo(Counters).@"struct".field_names) |field| {
+            if (@field(self, field)) |after| {
+                if (@field(before, field)) |start| {
+                    if (after >= start) @field(result, field) = after - start;
+                }
+            }
+        }
+        return result;
+    }
+};
+pub const Memory = struct {
+    scope: enum { unavailable, backend_device_buffers, backend_runtime_buffers } = .unavailable,
+    /// CUDA ownership handed off to retained cleanup owners is separate and
+    /// is never included in this context gauge after that handoff.
+    excludes_detached_owners: bool = false,
+    live_bytes: ?u64 = null,
+    /// Lifetime high-water gauge; not an invocation's peak allocation.
+    lifetime_peak_bytes: ?u64 = null,
+};
+/// Worker-process observations include other contexts and threads. These are
+/// distinct from the invocation's submitting-thread counters and program leases.
+pub const ProcessCounters = struct {
+    upload_calls: u64 = 0,
+    upload_bytes: u64 = 0,
+    download_calls: u64 = 0,
+    download_bytes: u64 = 0,
+    copy_calls: u64 = 0,
+    copy_bytes: u64 = 0,
+    completed_commands: u64 = 0,
+    failed_commands: u64 = 0,
+    physical_allocations: u64 = 0,
+    physical_frees: u64 = 0,
+    allocated_bytes: u64 = 0,
+    freed_bytes: u64 = 0,
+    initialized_bytes: u64 = 0,
+    initialization_calls: u64 = 0,
+
+    pub fn since(self: ProcessCounters, before: ProcessCounters) ProcessCounters {
+        var result: ProcessCounters = .{};
+        inline for (@typeInfo(ProcessCounters).@"struct".field_names) |field|
+            @field(result, field) = @field(self, field) -| @field(before, field);
+        return result;
+    }
+};
+pub const Process = struct {
+    /// Tracked MTLBuffer allocatedSize, including command-retained temporaries.
+    /// Alias bytes use logical mapped length and are never added to owned bytes.
+    memory_scope: enum { tracked_metal_buffers_worker_process } = .tracked_metal_buffers_worker_process,
+    counters: ProcessCounters = .{},
+    owned_live_bytes: u64 = 0,
+    owned_lifetime_peak_bytes: u64 = 0,
+    private_live_bytes: u64 = 0,
+    private_lifetime_peak_bytes: u64 = 0,
+    host_visible_live_bytes: u64 = 0,
+    host_visible_lifetime_peak_bytes: u64 = 0,
+    alias_live_bytes: u64 = 0,
+    alias_lifetime_peak_bytes: u64 = 0,
+
+    pub fn since(self: Process, before: Process) Process {
+        var result = self;
+        result.counters = self.counters.since(before.counters);
+        return result;
+    }
+};
+/// Actual requested allocation spans through an explicitly observed owner
+/// allocator. Allocator padding, mapped files and external library heaps are
+/// separate scopes. Matching/ancestor identities must never be added together.
+pub const ObservedAllocator = struct {
+    counter_scope: enum { owner_lifetime, owner_interval } = .owner_lifetime,
+    owner_identity: usize,
+    parent_identity: ?usize,
+    coverage: @import("allocation_observer.zig").Coverage,
+    usage: @import("allocation_observer.zig").Snapshot,
+    pub fn init(owner: *@import("allocation_observer.zig").State) ObservedAllocator {
+        return .{ .owner_identity = @intFromPtr(owner), .parent_identity = if (owner.parent()) |p| @intFromPtr(p) else null, .coverage = owner.coverage, .usage = owner.snapshot() };
+    }
+    fn since(self: ObservedAllocator, before: ObservedAllocator) ObservedAllocator {
+        var result = self;
+        if (self.owner_identity == before.owner_identity and self.counter_scope == .owner_lifetime and before.counter_scope == .owner_lifetime) {
+            result.usage = self.usage.since(before.usage);
+            result.counter_scope = .owner_interval;
+        }
+        return result;
+    }
+};
+pub const NativeAllocations = struct {
+    compute: ?ObservedAllocator = null,
+    model: ?ObservedAllocator = null,
+    late_enable_failed: bool = false,
+    fn since(self: NativeAllocations, before: NativeAllocations) NativeAllocations {
+        var result = self;
+        if (self.compute) |after| if (before.compute) |start| {
+            result.compute = after.since(start);
+        };
+        if (self.model) |after| if (before.model) |start| {
+            result.model = after.since(start);
+        };
+        return result;
+    }
+};
+/// Explicit CUDA API/topology scopes. No field claims total completed kernels
+/// or kernels hidden in an eager vendor operation/device-dynamic launch.
+pub const CudaCounters = struct {
+    direct_kernel_submissions: u64 = 0,
+    foreign_stream_kernel_calls: u64 = 0,
+    capture_recording_kernel_calls: u64 = 0,
+    capture_recording_graph_calls: u64 = 0,
+    known_graph_submissions: u64 = 0,
+    declared_graph_kernel_nodes_submitted: u64 = 0,
+    declared_graph_nodes_submitted: u64 = 0,
+    opaque_graph_submissions: u64 = 0,
+    /// Explicit project-owned successful host wait APIs. These are not CPU
+    /// blocking durations or implicit vendor/free synchronizations.
+    host_stream_synchronizations: u64 = 0,
+    host_event_synchronizations: u64 = 0,
+    failed_host_synchronizations: u64 = 0,
+    /// Accepted GPU dependency API calls, distinct from host synchronization.
+    gpu_stream_dependencies: u64 = 0,
+    capture_recording_stream_wait_events: u64 = 0,
+    foreign_stream_wait_event_calls: u64 = 0,
+    failed_gpu_stream_dependencies: u64 = 0,
+    metadata_failures: u64 = 0,
+    pub fn since(self: CudaCounters, before: CudaCounters) CudaCounters {
+        var result: CudaCounters = .{};
+        inline for (@typeInfo(CudaCounters).@"struct".field_names) |field|
+            @field(result, field) = @field(self, field) -| @field(before, field);
+        return result;
+    }
+};
+pub const Cuda = struct {
+    state: enum { enabled, allocation_failed } = .enabled,
+    owner_identity: ?usize = null,
+    counter_scope: enum { observer_lifetime, context_interval } = .observer_lifetime,
+    coverage: enum { since_enable } = .since_enable,
+    counters: ?CudaCounters = null,
+    registered_graphs: ?usize = null,
+    fn since(self: Cuda, before: Cuda) Cuda {
+        var result = self;
+        if (self.owner_identity != null and self.owner_identity == before.owner_identity) {
+            if (self.counters) |after| if (before.counters) |start| {
+                result.counters = after.since(start);
+                result.counter_scope = .context_interval;
+            };
+        }
+        return result;
+    }
+};
+pub const Snapshot = struct {
+    resolved_project_metal_dispatches: ?@import("runtime_observation.zig").MetalDispatches = null,
+    terminal_native_bodies: ?@import("runtime_observation.zig").NativeBodies = null,
+    selected_native_dispatches: ?@import("runtime_observation.zig").NativeDispatches = null,
+    joined_native_workers: ?@import("runtime_observation.zig").NativeWorkers = null,
+    native_quant_worker_callbacks: ?@import("runtime_observation.zig").NativeQuantWorkerCallbacks = null,
+    native_attention_programs: ?@import("runtime_observation.zig").NativeAttentionPrograms = null,
+    authored_native_programs: ?@import("runtime_observation.zig").NativePrograms = null,
+    authored_native_program_bank: ?@import("runtime_observation.zig").NativeProgramBank = null,
+    native_activation_programs: ?@import("runtime_observation.zig").NativeActivationPrograms = null,
+    owned_native_fallbacks: ?@import("runtime_observation.zig").NativeFallbacks = null,
+    device_allocator_roots: ?@import("device_allocation_registry.zig").Summary = null,
+    metal_buffer_interval: ?@import("../backends/metal_telemetry.zig").BufferIntervalReport = null,
+    video_owned_resources: ?VideoOwnedResources = null,
+    resolved_project_cuda_launches: ?@import("runtime_observation.zig").Kernels = null,
+    transfers: ?@import("transfer_audit.zig").Measurements = null,
+    counters: Counters = .{},
+    native_allocations: ?NativeAllocations = null,
+    /// Immutable deduplicated owner intervals for observed numerical dispatch.
+    allocation_owners: ?@import("allocation_registry.zig").Summary = null,
+    device_owners: ?@import("device_owner_registry.zig").Summary = null,
+    cuda: ?Cuda = null,
+    memory: Memory = .{},
+    /// Invocation interval on its submitting thread, including CPU fallbacks.
+    submission: ?@import("runtime_observation.zig").Counters = null,
+    /// Process-wide interval/gauges, never per-request ownership or residency.
+    process: ?Process = null,
+    pub fn since(self: Snapshot, before: Snapshot) Snapshot {
+        return .{
+            .resolved_project_metal_dispatches = self.resolved_project_metal_dispatches,
+            .terminal_native_bodies = self.terminal_native_bodies,
+            .selected_native_dispatches = self.selected_native_dispatches,
+            .joined_native_workers = self.joined_native_workers,
+            .native_quant_worker_callbacks = self.native_quant_worker_callbacks,
+            .native_attention_programs = self.native_attention_programs,
+            .native_activation_programs = self.native_activation_programs,
+            .authored_native_programs = self.authored_native_programs,
+            .authored_native_program_bank = self.authored_native_program_bank,
+            .owned_native_fallbacks = self.owned_native_fallbacks,
+            .device_allocator_roots = self.device_allocator_roots,
+            .metal_buffer_interval = self.metal_buffer_interval,
+            .video_owned_resources = self.video_owned_resources,
+            .resolved_project_cuda_launches = self.resolved_project_cuda_launches,
+            .transfers = self.transfers,
+            .counters = self.counters.since(before.counters),
+            .memory = self.memory,
+            .cuda = if (self.cuda) |after| if (before.cuda) |start| after.since(start) else after else null,
+            .native_allocations = if (self.native_allocations) |after| if (before.native_allocations) |start| after.since(start) else after else null,
+            .process = if (self.process) |after| if (before.process) |start| after.since(start) else after else null,
+        };
+    }
+};
+
+test "runtime telemetry distinguishes unavailable reset and measured zero counters" {
+    const before = Snapshot{ .counters = .{ .kernel_dispatches = 10, .graph_submissions = 4, .synchronizations = 3 }, .memory = .{ .scope = .backend_device_buffers, .live_bytes = 128, .lifetime_peak_bytes = 1024 } };
+    const after = Snapshot{ .counters = .{ .kernel_dispatches = 12, .graph_submissions = 4, .synchronizations = 1 }, .memory = .{ .scope = .backend_device_buffers, .live_bytes = 64, .lifetime_peak_bytes = 1024 } };
+    const delta = after.since(before);
+    try std.testing.expectEqual(@as(?u64, 2), delta.counters.kernel_dispatches);
+    try std.testing.expectEqual(@as(?u64, 0), delta.counters.graph_submissions);
+    try std.testing.expectEqual(@as(?u64, null), delta.counters.synchronizations);
+    try std.testing.expectEqual(@as(?u64, null), delta.counters.physical_allocations);
+    try std.testing.expectEqual(@as(?u64, 64), delta.memory.live_bytes);
+    try std.testing.expectEqual(@as(?u64, 1024), delta.memory.lifetime_peak_bytes);
+}
+
+/// Copied lower-video typed root observation. Kept separate from inference's
+/// buffer/CUDA roots: independent root peaks are never summed.
+pub const VideoOwnedResources = struct {
+    root_identity: usize,
+    coverage: enum { tracked_authored_resources, partial_metadata_failure },
+    scope: enum { process_authored_video_resources_including_concurrent_users } = .process_authored_video_resources_including_concurrent_users,
+    backing: enum { owned_MTLBuffer_and_MTLTexture_allocatedSize_not_residency } = .owned_MTLBuffer_and_MTLTexture_allocatedSize_not_residency,
+    semantic_lifetime_classes: enum { mixed_owned_lifetimes_not_inferred_from_storageMode } = .mixed_owned_lifetimes_not_inferred_from_storageMode,
+    live_bytes: [3]u64,
+    interval_peak_bytes: [3]u64,
+    lifetime_peak_bytes: [3]u64,
+    buffer_allocations: u64,
+    buffer_frees: u64,
+    texture_allocations: u64,
+    texture_frees: u64,
+    lifetime_metadata_failures: u64,
+    interval_metadata_failures: u64,
+    pub fn from(value: anytype) VideoOwnedResources {
+        return .{ .root_identity = value.root_identity, .coverage = if (value.lifetime_metadata_failures == 0) .tracked_authored_resources else .partial_metadata_failure, .live_bytes = value.live_bytes, .interval_peak_bytes = value.interval_peak_bytes, .lifetime_peak_bytes = value.lifetime_peak_bytes, .buffer_allocations = value.buffer_allocations, .buffer_frees = value.buffer_frees, .texture_allocations = value.texture_allocations, .texture_frees = value.texture_frees, .lifetime_metadata_failures = value.lifetime_metadata_failures, .interval_metadata_failures = value.interval_metadata_failures };
+    }
+};

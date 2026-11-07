@@ -32,14 +32,14 @@ spec.loader.exec_module(regen)
 
 
 class BoundaryAttentionArtifactsTest(unittest.TestCase):
-    def test_manifest_binds_both_architectures_and_sources(self):
+    def test_manifest_binds_all_architectures_and_sources(self):
         metadata = json.loads(
             (regen.ARTIFACTS / "gliner25_boundary_attention.json").read_text()
         )
         expected = {
             f"gliner25_boundary_attention_{direction}.{suffix}"
             for direction in regen.DIRECTIONS
-            for suffix in ("cubin", "sm80.cubin")
+            for suffix in regen.ARCHITECTURES.values()
         }
         self.assertEqual(set(metadata["artifacts"]), expected)
         self.assertIn("cuda compiler", metadata["compiler"].lower())
@@ -49,8 +49,10 @@ class BoundaryAttentionArtifactsTest(unittest.TestCase):
         )
         self.assertEqual(
             set(metadata["source_sha256"]),
-            {f"gliner25_boundary_attention_{d}.cu" for d in regen.DIRECTIONS},
+            {name for arch in regen.ARCHITECTURES for name in regen.source_files(arch)},
         )
+        self.assertEqual(metadata["source_files_by_arch"], {arch: regen.source_files(arch) for arch in regen.ARCHITECTURES})
+        self.assertEqual(metadata["profile_by_arch"]["sm_120"], "gliner25_boundary_attention_warp_d32_v2")
         for name, expected_hash in {
             **metadata["artifacts"],
             **metadata["source_sha256"],
@@ -62,7 +64,7 @@ class BoundaryAttentionArtifactsTest(unittest.TestCase):
                     self.assertEqual(data[:6], b"\x7fELF\x02\x01")
                     flags = struct.unpack_from("<I", data, 48)[0]
                     self.assertEqual(
-                        (flags >> 8) & 0xFF, 80 if ".sm80." in name else 89
+                        (flags >> 8) & 0xFF, 120 if ".sm120." in name else 80 if ".sm80." in name else 89
                     )
                     entry = (
                         b"boundary_backward"
@@ -70,6 +72,15 @@ class BoundaryAttentionArtifactsTest(unittest.TestCase):
                         else b"boundary_forward"
                     )
                     self.assertIn(entry + b"\x00", data)
+
+    def test_partial_regeneration_rejects_changed_retained_sources(self):
+        sources = {name: "current" for arch in regen.ARCHITECTURES for name in regen.source_files(arch)}
+        prior = {"source_sha256": dict(sources)}
+        regen.validate_retained_sources(prior, sources, ["sm_120"])
+        sources[regen.source_name("forward", "sm_80")] = "changed"
+        with self.assertRaisesRegex(RuntimeError, "retained sm_89"):
+            regen.validate_retained_sources(prior, sources, ["sm_120"])
+        regen.validate_retained_sources(prior, sources, list(regen.ARCHITECTURES))
 
 
 if __name__ == "__main__":

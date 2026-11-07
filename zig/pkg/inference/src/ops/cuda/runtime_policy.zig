@@ -17,7 +17,32 @@
 const std = @import("std");
 const env = @import("antfly_platform").env;
 
+/// Explicit physical policy for the shared dense encoder/decoder family.
+/// F32 and the original cross schedule remain the default. Reduced KV is
+/// accepted only with the complete typed split-KV consumer before publication.
+pub const Seq2seq = struct {
+    pub const Precision = enum { f32, f16 };
+    pub const CrossSchedule = enum { legacy, split_kv_128 };
+    pub const ProjectionSchedule = enum { legacy, rowpair_epilogue };
+    projection_schedule: ProjectionSchedule = .legacy,
+    residual_sum: bool = false,
+    im2col: bool = false,
+    projections: Precision = .f32,
+    cross_kv: Precision = .f32,
+    cross_schedule: CrossSchedule = .legacy,
+    encoder_attention: Precision = .f32,
+    vendor_attention: bool = true,
+
+    pub fn reduced() Seq2seq {
+        return .{ .im2col = true, .residual_sum = true, .projection_schedule = .rowpair_epilogue, .projections = .f16, .encoder_attention = .f16, .cross_kv = .f16, .cross_schedule = .split_kv_128 };
+    }
+    pub fn enabled(self: Seq2seq) bool {
+        return self.im2col or self.residual_sum or self.projections == .f16 or self.encoder_attention == .f16 or self.cross_schedule != .legacy;
+    }
+};
+
 pub const Policy = struct {
+    seq2seq: Seq2seq = .{},
     temp_cache_mb: ?usize = null,
     max_temp_buffers: ?usize = null,
     stable_temp_reuse: bool = false,
@@ -30,10 +55,21 @@ pub const Policy = struct {
     split_attention_chunk: ?usize = null,
 
     pub fn resolve() Policy {
+        const seq2seq_f16 = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_SEQ2SEQ_F16", false);
         const workspace_mb = env.getenvUsize("ANTFLY_INFERENCE_CUDA_CUBLASLT_WORKSPACE_MB") orelse
             env.getenvUsize("ANTFLY_CUDA_CUBLASLT_WORKSPACE_MB") orelse
             env.getenvUsize("TERMITE_CUDA_CUBLASLT_WORKSPACE_MB") orelse 0;
         return .{
+            .seq2seq = .{
+                .im2col = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_SEQ2SEQ_IM2COL", seq2seq_f16),
+                .residual_sum = seq2seq_f16,
+                .projection_schedule = if (seq2seq_f16) .rowpair_epilogue else .legacy,
+                .projections = if (seq2seq_f16) .f16 else .f32,
+                .cross_kv = if (seq2seq_f16) .f16 else .f32,
+                .cross_schedule = if (seq2seq_f16) .split_kv_128 else .legacy,
+                .encoder_attention = if (seq2seq_f16) .f16 else .f32,
+                .vendor_attention = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_SEQ2SEQ_CUDNN", true),
+            },
             .temp_cache_mb = env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB"),
             .max_temp_buffers = env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MAX_BUFFERS"),
             .stable_temp_reuse = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE", false),
@@ -103,4 +139,15 @@ test "LightOnOCR3 CUDA resolved buffer policy retains zero limits overflow and t
         try std.testing.expectEqual(@as(usize, 9), bounded.bufferLimit(training));
         try std.testing.expectEqual(@as(usize, 0), (Policy{ .temp_cache_mb = std.math.maxInt(usize) }).cacheBytes(training));
     }
+}
+
+test "CUDA dense seq2seq precision is explicit and leaves unrelated runtime policy unchanged" {
+    const defaults = Policy{};
+    try std.testing.expect(!defaults.seq2seq.enabled());
+    const reduced = Seq2seq.reduced();
+    try std.testing.expect(reduced.projections == .f16 and reduced.encoder_attention == .f16);
+    try std.testing.expect(reduced.vendor_attention);
+    const independent = Seq2seq{ .encoder_attention = .f16, .vendor_attention = false };
+    try std.testing.expect(independent.projections == .f32 and independent.enabled());
+    try std.testing.expectEqual(@as(usize, 0), defaults.workspace_bytes);
 }

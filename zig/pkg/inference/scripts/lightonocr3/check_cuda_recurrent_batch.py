@@ -155,7 +155,7 @@ def main():
                         yy = core[page * seq * width :]
                         oo = out[page * seq * width :]
                         gpu.launch(
-                            "lighton_conv",
+                            "antfly_gdn_causal_conv",
                             ((channels + 127) // 128, 1),
                             128,
                             pointer(xx),
