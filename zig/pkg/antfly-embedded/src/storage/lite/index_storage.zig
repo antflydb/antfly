@@ -485,7 +485,7 @@ const NativeArtifactStager = struct {
         if (bytes.len == 0) return error.InvalidArtifactConstructionState;
         const resources = self.resources orelse return error.Unsupported;
         if (bytes.len <= artifacts.OwnedBytes.maximum_length) {
-            if (InlinePreparedArtifact.createAt(self, bytes, resources.resource_manager, self.inode, self.file_namespace)) |artifact| return artifact else |err| switch (err) {
+            if (InlinePreparedArtifact.createAt(self, bytes, resources.resource_manager, self.inode, self.file_namespace, true)) |artifact| return artifact else |err| switch (err) {
                 error.ResourceBudgetExceeded, error.OutOfMemory => {},
                 else => return err,
             }
@@ -598,17 +598,17 @@ const InlinePreparedArtifact = struct {
 
     fn create(stager: *NativeArtifactStager, bytes: []const u8) !immutable_artifact.Prepared {
         if (stager.resources) |resources|
-            return createAt(stager, bytes, resources.resource_manager, stager.inode, stager.file_namespace);
+            return createAt(stager, bytes, resources.resource_manager, stager.inode, stager.file_namespace, false);
         const owner = stager.registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
         defer stager.registry.endCallback();
-        return createAt(stager, bytes, owner.resource_manager, (try owner.file.file.stat(owner.file.runtime())).inode, owner.file.header.reader_epoch_namespace);
+        return createAt(stager, bytes, owner.resource_manager, (try owner.file.file.stat(owner.file.runtime())).inode, owner.file.header.reader_epoch_namespace, false);
     }
 
-    fn createAt(stager: *NativeArtifactStager, bytes: []const u8, manager: ?*@import("../resource_manager.zig").ResourceManager, inode: u64, file_namespace: [32]u8) !immutable_artifact.Prepared {
+    fn createAt(stager: *NativeArtifactStager, bytes: []const u8, manager: ?*@import("../resource_manager.zig").ResourceManager, inode: u64, file_namespace: [32]u8, comptime allow_reclaim: bool) !immutable_artifact.Prepared {
         const state = try stager.alloc.create(@This());
         errdefer stager.alloc.destroy(state);
         // Published bytes have an independently retained resource/IO owner.
-        const backing = try Bytes.copy(stager.registry, manager, bytes);
+        const backing = if (allow_reclaim) try Bytes.copyDetached(stager.registry, manager, bytes) else try Bytes.copy(stager.registry, manager, bytes);
         errdefer backing.deinit();
         const prefix = try stager.alloc.dupe(u8, stager.prefix);
         errdefer stager.alloc.free(prefix);

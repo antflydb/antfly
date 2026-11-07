@@ -249,10 +249,17 @@ pub const OwnedBytes = struct {
     decoded_users: usize = 0,
 
     pub fn allocate(registry: *Registry, manager: ?*resources.ResourceManager, length: usize) !*@This() {
+        return allocateWithPolicy(registry, manager, length, false);
+    }
+
+    fn allocateWithPolicy(registry: *Registry, manager: ?*resources.ResourceManager, length: usize, comptime allow_reclaim: bool) !*@This() {
         if (length > maximum_length) return error.ArtifactTooLargeForResidency;
         const a = registry.allocator;
         var credit: ?resources.Reservation = if (manager) |owner|
-            try owner.reserveWithoutReclaim(.lite_native_page_cache, @sizeOf(@This()) + length)
+            if (allow_reclaim)
+                try owner.reserve(.lite_native_page_cache, @sizeOf(@This()) + length)
+            else
+                try owner.reserveWithoutReclaim(.lite_native_page_cache, @sizeOf(@This()) + length)
         else
             null;
         errdefer if (credit) |*value| value.release();
@@ -265,6 +272,15 @@ pub const OwnedBytes = struct {
     }
     pub fn copy(registry: *Registry, manager: ?*resources.ResourceManager, bytes: []const u8) !*@This() {
         const self = try allocate(registry, manager, bytes.len);
+        @memcpy(self.data, bytes);
+        self.seal();
+        return self;
+    }
+
+    /// Only independently owned preparation may invoke cache reclaimers.
+    /// Gate-held publication and reader callbacks keep the non-reclaiming API.
+    pub fn copyDetached(registry: *Registry, manager: ?*resources.ResourceManager, bytes: []const u8) !*@This() {
+        const self = try allocateWithPolicy(registry, manager, bytes.len, true);
         @memcpy(self.data, bytes);
         self.seal();
         return self;
@@ -1778,6 +1794,47 @@ test "lite artifact path aliases retain snapshot protection across orphan cleanu
         try std.testing.expectEqualSlices(u8, bytes[4096..][0..actual.len], &actual);
         try std.testing.expect((try writer.file.check()).valid);
     }
+}
+
+test "lite detached resident staging reclaims clean cache credit outside publication" {
+    const resources = @import("../resource_manager.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/resident-credit.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const registry = try store.artifactRegistry();
+    var budgets = resources.Options.defaultBudgets();
+    budgets[@backingInt(resources.Slice.lite_native_page_cache)] = .{ .hard_limit_bytes = 4096 };
+    var manager = resources.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    const CleanCache = struct {
+        credit: ?resources.Reservation,
+        calls: usize = 0,
+        fn reclaim(raw: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            var credit = self.credit orelse return 0;
+            self.credit = null;
+            const released = credit.bytes;
+            credit.release();
+            return released;
+        }
+    };
+    var clean: CleanCache = .{ .credit = try manager.reserveWithoutReclaim(.lite_native_page_cache, 4096) };
+    defer if (clean.credit) |*credit| credit.release();
+    const reclaim_id = try manager.registerReclaimer(.lite_native_page_cache, &clean, CleanCache.reclaim);
+    defer manager.unregisterReclaimer(reclaim_id);
+    try std.testing.expectError(error.ResourceBudgetExceeded, OwnedBytes.copy(registry, &manager, "normalized postings"));
+    try std.testing.expectEqual(@as(usize, 0), clean.calls);
+    const resident = try OwnedBytes.copyDetached(registry, &manager, "normalized postings");
+    try std.testing.expect(clean.calls > 0);
+    try std.testing.expectEqualStrings("normalized postings", resident.data);
+    resident.deinit();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_page_cache).used_bytes);
 }
 
 test "lite resident source handoff shares exact bytes across runtime close and rejects digest collisions" {

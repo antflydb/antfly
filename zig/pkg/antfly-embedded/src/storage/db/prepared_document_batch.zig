@@ -53,7 +53,8 @@ pub const Plan = struct {
     resolved_effects: ?mutation_effects.CoalescedKeyValueRequest(types.BatchWrite) = null,
     transform_capture_declined: bool = false,
     needs_reprepare: bool = false,
-    const Text = struct { config: manager_mod.ForegroundTextProjection, built: manager_mod.PreparedTextMapperPublication, publication: ?*manager_mod.OwnedForegroundTextPublication = null };
+    reprepare_allowed: bool = true,
+    const Text = struct { config: manager_mod.ForegroundTextProjection, built: manager_mod.PreparedTextMapperPublication, publication: ?*manager_mod.OwnedForegroundTextPublication = null, staging_declined: bool = false };
     const Entry = struct { value: []const u8, stored_value: ?[]u8 = null, authored_timestamp_ns: ?u64 = null, ordinal_key: []const u8 = &.{}, template: mapper.ExtractedWrite, extracted: ?mapper.ExtractedWrite = null };
 
     /// Called under the short catalog lifetime fence. No borrowed DB pointer
@@ -305,10 +306,18 @@ pub const Plan = struct {
     }
 
     pub fn stageIndependentForegroundTextWithBudget(self: *Plan, budget: *@import("../immutable_artifact.zig").AdmissionBudget) !void {
-        for (self.text.items) |*item| item.built.stageDetachedNativeWithBudget(item.config.stager, budget) catch |err| switch (err) {
-            error.Unsupported, error.ResourceBudgetExceeded, error.OutOfMemory => {},
-            else => return err,
-        };
+        self.reprepare_allowed = budget.remaining_ns != 0;
+        for (self.text.items) |*item| {
+            item.staging_declined = false;
+            item.built.stageDetachedNativeWithBudget(item.config.stager, budget) catch |err| switch (err) {
+                // Resident credit can be exhausted by retained snapshots. Its
+                // bounded file-staging fallback may in turn lose immediate
+                // admission to housekeeping. Neither optional acceleration
+                // refusal is a refusal of the caller's primary mutation.
+                error.FileBusy, error.WouldBlock, error.EnrichmentWaitCanceled, error.StaleArtifactConstruction, error.Unsupported, error.ResourceBudgetExceeded, error.OutOfMemory => item.staging_declined = true,
+                else => return err,
+            };
+        }
     }
 
     /// Capture staged artifacts, finite metadata witnesses and immutable index
@@ -322,6 +331,9 @@ pub const Plan = struct {
         for (self.text.items) |*item| {
             if (item.publication) |publication| publication.deinit();
             item.publication = null;
+            // Never move refused detached staging back under writer admission.
+            // The primary transaction retains the canonical asynchronous effect.
+            if (item.staging_declined) continue;
             const config = for (current.plan().foreground_text) |config| {
                 if (item.config.matches(config)) break config;
             } else continue;
@@ -431,6 +443,10 @@ pub const Plan = struct {
         }
         persistent.PersistentIndex.commitNativePublications(self.text_candidates[0..selected], primary) catch |err| {
             if (err == error.NativeArtifactDestinationOccupied) {
+                // The host validates every destination before staging primary
+                // mutations. With no waiting budget, decline this optional
+                // replacement and keep the primary/journal publication path.
+                if (!self.reprepare_allowed) return false;
                 self.needs_reprepare = true;
                 return error.OwnedPreparationStale;
             }

@@ -5107,7 +5107,7 @@ fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prep
         if (prepare_attempt) |prepare| {
             const started = std.Io.Clock.awake.now(io).nanoseconds;
             var budget: PreparationBudget = .{ .remaining_ns = std.math.cast(u64, @max(0, deadline - started)) orelse std.math.maxInt(u64) };
-            prepare(request, &budget) catch |err| return capi.mapError(err);
+            prepare(request, &budget) catch |err| return capi.mapErrorContext(err, "batch owned preparation");
             // Parsing, proof, mapping and IO are active request work. Actual
             // nested gate/lease waits consume this same overall call budget.
             const elapsed = @max(0, std.Io.Clock.awake.now(io).nanoseconds - started);
@@ -5120,7 +5120,11 @@ fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prep
         const guard = enterWithAdmissionBudget(entry, ptr, .write, .mutation, false, @max(0, deadline - std.Io.Clock.awake.now(io).nanoseconds)) orelse return capi.mapError(error.InvalidArgument);
         var held = true;
         defer if (held) guard.leave();
-        if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+        if (guard.entry_error) |code| {
+            var detail: [1024]u8 = undefined;
+            const message = std.fmt.bufPrint(&detail, "batch writer admission: {s}", .{std.mem.span(capi.lastErrorDetail())}) catch "batch writer admission refused";
+            return capi.recordError(code, message);
+        }
         const receipt_scope = beginOutcomeReceipts(guard.lock_handle);
         var receipt_scope_active = true;
         defer if (receipt_scope_active) receipt_scope.end();
@@ -5131,8 +5135,8 @@ fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prep
             if (err == error.CommitVisibilityNotSatisfied)
                 return capi.mapErrorContext(err, "batch primary write committed; derived visibility is pending; do not retry the batch");
             const owned_stale = err == error.OwnedPreparationStale and prepare_attempt != null;
-            if (err != error.LiteReplayBacklogExceeded and !owned_stale) return capi.mapError(err);
-            if (timeout_ms == 0) return capi.mapError(if (owned_stale) error.FileBusy else err);
+            if (err != error.LiteReplayBacklogExceeded and !owned_stale) return capi.mapErrorContext(err, "batch before primary commit");
+            if (timeout_ms == 0) return capi.mapErrorContext(if (owned_stale) error.FileBusy else err, if (owned_stale) "batch prepared source changed before commit" else "batch replay admission");
             // Busy timeout bounds admission/capacity waits, not active batch
             // preparation. A late, pre-commit quota refusal must still give
             // consumers their remaining wait budget after releasing the gate.
@@ -12154,6 +12158,81 @@ test "capi native indexed exports retain owned foreground eligibility after reop
     try std.testing.expectEqual(@as(?u64, sequence), guard.handle.database().executor.appliedSequence("selected_text"));
 }
 
+test "capi refused detached text staging preserves primary writes and asynchronous catch-up" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("owned-staging-refusal");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{directory.path()});
+    defer a.free(path);
+    const wrapper = try @import("lite_connection.zig").open(path, .{ .no_sync = true, .profile = .native }, true);
+    const id = try publishHandle(wrapper);
+    defer antfly_db_close(id);
+    const owner = wrapper.lite_connection.?.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(handleLockIo());
+    if (owner.worker) |worker| worker.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
+    var plan: Prepared = blk: {
+        const guard = enterHandle(id, .read).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        break :blk (try Prepared.capture(a, guard.handle.database())).?;
+    };
+    defer plan.deinit();
+    const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "one", .value = "{\"text\":\"detached refusal résumé 日本語\"}" }}, .sync_level = .write };
+    try plan.prepare(request);
+    try std.testing.expect(plan.text.items.len != 0);
+    const artifact = @import("../storage/immutable_artifact.zig");
+    const Refusal = struct {
+        attempts: usize = 0,
+        fn detached(raw: *anyopaque, _: []const u8, _: *artifact.AdmissionBudget) !artifact.Prepared {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.attempts += 1;
+            return error.FileBusy;
+        }
+        fn stage(_: *anyopaque, _: []const u8) !artifact.Prepared {
+            return error.UnexpectedStagingUnderWriterAdmission;
+        }
+        fn deinit(_: *anyopaque) void {}
+        const vtable: artifact.Stager.VTable = .{ .stage = stage, .stage_detached_with_budget = detached, .deinit = deinit };
+    };
+    var refusal: Refusal = .{};
+    // These descriptors borrow the catalog's stager; the catalog retains and
+    // destroys the actual capabilities independently of this test adapter.
+    for (plan.text.items) |*item| item.config.stager = .{ .ptr = &refusal, .vtable = &Refusal.vtable };
+    var budget: PreparationBudget = .{ .remaining_ns = 0 };
+    try plan.stageIndependentForegroundTextWithBudget(&budget);
+    try std.testing.expectEqual(plan.text.items.len, refusal.attempts);
+    {
+        const guard = enterHandle(id, .write).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        try plan.captureForegroundText(guard.handle.database());
+        try plan.finishForegroundText();
+        for (plan.text.items) |item| try std.testing.expect(item.publication == null);
+        var committed = false;
+        try trackedBatchWithPreparedDocuments(guard.handle.database(), request, &committed, guard.handle.selected_table_name, &plan);
+        try std.testing.expect(committed);
+        const value = (try guard.handle.database().get(a, "one")).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings(request.writes[0].value, value);
+    }
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(id));
+    var hits: capi.Buffer = .{};
+    defer antfly_buffer_free(&hits);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(id, .fromSlice("{\"full_text_search\":{\"match\":{\"field\":\"text\",\"text\":\"detached\"}},\"limit\":5}"), &hits));
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, hits.ptr.?[0..hits.len], .{});
+    defer parsed.deinit();
+    const responses = parsed.value.object.get("responses") orelse return error.TestMissingSearchResponses;
+    try std.testing.expectEqual(@as(usize, 1), responses.array.items.len);
+    const envelope = responses.array.items[0].object.get("hits") orelse return error.TestMissingSearchHits;
+    const found = envelope.object.get("hits") orelse return error.TestMissingSearchHits;
+    try std.testing.expectEqual(@as(usize, 1), found.array.items.len);
+}
+
 test "capi owned transforms reprepare changed bases without applying an increment twice" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("owned-transform-reprepare");
@@ -12216,13 +12295,21 @@ test "capi owned transforms reprepare changed bases without applying an incremen
 }
 
 test "capi owned artifact collision retries before an increment and preserves the occupied alias" {
+    try testOwnedArtifactCollision(5000);
+}
+
+test "capi owned artifact collision with no wait budget preserves primary and replay effects" {
+    try testOwnedArtifactCollision(0);
+}
+
+fn testOwnedArtifactCollision(timeout_ms: u64) !void {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("owned-artifact-collision");
     defer directory.cleanup();
     try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
     const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{directory.path()});
     defer a.free(path);
-    const wrapper = try @import("lite_connection.zig").open(path, .{ .no_sync = true, .profile = .native, .busy_timeout_ms = 5000 }, true);
+    const wrapper = try @import("lite_connection.zig").open(path, .{ .no_sync = true, .profile = .native, .busy_timeout_ms = timeout_ms }, true);
     const id = try publishHandle(wrapper);
     defer antfly_db_close(id);
     var output: capi.Buffer = .{};
@@ -12283,7 +12370,7 @@ test "capi owned artifact collision retries before an increment and preserves th
     var request: Request = .{ .id = id, .plan = &prepared, .request = .{ .transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "n", .value_json = "1" }} }}, .sync_level = .write } };
     defer if (request.occupied_path) |value| a.free(value);
     try std.testing.expectEqual(capi.ErrorCode.ok, executeBatchWithReplayPreparation(id, &request, Request.prepare, Request.apply));
-    try std.testing.expectEqual(@as(usize, 1), request.refusals);
+    try std.testing.expectEqual(@as(usize, if (timeout_ms == 0) 0 else 1), request.refusals);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(id, .fromSlice("counter"), &output));
     var row = try std.json.parseFromSlice(std.json.Value, a, output.ptr.?[0..output.len], .{});
     defer row.deinit();
