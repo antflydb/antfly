@@ -32,6 +32,8 @@ pub const ModelSource = struct {
     logical_path: ?[]const u8 = null,
     manifest: ?*const manifest_mod.ModelManifest = null,
     external_base_dir: ?[]const u8 = null,
+    /// Acquisition-owned authenticated handles, borrowed during construction.
+    external_reader: ?@import("onnx_graph").tensor.ExternalDataReader = null,
 
     pub fn fromPath(path: []const u8) ModelSource {
         return .{ .path = path, .kind = kindForPath(path) };
