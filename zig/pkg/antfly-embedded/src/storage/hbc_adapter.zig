@@ -124,6 +124,10 @@ pub fn setTestCheckpointBuildClaimHook(ctx: ?*anyopaque, hook: ?TestCheckpointBu
 pub const HBCConfig = vectorindex_types.HBCConfig;
 pub const StorageBackend = vectorindex_types.StorageBackend;
 pub const BulkBuildAlgo = vectorindex_types.BulkBuildAlgo;
+/// See `sparse/sparse.zig`'s and `persistent.zig`'s identically-named
+/// aliases: all point at the same backend-agnostic
+/// `native_catalog_backend.Sink`.
+pub const NativeCatalogSink = hbc_backend.NativeCatalogSink;
 
 /// Whether an index opened on this configured backend can bootstrap the native
 /// posting WAL/segment authority. Once a v2 generation is published it opens
@@ -5238,6 +5242,9 @@ pub const HBCIndex = struct {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.root_dir,
             .native => |backend| backend.root_dir,
+            // No on-disk root directory: metadata/postings live as KV
+            // records inside the host's own native file.
+            .native_catalog => null,
         };
     }
 
@@ -5923,35 +5930,38 @@ pub const HBCIndex = struct {
     pub fn snapshotLsmWriteStats(self: *const HBCIndex) ?LsmWriteStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotWriteStats(),
-            .native => null,
+            .native, .native_catalog => null,
         };
     }
 
     pub fn snapshotLsmMaintenanceStats(self: *const HBCIndex) ?LsmMaintenanceStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotMaintenanceStats(),
-            .native => null,
+            .native, .native_catalog => null,
         };
     }
 
     pub fn snapshotLsmOpenStats(self: *const HBCIndex) ?LsmOpenStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotOpenStats(),
-            .native => null,
+            .native, .native_catalog => null,
         };
     }
 
     pub fn checkpointLsmWalAfterDurableBoundary(self: *HBCIndex) !void {
         switch (self.env_owner) {
             .lsm => |handle| try handle.backend.checkpointWalAfterDurableBoundary(),
-            .native => {},
+            // `.native_catalog` commits are already durable (or an
+            // intentional ride-along) through the host's own native
+            // transaction; there is no separate WAL to checkpoint.
+            .native, .native_catalog => {},
         }
     }
 
     pub fn pinNativeCheckpoint(self: *HBCIndex) !lsm_backend.Backend.NativeCheckpoint {
         return switch (self.env_owner) {
             .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
-            .native => error.Unsupported,
+            .native, .native_catalog => error.Unsupported,
         };
     }
 
@@ -6020,42 +6030,42 @@ pub const HBCIndex = struct {
     pub fn snapshotLsmNativeStorageStats(self: *const HBCIndex) ?lsm_backend.NativeStorageStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),
-            .native => null,
+            .native, .native_catalog => null,
         };
     }
 
     pub fn lsmMaintenanceScore(self: *const HBCIndex) u64 {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.maintenanceScore(),
-            .native => 0,
+            .native, .native_catalog => 0,
         };
     }
 
     pub fn lsmMaintenanceDebtHint(self: *const HBCIndex) u64 {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.maintenanceDebtHint(),
-            .native => 0,
+            .native, .native_catalog => 0,
         };
     }
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const HBCIndex) ?u64 {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
-            .native => null,
+            .native, .native_catalog => null,
         };
     }
 
     pub fn refreshLsmMaintenanceDebtHint(self: *HBCIndex) void {
         switch (self.env_owner) {
             .lsm => |handle| handle.backend.refreshMaintenanceDebtHint(),
-            .native => {},
+            .native, .native_catalog => {},
         }
     }
 
     pub fn runLsmMaintenanceStep(self: *HBCIndex) !bool {
         return switch (self.env_owner) {
             .lsm => |handle| try handle.backend.runMaintenanceStep(),
-            .native => false,
+            .native, .native_catalog => false,
         };
     }
 
@@ -6074,7 +6084,7 @@ pub const HBCIndex = struct {
                 }
                 break :blk try handle.backend.runMaintenanceStepBestEffort();
             },
-            .native => false,
+            .native, .native_catalog => false,
         };
     }
 
@@ -6089,7 +6099,10 @@ pub const HBCIndex = struct {
         if (self.nativeHbcAuthoritative()) return 0;
         return switch (self.env_owner) {
             .lsm => |handle| @max(handle.backend.options.manifest_commit_backlog_bytes / 4, 1 << 20),
-            .native => 0,
+            // No per-commit admission limit: each native_catalog commit is
+            // one host transaction, not an LSM manifest with its own
+            // backlog budget.
+            .native, .native_catalog => 0,
         };
     }
 
@@ -6120,7 +6133,10 @@ pub const HBCIndex = struct {
         if (self.nativeHbcAuthoritative()) return false;
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.options.backend.durability != .full,
-            .native => false,
+            // A native_catalog commit's durability is the host transaction's
+            // own, not a separately-tunable LSM durability policy; this
+            // backend never needs an extra explicit sync of its own.
+            .native, .native_catalog => false,
         };
     }
 
@@ -6130,7 +6146,9 @@ pub const HBCIndex = struct {
         }
         if (!self.nativeHbcAuthoritative()) switch (self.env_owner) {
             .lsm => |handle| handle.backend.beginBulkIngestSession() catch |err| return err,
-            .native => {},
+            // No LSM bulk-ingest session concept for this backend: every
+            // write already goes through `self.store`'s own transactions.
+            .native, .native_catalog => {},
         };
         const opening_outermost = self.write_session_depth == 0;
         if (opening_outermost) {
@@ -6156,7 +6174,7 @@ pub const HBCIndex = struct {
                 self.write_session_kind = null;
                 switch (self.env_owner) {
                     .lsm => |handle| handle.backend.abortBulkIngestSession(),
-                    .native => {},
+                    .native, .native_catalog => {},
                 }
                 return err;
             };
@@ -6280,7 +6298,7 @@ pub const HBCIndex = struct {
                 }
                 return err;
             },
-            .native => {},
+            .native, .native_catalog => {},
         };
         if (finishing_outermost and expected_kind == .streaming_replay) self.endStreamingSplitVectorWorkspace();
         self.write_session_depth -= 1;
@@ -6335,7 +6353,7 @@ pub const HBCIndex = struct {
         if (self.write_session_depth == 0 or self.write_session_kind != expected_kind) return;
         if (!self.nativeHbcAuthoritative()) switch (self.env_owner) {
             .lsm => |handle| handle.backend.abortBulkIngestSession(),
-            .native => {},
+            .native, .native_catalog => {},
         };
         self.write_session_depth -= 1;
         if (self.write_session_depth == 0) {
@@ -9563,6 +9581,13 @@ pub const HBCIndex = struct {
                 .root_dir = handle.backend.root_dir orelse return error.MissingStorageRoot,
             },
             .native => |backend| .{ .storage = backend.storage, .root_dir = backend.root_dir },
+            // This experimental raw posting-WAL/checkpoint sidecar is a
+            // directory-of-files structure; `.native_catalog` has neither a
+            // directory nor a standalone LSM storage handle to anchor one.
+            // See the design doc's WS4-for-vectors note: metadata and small
+            // postings are KV records instead, so this path must never be
+            // reached for a `.native_catalog`-backed index.
+            .native_catalog => return error.Unsupported,
         };
         const posting_root = try std.fs.path.join(self.alloc, &.{ location.root_dir, "posting-segments" });
         defer self.alloc.free(posting_root);
@@ -9577,6 +9602,7 @@ pub const HBCIndex = struct {
                 .root_dir = handle.backend.root_dir orelse return error.MissingStorageRoot,
             },
             .native => |backend| .{ .storage = backend.storage, .root_dir = backend.root_dir },
+            .native_catalog => return error.Unsupported,
         };
         const posting_root = try std.fs.path.join(self.alloc, &.{ location.root_dir, "posting-segments" });
         defer self.alloc.free(posting_root);
@@ -13839,7 +13865,7 @@ pub const HBCIndex = struct {
     fn runtimeBatchMode(self: *const HBCIndex, in_bulk_session: bool) vectorindex_store.BatchMode {
         return switch (self.env_owner) {
             .lsm => |handle| hbcRuntimeBatchMode(in_bulk_session, handle.backend.options.direct_bulk_ingest),
-            .native => hbcRuntimeBatchMode(in_bulk_session, null),
+            .native, .native_catalog => hbcRuntimeBatchMode(in_bulk_session, null),
         };
     }
 

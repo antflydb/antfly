@@ -317,6 +317,9 @@ pub const IndexBackendOptions = struct {
     /// `storage/native_catalog_backend.zig:Sink`.
     text_main_native_catalog_sink: ?persistent_mod.NativeCatalogSink = null,
     dense_storage_backend: hbc_mod.StorageBackend = .lsm,
+    /// Required when `dense_storage_backend == .native_catalog` (Lite
+    /// only). See `storage/native_catalog_backend.zig:Sink`.
+    dense_main_native_catalog_sink: ?hbc_mod.NativeCatalogSink = null,
     sparse_backend: sparse_mod.SparseBackend = .lsm,
     /// Required when `sparse_backend == .native_catalog` (Lite only). See
     /// `storage/native_catalog_backend.zig:Sink`.

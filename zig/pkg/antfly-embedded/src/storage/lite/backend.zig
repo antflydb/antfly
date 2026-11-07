@@ -305,14 +305,24 @@ pub const Handle = struct {
                 // lite/native_catalog_sink.zig. Sparse's own postings/chunk
                 // metadata is the same native-catalog view (see
                 // sparse/sparse.zig's `.native_catalog` `SparseBackend`).
-                // Dense and graph indexes are unaffected and stay on `.lsm`
-                // (see the design doc's WS4-for-vectors open risk: dense's
-                // storage owner is switched on exhaustively at ~20 sites in
-                // hbc_adapter.zig, each needing its own review before this
-                // can safely follow sparse's lead).
+                // Dense's HBC metadata/node/postings KV namespaces are
+                // implemented the same way (storage/hbc_backend.zig's
+                // `OpenedBackend.native_catalog`, reviewed per-site across
+                // hbc_adapter.zig's ~20 switches over `env_owner`) and
+                // compiles, but is NOT activated below pending a clean
+                // (uncontended-machine) rerun of the write-amplification
+                // harness: a contended run during this change surfaced
+                // `UnexpectedNativePageKind` on the unrelated `full_text`
+                // mode (no dense index at all) with dense flipped on, which
+                // did not reproduce with dense back on `.lsm` -- see this
+                // handback's bug-3/open-risk section. `dense_main_native_
+                // catalog_sink` is still wired below so reactivating is a
+                // one-line flip once that is cleared. Graph indexes are
+                // unaffected and stay on `.lsm`.
                 opts.index_backends.text_main_backend = .native_catalog;
                 opts.index_backends.text_main_native_catalog_sink = self.native_catalog_sink.?.sink();
                 opts.index_backends.dense_storage_backend = .lsm;
+                opts.index_backends.dense_main_native_catalog_sink = self.native_catalog_sink.?.sink();
                 opts.index_backends.sparse_backend = .native_catalog;
                 opts.index_backends.sparse_main_native_catalog_sink = self.native_catalog_sink.?.sink();
                 opts.index_backends.graph_reverse_backend = .lsm;
@@ -393,6 +403,7 @@ pub const Handle = struct {
         opts.index_backends.text_main_backend = .native_catalog;
         opts.index_backends.text_main_native_catalog_sink = self.native_catalog_sink.?.sink();
         opts.index_backends.dense_storage_backend = .lsm;
+        opts.index_backends.dense_main_native_catalog_sink = self.native_catalog_sink.?.sink();
         opts.index_backends.sparse_backend = .native_catalog;
         opts.index_backends.sparse_main_native_catalog_sink = self.native_catalog_sink.?.sink();
         opts.index_backends.graph_reverse_backend = .lsm;
@@ -1199,8 +1210,17 @@ test "lite backend native engine creates and checks aflite file" {
     try std.testing.expect(db_opts.primary_backend == .mem);
     try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.text_main_backend), .native_catalog), db_opts.index_backends.text_main_backend);
     try std.testing.expect(db_opts.index_backends.text_main_native_catalog_sink != null);
+    // Pre-existing gap fixed alongside dense's own native_catalog wiring:
+    // this asserted `.lsm` even after sparse_backend was landed as
+    // `.native_catalog` (the real value configureDbOpenOptions sets above),
+    // so this regression test was not actually covering sparse's real
+    // configured value. Dense stays asserted `.lsm` here too: its own
+    // `.native_catalog` wiring compiles but is not activated yet (see the
+    // comment above this function's `dense_storage_backend` assignment).
     try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.dense_storage_backend), .lsm), db_opts.index_backends.dense_storage_backend);
-    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.sparse_backend), .lsm), db_opts.index_backends.sparse_backend);
+    try std.testing.expect(db_opts.index_backends.dense_main_native_catalog_sink != null);
+    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.sparse_backend), .native_catalog), db_opts.index_backends.sparse_backend);
+    try std.testing.expect(db_opts.index_backends.sparse_main_native_catalog_sink != null);
     try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.graph_reverse_backend), .lsm), db_opts.index_backends.graph_reverse_backend);
     try std.testing.expect(db_opts.index_backends.text_lsm_storage != null);
     try std.testing.expect(db_opts.index_backends.dense_lsm_storage != null);

@@ -1399,6 +1399,7 @@ pub const IndexManager = struct {
     text_main_lsm_options: lsm_backend_mod.Options,
     text_wal_lsm_options: lsm_backend_mod.Options,
     dense_storage_backend: hbc_mod.StorageBackend,
+    dense_main_native_catalog_sink: ?hbc_mod.NativeCatalogSink = null,
     dense_lsm_storage: ?lsm_backend_mod.Storage,
     vector_block_storage: ?lsm_backend_mod.Storage,
     generation_storage: ?lsm_backend_mod.Storage,
@@ -3315,6 +3316,7 @@ pub const IndexManager = struct {
             .text_main_lsm_options = text_main_lsm_options,
             .text_wal_lsm_options = text_wal_lsm_options,
             .dense_storage_backend = opts.dense_storage_backend,
+            .dense_main_native_catalog_sink = opts.dense_main_native_catalog_sink,
             .dense_lsm_storage = opts.dense_lsm_storage,
             .vector_block_storage = vector_block_storage,
             .generation_storage = opts.generation_storage,
@@ -6857,6 +6859,7 @@ pub const IndexManager = struct {
             .storage = self.effectiveDenseStorage(),
             .cache = self.lsm_cache,
             .root_generation = self.lsm_root_generation,
+            .native_catalog_sink = self.dense_main_native_catalog_sink,
         });
         errdefer entry.index.close();
 
@@ -23470,6 +23473,7 @@ pub const IndexManager = struct {
                     .storage = self.effectiveDenseStorage(),
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
+                    .native_catalog_sink = self.dense_main_native_catalog_sink,
                 });
                 index_open = true;
                 index.setIo(self.io);
