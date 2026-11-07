@@ -396,15 +396,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
         for (self.workers.items) |worker| {
             if (worker.future) |*future| _ = future.await(io);
-            _ = closeWorkerCatchUpState(self, worker, worker.applied_sequence, true) catch |err| {
-                std.log.warn("derived worker final catch-up close failed worker={s}: {s}", .{ worker.name, @errorName(err) });
-            };
-            if (worker.applied_sequence > worker.persisted_sequence) {
-                _ = self.persist_fn(self.ctx, worker.name, worker.applied_sequence, true) catch |err| failed: {
-                    std.log.warn("derived worker final applied-sequence persist failed worker={s}: {s}", .{ worker.name, @errorName(err) });
-                    break :failed false;
-                };
-            }
+            finalizeWorkerStateOnShutdown(self, worker, io);
             self.alloc.free(worker.name);
             self.alloc.destroy(worker);
         }
@@ -416,6 +408,49 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             self.alloc.destroy(self.threaded);
         }
         self.* = undefined;
+    }
+
+    /// Shutdown cannot wait out a persistently unavailable dependency the
+    /// way a live dispatch's backoff does, but it must still give a
+    /// transient fault (`isRecoverableCatchUpError`/`isRecoverablePersistError`
+    /// -- the same classes every other retry site in this file treats as
+    /// recoverable, see `isRecoverablePersistError`'s doc comment) a real
+    /// chance to clear before giving up. A single swallowed attempt here
+    /// used to silently drop `worker.applied_sequence` -- content this
+    /// process had already applied and made visible -- leaving the durable
+    /// checkpoint stuck at the older `persisted_sequence` for the next open
+    /// to resume from, with nothing to say recovery is still owed.
+    const shutdown_final_persist_max_attempts: usize = 8;
+
+    fn finalizeWorkerStateOnShutdown(self: *DerivedRuntime, worker: *Worker, io: Io) void {
+        var close_backoff = catch_up_policy.RecoverableRetryBackoff{};
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            if (closeWorkerCatchUpState(self, worker, worker.applied_sequence, true)) |_| break else |err| {
+                if (attempt + 1 < shutdown_final_persist_max_attempts and isRecoverableCatchUpError(worker, err)) {
+                    const delay_ns = catch_up_policy.recordRecoverableRetry(&self.recoverable_retry_counters, self.backlog.resource_manager, &close_backoff, err);
+                    io.sleep(Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
+                    continue;
+                }
+                std.log.warn("derived worker final catch-up close failed worker={s}: {s}", .{ worker.name, @errorName(err) });
+                break;
+            }
+        }
+
+        if (worker.applied_sequence <= worker.persisted_sequence) return;
+        var persist_backoff = catch_up_policy.RecoverableRetryBackoff{};
+        attempt = 0;
+        while (true) : (attempt += 1) {
+            if (self.persist_fn(self.ctx, worker.name, worker.applied_sequence, true)) |_| return else |err| {
+                if (attempt + 1 < shutdown_final_persist_max_attempts and isRecoverablePersistError(err)) {
+                    const delay_ns = catch_up_policy.recordRecoverableRetry(&self.recoverable_retry_counters, self.backlog.resource_manager, &persist_backoff, err);
+                    io.sleep(Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
+                    continue;
+                }
+                std.log.warn("derived worker final applied-sequence persist failed worker={s}: {s}", .{ worker.name, @errorName(err) });
+                return;
+            }
+        }
     }
 
     pub fn beginShutdown(self: *DerivedRuntime) void {
@@ -1084,7 +1119,7 @@ fn workerMain(worker: *Worker) void {
                 else
                     cleanupIdleAppliedSequence(runtime, io)) catch |err| {
                     if (err == error.WorkerStopping) return;
-                    if (catch_up_policy.isRecoverableAdmissionError(err)) {
+                    if (isRecoverablePersistError(err)) {
                         scheduleRecoverableCatchUpRetry(worker, err);
                         return;
                     }
@@ -1289,7 +1324,7 @@ fn workerMain(worker: *Worker) void {
 
         if (caught_up_sequence > from_sequence and !persisted) {
             persisted = runtime.persist_fn(runtime.ctx, worker.name, caught_up_sequence, forcePersistAppliedSequence(worker)) catch |err| {
-                if (catch_up_policy.isRecoverableAdmissionError(err)) {
+                if (isRecoverablePersistError(err)) {
                     scheduleRecoverableCatchUpRetry(worker, err);
                     continue;
                 }
@@ -1394,7 +1429,7 @@ fn truncateWithVisibilityWait(runtime: *DerivedRuntime, sequence: u64, wait: run
             continue;
         }
         runtime.truncate_fn(runtime.ctx, sequence) catch |err| {
-            if (!catch_up_policy.isRecoverableAdmissionError(err)) return err;
+            if (!isRecoverablePersistError(err)) return err;
             runtime.mutex.lockUncancelable(io);
             const delay = catch_up_policy.recordRecoverableRetry(&runtime.recoverable_retry_counters, runtime.backlog.resource_manager, &runtime.truncate_retry_backoff, err);
             runtime.truncate_retry_not_before_ns = platform_time.monotonicNs() +| delay;
@@ -1418,7 +1453,7 @@ fn completeWorkerTruncateAttempt(runtime: *DerivedRuntime, sequence: u64, io: Io
         defer runtime.mutex.unlock(io);
         runtime.truncates_in_flight -= 1;
         runtime.last_claimed_truncate_sequence = runtime.last_truncated_sequence;
-        if (catch_up_policy.isRecoverableAdmissionError(err)) {
+        if (isRecoverablePersistError(err)) {
             const delay = catch_up_policy.recordRecoverableRetry(&runtime.recoverable_retry_counters, runtime.backlog.resource_manager, &runtime.truncate_retry_backoff, err);
             runtime.truncate_retry_not_before_ns = platform_time.monotonicNs() +| delay;
             runtime.signalWorkers(io);
@@ -1534,6 +1569,25 @@ fn closeWorkerCatchUpState(
             token.value, applied_sequence, success, finish_result.applied_sequence_persisted,
         });
     return finish_result;
+}
+
+/// `persist_fn`/`truncate_fn` are themselves write/sync operations on the
+/// same primary store a derived worker's own journal_apply retries already
+/// treat `catch_up_policy.isTransientIoError` (OutcomeUnknown, InputOutput,
+/// NoSpaceLeft, DiskQuota, OutcomeReconciliationRequired) as recoverable
+/// for -- see that function's doc comment. Every call site below used to
+/// check only `isRecoverableAdmissionError`, so a transient I/O fault that
+/// landed on the *persist* or *truncate* step specifically (rather than the
+/// apply step) fell through to `recordError`/a propagated error, which
+/// latches `last_error_name` and permanently stops the worker: the backlog
+/// it had just (successfully) applied in memory never gets durably
+/// checkpointed, and no further retry ever runs even after the underlying
+/// I/O recovers. That is exactly "derived catch_up failed ... err=
+/// OutcomeUnknown" repeating for the same journal sequence until the worker
+/// gives up: the apply step keeps retrying correctly, but the very next
+/// persist of that same successful apply does not.
+fn isRecoverablePersistError(err: anyerror) bool {
+    return catch_up_policy.isRecoverableAdmissionError(err) or catch_up_policy.isTransientIoError(err);
 }
 
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
@@ -1712,6 +1766,14 @@ const TestThreadedRuntimeCapture = struct {
     would_block_failures: std.atomic.Value(u64) = .init(0),
     fail_next_publish: std.atomic.Value(bool) = .init(false),
     fail_next_truncate_writer_locked: std.atomic.Value(bool) = .init(false),
+    /// Counter-based (not one-shot) transient-I/O fault for the ordinary
+    /// (non-forced) `persist_fn` call: decrements on every call until it
+    /// reaches zero, then persists normally. Lets a regression test drive
+    /// several consecutive recoverable failures before the fault clears,
+    /// instead of only ever exercising a single retry.
+    persist_fail_remaining: std.atomic.Value(u32) = .init(0),
+    persist_fail_err: anyerror = error.OutcomeUnknown,
+    persist_fail_calls: std.atomic.Value(u64) = .init(0),
     block_finish: std.atomic.Value(bool) = .init(false),
     finish_entered: std.atomic.Value(bool) = .init(false),
     release_finish: std.atomic.Value(bool) = .init(false),
@@ -1753,6 +1815,13 @@ fn testThreadedRuntimePersist(ctx: *anyopaque, index_name: []const u8, sequence:
     _ = index_name;
     const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
     if (force and capture.fail_next_forced_persist.swap(false, .monotonic)) return error.Canceled;
+    if (!force) {
+        _ = capture.persist_fail_calls.fetchAdd(1, .monotonic);
+        var remaining = capture.persist_fail_remaining.load(.monotonic);
+        while (remaining > 0) {
+            remaining = capture.persist_fail_remaining.cmpxchgWeak(remaining, remaining - 1, .monotonic, .monotonic) orelse return capture.persist_fail_err;
+        }
+    }
     capture.persisted_sequence.store(sequence, .monotonic);
     return true;
 }
@@ -2702,6 +2771,80 @@ test "issue1015 full-text catch-up WouldBlock retries without poisoning worker" 
     try std.testing.expect(capture.finish_calls.load(.monotonic) >= 2);
     try std.testing.expectEqual(@as(u64, 1), runtime.appliedSequence("text_idx").?);
     try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
+}
+
+// Regression for the lwa-catchup-gate bug: `workerMain`'s ordinary
+// (non-forced) `persist_fn` call used to check only
+// `catch_up_policy.isRecoverableAdmissionError`, not
+// `isTransientIoError` (OutcomeUnknown, InputOutput, NoSpaceLeft,
+// DiskQuota, OutcomeReconciliationRequired) -- the exact class every
+// *other* retry site in this file (`isRecoverableCatchUpError`/
+// `isRecoverablePublishError`, and now `isRecoverablePersistError`)
+// already treats as recoverable. A single transient persist failure
+// after a *successful* apply used to call `recordError`, latching
+// `worker.last_error_name` forever: the backlog had already been
+// applied (visible in memory) but the worker stopped retrying before it
+// was ever durably checkpointed, and no amount of waiting recovered it
+// -- exactly "derived catch_up failed ... err=OutcomeUnknown" repeating
+// for the same journal sequence until the worker gives up.
+//
+// Injects `persist_fail_attempts` consecutive OutcomeUnknown failures
+// from the ordinary persist path, then lets it clear, and asserts the
+// worker keeps retrying (never poisoned) until the backlog is both
+// applied *and* durably persisted.
+test "issue-lwa-catchup-gate derived worker persist OutcomeUnknown retries repeatedly without poisoning worker" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/issue-lwa-catchup-gate-persist-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    try appendTestThreadedRuntimeRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.full_text},
+    });
+
+    var capture = TestThreadedRuntimeCapture{};
+    const persist_fail_attempts: u32 = 5;
+    capture.persist_fail_remaining.store(persist_fail_attempts, .monotonic);
+    capture.persist_fail_err = error.OutcomeUnknown;
+    var runtime = try DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testThreadedRuntimeApply,
+        testThreadedRuntimePersist,
+        testThreadedRuntimeTruncate,
+        testThreadedRuntimeBeginCatchUp,
+        testThreadedRuntimeFinishCatchUp,
+        null,
+        null,
+        null,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("text_idx", .{ .name = "text_idx", .kind = .full_text }, 0);
+    runtime.notifySequence(1);
+    try runtime.waitForAllWithVisibilityWait(1, .{ .deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_s });
+
+    // The gate check task 2 asks for: a worker that is still behind must
+    // never look healthy. At this point the fault has cleared and
+    // `waitForAllWithVisibilityWait` proves catch-up actually reached the
+    // target, so health and full durable coverage must both hold now.
+    try runtime.failIfUnhealthy();
+    try std.testing.expectEqual(@as(u64, 1), runtime.appliedSequence("text_idx").?);
+    try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
+    // Proves this actually retried through the repeated fault rather than
+    // succeeding on the first (uninjected) call: at least the N injected
+    // failures plus the one call that finally landed.
+    try std.testing.expect(capture.persist_fail_calls.load(.monotonic) >= persist_fail_attempts + 1);
+    try std.testing.expectEqual(@as(u32, 0), capture.persist_fail_remaining.load(.monotonic));
 }
 
 test "issue1015 terminal worker failure leaves unrelated worker operational and retains journal" {
