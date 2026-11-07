@@ -28,6 +28,20 @@ pub const types = backend_types;
 pub const Entry = backend_adapter.Entry;
 pub const ReplayEntry = backend_types.ReplayEntry;
 
+/// Backend-agnostic mirror of `native_catalog_backend.Mutation`'s shape,
+/// without this file depending on that Lite-specific module (this erasure
+/// layer stays backend-agnostic; `native_catalog_backend.zig` already
+/// depends on it, so the reverse import would be circular). Populated only
+/// when the concrete backend behind a `NamespaceWriteTxn`/`NamespaceBatch`
+/// supports harvesting pending mutations before commit -- see
+/// `NamespaceWriteTxn.pendingMutations`.
+pub const PendingMutation = struct {
+    namespace: ?[]const u8,
+    key: []const u8,
+    value: []const u8 = "",
+    is_delete: bool = false,
+};
+
 fn Box(comptime T: type) type {
     return struct {
         allocator: Allocator,
@@ -896,6 +910,13 @@ pub const NamespaceWriteTxn = struct {
         /// backends with no such distinction (every commit is durable).
         /// See `NamespaceWriteTxn.setDurableHint`.
         set_durable: ?*const fn (*anyopaque, bool) void = null,
+        /// Optional: this transaction's staged mutations harvested before
+        /// any commit (lite-single-commit-write-path.md §3.3a's "stage,
+        /// then install" mode), to fold into an externally-owned commit.
+        /// Absent for every backend but one that can expose its own
+        /// pending-mutation list (today, `.native_catalog`). See
+        /// `NamespaceWriteTxn.pendingMutations`.
+        pending_mutations: ?*const fn (Allocator, *anyopaque) anyerror![]const PendingMutation = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -907,6 +928,19 @@ pub const NamespaceWriteTxn = struct {
     pub fn commit(self: *NamespaceWriteTxn) !void {
         try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
         self.* = undefined;
+    }
+
+    /// This transaction's staged mutations, to fold into an externally-
+    /// owned commit instead of calling `commit` on this transaction (the
+    /// caller must still `abort` it once it has harvested what it needs --
+    /// this never talks to the backend's durable sink). `null` when the
+    /// concrete backend has no such harvest mechanism. The returned slice
+    /// of structs is freshly allocated (caller-owned), but the byte slices
+    /// inside are still borrowed from this transaction's own storage and
+    /// must be deep-copied before `abort`.
+    pub fn pendingMutations(self: *NamespaceWriteTxn) !?[]const PendingMutation {
+        const f = self.vtable.pending_mutations orelse return null;
+        return try BoundaryAbi.call("pending_mutations", self.boundary_dispatch, f, .{ self.allocator, self.ptr });
     }
 
     /// Call before `commit()`. `durable = false` asks the backend to ride
@@ -1217,6 +1251,8 @@ pub const NamespaceBatch = struct {
         append_put: ?*const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror!void,
         staged_bytes: ?*const fn (*anyopaque) anyerror!u64 = null,
+        /// See `NamespaceWriteTxn.VTable.pending_mutations`.
+        pending_mutations: ?*const fn (Allocator, *anyopaque) anyerror![]const PendingMutation = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -1225,6 +1261,12 @@ pub const NamespaceBatch = struct {
     pub fn stagedBytes(self: *NamespaceBatch) !?u64 {
         const staged = self.vtable.staged_bytes orelse return null;
         return try BoundaryAbi.call("staged_bytes", self.boundary_dispatch, staged, .{self.ptr});
+    }
+
+    /// See `NamespaceWriteTxn.pendingMutations`.
+    pub fn pendingMutations(self: *NamespaceBatch) !?[]const PendingMutation {
+        const f = self.vtable.pending_mutations orelse return null;
+        return try BoundaryAbi.call("pending_mutations", self.boundary_dispatch, f, .{ self.allocator, self.ptr });
     }
 
     pub fn abort(self: *NamespaceBatch) void {
@@ -2130,6 +2172,13 @@ pub fn namespaceWriteTxnFrom(
         pub fn setDurable(ptr: *anyopaque, durable: bool) void {
             unbox(ptr).handle.setDurable(durable);
         }
+
+        pub fn pendingMutations(alloc: Allocator, ptr: *anyopaque) anyerror![]const PendingMutation {
+            const raw = unbox(ptr).handle.pendingMutations();
+            const out = try alloc.alloc(PendingMutation, raw.len);
+            for (raw, out) |m, *o| o.* = .{ .namespace = m.namespace, .key = m.key, .value = m.value, .is_delete = m.is_delete };
+            return out;
+        }
     };
 
     return .{
@@ -2145,6 +2194,7 @@ pub fn namespaceWriteTxnFrom(
             .delete = vt.delete,
             .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
             .set_durable = if (@hasDecl(Handle, "setDurable")) vt.setDurable else null,
+            .pending_mutations = if (@hasDecl(Handle, "pendingMutations")) vt.pendingMutations else null,
         },
     };
 }
@@ -2368,6 +2418,13 @@ pub fn namespaceBatchFrom(
             if (comptime @hasDecl(Handle, "stagedLogicalBytes")) return inner.stagedLogicalBytes();
             return try inner.stagedBytes() orelse error.Unsupported;
         }
+
+        pub fn pendingMutations(alloc: Allocator, ptr: *anyopaque) anyerror![]const PendingMutation {
+            const raw = unbox(ptr).handle.pendingMutations();
+            const out = try alloc.alloc(PendingMutation, raw.len);
+            for (raw, out) |m, *o| o.* = .{ .namespace = m.namespace, .key = m.key, .value = m.value, .is_delete = m.is_delete };
+            return out;
+        }
     };
 
     const has_staged = comptime @hasDecl(Handle, "stagedLogicalBytes") or @hasDecl(Handle, "stagedBytes");
@@ -2383,6 +2440,7 @@ pub fn namespaceBatchFrom(
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
             .staged_bytes = if (has_staged) vt.stagedBytes else null,
+            .pending_mutations = if (@hasDecl(Handle, "pendingMutations")) vt.pendingMutations else null,
         },
     };
 }

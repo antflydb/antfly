@@ -15223,6 +15223,155 @@ pub const HBCIndex = struct {
         try std.testing.expectEqual(@as(u64, 7), decoded.projection_applied_sequence);
     }
 
+    // lite-single-commit-write-path.md §3.3a, dense-one-commit task 1/3:
+    // the vectorindex library's stage-only insert/delete mode, exercised
+    // against a real `.native_catalog`-backed `HBCIndex` (mirrors the
+    // checkpoint-publication test above). Covers: a search-visible read
+    // (`publishedActiveCount`) during the staged window still sees the
+    // pre-stage state; `abortStagedWrite` restores the in-memory routing
+    // tree exactly; `installStagedWrite` (after the harvested mutations
+    // are durable through a separate stand-in commit) publishes it.
+    test "insertWithMetadataStaged/deleteStaged: search sees old state during stage, abort restores, install publishes" {
+        const TestSink = struct {
+            allocator: Allocator,
+            entries: std.ArrayListUnmanaged(native_catalog_backend.Entry) = .empty,
+            submit_calls: usize = 0,
+
+            fn deinit(self: *@This()) void {
+                for (self.entries.items) |e| {
+                    if (e.namespace) |n| self.allocator.free(n);
+                    self.allocator.free(e.key);
+                    self.allocator.free(e.value);
+                }
+                self.entries.deinit(self.allocator);
+            }
+
+            fn findIndex(self: *@This(), namespace: ?[]const u8, key: []const u8) ?usize {
+                for (self.entries.items, 0..) |e, i| {
+                    const same_ns = (e.namespace == null and namespace == null) or
+                        (e.namespace != null and namespace != null and std.mem.eql(u8, e.namespace.?, namespace.?));
+                    if (same_ns and std.mem.eql(u8, e.key, key)) return i;
+                }
+                return null;
+            }
+
+            fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                _ = scope;
+                _ = durable;
+                self.submit_calls += 1;
+                for (mutations) |m| {
+                    if (m.is_delete) continue;
+                    if (self.findIndex(m.namespace, m.key)) |i| {
+                        self.allocator.free(self.entries.items[i].value);
+                        self.entries.items[i].value = try self.allocator.dupe(u8, m.value);
+                        continue;
+                    }
+                    try self.entries.append(self.allocator, .{
+                        .namespace = if (m.namespace) |n| try self.allocator.dupe(u8, n) else null,
+                        .key = try self.allocator.dupe(u8, m.key),
+                        .value = try self.allocator.dupe(u8, m.value),
+                    });
+                }
+            }
+
+            fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                _ = scope;
+                return try allocator.dupe(native_catalog_backend.Entry, self.entries.items);
+            }
+
+            fn sink(self: *@This()) native_catalog_backend.Sink {
+                return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc };
+            }
+        };
+
+        // Stands in for `commit_participant.View.putIndexCatalog`'s host
+        // transaction: translates `StagedWrite.mutations` (the vectorindex
+        // library's own backend-agnostic `PendingMutation`) into this
+        // test's `native_catalog_backend.Mutation` and submits them through
+        // the SAME sink the index's own commits would use, exactly as a
+        // real primary write's native transaction would once it commits.
+        const commitStaged = struct {
+            fn call(alloc: Allocator, sink: native_catalog_backend.Sink, scope: []const u8, mutations: []const vectorindex_store.PendingMutation) !void {
+                const translated = try alloc.alloc(native_catalog_backend.Mutation, mutations.len);
+                defer alloc.free(translated);
+                for (mutations, translated) |m, *t| t.* = .{ .namespace = m.namespace, .key = m.key, .value = m.value, .is_delete = m.is_delete };
+                try sink.submit(sink.ptr, scope, translated, true);
+            }
+        }.call;
+
+        const a = std.testing.allocator;
+        var test_sink = TestSink{ .allocator = a };
+        defer test_sink.deinit();
+
+        var idx = try HBCIndex.openWithLsmOptions(a, "test-dense-staged-write", .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 2,
+            .search_width = 8,
+            .storage_backend = .native_catalog,
+        }, .{ .native_catalog_sink = test_sink.sink() });
+        defer idx.close();
+
+        const scope = idx.nativeCatalogScope().?;
+
+        // --- Insert, staged ---
+        const submits_before = test_sink.submit_calls;
+        var staged = try idx.insertWithMetadataStaged(1, &.{ 1.0, 0.0 }, "");
+        // The in-memory routing tree already reflects the insert...
+        try std.testing.expectEqual(@as(u64, 1), idx.metadata.active_count);
+        // ...but nothing durable happened, and nothing is search-visible yet.
+        try std.testing.expectEqual(submits_before, test_sink.submit_calls);
+        try std.testing.expectEqual(@as(u64, 0), idx.publishedActiveCount());
+        try std.testing.expect(staged.mutations.len > 0);
+
+        // Abort: the in-memory tree reverts to the published (pre-stage)
+        // snapshot exactly, and nothing was ever durable.
+        idx.abortStagedWrite(&staged);
+        try std.testing.expectEqual(@as(u64, 0), idx.metadata.active_count);
+        try std.testing.expectEqual(@as(u64, 0), idx.publishedActiveCount());
+        try std.testing.expectEqual(submits_before, test_sink.submit_calls);
+
+        // Stage again, actually commit the harvested mutations through a
+        // SEPARATE call standing in for an externally-owned primary
+        // write's native transaction, then install.
+        var staged2 = try idx.insertWithMetadataStaged(1, &.{ 1.0, 0.0 }, "");
+        try std.testing.expectEqual(@as(u64, 0), idx.publishedActiveCount());
+        try commitStaged(a, test_sink.sink(), scope, staged2.mutations);
+        try idx.installStagedWrite(&staged2);
+        try std.testing.expectEqual(@as(u64, 1), idx.metadata.active_count);
+        try std.testing.expectEqual(@as(u64, 1), idx.publishedActiveCount());
+
+        // A fresh search must see it too (not just the bookkeeping
+        // counters): the install really did make this index's own reader
+        // state consistent with what was just published.
+        {
+            var results = try idx.search(&.{ 1.0, 0.0 }, 1);
+            defer results.deinit();
+            try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
+        }
+
+        // --- Delete, staged ---
+        const submits_before_delete = test_sink.submit_calls;
+        var del_staged = try idx.deleteStaged(1);
+        // Already removed from the live routing tree...
+        try std.testing.expectEqual(@as(u64, 0), idx.metadata.active_count);
+        // ...but still search-visible until install.
+        try std.testing.expectEqual(@as(u64, 1), idx.publishedActiveCount());
+        try std.testing.expectEqual(submits_before_delete, test_sink.submit_calls);
+
+        idx.abortStagedWrite(&del_staged);
+        try std.testing.expectEqual(@as(u64, 1), idx.metadata.active_count);
+        try std.testing.expectEqual(@as(u64, 1), idx.publishedActiveCount());
+
+        var del_staged2 = try idx.deleteStaged(1);
+        try commitStaged(a, test_sink.sink(), scope, del_staged2.mutations);
+        try idx.installStagedWrite(&del_staged2);
+        try std.testing.expectEqual(@as(u64, 0), idx.metadata.active_count);
+        try std.testing.expectEqual(@as(u64, 0), idx.publishedActiveCount());
+    }
+
     fn persistBulkPublishState(self: *HBCIndex) !void {
         // Publication intent must not itself make an otherwise empty session
         // look mutated, and it must be committed outside deferred session batch
@@ -18057,6 +18206,23 @@ pub const HBCIndex = struct {
         try vectorindex_hbc_index.insertWithMetadata(self, vector_id, vector_data, metadata_value, nowNs, elapsedSince);
     }
 
+    /// Stage-only counterpart of `insertWithMetadata`:
+    /// lite-single-commit-write-path.md §3.3a's dense extension of WS4
+    /// phase 2. See `vectorindex_hbc_index.StagedWrite`'s doc comment for
+    /// the full stage/install/abort contract. Returns
+    /// `error.StagedPublicationUnsupported` for a leann-backed index (no
+    /// stage-without-commit mode) or any backend but `.native_catalog`
+    /// (checked by the library call itself; see `nativeCatalogScope`).
+    pub fn insertWithMetadataStaged(self: *HBCIndex, vector_id: u64, vector_data: []const f32, metadata_value: []const u8) !vectorindex_hbc_index.StagedWrite {
+        if (self.leann != null) return error.StagedPublicationUnsupported;
+        try self.captureExactVectorBatch(&.{.{
+            .vector_id = vector_id,
+            .vector = vector_data,
+            .metadata = metadata_value,
+        }}, &.{});
+        return try vectorindex_hbc_index.insertWithMetadataStaged(self, vector_id, vector_data, metadata_value, nowNs, elapsedSince);
+    }
+
     pub fn batchInsertWithMetadata(self: *HBCIndex, items: []const BatchInsertItem) !void {
         try self.batchInsertWithMetadataOptions(items, .{});
     }
@@ -19482,6 +19648,48 @@ pub const HBCIndex = struct {
         if (self.leann) |store| return store.apply(&[_]BatchInsertItem{}, &.{vector_id});
         try self.captureExactVectorBatch(&.{}, &.{vector_id});
         try vectorindex_hbc_index.delete(self, vector_id);
+    }
+
+    /// Stage-only counterpart of `delete`; see `insertWithMetadataStaged`.
+    pub fn deleteStaged(self: *HBCIndex, vector_id: u64) !vectorindex_hbc_index.StagedWrite {
+        if (self.leann != null) return error.StagedPublicationUnsupported;
+        try self.captureExactVectorBatch(&.{}, &.{vector_id});
+        return try vectorindex_hbc_index.deleteStaged(self, vector_id);
+    }
+
+    /// Runs only after `staged.mutations` are already durable in an
+    /// externally-owned commit (folded in via `commit_participant.View.
+    /// putIndexCatalog(nativeCatalogScope(), staged.mutations)`). Publishes
+    /// this index's in-memory metadata and releases `published_snapshot_mu`.
+    pub fn installStagedWrite(self: *HBCIndex, staged: *vectorindex_hbc_index.StagedWrite) !void {
+        try vectorindex_hbc_index.installStagedWrite(self, staged);
+    }
+
+    /// `staged.mutations` were never committed durably. Restores this
+    /// index's in-memory metadata to what it was before
+    /// `insertWithMetadataStaged`/`deleteStaged` and releases
+    /// `published_snapshot_mu`.
+    pub fn abortStagedWrite(self: *HBCIndex, staged: *vectorindex_hbc_index.StagedWrite) void {
+        vectorindex_hbc_index.abortStagedWrite(self, staged);
+    }
+
+    /// This index's `.native_catalog` backend scope -- the same string a
+    /// caller must pass as `scope` to `commit_participant.View.
+    /// putIndexCatalog` when folding `insertWithMetadataStaged`/
+    /// `deleteStaged`'s harvested mutations into an externally-owned
+    /// native transaction. `null` when this index is not
+    /// `.native_catalog`-backed (in which case
+    /// `insertWithMetadataStaged`/`deleteStaged` already fail with
+    /// `error.StagedPublicationUnsupported`, so a caller that checks this
+    /// first never needs to attempt staging at all). Mirrors
+    /// `persistent.zig`'s `PersistentIndex.nativeCatalogScope` and
+    /// `graph/graph.zig`'s `GraphIndex.forwardCatalogScope`/
+    /// `reverseCatalogScope`.
+    pub fn nativeCatalogScope(self: *const HBCIndex) ?[]const u8 {
+        return switch (self.env_owner) {
+            .native_catalog => |backend| backend.scope,
+            .lsm, .native => null,
+        };
     }
 
     pub fn batchDelete(self: *HBCIndex, vector_ids: []const u64) !void {
