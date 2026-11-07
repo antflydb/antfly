@@ -22,6 +22,7 @@ const h = @import("handles.zig");
 const api = @import("db.zig");
 const std = h.std;
 const native = h.lite_backend.native;
+const antfly_platform = @import("antfly_platform");
 const alloc = std.heap.c_allocator;
 
 const memo_mod = @import("antfly_inference_query_embedding_cache");
@@ -990,15 +991,18 @@ pub const Demand = packed struct(u8) {
 /// callers sharing this `Owner`'s `Store` nothing, since their actual mutual
 /// exclusion is already enforced by the DB apply lock and the Store's own
 /// group-commit queue. This lane keeps the kernel lease parked for the next
-/// same-Store writer only when one is *already* polling for it
-/// (`checkin`'s `waiting != 0` case) -- never speculatively -- and
-/// releases it, always after a `Store.sync()` so the next holder (local or
-/// not) sees a durable tip, the moment local demand pauses. See `checkin`'s
-/// doc comment for why this does not instead key off
-/// `PathWriterLock.othersWaiting`: this process's own maintenance worker
-/// competes for the same kernel lease through the same file-based fair
-/// queue as a genuinely remote waiter, and the two are indistinguishable
-/// from that signal alone.
+/// same-Store writer -- unconditionally when one is *already* polling for
+/// it (`checkin`'s `waiting != 0` case, zero cost), otherwise until a
+/// genuinely foreign waiter (a different process, or a different
+/// in-process `Owner`) has been queued past a short fairness quantum --
+/// and releases it, always after a `Store.sync()` so the next holder sees
+/// a durable tip. See `checkin`'s doc comment for why the foreign check
+/// uses `PathWriterLock.othersWaitingAcrossProcesses`, not the plain
+/// `othersWaiting`: this process's own maintenance worker competes for the
+/// same kernel lease through the same file-based fair queue as a
+/// genuinely foreign waiter, and the two are indistinguishable from
+/// `othersWaiting` alone -- `othersWaitingAcrossProcesses` tells them
+/// apart by the process id `writer_queue` now stamps on every ticket.
 ///
 /// At most one writer is ever "checked out" of the lane at a time
 /// (`checked_out`): `checkout`/`checkin` replace *when* the kernel lease
@@ -1129,34 +1133,37 @@ pub const WriterLane = struct {
         }
     }
 
+    /// How long a lease must have been held before a *genuinely foreign*
+    /// waiter (`PathWriterLock.othersWaitingAcrossProcesses`, never this
+    /// process's own maintenance worker -- see that method's doc comment)
+    /// is allowed to end the lane's parking. Avoids releasing on a
+    /// transient queue blip from a remote caller about to be served by
+    /// someone else regardless; mirrors `QueuedMutex.contended_quantum_ns`,
+    /// the fairness window the old per-call handoff used.
+    const foreign_fairness_quantum_ns: i96 = 20 * std.time.ns_per_ms;
+
     /// Release `connection`'s hold on this lane once it no longer needs
     /// `root` (it has staged its write, or failed before staging): detach
     /// `connection`, then either hand the lease straight to an
     /// already-polling local writer (zero cost: no sync, no kernel
-    /// release) or, with nobody local waiting right now, sync and give
-    /// the kernel lease up immediately -- exactly as every write did
-    /// before this lane existed.
+    /// release), keep it parked for the next one, or -- only once nobody
+    /// local is waiting and a genuinely foreign (cross-process, or a
+    /// different in-process `Owner`) waiter has outlasted the fairness
+    /// quantum -- sync and give the kernel lease up for good.
     ///
-    /// This deliberately does not try to keep the lease parked "just in
-    /// case" the next foreground write arrives soon: `PathWriterLock.
-    /// othersWaiting` cannot tell a genuinely remote (cross-process, or a
-    /// different in-process `Owner`) waiter apart from this *same*
-    /// process's own maintenance worker, which competes for the same
-    /// kernel lease through the same file-based fair queue. Parking
-    /// speculatively on that signal starves the maintenance worker for
-    /// as long as local writers keep arriving, which then queues behind
-    /// the parked lease and makes `othersWaiting` true on the very next
-    /// `checkin` regardless of genuine remote contention -- observed
-    /// empirically as repeated, unproductive sync/close/reacquire
-    /// cycling under sustained local load. Gating purely on `waiting`
-    /// (same-process pollers already known to this lane, not inferred
-    /// from a shared file) avoids that interaction: a solo or bursty
-    /// writer with gaps releases the lease between writes just like
-    /// before, so maintenance and any other waiter (local or remote) get
-    /// their turn the moment local demand actually pauses, while a tight
-    /// concurrent burst (the scenario this lane targets) still shares
-    /// one parked lease across every member staged while another's fsync
-    /// is in flight.
+    /// Deliberately keys the remote check on `PathWriterLock.
+    /// othersWaitingAcrossProcesses`, not the plain `othersWaiting`: the
+    /// latter cannot tell a genuinely foreign waiter apart from this
+    /// *same* process's own maintenance worker, which competes for the
+    /// same kernel lease through the same file-based fair queue. Treating
+    /// that as "remote" starves the maintenance worker for as long as
+    /// local writers keep arriving (it only ever shows up as "someone is
+    /// queued" and never actually goes away on its own), and was observed
+    /// empirically as repeated, unproductive sync/close/reacquire cycling
+    /// under sustained local load. Excluding same-process tickets by
+    /// their recorded pid avoids that interaction while still giving a
+    /// truly remote process (or a different in-process `Owner`) a bounded
+    /// wait, not an indefinite one, even under continuous local traffic.
     pub fn checkin(self: *WriterLane, connection: *Connection, store: *NativeStore) void {
         const io = h.handleLockIo();
         connection.detach();
@@ -1164,6 +1171,15 @@ pub const WriterLane = struct {
         var lease = self.held_lease.?;
         self.held_lease = null;
         if (self.waiting != 0) {
+            self.parked = lease;
+            self.checked_out = false;
+            self.mutex.unlock(io);
+            return;
+        }
+        const own_pid = antfly_platform.process.currentId() orelse 0;
+        const now = std.Io.Clock.awake.now(io).nanoseconds;
+        const foreign_overdue = lease.othersWaitingAcrossProcesses(own_pid) and now - lease.acquired_ns >= foreign_fairness_quantum_ns;
+        if (!foreign_overdue) {
             self.parked = lease;
             self.checked_out = false;
             self.mutex.unlock(io);

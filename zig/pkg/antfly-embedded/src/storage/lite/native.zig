@@ -3995,6 +3995,24 @@ pub const PathWriterLock = struct {
         return true;
     }
 
+    /// Like `othersWaiting`, but true only for a waiter in a genuinely
+    /// different *process* -- see `writer_queue.Queue.
+    /// foreignTicketsIssuedSince`. Unlike `othersWaiting`, this process's
+    /// own background maintenance worker (or any other same-process
+    /// caller that reaches the queue through a path other than the one
+    /// holding this lease) never counts, since it registers a ticket
+    /// tagged with this same process's id. Callers that would otherwise
+    /// treat their own maintenance work as a hostile waiter -- starving it
+    /// by never releasing, since it only ever shows up as "someone is
+    /// queued" and never actually goes away on its own -- use this
+    /// instead.
+    pub fn othersWaitingAcrossProcesses(self: *const PathWriterLock, own_pid: u32) bool {
+        const io = self.borrowed_io orelse return true;
+        if (self.queue_turn) |*turn| return turn.hasForeignSuccessor(io, own_pid);
+        if (self.queue_watch) |*watch| return watch.hasForeignArrivals(io, own_pid);
+        return true;
+    }
+
     pub fn close(self: *PathWriterLock) void {
         if (self.reader_registration_batch) |batch| batch.end();
         const io = self.borrowed_io orelse self.io_impl.io();

@@ -95,6 +95,7 @@
 
 const std = @import("std");
 const path_lock_wait = @import("path_lock_wait.zig");
+const antfly_platform = @import("antfly_platform");
 
 const State = enum(u8) {
     waiting = 'W',
@@ -108,6 +109,17 @@ const tail_name = "tail";
 const ticket_name_len = "t-".len + 16;
 const counter_len = 16;
 const counter_check: u64 = 0xA5A5_5A5A_C3C3_3C3C;
+/// Byte 0 of a ticket file is its `State`; the issuing process's id (WS3
+/// multi-process fairness) lives right after it, written once at `enqueue`
+/// alongside the initial `waiting` state and never touched again. Lets a
+/// holder tell a genuinely different *process* queued behind it apart from
+/// another admission in its own process (for example its own background
+/// maintenance worker) that reached the queue through a different,
+/// same-process path -- `PathWriterLock.othersWaiting` alone cannot make
+/// that distinction, since both register as "a later ticket exists" from a
+/// purely file-based view.
+const pid_offset = 1;
+const pid_len = 4;
 /// Longest single path component on the platforms Lite supports.
 const max_name_len = 255;
 /// Bound on retries of a spurious `FileNotFound` when several processes
@@ -233,6 +245,36 @@ pub const Queue = struct {
         return next > mark;
     }
 
+    /// Like `ticketsIssuedSince`, but true only if at least one ticket
+    /// numbered `mark` or above was issued by a process other than
+    /// `own_pid`. Checks the cheap counter test first; only walks
+    /// individual ticket files (one open plus a short positional read
+    /// each) when that finds anything at all, and only over the (normally
+    /// tiny) range since `mark`. A ticket already cleaned up by the time
+    /// this walks to it (`error.FileNotFound`) finished before this check
+    /// ran, so it is not a live waiter and is skipped rather than counted;
+    /// any other error, or a ticket whose pid cannot be read (including one
+    /// written by a binary from before this field existed), answers "yes",
+    /// matching `ticketsIssuedSince`'s existing conservative default.
+    pub fn foreignTicketsIssuedSince(self: *const Queue, io: std.Io, mark: u64, own_pid: u32) bool {
+        const tail = self.dir.openFile(io, tail_name, .{}) catch return true;
+        defer tail.close(io);
+        const next = (readCounter(tail, io) catch return true) orelse return true;
+        if (next <= mark) return false;
+        var name_buf: [ticket_name_len]u8 = undefined;
+        var k = mark;
+        while (k < next) : (k += 1) {
+            const file = self.dir.openFile(io, ticketName(&name_buf, k), .{}) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return true,
+            };
+            defer file.close(io);
+            const pid = readTicketPid(file, io) catch return true;
+            if (pid == null or pid.? != own_pid) return true;
+        }
+        return false;
+    }
+
     /// Like `lockTail` but returns `error.WouldBlock` instead of waiting.
     pub fn tryLockTail(self: *Queue, io: std.Io) !TailGuard {
         const file = try self.openTail(io);
@@ -324,6 +366,11 @@ pub const Queue = struct {
             file.close(io);
         }
         try writeState(file, io, .waiting);
+        // Best-effort: a failed pid write just means this ticket reads as
+        // foreign-origin-unknown later (`readTicketPid` returns `null`),
+        // which `foreignTicketsIssuedSince` already treats conservatively
+        // as "yes, someone else might be waiting".
+        writeTicketPid(file, io, antfly_platform.process.currentId() orelse 0) catch {};
         try writeEnqueueCounter(tail.file, io, index + 1);
         tail.next = index + 1;
         return .{ .index = index, .file = file };
@@ -425,6 +472,13 @@ pub const Turn = struct {
     pub fn hasSuccessor(self: *const Turn, io: std.Io) bool {
         return self.queue.ticketsIssuedSince(io, self.ticket.index + 1);
     }
+
+    /// Like `hasSuccessor`, but true only for a later ticket issued by a
+    /// different process than `own_pid` -- see `Queue.
+    /// foreignTicketsIssuedSince`.
+    pub fn hasForeignSuccessor(self: *const Turn, io: std.Io, own_pid: u32) bool {
+        return self.queue.foreignTicketsIssuedSince(io, self.ticket.index + 1, own_pid);
+    }
 };
 
 /// Lets an uncontended (ticketless) lease notice writers queuing behind it.
@@ -440,6 +494,12 @@ pub const Watch = struct {
 
     pub fn hasArrivals(self: *const Watch, io: std.Io) bool {
         return self.queue.ticketsIssuedSince(io, self.mark);
+    }
+
+    /// Like `hasArrivals`, but true only for an arrival from a different
+    /// process than `own_pid` -- see `Queue.foreignTicketsIssuedSince`.
+    pub fn hasForeignArrivals(self: *const Watch, io: std.Io, own_pid: u32) bool {
+        return self.queue.foreignTicketsIssuedSince(io, self.mark, own_pid);
     }
 };
 
@@ -487,6 +547,24 @@ fn readState(file: std.Io.File, io: std.Io) !State {
 
 fn writeState(file: std.Io.File, io: std.Io, state: State) !void {
     try file.writePositionalAll(io, &.{@backingInt(state)}, 0);
+}
+
+fn writeTicketPid(file: std.Io.File, io: std.Io, pid: u32) !void {
+    var raw: [pid_len]u8 = undefined;
+    std.mem.writeInt(u32, &raw, pid, .little);
+    try file.writePositionalAll(io, &raw, pid_offset);
+}
+
+/// `null` if the field is missing, short, or zero (the sentinel written
+/// when this platform has no process id, or by anything that failed its
+/// best-effort write at enqueue) -- callers treat that the same as a read
+/// error: origin unknown, so assume foreign.
+fn readTicketPid(file: std.Io.File, io: std.Io) !?u32 {
+    var raw: [pid_len]u8 = undefined;
+    const n = try file.readPositionalAll(io, &raw, pid_offset);
+    if (n != raw.len) return null;
+    const pid = std.mem.readInt(u32, &raw, .little);
+    return if (pid == 0) null else pid;
 }
 
 /// Fallback when the executor cannot run a concurrent kernel wait.
@@ -590,6 +668,61 @@ test "writer queue grants in ticket order" {
         defer tail.release(io);
         try testing.expect(try q.isIdle(io, &tail));
     }
+}
+
+test "writer queue foreignTicketsIssuedSince distinguishes a different process's ticket from this one's own" {
+    // WS3 multi-process fairness: `othersWaiting`-style checks ("is any
+    // later ticket issued") cannot tell a genuinely different process
+    // apart from this same process's own maintenance worker reaching the
+    // queue through a different in-process path -- both just look like
+    // "a later ticket exists". `foreignTicketsIssuedSince` (and `Turn.
+    // hasForeignSuccessor`/`Watch.hasForeignArrivals`, its thin wrappers)
+    // answers the question production code actually needs: is there a
+    // waiter belonging to a *different* pid.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .limited(4) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sidecar = try testSidecar(&tmp, io, &path_buf);
+
+    var q = try Queue.open(testing.allocator, io, sidecar);
+    defer q.close(io);
+    var head = try enqueueOne(&q, io);
+    try q.awaitTurn(io, &head, farDeadline(io));
+    const turn: Turn = .{ .queue = q, .ticket = head };
+
+    const own_pid: u32 = antfly_platform.process.currentId() orelse 1;
+    try testing.expect(!turn.hasSuccessor(io));
+    try testing.expect(!turn.hasForeignSuccessor(io, own_pid));
+
+    // A second ticket, issued (per `enqueue`'s own pid stamp) under this
+    // *same* process's id -- standing in for this process's own
+    // maintenance worker reaching the same queue through a different
+    // in-process path. It is a successor, but never a foreign one, no
+    // matter how long it sits there.
+    const second = try enqueueOne(&q, io);
+    try testing.expect(turn.hasSuccessor(io));
+    try testing.expect(!turn.hasForeignSuccessor(io, own_pid));
+
+    // Simulate a genuinely different process's ticket by overwriting the
+    // pid field with one that does not match -- exactly what a real
+    // foreign `enqueue` would have stamped, and exactly what distinguishes
+    // a remote writer from this process's own maintenance worker in
+    // production. A second, unlocked, non-locking handle to the same
+    // ticket file is safe to open purely to poke this test fixture: flock
+    // guards concurrent *lock* attempts, not plain positional reads/writes.
+    var name_buf: [ticket_name_len]u8 = undefined;
+    const foreign_file = try q.dir.openFile(io, ticketName(&name_buf, second.index), .{ .mode = .read_write });
+    defer foreign_file.close(io);
+    try writeTicketPid(foreign_file, io, own_pid +% 1);
+    try testing.expect(turn.hasForeignSuccessor(io, own_pid));
+
+    q.finish(io, &head);
+    var granted_second = second;
+    try q.awaitTurn(io, &granted_second, farDeadline(io));
+    q.finish(io, &granted_second);
 }
 
 test "writer queue skips an abandoned waiter and keeps order" {
