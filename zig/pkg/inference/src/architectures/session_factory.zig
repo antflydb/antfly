@@ -981,15 +981,16 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
 // CPU loading keeps its existing execution policy.
 fn createNativeSessionForCudaUpload(
     allocator: std.mem.Allocator,
-    model_path: []const u8,
+    requested_model_path: []const u8,
     override: ?TaskOverride,
     retain_gliner_q8: bool,
     borrowed_manifest: ?*const manifest_mod.ModelManifest,
 ) !Session {
     var direct_quant_enabled = directQuantEnabled();
     const cpu_plan_context = defaultPlanContextForBackend(.cpu);
-    var mf = if (borrowed_manifest) |provided| provided.* else try manifest_mod.loadFromDir(allocator, model_path);
+    var mf = if (borrowed_manifest) |provided| provided.* else try manifest_mod.loadFromDir(allocator, requested_model_path);
     defer if (borrowed_manifest == null) mf.deinit();
+    const model_path = mf.source_root orelse requested_model_path;
 
     // Detect architecture from config.json
     var arch_config = try detectArchitecture(allocator, model_path, mf);
@@ -1921,7 +1922,7 @@ pub fn createGemma4CudaTrainingSession(
 
 fn createCudaSessionWithRequiredProfile(
     allocator: std.mem.Allocator,
-    model_path: []const u8,
+    requested_model_path: []const u8,
     override: ?TaskOverride,
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
@@ -1938,8 +1939,9 @@ fn createCudaSessionWithRequiredProfile(
         return error.KernelJitRequiredDynamicLoad;
     }
 
-    var model_manifest = if (borrowed_manifest) |provided| provided.* else try manifest_mod.loadFromDir(allocator, model_path);
+    var model_manifest = if (borrowed_manifest) |provided| provided.* else try manifest_mod.loadFromDir(allocator, requested_model_path);
     defer if (borrowed_manifest == null) model_manifest.deinit();
+    const model_path = model_manifest.source_root orelse requested_model_path;
     try model_manifest.requireRecognizedGlinerArchitecture();
     if (model_manifest.gliner_specialty_profile) |profile|
         try gliner_specialty.requireBackend(profile, .cuda);
@@ -2626,7 +2628,7 @@ fn loadSafetensorsIntoResident(
 
 fn createGpuHostedSessionWithTaskOverride(
     allocator: std.mem.Allocator,
-    model_path: []const u8,
+    requested_model_path: []const u8,
     override: ?TaskOverride,
     backend_type: BackendType,
     kernel_jit_config: kernel_jit.Config,
@@ -2639,8 +2641,9 @@ fn createGpuHostedSessionWithTaskOverride(
     try ensureGpuHostedSessionAvailable(backend_type);
     const direct_quant_enabled = directQuantEnabled();
 
-    var mf = if (borrowed_manifest) |provided| provided.* else try manifest_mod.loadFromDir(allocator, model_path);
+    var mf = if (borrowed_manifest) |provided| provided.* else try manifest_mod.loadFromDir(allocator, requested_model_path);
     defer if (borrowed_manifest == null) mf.deinit();
+    const model_path = mf.source_root orelse requested_model_path;
     var gpu_jina_lora_adapter: ?*gpu_hosted_store_mod.JinaLoraAdapter = null;
     errdefer if (gpu_jina_lora_adapter) |adapter| adapter.destroy();
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
@@ -3019,10 +3022,16 @@ fn detectArchitectureWithGgufFile(
         return .{ .gliner_boundary = config };
     }
     // Try to read config.json for model_type
-    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_path});
-    defer allocator.free(config_path);
+    const config_path: ?[]u8 = if (mf.config_path) |selected|
+        try allocator.dupe(u8, selected)
+    else if (mf.source_root == null)
+        try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_path})
+    else
+        null;
+    defer if (config_path) |path| allocator.free(path);
 
-    if (c_file.readFile(allocator, config_path)) |config_bytes| {
+    const maybe_config_bytes = if (config_path) |path| c_file.readFile(allocator, path) catch null else null;
+    if (maybe_config_bytes) |config_bytes| {
         defer allocator.free(config_bytes);
 
         if (try detectModelType(allocator, config_bytes)) |model_type| {
@@ -3102,7 +3111,7 @@ fn detectArchitectureWithGgufFile(
                 return .{ .bert = try bert.parseConfig(allocator, config_bytes) };
             }
         }
-    } else |_| {}
+    }
 
     if (mf.usesGgufWeights()) {
         const gguf_path = mf.gguf_path.?;
@@ -6198,7 +6207,8 @@ pub fn widenBudgetLimitsForModelPath(
     return widenBudgetLimitsForManifest(allocator, model_path, mf, limits, backend_type);
 }
 
-pub fn widenBudgetLimitsForManifest(allocator: std.mem.Allocator, model_path: []const u8, mf: manifest_mod.ModelManifest, limits: runtime.tier.memory.Limits, backend_type: BackendType) !runtime.tier.memory.Limits {
+pub fn widenBudgetLimitsForManifest(allocator: std.mem.Allocator, requested_model_path: []const u8, mf: manifest_mod.ModelManifest, limits: runtime.tier.memory.Limits, backend_type: BackendType) !runtime.tier.memory.Limits {
+    const model_path = mf.source_root orelse requested_model_path;
     if (!backend_type.usesGpuHostedSession()) return limits;
     switch (backend_type) {
         .metal => if (!build_options.enable_metal) return limits,

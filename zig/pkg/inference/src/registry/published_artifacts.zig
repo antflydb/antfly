@@ -284,6 +284,26 @@ pub const PublishedArtifacts = struct {
         defer graph.deinit();
         for (graph.external_paths) |external| try self.verifyPath(external);
     }
+    /// Rebase metadata into the captured namespace without opening optional
+    /// artifacts or granting execution permission. A backend must still call
+    /// constructionPath/verifyPath for each dependency it actually consumes.
+    pub fn namespacePath(self: *const PublishedArtifacts, path: []const u8) ![]u8 {
+        const absolute = try absolutePath(self.allocator, self.io, path);
+        errdefer self.allocator.free(absolute);
+        if (std.mem.eql(u8, absolute, self.requested_root)) {
+            const captured = try self.allocator.dupe(u8, self.physical_root);
+            self.allocator.free(absolute);
+            return captured;
+        }
+        if (managed.pathIsWithinRoot(self.requested_root, absolute)) {
+            const offset = self.requested_root.len + @intFromBool(!std.fs.path.isSep(self.requested_root[self.requested_root.len - 1]));
+            const captured = try std.fs.path.join(self.allocator, &.{ self.physical_root, absolute[offset..] });
+            self.allocator.free(absolute);
+            return captured;
+        }
+        return absolute;
+    }
+
     /// Capture the physical construction target once. Backends must never
     /// reopen a mutable caller alias after authenticating a different target.
     pub fn constructionPath(self: *const PublishedArtifacts, path: []const u8) ![]u8 {
@@ -837,5 +857,39 @@ test "model selection final verification detects member alias retargets" {
     try artifacts.verify();
     try tmp.dir.deleteFile(io, "model.gguf");
     try tmp.dir.symLink(io, "second.gguf", "model.gguf", .{});
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+}
+
+test "model selection namespace rebasing does not inspect unused alternatives" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "first");
+    try tmp.dir.createDirPath(io, "second");
+    try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const alias = try std.fs.path.join(a, &.{ root, "current" });
+    defer a.free(alias);
+    var artifacts = try PublishedArtifacts.init(a, io, alias, null);
+    defer artifacts.deinit();
+    try tmp.dir.deleteFile(io, "current");
+    try tmp.dir.symLink(io, "second", "current", .{ .is_directory = true });
+    const optional = try std.fs.path.join(a, &.{ alias, "absent/missing.onnx" });
+    defer a.free(optional);
+    const rebased = try artifacts.namespacePath(optional);
+    defer a.free(rebased);
+    const expected = try std.fs.path.join(a, &.{ root, "first/absent/missing.onnx" });
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, rebased);
+    // Rebasing grants no execution permission and does not follow the new alias.
+    try std.testing.expectError(error.FileNotFound, artifacts.constructionPath(rebased));
+    const outside = try std.fs.path.join(a, &.{ root, "second" });
+    defer a.free(outside);
+    const unchanged = try artifacts.namespacePath(outside);
+    defer a.free(unchanged);
+    try std.testing.expectEqualStrings(outside, unchanged);
+    try std.testing.expectError(error.ModelArtifactOutsideRoot, artifacts.constructionPath(unchanged));
     try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
 }

@@ -1148,17 +1148,17 @@ const ArtifactCatalog = struct {
         return c_file.fileExistsInDirChecked(self.allocator, self.storageRoot(), relative_path);
     }
 
-    /// Retain ONNX format, logical name and external-data directory under a
+    /// Retain model format, logical name and external-data directory under a
     /// physical parent. Constructors bind the leaf independently; resolving the
     /// leaf here would discard context for extensionless content-addressed blobs.
     fn resolveSource(self: *const ArtifactCatalog, relative: []const u8) !?[]u8 {
         const canonical = (try self.resolve(relative)) orelse return null;
-        if (!std.mem.endsWith(u8, relative, ".onnx")) return canonical;
+        if (!std.mem.endsWith(u8, relative, ".onnx") and !std.mem.endsWith(u8, relative, ".gguf")) return canonical;
         defer self.allocator.free(canonical);
-        return try self.logicalOnnxPath(relative);
+        return try self.logicalModelPath(relative);
     }
 
-    fn logicalOnnxPath(self: *const ArtifactCatalog, relative: []const u8) ![]u8 {
+    fn logicalModelPath(self: *const ArtifactCatalog, relative: []const u8) ![]u8 {
         const member = if (self.receipt != null) self.find(relative).?.path else relative;
         const parent = try std.fs.path.join(self.allocator, &.{ self.storageRoot(), std.fs.path.dirname(member) orelse "." });
         defer self.allocator.free(parent);
@@ -2587,7 +2587,7 @@ fn findPrimaryOnnx(manifest: *ModelManifest, catalog: *const ArtifactCatalog) !v
         if (try catalog.resolve(relative)) |path| {
             errdefer a.free(path);
             // Use the same logical name/base contract as companion graphs.
-            manifest.onnx_logical_path = try catalog.logicalOnnxPath(relative);
+            manifest.onnx_logical_path = try catalog.logicalModelPath(relative);
             manifest.onnx_path = path;
             return;
         }
@@ -7416,7 +7416,10 @@ test "bundle artifact paths stay within the canonical model root" {
     );
     const resolved = try resolveBundlePath(allocator, null, model_dir, "alias.gguf");
     defer allocator.free(resolved);
-    try std.testing.expect(std.mem.endsWith(u8, resolved, "model/artifacts/model.gguf"));
+    try std.testing.expect(std.mem.endsWith(u8, resolved, "model/alias.gguf"));
+    const physical = try Dir.cwd().realPathFileAlloc(io, resolved, allocator);
+    defer allocator.free(physical);
+    try std.testing.expect(std.mem.endsWith(u8, physical, "model/artifacts/model.gguf"));
 }
 
 test "managed receipt is authoritative for gguf discovery" {
