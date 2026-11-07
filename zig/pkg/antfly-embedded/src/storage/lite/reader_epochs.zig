@@ -45,20 +45,22 @@ const Namespace = struct {
         // already-open handle, and reuse that same handle for everything
         // below -- rather than asking the OS to canonicalize a cwd-relative
         // *string* (`std.fs.path.dirname(path) orelse "."`) and then
-        // re-opening whatever string comes back. `std.Io.Dir.realPathFile`
-        // -- what the old resolution used -- documents itself as having
-        // "limited platform support" and warns "using it can lead to
-        // unnecessary failures and race conditions"; a relative `path`
+        // re-opening whatever string comes back. A relative `path`
         // resolved against a cwd that is not exactly what the caller
         // expects at that instant silently points the whole reader-epoch
         // namespace, and the "identity" marker inside it, at the wrong
         // directory entirely -- observed in practice as a bare `identity`
         // file landing directly in the process's cwd instead of inside its
         // own `.aflite-readers-*` directory next to the `.aflite` file.
-        // Resolving the already-open parent handle's own identity via
-        // `Dir.realPath` (no `sub_path`, no fresh cwd lookup) and reusing
-        // that handle removes any dependency on cwd for the rest of this
-        // call.
+        // Opening the parent directory *handle* once up front (never a
+        // fresh cwd lookup) removes that dependency for the rest of this
+        // call, including the final `realPathFile` below: resolved against
+        // this already-open, already-pinned `parent`, not cwd, so a
+        // symlink alias still canonicalizes to the same namespace its
+        // target binds (`std.Io.Dir.realPathFile` is "generally advisable
+        // to avoid" per its own doc only because a cwd-relative `sub_path`
+        // reintroduces that same dependency -- `realPath`, used on `parent`
+        // itself until this change, carries the identical caveat).
         var parent = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(path) orelse ".", .{});
         var parent_open = true;
         errdefer if (parent_open) parent.close(io);
@@ -69,10 +71,41 @@ const Namespace = struct {
             // resolve only its still-existing parent directory.
             try parent.access(io, std.fs.path.basename(path), .{});
         }
-        var parent_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const parent_path_len = try parent.realPath(io, &parent_path_buf);
-        const canonical = try std.fs.path.joinZ(a, &.{ parent_path_buf[0..parent_path_len], std.fs.path.basename(path) });
+        // Follow a symlink alias to the same canonical path (and so the
+        // same namespace) its target binds. A hardlink alias has no such
+        // target to follow -- two names for one inode, neither more
+        // canonical than the other -- and is expected to land on a
+        // different namespace than the original.
+        //
+        // `path` is not always where the data currently sits: a publishing
+        // caller (e.g. a stable-snapshot copy, mid-rename) can bind the
+        // namespace for a *future* final name while the bytes are still at
+        // a temporary one, so nothing exists at `path` yet. `realPathFile`
+        // needs the target to exist; fall back to the bounded, non-resolving
+        // join (parent's own real path + path's basename, exactly as before
+        // this change) whenever it doesn't, rather than failing the publish.
+        const canonical = parent.realPathFileAlloc(io, std.fs.path.basename(path), a) catch |err| switch (err) {
+            error.FileNotFound => blk: {
+                var parent_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const parent_path_len = try parent.realPath(io, &parent_path_buf);
+                break :blk try std.fs.path.joinZ(a, &.{ parent_path_buf[0..parent_path_len], std.fs.path.basename(path) });
+            },
+            else => return err,
+        };
         errdefer a.free(canonical);
+        // A symlink alias's basename resolves into a *different* directory
+        // than `dirname(path)` (the alias's own location) -- the directory
+        // its target actually lives in. The reader-epoch namespace
+        // directory is created/looked up relative to the parent handle, so
+        // that handle must be reopened against `canonical`'s own directory
+        // before any of that, or an alias's reader would search right next
+        // to itself and never find the namespace its target (and so its
+        // canonical digest) already committed to. A no-op reopen (the
+        // common case, no symlink involved) just reopens the same
+        // directory by another path.
+        const target_parent = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(canonical) orelse ".", .{});
+        parent.close(io);
+        parent = target_parent;
         // The path chooses a bounded location, never the authority to reuse.
         var path_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(canonical, &path_digest, .{});
