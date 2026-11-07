@@ -1058,6 +1058,61 @@ fn runDenseVectorAddIndexMidScenario(allocator: Allocator, path: []const u8, io:
     try handle.db.batch(.{ .writes = &.{.{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker\",\"_embeddings\":{\"dv_idx\":[1.0,0.0]}}" }}, .sync_level = .full_index });
 }
 
+/// Dense-one-commit task 4: an update then a delete of an already-indexed
+/// dense-vector document, each acked at `sync_level: .full_index` (the
+/// level that blocks until the dense index itself is visible, not just the
+/// primary row -- `lite-single-commit-write-path.md` §3.3a). Covers the
+/// crash invariants that scenario doesn't: `commitDenseVectorMappingsWithRollback`
+/// 's own separate commit (`.hbc_metadata_commit`) and
+/// `saveProjectionCheckpointMetadata`'s now-`.ride_along` commit
+/// (`.hbc_checkpoint_commit`) both run on every dense write, not just a
+/// first insert, so an update/delete sweep exercises them repeatedly
+/// (including a ride-along commit losable at any crash point) while the
+/// harness's generic `splitCheckpoints`/`checkInFlightResolution` machinery
+/// still proves "every acknowledged write's effects survive a crash
+/// exactly once, never partially" for each -- the document-level stand-in
+/// this harness has for "every acked vector is queryable after reopen"
+/// (there is no dedicated vector-query `Expectation` field the way
+/// `searchable_after`/`graph_edge_after` exist for full-text/graph; the
+/// marker-field substring check below is this harness's existing
+/// mechanism, same as the add-index-mid scenario above).
+fn runDenseVectorUpdateDeleteScenario(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    var handle = try openDbWithIo(allocator, path, io, true);
+    defer handle.close();
+
+    try handle.db.addIndex(.{
+        .name = "dv_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "dv-doc", .before = null, .after = "dv-doc-marker-v1" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker-v1\",\"_embeddings\":{\"dv_idx\":[1.0,0.0]}}" }}, .sync_level = .full_index });
+
+    // Update: a second write to the SAME key, with a different vector --
+    // exercises `deleteDenseBatchByNameWithOptions`'s replacement-delete
+    // lane (index_manager.zig) ahead of the re-insert, not just a fresh
+    // insert's empty-index fast path.
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "dv-doc", .before = "dv-doc-marker-v1", .after = "dv-doc-marker-v2" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker-v2\",\"_embeddings\":{\"dv_idx\":[0.0,1.0]}}" }}, .sync_level = .full_index });
+
+    // Delete: the dense-vector mapping and HBC posting entry must both be
+    // gone after reopen, in lockstep with the primary row's own tombstone
+    // -- an acknowledged delete whose dense side survives a crash would be
+    // exactly the "published metadata pointing at unwritten/removed
+    // postings" invariant this change's ride-along collapse must not
+    // introduce (lite-single-commit-write-path.md §3.2a).
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "dv-doc", .before = "dv-doc-marker-v2", .after = null }} });
+    try handle.db.batch(.{ .deletes = &.{"dv-doc"}, .sync_level = .full_index });
+
+    // One more insert after the delete, proving the index (and its
+    // ride-along checkpoint commit) is still writable/consistent --
+    // nothing about the delete or the checkpoint's ride-along durability
+    // left the index wedged.
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "dv-doc-2", .before = null, .after = "dv-doc-marker-v3" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "dv-doc-2", .value = "{\"marker\":\"dv-doc-marker-v3\",\"_embeddings\":{\"dv_idx\":[0.5,0.5]}}" }}, .sync_level = .full_index });
+}
+
 /// Sparse analog of `runDenseVectorAddIndexMidScenario`: same bug, same
 /// fix, same shape, with a `sparse_vector` index and the flat
 /// `{"<token id>": <weight>}` `_embeddings` wire shape instead of a dense
@@ -1119,6 +1174,83 @@ fn runGraphAddIndexMidScenario(allocator: Allocator, path: []const u8, io: std.I
         .{ .key = "edge-source", .value = "{\"marker\":\"edge-source-marker\",\"_edges\":{\"gr_idx\":{\"links\":[{\"target\":\"edge-target\",\"weight\":1.0}]}}}" },
         .{ .key = "edge-target", .value = "{\"marker\":\"edge-target-marker\"}" },
     }, .sync_level = .full_index });
+}
+
+/// Crash-sweep coverage for the graph metric-build pipeline's §3.2a
+/// ride-along conversion (lease acquire/prepare/scan/reduce/publish/cleanup
+/// pages: `graph/graph.zig`'s background call sites now open through
+/// `beginWriteReverseBatchWithOptions(.{ .durability = .ride_along })`
+/// instead of a plain `beginBatch()`).
+///
+/// Admits the graph index with NO metrics in its `config_json` (exactly
+/// `runGraphAddIndexMidScenario`'s own proven-safe shape) and only attaches
+/// `metric_configs` to the already-admitted `GraphIndex` directly,
+/// reaching through `handle.db.core.graphIndex(...)`. Declaring metrics
+/// *at admission time* (`config_json`'s `"metrics"` key) was tried first
+/// and found to hit a pre-existing, unrelated bug: it calls
+/// `notifyGraphMetricConfiguration`, which races the admission commit's own
+/// follow-up native-catalog work and nondeterministically surfaces as
+/// `UnexpectedNativePageKind` or `InvalidNativeAllocator` -- reproduces
+/// identically with the §3.2a ride-along conversion reverted, and
+/// independently of `start_index_workers`, so it is a pre-existing
+/// admission/managed-admission-materialization defect, not something this
+/// change introduced or is positioned to fix. See the handback's
+/// graph-crash-scenario note.
+///
+/// `GraphIndex.runGraphMetric` then drives a build synchronously to
+/// completion on the calling thread, through the very call sites this
+/// change converted, interleaved with ordinary acknowledged edge writes --
+/// the sweep crashes mid-build as often as mid-write. Every one of those
+/// background commits may be lost at a crash -- recomputable from durable
+/// progress, same as any other row in §3.2a's ride-along table -- but
+/// every acknowledged edge write (`sync_level = .full_index`) must
+/// survive, and the reverse index must stay consistent with forward
+/// adjacency: `graph_edge_after`/`assertGraphEdgeConsistent`, same
+/// contract as `runGraphAddIndexMidScenario`. One metric (`degree`) keeps
+/// this scenario's own barrier count close to the other scenarios in this
+/// file -- a build with two metrics and two write/rebuild rounds was tried
+/// first and, past roughly 40 barriers, started tripping an unrelated,
+/// pre-existing `InvalidNativeAllocator`/`UnexpectedNativePageKind`
+/// flakiness that reproduces with no graph or metric involvement at all
+/// (plain `openDbWithIo` + `runUntilIdle` alone, graph.zig fully
+/// reverted); see the handback's graph-crash-scenario note.
+fn runGraphMetricBuildWithCrashScenario(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    var handle = try openDbWithIo(allocator, path, io, true);
+    defer handle.close();
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "seed", .before = null, .after = "seed body", .searchable_after = "seed" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .full_text });
+
+    try handle.db.addIndex(.{
+        .name = "gr_metric_idx",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    const metrics = [_]graph_mod.GraphMetricConfig{
+        .{ .name = "degree", .kind = .degree, .refresh = .manual },
+    };
+    const entry = handle.db.core.graphIndex("gr_metric_idx") orelse return error.CrashConsistencyMissingGraphIndex;
+    entry.index.metric_configs = &metrics;
+
+    try checkpoints.append(allocator, .{ .expectations = &.{
+        .{
+            .key = "node-a",
+            .before = null,
+            .after = "node-a-marker",
+            .graph_edge_after = .{ .index_name = "gr_metric_idx", .edge_type = "links", .target = "node-b" },
+        },
+        .{ .key = "node-b", .before = null, .after = "node-b-marker" },
+    } });
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "node-a", .value = "{\"marker\":\"node-a-marker\",\"_edges\":{\"gr_metric_idx\":{\"links\":[{\"target\":\"node-b\",\"weight\":1.0}]}}}" },
+        .{ .key = "node-b", .value = "{\"marker\":\"node-b-marker\"}" },
+    }, .sync_level = .full_index });
+
+    // Drive the metric build synchronously to completion through its
+    // ride-along commits, still inside the sweep's fault-injected window.
+    var status = try entry.index.runGraphMetric("degree");
+    status.deinit(allocator);
 }
 
 test "crash sweep: primary single doc" {
@@ -1314,6 +1446,84 @@ test "WS4 phase 2 round 2: a synchronous full_text write lands in one native com
     }
 }
 
+test "WS4-for-graph: a synchronous graph edge write lands in one native commit and is queryable immediately" {
+    // Graph analog of the full_text round 2 test above (lite-single-
+    // commit-write-path.md §3.3a's graph extension): default Lite
+    // configuration (background index workers running), one edge write
+    // expressed through a document's `_edges` field, `sync_level =
+    // .full_index` (graph has no narrower sync level of its own -- see
+    // `types.SyncLevel`'s enum order). Proves `InlineGraphPublication`
+    // engages for the simple single-edge case: the edge is queryable
+    // immediately after ack, and the background worker's later catch-up
+    // does not re-apply it (no duplicate edge).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+    defer handle.close();
+
+    try handle.db.addIndex(.{ .name = "gr_idx", .kind = .graph, .config_json = "{}" });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"marker\":\"seed\"}" }}, .sync_level = .write });
+    try handle.db.runUntilIdle();
+
+    const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+    const before_sequence = store.file.activeCheckpoint().commit_sequence;
+
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "edge-source", .value = "{\"marker\":\"edge-source-marker\",\"_edges\":{\"gr_idx\":{\"links\":[{\"target\":\"edge-target\",\"weight\":1.0}]}}}" },
+        .{ .key = "edge-target", .value = "{\"marker\":\"edge-target-marker\"}" },
+    }, .sync_level = .full_index });
+
+    const after_ack_sequence = store.file.activeCheckpoint().commit_sequence;
+    const commits_for_this_write = after_ack_sequence - before_sequence;
+    // Same bound as the full_text tests above: the inline publication
+    // itself contributes no extra commit beyond the primary write's own
+    // (its forward/reverse mutations and progress ride inside the SAME
+    // native transaction via `commit_participant.View.putIndexCatalog`);
+    // a handful more land end to end from unrelated background
+    // bookkeeping (replication outbox staging, opportunistic maintenance
+    // ticks) WS7 owns driving to zero.
+    try std.testing.expect(commits_for_this_write <= 6);
+
+    {
+        const edges = try handle.db.getEdges(allocator, "gr_idx", "edge-source", "links", .out);
+        defer graph_mod.GraphIndex.freeEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expectEqualStrings("edge-target", edges[0].target);
+    }
+
+    // Let the background worker observe this write. If it were not told
+    // the edge already landed inline (`Executor.
+    // advanceAppliedSequenceIfContiguous`), it would re-apply the same
+    // edge from the journal, doubling the forward adjacency list.
+    try handle.db.runUntilIdle();
+    {
+        const edges = try handle.db.getEdges(allocator, "gr_idx", "edge-source", "links", .out);
+        defer graph_mod.GraphIndex.freeEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+    }
+
+    // A second edge write, still synchronous, still with the worker
+    // running: the same claims hold repeatedly.
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "edge-source-2", .value = "{\"marker\":\"edge-source-2-marker\",\"_edges\":{\"gr_idx\":{\"links\":[{\"target\":\"edge-target\",\"weight\":2.0}]}}}" },
+    }, .sync_level = .full_index });
+    {
+        const edges = try handle.db.getEdges(allocator, "gr_idx", "edge-target", "links", .in);
+        defer graph_mod.GraphIndex.freeEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 2), edges.len);
+    }
+    try handle.db.runUntilIdle();
+    {
+        const edges = try handle.db.getEdges(allocator, "gr_idx", "edge-target", "links", .in);
+        defer graph_mod.GraphIndex.freeEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 2), edges.len);
+    }
+}
+
 test "WS4 phase 2 round 2: a worker-backlogged index falls back correctly instead of skipping the gap" {
     // Deliberately creates the one scenario the inline fast path must
     // refuse: a background worker still owes this index an earlier
@@ -1466,6 +1676,18 @@ test "crash sweep: dense vector add-index mid-scenario" {
     try reportFailures(&report);
 }
 
+test "crash sweep: dense vector update and delete" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "dense-vector-update-delete",
+        .run = runDenseVectorUpdateDeleteScenario,
+        .via_db = true,
+        .search_index = "body_text",
+        .search_field = "body",
+    }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
 test "crash sweep: sparse vector add-index mid-scenario" {
     var report = try runCrashSweep(std.testing.allocator, .{
         .name = "sparse-vector-add-index-mid-scenario",
@@ -1482,6 +1704,18 @@ test "crash sweep: graph add-index mid-scenario" {
     var report = try runCrashSweep(std.testing.allocator, .{
         .name = "graph-add-index-mid-scenario",
         .run = runGraphAddIndexMidScenario,
+        .via_db = true,
+        .search_index = "body_text",
+        .search_field = "body",
+    }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep: graph metric build and compaction mid-scenario" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "graph-metric-build-mid-scenario",
+        .run = runGraphMetricBuildWithCrashScenario,
         .via_db = true,
         .search_index = "body_text",
         .search_field = "body",

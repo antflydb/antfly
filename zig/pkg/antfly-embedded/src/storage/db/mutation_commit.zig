@@ -152,6 +152,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const applyDerivedBatchToIndexContext = S.applyDerivedBatchToIndexContext;
         const InlineTextPublication = S.InlineTextPublication;
         const prepareInlineTextPublication = S.prepareInlineTextPublication;
+        const InlineGraphPublication = S.InlineGraphPublication;
+        const prepareInlineGraphPublication = S.prepareInlineGraphPublication;
         const attachPreparedUpsertDocumentProjections = S.attachPreparedUpsertDocumentProjections;
         const augmentExtractedWriteWithGraphFieldEdges = S.augmentExtractedWriteWithGraphFieldEdges;
         const augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed = S.augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed;
@@ -3067,7 +3069,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // non-`.native_catalog` index, ...) simply fails to prepare
             // here and falls through to that existing path unchanged,
             // further down this function.
-            var inline_text_publications: [@import("../commit_participant.zig").List.max_participants]?*InlineTextPublication = @splat(null);
+            // Sized independently of `commit_participant.List.max_participants`:
+            // that constant bounds the TOTAL number of contributors one write's
+            // commit may carry (authored_acceptance + inline text + inline
+            // dense + inline sparse + inline graph, ...); this array bounds only
+            // how many SIMULTANEOUS inline text publications one write may
+            // attempt (a write touching more than `max_inline_text_publications`
+            // managed full_text indexes still acks correctly -- the excess
+            // indexes simply fall through to the existing worker-driven catch-up
+            // path below, same as any other `prepareInlineTextPublication`
+            // failure). Conflating the two used to mean raising the shared
+            // commit-participant capacity for dense/sparse/graph would have
+            // silently also raised how many text publications this function
+            // attempts inline, with no review of whether that's still safe.
+            const max_inline_text_publications = 4;
+            var inline_text_publications: [max_inline_text_publications]?*InlineTextPublication = @splat(null);
             // Captured once at prepare time, never nulled: `install` below
             // nulls `inline_text_publications` slots so its own cleanup
             // `defer` knows what still needs `abort`, but the filter at
@@ -3239,10 +3255,99 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     sync_targets.full_text_indexes = filtered;
                 }
             }
+            // lite-single-commit-write-path.md §3.3a: the graph extension
+            // of the fast path above. Deliberately narrow -- exactly one
+            // graph edge write and nothing else graph-related in this
+            // batch (no deletes, no doc clears, no artifact
+            // materialization) -- so every precondition
+            // `prepareInlineGraphPublication`/`graphEdgeWriteEligibleFor
+            // InlinePublication` cannot itself check (multiple edges in
+            // one batch, mixed writes/deletes needing a specific apply
+            // order) is simply never attempted here; the caller falls back
+            // to the existing `applyGraphMutationsByName` path for all of
+            // those, same as before this change. Gated on `.full_index`
+            // (not `.full_text`): graph has no narrower sync level of its
+            // own, matching `types.SyncLevel`'s enum order and
+            // `collectManagedSyncTargetsWithGeneratedSource`'s treatment
+            // of non-full_text managed indexes.
+            var inline_graph_publication: ?*InlineGraphPublication = null;
+            var inline_graph_handled_name: []const u8 = &.{};
+            defer if (inline_graph_publication) |prepared| prepared.abort();
+            defer if (inline_graph_handled_name.len != 0) S.ownerField(self, "alloc").*.free(@constCast(inline_graph_handled_name));
+            if (append_derived_replay and effective_req.sync_level == .full_index and
+                opts.transaction_resolution == null and materialized_derived_batch != null and
+                materialized_derived_batch.?.graph_writes.len == 1 and
+                materialized_derived_batch.?.graph_deletes.len == 0 and
+                materialized_derived_batch.?.graph_doc_clears.len == 0 and
+                materialized_derived_batch.?.changed_artifact_keys.len == 0 and
+                materialized_derived_batch.?.deleted_keys.len == 0)
+            {
+                const write = materialized_derived_batch.?.graph_writes[0];
+                const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = write.index_name, .kind = .graph };
+                if (prepareInlineGraphPublication(
+                    S.ownerField(self, "alloc").*,
+                    S.ownerField(self, "core").*.index_manager,
+                    write,
+                    index_ref,
+                    sequence,
+                )) |prepared| {
+                    const handled_name = S.ownerField(self, "alloc").*.dupe(u8, write.index_name) catch |dup_err| {
+                        prepared.abort();
+                        return dup_err;
+                    };
+                    inline_graph_publication = prepared;
+                    inline_graph_handled_name = handled_name;
+                } else |_| {}
+            }
             var commit_participants: @import("../commit_participant.zig").List = .{};
             if (authored_acceptance.vectors.len != 0) try commit_participants.append(authored_acceptance.participant());
             for (inline_text_publications[0..inline_text_publication_count]) |maybe_prepared| {
                 if (maybe_prepared) |prepared| try commit_participants.append(prepared.participant());
+            }
+            if (inline_graph_publication) |prepared| {
+                if (commit_participants.append(prepared.participant())) {
+                    // Appended successfully: this write's commit now
+                    // carries the graph publication, so exclude its index
+                    // name from every generic sync_targets consumer below
+                    // (the has-workers notify/wait path reads `all_indexes`
+                    // only through `target_identities`/global sequence
+                    // wake, never by name for `.full_index` -- see
+                    // `notifyExecutorForSyncLevel` -- but the NO-WORKERS
+                    // fallback further down applies every name still left
+                    // in `all_indexes`, so it must not see this one).
+                    const filter_alloc = S.ownerField(self, "alloc").*;
+                    var kept_count: usize = 0;
+                    for (sync_targets.all_indexes) |name| {
+                        if (!std.mem.eql(u8, name, inline_graph_handled_name)) kept_count += 1;
+                    }
+                    if (kept_count != sync_targets.all_indexes.len) {
+                        const filtered = try filter_alloc.alloc([]const u8, kept_count);
+                        errdefer filter_alloc.free(filtered);
+                        var fill: usize = 0;
+                        for (sync_targets.all_indexes) |name| {
+                            if (std.mem.eql(u8, name, inline_graph_handled_name)) {
+                                filter_alloc.free(@constCast(name));
+                            } else {
+                                filtered[fill] = name;
+                                fill += 1;
+                            }
+                        }
+                        filter_alloc.free(@constCast(sync_targets.all_indexes));
+                        sync_targets.all_indexes = filtered;
+                    }
+                } else |_| {
+                    // `commit_participant.List` is at fixed capacity
+                    // (raised, but still finite -- see its own doc
+                    // comment): never silently drop this write's graph
+                    // effect because the list happened to be full. Abort
+                    // the prepared publication now and fall through to the
+                    // ordinary (non-inline) graph apply path exactly as if
+                    // `prepareInlineGraphPublication` itself had returned
+                    // `error.InlineGraphPublicationUnsupported` -- nothing
+                    // above this point committed anything for it yet.
+                    prepared.abort();
+                    inline_graph_publication = null;
+                }
             }
             const combined_commit_participant: ?@import("../commit_participant.zig").Participant =
                 if (commit_participants.len != 0) commit_participants.participant() else null;
@@ -3426,6 +3531,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                 }
             }
+            if (inline_graph_publication) |prepared| {
+                prepared.install();
+                inline_graph_publication = null;
+                if (S.ownerField(self, "executor").*.hasWorkers()) {
+                    _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_graph_handled_name, sequence);
+                }
+            }
             snapshot_mutation.release();
             if (split_shadow_ticket) |ticket| {
                 const apply_shadow_start_ns = monotonicTimeNs();
@@ -3528,6 +3640,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         // needed here any more.
                         if (sync_targets.full_text_indexes.len != 0) {
                             try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.full_text_indexes, profile);
+                        }
+                    } else if (effective_req.sync_level == .full_index) {
+                        // Mirrors the `.full_text` branch above for the
+                        // graph inline fast path: `sync_targets.all_indexes`
+                        // already excludes the inline-handled graph index
+                        // name (filtered once, above, before this no-
+                        // workers fallback and the has-workers notify/wait
+                        // path both run). Applying only to what is left is
+                        // equivalent to the original unfiltered
+                        // `applyDerivedBatchProfiled` call when nothing was
+                        // handled inline (every managed index not actually
+                        // relevant to this batch is already a no-op there
+                        // via `batchAdvancesManagedIndexApplyState`), and
+                        // correctly skips re-applying an index this commit
+                        // already published inline when something was.
+                        if (sync_targets.all_indexes.len != 0) {
+                            try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.all_indexes, profile);
                         }
                     } else {
                         try applyDerivedBatchProfiled(self, materialized_derived_batch.?, profile);
