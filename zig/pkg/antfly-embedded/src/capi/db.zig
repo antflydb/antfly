@@ -5047,6 +5047,8 @@ pub fn executeBatchWithReplayAdmissionRetry(ptr: ?*anyopaque, request: *anyopaqu
 fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prepare_attempt: ?*const fn (*anyopaque) anyerror!void, apply: *const fn (*anyopaque, *Handle, *bool) anyerror!void) capi.ErrorCode {
     const alloc = std.heap.c_allocator;
     var entry = HandleEntry.capture(ptr) orelse return capi.mapError(error.InvalidArgument);
+    var entry_owned = true;
+    defer if (entry_owned) entry.release();
     const timeout_ms = if (entry.lock_handle.lite_connection) |connection| connection.options.busy_timeout_ms else 0;
     const io = handleLockIo();
     var deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
@@ -5062,6 +5064,9 @@ fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prep
             deadline += @max(0, std.Io.Clock.awake.now(io).nanoseconds - started);
         }
 
+        // Admission consumes the entry on every outcome. Before that handoff,
+        // preparation errors must release both the table and parent pins.
+        entry_owned = false;
         const guard = enterWithAdmissionBudget(entry, ptr, .write, .mutation, false, @max(0, deadline - std.Io.Clock.awake.now(io).nanoseconds)) orelse return capi.mapError(error.InvalidArgument);
         var held = true;
         defer if (held) guard.leave();
@@ -5101,6 +5106,7 @@ fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prep
             // Do not reacquire an expired or canceled operation's admission.
             if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return capi.mapError(error.LiteReplayBacklogExceeded);
             entry = HandleEntry.capture(ptr) orelse return capi.mapError(error.InvalidArgument);
+            entry_owned = true;
             capi.clearLastError();
             backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
             continue;
@@ -5146,6 +5152,7 @@ pub fn antfly_db_batch(
             const request: *@This() = @ptrCast(@alignCast(raw));
             const plan = request.prepared orelse return;
             try plan.prepareAttempt();
+            try plan.stageIndependentForegroundText();
             {
                 const guard = enterHandle(request.handle_ptr, .read) orelse return error.InvalidArgument;
                 defer guard.leave();
@@ -5228,6 +5235,7 @@ pub fn antfly_db_batch_json(
             const request: *@This() = @ptrCast(@alignCast(raw));
             const plan = request.prepared orelse return;
             try plan.prepareAttempt();
+            try plan.stageIndependentForegroundText();
             {
                 const guard = enterHandle(request.handle_ptr, .read) orelse return error.InvalidArgument;
                 defer guard.leave();
@@ -12069,6 +12077,47 @@ test "capi native memory supersession uses filtered lexical indexes and durable 
     try std.testing.expectEqual(t.Lifecycle.superseded, record.lifecycle);
     const detail = try std.json.parseFromSliceLeaky(t.SupersessionProposalDetail, a, try nativeMemoryTestCall(handle, a, "alice", .supersession_proposal, .{}, "", "pair"), .{});
     try std.testing.expectEqual(t.SupersessionRelation.supersedes, detail.proposal.verdict.?);
+}
+
+test "capi native batch preparation failure releases table and parent pins" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("batch-preparation-pins");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{directory.path()});
+    defer a.free(path);
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer runtime.deinit();
+    const root = try openLiteHandleAllocWithRuntime(a, path, .{ .no_sync = true, .profile = .hosted }, true, std.testing.io, runtime.ptr());
+    const id = try publishHandle(root);
+    defer antfly_db_close(id);
+    try std.testing.expectEqual(capi.ErrorCode.ok, @import("tables.zig").antfly_db_create_table_json(id, .fromSlice("history"), .fromSlice("{}")));
+    var table: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, @import("tables.zig").antfly_db_open_table(id, .fromSlice("history"), &table));
+    defer antfly_db_close(table);
+    const Probe = struct {
+        applied: bool = false,
+        fn prepare(_: *anyopaque) !void {
+            return error.OutOfMemory;
+        }
+        fn apply(raw: *anyopaque, _: *Handle, _: *bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.applied = true;
+        }
+    };
+    for ([_]?*anyopaque{ id, table }) |target| {
+        const entry = HandleEntry.capture(target).?;
+        const slot = entry.slot;
+        const parent = entry.parent_slot;
+        entry.release();
+        const before = slot.active.load(.acquire);
+        const parent_before = if (parent) |pin| pin.active.load(.acquire) else 0;
+        var probe: Probe = .{};
+        try std.testing.expectEqual(capi.ErrorCode.internal, executeBatchWithReplayPreparation(target, &probe, Probe.prepare, Probe.apply));
+        try std.testing.expect(!probe.applied);
+        try std.testing.expectEqual(before, slot.active.load(.acquire));
+        if (parent) |pin| try std.testing.expectEqual(parent_before, pin.active.load(.acquire));
+    }
 }
 
 test "capi native batch response allocation failure precedes an increment" {

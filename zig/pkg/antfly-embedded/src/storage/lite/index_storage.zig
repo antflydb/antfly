@@ -445,7 +445,10 @@ const NativeArtifactStager = struct {
     alloc: Allocator,
     registry: *artifacts.Registry,
     prefix: []u8,
-    const vtable: immutable_artifact.Stager.VTable = .{ .stage = stage, .acquire_build_resources = acquireBuildResources, .deinit = deinit };
+    inode: u64,
+    file_namespace: [32]u8,
+    resources: ?immutable_artifact.BuildResources,
+    const vtable: immutable_artifact.Stager.VTable = .{ .stage = stage, .stage_detached = stageDetached, .acquire_build_resources = acquireBuildResources, .deinit = deinit };
 
     fn retainBuildResources(raw: *anyopaque) void {
         const registry: *artifacts.Registry = @ptrCast(@alignCast(raw));
@@ -457,7 +460,7 @@ const NativeArtifactStager = struct {
     }
     fn acquireBuildResources(raw: *anyopaque) !?immutable_artifact.BuildResources {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return captureResources(self.registry);
+        return if (self.resources) |resources| resources.retained() else null;
     }
 
     fn captureResources(registry: *artifacts.Registry) !?immutable_artifact.BuildResources {
@@ -468,6 +471,14 @@ const NativeArtifactStager = struct {
         if (owner.resource_manager != null and !owner.resource_manager_transfers_on_close) return null;
         registry.retainOwner();
         return .{ .native_metadata_revision = if (owner.file.header.indexed_reclamation) owner.file.header.indexed_revision else 3, .ptr = registry, .allocator = registry.allocator, .io = registry.io(), .resource_manager = owner.resource_manager, .release_fn = releaseBuildResources, .retain_fn = retainBuildResources };
+    }
+
+    fn stageDetached(raw: *anyopaque, bytes: []const u8) !immutable_artifact.Prepared {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (bytes.len == 0) return error.InvalidArtifactConstructionState;
+        const resources = self.resources orelse return error.Unsupported;
+        if (bytes.len > artifacts.OwnedBytes.maximum_length) return error.Unsupported;
+        return InlinePreparedArtifact.createAt(self, bytes, resources.resource_manager, self.inode, self.file_namespace);
     }
 
     fn stage(raw: *anyopaque, bytes: []const u8) !immutable_artifact.Prepared {
@@ -507,6 +518,7 @@ const NativeArtifactStager = struct {
 
     fn deinit(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.resources) |*resources| resources.deinit();
         self.registry.releaseOwner();
         self.alloc.free(self.prefix);
         self.alloc.destroy(self);
@@ -529,18 +541,23 @@ const InlinePreparedArtifact = struct {
     const Bytes = artifacts.OwnedBytes;
 
     fn create(stager: *NativeArtifactStager, bytes: []const u8) !immutable_artifact.Prepared {
+        if (stager.resources) |resources|
+            return createAt(stager, bytes, resources.resource_manager, stager.inode, stager.file_namespace);
         const owner = stager.registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
         defer stager.registry.endCallback();
-        const inode = (try owner.file.file.stat(owner.file.runtime())).inode;
+        return createAt(stager, bytes, owner.resource_manager, (try owner.file.file.stat(owner.file.runtime())).inode, owner.file.header.reader_epoch_namespace);
+    }
+
+    fn createAt(stager: *NativeArtifactStager, bytes: []const u8, manager: ?*@import("../resource_manager.zig").ResourceManager, inode: u64, file_namespace: [32]u8) !immutable_artifact.Prepared {
         const state = try stager.alloc.create(@This());
         errdefer stager.alloc.destroy(state);
         // Published bytes have an independently retained resource/IO owner.
-        const backing = try Bytes.copy(stager.registry, owner.resource_manager, bytes);
+        const backing = try Bytes.copy(stager.registry, manager, bytes);
         errdefer backing.deinit();
         const prefix = try stager.alloc.dupe(u8, stager.prefix);
         errdefer stager.alloc.free(prefix);
         stager.registry.retainOwner(); // Publication callbacks own a separate reference.
-        state.* = .{ .alloc = stager.alloc, .registry = stager.registry, .prefix = prefix, .inode = inode, .file_namespace = owner.file.header.reader_epoch_namespace, .bytes = backing };
+        state.* = .{ .alloc = stager.alloc, .registry = stager.registry, .prefix = prefix, .inode = inode, .file_namespace = file_namespace, .bytes = backing };
         return .{ .ptr = state, .vtable = &vtable };
     }
 
@@ -709,8 +726,12 @@ fn acquireImmutableStager(raw: *anyopaque, alloc: Allocator) !?immutable_artifac
     const state = try alloc.create(NativeArtifactStager);
     errdefer alloc.destroy(state);
     const prefix = try alloc.dupe(u8, self.namespace_prefix);
+    errdefer alloc.free(prefix);
+    var resources = try NativeArtifactStager.captureResources(registry);
+    errdefer if (resources) |*owned| owned.deinit();
+    const inode = (try self.docs.file.file.stat(self.docs.file.runtime())).inode;
     registry.retainOwner();
-    state.* = .{ .alloc = alloc, .registry = registry, .prefix = prefix };
+    state.* = .{ .alloc = alloc, .registry = registry, .prefix = prefix, .inode = inode, .file_namespace = self.docs.file.header.reader_epoch_namespace, .resources = resources };
     return .{ .ptr = state, .vtable = &NativeArtifactStager.vtable };
 }
 
@@ -4863,6 +4884,41 @@ test "lite native retirement sweep rolls back a malformed page and respects name
     try std.testing.expectEqual(@as(?u64, 4), try docs.file.getIndexCatalogRecordSize("/indexes/text/segments/1.seg"));
     var scoped = Store.initWithNamespace(a, &docs, "/other");
     try std.testing.expectError(error.InvalidNativeIndexPath, scoped.storage().sweepTextRetirements("/indexes/text", null));
+}
+
+test "lite detached artifact staging survives backend close without live callbacks" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "detached-resident-stage.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    docs.maintenance_start_suppressed = true;
+    var live = true;
+    defer if (live) docs.close();
+    var adapter = Store.init(a, &docs);
+    var stager = (try adapter.storage().acquireImmutableStager(a)).?;
+    defer stager.deinit();
+    const registry = docs.artifact_registry.?;
+    const target: immutable_artifact.AliasTarget = .{ .inode = (try docs.file.file.stat(docs.file.runtime())).inode, .file_namespace = docs.file.header.reader_epoch_namespace, .prefix = "/indexes/text" };
+    docs.close();
+    live = false;
+    try std.testing.expect(registry.store == null);
+    var resources = (try stager.acquireBuildResources()).?;
+    defer resources.deinit();
+    var artifact = try stager.stageDetached("owned after close");
+    defer artifact.deinit();
+    var source = try artifact.prepareLinkAt(target, "/indexes/text/segments/1.seg");
+    defer source.close();
+    var bytes: [17]u8 = undefined;
+    try source.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("owned after close", &bytes);
+    try std.testing.expectEqual(@as(usize, 0), registry.callbacks);
+    const large = try a.alloc(u8, artifacts.OwnedBytes.maximum_length + 1);
+    defer a.free(large);
+    @memset(large, 'x');
+    try std.testing.expectError(error.Unsupported, stager.stageDetached(large));
+    try std.testing.expectEqual(@as(usize, 0), registry.callbacks);
 }
 
 test "lite resident immutable sources retain owned bytes without durable range leases" {

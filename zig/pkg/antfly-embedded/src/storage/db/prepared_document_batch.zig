@@ -182,6 +182,16 @@ pub const Plan = struct {
         }
     }
 
+    /// Copy resident artifacts and prepare their authoritative ordinal columns
+    /// using captured resource/file identities. No live DB, gate, lease or
+    /// Registry callback is needed. Large artifacts retain bounded staging.
+    pub fn stageIndependentForegroundText(self: *Plan) !void {
+        for (self.text.items) |*item| item.built.stageDetachedNative(item.config.stager) catch |err| switch (err) {
+            error.Unsupported, error.ResourceBudgetExceeded, error.OutOfMemory => {},
+            else => return err,
+        };
+    }
+
     /// Capture staged artifacts, finite metadata witnesses and immutable index
     /// inputs under the current-runtime lifetime fence. The caller finishes
     /// replacement preparation after releasing this fence.

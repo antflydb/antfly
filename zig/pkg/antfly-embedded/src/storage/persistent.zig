@@ -1038,7 +1038,19 @@ pub const NativeOrdinalPreparation = struct {
 };
 
 pub fn prepareNativeTextSegment(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8) !PreparedReplaySegment {
-    var result = try prepareReplaySegment(alloc, stager, bytes);
+    return prepareNativeTextSegmentWithStaging(alloc, stager, bytes, false);
+}
+
+pub fn prepareDetachedNativeTextSegment(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8) !PreparedReplaySegment {
+    return prepareNativeTextSegmentWithStaging(alloc, stager, bytes, true);
+}
+
+fn prepareNativeTextSegmentWithStaging(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8, detached: bool) !PreparedReplaySegment {
+    var result = if (detached) blk: {
+        var range = try extractSegmentKeyRange(alloc, bytes);
+        errdefer range.deinit(alloc);
+        break :blk PreparedReplaySegment{ .artifact = try stager.stageDetached(bytes), .key_range = range, .alloc = alloc };
+    } else try prepareReplaySegment(alloc, stager, bytes);
     errdefer result.deinit();
     var resources = (try stager.acquireBuildResources()) orelse return error.Unsupported;
     errdefer resources.deinit();

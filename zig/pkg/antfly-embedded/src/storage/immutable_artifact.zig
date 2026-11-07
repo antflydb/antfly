@@ -107,6 +107,9 @@ pub const Stager = struct {
     dispatch: Boundary.Dispatch = Boundary.local_dispatch,
     pub const VTable = struct {
         stage: *const fn (*anyopaque, []const u8) anyerror!Prepared,
+        /// Pure owned preparation. This operation must neither borrow a live
+        /// runtime nor acquire publication admission; unsupported sizes decline.
+        stage_detached: ?*const fn (*anyopaque, []const u8) anyerror!Prepared = null,
         acquire_build_resources: ?*const fn (*anyopaque) anyerror!?BuildResources = null,
         deinit: *const fn (*anyopaque) void,
     };
@@ -117,6 +120,10 @@ pub const Stager = struct {
     }
     pub fn stage(self: Stager, bytes: []const u8) !Prepared {
         return Boundary.call("stage", self.dispatch, self.vtable.stage, .{ self.ptr, bytes });
+    }
+    pub fn stageDetached(self: Stager, bytes: []const u8) !Prepared {
+        const operation = self.vtable.stage_detached orelse return error.Unsupported;
+        return Boundary.call("stage_detached", self.dispatch, operation, .{ self.ptr, bytes });
     }
     pub fn deinit(self: *Stager) void {
         self.vtable.deinit(self.ptr);

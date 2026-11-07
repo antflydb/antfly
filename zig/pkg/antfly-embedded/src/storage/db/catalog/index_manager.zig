@@ -1257,14 +1257,18 @@ pub const PreparedTextMapperPublication = struct {
     }
 
     pub fn stage(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager) !void {
-        return self.stageWithIdentities(stager, false);
+        return self.stageWithIdentities(stager, false, false);
     }
 
     pub fn stageNative(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager) !void {
-        return self.stageWithIdentities(stager, true);
+        return self.stageWithIdentities(stager, true, false);
     }
 
-    fn stageWithIdentities(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager, native_identities: bool) !void {
+    pub fn stageDetachedNative(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager) !void {
+        return self.stageWithIdentities(stager, true, true);
+    }
+
+    fn stageWithIdentities(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager, native_identities: bool, detached: bool) !void {
         if (self.staged.len != 0 or self.segments.len == 0) return;
         const staged = try self.alloc.alloc(persistent_mod.PreparedReplaySegment, self.segments.len);
         var initialized: usize = 0;
@@ -1273,7 +1277,7 @@ pub const PreparedTextMapperPublication = struct {
             self.alloc.free(staged);
         }
         for (self.segments, 0..) |*bytes, i| {
-            staged[i] = if (native_identities) try persistent_mod.prepareNativeTextSegment(self.alloc, stager, bytes.*) else try persistent_mod.prepareReplaySegment(self.alloc, stager, bytes.*);
+            staged[i] = if (detached) try persistent_mod.prepareDetachedNativeTextSegment(self.alloc, stager, bytes.*) else if (native_identities) try persistent_mod.prepareNativeTextSegment(self.alloc, stager, bytes.*) else try persistent_mod.prepareReplaySegment(self.alloc, stager, bytes.*);
             initialized += 1;
         }
         // Staging succeeds as a unit. On refusal, the caller still owns all
