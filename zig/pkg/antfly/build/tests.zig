@@ -3470,7 +3470,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"time series"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    time_series_tests.step.max_rss = 5 * 1024 * 1024 * 1024;
+    // Native macOS ReleaseFast peaks at 7.49 GB with DB visibility coverage.
+    time_series_tests.step.max_rss = 8 * 1024 * 1024 * 1024;
     b.step("time-series-test", "Verify fixed temporal buckets, bounds and empty measurements").dependOn(&b.addRunArtifact(time_series_tests).step);
     const time_series_storage_tests = b.addTest(.{
         .name = "time-series-storage-tests",

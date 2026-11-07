@@ -148365,7 +148365,7 @@ test "time series historical TTL sources preserve write versions and signed visi
     try std.testing.expectEqual(@as(?i128, -1_000_000_000), try ttl_mod.readSourceTimestamp(db.core.store, a, "historical"));
     const value = (try db.get(a, "historical")) orelse return error.TestUnexpectedResult;
     a.free(value);
-    var reading = (try db.lookup(a, "historical", .{})) orelse return error.TestUnexpectedResult;
+    var reading = (try db.lookup(a, "historical", .{ .include_primary_digest = true })) orelse return error.TestUnexpectedResult;
     defer reading.deinit(a);
     try std.testing.expectEqual(@as(?u64, 12345), reading.version);
     var restored_versions: std.StringHashMapUnmanaged(u64) = .empty;
