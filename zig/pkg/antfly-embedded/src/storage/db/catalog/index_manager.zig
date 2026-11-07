@@ -28896,10 +28896,24 @@ pub const IndexManager = struct {
     /// path cannot replicate" (not a skip -- still needs applying, just not
     /// inline).
     pub fn graphEdgeWriteEligibleForInlinePublication(self: *const IndexManager, entry: *const GraphIndex, write: types.GraphEdgeWrite) bool {
-        if (entry.ttl_duration_ns != 0 or graphEntryHasContributors(entry)) return false;
-        if (write.owner.len != 0 or write.owner_document.len != 0) return false;
+        if (entry.ttl_duration_ns != 0) {
+            wal_trace.recordOp(.graph_inline_eligibility_ttl);
+            return false;
+        }
+        if (graphEntryHasContributors(entry)) {
+            wal_trace.recordOp(.graph_inline_eligibility_contributors);
+            return false;
+        }
+        if (write.owner.len != 0 or write.owner_document.len != 0) {
+            wal_trace.recordOp(.graph_inline_eligibility_owner);
+            return false;
+        }
         const range_key = if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source;
-        return self.keyInRange(range_key);
+        if (!self.keyInRange(range_key)) {
+            wal_trace.recordOp(.graph_inline_eligibility_out_of_range);
+            return false;
+        }
+        return true;
     }
 
     /// WS4-for-vectors' sparse extension of the fast path above, mirroring
