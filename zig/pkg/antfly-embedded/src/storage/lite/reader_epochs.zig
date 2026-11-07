@@ -19,6 +19,7 @@
 //! registration cannot cross a writer's scan-to-allocation window. Kernel locks
 //! reclaim crashed registrations; no clock, PID reuse, or timeout decides safety.
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 pub const Frontier = struct { data: ?u64 = null, metadata: ?u64 = null };
 pub const Lease = struct {
@@ -34,6 +35,16 @@ pub const Lease = struct {
         a.free(self.path);
     }
 };
+
+/// Test-only escape hatch for the one legitimate, already-regression-tested
+/// caller that deliberately relies on the ambient process cwd: native.zig's
+/// "bug2" test pins cwd to a private tmp directory with
+/// `std.process.setCurrentPath` *before* opening a bare, directory-component-
+/// free path, specifically to prove that case still resolves the namespace
+/// next to the file (not somewhere stray) -- exactly the shape the debug
+/// assertion below exists to catch for every *other* caller, which never
+/// pins cwd on purpose first. Never set outside that one test.
+pub var debug_assert_allow_cwd_fallback: bool = false;
 
 const Namespace = struct {
     canonical: [:0]u8,
@@ -71,6 +82,28 @@ const Namespace = struct {
         }
         var parent_path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const parent_path_len = try parent.realPath(io, &parent_path_buf);
+        // Debug/test-only trap for the exact bug this function's own doc
+        // comment above describes (a bare `identity` file landing directly
+        // in the process cwd): a caller that built `path` from a bare
+        // filename (no directory component -- `dirname` returns `null`, the
+        // `orelse "."` above then resolves `parent` to cwd) or that
+        // otherwise resolved this namespace's parent to be the process cwd
+        // itself is one `std.process.chdir`/relative-cwd race away from
+        // scattering `identity`/marker files across whatever directory the
+        // process happens to be running in. Catch the caller with a stack
+        // trace instead of silently creating the namespace there.
+        if ((builtin.mode == .debug or builtin.is_test) and !debug_assert_allow_cwd_fallback) {
+            var cwd_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const cwd_path_len = std.Io.Dir.cwd().realPath(io, &cwd_path_buf) catch 0;
+            const parent_path = parent_path_buf[0..parent_path_len];
+            const resolves_to_cwd = cwd_path_len != 0 and std.mem.eql(u8, parent_path, cwd_path_buf[0..cwd_path_len]);
+            if (std.fs.path.dirname(path) == null or resolves_to_cwd) {
+                std.debug.panic(
+                    "reader_epochs.Namespace.open: path \"{s}\" resolves its reader-epoch namespace directly into the process cwd (\"{s}\") -- caller built this path from a bare filename or a \".\" fallback instead of a path next to the real .aflite file",
+                    .{ path, parent_path },
+                );
+            }
+        }
         const canonical = try std.fs.path.joinZ(a, &.{ parent_path_buf[0..parent_path_len], std.fs.path.basename(path) });
         errdefer a.free(canonical);
         // The path chooses a bounded location, never the authority to reuse.

@@ -135,6 +135,14 @@ test "bug2: an indexed-reclamation Lite file at a relative path creates no files
 
     std.debug.print("BUG2-DIAG: about to create, cwd should be tmp={s}\n", .{tmp_dir_path});
     const bare_name = "bug2-repro.aflite";
+    // This test is the one legitimate, deliberate exercise of
+    // `Namespace.open`'s cwd fallback (see that function's own debug
+    // assertion): cwd is pinned above, on purpose, specifically so a bare
+    // path resolves predictably. Every other caller that reaches that
+    // fallback is depending on cwd by accident, which the assertion exists
+    // to catch; suppress it only for this one call.
+    @import("reader_epochs.zig").debug_assert_allow_cwd_fallback = true;
+    defer @import("reader_epochs.zig").debug_assert_allow_cwd_fallback = false;
     {
         var file = try NativeFile.createWithIo(a, io, bare_name, .{ .indexed_reclamation = true, .no_sync = true, .exclusive = true });
         defer file.close();
