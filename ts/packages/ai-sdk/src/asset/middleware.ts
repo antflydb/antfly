@@ -119,7 +119,7 @@ export interface AssetMiddlewareOptions {
    * the asset is always fetched and sent inline instead.
    */
   allowVendorUpload?: boolean;
-  /** The provider's files API, required when `allowVendorUpload` is true. */
+  /** Optional files API or provider; providers without `files()` use inline bytes. */
   files?: FilesV4 | ProviderV4;
   /** Shared across calls for one vendor account. Defaults to a bounded in-memory cache. */
   cache?: AssetUploadCache;
@@ -177,6 +177,9 @@ async function fetchResourceBytes(
 export function createAssetMiddleware(options: AssetMiddlewareOptions): LanguageModelMiddleware {
   const fetchFn = options.fetch ?? globalThis.fetch;
   const cache = options.cache ?? createInMemoryAssetUploadCache();
+  const files = options.allowVendorUpload ? options.files : undefined;
+  // Inspect capability without calling provider factories before authorization.
+  const getFilesAPI = files && ("uploadFile" in files ? () => files : files.files?.bind(files));
 
   const positiveInteger = (value: number | undefined, fallback: number, name: string) => {
     const limit = value ?? fallback;
@@ -223,7 +226,7 @@ export function createAssetMiddleware(options: AssetMiddlewareOptions): Language
     );
 
     admit(resource, assets);
-    if (options.allowVendorUpload && options.files) {
+    if (getFilesAPI) {
       // A representation ETag is scoped to one asset, not globally to bytes.
       // Only source metadata supplies the separately verified content digest.
       // MIME is part of a vendor file's representation as well.
@@ -239,7 +242,6 @@ export function createAssetMiddleware(options: AssetMiddlewareOptions): Language
           ];
       // Keep capability URLs out of externally implemented cache keys.
       const cacheIdentity = createHash("sha256").update(JSON.stringify(identity)).digest("hex");
-      const files = options.files;
       const entry = await uploadedOnce(
         cache,
         `${provider}\u0000${cacheIdentity}`,
@@ -249,9 +251,10 @@ export function createAssetMiddleware(options: AssetMiddlewareOptions): Language
           sharedSignal.throwIfAborted();
           if (cached && (!cached.expiresAt || cached.expiresAt.getTime() > Date.now()))
             return cached;
+          const api = getFilesAPI();
           const bytes = await fetchResourceBytes(resource, fetchFn, sharedSignal);
           const uploaded = await uploadFile({
-            api: files,
+            api,
             data: bytes,
             mediaType: resource.mime_type,
             abortSignal: sharedSignal,
