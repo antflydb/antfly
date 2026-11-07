@@ -24,13 +24,18 @@ import (
 const SourceRecordVersion = 3
 
 type SourceIdentity struct {
-	ID        string `json:"id"`
-	Provider  string `json:"provider"`
-	ItemID    string `json:"item_id"`
-	URI       string `json:"uri"`
-	Path      string `json:"path"`
-	Revision  string `json:"revision"`
-	IndexedAt int64  `json:"indexed_at"`
+	ID       string `json:"id"`
+	Provider string `json:"provider"`
+	ItemID   string `json:"item_id"`
+	// RelativeKey is this row's key relative to its source's own root (see
+	// Item.RelativeKey). Stored alongside ItemID so a row's identity can be
+	// recomputed and verified under IdentityKey without a second, separate
+	// copy of the value living only in free-form Metadata.
+	RelativeKey string `json:"relative_key,omitempty"`
+	URI         string `json:"uri"`
+	Path        string `json:"path"`
+	Revision    string `json:"revision"`
+	IndexedAt   int64  `json:"indexed_at"`
 }
 
 type AcquiredContent struct {
@@ -64,7 +69,7 @@ func (d Document) MarshalJSON() ([]byte, error) {
 		}
 	}
 	return json.Marshal(sourceRecord{SchemaVersion: SourceRecordVersion,
-		Source:  SourceIdentity{ID: configString(d.Metadata, "source_id"), Provider: configString(d.Metadata, "provider"), ItemID: configString(d.Metadata, "identity"), URI: d.URI, Path: d.Path, Revision: d.Revision, IndexedAt: d.IndexedAt},
+		Source:  SourceIdentity{ID: configString(d.Metadata, "source_id"), Provider: configString(d.Metadata, "provider"), ItemID: configString(d.Metadata, "identity"), RelativeKey: configString(d.Metadata, "relative_key"), URI: d.URI, Path: d.Path, Revision: d.Revision, IndexedAt: d.IndexedAt},
 		Content: content, Permissions: d.Permissions, Metadata: d.Metadata})
 }
 
@@ -103,7 +108,7 @@ func (d *Document) UnmarshalJSON(raw []byte) error {
 	if metadata == nil {
 		metadata = map[string]any{}
 	}
-	for key, value := range map[string]string{"source_id": record.Source.ID, "provider": record.Source.Provider, "identity": record.Source.ItemID} {
+	for key, value := range map[string]string{"source_id": record.Source.ID, "provider": record.Source.Provider, "identity": record.Source.ItemID, "relative_key": record.Source.RelativeKey} {
 		if existing := configString(metadata, key); existing != "" && existing != value {
 			return fmt.Errorf("source identity differs from metadata")
 		}
@@ -113,11 +118,15 @@ func (d *Document) UnmarshalJSON(raw []byte) error {
 	return nil
 }
 
-func SourceRow(id, sourceID string, document Document) (map[string]any, error) {
+// SourceRow projects document into its stored row, after verifying that id is
+// exactly the key IdentityKey computes for it under namespace (the owning
+// source's identity.namespace, or "" for a source that has not set one, in
+// which case this is exactly the legacy RecordKey check).
+func SourceRow(id, sourceID, namespace string, document Document) (map[string]any, error) {
 	if document.Version != SourceRecordVersion {
 		return nil, fmt.Errorf("source publication requires neutral record v%d", SourceRecordVersion)
 	}
-	key, err := RecordKey(sourceID, configString(document.Metadata, "identity"))
+	key, err := IdentityKey(sourceID, namespace, configString(document.Metadata, "relative_key"), configString(document.Metadata, "identity"))
 	if err != nil || key != id {
 		return nil, fmt.Errorf("record identity differs from source ownership")
 	}

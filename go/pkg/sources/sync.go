@@ -26,17 +26,55 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const ScopedMergeContentType = "application/vnd.antfly.scoped-merge.v1+json"
 
 // RecordKey separates the provider's identity from the destination key. Every
 // provider belonging to one logical source shares a single exclusive key range.
+//
+// This is the legacy, namespace-less formula: sha256(providerID), where
+// providerID is the connector's own acquisition identity (item.ID), which
+// embeds the connector's location (URL/bucket/path) and is unrelated to the
+// bytes it names. A source with no identity.namespace set keeps this formula
+// forever, byte for byte, so nothing persisted before namespaces existed is
+// affected. See IdentityKey for the namespace-scoped formula.
 func RecordKey(sourceID, providerID string) (string, error) {
 	if !canonicalID(sourceID) || !ownedID(providerID, "job/"+sourceID) {
 		return "", fmt.Errorf("invalid source record identity")
 	}
 	digest := sha256.Sum256([]byte(providerID))
+	return RecordPrefix(sourceID) + hex.EncodeToString(digest[:]), nil
+}
+
+// IdentityKey computes a source row's key. With no namespace, it is exactly
+// RecordKey(sourceID, providerID) -- including its validation -- so adopting
+// this function changes nothing for a source that has not set
+// identity.namespace. With a namespace, the key is
+// sha256(namespace + "/" + relativeKey) instead: identity follows the row's
+// position under the source's own root, not the provider's acquisition
+// identity, so a connection or provider change that preserves the namespace
+// and relative key keeps the same row instead of re-keying it.
+//
+// Setting namespace to a source's current provider-ID prefix (i.e.
+// namespace = strings.TrimSuffix(providerID, "/"+relativeKey)) reconstructs
+// providerID byte for byte when concatenated back with relativeKey, by
+// construction; it does not by itself reproduce RecordKey's legacy digest,
+// because the two formulas hash different strings (the full providerID vs.
+// namespace+"/"+relativeKey). Adopting a namespace on a populated source is
+// therefore always exactly one re-key, acknowledged by the API as rekeys:
+// true; only sources that never had rows under the legacy formula (new
+// sources, given a namespace at creation before any row exists) avoid it
+// entirely.
+func IdentityKey(sourceID, namespace, relativeKey, providerID string) (string, error) {
+	if namespace == "" {
+		return RecordKey(sourceID, providerID)
+	}
+	if !canonicalID(sourceID) || relativeKey == "" || !utf8.ValidString(relativeKey) || strings.ContainsRune(relativeKey, 0) || !utf8.ValidString(namespace) || strings.ContainsRune(namespace, 0) {
+		return "", fmt.Errorf("invalid source record identity")
+	}
+	digest := sha256.Sum256([]byte(namespace + "/" + relativeKey))
 	return RecordPrefix(sourceID) + hex.EncodeToString(digest[:]), nil
 }
 func RecordPrefix(sourceID string) string { return "source://job/" + sourceID + "/records/" }
@@ -90,19 +128,35 @@ type SyncMergeValidator interface {
 // may share a table. No fallback to legacy/unbounded LinearMerge is permitted.
 type SyncWriter struct {
 	client                          SyncClient
-	table, sourceID                 string
+	table, sourceID, namespace      string
 	bounds                          KeyRange
 	inventory, verified             map[string]bool
 	authoritative, finished, failed bool
 }
 
+// NewSyncWriter pins a namespace-less (legacy) inventory: every key is
+// RecordKey(sourceID, id), byte for byte. Equivalent to
+// NewSyncWriterWithIdentity with an empty namespace and items that carry no
+// relative key, since IdentityKey only consults relativeKey when a namespace
+// is set.
 func NewSyncWriter(client SyncClient, table, sourceID string, providerIDs []string, authoritative bool) (*SyncWriter, error) {
-	if client == nil || table == "" || !canonicalID(sourceID) || len(providerIDs) > maxCollaborationSourceObjects {
+	items := make([]Item, len(providerIDs))
+	for i, id := range providerIDs {
+		items[i] = Item{ID: id}
+	}
+	return NewSyncWriterWithIdentity(client, table, sourceID, "", items, authoritative)
+}
+
+// NewSyncWriterWithIdentity pins an inventory keyed by IdentityKey(sourceID,
+// namespace, item.RelativeKey (or its native-ID fallback), item.ID). With an
+// empty namespace this is exactly NewSyncWriter.
+func NewSyncWriterWithIdentity(client SyncClient, table, sourceID, namespace string, items []Item, authoritative bool) (*SyncWriter, error) {
+	if client == nil || table == "" || !canonicalID(sourceID) || len(items) > maxCollaborationSourceObjects {
 		return nil, fmt.Errorf("invalid source sync configuration")
 	}
-	w := &SyncWriter{client: client, table: table, sourceID: sourceID, bounds: recordRange(sourceID), inventory: map[string]bool{}, verified: map[string]bool{}, authoritative: authoritative}
-	for _, id := range providerIDs {
-		key, err := RecordKey(sourceID, id)
+	w := &SyncWriter{client: client, table: table, sourceID: sourceID, namespace: namespace, bounds: recordRange(sourceID), inventory: map[string]bool{}, verified: map[string]bool{}, authoritative: authoritative}
+	for _, item := range items {
+		key, err := IdentityKey(sourceID, namespace, relativeKeyFor(sourceID, item), item.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -126,7 +180,7 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 	}
 	ids := make([]string, 0, len(documents))
 	for id, doc := range documents {
-		key, err := RecordKey(w.sourceID, configString(doc.Metadata, "identity"))
+		key, err := IdentityKey(w.sourceID, w.namespace, configString(doc.Metadata, "relative_key"), configString(doc.Metadata, "identity"))
 		if err != nil || key != id || !w.inventory[id] || configString(doc.Metadata, "source_id") != w.sourceID {
 			w.failed = true
 			return MergeResult{}, fmt.Errorf("record outside pinned source inventory")
@@ -185,7 +239,7 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 		doc := documents[id]
 		changed[id] = doc
 		changedIDs = append(changedIDs, id)
-		rows[id], err = SourceRow(id, w.sourceID, doc)
+		rows[id], err = SourceRow(id, w.sourceID, w.namespace, doc)
 		if err != nil {
 			return MergeResult{}, err
 		}

@@ -170,7 +170,12 @@ func (c *LocalConnector) Enumerate(ctx context.Context, r Request) (Inventory, e
 			return Inventory{}, fmt.Errorf("%w: local object exceeds the %d byte limit", ErrInvalidInput, maxLocalMediaBytes)
 		}
 		uri := (&url.URL{Scheme: "local", Path: "/" + rel}).String()
-		out.Objects = append(out.Objects, Item{ID: "local://" + strings.Trim(r.SourceNamespace, "/") + "/" + rel, Path: rel, Filename: name, Revision: match[1], URL: uri, Size: info.Size(), SourceKind: ProviderLocal, ReadMode: sourceReadBytes, ObjectIndex: len(out.Objects) + 1, Metadata: map[string]any{"source_namespace": r.SourceNamespace, "canonical_url": uri, localModifiedKey: localModified(info)}})
+		// rel already includes cfg.Prefix (the configured sub-root for this
+		// source); the relative key is root-relative, i.e. without it, same as
+		// S3/GCS's prefix stripping. Content-addressed storage already names
+		// objects by digest, so this is stable across a prefix change too.
+		relativeKey := path.Join(localObjectDir, name)
+		out.Objects = append(out.Objects, Item{ID: "local://" + strings.Trim(r.SourceNamespace, "/") + "/" + rel, Path: rel, RelativeKey: relativeKey, Filename: name, Revision: match[1], URL: uri, Size: info.Size(), SourceKind: ProviderLocal, ReadMode: sourceReadBytes, ObjectIndex: len(out.Objects) + 1, Metadata: map[string]any{"source_namespace": r.SourceNamespace, "canonical_url": uri, localModifiedKey: localModified(info)}})
 		if r.Preview {
 			break
 		}

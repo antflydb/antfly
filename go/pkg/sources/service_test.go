@@ -130,6 +130,83 @@ func TestServiceMediaRangesRevocationAndReconciliation(t *testing.T) {
 	require.Equal(t, 410, fetchService(s, ref, "GET", "").Code)
 	require.Equal(t, 400, serviceCall(s, "POST", "/v1/sync", map[string]any{}).Code)
 }
+
+// TestServiceSourceIdentityNamespaceLifecycle exercises Part 2's PUT contract
+// end to end: a source predating identity.namespace (serviceFixture's
+// source, exactly like a real pre-upgrade deployment) still re-keys on a
+// connection/config change and the response says so; setting a namespace is
+// itself a one-time rekey; once set it is immutable, and no later PUT --
+// including one that changes connection -- ever re-keys again; a PUT that
+// omits identity entirely never clears an existing namespace; and a brand
+// new source gets a namespace at creation, so creating one never re-keys.
+func TestServiceSourceIdentityNamespaceLifecycle(t *testing.T) {
+	s, _, _ := serviceFixture(t)
+	source := s.profile.Sources[0]
+	require.Empty(t, source.Identity.Namespace, "fixture source predates identity.namespace, like a real upgrade")
+
+	// Permissions-only change: no namespace, no connection/config change.
+	source.Permissions = &Permissions{Readers: []string{"another-user"}}
+	w := serviceCall(s, "PUT", "/v1/sources/"+source.ID, source)
+	require.Equal(t, 200, w.Code)
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Equal(t, false, response["rekeys"])
+	require.Empty(t, s.profile.Sources[0].Identity.Namespace)
+
+	// Connection change on a still-namespace-less source: re-keys as today.
+	require.Equal(t, 200, serviceCall(s, "PUT", "/v1/connections/retry-budget", Connection{Provider: ProviderS3}).Code)
+	source = s.profile.Sources[0]
+	source.Connection = "retry-budget"
+	w = serviceCall(s, "PUT", "/v1/sources/"+source.ID, source)
+	require.Equal(t, 200, w.Code)
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Equal(t, true, response["rekeys"])
+	require.Empty(t, s.profile.Sources[0].Identity.Namespace, "a connection change alone does not assign a namespace")
+
+	// Setting a namespace for the first time is itself a one-time rekey, even
+	// with no connection/config change alongside it.
+	source = s.profile.Sources[0]
+	source.Identity.Namespace = "adopted-namespace"
+	w = serviceCall(s, "PUT", "/v1/sources/"+source.ID, source)
+	require.Equal(t, 200, w.Code)
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Equal(t, true, response["rekeys"])
+	require.Equal(t, "adopted-namespace", s.profile.Sources[0].Identity.Namespace)
+
+	// Immutable: a PUT trying to change it is rejected, and the stored value
+	// is untouched.
+	source = s.profile.Sources[0]
+	source.Identity.Namespace = "different-namespace"
+	w = serviceCall(s, "PUT", "/v1/sources/"+source.ID, source)
+	require.Equal(t, 409, w.Code)
+	require.Equal(t, "adopted-namespace", s.profile.Sources[0].Identity.Namespace)
+
+	// Omitting identity on a later PUT does not clear it, and once a
+	// namespace is set, a connection change no longer re-keys anything.
+	source = s.profile.Sources[0]
+	source.Identity = Identity{}
+	require.Equal(t, 200, serviceCall(s, "PUT", "/v1/connections/retry-budget-2", Connection{Provider: ProviderS3}).Code)
+	source.Connection = "retry-budget-2"
+	w = serviceCall(s, "PUT", "/v1/sources/"+source.ID, source)
+	require.Equal(t, 200, w.Code)
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Equal(t, false, response["rekeys"])
+	require.Equal(t, "adopted-namespace", s.profile.Sources[0].Identity.Namespace)
+
+	// A brand new source gets a namespace at creation and never re-keys for it.
+	newID := "22222222-2222-4222-8222-222222222222"
+	newSource := Source{ID: newID, Connection: source.Connection, Table: "sources", Config: json.RawMessage(`{"bucket":"docs"}`), Permissions: &Permissions{Readers: []string{"user:self"}}}
+	w = serviceCall(s, "PUT", "/v1/sources/"+newID, newSource)
+	require.Equal(t, 200, w.Code)
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Equal(t, false, response["rekeys"])
+	for _, candidate := range s.profile.Sources {
+		if candidate.ID == newID {
+			require.Equal(t, newID, candidate.Identity.Namespace)
+		}
+	}
+}
+
 func TestServiceRuntimeConnectionSourceLifecycle(t *testing.T) {
 	s, _, backend := serviceFixture(t)
 	unauth := httptest.NewRecorder()

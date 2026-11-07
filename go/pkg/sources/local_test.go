@@ -74,6 +74,26 @@ func TestLocalPutIsContentAddressedAndIdempotent(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidInput)
 }
 
+// TestLocalRelativeKeyStripsConfiguredPrefix pins that a local item's
+// RelativeKey is relative to the source's own root (its configured prefix),
+// not the shared store root: changing the prefix changes Item.ID (and so the
+// legacy RecordKey) but must not change RelativeKey, and setting
+// identity.namespace to today's provider-ID prefix must reconstruct the
+// provider ID byte for byte (the invariant IdentityKey relies on).
+func TestLocalRelativeKeyStripsConfiguredPrefix(t *testing.T) {
+	root := t.TempDir()
+	object := localPut(t, root, "team-a", ".txt", "hello")
+	inventory, err := (&LocalConnector{Root: root}).Enumerate(context.Background(), localRequest(t, "team-a"))
+	require.NoError(t, err)
+	require.Len(t, inventory.Objects, 1)
+	item := inventory.Objects[0]
+	require.Equal(t, "objects/sha256/"+object.SHA256+".txt", item.RelativeKey)
+	require.NotEqual(t, item.Path, item.RelativeKey, "Path keeps the configured prefix; RelativeKey strips it")
+
+	namespace := strings.TrimSuffix(item.ID, "/"+item.RelativeKey)
+	require.Equal(t, item.ID, namespace+"/"+item.RelativeKey)
+}
+
 func TestLocalPutRepairsDamagedObject(t *testing.T) {
 	root := t.TempDir()
 	object := localPut(t, root, "", ".bin", "original")

@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Ownership includes previously attempted writes across interrupted inventories.
@@ -45,6 +46,13 @@ type Profile struct {
 	Connections       map[string]Connection `json:"connections"`
 	Sources           []Source              `json:"sources"`
 }
+
+// Identity names the opaque prefix that scopes a source's row keys,
+// independent of its connection or config (see IdentityKey). Immutable once
+// set: Service rejects any later change.
+type Identity struct {
+	Namespace string `json:"namespace,omitempty"`
+}
 type Source struct {
 	Streams []TextStream `json:"streams,omitempty"`
 	// Publication defaults to native acquisition. Binary rows require a revision-enforcing
@@ -57,6 +65,7 @@ type Source struct {
 	Config               json.RawMessage `json:"config"`
 	Permissions          *Permissions    `json:"permissions"`
 	PermissionTTLSeconds int             `json:"permission_ttl_seconds,omitempty"`
+	Identity             Identity        `json:"identity,omitzero"`
 }
 type Runner struct {
 	// SourceID selects one source while retaining the complete profile/catalog.
@@ -282,6 +291,9 @@ func (r *Runner) validate() error {
 		if s.PermissionTTLSeconds != 0 && (s.PermissionTTLSeconds < 60 || s.PermissionTTLSeconds > 86400) {
 			return fmt.Errorf("permission TTL must be 60..86400 seconds")
 		}
+		if ns := s.Identity.Namespace; ns != "" && (len(ns) > 4096 || !utf8.ValidString(ns) || strings.ContainsAny(ns, "\x00\r\n")) {
+			return fmt.Errorf("invalid source identity namespace")
+		}
 	}
 	if !selected {
 		return fmt.Errorf("selected source is not configured")
@@ -311,6 +323,7 @@ func sourceConfigurationHash(source Source, connection Connection) (string, erro
 	source.Alias = ""
 	source.Streams = nil // Search/producer bindings do not change acquired bytes.
 	source.PermissionTTLSeconds = 0
+	source.Identity = Identity{} // Row keying, not acquisition; see IdentityKey.
 	identity, err := json.Marshal(struct {
 		Source     Source
 		Connection Connection
@@ -478,11 +491,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err := r.Publisher.EnsureTable(ctx, s.Table); err != nil {
 		return 0, "", err
 	}
-	providerIDs := make([]string, 0, len(state.Pending.Objects))
-	for _, item := range state.Pending.Objects {
-		providerIDs = append(providerIDs, item.ID)
-	}
-	writer, err := NewSyncWriter(r.Publisher, s.Table, s.ID, providerIDs, state.Pending.Authoritative)
+	writer, err := NewSyncWriterWithIdentity(r.Publisher, s.Table, s.ID, s.Identity.Namespace, state.Pending.Objects, state.Pending.Authoritative)
 	if err != nil {
 		return 0, "", err
 	}
@@ -549,7 +558,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		if len(state.Owned) > maxOwnedSourceObjects {
 			return 0, "", fmt.Errorf("source ownership exceeds budget")
 		}
-		key, err := RecordKey(s.ID, item.ID)
+		key, err := IdentityKey(s.ID, s.Identity.Namespace, relativeKeyFor(s.ID, item), item.ID)
 		if err != nil {
 			return 0, "", err
 		}

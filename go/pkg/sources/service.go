@@ -566,6 +566,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
+		rekeys := false
 		switch r.Method {
 		case http.MethodPut:
 			queue, err := s.readPurges()
@@ -585,11 +586,38 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if index < 0 {
+				// New sources get an opaque namespace at creation so a later
+				// connection or provider change never has to re-key anything:
+				// nothing is ever keyed before the source has a namespace.
+				if source.Identity.Namespace == "" {
+					source.Identity.Namespace = id
+				}
 				next.Sources = append(next.Sources, source)
 			} else {
 				if next.Sources[index].Table != source.Table {
 					serviceError(w, 409, "source_destination_immutable")
 					return
+				}
+				existing := next.Sources[index]
+				switch {
+				case source.Identity.Namespace == "":
+					// Omitting identity on an update leaves it exactly as it
+					// was; it is never cleared by omission.
+					source.Identity.Namespace = existing.Identity.Namespace
+				case existing.Identity.Namespace != "" && source.Identity.Namespace != existing.Identity.Namespace:
+					serviceError(w, 409, "source_identity_namespace_immutable")
+					return
+				}
+				if existing.Identity.Namespace == "" {
+					// Nothing before this field existed separated row identity
+					// from connection/config, so this source's rows are still
+					// keyed by acquisition identity (RecordKey's legacy
+					// formula): a connection or config change re-keys them
+					// today exactly as it always has, and so does setting a
+					// namespace for the first time on an already populated
+					// source. Once a namespace is set, identity follows it
+					// instead, so no later PUT can ever re-key this source again.
+					rekeys = existing.Connection != source.Connection || !bytes.Equal(existing.Config, source.Config) || source.Identity.Namespace != ""
 				}
 				next.Sources[index] = source
 			}
@@ -664,7 +692,11 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.profile = next
 		s.refreshMediaRegistry()
-		serviceJSON(w, 200, map[string]any{"version": 1, "state": "configured"})
+		response := map[string]any{"version": 1, "state": "configured"}
+		if r.Method == http.MethodPut {
+			response["rekeys"] = rekeys
+		}
+		serviceJSON(w, 200, response)
 		return
 	}
 	serviceError(w, 404, "not_found")
