@@ -23,6 +23,25 @@ describe("StandaloneSourcesClient", () => {
     });
     expect(JSON.parse(init?.body as string)).toEqual({ restart: true });
   });
+  it("syncs a single source by source_id, for a per-source run after an upload", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ version: 1, id: "job", state: "running", started_at: 1 }), {
+        status: 202,
+      })
+    );
+    const client = new StandaloneSourcesClient({
+      baseUrl: "https://sources.example",
+      token: "operator-token",
+      fetch: fetcher,
+    });
+    await client.sync({ sourceId: "11111111-1111-1111-1111-111111111111", requestKey: "key-1" });
+    const [, init] = fetcher.mock.calls[0] ?? [];
+    expect(JSON.parse(init?.body as string)).toEqual({
+      source_id: "11111111-1111-1111-1111-111111111111",
+      restart: false,
+      request_key: "key-1",
+    });
+  });
   it("preserves service errors without exposing tokens", async () => {
     const fetcher = vi
       .fn<typeof fetch>()

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/stretchr/testify/require"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -70,6 +71,41 @@ func TestS3ObjectKeysRemainDistinctCanonicalURIs(t *testing.T) {
 		}
 		uris[doc.URI] = key
 	}
+}
+
+// TestS3RelativeKeyStripsConfiguredPrefix pins that an S3 item's RelativeKey
+// is relative to the source's own root (its configured prefix), not the
+// bucket: Path keeps the full bucket key (unchanged, so canonical S3 URIs
+// are unaffected) while RelativeKey strips cfg.Prefix, and setting
+// identity.namespace to today's provider-ID prefix must reconstruct the
+// provider ID byte for byte (the invariant IdentityKey relies on).
+func TestS3RelativeKeyStripsConfiguredPrefix(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("list-type") == "2" {
+			w.Header().Set("Content-Type", "application/xml")
+			fmt.Fprint(w, `<ListBucketResult><Name>docs</Name><IsTruncated>false</IsTruncated><Contents><Key>team-a/report.txt</Key><ETag>"etag"</ETag><Size>5</Size></Contents></ListBucketResult>`)
+			return
+		}
+		// The follow-up StatObject HEAD re-verifies the listed entry.
+		w.Header().Set("ETag", `"etag"`)
+		w.Header().Set("Content-Length", "5")
+		w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+	}))
+	defer server.Close()
+	target, _ := url.Parse(server.URL)
+	client, err := minio.New(target.Host, &minio.Options{Creds: credentials.NewStaticV4("access", "secret", ""), Secure: false, Region: "us-east-1"})
+	require.NoError(t, err)
+	c := S3Connector{Client: client}
+	raw, _ := json.Marshal(S3Config{Bucket: "docs", Prefix: "team-a/"})
+	inventory, err := c.Enumerate(context.Background(), Request{Mode: ImportModeSource, SourceNamespace: "job/" + testSourceID, Config: raw})
+	require.NoError(t, err)
+	require.Len(t, inventory.Objects, 1)
+	item := inventory.Objects[0]
+	require.Equal(t, "team-a/report.txt", item.Path, "Path keeps the full bucket key")
+	require.Equal(t, "report.txt", item.RelativeKey, "RelativeKey strips the configured prefix")
+
+	namespace := strings.TrimSuffix(item.ID, "/"+item.RelativeKey)
+	require.Equal(t, item.ID, namespace+"/"+item.RelativeKey)
 }
 
 // Exercise real MinIO request construction: a readable replacement must never

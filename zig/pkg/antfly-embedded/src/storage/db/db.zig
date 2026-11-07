@@ -27323,7 +27323,7 @@ pub const DB = struct {
         if (ordered_value.value.command.binding.epoch != command.authority_epoch or
             !std.mem.eql(u8, &ordered_value.value.command.binding.digest, &command.catalog_digest) or
             !std.mem.eql(u8, &ordered_value.value.command.namespace, &namespace)) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held);
-        if (command.execution_identity != null and ordered_value.value.command.binding.effect_protocol < 17) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .invalid_output, &apply_held);
+        if (command.execution_identity != null and ordered_value.value.command.binding.effect_protocol < @as(u16, if (command.producer_scope_key.len == 0) 17 else 18)) return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .invalid_output, &apply_held);
         if (command.mode != .publish) {
             var txn = try self.core.store.beginWriteTxn();
             var txn_open = true;
@@ -93691,6 +93691,39 @@ test "db dense repair reprocesses corrupt managed source before rebuilding" {
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 2), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db dense enrichment skips unchanged multimodal parts" {
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedSingleCall;
+        }
+        fn parts(ptr: *anyopaque, a: Allocator, _: []const u8, _: []const template_mod.ContentPart, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return a.dupe(f32, &.{ 1, 0, 0 });
+        }
+    };
+    var probe = Probe{};
+    var directory = try TestDirectory.init("parts-source-hash");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_parts_fn = Probe.parts } } });
+    defer db.close();
+    try db.addIndex(.{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{body}}\"}}" });
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"same source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"same source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"new source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
 }
 
 test "db dense enrichment skips unchanged source hash" {
