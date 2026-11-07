@@ -1197,6 +1197,50 @@ test "lite write amplification: full_index text inline fast path engages every w
     try expectAtMost(indexed.durableCommitsPerWrite(), 1.35, "full_index-with-text inline fast path steady-state durable commits/write");
 }
 
+// lite-single-commit-write-path.md §3.3a's sparse extension: measures the
+// inline sparse publication fast path directly with `measureSingleWriterVector`
+// (sparse=true), the same single-writer, caller-supplied-vector mode the
+// main report's "sparse-vector-visible" row already uses, which never
+// touches the 8-writer concurrent sparse mode (see `measureConcurrentVector`)
+// -- that mode currently crashes in the pre-existing, unrelated
+// `encodeChunkOrdinalRange`/`addToPostings` worker-driven apply path under
+// real concurrent writers (a data race in `sparse.zig`'s posting-chunk
+// split/merge logic, reproducible with or without this change, since the
+// inline fast path never engages for a worker-driven catch-up write at all
+// -- only for this write's OWN synchronous ack). Not chased here; see the
+// handback notes.
+test "lite write amplification report: sparse_vector with inline publication (sparse-text-inline round 2)" {
+    const alloc = std.testing.allocator;
+    const updates = default_updates;
+
+    const sparse = try measureSingleWriterVector(alloc, "lite-write-amp-sparse-inline", true, updates);
+    std.debug.print("lite write amplification report, sparse_vector with inline publication (updates={d}, sparse_terms={d}):\n", .{ updates, sparse_terms });
+    printStageTable("sparse-vector-visible with inline publication (sync_level=full_index)", sparse);
+
+    const report = modeJson(sparse);
+    const json_text = try std.json.Stringify.valueAlloc(alloc, report, .{ .whitespace = .indent_2 });
+    defer alloc.free(json_text);
+    std.debug.print("lite_write_amplification_sparse_inline_json_begin\n{s}\nlite_write_amplification_sparse_inline_json_end\n", .{json_text});
+
+    // Same headroom as the text/graph inline fast paths: one amortized
+    // startup write (this index's very first write, which the eligibility
+    // gate's background-worker-catchup check -- mirrored from text's own
+    // -- always defers to the slow path) plus slack.
+    try expectAtMost(sparse.durableCommitsPerWrite(), 1.25, "sparse_vector inline fast path durable commits/write");
+}
+
+// Steady-state counterpart to the text/graph alternation regression tests
+// above, but for sparse: guards against the same class of bug (a stale
+// filtered-name comparison, or a counter left mutated between prepare and
+// install/abort) reappearing on the sparse branch specifically.
+test "lite write amplification: sparse_vector inline fast path engages every write in steady state" {
+    const alloc = std.testing.allocator;
+    const updates: usize = 20;
+
+    const sparse = try measureSingleWriterVector(alloc, "lite-write-amp-sparse-inline-steady", true, updates);
+    try expectAtMost(sparse.durableCommitsPerWrite(), 1.35, "sparse_vector inline fast path steady-state durable commits/write");
+}
+
 fn expectAtMost(actual: f64, ceiling: f64, comptime label: []const u8) !void {
     if (actual > ceiling) {
         std.debug.print("{s}: {d:.3} exceeds ceiling {d:.3}\n", .{ label, actual, ceiling });

@@ -154,6 +154,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const prepareInlineTextPublication = S.prepareInlineTextPublication;
         const InlineGraphPublication = S.InlineGraphPublication;
         const prepareInlineGraphPublication = S.prepareInlineGraphPublication;
+        const InlineSparsePublication = S.InlineSparsePublication;
+        const prepareInlineSparsePublication = S.prepareInlineSparsePublication;
         const attachPreparedUpsertDocumentProjections = S.attachPreparedUpsertDocumentProjections;
         const augmentExtractedWriteWithGraphFieldEdges = S.augmentExtractedWriteWithGraphFieldEdges;
         const augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed = S.augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed;
@@ -3350,6 +3352,50 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     inline_graph_handled_name = handled_name;
                 } else |_| {}
             }
+            // lite-single-commit-write-path.md §3.3a's sparse extension of
+            // the fast path above, mirroring the graph block immediately
+            // above it. Deliberately narrow -- exactly one sparse
+            // embedding write and nothing else sparse-related in this
+            // batch (no deletes, no overwritten docs, no changed
+            // artifacts) -- so every precondition
+            // `prepareInlineSparsePublication`/`sparseEmbeddingWriteEligible
+            // ForInlinePublication` cannot itself check (multiple
+            // embeddings in one batch, an artifact-backed write needing its
+            // own read, a document-field-derived index needing a second
+            // commit) is simply never attempted here; the caller falls
+            // back to the existing `applySparseEmbeddingWritesByNameWith
+            // Options` path for all of those, same as before this change.
+            // Gated on `.full_index`, same reasoning as graph's own gate:
+            // sparse has no narrower sync level of its own.
+            var inline_sparse_publication: ?*InlineSparsePublication = null;
+            var inline_sparse_handled_name: []const u8 = &.{};
+            defer if (inline_sparse_publication) |prepared| prepared.abort();
+            defer if (inline_sparse_handled_name.len != 0) S.ownerField(self, "alloc").*.free(@constCast(inline_sparse_handled_name));
+            if (append_derived_replay and effective_req.sync_level == .full_index and
+                opts.transaction_resolution == null and materialized_derived_batch != null and
+                materialized_derived_batch.?.sparse_embeddings.len == 1 and
+                materialized_derived_batch.?.deleted_keys.len == 0 and
+                materialized_derived_batch.?.overwritten_doc_keys.len == 0 and
+                materialized_derived_batch.?.changed_artifact_keys.len == 0)
+            {
+                const write = materialized_derived_batch.?.sparse_embeddings[0];
+                const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = write.index_name, .kind = .sparse_vector };
+                if (prepareInlineSparsePublication(
+                    S.ownerField(self, "alloc").*,
+                    S.ownerField(self, "core").*.store,
+                    S.ownerField(self, "core").*.index_manager,
+                    write,
+                    index_ref,
+                    sequence,
+                )) |prepared| {
+                    const handled_name = S.ownerField(self, "alloc").*.dupe(u8, write.index_name) catch |dup_err| {
+                        prepared.abort();
+                        return dup_err;
+                    };
+                    inline_sparse_publication = prepared;
+                    inline_sparse_handled_name = handled_name;
+                } else |_| {}
+            }
             var commit_participants: @import("../commit_participant.zig").List = .{};
             if (authored_acceptance.vectors.len != 0) try commit_participants.append(authored_acceptance.participant());
             for (inline_text_publications[0..inline_text_publication_count]) |maybe_prepared| {
@@ -3398,6 +3444,41 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // above this point committed anything for it yet.
                     prepared.abort();
                     inline_graph_publication = null;
+                }
+            }
+            if (inline_sparse_publication) |prepared| {
+                if (commit_participants.append(prepared.participant())) {
+                    // Mirrors the graph block above: exclude this write's
+                    // sparse index name from `sync_targets.all_indexes` so
+                    // the `.full_index` no-worker fallback further down
+                    // never re-applies an index this inline publication
+                    // already made durable.
+                    const filter_alloc = S.ownerField(self, "alloc").*;
+                    var kept_count: usize = 0;
+                    for (sync_targets.all_indexes) |name| {
+                        if (!std.mem.eql(u8, name, inline_sparse_handled_name)) kept_count += 1;
+                    }
+                    if (kept_count != sync_targets.all_indexes.len) {
+                        const filtered = try filter_alloc.alloc([]const u8, kept_count);
+                        errdefer filter_alloc.free(filtered);
+                        var fill: usize = 0;
+                        for (sync_targets.all_indexes) |name| {
+                            if (std.mem.eql(u8, name, inline_sparse_handled_name)) {
+                                filter_alloc.free(@constCast(name));
+                            } else {
+                                filtered[fill] = name;
+                                fill += 1;
+                            }
+                        }
+                        filter_alloc.free(@constCast(sync_targets.all_indexes));
+                        sync_targets.all_indexes = filtered;
+                    }
+                } else |_| {
+                    // Same reasoning as the graph block above: never
+                    // silently drop this write's sparse effect because
+                    // the commit-participant list happened to be full.
+                    prepared.abort();
+                    inline_sparse_publication = null;
                 }
             }
             const combined_commit_participant: ?@import("../commit_participant.zig").Participant =
@@ -3587,6 +3668,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 inline_graph_publication = null;
                 if (S.ownerField(self, "executor").*.hasWorkers()) {
                     _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_graph_handled_name, sequence);
+                }
+            }
+            if (inline_sparse_publication) |prepared| {
+                prepared.install();
+                inline_sparse_publication = null;
+                if (S.ownerField(self, "executor").*.hasWorkers()) {
+                    _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_sparse_handled_name, sequence);
                 }
             }
             snapshot_mutation.release();

@@ -2854,18 +2854,18 @@ pub const SparseIndex = struct {
         try self.batchIncrementalTxn(&txn, writes, deletes, options);
     }
 
-    fn batchIncrementalTxn(self: *SparseIndex, txn: anytype, writes: []const SparseWrite, deletes: []const []const u8, options: BatchOptions) !void {
-        errdefer txn.abort();
-        const prev_next_doc_num = self.next_doc_num;
-        const prev_next_segment_id = self.next_segment_id;
-        const prev_doc_count = self.doc_count;
-        const prev_term_count = self.term_count;
-        errdefer {
-            self.next_doc_num = prev_next_doc_num;
-            self.next_segment_id = prev_next_segment_id;
-            self.doc_count = prev_doc_count;
-            self.term_count = prev_term_count;
-        }
+    /// The staged half of `batchIncrementalTxn`: every delete/insert/term-
+    /// range-refresh mutation plus the counter meta records, against
+    /// whatever `txn` already is -- a plain owned write transaction (the
+    /// ordinary `batch()`/`batchWithOptions()` path below, which commits
+    /// it itself right after) or a `native_catalog_backend.Backend.
+    /// boundWrite` handle the caller will harvest via `pendingMutations()`
+    /// and `abort()` instead of committing (`prepareInlineSparsePublication`
+    /// below). Mutates `self.next_doc_num`/`next_segment_id`/`doc_count`/
+    /// `term_count` directly, exactly like the rest of this file; callers
+    /// that must not leave those applied until some later durability point
+    /// (the inline path) save and restore them around this call themselves.
+    fn stageIncrementalMutations(self: *SparseIndex, txn: anytype, writes: []const SparseWrite, deletes: []const []const u8, options: BatchOptions) !void {
         var scratch_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch_arena.deinit();
         const scratch = scratch_arena.allocator();
@@ -2907,9 +2907,203 @@ pub const SparseIndex = struct {
 
         phase_start_ns = nowNs();
         try persistSparseCounters(self, txn);
-
-        try txn.commit();
         self.write_profile.incremental_commit_ns += elapsedSince(phase_start_ns);
+    }
+
+    fn batchIncrementalTxn(self: *SparseIndex, txn: anytype, writes: []const SparseWrite, deletes: []const []const u8, options: BatchOptions) !void {
+        errdefer txn.abort();
+        const prev_next_doc_num = self.next_doc_num;
+        const prev_next_segment_id = self.next_segment_id;
+        const prev_doc_count = self.doc_count;
+        const prev_term_count = self.term_count;
+        errdefer {
+            self.next_doc_num = prev_next_doc_num;
+            self.next_segment_id = prev_next_segment_id;
+            self.doc_count = prev_doc_count;
+            self.term_count = prev_term_count;
+        }
+        try self.stageIncrementalMutations(txn, writes, deletes, options);
+        const commit_start_ns = nowNs();
+        try txn.commit();
+        self.write_profile.incremental_commit_ns += elapsedSince(commit_start_ns);
+    }
+
+    // ------------------------------------------------------------------
+    // Inline sparse publication (design doc §3.3a's sparse extension).
+    //
+    // Mirrors `graph/graph.zig`'s `InlineEdgePublication`/
+    // `prepareInlineEdgePublication`: run the same staged mutation-
+    // building `stageIncrementalMutations` above already does for the
+    // ordinary `batchIncrementalTxn` path, but against a `native_catalog_
+    // backend.Backend.boundWrite` handle instead of this index's own
+    // owned write transaction, harvest its `pendingMutations()` (deep
+    // copied -- `boundWrite`'s own arena is freed the moment `abort()`
+    // runs below), and hand them to a caller that folds them into an
+    // externally-owned native transaction via one `commit_participant.
+    // View.putIndexCatalog` call, instead of this index opening and
+    // committing its own.
+    //
+    // Counter deferral: `stageIncrementalMutations` mutates `self.
+    // next_doc_num`/`next_segment_id`/`doc_count`/`term_count` directly
+    // (same as every other caller in this file), which is only safe here
+    // because `prepareInlineSparsePublication` immediately restores them
+    // to their pre-call values before returning -- so a reader observing
+    // `self.*` between `prepare` and `install`/`abort` never sees a
+    // counter value with no durability behind it yet, matching
+    // `native_catalog_backend.Backend.applyExternallyCommittedMutations`'s
+    // own "never call earlier" invariant for this backend's read mirror.
+    // `installInlineSparsePublication` re-applies the saved "new" values
+    // only once the caller's external commit has actually returned
+    // successfully; `abort` leaves them alone (already restored).
+    pub const InlineSparsePublicationError = error{InlineSparsePublicationUnsupported};
+
+    /// A staged sparse batch's mutations, not yet durable. Exactly one of
+    /// `install` (the mutations are now durable in an externally-owned
+    /// commit) or `abort` (they are not) must run exactly once for every
+    /// value this returns.
+    pub const InlineSparsePublication = struct {
+        alloc: Allocator,
+        mutations: []native_catalog_backend.Mutation,
+        next_doc_num: u64,
+        next_segment_id: u64,
+        doc_count: u64,
+        term_count: u64,
+
+        /// This publication's mutations, to fold into an externally-owned
+        /// native transaction via `commit_participant.View.
+        /// putIndexCatalog(scope, ...)`, where `scope` is this index's own
+        /// `nativeCatalogScope()`.
+        pub fn pendingMutations(self: *const InlineSparsePublication) []const native_catalog_backend.Mutation {
+            return self.mutations;
+        }
+
+        /// Discards a publication whose mutations were never committed
+        /// durably (or whose commit failed): nothing becomes visible to
+        /// this index's readers. `self.next_doc_num`/etc were already
+        /// restored to their pre-`prepare` values by `prepareInlineSparse
+        /// Publication` itself, so there is nothing left to roll back here.
+        pub fn abort(self: *InlineSparsePublication) void {
+            freeOwnedSparseMutations(self.alloc, self.mutations);
+            self.* = undefined;
+        }
+    };
+
+    fn dupeOwnedSparseMutationsAlloc(alloc: Allocator, items: []const native_catalog_backend.Mutation) ![]native_catalog_backend.Mutation {
+        // Deep copy: `items` is normally a `BoundTxn.pendingMutations()`
+        // slice whose key/value/namespace bytes live in that transaction's
+        // own arena, freed the moment the caller aborts it.
+        const out = try alloc.alloc(native_catalog_backend.Mutation, items.len);
+        var filled: usize = 0;
+        errdefer freeOwnedSparseMutations(alloc, out[0..filled]);
+        for (items, 0..) |m, i| {
+            out[i] = .{
+                .namespace = if (m.namespace) |n| try alloc.dupe(u8, n) else null,
+                .key = try alloc.dupe(u8, m.key),
+                .value = if (m.is_delete) "" else try alloc.dupe(u8, m.value),
+                .is_delete = m.is_delete,
+            };
+            filled = i + 1;
+        }
+        return out;
+    }
+
+    fn freeOwnedSparseMutations(alloc: Allocator, items: []const native_catalog_backend.Mutation) void {
+        for (items) |m| {
+            if (m.namespace) |n| alloc.free(n);
+            alloc.free(m.key);
+            if (!m.is_delete) alloc.free(m.value);
+        }
+        alloc.free(items);
+    }
+
+    /// Builds one small sparse batch's `InlineSparsePublication`, without
+    /// touching this index's durable sink (see `native_catalog_backend.
+    /// Backend.boundWrite`'s "never talks to sink" note). Returns
+    /// `error.InlineSparsePublicationUnsupported` for every backend but
+    /// `.native_catalog`; the caller falls back to `batchWithOptions` (via
+    /// `IndexManager.applySparseEmbeddingWritesByNameWithOptions`'s own
+    /// commit) in that case. Takes `writes`/`deletes` exactly like
+    /// `batch`/`batchWithOptions`, but deliberately does not accept
+    /// `BatchOptions`: this fast path always runs with `defer_term_range_
+    /// updates = true` (matching the production caller) and is never
+    /// reached for bulk ingest (`IndexManager`-layer eligibility excludes
+    /// that mode before this is called).
+    pub fn prepareInlineSparsePublication(self: *SparseIndex, writes: []const SparseWrite, deletes: []const []const u8) !InlineSparsePublication {
+        const backend = switch (self.owner) {
+            .native_catalog => |b| b,
+            else => return error.InlineSparsePublicationUnsupported,
+        };
+
+        const prev_next_doc_num = self.next_doc_num;
+        const prev_next_segment_id = self.next_segment_id;
+        const prev_doc_count = self.doc_count;
+        const prev_term_count = self.term_count;
+
+        // Same defensive canonicalization `batchWithOptions` applies to
+        // every caller (allocation-free when `writes` is already sorted,
+        // per-dimension-unique, as every production caller's writes are).
+        var canonical_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer canonical_arena.deinit();
+        const canonical_writes = try canonicalWrites(canonical_arena.allocator(), self.alloc, writes);
+
+        var txn = try backend.boundWrite(.{});
+        defer txn.abort();
+
+        self.stageIncrementalMutations(&txn, canonical_writes, deletes, .{ .defer_term_range_updates = true }) catch |err| {
+            self.next_doc_num = prev_next_doc_num;
+            self.next_segment_id = prev_next_segment_id;
+            self.doc_count = prev_doc_count;
+            self.term_count = prev_term_count;
+            return err;
+        };
+
+        const mutations = dupeOwnedSparseMutationsAlloc(self.alloc, txn.pendingMutations()) catch |err| {
+            self.next_doc_num = prev_next_doc_num;
+            self.next_segment_id = prev_next_segment_id;
+            self.doc_count = prev_doc_count;
+            self.term_count = prev_term_count;
+            return err;
+        };
+
+        const result: InlineSparsePublication = .{
+            .alloc = self.alloc,
+            .mutations = mutations,
+            .next_doc_num = self.next_doc_num,
+            .next_segment_id = self.next_segment_id,
+            .doc_count = self.doc_count,
+            .term_count = self.term_count,
+        };
+
+        // Undo the optimistic in-memory mutation `stageIncrementalMutations`
+        // just made: self.* must stay at the pre-write values until
+        // `installInlineSparsePublication` runs, after the caller's
+        // external commit is durable -- see this section's doc comment.
+        self.next_doc_num = prev_next_doc_num;
+        self.next_segment_id = prev_next_segment_id;
+        self.doc_count = prev_doc_count;
+        self.term_count = prev_term_count;
+
+        return result;
+    }
+
+    /// Runs only after `publication`'s mutations (`pendingMutations()`)
+    /// are already durable in an externally-owned native transaction's
+    /// commit. Syncs this backend's in-memory read mirror (so this
+    /// index's own subsequent reads see the write) and applies the saved
+    /// counter values -- the step after which a synchronous sparse-visible
+    /// write's ack may return.
+    pub fn installInlineSparsePublication(self: *SparseIndex, publication: *InlineSparsePublication) !void {
+        const backend = switch (self.owner) {
+            .native_catalog => |b| b,
+            else => return error.InlineSparsePublicationUnsupported,
+        };
+        try backend.applyExternallyCommittedMutations(publication.mutations);
+        self.next_doc_num = publication.next_doc_num;
+        self.next_segment_id = publication.next_segment_id;
+        self.doc_count = publication.doc_count;
+        self.term_count = publication.term_count;
+        freeOwnedSparseMutations(self.alloc, publication.mutations);
+        publication.* = undefined;
     }
 
     fn estimateSparseBulkWorkingBytes(writes: []const SparseWrite) u64 {
@@ -6805,6 +6999,195 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+// ---------------------------------------------------------------------------
+// `.native_catalog` backend: a minimal, allocator-backed
+// `native_catalog_backend.Sink` standing in for Lite's real
+// `lite/native_catalog_sink.zig`, mirroring `graph/graph.zig`'s identically-
+// shaped `NativeCatalogTestSink` (see that file's own doc comment). Used
+// below to exercise `prepareInlineSparsePublication`/
+// `installInlineSparsePublication` end to end, including across a reopen.
+// ---------------------------------------------------------------------------
+
+const NativeCatalogTestSink = struct {
+    allocator: Allocator,
+    entries: std.StringHashMapUnmanaged([]u8) = .empty,
+    submit_calls: usize = 0,
+    durable_submit_calls: usize = 0,
+
+    fn compositeKeyAlloc(alloc: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) ![]u8 {
+        return try std.mem.concat(alloc, u8, &.{ scope, "\x00", namespace orelse "", "\x00", key });
+    }
+
+    fn deinit(self: *@This()) void {
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.entries.deinit(self.allocator);
+    }
+
+    fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.submit_calls += 1;
+        if (durable) self.durable_submit_calls += 1;
+        for (mutations) |m| {
+            const composite = try compositeKeyAlloc(self.allocator, scope, m.namespace, m.key);
+            if (m.is_delete) {
+                if (self.entries.fetchRemove(composite)) |removed| {
+                    self.allocator.free(removed.key);
+                    self.allocator.free(removed.value);
+                }
+                self.allocator.free(composite);
+                continue;
+            }
+            if (self.entries.getEntry(composite)) |existing| {
+                self.allocator.free(existing.value_ptr.*);
+                existing.value_ptr.* = try self.allocator.dupe(u8, m.value);
+                self.allocator.free(composite);
+                continue;
+            }
+            try self.entries.put(self.allocator, composite, try self.allocator.dupe(u8, m.value));
+        }
+    }
+
+    fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var result = std.ArrayListUnmanaged(native_catalog_backend.Entry).empty;
+        errdefer {
+            for (result.items) |e| {
+                if (e.namespace) |n| allocator.free(n);
+                allocator.free(e.key);
+                allocator.free(e.value);
+            }
+            result.deinit(allocator);
+        }
+        const prefix = try std.mem.concat(allocator, u8, &.{ scope, "\x00" });
+        defer allocator.free(prefix);
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
+            const remainder = entry.key_ptr.*[prefix.len..];
+            const sep = std.mem.indexOfScalar(u8, remainder, 0) orelse return error.InvalidTestKey;
+            const ns = remainder[0..sep];
+            const key = remainder[sep + 1 ..];
+            try result.append(allocator, .{
+                .namespace = if (ns.len == 0) null else try allocator.dupe(u8, ns),
+                .key = try allocator.dupe(u8, key),
+                .value = try allocator.dupe(u8, entry.value_ptr.*),
+            });
+        }
+        return try result.toOwnedSlice(allocator);
+    }
+
+    fn sink(self: *@This()) native_catalog_backend.Sink {
+        return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc };
+    }
+};
+
+test "sparse inline publication folds one batch into an externally-owned commit and is durable after reopen" {
+    const alloc = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = tmpPath(&buf, "inline-publication");
+    defer cleanupTmp(path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+
+    var index = try SparseIndex.open(alloc, path, .{
+        .backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.sink(),
+    });
+    defer index.close();
+    // `open`'s own meta read/commit for a fresh index already submits
+    // through the sink; this test only cares that `prepareInlineSparse
+    // Publication` adds none of its own on top of that.
+    const submit_calls_after_open = test_sink.submit_calls;
+
+    const write: SparseWrite = .{ .doc_id = "doc-1", .vec = .{ .indices = &.{ 3, 7 }, .values = &.{ 1.5, 2.5 } } };
+    var publication = try index.prepareInlineSparsePublication(&.{write}, &.{});
+    // Nothing durable yet, and no reader of this index sees the doc.
+    try std.testing.expectEqual(submit_calls_after_open, test_sink.submit_calls);
+    try std.testing.expectEqual(@as(u64, 0), index.doc_count);
+    {
+        const hits = try index.search(alloc, &.{ .indices = &.{3}, .values = &.{1} }, 10);
+        defer SparseIndex.freeResults(alloc, hits);
+        try std.testing.expectEqual(@as(usize, 0), hits.len);
+    }
+    try std.testing.expect(publication.pendingMutations().len > 0);
+
+    // Simulate an externally-owned combined commit folding this index's
+    // mutations into one native transaction (one `commit_participant.
+    // View.putIndexCatalog` call, per the section doc comment): this
+    // harness calls the sink directly, same as
+    // `lite/native_catalog_sink.zig`'s `Sink.submit` would for a
+    // `putIndexCatalog` call inside one caller-held native transaction.
+    const scope = index.nativeCatalogScope().?;
+    try NativeCatalogTestSink.submit(&test_sink, scope, publication.pendingMutations(), true);
+
+    try index.installInlineSparsePublication(&publication);
+    try std.testing.expectEqual(@as(u64, 1), index.doc_count);
+
+    const hits = try index.search(alloc, &.{ .indices = &.{3}, .values = &.{1} }, 10);
+    defer SparseIndex.freeResults(alloc, hits);
+    try std.testing.expectEqual(@as(usize, 1), hits.len);
+    try std.testing.expectEqualStrings("doc-1", hits[0].doc_id);
+
+    // Reopen: the externally-committed mutations are genuinely durable in
+    // the sink, not merely visible through this process' in-memory mirror.
+    var reopened = try SparseIndex.open(alloc, path, .{
+        .backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.sink(),
+    });
+    defer reopened.close();
+    const reopened_hits = try reopened.search(alloc, &.{ .indices = &.{3}, .values = &.{1} }, 10);
+    defer SparseIndex.freeResults(alloc, reopened_hits);
+    try std.testing.expectEqual(@as(usize, 1), reopened_hits.len);
+    try std.testing.expectEqual(@as(u64, 1), reopened.doc_count);
+}
+
+test "sparse inline publication abort discards staged mutations and counters" {
+    const alloc = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = tmpPath(&buf, "inline-publication-abort");
+    defer cleanupTmp(path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+
+    var index = try SparseIndex.open(alloc, path, .{
+        .backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.sink(),
+    });
+    defer index.close();
+    const submit_calls_after_open = test_sink.submit_calls;
+    const prev_next_doc_num = index.next_doc_num;
+    const prev_doc_count = index.doc_count;
+
+    const write: SparseWrite = .{ .doc_id = "doc-2", .vec = .{ .indices = &.{1}, .values = &.{1.0} } };
+    var publication = try index.prepareInlineSparsePublication(&.{write}, &.{});
+    publication.abort();
+    try std.testing.expectEqual(submit_calls_after_open, test_sink.submit_calls);
+    try std.testing.expectEqual(prev_next_doc_num, index.next_doc_num);
+    try std.testing.expectEqual(prev_doc_count, index.doc_count);
+
+    const hits = try index.search(alloc, &.{ .indices = &.{1}, .values = &.{1} }, 10);
+    defer SparseIndex.freeResults(alloc, hits);
+    try std.testing.expectEqual(@as(usize, 0), hits.len);
+}
+
+test "sparse inline publication rejects every backend but native_catalog" {
+    const alloc = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = tmpPath(&buf, "inline-publication-unsupported");
+    defer cleanupTmp(path);
+
+    var index = try SparseIndex.open(alloc, path, .{ .backend = .lsm_memory });
+    defer index.close();
+    const write: SparseWrite = .{ .doc_id = "doc-3", .vec = .{ .indices = &.{1}, .values = &.{1.0} } };
+    try std.testing.expectError(error.InlineSparsePublicationUnsupported, index.prepareInlineSparsePublication(&.{write}, &.{}));
 }
 
 fn expectIncarnationSearch(index: *SparseIndex, term: u32, expected: []const struct { id: []const u8, score: f32 }, filtered: bool) !void {
