@@ -96,6 +96,7 @@ import SwiftUI
     do {
       try FileManager.default.createDirectory(
         at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+      try RecordingArchive.removeStaleCandidates(in: directory)
       if FileManager.default.fileExists(atPath: settingsFile.path) {
         config = try Configuration.decode(Data(contentsOf: settingsFile))
       }
@@ -941,6 +942,7 @@ import SwiftUI
     }
   }
   private func removeAudio() throws {
+    try RecordingArchive.removeStaleCandidates(in: directory)
     let file = directory.appendingPathComponent("last-recording.wav")
     if FileManager.default.fileExists(atPath: file.path) {
       try FileManager.default.removeItem(at: file)

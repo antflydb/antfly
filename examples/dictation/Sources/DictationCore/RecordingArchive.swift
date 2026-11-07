@@ -4,6 +4,19 @@
 import Foundation
 
 public enum RecordingArchive {
+  /// Remove uncommitted candidates left by a crash, never the retained recording.
+  public static func removeStaleCandidates(in directory: URL) throws {
+    let prefix = ".recording-"
+    for file in try FileManager.default.contentsOfDirectory(
+      at: directory, includingPropertiesForKeys: nil)
+    {
+      let name = file.lastPathComponent
+      guard name.hasPrefix(prefix), name.hasSuffix(".wav"),
+        UUID(uuidString: String(name.dropFirst(prefix.count).dropLast(4))) != nil
+      else { continue }
+      try FileManager.default.removeItem(at: file)
+    }
+  }
   /// Write a unique candidate off the UI actor. The caller commits its rename
   /// only after checking that the recording is still current, and always removes
   /// the candidate afterward. Cancellation can never publish stale audio.

@@ -111,3 +111,16 @@ func microphoneConversionPreservesOneSecondOfStereoSpeech(rate: Double) throws {
   #expect(failure.code == "capacity" && failure.retryAfter == "5")
   #expect(failure.localizedDescription.contains("Retry-After: 5"))
 }
+
+@Test func crashRecoveryRemovesOnlyUncommittedAudioCandidates() throws {
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let candidate = directory.appendingPathComponent(".recording-" + UUID().uuidString + ".wav")
+  try Data([1]).write(to: candidate)
+  let retained = directory.appendingPathComponent("last-recording.wav")
+  try Data([2]).write(to: retained)
+  try RecordingArchive.removeStaleCandidates(in: directory)
+  #expect(!FileManager.default.fileExists(atPath: candidate.path))
+  #expect(try Data(contentsOf: retained) == Data([2]))
+}
