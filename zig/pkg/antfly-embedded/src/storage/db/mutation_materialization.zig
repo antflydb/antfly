@@ -42,6 +42,7 @@ const collectSparseEmbeddingWritesForBatch = @import("replay_vector_collectors.z
 const collectSparseFieldWritesProfiled = @import("replay_vector_collectors.zig").collectSparseFieldWritesProfiled;
 const denseEmbeddingDocKeySet = @import("replay_vector_collectors.zig").denseEmbeddingDocKeySet;
 const derived_types = @import("derived/derived_types.zig");
+const doc_identity = @import("doc_identity.zig");
 const docstore_mod = @import("../docstore.zig");
 const document_child_range_effects = @import("document_child_range_effects.zig");
 const document_child_range_outbox = @import("document_child_range_outbox.zig");
@@ -3824,6 +3825,127 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .publication = publication,
                 .forward_scope = forward_scope,
                 .reverse_scope = reverse_scope,
+                .progress = .{
+                    .consumer = index_ref.name,
+                    .sequence = sequence,
+                    .generation = entry.config.coverage_generation,
+                    .config_hash = types.indexConfigHash(entry.config),
+                },
+            };
+            return result;
+        }
+
+        /// lite-single-commit-write-path.md §3.3a's sparse extension of
+        /// WS4 phase 2: a prepared single-batch inline publication,
+        /// mirroring `InlineGraphPublication` but wrapping
+        /// `sparse_mod.SparseIndex.InlineSparsePublication` (already
+        /// built and unit-tested in sparse.zig) instead of building its
+        /// own staged mutations. Holds this sparse index's apply guard
+        /// from prepare through `install`/`abort`, serializing against
+        /// every other writer of this index for the whole window -- same
+        /// deliberate concurrency trade as text's and graph's own apply
+        /// guards.
+        pub const InlineSparsePublication = struct {
+            alloc: Allocator,
+            entry: *index_manager_mod.IndexManager.SparseIndex,
+            apply_guard: index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+            publication: sparse_mod.SparseIndex.InlineSparsePublication,
+            scope: []const u8,
+            progress: apply_state.Progress,
+
+            fn reset(_: *anyopaque) void {}
+            fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
+            fn stage(ptr: *anyopaque, view: commit_participant.View, _: []const u8) anyerror!void {
+                const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
+                const mutations = self.publication.pendingMutations();
+                if (mutations.len != 0) try view.putIndexCatalog(self.scope, mutations);
+                try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            /// Call only once the host transaction's commit has actually
+            /// returned successfully (see `InlineTextPublication.install`'s
+            /// identical warning).
+            pub fn participant(self: *InlineSparsePublication) commit_participant.Participant {
+                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+            }
+
+            pub fn install(self: *InlineSparsePublication) void {
+                std.debug.assert(self.apply_guard.locked());
+                self.entry.index.installInlineSparsePublication(&self.publication) catch |err| {
+                    std.log.err("inline sparse publication install: mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+                };
+                self.apply_guard.unlock();
+                self.alloc.destroy(self);
+            }
+
+            pub fn abort(self: *InlineSparsePublication) void {
+                std.debug.assert(self.apply_guard.locked());
+                self.publication.abort();
+                self.apply_guard.unlock();
+                self.alloc.destroy(self);
+            }
+        };
+
+        /// WS4-for-vectors fast path: prepares one managed sparse index's
+        /// single-batch inline publication. Returns `error.
+        /// InlineSparsePublicationUnsupported` for every case outside
+        /// `sparse_mod.SparseIndex.prepareInlineSparsePublication`'s own
+        /// narrow scope (non-`.native_catalog` stores) AND for every case
+        /// needing `IndexManager`-layer bookkeeping that fast path cannot
+        /// replicate (document-field-derived vectors, chunked/named-
+        /// embedding indexes, shard range -- see `IndexManager.
+        /// sparseEmbeddingWriteEligibleForInlinePublication`'s own doc
+        /// comment), so the caller falls back to `applySparseEmbedding
+        /// WritesByNameWithOptions`, which remains correct (and is not
+        /// changed by any of this) for all of them.
+        pub fn prepareInlineSparsePublication(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_manager: *index_manager_mod.IndexManager,
+            write: derived_types.DerivedSparseEmbeddingWrite,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            sequence: u64,
+        ) !*InlineSparsePublication {
+            if (index_ref.kind != .sparse_vector) return error.InlineSparsePublicationUnsupported;
+            const entry = index_manager.sparseIndex(index_ref.name) orelse return error.InlineSparsePublicationUnsupported;
+            if (!index_manager.sparseEmbeddingWriteEligibleForInlinePublication(entry, write)) return error.InlineSparsePublicationUnsupported;
+
+            const scope = entry.index.nativeCatalogScope() orelse return error.InlineSparsePublicationUnsupported;
+
+            var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
+            errdefer apply_guard.unlock();
+
+            // Mirrors `IndexManager.assignSparseWriteDocNumsFromIdentity`:
+            // this index's eligibility (checked above) already guarantees
+            // `entry.chunk_name == null and entry.embedding_names.len ==
+            // 0`, the exact condition under which that function looks up
+            // the primary document's stable ordinal instead of letting
+            // `SparseIndex.processInsert` auto-assign a fresh one -- the
+            // fast path must do the same lookup, or this write's doc_num
+            // would drift from what the slow path would have assigned
+            // for the identical write.
+            var probe_txn = try store.beginProbeTxn();
+            defer probe_txn.abort();
+            const doc_num = try doc_identity.lookupOrdinalTxn(alloc, &probe_txn, write.doc_key);
+
+            const sparse_write: sparse_mod.SparseWrite = .{
+                .doc_id = write.doc_key,
+                .vec = .{ .indices = write.indices, .values = write.values },
+                .doc_num = doc_num,
+            };
+
+            const publication = entry.index.prepareInlineSparsePublication(&.{sparse_write}, &.{}) catch |err| switch (err) {
+                error.InlineSparsePublicationUnsupported => return error.InlineSparsePublicationUnsupported,
+                else => return err,
+            };
+
+            const result = try alloc.create(InlineSparsePublication);
+            result.* = .{
+                .alloc = alloc,
+                .entry = entry,
+                .apply_guard = apply_guard,
+                .publication = publication,
+                .scope = scope,
                 .progress = .{
                     .consumer = index_ref.name,
                     .sequence = sequence,

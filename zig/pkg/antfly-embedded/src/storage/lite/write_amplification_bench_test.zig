@@ -335,6 +335,32 @@ fn insertOneVector(
     try std.testing.expectEqual(capi_types.ErrorCode.ok, api.antfly_db_batch_json(handle, .fromSlice(body), &output));
 }
 
+/// One single-doc write that carries BOTH a text `body` field (for the
+/// default full-text index) and a caller-supplied sparse embedding (for
+/// `sparse_index_name`) in the SAME `inserts` entry -- the mixed-kind case
+/// lite-single-commit-write-path.md §3.3a asks for: each eligible index
+/// (text's `InlineTextPublication`, sparse's `InlineSparsePublication`)
+/// must contribute its own commit_participant to the SAME native
+/// transaction as the primary row, not fall back to a slower path just
+/// because another index is also present in the write.
+fn insertOneMixedTextSparse(alloc: std.mem.Allocator, handle: *anyopaque, key: []const u8, text: []const u8, vector_json: []const u8, sync_level: []const u8) !void {
+    const key_json = try jsonString(alloc, key);
+    defer alloc.free(key_json);
+    const text_json = try jsonString(alloc, text);
+    defer alloc.free(text_json);
+    const sync_level_json = try jsonString(alloc, sync_level);
+    defer alloc.free(sync_level_json);
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"inserts\":{{{s}:{{\"body\":{s},\"_embeddings\":{{\"" ++ sparse_index_name ++ "\":{s}}}}}}},\"sync_level\":{s}}}",
+        .{ key_json, text_json, vector_json, sync_level_json },
+    );
+    defer alloc.free(body);
+    var output: capi_types.Buffer = .{};
+    defer api.antfly_buffer_free(&output);
+    try std.testing.expectEqual(capi_types.ErrorCode.ok, api.antfly_db_batch_json(handle, .fromSlice(body), &output));
+}
+
 // ---------------------------------------------------------------------------
 // Measurement modes
 // ---------------------------------------------------------------------------
@@ -1143,6 +1169,141 @@ test "lite write amplification: full_text inline fast path engages every write i
     // worker-driven index commit + worker-driven progress commit),
     // averaging close to 3x this ceiling over only 20 writes.
     try expectAtMost(full_text.durableCommitsPerWrite(), 1.35, "full_text inline fast path steady-state durable commits/write");
+}
+
+// lite-single-commit-write-path.md §3.2a/§3.3/§3.3a (full_index text inline
+// publication): `prepareInlineTextPublication`'s fast path used to be
+// gated on `sync_level == .full_text` exactly, so an `indexed`
+// (`full_index`) write with a text index -- the harness's own "indexed"
+// mode above, and the common case for a write that must also wait for
+// enrichments/dense/graph/LEANN visibility before acking -- never took it,
+// even though `.full_index` is `.full_text`'s superset and already
+// requires this text index's own visibility. Measures that `.full_index`
+// write directly (`measureSingleWriter`'s `indexed` mode, same Fixture and
+// text payload as the main report's "indexed" row) to confirm the fast
+// path now engages there too: before this change this mode cost one
+// native commit for the primary write plus the worker-driven index
+// segment/seal/progress commits (durable_commits_per_write well above 1,
+// calling-thread syncs/update in the tens -- see the `measured
+// main@6c0b004e95 baseline` cited in "lite write amplification ceilings"),
+// after it the same ~1.03 commits/write steady state as the `full_text`
+// sync-level test above.
+test "lite write amplification report: full_index with text index (sparse-text-inline round 1)" {
+    const alloc = std.testing.allocator;
+    const updates = default_updates;
+
+    const indexed = try measureSingleWriter(alloc, "lite-write-amp-fullindex-text", true, updates);
+    std.debug.print("lite write amplification report, full_index sync level with text index (updates={d}, text_bytes={d}):\n", .{ updates, text_bytes });
+    printStageTable("full-index-visible with text index (sync_level=full_index, workers on)", indexed);
+
+    const report = modeJson(indexed);
+    const json_text = try std.json.Stringify.valueAlloc(alloc, report, .{ .whitespace = .indent_2 });
+    defer alloc.free(json_text);
+    std.debug.print("lite_write_amplification_full_index_text_json_begin\n{s}\nlite_write_amplification_full_index_text_json_end\n", .{json_text});
+
+    // Same headroom as the `full_text` sync-level test above: one amortized
+    // startup write (the very first write for this index, which always
+    // defers to the slow worker-driven path -- see
+    // `batchInternalPreparedOwned`'s comment on "the very first write this
+    // worker has ever been asked to apply") plus slack.
+    try expectAtMost(indexed.durableCommitsPerWrite(), 1.25, "full_index-with-text durable commits/write (workers on)");
+}
+
+// Steady-state counterpart to the `full_text` alternation regression test
+// above, but for `.full_index`: guards against the same class of bug
+// (a use-after-free or a stale filtered-name comparison) reappearing
+// specifically on the `.full_index` branch of the fast-path gate and its
+// own `sync_targets.all_indexes` filter, which the `.full_text` steady-
+// state test above cannot see since it never takes that branch.
+test "lite write amplification: full_index text inline fast path engages every write in steady state" {
+    const alloc = std.testing.allocator;
+    const updates: usize = 20;
+
+    const indexed = try measureSingleWriter(alloc, "lite-write-amp-fullindex-text-steady", true, updates);
+    try expectAtMost(indexed.durableCommitsPerWrite(), 1.35, "full_index-with-text inline fast path steady-state durable commits/write");
+}
+
+// lite-single-commit-write-path.md §3.3a's sparse extension: measures the
+// inline sparse publication fast path directly with `measureSingleWriterVector`
+// (sparse=true), the same single-writer, caller-supplied-vector mode the
+// main report's "sparse-vector-visible" row already uses, which never
+// touches the 8-writer concurrent sparse mode (see `measureConcurrentVector`)
+// -- that mode currently crashes in the pre-existing, unrelated
+// `encodeChunkOrdinalRange`/`addToPostings` worker-driven apply path under
+// real concurrent writers (a data race in `sparse.zig`'s posting-chunk
+// split/merge logic, reproducible with or without this change, since the
+// inline fast path never engages for a worker-driven catch-up write at all
+// -- only for this write's OWN synchronous ack). Not chased here; see the
+// handback notes.
+test "lite write amplification report: sparse_vector with inline publication (sparse-text-inline round 2)" {
+    const alloc = std.testing.allocator;
+    const updates = default_updates;
+
+    const sparse = try measureSingleWriterVector(alloc, "lite-write-amp-sparse-inline", true, updates);
+    std.debug.print("lite write amplification report, sparse_vector with inline publication (updates={d}, sparse_terms={d}):\n", .{ updates, sparse_terms });
+    printStageTable("sparse-vector-visible with inline publication (sync_level=full_index)", sparse);
+
+    const report = modeJson(sparse);
+    const json_text = try std.json.Stringify.valueAlloc(alloc, report, .{ .whitespace = .indent_2 });
+    defer alloc.free(json_text);
+    std.debug.print("lite_write_amplification_sparse_inline_json_begin\n{s}\nlite_write_amplification_sparse_inline_json_end\n", .{json_text});
+
+    // Same headroom as the text/graph inline fast paths: one amortized
+    // startup write (this index's very first write, which the eligibility
+    // gate's background-worker-catchup check -- mirrored from text's own
+    // -- always defers to the slow path) plus slack.
+    try expectAtMost(sparse.durableCommitsPerWrite(), 1.25, "sparse_vector inline fast path durable commits/write");
+}
+
+// Steady-state counterpart to the text/graph alternation regression tests
+// above, but for sparse: guards against the same class of bug (a stale
+// filtered-name comparison, or a counter left mutated between prepare and
+// install/abort) reappearing on the sparse branch specifically.
+test "lite write amplification: sparse_vector inline fast path engages every write in steady state" {
+    const alloc = std.testing.allocator;
+    const updates: usize = 20;
+
+    const sparse = try measureSingleWriterVector(alloc, "lite-write-amp-sparse-inline-steady", true, updates);
+    try expectAtMost(sparse.durableCommitsPerWrite(), 1.35, "sparse_vector inline fast path steady-state durable commits/write");
+}
+
+// lite-single-commit-write-path.md §3.3a: a mixed-kind write -- one doc
+// carrying both a text `body` field and a caller-supplied sparse
+// embedding -- must still cost one native commit: each eligible index
+// (InlineTextPublication, InlineSparsePublication) contributes its own
+// commit_participant to the SAME transaction, and the other's presence
+// must never push either one onto its own slower, separate-commit path.
+test "lite write amplification: mixed text+sparse write engages both inline fast paths in one commit" {
+    const alloc = std.testing.allocator;
+    const updates = default_updates;
+
+    var fixture = try Fixture.open(alloc, "lite-write-amp-mixed-text-sparse", .full_text);
+    defer fixture.close();
+    try addExternalVectorIndex(alloc, fixture.handle, sparse_index_name, true);
+
+    var buffer: [text_bytes]u8 = undefined;
+    var key_buffer: [32]u8 = undefined;
+    wal_trace.reset();
+    wal_trace.registerCallingThread();
+    for (0..updates) |i| {
+        const key = try std.fmt.bufPrint(&key_buffer, "doc-{d}", .{i % 128});
+        const text = payload(&buffer, 0, i);
+        const vector_json = try sparseVectorJsonAlloc(alloc, i);
+        defer alloc.free(vector_json);
+        try insertOneMixedTextSparse(alloc, fixture.handle, key, text, vector_json, "full_index");
+    }
+    const mixed: ModeReport = .{ .updates = updates, .report = wal_trace.snapshot() };
+
+    std.debug.print("lite write amplification report, mixed text+sparse (updates={d}):\n", .{updates});
+    printStageTable("mixed text+sparse-visible (sync_level=full_index, workers on)", mixed);
+
+    // Same headroom as every other inline fast-path report test: one
+    // amortized startup write per eligible index (each index's own
+    // worker-catchup precheck defers its very first write to the slow
+    // path) plus slack. Two indexes' startup writes can land on the SAME
+    // update (doc-0's very first write touches both), so this stays at
+    // the single-index ceiling, not double it.
+    try expectAtMost(mixed.durableCommitsPerWrite(), 1.25, "mixed text+sparse durable commits/write (workers on)");
 }
 
 fn expectAtMost(actual: f64, ceiling: f64, comptime label: []const u8) !void {
