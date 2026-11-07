@@ -121,7 +121,7 @@ pub const PublishedArtifacts = struct {
         const physical_direct = if (direct) try managed.resolveRegularFilePath(a, io, root) else null;
         errdefer if (physical_direct) |path| a.free(path);
         const standalone = direct and std.mem.eql(u8, storage_root, root);
-        var receipt = if (standalone) null else try managed.loadValidated(a, io, storage_root);
+        var receipt = if (standalone) null else try managed.loadValidated(a, io, physical_root);
         errdefer if (receipt) |*value| value.deinit();
         const publication = if (receipt) |value| value.publication_generation else null;
         if (expected) |value| if (!std.meta.eql(value.publication, publication)) return error.ModelArtifactsChanging;
@@ -203,7 +203,7 @@ pub const PublishedArtifacts = struct {
             const artifact = receipt.find(relative) orelse return null;
             return try self.allocator.dupe(u8, artifact.canonical_path);
         }
-        return managed.resolveContainedArtifactPath(self.allocator, self.io, self.directory_scope orelse self.storage_root, relative) catch |err| switch (err) {
+        return managed.resolveContainedArtifactPath(self.allocator, self.io, self.constructionRoot(), relative) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => null,
             else => return err,
         };
@@ -260,13 +260,14 @@ pub const PublishedArtifacts = struct {
             const artifact = &receipt.artifacts[try self.indexForPath(path)];
             return self.readSelected(path, artifact, max_bytes);
         }
-        const canonical = try managed.resolveRegularFilePath(self.allocator, self.io, path);
-        defer self.allocator.free(canonical);
-        const root = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.storage_root, self.allocator);
-        defer self.allocator.free(root);
-        const standalone = self.direct_path != null and std.mem.eql(u8, self.root, self.storage_root);
-        if (!managed.pathIsWithinRoot(root, canonical) and !(standalone and std.mem.eql(u8, root, canonical))) return error.ModelArtifactOutsideRoot;
-        return self.readSelected(canonical, null, max_bytes);
+        // Share construction's namespace rebasing and containment. Resolving
+        // storage_root again could follow a different installation, and would
+        // discard a standalone file's validated directory sidecar scope.
+        const physical = try self.constructionPath(path);
+        defer self.allocator.free(physical);
+        const stat = try std.Io.Dir.cwd().statFile(self.io, physical, .{ .follow_symlinks = false });
+        if (stat.kind != .file) return error.InvalidModelArtifactKind;
+        return self.readSelected(physical, null, max_bytes);
     }
     fn readSelected(self: *const PublishedArtifacts, path: []const u8, artifact: ?*const managed.ValidatedArtifact, max_bytes: usize) ![]u8 {
         if (artifact) |member| {
@@ -957,6 +958,12 @@ fn directDirectoryScopeAllocationScenario(a: std.mem.Allocator, file: []const u8
     defer a.free(path);
     const config = try artifacts.constructionPath(path);
     defer a.free(config);
+    const relative = try artifacts.read("config.json", 1024);
+    defer a.free(relative);
+    const direct = try artifacts.readPath(config, 1024);
+    defer a.free(direct);
+    try std.testing.expectEqualStrings("{}", relative);
+    try std.testing.expectEqualStrings(relative, direct);
     try artifacts.verify();
 }
 
@@ -981,6 +988,7 @@ test "model selection direct directory scopes contain sidecars and unwind alloca
     defer artifacts.deinit();
     try std.testing.expectError(error.ModelArtifactOutsideRoot, artifacts.bindDirectoryScope(foreign));
     try artifacts.bindDirectoryScope(root);
+    try std.testing.expectError(error.InvalidModelArtifactKind, artifacts.readPath(root, 1024));
     const outside = try std.fs.path.join(a, &.{ foreign, "config.json" });
     defer a.free(outside);
     try std.testing.expectError(error.ModelArtifactOutsideRoot, artifacts.constructionPath(outside));
@@ -988,4 +996,95 @@ test "model selection direct directory scopes contain sidecars and unwind alloca
     try tmp.dir.createDirPath(io, "model");
     try tmp.dir.writeFile(io, .{ .sub_path = "model/model.gguf", .data = "weights" });
     try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+}
+
+test "model selection unmanaged metadata reads retain the captured root across alias switches" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "first", "second" }) |name| try tmp.dir.createDirPath(io, name);
+    try tmp.dir.writeFile(io, .{ .sub_path = "first/config.json", .data = "first" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "second/config.json", .data = "other" });
+    try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const alias = try std.fs.path.join(a, &.{ root, "current" });
+    defer a.free(alias);
+    const logical = try std.fs.path.join(a, &.{ alias, "config.json" });
+    defer a.free(logical);
+    const original = try tmp.dir.realPathFileAlloc(io, "first/config.json", a);
+    defer a.free(original);
+    const foreign = try tmp.dir.realPathFileAlloc(io, "second/config.json", a);
+    defer a.free(foreign);
+    var artifacts = try PublishedArtifacts.init(a, io, alias, null);
+    defer artifacts.deinit();
+    try tmp.dir.deleteFile(io, "current");
+    try tmp.dir.symLink(io, "second", "current", .{ .is_directory = true });
+    const relative = try artifacts.read("config.json", 1024);
+    defer a.free(relative);
+    try std.testing.expectEqualStrings("first", relative);
+    for ([_][]const u8{ logical, original }) |path| {
+        const bytes = try artifacts.readPath(path, 1024);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("first", bytes);
+    }
+    try std.testing.expectError(error.ModelArtifactOutsideRoot, artifacts.readPath(foreign, 1024));
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+    try tmp.dir.deleteFile(io, "current");
+    try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    try artifacts.verify();
+}
+
+test "model selection receipt discovery uses the captured root before opening metadata" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "first", "second" }) |name| {
+        try tmp.dir.createDirPath(io, name);
+        const receipt = try std.fs.path.join(a, &.{ name, managed.complete_filename });
+        defer a.free(receipt);
+        // Identical legacy receipts deliberately cannot distinguish the bytes.
+        try tmp.dir.writeFile(io, .{ .sub_path = receipt, .data = "{\"version\":2,\"artifacts\":[{\"path\":\"config.json\",\"size\":5},{\"path\":\"model.gguf\",\"size\":7}]}" });
+        const weights = try std.fs.path.join(a, &.{ name, "model.gguf" });
+        defer a.free(weights);
+        try tmp.dir.writeFile(io, .{ .sub_path = weights, .data = "weights" });
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "first/config.json", .data = "first" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "second/config.json", .data = "other" });
+    try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const alias = try std.fs.path.join(a, &.{ root, "current" });
+    defer a.free(alias);
+    const Probe = struct {
+        dir: std.Io.Dir,
+        switched: bool = false,
+        var current: *@This() = undefined;
+        var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            if (!current.switched and std.mem.endsWith(u8, path, managed.complete_filename)) {
+                current.switched = true;
+                current.dir.deleteFile(std.testing.io, "current") catch unreachable;
+                current.dir.symLink(std.testing.io, "second", "current", .{ .is_directory = true }) catch unreachable;
+            }
+            return original(raw, dir, path, options);
+        }
+    };
+    var probe = Probe{ .dir = tmp.dir };
+    var table = io.vtable.*;
+    Probe.current = &probe;
+    Probe.original = table.dirOpenFile;
+    table.dirOpenFile = Probe.open;
+    var artifacts = try PublishedArtifacts.init(a, .{ .userdata = io.userdata, .vtable = &table }, alias, null);
+    defer artifacts.deinit();
+    try std.testing.expect(probe.switched);
+    const bytes = try artifacts.read("config.json", 1024);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("first", bytes);
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+    try tmp.dir.deleteFile(io, "current");
+    try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    try artifacts.verify();
 }

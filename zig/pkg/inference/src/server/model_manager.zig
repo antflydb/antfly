@@ -63,6 +63,11 @@ const ComponentConstruction = struct {
         }
         return .{ .io = io, .lease = lease, .owned = try PublishedArtifacts.init(a, io, selected.path, .{ .publication = selected.publication }), .borrowed = null };
     }
+    /// Reuse an externally owned publication lease and artifact catalog during
+    /// synchronous preparation. This view never releases the caller's fence.
+    fn borrowingUnderLease(io: std.Io, borrowed_artifacts: *PublishedArtifacts) ComponentConstruction {
+        return .{ .io = io, .lease = .{}, .owned = null, .borrowed = borrowed_artifacts };
+    }
     fn artifacts(self: *ComponentConstruction) *PublishedArtifacts {
         return self.borrowed orelse &self.owned.?;
     }
@@ -5247,15 +5252,22 @@ pub const ModelManager = struct {
         if (!std.meta.eql(man.managed_publication, try managed_receipt.publicationGeneration(self.allocator, io, model_dir))) return error.ModelArtifactsChanging;
     }
 
-    pub fn loadGenerationTokenizerAssets(self: *ModelManager, model_dir: []const u8, man: *const manifest_mod.ModelManifest) !TokenizerAssets {
+    pub fn loadGenerationTokenizerAssets(self: *ModelManager, model_dir: []const u8, provided_man: *const manifest_mod.ModelManifest) !TokenizerAssets {
         const io = self.session_manager.io orelse std.Options.debug_io;
         var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
         defer publication_lease.deinit(io);
-        try self.verifyArtifactPublication(model_dir, man);
+        try self.verifyArtifactPublication(model_dir, provided_man);
         try self.ensureResourceOwnerReady();
-        var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = man.managed_publication });
+        var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = provided_man.managed_publication });
         defer artifacts.deinit();
         artifacts.verification_cache = &self.verified_artifacts;
+        var proof = ComponentConstruction.borrowingUnderLease(io, &artifacts);
+        defer proof.deinit();
+        // Tokenizer-only preparation shares session construction's identity,
+        // provenance, and scope checks without opening unused weight sources.
+        var bound = try BoundModelSource.init(&proof, model_dir, ModelSource.kindForPath(model_dir), provided_man, null);
+        defer bound.deinit();
+        const man = bound.view().manifest.?;
         const gemma_compat = tokenizerGemmaCompat(man.*, model_dir);
         const kind = try tokenizerKindWithArtifacts(man.*, &artifacts, gemma_compat);
         const plan = try tokenizerLoadAdmissionPlanWithArtifacts(self.allocator, model_dir, man, kind, &artifacts);
@@ -5286,7 +5298,7 @@ pub const ModelManager = struct {
             ct.* = try generation.ChatTemplate.init(self.allocator, source, man.bos_token, man.eos_token, man.unk_token, man.pad_token);
             assets.chat_tmpl = ct;
         }
-        try artifacts.verify();
+        try bound.finish(&proof);
         try self.verifyArtifactPublication(model_dir, man);
         if (lease) |*active| try active.retain(plan.resident);
         assets.lease = lease;
@@ -19636,4 +19648,67 @@ test "model selection Jina GGUF CPU ignores adapters reserved for Metal" {
     try expectBoundSourceOutput(session, true);
     try std.testing.expectError(error.FileNotFound, bound.forBackend(&proof, .metal));
     try std.testing.expectEqual(native.manifest, (try bound.forBackend(&proof, .native)).?.manifest);
+}
+
+test "model selection direct tokenizer preparation shares its directory snapshot with the session" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |managed_model| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try writeCancellationTestModel(tmp.dir, a);
+        if (managed_model) try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.gguf", "config.json", "tokenizer.json" });
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        var man = try manifest_mod.loadFromDir(a, root);
+        defer man.deinit();
+        var sm = backends.SessionManager.initWithIo(a, io);
+        sm.preferred_backends = &.{.native};
+        sm.native_call_policy = .in_process;
+        var manager = ModelManager.init(a, sm);
+        defer manager.deinit();
+        manager.admission_enabled = true;
+        {
+            var session = try manager.loadArtifactSession(man.gguf_path.?, man);
+            defer session.deinit();
+            try expectBoundSourceOutput(session.session, true);
+            var directory = try manager.loadGenerationTokenizerAssets(root, &man);
+            defer directory.deinit();
+            var direct = try manager.loadGenerationTokenizerAssets(man.gguf_path.?, &man);
+            defer direct.deinit();
+            const expected = try directory.tokenizer().encode(a, "a");
+            defer a.free(expected);
+            const actual = try direct.tokenizer().encode(a, "a");
+            defer a.free(actual);
+            try std.testing.expect(expected.len != 0);
+            try std.testing.expectEqualSlices(i32, expected, actual);
+        }
+        try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+    }
+}
+
+test "model selection tokenizer preparation rejects stale directory provenance before parsing" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "first", "second" }) |name| {
+        try tmp.dir.createDirPath(io, name);
+        var dir = try tmp.dir.openDir(io, name, .{});
+        defer dir.close(io);
+        try writeCancellationTestModel(dir, a);
+    }
+    try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const alias = try std.fs.path.join(a, &.{ root, "current" });
+    defer a.free(alias);
+    var man = try manifest_mod.loadFromDir(a, alias);
+    defer man.deinit();
+    try tmp.dir.deleteFile(io, "current");
+    try tmp.dir.symLink(io, "second", "current", .{ .is_directory = true });
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    try std.testing.expectError(error.ModelArtifactsChanging, manager.loadGenerationTokenizerAssets(alias, &man));
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
 }
