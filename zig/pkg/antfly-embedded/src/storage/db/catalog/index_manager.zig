@@ -21082,7 +21082,12 @@ pub const IndexManager = struct {
         }
     };
 
-    const DenseVectorIdAssignment = struct {
+    /// `pub` only so `mutation_materialization.zig`'s
+    /// `prepareInlineDensePublication` (lite-single-commit-write-path.md
+    /// §3.3a) can hold the `assignDenseVectorIdInlineTxn` result in a local
+    /// before copying out the one field (`vector_id`) it actually needs;
+    /// never otherwise named outside this file.
+    pub const DenseVectorIdAssignment = struct {
         vector_id: u64,
         needs_mapping: bool,
         can_assume_absent: bool,
@@ -27032,6 +27037,52 @@ pub const IndexManager = struct {
         }
     }
 
+    /// lite-single-commit-write-path.md §3.3a's dense extension of the
+    /// inline publication fast path (mirrors `graphEdgeWriteEligibleFor
+    /// InlinePublication`'s own doc comment for the general shape this
+    /// family of functions follows). Runs the SAME three-step lookup
+    /// `ensureDenseVectorIdTxnWithMemo` does -- the durable reverse
+    /// doc_key->vector_id mapping, then legacy-ordinal compatibility, then
+    /// the deterministic hash -- but never falls into
+    /// `assignDenseVectorIdFromPreferredTxn`'s own collision-spill `while
+    /// (true)` loop: that loop's `reserveDenseVectorIdTxn` writes a durable
+    /// allocator counter through a MUTABLE store transaction, which the
+    /// inline path's read-only probe transaction (`store.beginProbeTxn()`,
+    /// mirroring `prepareInlineSparsePublication`'s own ordinal lookup) does
+    /// not provide and the generic `txn: anytype` plumbing could not use
+    /// even if it did. Returns `null` -- never an error -- whenever the
+    /// deterministic ID collides with another document's vector; the
+    /// caller must fall back to the slow path (`applyDenseEmbeddingWrites
+    /// ByNameWithOptions`), which DOES reach the spill loop. A genuine
+    /// identity inconsistency (corrupt dual-sided mapping) still surfaces
+    /// as `error.InvalidDenseVectorMetadata`, exactly as the slow path's
+    /// own `mappedDenseVectorIdAssignmentTxn`/`assignDenseVectorIdFromPreferredTxn`
+    /// would raise it for the identical occupancy state -- not swallowed
+    /// into a silent fallback.
+    pub fn assignDenseVectorIdInlineTxn(
+        self: *IndexManager,
+        txn: anytype,
+        entry: *DenseIndex,
+        index_name: []const u8,
+        doc_key: []const u8,
+    ) !?DenseVectorIdAssignment {
+        if (try self.lookupDenseVectorIdTxn(txn, index_name, doc_key)) |existing| {
+            return try self.mappedDenseVectorIdAssignmentTxn(txn, entry, index_name, doc_key, existing, null);
+        }
+        if (try self.legacyOrdinalDenseVectorIdAssignmentTxn(txn, entry, doc_key, null, null)) |assignment| {
+            return assignment;
+        }
+        const preferred_vector_id = deterministicDenseVectorId(doc_key);
+        const occupancy = try self.denseVectorIdOccupancyTxn(txn, entry, index_name, preferred_vector_id, doc_key, null);
+        if (occupancy.identity_inconsistent) return error.InvalidDenseVectorMetadata;
+        if (occupancy.state == .conflicts) return null;
+        return .{
+            .vector_id = preferred_vector_id,
+            .needs_mapping = false,
+            .can_assume_absent = !occupancy.vector_present,
+        };
+    }
+
     fn mappedDenseVectorIdAssignmentTxn(
         self: *IndexManager,
         txn: anytype,
@@ -28936,6 +28987,58 @@ pub const IndexManager = struct {
         return self.keyInRange(write.doc_key);
     }
 
+    /// WS4-for-vectors' dense extension of the fast path above, mirroring
+    /// `sparseEmbeddingWriteEligibleForInlinePublication`'s own shape (the
+    /// `!entry.external`/`chunk_name`/`embedding_names` triple means exactly
+    /// the same thing here: a non-`external` dense index also derives
+    /// vectors from a document field through `IndexManager`-layer
+    /// bookkeeping -- `indexDenseBatchByNameWithOptions`, a second commit
+    /// the general path runs for the SAME batch -- that this fast path
+    /// never attempts, and a chunk- or named-embedding-backed index keys
+    /// writes by artifact/chunk identity, not the primary document
+    /// identity `assignDenseVectorIdInlineTxn`'s ordinal fallback looks
+    /// up). `write.vector.len == 0` is the dense analogue of sparse's
+    /// `indices.len == 0`: an artifact-backed write with no inline payload
+    /// needs the slow path's own artifact read
+    /// (`preloadDenseEmbeddingArtifactVectorsTxn`). This is the common path
+    /// for EVERY caller-supplied-vector write, not a rare case:
+    /// `buildDerivedBatch` (mutation_materialization.zig) always zeroes
+    /// `.vector` once `.artifact_key` is set, and document-mapping
+    /// (`appendEmbeddingArtifactWrite`) always assigns an artifact_key for
+    /// a caller-supplied embedding, synchronously, before this write ever
+    /// reaches eligibility. `mutation_commit.zig`'s inline-dense block
+    /// resolves the real vector itself first -- from the embedding
+    /// artifact's own not-yet-committed bytes already staged in
+    /// `write_buffers.explicit_embedding_artifact_writes` (same primary
+    /// transaction, just not durable yet, so a read-only probe transaction
+    /// against the store cannot see it) -- and only reaches this check
+    /// with `write.vector` still empty when that resolution itself failed
+    /// (no matching staged artifact, or an elided/stub payload needing the
+    /// slow path's real artifact read). `write.parent_doc_key
+    /// != null` is defensive -- it should already be impossible once
+    /// `chunk_name`/`embedding_names` are excluded above, since only a
+    /// chunk-backed write ever sets it, but costs nothing to check
+    /// explicitly rather than lean on that invariant holding forever.
+    /// `entry.index.experimentalPostingWalAuthoritative()` excludes the
+    /// one case where `beginDensePostingSidecarCaptureLeaseByNameWithOptions`
+    /// is NOT a no-op for a `.native_catalog`-backed entry (see
+    /// `densePostingSidecarEnabledForEntry`: with the posting-WAL sidecar
+    /// off, as it is by default for every fresh `.native_catalog` dense
+    /// index, that lease call returns `null` immediately) -- a write to an
+    /// index that HAS been migrated onto the posting WAL sidecar still
+    /// falls back to the slow path, which carries that lease's effects
+    /// correctly today. A caller must fall back to
+    /// `applyDenseEmbeddingWritesByNameWithOptions` (the normal, slow
+    /// path) whenever this returns `false`; see
+    /// `graphEdgeWriteEligibleForInlinePublication`'s own doc comment for
+    /// why `false` must never be read as "skip the write outright".
+    pub fn denseEmbeddingWriteEligibleForInlinePublication(self: *const IndexManager, entry: *const DenseIndex, write: derived_types.DerivedDenseEmbeddingWrite) bool {
+        if (!entry.external or entry.chunk_name != null or entry.embedding_names.len != 0) return false;
+        if (write.vector.len == 0 or write.parent_doc_key != null) return false;
+        if (entry.index.experimentalPostingWalAuthoritative()) return false;
+        return self.keyInRange(write.doc_key);
+    }
+
     test "graphEdgeWriteEligibleForInlinePublication rejects TTL, contributors and owner-bearing writes" {
         const alloc = std.testing.allocator;
         var manager = try IndexManager.init(alloc, ".");
@@ -28971,6 +29074,50 @@ pub const IndexManager = struct {
         var field_entry = plain_entry;
         field_entry.edge_type_configs = field_edge_types[0..];
         try std.testing.expect(!manager.graphEdgeWriteEligibleForInlinePublication(&field_entry, plain_write));
+    }
+
+    test "denseEmbeddingWriteEligibleForInlinePublication rejects non-external, chunked, named-embedding and artifact-only writes" {
+        const alloc = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        const path_z = try alloc.dupeSentinel(u8, path, 0);
+        defer alloc.free(path_z);
+        var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+        defer store.close();
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "dv_ext",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        }});
+        const external_entry = manager.denseIndex("dv_ext") orelse return error.IndexNotFound;
+        const plain_write: derived_types.DerivedDenseEmbeddingWrite = .{ .index_name = "dv_ext", .doc_key = "doc:1", .vector = &[_]f32{ 1.0, 0.0 } };
+        try std.testing.expect(manager.denseEmbeddingWriteEligibleForInlinePublication(external_entry, plain_write));
+
+        const artifact_only_write: derived_types.DerivedDenseEmbeddingWrite = .{ .index_name = "dv_ext", .doc_key = "doc:1", .artifact_key = "doc:1\x00\x00embedding", .vector = &.{} };
+        try std.testing.expect(!manager.denseEmbeddingWriteEligibleForInlinePublication(external_entry, artifact_only_write));
+
+        const parent_write: derived_types.DerivedDenseEmbeddingWrite = .{ .index_name = "dv_ext", .doc_key = "doc:1#chunk0", .parent_doc_key = "doc:1", .vector = &[_]f32{ 1.0, 0.0 } };
+        try std.testing.expect(!manager.denseEmbeddingWriteEligibleForInlinePublication(external_entry, parent_write));
+
+        var chunked_entry = external_entry.*;
+        chunked_entry.chunk_name = @constCast("chunk_v1");
+        try std.testing.expect(!manager.denseEmbeddingWriteEligibleForInlinePublication(&chunked_entry, plain_write));
+
+        var named_names = [_][]u8{@constCast("a")};
+        var named_entry = external_entry.*;
+        named_entry.embedding_names = named_names[0..];
+        try std.testing.expect(!manager.denseEmbeddingWriteEligibleForInlinePublication(&named_entry, plain_write));
+
+        var non_external_entry = external_entry.*;
+        non_external_entry.external = false;
+        try std.testing.expect(!manager.denseEmbeddingWriteEligibleForInlinePublication(&non_external_entry, plain_write));
     }
 
     /// Older non-TTL projections did not retain contributor order. Populate
@@ -33309,6 +33456,31 @@ pub const IndexManager = struct {
         const ordinal_doc_key = parent_doc_key orelse doc_key;
         const ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, mutable_txn, ordinal_doc_key);
         try self.writeDenseVectorMappingTxnOptionalOrdinal(mutable_txn, index_name, doc_key, vector_id, vector_fingerprint, ordinal);
+    }
+
+    /// Public seam for `mutation_materialization.zig`'s
+    /// `InlineDensePublication` (lite-single-commit-write-path.md §3.3a):
+    /// writes the SAME durable doc_key<->vector_id reverse mapping (plus
+    /// ordinal-keyed records, when an identity ordinal already exists)
+    /// `applyDenseEmbeddingWritesEntry`'s slow path writes unconditionally
+    /// for every assigned vector via `writeDenseVectorMappingTxn`+
+    /// `denseVectorFingerprint`, through an arbitrary txn-like view --
+    /// concretely, the inline path's `commit_participant.View`, whose
+    /// restricted `put` only accepts the `\x00\x00`-prefixed primary-
+    /// catalog keys this mapping lives under (`denseDocMappingKey`/
+    /// `denseVectorIdMappingKey`/the ordinal-keyed variants), so it is
+    /// never exposed by name here. `parent_doc_key` is always `null`:
+    /// `denseEmbeddingWriteEligibleForInlinePublication` already rejects
+    /// every write that could carry one.
+    pub fn writeDenseVectorMappingForInlinePublicationTxn(
+        self: *IndexManager,
+        txn: anytype,
+        index_name: []const u8,
+        doc_key: []const u8,
+        vector_id: u64,
+        vector: []const f32,
+    ) !void {
+        try self.writeDenseVectorMappingTxn(txn, index_name, doc_key, null, vector_id, denseVectorFingerprint(vector));
     }
 
     fn writeDenseVectorMappingTxnWithOrdinal(
@@ -41356,6 +41528,66 @@ test "dense vector id allocator spills preferred-id collisions without aliasing 
             &corruption_memo,
         ),
     );
+}
+
+test "assignDenseVectorIdInlineTxn falls back (returns null) on a deterministic-id collision" {
+    // The inline publication fast path (lite-single-commit-write-path.md
+    // §3.3a) must never reach `reserveDenseVectorIdTxn`'s durable counter
+    // write: `assignDenseVectorIdInlineTxn` returns `null` instead,
+    // telling `prepareInlineDensePublication` to fall back to the slow
+    // path (which DOES reach the spill loop and resolves the collision
+    // correctly). This plants another document's vector at exactly the
+    // victim key's deterministic id -- not a hash-generator collision, but
+    // the same occupancy state one would produce -- and proves the inline
+    // path backs off rather than aliasing it.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
+    defer alloc.free(cwd);
+    const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
+    defer alloc.free(absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, absolute_path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    }});
+
+    const entry = manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    const victim_doc_key = "doc:victim";
+    const colliding_id = deterministicDenseVectorId(victim_doc_key);
+
+    // A DIFFERENT document already occupies the exact id `victim_doc_key`
+    // would deterministically be assigned.
+    try entry.index.batchInsertWithMetadata(&.{.{
+        .vector_id = colliding_id,
+        .vector = &[_]f32{ 1.0, 0.0, 0.0 },
+        .metadata = "doc:occupant",
+    }});
+    try manager.writeDenseVectorMapping(&store, "dv_v1", "doc:occupant", colliding_id);
+
+    var probe_txn = try store.beginProbeTxn();
+    defer probe_txn.abort();
+    const assignment = try manager.assignDenseVectorIdInlineTxn(&probe_txn, entry, "dv_v1", victim_doc_key);
+    try std.testing.expect(assignment == null);
+
+    // The occupant's own (non-colliding) insert still resolves normally
+    // through the SAME inline path.
+    const occupant_assignment = (try manager.assignDenseVectorIdInlineTxn(&probe_txn, entry, "dv_v1", "doc:occupant")) orelse return error.UnexpectedNullAssignment;
+    try std.testing.expectEqual(colliding_id, occupant_assignment.vector_id);
 }
 
 test "dense metadata prefetch includes legacy ordinal vector ids" {
