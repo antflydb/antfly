@@ -190,12 +190,15 @@ pub const Config = struct {
             var manifest: @import("antfly_decisions").revisions.Manifest = .{};
             var projection = std.json.Value{ .object = .empty };
             try projection.object.put(a, "upstream_revisions", raw.object.get("dependencies").?);
+            try projection.object.put(a, "upstream_revisions_version", .{ .integer = 1 });
             manifest.collect(projection) catch return error.InvalidAdjudicationOutput;
         }
         return probe;
     }
 
     pub const RevisionCache = struct {
+        /// Recognition of old stored hashes only; never used with an executor.
+        historical: bool = false,
         budget: ?ExecutionBudget = null,
         stages: [@import("antfly_decisions").cascade.max_stages]RevisionProbe = @splat(.{}),
         proxies: std.AutoHashMapUnmanaged([32]u8, RevisionProbe) = .empty,
@@ -228,7 +231,10 @@ pub const Config = struct {
 
     fn proxyRevision(self: Config, a: std.mem.Allocator, decider: std.json.Value, response: std.json.Value, executor: ?Executor, cache: *RevisionCache, index: usize) !?[32]u8 {
         var dependencies: @import("antfly_decisions").revisions.Manifest = .{};
-        dependencies.collect(response) catch return error.InvalidAdjudicationOutput;
+        if (cache.historical) {
+            if (executor != null) return error.InvalidAdjudicationOutput;
+            dependencies.collectHistorical(response) catch return error.InvalidAdjudicationOutput;
+        } else dependencies.collect(response) catch return error.InvalidAdjudicationOutput;
         if (dependencies.len == 0) return null;
         const scalar = dependencies.len == 1 and dependencies.nodes[0].kind == .model and dependencies.nodes[0].path.len == 0;
         const recorded: [32]u8 = if (scalar) blk: {
@@ -275,6 +281,14 @@ pub const Config = struct {
         if (cached.value_ptr.failure) |err| return err;
         if (cache.budget) |budget| try budget.check();
         return cached.value_ptr.revision orelse error.CapabilityDiscoveryUnavailable;
+    }
+
+    /// Recognize old composite bindings without treating omitted provenance as
+    /// complete. Current collection/verifier rules still govern authorization.
+    pub fn historicalResponseRevision(self: Config, a: std.mem.Allocator, response: std.json.Value) !?[32]u8 {
+        var cache: RevisionCache = .{ .historical = true };
+        defer cache.deinit(a);
+        return self.responseRevision(a, response, null, &cache);
     }
 
     /// Previous writers pinned only the final generated answer of a proxy.
@@ -613,67 +627,26 @@ fn classifyResponse(config: Config, response: std.json.Value, definition: ?*cons
     // return generated evidence, including from inside a local frozen cascade.
     const proxy = Config.isDecisionProxy(answering);
     if (expected_method != .string or (!proxy and !std.mem.eql(u8, method.string, expected_method.string))) return error.InvalidAdjudicationOutput;
-    const generated = std.mem.eql(u8, method.string, "generated");
-    var verdict_only = false;
-    if (generated) {
-        const source = answer.object.get("probability_source") orelse return error.InvalidAdjudicationOutput;
-        if (proxy) {
-            if (source != .string or (!std.mem.eql(u8, source.string, "verdict") and !std.mem.eql(u8, source.string, "token_logprobs"))) return error.InvalidAdjudicationOutput;
-            verdict_only = std.mem.eql(u8, source.string, "verdict");
-        } else {
-            const policy = answering.object.get("probabilities") orelse std.json.Value{ .string = "token_logprobs" };
-            verdict_only = policy == .string and std.mem.eql(u8, policy.string, "verdict_only");
-            if (source != .string or !std.mem.eql(u8, source.string, if (verdict_only) "verdict" else "token_logprobs")) return error.InvalidAdjudicationOutput;
-        }
-        if (!answer.object.contains("raw_structured_answer")) return error.InvalidAdjudicationOutput;
+    const validated = @import("antfly_decisions").votes.validateAnswer(answer) catch return error.InvalidAdjudicationOutput;
+    const vote = switch (validated) {
+        .choice => |choice| choice,
+        else => return error.InvalidAdjudicationOutput,
+    };
+    if (vote.generated and !proxy) {
+        const policy = answering.object.get("probabilities") orelse std.json.Value{ .string = "token_logprobs" };
+        const expected_verdict = policy == .string and std.mem.eql(u8, policy.string, "verdict_only");
+        if (vote.verdict != expected_verdict) return error.InvalidAdjudicationOutput;
     }
-    const probabilities = answer.object.get("probabilities") orelse return error.InvalidAdjudicationOutput;
-    if (probabilities != .array or probabilities.array.items.len != config.question.choices.len) return error.InvalidAdjudicationOutput;
-    const selected = answer.object.get("choice") orelse return error.InvalidAdjudicationOutput;
-    if (selected != .string) return error.InvalidAdjudicationOutput;
-    if (generated) {
-        const raw = answer.object.get("raw_structured_answer").?;
-        if (raw != .string or !std.mem.eql(u8, raw.string, selected.string)) return error.InvalidAdjudicationOutput;
-    }
-    var selected_probability: ?f64 = null;
-    var maximum: f64 = 0;
-    var accepted: f64 = 0;
-    var rejected: f64 = 0;
-    var total: f64 = 0;
+    if (vote.distribution.len != config.question.choices.len) return error.InvalidAdjudicationOutput;
+    // The shared validator proves shape, normalization, selection, and unique
+    // labels. Only membership in this frozen question remains policy-specific.
     for (config.question.choices) |choice| {
-        var found = false;
-        for (probabilities.array.items) |entry| {
-            if (entry != .object) return error.InvalidAdjudicationOutput;
-            const value = entry.object.get("value") orelse return error.InvalidAdjudicationOutput;
-            if (value != .string) return error.InvalidAdjudicationOutput;
-            if (!std.mem.eql(u8, value.string, choice.value)) continue;
-            if (found) return error.InvalidAdjudicationOutput;
-            found = true;
-            const raw = entry.object.get("probability") orelse return error.InvalidAdjudicationOutput;
-            const probability: f64 = switch (raw) {
-                .float => raw.float,
-                .integer => @floatFromInt(raw.integer),
-                else => return error.InvalidAdjudicationOutput,
-            };
-            if (!std.math.isFinite(probability) or probability < 0 or probability > 1) return error.InvalidAdjudicationOutput;
-            // Verdict-only evidence must assert exactly the sampled choice.
-            if (verdict_only and probability != @as(f64, if (std.mem.eql(u8, selected.string, choice.value)) 1 else 0)) return error.InvalidAdjudicationOutput;
-            total += probability;
-            maximum = @max(maximum, probability);
-            if (std.mem.eql(u8, selected.string, choice.value)) selected_probability = probability;
-            if (std.mem.eql(u8, choice.value, config.accept.choice)) accepted = probability;
-            if (config.reject) |reject| if (std.mem.eql(u8, choice.value, reject.choice)) {
-                rejected = probability;
-            };
-        }
-        if (!found) return error.InvalidAdjudicationOutput;
+        for (vote.distribution) |entry| {
+            if (std.mem.eql(u8, entry.object.get("value").?.string, choice.value)) break;
+        } else return error.InvalidAdjudicationOutput;
     }
-    const selected_p = selected_probability orelse return error.InvalidAdjudicationOutput;
-    // Typed choices are derived from their distribution. Generated choices are
-    // sampled decoder output and can legitimately have a lower probability.
-    if (@abs(total - 1) > 0.001 or (!generated and selected_p != maximum)) return error.InvalidAdjudicationOutput;
     if (@import("antfly_decisions").cascade.agreementBlocked(response) catch return error.InvalidAdjudicationOutput) return .abstained;
-    if (std.mem.eql(u8, selected.string, config.accept.choice) and accepted >= config.accept.min_probability and accepted > 0.5) return .accepted;
-    if (config.reject) |reject| if (std.mem.eql(u8, selected.string, reject.choice) and rejected >= reject.min_probability and rejected > 0.5) return .rejected;
+    if (std.mem.eql(u8, vote.selected, config.accept.choice) and vote.probability >= config.accept.min_probability and vote.probability > 0.5) return .accepted;
+    if (config.reject) |reject| if (std.mem.eql(u8, vote.selected, reject.choice) and vote.probability >= reject.min_probability and vote.probability > 0.5) return .rejected;
     return .abstained;
 }

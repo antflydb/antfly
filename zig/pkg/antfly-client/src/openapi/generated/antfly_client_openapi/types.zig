@@ -10682,9 +10682,11 @@ pub const DecisionCascadeAgreementStatus = enum {
 };
 
 pub const DecisionCascadeStageTrace = struct {
+    /// Version 1 attests that upstream_revisions includes every reported model and cascade definition, including definition-only subtrees. Omitted historical projections may have lost definitions and cannot authorize replay.
+    upstream_revisions_version: ?i32 = null,
     /// Sorted question names compared by this stage. Present only when a local comparison ran. Allows upstream consumers to verify scoped agreement directly from the stage answers without reconstructing its policy. Historical traces may omit this field; ambiguous historical agreement abstains.
     agreement_questions: ?[]const []const u8 = null,
-    /// Complete bounded upstream execution dependencies. An empty array explicitly records no versioned dependencies. Omission on historical projected proxy stages indicates incomplete provenance.
+    /// Bounded upstream execution dependencies. With upstream_revisions_version 1, this is complete and an empty array records no versioned dependencies. Historical projections without a version may have dropped cascade definitions even when nonempty and cannot authorize replay.
     upstream_revisions: ?[]const DecisionRevisionDependency = null,
     upstream_agreement: ?DecisionCascadeUpstreamAgreement = null,
     agreement_status: ?DecisionCascadeAgreementStatus = null,
@@ -10709,6 +10711,7 @@ pub const DecisionCascadeStageTrace = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "upstream_revisions_version", "upstream_revisions_version", true },
         .{ "agreement_questions", "agreement_questions", true },
         .{ "upstream_revisions", "upstream_revisions", true },
         .{ "upstream_agreement", "upstream_agreement", true },
@@ -10736,6 +10739,10 @@ pub const DecisionCascadeStageTrace = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.upstream_revisions_version) |value| {
+            try jw.objectField("upstream_revisions_version");
+            try jw.write(value);
+        }
         if (self.agreement_questions) |value| {
             try jw.objectField("agreement_questions");
             try jw.write(value);

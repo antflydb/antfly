@@ -533,7 +533,7 @@ fn validateDisagreedQuestions(agreement: Agreement, answers: V) !void {
 pub fn responseAgreement(response: V) !?Agreement {
     if (response != .object) return error.InvalidDecisionOutput;
     const raw = response.object.get("cascade") orelse return null;
-    if (raw != .object or response.object.contains("upstream_revisions")) return error.InvalidDecisionOutput;
+    if (raw != .object or response.object.contains("upstream_revisions") or response.object.contains("upstream_revisions_version")) return error.InvalidDecisionOutput;
     const agreement = try readAgreement(raw.object);
     try validateReportedIdentity(raw.object);
     if (agreement) |reported| try validateDisagreedQuestions(reported, response.object.get("answers") orelse return error.InvalidDecisionOutput);
@@ -557,19 +557,12 @@ pub fn responseAgreement(response: V) !?Agreement {
             if (index == 0 and local != null) return error.InvalidDecisionOutput;
             if (fields.contains("agreement_questions") and (local == null or local.?.status == .unverified)) return error.InvalidDecisionOutput;
             if (fields.get("error")) |failure| {
-                if (failure != .string or failure.string.len == 0 or index == 0 or escalated.bool or fields.contains("answers") or fields.contains("upstream_agreement") or fields.contains("upstream_revisions")) return error.InvalidDecisionOutput;
+                if (failure != .string or failure.string.len == 0 or index == 0 or escalated.bool or fields.contains("answers") or fields.contains("upstream_agreement") or fields.contains("upstream_revisions") or fields.contains("upstream_revisions_version")) return error.InvalidDecisionOutput;
                 if (local) |state| if (state.status != .unverified) return error.InvalidDecisionOutput;
                 aggregate = combineAgreement(aggregate, local);
             } else {
-                const model = fields.get("model") orelse return error.InvalidDecisionOutput;
-                if (model != .string or model.string.len == 0 or !std.unicode.utf8ValidateSlice(model.string)) return error.InvalidDecisionOutput;
-                if (fields.get("model_revision")) |revision| {
-                    if (revision != .string) return error.InvalidDecisionOutput;
-                    try @import("revisions.zig").validateNode(.{ .kind = .cascade, .path = &.{}, .identity = revision.string });
-                }
-                const answers = fields.get("answers") orelse return error.InvalidDecisionOutput;
-                var storage: [64]NamedAnswer = undefined;
-                _ = try orderedAnswers(answers, &storage);
+                try @import("votes.zig").validateResponse(entry, std.mem.eql(u8, method.string, "generated"));
+                const answers = fields.get("answers").?;
                 try validateReportedIdentity(fields);
                 if (local) |state| try validateDisagreedQuestions(state, answers);
                 const upstream = try readUpstreamAgreement(fields, answers);
@@ -799,15 +792,15 @@ pub fn validateTrace(definition: *const Definition, response: V) !usize {
         if (name != .string or !std.mem.eql(u8, name.string, stage.name) or method != .string or !std.mem.eql(u8, method.string, @tagName(stage.method)) or escalated != .bool) return error.InvalidDecisionOutput;
         const has_next = index + 1 < executed.array.items.len;
         if (fields.get("error")) |err| {
-            if (err != .string or err.string.len == 0 or fields.contains("answers") or index == 0 or has_next or escalated.bool or stage.on_failure != .keep_previous or fields.contains("upstream_agreement") or fields.contains("upstream_revisions") or fields.contains("agreement_questions")) return error.InvalidDecisionOutput;
+            if (err != .string or err.string.len == 0 or fields.contains("answers") or index == 0 or has_next or escalated.bool or stage.on_failure != .keep_previous or fields.contains("upstream_agreement") or fields.contains("upstream_revisions") or fields.contains("agreement_questions") or fields.contains("upstream_revisions_version")) return error.InvalidDecisionOutput;
             const expected: ?Agreement = if (stage.require_agreement) .{ .status = .unverified } else null;
             try validateAgreement(fields, expected);
             if (expected) |agreement| aggregate = agreement;
             continue;
         }
         const answers = fields.get("answers") orelse return error.InvalidDecisionOutput;
-        if (answers != .array or answers.array.items.len == 0) return error.InvalidDecisionOutput;
-        if (fields.contains("upstream_revisions")) {
+        try @import("votes.zig").validateResponse(entry, stage.method == .generated);
+        if (fields.contains("upstream_revisions") or fields.contains("upstream_revisions_version")) {
             var dependencies: @import("revisions.zig").Manifest = .{};
             try dependencies.collect(entry);
         }
@@ -1015,6 +1008,7 @@ pub fn execute(a: A, definition: *const Definition, name: []const u8, item_count
 }
 
 fn appendTrace(a: A, row: *Row, stage: Stage, response: ?V, usage: ?V, err: ?anyerror, next_band: ?Band) !bool {
+    if (response) |value| try @import("votes.zig").validateResponse(value, stage.method == .generated);
     const upstream = if (response) |value| try responseAgreement(value) else null;
     const local: ?Agreement = if (stage.require_agreement)
         (if (response != null and !blockedAgreement(upstream))
@@ -1033,7 +1027,10 @@ fn appendTrace(a: A, row: *Row, stage: Stage, response: ?V, usage: ?V, err: ?any
     var dependencies: @import("revisions.zig").Manifest = .{};
     if (response) |value| try dependencies.collect(value);
     var entry = try trace(a, stage, response, usage, err);
-    if (response != null) try put(a, &entry.object, "upstream_revisions", try dependencies.value(a));
+    if (response != null) {
+        try put(a, &entry.object, "upstream_revisions", try dependencies.value(a));
+        try put(a, &entry.object, "upstream_revisions_version", .{ .integer = 1 });
+    }
     var reference: ?AgreementRef = null;
     if (upstream) |agreement| {
         var receipt: std.json.ObjectMap = .empty;
@@ -1072,7 +1069,7 @@ fn assemble(a: A, definition: *const Definition, name: []const u8, row: *Row, fi
     var root = std.json.ObjectMap{};
     // Retain the answering stage's metadata (model, identity, provenance).
     for (final.object.keys(), final.object.values()) |key, value| {
-        if (std.mem.eql(u8, key, "usage") or std.mem.eql(u8, key, "cascade") or std.mem.eql(u8, key, "upstream_revisions")) continue;
+        if (std.mem.eql(u8, key, "usage") or std.mem.eql(u8, key, "cascade") or std.mem.eql(u8, key, "upstream_revisions") or std.mem.eql(u8, key, "upstream_revisions_version")) continue;
         try put(a, &root, key, value);
     }
     var usage = std.json.ObjectMap{};
@@ -1207,7 +1204,13 @@ const Fake = struct {
         const body = try std.fmt.allocPrint(a,
             \\{{"model":"{s}","answers":[{{"name":"same","type":"choice","decision_method":"{s}","choice":"{s}","probabilities":[{{"value":"same","probability":{d}}},{{"value":"different","probability":{d}}}]}}],"usage":{{"input_tokens":10,"output_tokens":2}}}}
         , .{ model, method, if (p_same >= 0.5) "same" else "different", p_same, 1 - p_same });
-        return std.json.parseFromSliceLeaky(V, a, body, .{});
+        var value = try std.json.parseFromSliceLeaky(V, a, body, .{});
+        if (std.mem.eql(u8, method, "generated")) {
+            const answer = &value.object.getPtr("answers").?.array.items[0];
+            try answer.object.put(a, "probability_source", .{ .string = "token_logprobs" });
+            try answer.object.put(a, "raw_structured_answer", answer.object.get("choice").?);
+        }
+        return value;
     }
 
     fn run(ptr: *anyopaque, a: A, stage_index: usize, stage: Stage, indices: []const usize) anyerror!StageResult {
@@ -1782,7 +1785,7 @@ test "decision cascade reported traces enforce aggregate and final answer cohere
 
 fn scopedReceiptFixture(a: A) !V {
     var value = try std.json.parseFromSliceLeaky(V, a,
-        \\{"model":"strong","cascade":{"decider":"c","definition_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","answered_by":"strong","agreement_status":"agreed","agreed":true,"stages":[{"name":"fast","model":"fast","decision_method":"typed","escalated":true,"upstream_revisions":[],"answers":[{"name":"a","type":"choice","decision_method":"typed","choice":"yes","probabilities":[{"value":"yes","probability":0.97},{"value":"no","probability":0.03}]},{"name":"b","type":"choice","decision_method":"typed","choice":"yes"}]},{"name":"strong","model":"strong","decision_method":"typed","escalated":false,"upstream_revisions":[],"agreement_status":"agreed","agreed":true,"agreement_questions":["a"],"answers":[{"name":"a","type":"choice","decision_method":"typed","choice":"yes","probabilities":[{"value":"yes","probability":0.97},{"value":"no","probability":0.03}]},{"name":"b","type":"choice","decision_method":"typed","choice":"no"}]}]}}
+        \\{"model":"strong","cascade":{"decider":"c","definition_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","answered_by":"strong","agreement_status":"agreed","agreed":true,"stages":[{"name":"fast","model":"fast","decision_method":"typed","escalated":true,"upstream_revisions_version":1,"upstream_revisions":[],"answers":[{"name":"a","type":"choice","decision_method":"typed","choice":"yes","probabilities":[{"value":"yes","probability":0.97},{"value":"no","probability":0.03}]},{"name":"b","type":"choice","decision_method":"typed","choice":"yes","probabilities":[{"value":"yes","probability":0.97},{"value":"no","probability":0.03}]}]},{"name":"strong","model":"strong","decision_method":"typed","escalated":false,"upstream_revisions_version":1,"upstream_revisions":[],"agreement_status":"agreed","agreed":true,"agreement_questions":["a"],"answers":[{"name":"a","type":"choice","decision_method":"typed","choice":"yes","probabilities":[{"value":"yes","probability":0.97},{"value":"no","probability":0.03}]},{"name":"b","type":"choice","decision_method":"typed","choice":"no","probabilities":[{"value":"yes","probability":0.03},{"value":"no","probability":0.97}]}]}]}}
     , .{});
     try value.object.put(a, "answers", value.object.get("cascade").?.object.get("stages").?.array.items[1].object.get("answers").?);
     return value;
@@ -1819,6 +1822,8 @@ test "decision cascade verifies explicit scope and abstains on ambiguous histori
     try std.testing.expect(!try agreementBlocked(response));
     // Scope omission is safe when every possible scoped comparison agrees.
     try answers[0].object.put(a, "choice", .{ .string = "yes" });
+    try answers[0].object.getPtr("probabilities").?.array.items[0].object.put(a, "probability", .{ .float = 0.97 });
+    try answers[0].object.getPtr("probabilities").?.array.items[1].object.put(a, "probability", .{ .float = 0.03 });
     _ = final.object.swapRemove("agreement_questions");
     try std.testing.expect(!try agreementBlocked(response));
 }

@@ -315,7 +315,11 @@ and final answer must be coherent. Metadata-only legacy summaries remain
 supported; upstream policy definitions are not reconstructed locally.
 A performed local comparison records sorted `agreement_questions` on its stage.
 Consumers recompute that comparison from the preceding and current answers,
-including strict predicate tie handling. Older full traces without scope remain
+including strict predicate tie handling. Every successful stage also passes a
+shared, bounded vote validator before its selected answer can authorize
+agreement: typed choices must maximize normalized finite distributions, generated
+choices must match their raw sampled answer, and categorical verdicts must carry
+consistent 0/1 evidence. Validation does not rebuild producer plans per result. Older full traces without scope remain
 usable when the answer evidence proves agreement; ambiguous historical scoped
 agreement abstains as `unverified`. Reported disagreement must identify actual
 differing votes. A flat dependency projection cannot coexist with a full trace
@@ -362,9 +366,14 @@ calibrated confidence estimate.
 Stage traces also retain a flat `upstream_revisions` manifest, bounded to 32
 entries and eight stage path levels. It records every successful generated
 model revision and the upstream cascade definitions, including dependencies
-before a typed final answer. An empty manifest explicitly records no versioned
-dependencies; missing provenance on older projected upstream traces cannot
-establish that the upstream was unversioned. Resolver replay requires an
+before a typed final answer. A cascade definition remains a versioned dependency
+even when every stage is typed or no provider reports a model revision.
+`upstream_revisions_version: 1` marks complete projections; only a versioned empty
+manifest explicitly records no versioned dependencies. Older projections may
+have dropped definition-only subtrees even while retaining other model nodes.
+Their old hashes are recognized for migration, but cannot establish completeness
+or authorize replay. Unavailable verification preserves the committed artifact;
+explicit configuration/source invalidation permits fresh inference. Resolver replay requires an
 authoritative verifier for composite routes and preserves stored receipts when
 that verification is unavailable. Stored successful responses are reclassified
 under the current policy without model inference; an upstream veto retracts a

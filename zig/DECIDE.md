@@ -172,3 +172,9 @@ that actually ran. Proxy consumers verify those selected votes without compiling
 the upstream policy. Historical full traces with ambiguous omitted scope abstain;
 metadata-only summaries retain their existing contract. Flat upstream dependency
 projections are stage provenance and cannot override a supplied public trace.
+
+Choice and predicate evidence validation is shared by local stages, upstream full
+traces, and resolver thresholds. Complete stage dependency projections carry
+`upstream_revisions_version: 1`. Cascade definitions are pinned independently of
+model revisions; pre-versioned projections are incomplete provenance and old hash
+recognition alone cannot authorize replay.

@@ -17,6 +17,7 @@
 //! private typed-classification representation behind this boundary.
 const std = @import("std");
 pub const cloudflare = @import("antfly_cloudflare");
+pub const votes = @import("votes.zig");
 pub const revisions = @import("revisions.zig");
 pub const cascade = @import("cascade.zig");
 pub const evidence = @import("evidence.zig");

@@ -30,6 +30,7 @@ pub const Manifest = struct {
     paths: [max_nodes][max_depth][]const u8 = undefined,
     len: usize = 0,
     visited: usize = 0,
+    historical: bool = false,
 
     pub fn items(self: *const Manifest) []const Node {
         return self.nodes[0..self.len];
@@ -52,6 +53,16 @@ pub const Manifest = struct {
         try self.add(.{ .kind = .unverified, .path = &.{}, .identity = "0000000000000000000000000000000000000000000000000000000000000000" });
     }
     pub fn collect(self: *Manifest, response: V) !void {
+        self.historical = false;
+        try self.collectInner(response);
+    }
+    /// Binding recognition only: reproduce the pre-versioned projection digest.
+    /// This result must never authorize replay or be sent to a verifier.
+    pub fn collectHistorical(self: *Manifest, response: V) !void {
+        self.historical = true;
+        try self.collectInner(response);
+    }
+    fn collectInner(self: *Manifest, response: V) !void {
         self.len = 0;
         self.visited = 0;
         try self.walk(response, &.{});
@@ -60,6 +71,8 @@ pub const Manifest = struct {
         self.visited += 1;
         if (self.visited > 128) return error.InvalidDecisionOutput;
         if (response != .object) return error.InvalidDecisionOutput;
+        const version = response.object.get("upstream_revisions_version");
+        if (version) |v| if (v != .integer or v.integer != 1 or !response.object.contains("upstream_revisions")) return error.InvalidDecisionOutput;
         if (response.object.get("upstream_revisions")) |flat| {
             // A stage projection replaces hidden upstream provenance. It must
             // never override a supplied public trace, even with an empty list.
@@ -106,12 +119,37 @@ pub const Manifest = struct {
                     if (!found) return error.InvalidDecisionOutput;
                 }
             }
+            if (!self.historical) {
+                var incomplete = false;
+                var definition = false;
+                var reported: ?[]const u8 = null;
+                if (response.object.get("upstream_agreement")) |summary| {
+                    if (summary != .object) return error.InvalidDecisionOutput;
+                    if (summary.object.get("definition_sha256")) |identity| {
+                        if (identity != .string) return error.InvalidDecisionOutput;
+                        try validateNode(.{ .kind = .cascade, .path = &.{}, .identity = identity.string });
+                        reported = identity.string;
+                    }
+                }
+                for (self.nodes[first..self.len]) |node| {
+                    if (node.path.len != path.len) continue;
+                    if (node.kind == .unverified) incomplete = true;
+                    if (node.kind == .cascade) {
+                        if (reported) |identity| if (!std.mem.eql(u8, node.identity, identity)) return error.InvalidDecisionOutput;
+                        definition = true;
+                    }
+                }
+                if (version != null and response.object.contains("upstream_agreement") and !definition and !incomplete) return error.InvalidDecisionOutput;
+                // Historical projections could drop definition-only subtrees,
+                // even while retaining other models. Nonempty is not proof.
+                if (version == null and !incomplete) try self.add(.{ .kind = .unverified, .path = path, .identity = reported orelse "0000000000000000000000000000000000000000000000000000000000000000" });
+            }
             return;
         }
         if (response.object.get("cascade")) |cascade| {
             if (cascade != .object) return error.InvalidDecisionOutput;
             if (cascade.object.get("stages")) |stages| {
-                if (stages != .array or stages.array.items.len > 4 or path.len == max_depth) return error.InvalidDecisionOutput;
+                if (stages != .array or stages.array.items.len == 0 or stages.array.items.len > 4 or path.len == max_depth) return error.InvalidDecisionOutput;
                 const identity = cascade.object.get("definition_sha256") orelse return error.InvalidDecisionOutput;
                 if (identity != .string) return error.InvalidDecisionOutput;
                 const before = self.len;
@@ -125,7 +163,7 @@ pub const Manifest = struct {
                     next[path.len] = name.string;
                     try self.walk(stage, next[0 .. path.len + 1]);
                 }
-                if (self.len != before) try self.add(.{ .kind = .cascade, .path = path, .identity = identity.string });
+                if (!self.historical or self.len != before) try self.add(.{ .kind = .cascade, .path = path, .identity = identity.string });
                 return;
             }
             try self.markIncomplete();
@@ -208,7 +246,7 @@ test "flat dependencies preserve generated stages before typed finals and upstre
     defer arena.deinit();
     const a = arena.allocator();
     var input = try std.json.parseFromSliceLeaky(V, a,
-        \\{"model":"typed-final","answers":[{"decision_method":"typed"}],"cascade":{"definition_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stages":[{"name":"fast","decision_method":"generated","model":"gen","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","answers":[{"decision_method":"generated"}]},{"name":"strong","decision_method":"typed","upstream_revisions":[],"model":"typed-final","answers":[{"decision_method":"typed"}]}]}}
+        \\{"model":"typed-final","answers":[{"decision_method":"typed"}],"cascade":{"definition_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stages":[{"name":"fast","decision_method":"generated","model":"gen","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","answers":[{"decision_method":"generated"}]},{"name":"strong","decision_method":"typed","upstream_revisions_version":1,"upstream_revisions":[],"model":"typed-final","answers":[{"decision_method":"typed"}]}]}}
     , .{});
     var manifest: Manifest = .{};
     try manifest.collect(input);
@@ -227,6 +265,7 @@ test "flat dependencies preserve generated stages before typed finals and upstre
     var flat = try manifest.value(a);
     var projected = V{ .object = .empty };
     try projected.object.put(a, "upstream_revisions", flat);
+    try projected.object.put(a, "upstream_revisions_version", .{ .integer = 1 });
     var replay: Manifest = .{};
     try replay.collect(projected);
     try std.testing.expectEqualSlices(u8, &original, &replay.digest(false));
@@ -235,6 +274,7 @@ test "flat dependencies preserve generated stages before typed finals and upstre
     // Duplicate selectors and malformed paths are invalid, even at equal revisions.
     try flat.array.append(flat.array.items[0]);
     try projected.object.put(a, "upstream_revisions", flat);
+    try projected.object.put(a, "upstream_revisions_version", .{ .integer = 1 });
     try std.testing.expectError(error.InvalidDecisionOutput, replay.collect(projected));
 }
 
@@ -246,6 +286,8 @@ test "flat dependencies distinguish complete empty projections from historical o
     try manifest.collect(try std.json.parseFromSliceLeaky(V, a, "{\"upstream_agreement\":{}}", .{}));
     try std.testing.expectEqual(.unverified, manifest.nodes[0].kind);
     try manifest.collect(try std.json.parseFromSliceLeaky(V, a, "{\"upstream_agreement\":{},\"upstream_revisions\":[]}", .{}));
+    try std.testing.expectEqual(.unverified, manifest.nodes[0].kind);
+    try manifest.collect(try std.json.parseFromSliceLeaky(V, a, "{\"upstream_revisions_version\":1,\"upstream_revisions\":[]}", .{}));
     try std.testing.expectEqual(@as(usize, 0), manifest.len);
     try manifest.collect(try std.json.parseFromSliceLeaky(V, a,
         \\{"name":"proxy","decision_method":"typed","answers":[{"decision_method":"typed"}]}
@@ -268,4 +310,50 @@ test "flat dependencies bound cardinality depth and selector ambiguity" {
     try std.testing.expectError(error.InvalidDecisionOutput, manifest.add(.{ .kind = .model, .path = &.{"overflow"}, .identity = id, .model = "gen" }));
     try std.testing.expectError(error.InvalidDecisionOutput, validateNode(.{ .kind = .model, .path = &@as([max_depth + 1][]const u8, @splat("x")), .identity = id, .model = "gen" }));
     try std.testing.expectError(error.InvalidDecisionOutput, validateNode(.{ .kind = .model, .path = &.{"bad/path"}, .identity = id, .model = "gen" }));
+}
+
+test "definition-only cascades are pinned and legacy projections cannot prove completeness" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const full = try std.json.parseFromSliceLeaky(V, a,
+        \\{"cascade":{"definition_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stages":[{"name":"typed","answers":[{"decision_method":"typed"}],"upstream_revisions_version":1,"upstream_revisions":[]}]}}
+    , .{});
+    var current: Manifest = .{};
+    try current.collect(full);
+    try std.testing.expectEqual(@as(usize, 1), current.len);
+    try std.testing.expectEqual(.cascade, current.nodes[0].kind);
+    try std.testing.expectEqualStrings(id, current.nodes[0].identity);
+    var old: Manifest = .{};
+    try old.collectHistorical(full);
+    try std.testing.expectEqual(@as(usize, 0), old.len);
+    var projection = V{ .object = .empty };
+    try projection.object.put(a, "upstream_revisions", try current.value(a));
+    var replay: Manifest = .{};
+    try replay.collect(projection);
+    try std.testing.expectEqual(@as(usize, 2), replay.len);
+    try std.testing.expectEqual(.unverified, replay.nodes[1].kind);
+    try old.collectHistorical(projection);
+    try std.testing.expectEqual(@as(usize, 1), old.len);
+    try projection.object.put(a, "upstream_revisions_version", .{ .integer = 1 });
+    try replay.collect(projection);
+    try std.testing.expectEqualSlices(u8, &current.digest(false), &replay.digest(false));
+    try projection.object.put(a, "upstream_agreement", try std.json.parseFromSliceLeaky(V, a,
+        \\{"definition_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+    , .{}));
+    try replay.collect(projection);
+    try projection.object.put(a, "upstream_revisions", .{ .array = .init(a) });
+    try std.testing.expectError(error.InvalidDecisionOutput, replay.collect(projection));
+    _ = projection.object.swapRemove("upstream_revisions_version");
+    try replay.collect(projection);
+    try std.testing.expectEqual(.unverified, replay.nodes[0].kind);
+    try std.testing.expectEqualStrings(id, replay.nodes[0].identity);
+    for ([_][]const u8{ "0", "2", "null", "true", "\"1\"" }) |raw| {
+        try projection.object.put(a, "upstream_revisions_version", try std.json.parseFromSliceLeaky(V, a, raw, .{}));
+        try std.testing.expectError(error.InvalidDecisionOutput, replay.collect(projection));
+    }
+    try projection.object.put(a, "upstream_revisions_version", .{ .integer = 1 });
+    _ = projection.object.swapRemove("upstream_revisions");
+    try std.testing.expectError(error.InvalidDecisionOutput, replay.collect(projection));
 }

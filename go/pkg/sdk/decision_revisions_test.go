@@ -26,6 +26,7 @@ func TestDecisionRevisionManifestPreservesEmptyPresence(t *testing.T) {
 	for _, raw := range []string{
 		`{"name":"proxy","decision_method":"typed","escalated":false}`,
 		`{"name":"proxy","decision_method":"typed","escalated":false,"upstream_revisions":[]}`,
+		`{"name":"proxy","decision_method":"typed","escalated":false,"upstream_revisions":[],"upstream_revisions_version":1}`,
 		`{"name":"strong","decision_method":"typed","escalated":false,"agreement_questions":["same"],"agreement_status":"agreed","agreed":true}`,
 	} {
 		var trace oapi.DecisionCascadeStageTrace
@@ -43,7 +44,7 @@ func TestDecisionRevisionManifestPreservesEmptyPresence(t *testing.T) {
 		if err := json.Unmarshal(wire, &roundtrip); err != nil {
 			t.Fatal(err)
 		}
-		for _, key := range []string{"upstream_revisions", "agreement_questions"} {
+		for _, key := range []string{"upstream_revisions", "upstream_revisions_version", "agreement_questions"} {
 			if string(original[key]) != string(roundtrip[key]) {
 				t.Fatalf("lost %s: %s -> %s", key, raw, wire)
 			}

@@ -104,3 +104,13 @@ def test_comparison_scope_round_trip_preserves_sorted_question_names():
         if questions is not None:
             wire.update(agreement_questions=questions, agreement_status="agreed", agreed=True)
         assert DecisionCascadeStageTrace.from_dict(wire).to_dict() == wire
+
+
+def test_projection_version_round_trip_preserves_completeness_marker():
+    from antfly.client_generated.models import DecisionCascadeStageTrace
+
+    for version in (None, 1):
+        wire = {"name": "proxy", "decision_method": "typed", "escalated": False, "upstream_revisions": []}
+        if version is not None:
+            wire["upstream_revisions_version"] = version
+        assert DecisionCascadeStageTrace.from_dict(wire).to_dict() == wire
