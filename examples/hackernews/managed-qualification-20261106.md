@@ -150,6 +150,54 @@ the new upstream timing header. This successful observation does not cancel the
 earlier outliers or establish a cold-start percentile. Focused gateway,
 qualification and plan tests passed (24 tests, one optional skip, nine subtests).
 
+### Managed outlier origin correlation
+
+The request at 02:58:17 UTC corresponding to the 21.497-second client observation
+completed in Colony in 2.253 seconds. Google's load balancer recorded 2.293 seconds,
+HTTP 200 and `response_sent_by_backend` for the matching route/window. This places
+the unexplained additional delay beyond the Google origin, on the Cloudflare/client
+delivery or local observation path. It does not identify the specific fault, and
+no original Cloudflare Ray ID or client phase trace was captured for that request.
+
+Twelve additional read-only searches with DNS/TCP/TLS/header/body/close traces
+completed in 2.248–2.788 seconds; the longest body read was 104 ms. None reproduced
+the 21.497-second stall. Three more real managed queries validated the new
+correlation capture: 2.399, 2.518 and 2.421 seconds, with body/decode times of
+3–4 ms. All returned 20 distinct rows and valid Colony request and Cloudflare Ray
+IDs. The updated gateway propagates only bounded validated IDs, including on
+upstream errors, and qualification reports retain absolute start and header/body
+and close times. A regression test ensures a delayed connection close remains in
+the total and outside-upstream duration. Focused tests now pass 26 cases, with one
+optional skip and nine subtests.
+The transport fault is not claimed fixed; further attribution requires a
+recurrence with these IDs/timings or Cloudflare-side telemetry.
+
+### Applied hosting probe correction
+
+[Colony #952](https://github.com/antflydb/colony/pull/952), source
+`90d48b808776cf902d9bb4dac2743c0d91763a01`, owns the probe correction. After
+successful infrastructure build/tests and explicit saved-plan approval, the
+documented deploy service account's apply was denied `run.services.update`.
+Read-only inspection confirmed no resource, output or pending-operation changes.
+A fresh preview and explicit retry approval used the verified existing human
+ADC identity; no IAM permissions were added. The retry completed with one HN
+service updated and 67 resources unchanged.
+
+Revision `hackernews-00004-njc` uses the same gateway image and a one-second
+startup probe, one-second timeout and 30 failures. At 03:57:57.580 UTC November 7,
+Cloud Run started its deployment-rollout container; the probe passed at
+03:57:58.888, about 1.31 seconds later, versus about 10.17 seconds in the earlier
+autoscaling observation. These are individual startup events, not matched
+cold-start percentiles. The first post-rollout search-first qualification passed
+its five-second gate: History 0.632 s, Recent 1.049 s, All 2.524 s, with the same
+ranked IDs as the pre-migration golden record for every view. Readiness passed
+after the searches. Private invocation, scale-to-zero, the pinned gateway image,
+67 stored resources, 16 outputs and zero pending operations were verified.
+
+The new timing/correlation gateway code is still in Antfly #1547; this probe-only
+rollout did not deploy that code, change the database image, or optimize existing
+table schemas. Keep those boundaries separate from the verified probe correction.
+
 ## Remaining scope
 
 These are bounded sample checks. Full-archive construction/performance,

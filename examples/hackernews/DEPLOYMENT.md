@@ -228,6 +228,17 @@ must not be interpreted as zero overhead. Correlate with provider request/startu
 logs and engine profiles. Engine `/metrics` refreshes asynchronously every five
 seconds, so adjacent scrapes do not give reliable per-request phase deltas.
 
+Reports also capture absolute `started_at`, `headers_seconds` (connection setup,
+request upload and waiting for response headers), and `body_seconds` (body read
+and JSON decoding), and `close_seconds`. Total duration includes connection
+close, so a delayed close cannot disappear from the latency gate. They retain
+only validated UUID request IDs and Cloudflare
+Ray IDs, including the managed upstream IDs forwarded by newer gateways. Use
+these to correlate slow observations with Colony and load-balancer logs; never
+copy arbitrary response headers into qualification evidence. An origin completing
+quickly does not explain a later edge/client stall, and a successful rerun alone
+does not prove that stall fixed.
+
 For the Cloud Run hosting owner (`colony/infra/showcases/hackernews.go`), configure
 the `/health` startup probe explicitly: `initialDelaySeconds: 0`,
 `periodSeconds: 1`, `timeoutSeconds: 1`, `failureThreshold: 30`. The provider's
@@ -236,6 +247,8 @@ container could serve its first search. Keep `/health` local; `/ready` performs
 upstream checks and must not gate process startup. This probe configuration does
 not require keeping idle instances alive. Apply through the hosting owner and
 qualify a new revision's first request before claiming the startup issue fixed.
+This probe change is now applied to the private HN service; see the dated
+qualification record for its revision, startup logs and search results.
 
 Only after private acceptance enable the HN public invoker, reviewed monitoring
 channels and optional verified domain mapping. Publish the exact DNS records

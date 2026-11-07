@@ -29,7 +29,12 @@ import time
 from urllib.error import HTTPError
 from urllib.request import Request
 
-from managed_api import authorization_headers, open_request, validate_backend
+from managed_api import (
+    authorization_headers,
+    correlation_evidence,
+    open_request,
+    validate_backend,
+)
 
 
 def save(path, value):
@@ -61,6 +66,7 @@ def probe(base, route, payload, authorization=None):
         # This is a gateway identity token, never the backend Antfly key.
         headers["Authorization"] = authorization
     started = time.monotonic()
+    started_at = time.time()
     try:
         with open_request(
             Request(
@@ -70,24 +76,51 @@ def probe(base, route, payload, authorization=None):
             ),
             timeout=30,
         ) as response:
+            headers_seconds = time.monotonic() - started
             raw = response.read(4194305)
             if len(raw) > 4194304:
                 raise ValueError("Response too large")
             result = json.loads(raw)
             status = response.status
-            elapsed = time.monotonic() - started
-            timing = timing_evidence(response.headers, elapsed)
-        return result, {"status": status, "seconds": elapsed, **timing}
+            body_finished = time.monotonic()
+            correlation = correlation_evidence(response.headers)
+            closing = time.monotonic()
+        finished = time.monotonic()
+        elapsed = finished - started
+        timing = timing_evidence(response.headers, elapsed)
+        return result, {
+            "status": status,
+            "seconds": elapsed,
+            "started_at": started_at,
+            "headers_seconds": headers_seconds,
+            "body_seconds": body_finished - started - headers_seconds,
+            "close_seconds": finished - closing,
+            **timing,
+            **correlation,
+        }
     except HTTPError as error:
         status = error.code
-        elapsed = time.monotonic() - started
-        timing = timing_evidence(error.headers, elapsed)
+        headers_seconds = time.monotonic() - started
+        correlation = correlation_evidence(error.headers)
+        closing = time.monotonic()
         error.close()
-        return None, {"status": status, "seconds": elapsed, **timing}
+        finished = time.monotonic()
+        elapsed = finished - started
+        timing = timing_evidence(error.headers, elapsed)
+        return None, {
+            "status": status,
+            "seconds": elapsed,
+            "started_at": started_at,
+            "headers_seconds": headers_seconds,
+            "close_seconds": finished - closing,
+            **timing,
+            **correlation,
+        }
     except (OSError, ValueError) as error:
         return None, {
             "transport_error": type(error).__name__,
             "seconds": time.monotonic() - started,
+            "started_at": started_at,
         }
 
 
