@@ -285,13 +285,14 @@ pub fn estimateNativeWeightBytes(allocator: std.mem.Allocator, mf: manifest_mod.
     return switch (mf.nativeWeightArtifactKind() orelse return 0) {
         .gguf => blk: {
             var total = try c_file.fileSize(allocator, mf.gguf_path.?);
-            if (mf.gliner_head_gguf_path) |head_path| {
-                total = std.math.add(u64, total, try c_file.fileSize(allocator, head_path)) catch
-                    return error.ResourceLimitExceeded;
-            }
-            if (mf.gliner_head_safetensors_path) |head_path| {
-                total = std.math.add(u64, total, try c_file.fileSize(allocator, head_path)) catch
-                    return error.ResourceLimitExceeded;
+            switch (mf.nativeCompanion()) {
+                .gliner_gguf, .gliner_safetensors => {
+                    total = std.math.add(u64, total, try c_file.fileSize(allocator, mf.nativeCompanionPath().?)) catch
+                        return error.ResourceLimitExceeded;
+                },
+                // Projector request admission is accounted separately. Merely
+                // inspecting a projector does not make all its weights resident.
+                .none, .projector => {},
             }
             break :blk total;
         },
@@ -2666,7 +2667,7 @@ fn createGpuHostedSessionWithTaskOverride(
     else {};
     var a4b_artifact_qualified = false;
     if (mf.usesGgufWeights()) {
-        var report_opt = try inspectGgufModel(allocator, model_path);
+        var report_opt = try inspectGgufModelForListing(allocator, model_path, mf);
         defer if (report_opt) |*report| report.deinit();
         if (report_opt) |report| {
             try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
@@ -3325,9 +3326,11 @@ fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8
     if (mf.gliner_token_e != 0) cfg.entity_token_id = mf.gliner_token_e;
     if (mf.gliner_token_r != 0) cfg.relation_token_id = mf.gliner_token_r;
 
-    // Exact specialty markers come from the authenticated tokenizer snapshot.
-    // Do not reread an unpinned legacy override after capturing that identity.
-    if (mf.gliner_specialty_profile != null) return;
+    // Directory discovery already applied the catalog-selected token sidecars.
+    // Captured IDs are authoritative, including for explicit legacy manifests
+    // rebound by ModelManager. Reopening a default could consume an unlisted
+    // file or override the snapshot with a later version.
+    if (mf.source_root != null or mf.gliner_specialty_profile != null) return;
 
     const at_path = try std.fmt.allocPrint(allocator, "{s}/added_tokens.json", .{model_path});
     defer allocator.free(at_path);
@@ -12974,4 +12977,24 @@ test "GLiNER CUDA bound source retains reduced precision release gates" {
         try std.testing.expectError(error.UnqualifiedGlinerCudaPrecision, createSessionFromManifest(std.testing.allocator, "/never-opened", &manifest, .cuda, .{}, .dynamic, null, precision, false));
         try std.testing.expectError(error.UnsupportedGlinerCudaPrecision, createSessionFromManifest(std.testing.allocator, "/never-opened", &manifest, .cuda, .{}, .dynamic, null, precision, true));
     }
+}
+
+test "GLiNER captured markers ignore later default token overrides" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "added_tokens.json", .data = "{\"[C]\":9,\"[E]\":10,\"[R]\":11,\"[L]\":12}" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const mf = manifest_mod.ModelManifest{ .allocator = a, .source_root = root, .gliner_token_c = 3, .gliner_token_e = 4, .gliner_token_r = 5, .gliner_token_l = 6 };
+    var cfg = deberta_mod.Config{};
+    try applyGlinerLabelTokenIds(a, root, mf, &cfg);
+    try std.testing.expectEqual(@as(i64, 3), cfg.classification_token_id);
+    try std.testing.expectEqual(@as(i64, 4), cfg.entity_token_id);
+    try std.testing.expectEqual(@as(i64, 5), cfg.relation_token_id);
+    var label = mf;
+    label.gliner_classification_head = .label_marker_mlp;
+    try applyGlinerLabelTokenIds(a, root, label, &cfg);
+    try std.testing.expectEqual(@as(i64, 6), cfg.classification_token_id);
 }

@@ -99,9 +99,7 @@ const ComponentConstruction = struct {
                 for (dependencies.paths) |dependency| try self.artifacts().verifyPath(dependency);
             },
         }
-        for ([_]?[]const u8{ man.gguf_projector_path, man.gliner_head_gguf_path, man.gliner_head_safetensors_path }) |maybe_path| {
-            if (maybe_path) |native_path| try self.artifacts().verifyPath(native_path);
-        }
+        if (man.nativeCompanionPath()) |path| try self.artifacts().verifyPath(path);
     }
     fn finish(self: *ComponentConstruction) !void {
         try self.artifacts().verify();
@@ -163,7 +161,12 @@ const BoundDirectoryManifest = struct {
             .safetensors => try result.capture(proof, "safetensors_path"),
             .sharded_safetensors => try result.capture(proof, "safetensors_index_path"),
         }
-        inline for (.{ "gguf_projector_path", "gliner_head_gguf_path", "gliner_head_safetensors_path" }) |field| try result.capture(proof, field);
+        switch (self.manifest.nativeCompanion()) {
+            .none => {},
+            .gliner_gguf => try result.capture(proof, "gliner_head_gguf_path"),
+            .gliner_safetensors => try result.capture(proof, "gliner_head_safetensors_path"),
+            .projector => try result.capture(proof, "gguf_projector_path"),
+        }
         if (result.manifest.config_path != null) {
             try result.capture(proof, "config_path");
         } else if (self.manifest.source_root) |root| {
@@ -700,7 +703,7 @@ fn validateNativeCompanionsForBackend(
         };
         companion_count += 1;
     }
-    if (candidate == .gguf) {
+    if (candidate == .gguf and man.isSplitGlinerBundle()) {
         if (man.gliner_head_gguf_path) |path| {
             companions[companion_count] = .{ .path = path, .kind = .gguf };
             companion_count += 1;
@@ -13910,6 +13913,8 @@ test "native compatibility rejects a malformed split GLiNER safetensors head" {
         allocator,
         &.{
             .allocator = allocator,
+            .gliner_model_type = "gliner",
+            .gguf_path = "/missing/encoder.gguf",
             .gliner_head_safetensors_path = "/missing/gliner_head.safetensors",
         },
         .gguf,
@@ -19220,4 +19225,92 @@ test "model selection native architecture config is bound and authenticated" {
     var embedded = try manager.loadArtifactSession(root, legacy);
     defer embedded.deinit();
     try expectBoundSourceOutput(embedded.session, true);
+}
+
+test "model selection native binding ignores unconsumed companion exports" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |managed_model| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try writeCancellationTestModel(tmp.dir, a);
+        if (managed_model) try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.gguf", "config.json", "tokenizer.json" });
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        var man = try manifest_mod.loadFromDir(a, root);
+        defer man.deinit();
+        man.gliner_head_gguf_path = try std.fs.path.join(a, &.{ root, "unused-head.gguf" });
+        man.gliner_head_safetensors_path = try std.fs.path.join(a, &.{ root, "unused-head.safetensors" });
+        var sm = backends.SessionManager.initWithIo(a, io);
+        sm.preferred_backends = &.{.native};
+        sm.native_call_policy = .in_process;
+        var manager = ModelManager.init(a, sm);
+        defer manager.deinit();
+        manager.admission_enabled = true;
+        var loaded = try manager.loadArtifactSession(root, man);
+        defer loaded.deinit();
+        try expectBoundSourceOutput(loaded.session, true);
+    }
+}
+
+test "model selection native companion proof and admission select only the GGUF head" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    try writeTinyDebertaEncoderGgufForModelManagerTest(tmp.dir, a, "gliner_head.gguf");
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.gguf", "config.json", "gliner_head.gguf" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    man.gliner_model_type = try a.dupe(u8, "gliner");
+    man.gliner_head_safetensors_path = try std.fs.path.join(a, &.{ root, "missing-alternate.safetensors" });
+    man.gguf_projector_path = try std.fs.path.join(a, &.{ root, "missing-projector.gguf" });
+    var proof = try ComponentConstruction.init(a, io, .{ .path = root, .publication = man.managed_publication }, null, null);
+    defer proof.deinit();
+    var bound = try BoundModelSource.init(&proof, root, .directory, &man, null);
+    defer bound.deinit();
+    const native = (try bound.forBackend(&proof, .native)).?;
+    try bound.verify(&proof, .native);
+    const mf = native.manifest.?;
+    const expected = (try c_file.fileSize(a, mf.gguf_path.?)) + (try c_file.fileSize(a, mf.gliner_head_gguf_path.?));
+    try std.testing.expectEqual(expected, try session_factory.estimateNativeWeightBytes(a, mf.*));
+    const store = try @import("../models/tensor_store.zig").openFromManifest(a, mf.*);
+    defer store.deinit();
+    try bound.finish(&proof);
+    try tmp.dir.writeFile(io, .{ .sub_path = "gliner_head.gguf", .data = "corrupt selected head" });
+    try std.testing.expectError(error.InvalidManagedDownload, bound.verify(&proof, .native));
+}
+
+test "model selection GGUF inspection uses explicit selection despite corrupt default" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    try tmp.dir.rename("model.gguf", tmp.dir, "selected.gguf", io);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "invalid unselected export" });
+    var report = try session_factory.inspectGgufModelForListing(a, root, man);
+    defer if (report) |*value| value.deinit();
+    try std.testing.expect(report != null);
+    const session = try session_factory.createSessionFromManifest(a, root, &man, .native, .{}, .dynamic, null, null, false);
+    defer session.close();
+    try expectBoundSourceOutput(session, true);
+}
+
+test "native compatibility ignores head exports outside split GLiNER routes" {
+    const summary = try validateNativeCompanionsForBackend(
+        std.testing.allocator,
+        &.{ .allocator = std.testing.allocator, .gliner_head_safetensors_path = "/missing/unused-head.safetensors" },
+        .gguf,
+        .native,
+        .{ .family = .unsupported },
+    );
+    try std.testing.expect(summary == null);
 }

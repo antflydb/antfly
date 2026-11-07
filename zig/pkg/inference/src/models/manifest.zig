@@ -718,6 +718,26 @@ pub const ModelManifest = struct {
         return null;
     }
 
+    pub const NativeCompanion = enum { none, gliner_gguf, gliner_safetensors, projector };
+
+    /// The tensor store and its construction proof must select the same
+    /// companion. Alternate exports never become dependencies implicitly.
+    pub fn nativeCompanion(self: *const ModelManifest) NativeCompanion {
+        if (!self.usesGgufWeights()) return .none;
+        if (self.isSplitGlinerBundle()) return if (self.gliner_head_gguf_path != null) .gliner_gguf else .gliner_safetensors;
+        if (self.gguf_projector_path != null) return .projector;
+        return .none;
+    }
+
+    pub fn nativeCompanionPath(self: *const ModelManifest) ?[]const u8 {
+        return switch (self.nativeCompanion()) {
+            .none => null,
+            .gliner_gguf => self.gliner_head_gguf_path,
+            .gliner_safetensors => self.gliner_head_safetensors_path,
+            .projector => self.gguf_projector_path,
+        };
+    }
+
     pub fn usesGgufWeights(self: *const ModelManifest) bool {
         const artifact = self.nativeWeightArtifactKind() orelse return false;
         return artifact == .gguf;
