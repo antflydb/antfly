@@ -1460,6 +1460,10 @@ pub const Owner = struct {
     const MaintenanceSchedule = struct {
         name: ?[]u8 = null,
         readiness: ?MaintenanceReadiness = null,
+        // A completed source pass may observe later fully covered native text
+        // writes without reopening providers. This is scheduling authority only;
+        // publication still takes its own exact catalog/consumer fences.
+        covered_text_controls: ?[32]u8 = null,
         has_group_sources: bool = false,
         next_group_source_ns: i96 = 0,
         // A wakeup belongs to the owner; runnable source/artifact work belongs
@@ -2132,6 +2136,47 @@ pub const Owner = struct {
             prefix, &@import("../storage/internal_keys.zig").replay_meta_next_sequence_key,
         }));
         return result;
+    }
+
+    fn coveredTextControls(root: *h.Handle, database: *h.db_mod.DB, namespace: []const u8, readiness: MaintenanceReadiness) !?[32]u8 {
+        if (database.detachedTextSourceBlock() != null) return null;
+        var schema = database.core.acquireSchemaView();
+        defer if (schema) |*view| view.release();
+        if (schema) |view| if (view.storageMode() == .relational) return null;
+        const indexes = database.core.index_manager;
+        if (indexes.text_indexes.items.len == 0) return null;
+        for (indexes.text_indexes.items) |*entry| if (!entry.persistent.hasNativeMetadata()) return null;
+        const file = &root.owned_lite_backend.?.native_docstore.?.file;
+        const metadata = file.activeCheckpoint().logical.metadata;
+        if (std.mem.allEqual(u8, &metadata, 0)) return null;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const prefix = if (std.mem.eql(u8, namespace, "root")) "" else try root.owned_lite_backend.?.documentPrefixAlloc(a, namespace);
+        var digest = std.crypto.hash.sha2.Sha256.init(.{});
+        digest.update("antfly-covered-native-text-source-v1");
+        digest.update(&metadata);
+        // Exclude only the source sequence. All schema/resolver/table/policy
+        // controls, including absent values, belong to the clean witness.
+        for (readiness[0..PublicationCatalog.metadata_keys.len]) |value| {
+            digest.update(&.{@intFromBool(value != null)});
+            if (value) |bytes| digest.update(&bytes);
+        }
+        var read = try root.owned_lite_backend.?.native_docstore.?.beginRead();
+        defer read.abort();
+        const control_keys = try indexes.retainedTextRuntimeControlKeysAlloc(a);
+        const admission_prefix = keys.globalReplayPrefix(.managed_admission);
+        for (control_keys) |key| {
+            const value = try read.valueFingerprint(try std.mem.concat(a, u8, &.{ prefix, key }));
+            if (value != null and std.mem.startsWith(u8, key, &admission_prefix)) return null;
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, @intCast(key.len), .little);
+            digest.update(&length);
+            digest.update(key);
+            digest.update(&.{@intFromBool(value != null)});
+            if (value) |bytes| digest.update(&bytes);
+        }
+        return digest.finalResult();
     }
 
     fn namespaceCanSleep(self: *Owner, root: *h.Handle, namespace: []const u8, table_id: u64) !bool {
@@ -3347,7 +3392,9 @@ pub const Owner = struct {
             // Selection and detached replay use one namespace runtime. Opening
             // it on the serving wrapper first duplicated all index/provider
             // startup merely to discover this turn's work.
-            const namespace_root = if (self.options.profile == .native) blk: {
+            const namespace_root = if (self.options.profile == .native and foreground.embedded_tables.contains(name))
+                foreground
+            else if (self.options.profile == .native) blk: {
                 selected_root = try self.refreshMaintenanceSnapshotNamed(foreground, .source, name);
                 // A merge can co-own the selected runtime. A namespace switch
                 // must retire that whole cache reference, never close the
@@ -3368,7 +3415,7 @@ pub const Owner = struct {
                 // callbacks are installed only after control work is captured.
                 break :blk selected_root.?;
             } else foreground;
-            database = (if (self.options.profile == .native) self.openMaintenanceNamespace(namespace_root, name) else @import("tables.zig").get(namespace_root, name)) catch return true;
+            database = (if (self.options.profile == .native and namespace_root != foreground) self.openMaintenanceNamespace(namespace_root, name) else @import("tables.zig").get(namespace_root, name)) catch return true;
             selected = namespace_root.embedded_tables.get(name).?;
         };
         clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.catalog_ns);
@@ -3483,12 +3530,76 @@ pub const Owner = struct {
         }
         self.maintenance_round_ttl_pending = self.maintenance_round_ttl_pending or ttl_more;
         if (namespace_pending or schedule.database_pending) self.maintenance_pending = true;
+        const covered_controls = if (self.options.profile == .native and entry_readiness != null)
+            try coveredTextControls(selection_root, database, readiness_namespace, entry_readiness.?)
+        else
+            null;
+        var observed_covered_source = false;
+        const covered_source = !publish_ready_merge and !namespace_pending and !schedule.database_pending and
+            !schedule.startup_replay_pending and now < schedule.next_database_audit_ns and
+            covered_controls != null and schedule.covered_text_controls != null and
+            std.mem.eql(u8, &covered_controls.?, &schedule.covered_text_controls.?);
+        if (covered_source) {
+            if (entry_sequence != schedule.serviced_sequence) {
+                // Every durable consumer was checked at this same admitted
+                // tip. Only source observation advances here; retained journal
+                // bytes/credits remain owned by physical retirement.
+                schedule.serviced_sequence = entry_sequence;
+                schedule.readiness = entry_readiness;
+                observed_covered_source = true;
+                if (!schedule.artifact_pending) schedule.next_artifact_ns = now + 100 * std.time.ns_per_ms;
+                schedule.artifact_pending = true;
+            }
+            // Producer headroom must not wait for an optional housekeeping
+            // deadline. This uses the very same window/tier policy as capture.
+            if (try database.core.index_manager.nativeTextMaintenanceNeedsMerge()) schedule.next_artifact_ns = now;
+            if (try selection_file.replayAdmission()) |debt| {
+                if (debt.bytes >= @max(@as(u64, 1), @min(1024 * 1024, debt.limits.bytes / 4)) or
+                    debt.records >= @max(@as(u64, 1), @min(64, debt.limits.records / 4))) schedule.next_artifact_ns = now;
+            }
+        }
         const run_source = !publish_ready_merge and if (self.options.profile == .native)
             namespace_pending or schedule.database_pending or entry_sequence != schedule.serviced_sequence or
                 database.core.nextDerivedSequence() != entry_sequence or now >= schedule.next_database_audit_ns
         else
             self.maintenance_pending;
         const run_database = publish_ready_merge or run_source or (schedule.artifact_pending and now >= schedule.next_artifact_ns);
+        var serving_physical_serviced = false;
+        var serving_retirement_more = false;
+        var serving_index_more = false;
+        if (run_database and !run_source and covered_source and selected_root == null and
+            self.options.open_mode == .writer)
+        {
+            // Covered native text needs physical service, not a replacement
+            // DB/provider runtime. Keep this bounded metadata-only slice under
+            // the existing coordinator/path lease; merge construction still
+            // uses independently retained immutable sources outside admission.
+            schedule.next_artifact_ns = now + 100 * std.time.ns_per_ms;
+            const previous_state = database.borrowed_group_source_state;
+            database.borrowed_group_source_state = group_state;
+            defer database.borrowed_group_source_state = previous_state;
+            const debt = try selection_file.replayAdmission();
+            const pressure = if (debt) |value|
+                value.bytes >= @max(@as(u64, 1), @min(1024 * 1024, value.limits.bytes / 4)) or
+                    value.records >= @max(@as(u64, 1), @min(64, value.limits.records / 4))
+            else
+                false;
+            serving_retirement_more = try database.runBackgroundTurnWithCancellation(h.db_mod.types.CancellationToken.fromAtomic(&self.stopping), if (pressure) .retirement else .retirement_batched);
+            serving_index_more = try database.core.index_manager.serviceNativeTextStorageSlice();
+            serving_physical_serviced = true;
+            schedule.artifact_pending = serving_retirement_more or serving_index_more;
+            self.maintenance_storage_pending = true;
+            if (self.pending_text_merge != null or !try database.core.index_manager.nativeTextMaintenanceNeedsMerge()) {
+                self.publication_stats.maintenance_database_turns +|= 1;
+                self.publication_stats.maintenance_artifact_only_turns +|= 1;
+                return self.finishMaintenanceVisit(false, true, audit_round_end);
+            }
+            // Capture immutable merge inputs from the checkpoint *after* the
+            // serving physical slice. Never let stale detached cleanup reject
+            // a merge before construction even starts. Publication still
+            // validates the owned task's exact inputs and concurrent deletes.
+
+        }
         const captured_artifact_pending = schedule.artifact_pending;
         if (run_source) schedule.database_pending = true;
         if (run_database) {
@@ -3496,6 +3607,14 @@ pub const Owner = struct {
             self.publication_stats.maintenance_database_turns +|= 1;
             if (run_source) self.publication_stats.maintenance_source_turns +|= 1 else self.publication_stats.maintenance_artifact_only_turns +|= 1;
         } else self.publication_stats.maintenance_idle_namespace_turns +|= 1;
+        // A storage-only visit has no reason to borrow the selected DB after
+        // releasing admission. Foreground refresh may retire that DB while the
+        // raw storage owner is detached. Queue physical work in its dedicated
+        // lane instead; it owns no provider/index runtime or borrowed DB state.
+        if (self.options.profile == .native and !run_database) {
+            if (observed_covered_source) self.maintenance_storage_pending = true;
+            return self.finishMaintenanceVisit(false, false, audit_round_end);
+        }
         // Immutable text construction runs independently of the replay actor;
         // publication and native staging remain bounded maintenance slices.
 
@@ -3679,7 +3798,7 @@ pub const Owner = struct {
             defer store.index_reads_require_admission = false;
             // Revalidate the current catalog and consumer fences while holding
             // path admission through a bounded journal-retirement transaction.
-            const retirement_more = blk: {
+            const retirement_more = if (serving_physical_serviced) serving_retirement_more else blk: {
                 enterMaintenanceWriter(root, .index) catch |err| {
                     maintenance_error = err;
                     maintenance_error_phase = .retirement;
@@ -3707,7 +3826,7 @@ pub const Owner = struct {
             };
             artifact_more = retirement_more;
             pending = pending or retirement_more;
-            const more = database.runBackgroundTurnWithCancellation(cancellation, .index_storage) catch |err| blk: {
+            const more = if (serving_physical_serviced) serving_index_more else database.runBackgroundTurnWithCancellation(cancellation, .index_storage) catch |err| blk: {
                 maintenance_error = err;
                 maintenance_error_phase = .artifacts;
                 break :blk true;
@@ -3873,6 +3992,7 @@ pub const Owner = struct {
                     completed.startup_replay_pending = false;
                     completed.serviced_sequence = entry_sequence;
                     completed.readiness = entry_readiness;
+                    completed.covered_text_controls = if (!source_more) covered_controls else null;
                     completed.next_database_audit_ns = std.Io.Clock.awake.now(io).nanoseconds + database_audit_delay_ns;
                 }
             }
@@ -9096,12 +9216,13 @@ test "capi native maintenance namespaces isolate active replay from idle indexed
         }
     }
     try std.testing.expect(wrapped);
-    try std.testing.expectEqual(@as(u64, 1), owner.publication_stats.maintenance_database_turns - turns);
+    try std.testing.expectEqual(@as(u64, 0), owner.publication_stats.maintenance_database_turns - turns);
     // The audit can also visit the already-serviced root; every unrelated
     // indexed namespace must remain idle without opening its runtime.
     try std.testing.expect(owner.publication_stats.maintenance_idle_namespace_turns - idle_turns >= 8);
     try std.testing.expectEqual(@as(u64, 8), owner.publication_stats.maintenance_readiness_skips - readiness_skips);
-    try std.testing.expectEqual(@as(usize, 0), owner.current.?.embedded_tables.count());
+    // Already loaded foreground namespaces may remain cached; maintenance
+    // must not construct a fresh detached runtime for any idle namespace.
     try std.testing.expect(owner.test_runtime_snapshot_opens - opened <= 1);
     try std.testing.expect(try owner.current.?.db.core.loadAppliedSequence(alloc, "text") >= target);
     // With no source debt, an expired audit still services index/WAL lifecycle.
@@ -9138,6 +9259,91 @@ test "capi native maintenance namespaces isolate active replay from idle indexed
     try schema_write.put(schema_key, "{\"type\":\"object\",\"properties\":{\"new_field\":{\"type\":\"string\"}}}");
     try schema_write.commit();
     try std.testing.expect(!try owner.namespaceCanSleep(current, namespace, table_id));
+}
+
+test "capi native covered text source observes writes without reopening source and fences changed controls" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("covered-text-source", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    const key: Owner.MaintenanceKey = .{ .table_id = owner.current.?.db.core.identity_namespace.table_id, .incarnation = owner.current.?.db.root_incarnation };
+    var warmed = false;
+    for (0..64) |_| {
+        _ = try owner.maintenanceTurnForTest();
+        if (owner.maintenance_schedules.getPtr(key)) |schedule| {
+            if (schedule.covered_text_controls != null and !schedule.database_pending and !schedule.startup_replay_pending and !owner.maintenance_storage_pending) {
+                warmed = true;
+                break;
+            }
+        }
+    }
+    if (!warmed) return error.CoveredSourceWarmupMissing;
+    // Keep this test deterministic: service clocks, rather than host speed,
+    // decide whether optional physical work is due during observation.
+    const far_future = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds + std.time.ns_per_hour;
+    owner.maintenance_schedules.getPtr(key).?.next_database_audit_ns = far_future;
+    owner.maintenance_schedules.getPtr(key).?.artifact_pending = true;
+    owner.maintenance_schedules.getPtr(key).?.next_artifact_ns = far_future;
+    var output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&output);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice("{\"inserts\":{\"covered\":{\"text\":\"atomic native publication\"}},\"sync_level\":\"full_index\"}"), &output));
+    const target = owner.current.?.db.core.nextDerivedSequence();
+    const before = owner.publication_stats.maintenance_source_turns;
+    for (0..8) |_| {
+        _ = try owner.maintenanceTurnForTest();
+        if (owner.maintenance_schedules.getPtr(key).?.serviced_sequence == target) break;
+    }
+    try std.testing.expectEqual(target, owner.maintenance_schedules.getPtr(key).?.serviced_sequence);
+    try std.testing.expectEqual(before, owner.publication_stats.maintenance_source_turns);
+    // Observing semantic completion must not refund physically retained bytes.
+    const store = owner.current.?.owned_lite_backend.?.native_docstore.?;
+    if ((try store.file.replayAdmission()).?.records == 0) return error.CoveredObservationReleasedPhysicalCredits;
+    const opened = owner.test_runtime_snapshot_opens;
+    const artifacts = owner.publication_stats.maintenance_artifact_only_turns;
+    owner.maintenance_schedules.getPtr(key).?.next_artifact_ns = 0;
+    owner.maintenance_schedules.getPtr(key).?.group_sources.?.replay_retirement.batch.first_pending_ns = 0;
+    for (0..8) |_| {
+        _ = try owner.maintenanceTurnForTest();
+        if (owner.publication_stats.maintenance_artifact_only_turns != artifacts) break;
+    }
+    if (owner.publication_stats.maintenance_artifact_only_turns <= artifacts) return error.NativePhysicalSliceNotServiced;
+    try std.testing.expectEqual(opened, owner.test_runtime_snapshot_opens);
+    try std.testing.expectEqual(before, owner.publication_stats.maintenance_source_turns);
+    // A real lagging consumer still needs detached source service even when
+    // every schema/control fingerprint is unchanged.
+    try fixture.writeReplaySource(.{ .writes = &.{.{ .key = "replay-only", .value = "{\"text\":\"lagging consumer must run\"}" }}, .sync_level = .write });
+    const replay_target = owner.current.?.db.core.nextDerivedSequence();
+    for (0..32) |_| {
+        _ = try owner.maintenanceTurnForTest();
+        if (owner.publication_stats.maintenance_source_turns > before) break;
+    }
+    if (owner.publication_stats.maintenance_source_turns <= before) return error.LaggingConsumerNotServiced;
+    {
+        var lease = try fixture.connection.acquire();
+        defer lease.close();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        const root = try owner.refresh();
+        try std.testing.expect(try root.db.core.loadAppliedSequence(alloc, "text") >= replay_target);
+        const readiness = try Owner.namespaceReadiness(root, "root");
+        const prior = (try Owner.coveredTextControls(root, &root.db, "root", readiness)).?;
+        const control_keys = try root.db.core.index_manager.retainedTextRuntimeControlKeysAlloc(std.testing.allocator);
+        defer {
+            for (control_keys) |control| std.testing.allocator.free(control);
+            std.testing.allocator.free(control_keys);
+        }
+        // The admission key is a data-plane control, outside the fixed schema
+        // directory. Its presence must disqualify an otherwise covered source.
+        {
+            var write = try root.owned_lite_backend.?.native_docstore.?.beginWrite();
+            errdefer write.abort();
+            try write.put(control_keys[control_keys.len - 1], "pending");
+            try write.commit();
+        }
+        try std.testing.expect((try Owner.coveredTextControls(root, &root.db, "root", try Owner.namespaceReadiness(root, "root"))) == null);
+        _ = prior;
+    }
 }
 
 test "capi native maintenance namespaces service new unindexed source generations before idle audit" {
@@ -9248,8 +9454,10 @@ test "capi native maintenance namespaces artifact continuation does not restart 
     var probe: Probe = .{};
     owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.captured };
     defer owner.test_after_capture = null;
+    const opened = owner.test_runtime_snapshot_opens;
     _ = try owner.maintenanceTurnForTest();
-    try std.testing.expect(probe.entered);
+    try std.testing.expect(!probe.entered);
+    try std.testing.expectEqual(opened, owner.test_runtime_snapshot_opens);
     try std.testing.expect(!probe.has_source_epoch);
     try std.testing.expectEqual(sources, owner.publication_stats.maintenance_source_turns);
     try std.testing.expectEqual(artifacts + 1, owner.publication_stats.maintenance_artifact_only_turns);

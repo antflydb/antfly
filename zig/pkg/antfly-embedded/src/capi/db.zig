@@ -6696,7 +6696,7 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
     var refusal_receipt: ?[]u8 = if (is_commit) std.heap.c_allocator.alloc(u8, 2048) catch
         return capi.recordError(.internal, "{\"commit_outcome\":\"not_applied\",\"error\":{\"code\":\"53200\",\"message\":\"COMMIT was not executed: receipt allocation failed.\",\"retryable\":false}}") else null;
     defer if (refusal_receipt) |buffer| std.heap.c_allocator.free(buffer);
-    const guard = enterSqlWithReplayAdmission(entry, handle_ptr, intent, if (prepared) |*value| value else |_| null);
+    var guard = enterSqlWithReplayAdmission(entry, handle_ptr, intent, if (prepared) |*value| value else |_| null);
     defer guard.leaveAccess();
     if (guard.entry_error) |code| {
         if (is_commit) out_buf.* = embeddedSqlNotAppliedReceipt(&refusal_receipt, .{
@@ -6725,8 +6725,10 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
         if (is_commit) out_buf.* = embeddedSqlNotAppliedReceipt(&refusal_receipt, antfly.capi_dependencies.sql_errors.describe(error.UnsupportedSqlExecution));
         return capi.recordError(.unsupported, @src().fn_name ++ ": storage owner binding is already configured");
     }
+    var sql_preparation = SqlPreparationHandoff.init(&guard, handle_ptr, if (prepared) |*value| value else |_| null);
+    defer sql_preparation.deinit();
     const result = if (prepared) |*value|
-        executePreparedEmbeddedSql(handle, "default", request_json.bytes(), &budget, value, out_buf)
+        executePreparedEmbeddedSqlWithHandoff(handle, "default", request_json.bytes(), &budget, value, out_buf, sql_preparation.handoff())
     else |err|
         embeddedSqlPreparationFailure(handle, request_json.bytes(), err);
     result catch |err| {
@@ -6750,6 +6752,107 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
     };
     return .ok;
 }
+
+/// Autocommit normalization owns an immutable session and a separate runtime
+/// lifetime pin. Re-entry can retire the serving wrapper, so the SQL frame's
+/// policy lease, allocation owner and cursor destructors must outlive refresh.
+/// Active SQL sessions retain serialized admission until they have their own
+/// independent session-lifetime protocol.
+const SqlPreparationHandoff = struct {
+    guard: *HandleGuard,
+    connection: ?*@import("lite_connection.zig").Connection = null,
+    handle_ptr: ?*anyopaque,
+    retained_root: ?*Handle = null,
+    additional_roots: std.ArrayList(*Handle) = .empty,
+    table_name: []const u8 = "",
+    table_id: u64 = 0,
+    incarnation: u128 = 0,
+    inode: u64 = 0,
+    metadata: [16]u8 = @splat(0),
+
+    fn init(guard: *HandleGuard, handle_ptr: ?*anyopaque, prepared: ?*PreparedEmbeddedSql) @This() {
+        var result: @This() = .{ .guard = guard, .handle_ptr = handle_ptr };
+        const connection = guard.connection orelse return result;
+        const program = prepared orelse return result;
+        if (connection.options.profile != .native or program.parsed.value.session_id != null) return result;
+        switch (program.compiled.statement) {
+            .insert, .update => {},
+            else => return result,
+        }
+        const root = guard.handle;
+        const file = &root.owned_lite_backend.?.native_docstore.?.file;
+        if (std.mem.allEqual(u8, &file.activeCheckpoint().logical.metadata, 0)) return result;
+        root.query_borrows += 1;
+        result.retained_root = root;
+        result.connection = connection;
+        return result;
+    }
+
+    fn deinit(self: *@This()) void {
+        const root = self.retained_root orelse return;
+        const connection = self.connection.?;
+        const io = handleLockIo();
+        if (!self.guard.connection_gate_held) connection.gate.mutex.lockUncancelable(io);
+        defer if (!self.guard.connection_gate_held) connection.gate.mutex.unlock(io);
+        std.debug.assert(root.query_borrows != 0);
+        root.query_borrows -= 1;
+        for (self.additional_roots.items) |retained| {
+            std.debug.assert(retained.query_borrows != 0);
+            retained.query_borrows -= 1;
+        }
+        self.additional_roots.deinit(std.heap.c_allocator);
+        connection.collectRetired();
+        self.retained_root = null;
+    }
+
+    fn handoff(self: *@This()) ?@import("sql.zig").PreparationHandoff {
+        if (self.retained_root == null) return null;
+        return .{ .ptr = self, .release_admission = releaseAdmission, .reacquire_admission = reacquireAdmission };
+    }
+
+    fn releaseAdmission(ptr: *anyopaque, name: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const root = self.guard.handle;
+        const database = try @import("tables.zig").get(root, name);
+        try @import("sql_ddl.zig").requireRecovered(root, database, name);
+        const file = &root.owned_lite_backend.?.native_docstore.?.file;
+        self.inode = (try file.file.stat(file.runtime())).inode;
+        self.metadata = file.activeCheckpoint().logical.metadata;
+        self.table_name = name;
+        self.table_id = database.core.identity_namespace.table_id;
+        self.incarnation = database.root_incarnation;
+        if (root != self.retained_root.?) {
+            const already_retained = for (self.additional_roots.items) |retained| {
+                if (retained == root) break true;
+            } else false;
+            if (!already_retained) {
+                try self.additional_roots.append(std.heap.c_allocator, root);
+                root.query_borrows += 1;
+            }
+        }
+        self.guard.suspendQuery();
+        if (comptime builtin.is_test) if (test_sql_normalization_detached) |hook| hook.notify(hook.ptr);
+    }
+
+    fn reacquireAdmission(ptr: *anyopaque) !*Handle {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (!self.guard.resumeAccess(self.handle_ptr, .exclusive)) return error.InvalidArgument;
+        if (self.guard.entry_error != null) return error.AdmissionFailed;
+        const root = self.guard.handle;
+        const file = &root.owned_lite_backend.?.native_docstore.?.file;
+        if ((try file.file.stat(file.runtime())).inode != self.inode or
+            !std.mem.eql(u8, &self.metadata, &file.activeCheckpoint().logical.metadata)) return error.PreparedGenerationChanged;
+        const database = try @import("tables.zig").get(root, self.table_name);
+        if (database.core.identity_namespace.table_id != self.table_id or database.root_incarnation != self.incarnation) return error.PreparedGenerationChanged;
+        try @import("sql_ddl.zig").requireRecovered(root, database, self.table_name);
+        return root;
+    }
+};
+
+var test_sql_normalization_detached: if (builtin.is_test) ?struct {
+    ptr: *anyopaque,
+    notify: *const fn (*anyopaque) void,
+} else void = if (builtin.is_test) null else {};
 
 const EmbeddedSqlRequest = struct {
     statement: []const u8,
@@ -6862,6 +6965,10 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
 }
 
 fn executePreparedEmbeddedSql(handle: *Handle, table_name: []const u8, request_json: []const u8, budget: *EmbeddedSqlBudget, prepared: *PreparedEmbeddedSql, out_buf: *capi.Buffer) !void {
+    return executePreparedEmbeddedSqlWithHandoff(handle, table_name, request_json, budget, prepared, out_buf, null);
+}
+
+fn executePreparedEmbeddedSqlWithHandoff(handle: *Handle, table_name: []const u8, request_json: []const u8, budget: *EmbeddedSqlBudget, prepared: *PreparedEmbeddedSql, out_buf: *capi.Buffer, handoff: ?@import("sql.zig").PreparationHandoff) !void {
     const session = try @import("sql_session.zig").requestSession(handle, request_json);
     errdefer if (session) |value| {
         if (value.active) value.failed = true;
@@ -6905,7 +7012,7 @@ fn executePreparedEmbeddedSql(handle: *Handle, table_name: []const u8, request_j
         if (value.failed) return error.SqlTransactionAborted;
         if (value.active and (compiled.statement == .create_table or compiled.statement == .drop_table or compiled.statement == .catalog_ddl or compiled.statement == .policy_ddl)) return error.UnsupportedSqlExecution;
     }
-    var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
+    var adapter = sql.Adapter(antfly){ .preparation_handoff = handoff, .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
     var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
     var result = sql.runtime.execute(handle.alloc, adapter.backend(), compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {
         if (err == error.SqlNotNullViolation or err == error.SqlUntranslatableCharacter) out_buf.* = try stringifyJson(.{ .@"error" = error_context.diagnostic(err) });
@@ -10834,6 +10941,72 @@ test "issue1015 concurrent Lite handles sustain primary writes and full-text cat
     spawned = 0;
     defer for (workers[0..joined]) |worker| alloc.free(worker.path);
     for (workers[0..joined]) |worker| if (worker.failure) |err| return err;
+}
+
+test "capi SQL owned normalization releases admission and rejects metadata changes before commit" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Scenario = enum { primary_change, metadata_change, normalization_failure };
+    for ([_]Scenario{ .primary_change, .metadata_change, .normalization_failure }) |scenario| {
+        var directory = try TestDirectory.init("sql-owned-normalization");
+        defer directory.cleanup();
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+        const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{directory.path()});
+        defer a.free(path);
+        const wrapper = try @import("lite_connection.zig").open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 5000 }, true);
+        const id = try publishHandle(wrapper);
+        defer antfly_db_close(id);
+        var output: capi.Buffer = .{};
+        defer antfly_buffer_free(&output);
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(id, .fromSlice("{\"statement\":\"CREATE TABLE values_table (n BIGINT CHECK (n > 0))\"}"), &output));
+        antfly_buffer_free(&output);
+        const owner = wrapper.lite_connection.?.owner;
+        owner.stopping.store(true, .release);
+        owner.wake.set(handleLockIo());
+        if (owner.worker) |worker| worker.join();
+        owner.worker = null;
+        owner.stopping.store(false, .release);
+        owner.verification_cancel.requested.store(false, .release);
+        const Probe = struct {
+            id: *anyopaque,
+            connection: *@import("lite_connection.zig").Connection,
+            metadata_change: bool,
+            calls: usize = 0,
+            unlocked: bool = false,
+            nested_result: capi.ErrorCode = .invalid_argument,
+            fn notify(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.calls += 1;
+                if (!self.connection.gate.mutex.tryLock()) return;
+                self.unlocked = true;
+                self.connection.gate.mutex.unlock(handleLockIo());
+                var nested: capi.Buffer = .{};
+                defer antfly_buffer_free(&nested);
+                self.nested_result = if (self.metadata_change)
+                    antfly_db_sql_json(self.id, .fromSlice("{\"statement\":\"CREATE TABLE unrelated_table (n BIGINT)\"}"), &nested)
+                else
+                    antfly_db_batch_json(self.id, .fromSlice("{\"inserts\":{\"concurrent\":{\"text\":\"writer made progress\"}}}"), &nested);
+            }
+        };
+        var probe: Probe = .{ .id = id, .connection = wrapper.lite_connection.?, .metadata_change = scenario == .metadata_change };
+        test_sql_normalization_detached = .{ .ptr = &probe, .notify = Probe.notify };
+        defer test_sql_normalization_detached = null;
+        const result = antfly_db_sql_json(id, .fromSlice(if (scenario == .normalization_failure)
+            "{\"statement\":\"INSERT INTO values_table (_id,n) VALUES ('row',-1) RETURNING n\"}"
+        else
+            "{\"statement\":\"INSERT INTO values_table (_id,n) VALUES ('row',7) RETURNING n\"}"), &output);
+        test_sql_normalization_detached = null;
+        if (probe.calls == 0 or !probe.unlocked or probe.nested_result != .ok) std.debug.print("SQL_NORMALIZATION scenario={s} result={any} calls={d} unlocked={any} nested={any} response={s}\n", .{ @tagName(scenario), result, probe.calls, probe.unlocked, probe.nested_result, if (output.ptr) |ptr| ptr[0..output.len] else "" });
+        try std.testing.expect(probe.calls != 0);
+        try std.testing.expect(probe.unlocked);
+        try std.testing.expectEqual(capi.ErrorCode.ok, probe.nested_result);
+        if (scenario == .primary_change) try std.testing.expectEqual(capi.ErrorCode.ok, result) else try std.testing.expect(result != .ok);
+        antfly_buffer_free(&output);
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(id, .fromSlice("{\"statement\":\"SELECT n FROM values_table WHERE _id = 'row'\"}"), &output));
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, output.ptr.?[0..output.len], .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, if (scenario == .primary_change) 1 else 0), parsed.value.object.get("rows").?.array.items.len);
+    }
 }
 
 test "capi SQL preparation shares live bytes across queued connections and close" {

@@ -552,3 +552,31 @@ The indexed run still captured 95 background source turns, including roughly
 2.07 seconds constructing their snapshots. Removing redundant source/runtime
 construction and completing owned SQL preparation remain necessary before final
 end-to-end qualification.
+
+## Separate covered source observation from physical service
+
+A new source sequence is a notification, not proof that an index consumer still
+has work. The native owner checks durable consumer watermarks before selecting
+source service. After a successful source pass, a document/text-only namespace
+can retain a compact scheduling witness: namespace incarnation, nonzero metadata
+identity, the schema/resolver/table/policy control fingerprints, and per-index
+analyzer and managed-admission controls. A matching witness and caught-up durable
+consumers permit observation of a later sequence without reopening a source DB.
+Startup, expired audits, changed controls, repairs, transitions, generated work,
+resolvers, group sources, relational storage and mixed indexes retain source
+service. These hints never replace publication validation.
+
+Covered source observation does not delete journal bytes or refund credits.
+Journal retirement keeps its oldest coalescing deadline and its consumer clamps;
+journal pressure and the existing text window/tier policy can request immediate
+service. Bounded native journal and text-retirement metadata work use the admitted
+serving owner. That slice does not build segments, call providers or invoke a
+nested LSM. Required merges then capture their independently owned inputs from
+the resulting checkpoint. Detached cleanup must not reject a merge before its
+construction starts. A turn with neither source nor artifact work schedules no
+replacement DB: physical allocator service owns a separate raw-store lane.
+
+The local operation-count diagnostic confirmed the source-selection mechanism:
+128 indexed writes went from 95 source turns to one. Its intermediate artifact
+path still rebuilt runtimes and yielded repeatedly; that diagnostic is evidence
+for separating physical service, not final end-to-end performance qualification.

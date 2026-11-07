@@ -112,6 +112,16 @@ pub fn highlightsValueLeaky(a: std.mem.Allocator, items: anytype) !?std.json.Val
     return .{ .object = fields };
 }
 
+/// Optional coordinator handoff for CPU-only row normalization. The caller
+/// owns runtime lifetime pins; normalizeRows uses its captured immutable schema.
+/// Resume always runs, including allocation/validation failure, before SQL can
+/// inspect live catalog state or publish any mutation.
+pub const PreparationHandoff = struct {
+    ptr: *anyopaque,
+    release_admission: *const fn (*anyopaque, []const u8) anyerror!void,
+    reacquire_admission: *const fn (*anyopaque) anyerror!*@import("handles.zig").Handle,
+};
+
 pub fn Adapter(comptime native: type) type {
     return struct {
         const Self = @This();
@@ -127,6 +137,7 @@ pub fn Adapter(comptime native: type) type {
         table_name: []const u8,
         read_only: bool = false,
         outcome_transaction_id: ?types.TxnId = null,
+        preparation_handoff: ?PreparationHandoff = null,
 
         pub fn backend(self: *Self) catalog.Backend {
             return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
@@ -1077,6 +1088,28 @@ pub fn Adapter(comptime native: type) type {
             return cursor.next(cursor.ptr, alloc, request.limit);
         }
 
+        fn normalizeOwnedRows(self: *Self, session: anytype, alloc: std.mem.Allocator, table: catalog.Table, writes: []const types.BatchWrite) ![]types.BatchWrite {
+            const handoff = self.preparation_handoff orelse {
+                defer session.deinit();
+                return session.normalizeRows(alloc, writes);
+            };
+            handoff.release_admission(handoff.ptr, table.physical_name) catch |err| {
+                session.deinit();
+                return err;
+            };
+            const normalized = session.normalizeRows(alloc, writes);
+            // End the immutable schema/read borrow while the suspended guard
+            // still pins its runtime. Re-entry may retire that runtime.
+            session.deinit();
+            // A failed normalization still resumes admission. Error handling,
+            // cursor teardown and SQL outcome receipts may reference the live
+            // adapter; none may accidentally execute outside its fence.
+            const root = try handoff.reacquire_admission(handoff.ptr);
+            self.handle = root;
+            self.db = root.database();
+            return normalized;
+        }
+
         fn prepareMutations(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) ![]const catalog.Mutation {
             const adapter_owner: *Self = @ptrCast(@alignCast(ptr));
             var selected_adapter = try adapter_owner.selected(table.physical_name);
@@ -1087,15 +1120,13 @@ pub fn Adapter(comptime native: type) type {
             if (writes.len == 0) return input;
             if (table.storage_mode == .document) {
                 const session = try self.db.openDocumentReadSession(alloc, writes[0].key, writes[0].key, .{ .limit = 1, .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version } });
-                defer session.deinit();
-                return images.merge(alloc, input, try session.normalizeRows(alloc, writes));
+                return images.merge(alloc, input, try adapter_owner.normalizeOwnedRows(session, alloc, table, writes));
             }
             const session = try self.db.openRelationalReadSession(alloc, writes[0].key, writes[0].key, .{
                 .limit = 1,
                 .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version },
             });
-            defer session.deinit();
-            const normalized = try session.normalizeRows(alloc, writes);
+            const normalized = try adapter_owner.normalizeOwnedRows(session, alloc, table, writes);
             return images.merge(alloc, input, normalized);
         }
 

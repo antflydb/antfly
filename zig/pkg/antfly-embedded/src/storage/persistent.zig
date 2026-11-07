@@ -1404,6 +1404,10 @@ pub const PersistentIndex = struct {
         return fallback;
     }
 
+    pub fn hasNativeMetadata(self: *const PersistentIndex) bool {
+        return self.main_store_owner == .native;
+    }
+
     pub fn supportsFileBackedSegmentArtifacts(self: *const PersistentIndex) bool {
         const store = self.segment_files orelse return false;
         return store.storage_owner != null or store.storage.vtable.open_leased_immutable_source != null or store.storage.vtable.map_immutable_artifact != null;

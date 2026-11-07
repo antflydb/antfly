@@ -27492,6 +27492,40 @@ pub const IndexManager = struct {
         return stats;
     }
 
+    /// One native retirement slice on the admitted serving owner. This never
+    /// constructs a merge, runs providers, or enters nested LSM maintenance.
+    /// The caller has ruled out mixed indexes and owns the publication fence.
+    pub fn serviceNativeTextStorageSlice(self: *IndexManager) !bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        for (self.text_indexes.items) |*entry| {
+            if (!entry.persistent.hasNativeMetadata()) return error.UnsupportedOperation;
+        }
+        for (self.text_indexes.items) |*entry| {
+            if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay| {
+                if (delay == 0) {
+                    _ = try entry.persistent.runLsmMaintenanceStep();
+                    break;
+                }
+            }
+        }
+        // A future retry is debt too; callers retain its timed continuation.
+        for (self.text_indexes.items) |*entry| if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort() != null) return true;
+        return false;
+    }
+
+    /// Scheduling probe over immutable inventories. No task, source runtime or
+    /// artifact is constructed; actual merges still capture owned inputs.
+    pub fn nativeTextMaintenanceNeedsMerge(self: *IndexManager) !bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        for (self.text_indexes.items) |*entry| {
+            if (!entry.persistent.hasNativeMetadata()) return true;
+            if (try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) return true;
+        }
+        return false;
+    }
+
     fn textIndexNeedsMerge(self: *IndexManager, index: *persistent_mod.PersistentIndex, policy: merger_mod.MergePolicy) !bool {
         var admitted = policy;
         admitted.max_live_segments = self.text_merge_segment_limit.load(.acquire);
