@@ -2106,7 +2106,7 @@ test "a ride-along commit needs an explicit durability barrier before close, or 
         try file.putDocument("seed", "seed-value");
         try file.beginTransaction();
         try file.putDocument("ride-along-doc", "ride-along-value");
-        try file.commitTransactionWithDurability(false);
+        try file.commitTransactionWithDurability(false, null);
         try std.testing.expect(file.durable_header != null);
         file.close();
 
@@ -2133,7 +2133,7 @@ test "a ride-along commit needs an explicit durability barrier before close, or 
         try file.putDocument("seed", "seed-value");
         try file.beginTransaction();
         try file.putDocument("ride-along-doc", "ride-along-value");
-        try file.commitTransactionWithDurability(false);
+        try file.commitTransactionWithDurability(false, null);
         try std.testing.expect(file.durable_header != null);
         try file.sync();
         try std.testing.expect(file.durable_header == null);

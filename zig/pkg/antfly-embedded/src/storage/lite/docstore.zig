@@ -1643,6 +1643,14 @@ pub const Store = struct {
     /// Guarded by mutex. Secret publication failures fence every adapter until reopen.
     secret_store_uncertain: bool = false,
     mutex: PublicationMutex = .{},
+    /// Set under `mutex` by `releaseStoreMutexForSync` right before it
+    /// unlocks for a group's durability-barrier syscall, cleared under
+    /// `mutex` by `reacquireStoreMutexAfterSync` right after it relocks.
+    /// `mutex` being unlockable during that window is the whole point of
+    /// WS2's pipelining, but nothing else may begin a native transaction,
+    /// allocate/reclaim/retire pages, or publish a checkpoint on `file`
+    /// while a commit is suspended there -- see `lockStoreExclusive`.
+    commit_in_sync: bool = false,
     writer_mutex: std.Io.Mutex = .init,
     writer_ready: platform_sync.BroadcastCondition = .init,
     generation_lock: std.Io.RwLock = .init,
@@ -2109,7 +2117,7 @@ pub const Store = struct {
         }
         self.maintenance_wake.set(io);
         // Kick a cold maintenance worker without waiting for publication.
-        if (!self.maintenance_started.load(.acquire) and self.mutex.tryLock()) {
+        if (!self.maintenance_started.load(.acquire) and tryLockStoreExclusive(self)) {
             self.startMaintenanceAssumeLocked();
             self.mutex.unlock();
         }
@@ -2142,7 +2150,7 @@ pub const Store = struct {
     /// Primary and index publications share the newest allocator/checkpoint;
     /// existing read pins keep their original immutable roots.
     pub fn refreshIndexPublicationCheckpoint(self: *Store, header: native.Header) !void {
-        lockStore(self);
+        lockStoreExclusive(self);
         defer self.mutex.unlock();
         if (self.file.transaction_header != null or self.file.durable_header != null or
             self.file.checkpoint_publication_uncertain or self.secret_store_uncertain or
@@ -2308,7 +2316,11 @@ pub const Store = struct {
         {
             if (self.writer_admission) |admission| try admission.enter(admission.ptr, .allocator_service);
             defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
-            lockStore(self);
+            // Exclusive: this block reclaims/retires pages on self.file
+            // (cleanupOrphans, the marker sweep, reclaimPagesForMaintenance),
+            // which must never run during another commit's released sync
+            // window -- see `lockStoreExclusive`.
+            lockStoreExclusive(self);
             defer self.mutex.unlock();
             if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return;
             if (cancel) |token| try token.check();
@@ -2807,7 +2819,12 @@ pub const Store = struct {
                 defer self.releaseWriterSlot();
                 self.generation_lock.lockUncancelable(io);
                 defer self.generation_lock.unlock(io);
-                lockStore(self);
+                // Exclusive: this block can adopt a whole new generation
+                // onto self.file (`publishVacuum`) -- the writer slot
+                // alone does not exclude a foreground group's released
+                // sync window, since that slot is released right after
+                // staging, before the group's fsync even starts.
+                lockStoreExclusive(self);
                 defer self.mutex.unlock();
                 if (cancel) |token| try token.check();
                 if (capture.overflow) {
@@ -2967,7 +2984,10 @@ pub const Store = struct {
         self.generation_lock.lockUncancelable(io);
         defer self.generation_lock.unlock(io);
 
-        lockStore(self);
+        // Exclusive: replaceWithPreparedGeneration below swaps self.file's
+        // entire underlying descriptor, which must never happen while a
+        // foreground group's commit is mid-sync with self.mutex released.
+        lockStoreExclusive(self);
         defer self.mutex.unlock();
         lockStore(prepared);
         defer prepared.mutex.unlock();
@@ -3201,7 +3221,7 @@ pub const Store = struct {
         // self.mutex is contended right now, skip starting it this call --
         // the next stageRideAlong (or this same byte threshold, checked
         // without needing self.mutex at all) gets another chance.
-        if (!self.mutex.tryLock()) return;
+        if (!tryLockStoreExclusive(self)) return;
         defer self.mutex.unlock();
         if (self.ride_along_flush_started.load(.acquire)) return;
         self.ride_along_flush_future = self.file.runtime().concurrent(rideAlongFlushLoop, .{self}) catch return;
@@ -3384,7 +3404,10 @@ pub const Store = struct {
         if (self.read_only) return error.ReadOnly;
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, .index);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
-        lockStore(self);
+        // Exclusive: self.file.sync() below can itself publish a checkpoint
+        // (when durable_header is pending), so it must never run during
+        // another commit's released sync window -- see `lockStoreExclusive`.
+        lockStoreExclusive(self);
         defer self.mutex.unlock();
         if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
         if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
@@ -3492,20 +3515,39 @@ pub const Store = struct {
         // These hooks let commitTransactionWithDurability's one
         // `syncIfRequired` call release this mutex for just that syscall
         // and re-acquire it immediately after, before touching anything
-        // else -- see `NativeFile.sync_lock_hooks`.
-        self.file.sync_lock_hooks = .{ .context = self, .release = releaseStoreMutexForSync, .reacquire = reacquireStoreMutexAfterSync };
-        defer self.file.sync_lock_hooks = null;
-        try self.file.commitTransactionWithDurability(durable);
+        // else. Passed explicitly into this one call (never stored on
+        // `self.file`, see `NativeFile.SyncLockHooks`'s doc comment) so no
+        // other commit on this same file -- reclaim, vacuum, `Store.sync`,
+        // none of which pass hooks of their own -- can ever observe or act
+        // on this group's hooks.
+        //
+        // The released window is not just "no lock held": `commit_in_sync`
+        // (set by `releaseStoreMutexForSync` before it unlocks, cleared by
+        // `reacquireStoreMutexAfterSync` after it relocks, both still under
+        // the mutex) marks that this file has a commit suspended mid-
+        // publish. Every other path that would begin a transaction,
+        // allocate/reclaim pages, or publish a checkpoint on this file
+        // waits out that window after taking the mutex instead of
+        // proceeding -- see `lockStoreExclusive`. Readers and new `Txn`
+        // staging (which only touch in-memory `TransactionWrites`, not
+        // `self.file`'s page/allocator state) are unaffected: they keep
+        // using plain `lockStore`.
+        try self.file.commitTransactionWithDurability(durable, .{ .context = self, .release = releaseStoreMutexForSync, .reacquire = reacquireStoreMutexAfterSync });
     }
 
     fn releaseStoreMutexForSync(context: *anyopaque) void {
         const self: *Store = @ptrCast(@alignCast(context));
+        self.commit_in_sync = true;
         self.mutex.unlock();
     }
 
     fn reacquireStoreMutexAfterSync(context: *anyopaque) void {
         const self: *Store = @ptrCast(@alignCast(context));
-        lockStore(self);
+        // Bypasses `lockStoreExclusive`'s own wait-on-`commit_in_sync` loop
+        // on purpose: this call is the one that clears the flag, so waiting
+        // on it here would deadlock against itself.
+        self.mutex.lock();
+        self.commit_in_sync = false;
     }
 
     fn writerSlotAvailable(self: *Store) bool {
@@ -5753,6 +5795,39 @@ fn lockStore(store: *Store) void {
     store.mutex.lock();
 }
 
+/// Like `lockStore`, but for a caller about to begin a native transaction,
+/// allocate/reclaim/retire pages, or publish a checkpoint on `store.file`:
+/// waits out any group's released sync window (`commit_in_sync`) before
+/// proceeding, so that work never runs concurrently with a commit that is
+/// mid-`syncIfRequired` with `store.mutex` unlocked (see `applyMutationGroup`
+/// and `commit_in_sync`'s doc comment). Readers and new-`Txn` staging, which
+/// never touch that mutation state, keep using plain `lockStore` so they are
+/// not blocked by an in-flight group's fsync -- that is the entire point of
+/// WS2's pipelining.
+///
+/// Never call this from `reacquireStoreMutexAfterSync`: that call is what
+/// clears `commit_in_sync`, so waiting on it there is a guaranteed deadlock.
+fn lockStoreExclusive(store: *Store) void {
+    store.mutex.lock();
+    while (store.commit_in_sync) {
+        store.mutex.unlock();
+        antfly_platform.time.yieldNow();
+        store.mutex.lock();
+    }
+}
+
+/// `tryLock` counterpart to `lockStoreExclusive`, for the opportunistic
+/// "skip this turn if contended" call sites: an in-flight group's released
+/// sync window counts as contended the same way a held mutex already does.
+fn tryLockStoreExclusive(store: *Store) bool {
+    if (!store.mutex.tryLock()) return false;
+    if (store.commit_in_sync) {
+        store.mutex.unlock();
+        return false;
+    }
+    return true;
+}
+
 fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 }
@@ -7477,21 +7552,47 @@ test "lite closing a store with only ride-along work (no foreground write) does 
     };
     var closer: Closer = .{ .store = &store };
     const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+
+    // `close()`'s own durability barrier (b) -- `forceDrainDurable()`
+    // before `stopRideAlongFlush()` -- must make this durable despite no
+    // foreground write ever arriving to lead the queue. Wait on the ticket
+    // concurrently with `close()`, never after it returns: `close()` ends
+    // with `self.* = undefined`, so touching `store.commit_mutex`/
+    // `commit_head` through this same ticket afterward is undefined
+    // behavior that happened to read the poison pattern as a permanently
+    // "contended" mutex and hang forever (caught live: `commit_head` read
+    // back as `0xaaaa...`, `commit_mutex.state` as `.contended`, with
+    // nothing left to ever unlock it). `forceDrainDurable` runs
+    // synchronously as `close()`'s very first step, so this ordinarily
+    // resolves well before `close()` itself would even finish -- but this
+    // still runs the wait itself on its own thread, bounded by the same
+    // deadline as `close()`, so a regression in either one fails loudly
+    // instead of wedging the suite.
+    const TicketWaiter = struct {
+        ticket: Store.Ticket,
+        done: std.atomic.Value(bool) = .init(false),
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            self.result = self.ticket.wait();
+            self.done.store(true, .release);
+        }
+    };
+    var ticket_waiter: TicketWaiter = .{ .ticket = ticket };
+    const ticket_thread = try std.Thread.spawn(.{}, TicketWaiter.run, .{&ticket_waiter});
     const deadline_ns = antfly_platform.time.monotonicNs() +| (10 * std.time.ns_per_s);
-    while (!closer.done.load(.acquire)) {
+    while (!closer.done.load(.acquire) or !ticket_waiter.done.load(.acquire)) {
         if (antfly_platform.time.monotonicNs() >= deadline_ns) {
             thread.detach();
+            ticket_thread.detach();
             return error.CloseHangDetected;
         }
         std.Thread.yield() catch {};
     }
     thread.join();
     store_open = false;
+    ticket_thread.join();
+    try ticket_waiter.result;
 
-    // `close()`'s own durability barrier (b) -- `forceDrainDurable()`
-    // before `stopRideAlongFlush()` -- must have made this durable despite
-    // no foreground write ever arriving to lead the queue.
-    try ticket.wait();
     var reopened = try Store.open(alloc, path, true);
     defer reopened.close();
     const value = try reopened.file.getDocumentAlloc(alloc, "ride-only");
@@ -7778,6 +7879,318 @@ test "lite a new Txn opens and stages while a group's fsync is in flight" {
     defer read.abort();
     try std.testing.expectEqualStrings("landed", try read.get("a"));
     try std.testing.expectEqualStrings("landed", try read.get("b"));
+}
+
+test "lite maintenance is excluded, not just serialized by luck, during a group's released sync window" {
+    // Regression test for the mid-commit store-lock release bug: WS2 lets
+    // `applyMutationGroup` release `self.mutex` around the real fsync
+    // syscall (`NativeFile.SyncLockHooks`, passed explicitly now -- never a
+    // shared `self.file` field). While that window is open, nothing else
+    // may begin a transaction or reclaim/retire pages on the same
+    // `NativeFile`: doing so let a concurrent reclaim/maintenance commit
+    // race the foreground group to the same checkpoint slot (lost acks,
+    // `UnexpectedNativePageKind`) and, separately, let a stale/foreign
+    // `sync_lock_hooks` read skip a `defer`'s reacquire entirely (the
+    // close()-time deadlock). `Store.commit_in_sync` plus
+    // `lockStoreExclusive` (docstore.zig) now fence that window.
+    //
+    // This proves exclusion directly, not just absence of corruption on one
+    // lucky interleaving: a maintenance pass started while the gate holds
+    // must still be waiting (not done) after many yields, and must
+    // complete only once the gate opens.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const Gate = struct {
+        var armed: std.atomic.Value(bool) = .init(false);
+        var started: std.atomic.Value(bool) = .init(false);
+        var proceed: std.atomic.Value(bool) = .init(false);
+        pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            if (armed.swap(false, .acq_rel)) {
+                started.store(true, .release);
+                while (!proceed.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            }
+            return std.Options.debug_io.vtable.fileSync(userdata, file);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "maintenance-excluded-during-sync.aflite");
+    defer alloc.free(path);
+    var vtable = std.Options.debug_io.vtable.*;
+    vtable.fileSync = Gate.sync;
+    const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io, .reclamation = .{ .page_reuse = true } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+
+    const Worker = struct {
+        store: *Store,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            var write = self.store.beginWrite() catch |err| {
+                self.result = err;
+                return;
+            };
+            write.put("gated", "landed") catch |err| {
+                self.result = err;
+                write.abort();
+                return;
+            };
+            self.result = write.commit();
+        }
+    };
+    var worker_a = Worker{ .store = &store };
+    Gate.started.store(false, .release);
+    Gate.proceed.store(false, .release);
+    Gate.armed.store(true, .release);
+    const thread_a = try std.Thread.spawn(.{}, Worker.run, .{&worker_a});
+    var joined_a = false;
+    defer {
+        Gate.proceed.store(true, .release);
+        if (!joined_a) thread_a.join();
+        Gate.armed.store(false, .release);
+    }
+    try waitForGateStartedForTest(store.file.runtime(), &Gate.started);
+    // A is paused inside its own gated fsync with self.mutex released (the
+    // whole point of WS2's pipelining) but commit_in_sync still marking
+    // this file's commit as suspended mid-publish.
+    try std.testing.expect(store.commit_in_sync);
+
+    const MaintWorker = struct {
+        store: *Store,
+        done: std.atomic.Value(bool) = .init(false),
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            self.result = self.store.maintainOnce(true);
+            self.done.store(true, .release);
+        }
+    };
+    var worker_b = MaintWorker{ .store = &store };
+    const thread_b = try std.Thread.spawn(.{}, MaintWorker.run, .{&worker_b});
+    var joined_b = false;
+    defer if (!joined_b) thread_b.join();
+
+    // Give B every opportunity to race ahead if the exclusion were broken.
+    var spins: usize = 0;
+    while (spins < 500) : (spins += 1) {
+        try std.testing.expect(!worker_b.done.load(.acquire));
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(store.commit_in_sync);
+    try std.testing.expect(!worker_b.done.load(.acquire));
+
+    Gate.proceed.store(true, .release);
+    thread_a.join();
+    joined_a = true;
+    try worker_a.result;
+    thread_b.join();
+    joined_b = true;
+    try worker_b.result;
+
+    try std.testing.expect(!store.commit_in_sync);
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("landed", try read.get("gated"));
+}
+
+test "lite close() completes after a group's released sync window, no ticket skipped" {
+    // Regression test for the close()-time deadlock: before the fix, a
+    // concurrent commit on the same NativeFile (reclaim/maintenance) could
+    // read a stale `self.file.sync_lock_hooks` and release/reacquire a
+    // `PublicationMutex` ticket it never legitimately held, skipping a
+    // ticket and hanging whichever waiter (often `Store.stopMaintenance`
+    // inside `close()`) was next in line. Hooks are now passed explicitly
+    // per call (never a shared field), so this must complete promptly.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const Gate = struct {
+        var armed: std.atomic.Value(bool) = .init(false);
+        var started: std.atomic.Value(bool) = .init(false);
+        var proceed: std.atomic.Value(bool) = .init(false);
+        pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            if (armed.swap(false, .acq_rel)) {
+                started.store(true, .release);
+                while (!proceed.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            }
+            return std.Options.debug_io.vtable.fileSync(userdata, file);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "close-no-skipped-ticket.aflite");
+    defer alloc.free(path);
+    var vtable = std.Options.debug_io.vtable.*;
+    vtable.fileSync = Gate.sync;
+    const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io, .reclamation = .{ .page_reuse = true } });
+    var closed = false;
+    defer if (!closed) store.close();
+
+    const Worker = struct {
+        store: *Store,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            var write = self.store.beginWrite() catch |err| {
+                self.result = err;
+                return;
+            };
+            write.put("a", "landed") catch |err| {
+                self.result = err;
+                write.abort();
+                return;
+            };
+            self.result = write.commit();
+        }
+    };
+    var worker_a = Worker{ .store = &store };
+    Gate.started.store(false, .release);
+    Gate.proceed.store(false, .release);
+    Gate.armed.store(true, .release);
+    const thread_a = try std.Thread.spawn(.{}, Worker.run, .{&worker_a});
+    var joined_a = false;
+    defer {
+        Gate.proceed.store(true, .release);
+        if (!joined_a) thread_a.join();
+        Gate.armed.store(false, .release);
+    }
+    try waitForGateStartedForTest(store.file.runtime(), &Gate.started);
+
+    const MaintWorker = struct {
+        store: *Store,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            self.result = self.store.maintainOnce(true);
+        }
+    };
+    var worker_b = MaintWorker{ .store = &store };
+    const thread_b = try std.Thread.spawn(.{}, MaintWorker.run, .{&worker_b});
+    var joined_b = false;
+    defer if (!joined_b) thread_b.join();
+
+    Gate.proceed.store(true, .release);
+    thread_a.join();
+    joined_a = true;
+    try worker_a.result;
+    thread_b.join();
+    joined_b = true;
+    try worker_b.result;
+
+    // Before the fix, this could hang forever on a skipped ticket.
+    store.close();
+    closed = true;
+}
+
+test "lite 4 concurrent foreground writers and 2 ride-along members survive a crash at the group's sync" {
+    // Regression test for item (d): this hung before the fix (crash path
+    // stuck in futexWaitInner on a skipped PublicationMutex ticket, the
+    // same root cause as the close() deadlock above) because the crashing
+    // member's commit released self.mutex via a stale shared hooks field
+    // that a concurrent member's own commit could clear out from under it.
+    // Bounded with a deadline so a regression hangs the test, not the
+    // process.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "crash-at-group-sync.aflite");
+    defer alloc.free(path);
+
+    const Fault = struct {
+        var armed: std.atomic.Value(bool) = .init(false);
+        pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            if (armed.swap(false, .acq_rel)) return error.InputOutput;
+            return std.Options.debug_io.vtable.fileSync(userdata, file);
+        }
+    };
+    var vtable = std.Options.debug_io.vtable.*;
+    vtable.fileSync = Fault.sync;
+    const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io, .reclamation = .{ .page_reuse = true } });
+    defer store.close();
+
+    const Worker = struct {
+        store: *Store,
+        key: []const u8,
+        ride_along: bool,
+        done: std.atomic.Value(bool) = .init(false),
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            if (self.ride_along) {
+                const RideContext = struct {
+                    key: []const u8,
+                    fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+                        const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                        try file.putDocument(ctx.key, "rode along");
+                    }
+                };
+                var ctx = RideContext{ .key = self.key };
+                const ticket = self.store.stageRideAlong(.{ .context = &ctx, .apply = RideContext.apply }) catch |err| {
+                    self.result = err;
+                    return;
+                };
+                self.result = ticket.wait();
+                return;
+            }
+            var write = self.store.beginWriteYielding() catch |err| {
+                self.result = err;
+                return;
+            };
+            write.put(self.key, "landed") catch |err| {
+                self.result = err;
+                write.abort();
+                return;
+            };
+            self.result = write.commit();
+        }
+    };
+
+    // Arm the one-shot fault just before driving the first group's sync.
+    Fault.armed.store(true, .release);
+    var workers: [6]Worker = .{
+        .{ .store = &store, .key = "fg0", .ride_along = false },
+        .{ .store = &store, .key = "fg1", .ride_along = false },
+        .{ .store = &store, .key = "fg2", .ride_along = false },
+        .{ .store = &store, .key = "fg3", .ride_along = false },
+        .{ .store = &store, .key = "ride0", .ride_along = true },
+        .{ .store = &store, .key = "ride1", .ride_along = true },
+    };
+    var threads: [workers.len]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Worker.run, .{&workers[i]});
+
+    const deadline_ns = antfly_platform.time.monotonicNs() +| (20 * std.time.ns_per_s);
+    for (&workers) |*w| {
+        while (!w.done.load(.acquire)) {
+            if (antfly_platform.time.monotonicNs() >= deadline_ns) return error.TestUnexpectedResult;
+            std.Thread.yield() catch {};
+        }
+    }
+    for (&threads) |t| t.join();
+
+    // Every member sees either success or OutcomeUnknown (the injected
+    // fault's group), never a hang and never silent data loss: whichever
+    // outcome each got, the store must still be usable afterward.
+    for (&workers) |w| {
+        w.result catch |err| {
+            try std.testing.expect(err == error.OutcomeUnknown);
+        };
+    }
+    if (store.file.checkpoint_publication_uncertain) try store.file.reconcilePublicationUncertainty();
+
+    // A clean retry of every member must succeed and be visible, proving
+    // the store recovered rather than being left wedged.
+    for (&workers) |w| {
+        var write = try store.beginWrite();
+        write.put(w.key, "retried") catch |err| {
+            write.abort();
+            return err;
+        };
+        try write.commit();
+    }
+    var read = try store.beginRead();
+    defer read.abort();
+    for (&workers) |w| try std.testing.expectEqualStrings("retried", try read.get(w.key));
 }
 
 test "lite 8 concurrent Txn writers share fsyncs: mean group size above 1, fsyncs per write well below the solo baseline" {
@@ -8108,7 +8521,7 @@ test "lite index sync skips allocator admission and redundant durability barrier
     // The shortcut must not swallow an unpublished durability boundary.
     try store.file.beginTransaction();
     try store.file.putDocument("deferred", "durable after sync");
-    try store.file.commitTransactionWithDurability(false);
+    try store.file.commitTransactionWithDurability(false, null);
     try std.testing.expect(store.file.durable_header != null);
     try store.syncIndexContents();
     try std.testing.expect(Probe.calls > synced);
