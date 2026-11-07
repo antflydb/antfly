@@ -523,6 +523,10 @@ Three modes:
   batch loader, so one query makes one embedder call per recompute batch;
   candidates whose embedding is still stored are read instead. Without an
   enrichment runtime, reads of stubs fail with `error.ReembedUnavailable`.
+- **Vector blocks.** LEANN indexes stay out of HBC's shared vector-block
+  plane (`IndexManager.denseIndexUsesVectorBlocks`): it would otherwise keep
+  a float32 copy of every embedding transient storage drops, and its
+  artifact scan would fail on stubs. Their readiness never waits on it.
 - **No vectors needed otherwise.** Graph rebuilds (deletes, checkpoints)
   use `leann.Index.rebuildFromCodes`; 4-bit codes match exact rebuilds
   (see [Multi-bit RaBitQ codes](#multi-bit-rabitq-codes)). Replay of a

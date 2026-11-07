@@ -102827,6 +102827,9 @@ fn runTransientLeannStubCase(alloc: Allocator, storage: []const u8, chunked: boo
         try std.testing.expect(entry.index.leann.?.index != null);
         try std.testing.expect(stubs >= 256);
         try std.testing.expect(!db.core.index_manager.localLeannElisionPending());
+        // The shared vector-block plane neither mirrors nor waits on LEANN.
+        try std.testing.expect(!db.core.index_manager.vectorBlockBaseMaintenanceNeeded());
+        try std.testing.expect(!db.core.index_manager.vectorBlockProjectionPending());
     }
 }
 

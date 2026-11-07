@@ -3976,6 +3976,16 @@ pub const IndexManager = struct {
         return try std.fs.path.join(self.alloc, &.{ self.base_path, "vector-blocks" });
     }
 
+    /// Whether a dense index's exact vectors belong in the shared vector-block
+    /// plane. LEANN indexes keep only a graph and codes and re-read (or
+    /// re-embed) exact vectors themselves, so mirroring them there would keep
+    /// a float32 copy of every embedding that transient storage drops, and
+    /// its artifact scan would trip over the stubs. HBC posting readiness
+    /// never applies to them either.
+    fn denseIndexUsesVectorBlocks(entry: *const DenseIndex) bool {
+        return entry.index.leann == null;
+    }
+
     fn denseVectorArtifactNameCount(entry: *const DenseIndex) usize {
         return if (entry.embedding_names.len != 0) entry.embedding_names.len else 1;
     }
@@ -4059,12 +4069,14 @@ pub const IndexManager = struct {
     fn vectorBlockArtifactScopeHashesAlloc(self: *const IndexManager) ![]u64 {
         var scope_count: usize = 0;
         for (self.dense_indexes.items) |*entry| {
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             scope_count = std.math.add(usize, scope_count, denseVectorArtifactNameCount(entry)) catch
                 return error.OutOfMemory;
         }
         const hashes = try self.alloc.alloc(u64, scope_count);
         var offset: usize = 0;
         for (self.dense_indexes.items) |*entry| {
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             for (0..denseVectorArtifactNameCount(entry)) |index| {
                 hashes[offset] = denseVectorArtifactScopeHashAt(entry, index);
                 offset += 1;
@@ -4084,6 +4096,7 @@ pub const IndexManager = struct {
         var scopes = std.ArrayListUnmanaged(vector_block_store_mod.ArtifactScope).empty;
         errdefer scopes.deinit(self.alloc);
         for (self.dense_indexes.items) |*entry| {
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             for (0..denseVectorArtifactNameCount(entry)) |index| try scopes.append(self.alloc, .{
                 .name_hash = internal_keys.embeddingArtifactScopeHashForName(denseVectorArtifactNameAt(entry, index)),
                 .dimensions = entry.dims,
@@ -4112,7 +4125,7 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         snapshot_sequence: u64,
     ) !void {
-        if (self.vector_block_storage == null) return;
+        if (self.vector_block_storage == null or !denseIndexUsesVectorBlocks(entry)) return;
         if (try self.tryPrepareFreshDenseVectorCaptureBase(entry, snapshot_sequence)) return;
         try self.ensureVectorBlockBaseAtAppliedSequence(entry.config.name, snapshot_sequence);
         if (!try self.tryPrepareFreshDenseVectorCaptureBase(entry, snapshot_sequence))
@@ -4125,6 +4138,7 @@ pub const IndexManager = struct {
         snapshot_sequence: u64,
     ) !bool {
         const storage = self.vector_block_storage orelse return true;
+        if (!denseIndexUsesVectorBlocks(entry)) return true;
         self.lockAtomicWithBackoff(&self.vector_block_build_mu);
         defer self.vector_block_build_mu.unlock();
 
@@ -4161,7 +4175,7 @@ pub const IndexManager = struct {
         // index owns vectors. Otherwise the missing generation is repair debt
         // and the caller must rebuild it from the pinned primary boundary.
         for (self.dense_indexes.items) |*dense_entry| {
-            if (dense_entry == entry) continue;
+            if (dense_entry == entry or !denseIndexUsesVectorBlocks(dense_entry)) continue;
             if (dense_entry.index.stats().active_count != 0) return false;
         }
         var writer = try vector_block_store_mod.Store.open(self.alloc, storage, root);
@@ -4339,6 +4353,7 @@ pub const IndexManager = struct {
     }
 
     pub fn vectorBlockReadyForDenseIndex(self: *IndexManager, name: []const u8) bool {
+        if (self.denseIndex(name)) |leann_entry| if (!denseIndexUsesVectorBlocks(leann_entry)) return true;
         if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         const entry = self.denseIndex(name) orelse return false;
         if (self.vectorBlockStableTipFinalizingEntry(entry)) return false;
@@ -4363,6 +4378,7 @@ pub const IndexManager = struct {
     /// look incomplete.
     pub fn vectorBlockProjectionRequiredForDenseIndex(self: *IndexManager, name: []const u8) bool {
         const entry = self.denseIndex(name) orelse return false;
+        if (!denseIndexUsesVectorBlocks(entry)) return false;
         return entry.index.experimentalPostingWalAuthoritative();
     }
 
@@ -4387,6 +4403,7 @@ pub const IndexManager = struct {
         source_sequence: u64,
         expected_count: u64,
     ) bool {
+        if (self.denseIndex(name)) |leann_entry| if (!denseIndexUsesVectorBlocks(leann_entry)) return true;
         if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         const entry = self.denseIndex(name) orelse return false;
         if (self.vectorBlockStableTipFinalizingEntry(entry)) return false;
@@ -4410,6 +4427,7 @@ pub const IndexManager = struct {
             // same table-wide base and starves the repair that can resolve it.
             // Serviceable operator rebuilds are not skipped because
             // repairUnavailable() is false for their retained generation.
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             if (self.repairUnavailable(entry.config.name)) continue;
             if (self.vectorBlockReadyForDenseIndex(entry.config.name)) continue;
             const posting_sequence = entry.index.experimentalPostingDurableAppliedSequence();
@@ -4450,6 +4468,7 @@ pub const IndexManager = struct {
     pub fn vectorBlockProjectionPending(self: *IndexManager) bool {
         if (self.vector_block_storage == null) return false;
         for (self.dense_indexes.items) |*entry| {
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             if (!entry.index.experimentalPostingWalAuthoritative()) continue;
             if (!self.vectorBlockReadyForDenseIndex(entry.config.name)) return true;
         }
@@ -4633,7 +4652,7 @@ pub const IndexManager = struct {
         covered_source_sequence: u64,
     ) !bool {
         const started_ns = platform_time.monotonicNs();
-        if (mutations.len == 0) return false;
+        if (mutations.len == 0 or !denseIndexUsesVectorBlocks(entry)) return false;
         const storage = self.vector_block_storage orelse return false;
         const current = self.acquireVectorBlockGeneration() orelse return false;
         defer current.release();
@@ -4928,6 +4947,7 @@ pub const IndexManager = struct {
         if (self.vector_block_storage == null) return;
         const converting = require_storage_encoding and !self.vectorBlockUsesDesiredEncoding();
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        if (!denseIndexUsesVectorBlocks(entry)) return;
         if (entry.index.experimentalPostingDurableAppliedSequence()) |posting_sequence| {
             // A stable source snapshot may legitimately be ahead of the last
             // flattened posting generation. Publish that exact-vector plane
@@ -5302,6 +5322,7 @@ pub const IndexManager = struct {
     ) !void {
         if (self.vector_block_storage == null) return;
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        if (!denseIndexUsesVectorBlocks(entry)) return;
         if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
             return error.VectorBlockGenerationReservationLost;
         self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
@@ -11689,6 +11710,7 @@ pub const IndexManager = struct {
     pub fn runVectorBlockMaintenance(self: *IndexManager) !usize {
         var total_steps: usize = 0;
         for (self.dense_indexes.items) |*entry| {
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             if (self.repairUnavailable(entry.config.name)) continue;
             if (entry.index.shouldDeferOptionalPostingMaintenance()) continue;
             self.lockAtomicWithBackoff(entry.apply_mutex);
@@ -11744,6 +11766,7 @@ pub const IndexManager = struct {
         for (self.dense_indexes.items) |*entry| {
             if (options.cancel_check) |check| if (check.requested()) return .{ .published = published, .deferred = true };
             if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             if (self.repairUnavailable(entry.config.name) and
                 !(options.covered_rebuilding_index != null and std.mem.eql(u8, options.covered_rebuilding_index.?, entry.config.name))) continue;
             const healthy = self.vectorBlockReadyForDenseIndex(entry.config.name);
@@ -11834,6 +11857,7 @@ pub const IndexManager = struct {
             // intentionally stale, so using it to validate the shared vector
             // base creates a dependency inversion: projection maintenance
             // fails before posting repair is allowed to run.
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             if (self.repairUnavailable(entry.config.name)) continue;
             self.lockAtomicWithBackoff(entry.apply_mutex);
             defer entry.apply_mutex.unlock();
@@ -51906,6 +51930,18 @@ test "auto leann stubs text-derived vectors and keeps media-derived ones" {
     try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_idx", .kind = .dense_vector, .config_json = config_json }});
     const entry = manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
     try std.testing.expect(entry.leann_transient and entry.leann_text_only);
+    // LEANN stays out of the shared vector-block plane: no scope to mirror
+    // (and scan past stubs), and nothing for its readiness to wait on.
+    {
+        const scopes = try manager.vectorBlockArtifactScopesAlloc();
+        defer alloc.free(scopes);
+        try std.testing.expectEqual(@as(usize, 0), scopes.len);
+        const hashes = try manager.vectorBlockArtifactScopeHashesAlloc();
+        defer alloc.free(hashes);
+        try std.testing.expectEqual(@as(usize, 0), hashes.len);
+        try std.testing.expect(manager.vectorBlockReadyForDenseIndex("leann_idx"));
+        try std.testing.expect(!manager.vectorBlockProjectionRequiredForDenseIndex("leann_idx"));
+    }
 
     var writes: [n]mapper.DenseEmbeddingWrite = undefined;
     for (&writes, 0..) |*w, i| w.* = .{ .index_name = @constCast("leann_idx"), .doc_key = keys[i], .vector = &.{}, .artifact_key = artifact_keys[i] };
