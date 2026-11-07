@@ -32309,6 +32309,8 @@ fn processDenseEmbedding(
         .source_sequence = request.sequence,
         .vector = vector,
         .ordered_input = if (input) |*token| token else null,
+        // Prepared as plain text: re-embedding renders the same text.
+        .text_input = true,
     })) return;
     try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
 
