@@ -5191,30 +5191,48 @@ pub const RunPermit = struct {
         return null;
     }
 
-    pub fn acquireExecutionInputs(self: *RunPermit, inputs: invocation.Inputs, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !RunPermit {
-        var request = self.request orelse return error.MissingRunRequest;
+    /// Refine the fresh execution while its preprocessing owner remains live.
+    /// Actual geometry cannot erase declared floors or fabricate retained credit.
+    fn executionRequestEnvelope(self: *const RunPermit) !RunRequest {
+        if (self.dispatch_cleanup_epoch != null) return error.PreparedAdmissionRequiresReadyTurn;
+        return self.request orelse error.MissingRunRequest;
+    }
+
+    fn refinedExecutionRequest(self: *const RunPermit, envelope: RunRequest, shapes: ShapeInputs) !RunRequest {
+        var request = envelope;
+        try self.session.resolveRunGeometry(shapes, &request);
+        request.sequence = @max(request.sequence, envelope.sequence);
+        request.workspace_bytes = @max(request.workspace_bytes, envelope.workspace_bytes);
+        request.output_kv_bytes = @max(request.output_kv_bytes, envelope.output_kv_bytes);
+        if (envelope.output_bytes) |bytes| request.output_bytes = @max(request.output_bytes orelse 0, bytes);
         request.pre_admitted_host_bytes = @min(if (self.lease) |lease| lease.amounts.host_scratch_bytes else 0, try addBytes(request.input_bytes, request.host_preprocess_bytes));
+        return request;
+    }
+
+    pub fn acquireExecutionInputs(self: *RunPermit, inputs: invocation.Inputs, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !RunPermit {
+        const envelope = try self.executionRequestEnvelope();
         return switch (inputs) {
-            .host => |host| self.session.admitShapeRequest(.{ .tensors = host }, request, allocator, control),
+            .host => |host| self.session.admitShapeRequest(.{ .tensors = host }, try self.refinedExecutionRequest(envelope, .{ .tensors = host }), allocator, control),
             .resident => |resident| blk: {
                 var arena = std.heap.ArenaAllocator.init(allocator);
                 defer arena.deinit();
                 const info = try residentShapeInfo(self.session, resident, arena.allocator());
-                break :blk self.session.admitShapeRequest(.{ .resident_inputs = .{ .info = info, .values = resident } }, request, allocator, control);
+                const shapes = ShapeInputs{ .resident_inputs = .{ .info = info, .values = resident } };
+                break :blk self.session.admitShapeRequest(shapes, try self.refinedExecutionRequest(envelope, shapes), allocator, control);
             },
         };
     }
 
     pub fn acquireExecutionInputsBeforeExecution(self: *RunPermit, inputs: invocation.Inputs, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !RunPermit {
-        var request = self.request orelse return error.MissingRunRequest;
-        request.pre_admitted_host_bytes = @min(if (self.lease) |lease| lease.amounts.host_scratch_bytes else 0, try addBytes(request.input_bytes, request.host_preprocess_bytes));
+        const envelope = try self.executionRequestEnvelope();
         return switch (inputs) {
-            .host => |host| self.session.admitShapeRequestBeforeExecution(.{ .tensors = host }, request, allocator, control),
+            .host => |host| self.session.admitShapeRequestBeforeExecution(.{ .tensors = host }, try self.refinedExecutionRequest(envelope, .{ .tensors = host }), allocator, control),
             .resident => |resident| blk: {
                 var arena = std.heap.ArenaAllocator.init(allocator);
                 defer arena.deinit();
                 const info = try residentShapeInfo(self.session, resident, arena.allocator());
-                break :blk self.session.admitShapeRequestBeforeExecution(.{ .resident_inputs = .{ .info = info, .values = resident } }, request, allocator, control);
+                const shapes = ShapeInputs{ .resident_inputs = .{ .info = info, .values = resident } };
+                break :blk self.session.admitShapeRequestBeforeExecution(shapes, try self.refinedExecutionRequest(envelope, shapes), allocator, control);
             },
         };
     }
@@ -9939,4 +9957,104 @@ test "fresh host output and retained floor preflight classifies impossible split
     try std.testing.expectError(error.ResourceLimitExceeded, session.validateHostPreprocessWithOutput(std.math.maxInt(usize), rows, width));
     try std.testing.expectEqualDeep(before, controller.snapshot());
     try std.testing.expectEqual(callbacks, supplier.reserves);
+}
+
+fn freshExecutionGeometryCase(a: std.mem.Allocator) !void {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const ml = @import("ml");
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ 1, 2, 4 }));
+    try graph.markOutput(try builder.neg(x));
+    const bytes = try @import("onnx_graph").exportGraph(a, &graph, .{});
+    defer a.free(bytes);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "fresh-execution.onnx", .data = bytes });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "fresh-execution.onnx" });
+    defer a.free(path);
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var session = try @import("imported_onnx_session.zig").createSessionWithOptions(a, path, .native, .{ .graph_runtime_strategy = .partitioned });
+    var session_open = true;
+    defer if (session_open) session.close();
+    try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    defer std.debug.assert(scheduler.head == null and scheduler.tail == null);
+    session.cohort_scheduler = &scheduler;
+    session.output_geometry = .{ .input_name = "x", .width = 4 };
+    session.run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 * 1024 }, .static_workspace_bytes = 64, .check_live_memory = false };
+    var input = try Tensor.initFloat32(a, "x", &.{ 1, 2, 4 }, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    defer input.deinit();
+    const control = InferenceExecutionControl{ .native_call_policy = .in_process };
+    const actual = try session.planRun(&.{input}, null);
+    for ([_]bool{ false, true }) |before_execution| for ([_]?usize{ null, 4096 }) |declared_output| {
+        var preprocessing = try session.admit(.{ .batch = 1, .sequence = 7, .input_bytes = input.data.len, .host_preprocess_bytes = 8, .output_bytes = declared_output, .workspace_bytes = 128 });
+        defer preprocessing.deinit();
+        try std.testing.expect(try preprocessing.yieldExecution());
+        const original = preprocessing.request.?;
+        const paid_host = preprocessing.lease.?.amounts.host_scratch_bytes;
+        var cleanup = try @import("../execution/cleanup_owner.zig").Owner.beginResident(session);
+        defer cleanup.finishAfterUnlock();
+        var execution = if (before_execution)
+            try preprocessing.acquireExecutionInputsBeforeExecution(.{ .host = &.{input} }, a, control)
+        else
+            try preprocessing.acquireExecutionInputs(.{ .host = &.{input} }, a, control);
+        defer execution.deinitWithCleanup(.{ .boundary = cleanup.epoch() });
+        try std.testing.expect(execution.prepared != null);
+        try std.testing.expect(!execution.execution_yielded and execution.dispatch_cleanup_epoch == null);
+        try std.testing.expectEqualDeep(original, preprocessing.request.?);
+        try std.testing.expectEqual(@max(actual.output_bytes.?, declared_output orelse 0), execution.request.?.output_bytes.?);
+        try std.testing.expectEqual(@max(actual.workspace_bytes, original.workspace_bytes), execution.request.?.workspace_bytes);
+        try std.testing.expectEqual(@max(actual.sequence, original.sequence), execution.request.?.sequence);
+        try std.testing.expectEqual(original.host_preprocess_bytes, execution.request.?.host_preprocess_bytes);
+        try std.testing.expectEqual(original.input_bytes, execution.request.?.input_bytes);
+        try std.testing.expectEqual(@min(paid_host, original.input_bytes + original.host_preprocess_bytes), execution.request.?.pre_admitted_host_bytes);
+        try execution.preparePhysicalStorage(a);
+        try execution.bindPhysicalCleanupEpoch(cleanup.epoch().?);
+        var waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
+        try session.selectReadyCohort(session.execution_gate, control, &waiter);
+        defer session.leaveSelectedCohort(&waiter);
+        try session.acquireSelectedCohort(control, &waiter);
+        var locked = true;
+        defer if (locked) session.releaseSelectedCohortGate(&waiter);
+        // Both helper variants refuse before even resident shape discovery or
+        // allocator access after the numerical boundary has been installed.
+        const ShapeProbe = struct {
+            fn shape(raw: *anyopaque, _: ops.CT, _: std.mem.Allocator) ![]i64 {
+                const calls: *usize = @ptrCast(@alignCast(raw));
+                calls.* += 1;
+                return error.UnexpectedResidentShapeQuery;
+            }
+        };
+        var shape_calls: usize = 0;
+        var table = @import("../ops/native_compute.zig").vtable_impl;
+        table.tensorShape = ShapeProbe.shape;
+        const backend = ops.ComputeBackend{ .ptr = &shape_calls, .vtable = &table };
+        const resident = [_]ResidentInput{.{ .value = @ptrFromInt(8), .backend = &backend }};
+        var fail0 = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        try std.testing.expectError(error.PreparedAdmissionRequiresReadyTurn, execution.acquireExecutionInputs(.{ .resident = &resident }, fail0.allocator(), control));
+        try std.testing.expectError(error.PreparedAdmissionRequiresReadyTurn, execution.acquireExecutionInputsBeforeExecution(.{ .resident = &resident }, fail0.allocator(), control));
+        try std.testing.expectEqual(@as(usize, 0), shape_calls);
+        try std.testing.expectEqual(@as(usize, 0), fail0.alloc_index);
+        try std.testing.expect(!fail0.has_induced_failure);
+        const outputs = try execution.runWithControl(&.{input}, a, control);
+        session.releaseSelectedCohortGate(&waiter);
+        locked = false;
+        defer deinitTensorSlice(outputs, a);
+        try std.testing.expectEqual(@as(usize, 1), outputs.len);
+        try std.testing.expectEqualSlices(f32, &.{ -1, -2, -3, -4, -5, -6, -7, -8 }, outputs[0].asFloat32());
+    };
+    session.close();
+    session_open = false;
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "fresh execution permits resolve actual prepared geometry before B while preserving preprocessing floors" {
+    try freshExecutionGeometryCase(std.testing.allocator);
+}
+
+test "fresh execution geometry preparation unwinds every actual Native owner allocation failure" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, freshExecutionGeometryCase, .{});
 }
