@@ -19528,7 +19528,7 @@ fn nativeWhisperSharedDefinitionCase(a: std.mem.Allocator) !void {
     try std.testing.expect(one.graph.nodes.items.ptr == two.graph.nodes.items.ptr);
     try std.testing.expect(one.descriptors.ptr == two.descriptors.ptr and one.steps.ptr == two.steps.ptr);
     try std.testing.expect(one.values.ptr != two.values.ptr and one.bindings.ptr != two.bindings.ptr and one.planes.ptr != two.planes.ptr);
-    try std.testing.expect(one.root != two.root and one.selected != two.selected and one.frame.? != two.frame.?);
+    try std.testing.expect(one.selected.pool != two.selected.pool and one.selected != two.selected and one.frame.? != two.frame.?);
     try std.testing.expect(one.backend.ptr != two.backend.ptr);
     try std.testing.expect(first.weights.?.fetcher.handles.items.ptr != second.weights.?.fetcher.handles.items.ptr);
     try std.testing.expect(first.program.?.self_slabs[0].k != second.program.?.self_slabs[0].k);
