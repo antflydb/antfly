@@ -1517,6 +1517,16 @@ pub const SegmentReader = struct {
     }
 
     pub fn layoutStatsWithInvertedDetails(self: *const SegmentReader, detailed_inverted: bool) SegmentLayoutStats {
+        return self.layoutStatsForPurpose(detailed_inverted, false);
+    }
+
+    /// Admission needs physical section sizes, never a decoded tail dictionary.
+    /// Detailed user-facing accounting retains its existing logical statistics.
+    pub fn mergeLayoutStats(self: *const SegmentReader) SegmentLayoutStats {
+        return self.layoutStatsForPurpose(false, true);
+    }
+
+    fn layoutStatsForPurpose(self: *const SegmentReader, detailed_inverted: bool, skip_delta_navigation: bool) SegmentLayoutStats {
         var stats = SegmentLayoutStats{};
         var stored_end: usize = @intCast(self.index_offset);
         for (self.fields) |*field| {
@@ -1527,6 +1537,11 @@ pub const SegmentReader = struct {
                 switch (section.section_type) {
                     .inverted_text => {
                         stats.inverted_text_bytes +|= length;
+                        if (skip_delta_navigation and self.normalized_postings) {
+                            stats.inverted_header_bytes +|= @min(length, posting_delta.header_size);
+                            stats.inverted_postings_bytes +|= length -| posting_delta.header_size;
+                            continue;
+                        }
                         if (self.invertedLayoutStats(field.name, section, detailed_inverted)) |inverted_layout| {
                             {
                                 stats.inverted_header_bytes +|= inverted_layout.header_bytes;

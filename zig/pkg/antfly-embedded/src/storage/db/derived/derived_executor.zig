@@ -490,66 +490,18 @@ const ManualRuntime = struct {
     }
 
     fn waitForAll(self: *ManualRuntime, sequence: u64, wait: VisibilityWait) !void {
-        for (self.workers.items) |*worker| {
-            worker.target_sequence = @max(worker.target_sequence, sequence);
-            const target = @min(worker.target_sequence, wait.replay_target_cap);
-            if (target <= worker.applied_sequence) continue;
-            // Manual execution cannot wait for a structural owner on this same thread.
-            if (worker.paused) return error.DerivedWorkerPaused;
-            try wait.check();
-
-            while (worker.applied_sequence < target) {
-                const before_applied = worker.applied_sequence;
-                const result = try self.catchUpWorker(worker, wait);
-                var published = false;
-                defer result.observe(wait, published);
-                var session_open = true;
-                defer {
-                    if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
-                        _ = finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
-                    };
-                }
-                const stats = result.stats;
-                try wait.check();
-                const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
-                    applied_sequence
-                else if (stats.shouldTryTargetAdvance(worker.applied_sequence, target) and
-                    try self.canAdvanceToTarget(worker, worker.applied_sequence, target))
-                    target
-                else
-                    worker.applied_sequence;
-                session_open = false;
-                const finish_result = if (self.finish_catch_up_fn) |finish_catch_up|
-                    try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true)
-                else
-                    CatchUpFinishResult{};
-                if (caught_up_sequence > worker.applied_sequence) {
-                    if (!finish_result.applied_sequence_persisted) {
-                        while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
-                            try wait.check();
-                            if (wait.replay_budget != null) return error.EnrichmentWaitCanceled;
-                            std.atomic.spinLoopHint();
-                        }
-                    }
-                    worker.applied_sequence = caught_up_sequence;
-                    if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
-                }
-                published = true;
-                if (wait.replay_budget != null or (stats.partial_sequence == 0 and worker.applied_sequence == before_applied)) break;
-            }
-        }
-
-        const min_applied = computeMinApplied(self.workers.items);
-        if (min_applied > 0) {
-            try self.truncate_fn(self.ctx, min_applied);
-            self.backlog.releaseThrough(min_applied);
-        }
+        return self.waitForSelected(sequence, null, wait);
     }
 
     fn waitForIndexes(self: *ManualRuntime, sequence: u64, index_names: []const []const u8, wait: VisibilityWait) !void {
         if (index_names.len == 0) return;
-        for (self.workers.items) |*worker| {
-            if (!indexNameInList(worker.name, index_names)) continue;
+        return self.waitForSelected(sequence, index_names, wait);
+    }
+
+    fn waitForSelected(self: *ManualRuntime, sequence: u64, index_names: ?[]const []const u8, wait: VisibilityWait) !void {
+        var capacity_deferred = false;
+        workers: for (self.workers.items) |*worker| {
+            if (index_names) |selected| if (!indexNameInList(worker.name, selected)) continue;
             worker.target_sequence = @max(worker.target_sequence, sequence);
             const target = @min(worker.target_sequence, wait.replay_target_cap);
             if (target <= worker.applied_sequence) continue;
@@ -559,7 +511,16 @@ const ManualRuntime = struct {
 
             while (worker.applied_sequence < target) {
                 const before_applied = worker.applied_sequence;
-                const result = try self.catchUpWorker(worker, wait);
+                const result = self.catchUpWorker(worker, wait) catch |err| {
+                    if (wait.replay_budget != null and err == error.TextMergeProducerDeferred) {
+                        // A capacity refusal leaves this consumer pending. Its
+                        // catch-up session has unwound; other consumers still
+                        // get their bounded slice before returning the refusal.
+                        capacity_deferred = true;
+                        continue :workers;
+                    }
+                    return err;
+                };
                 var published = false;
                 defer result.observe(wait, published);
                 var session_open = true;
@@ -603,6 +564,7 @@ const ManualRuntime = struct {
             try self.truncate_fn(self.ctx, min_applied);
             self.backlog.releaseThrough(min_applied);
         }
+        if (capacity_deferred) return error.TextMergeProducerDeferred;
     }
 };
 

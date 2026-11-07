@@ -171,6 +171,125 @@ const Input = struct {
     }
 };
 
+/// Compact, owned navigation for merge service. One eight-byte reference per
+/// encoded contribution replaces a hash table and posting accumulator for
+/// every vocabulary term. Positions stay encoded until their term is consumed.
+/// Arbitrary term bytes retain the same lexical order as the frozen dictionary.
+pub const TermIndex = struct {
+    allocator: A,
+    bytes: []u8,
+    refs: []Ref,
+    norms: []u32,
+    stats: Stats,
+    pub const Ref = struct { offset: u32, doc: u32 };
+    pub const Hit = struct { term: []const u8, frequency: u32, position_count: u32, positions: []const u8 };
+
+    pub fn init(a: A, bytes: []const u8, maximum_navigation_bytes: usize) !TermIndex {
+        const stats = try Stats.read(bytes, bytes.len);
+        var crc = std.hash.Crc32.init();
+        crc.update(bytes[0..28]);
+        crc.update(bytes[header_size..]);
+        if (crc.final() != std.mem.readInt(u32, bytes[28..32], .little)) return error.InvalidPostingDelta;
+        const count = try scan(bytes, stats, null, null);
+        const retained = try std.math.add(usize, bytes.len, try std.math.add(usize, try std.math.mul(usize, count, @sizeOf(Ref)), @as(usize, stats.doc_space) * @sizeOf(u32)));
+        if (retained > maximum_navigation_bytes) return error.SegmentReadBudgetExceeded;
+        const owned = try a.dupe(u8, bytes);
+        errdefer a.free(owned);
+        const refs = try a.alloc(Ref, count);
+        errdefer a.free(refs);
+        const norms = try a.alloc(u32, stats.doc_space);
+        errdefer a.free(norms);
+        @memset(norms, 0);
+        _ = try scan(owned, stats, refs, norms);
+        var result: TermIndex = .{ .allocator = a, .bytes = owned, .refs = refs, .norms = norms, .stats = stats };
+        std.mem.sort(Ref, refs, &result, struct {
+            fn less(index: *const TermIndex, left: Ref, right: Ref) bool {
+                const order = std.mem.order(u8, index.hit(left).term, index.hit(right).term);
+                return order == .lt or (order == .eq and left.doc < right.doc);
+            }
+        }.less);
+        // Sorting establishes both per-term document order and the same
+        // per-document uniqueness check as the ordinary decoder.
+        for (refs, 0..) |reference, i| {
+            if (i != 0 and reference.doc == refs[i - 1].doc and std.mem.eql(u8, result.hit(reference).term, result.hit(refs[i - 1]).term)) return error.InvalidPostingDelta;
+        }
+        return result;
+    }
+
+    pub fn deinit(self: *TermIndex) void {
+        self.allocator.free(self.norms);
+        self.allocator.free(self.refs);
+        self.allocator.free(self.bytes);
+        self.* = undefined;
+    }
+
+    pub fn retainedBytes(self: *const TermIndex) usize {
+        return self.bytes.len + self.refs.len * @sizeOf(Ref) + self.norms.len * @sizeOf(u32);
+    }
+
+    pub fn hit(self: *const TermIndex, reference: Ref) Hit {
+        var input: Input = .{ .bytes = self.bytes[reference.offset..] };
+        const length = input.integer() catch unreachable;
+        const control = input.wideInteger() catch unreachable;
+        const term = input.take(length) catch unreachable;
+        return .{ .term = term, .frequency = @intCast(control >> 1), .position_count = if (control & 1 != 0) @intCast(control >> 1) else 0, .positions = input.bytes };
+    }
+
+    pub fn readPositions(self: *const TermIndex, reference: Ref, output: []u32) void {
+        const value = self.hit(reference);
+        std.debug.assert(output.len == value.position_count);
+        var input: Input = .{ .bytes = value.positions };
+        var position: u32 = 0;
+        for (output) |*next| {
+            position += input.integer() catch unreachable;
+            next.* = position;
+        }
+    }
+
+    pub fn lowerBound(self: *const TermIndex, term: []const u8) usize {
+        var first: usize = 0;
+        var last = self.refs.len;
+        while (first < last) {
+            const middle = first + (last - first) / 2;
+            if (std.mem.order(u8, self.hit(self.refs[middle]).term, term) == .lt) first = middle + 1 else last = middle;
+        }
+        return first;
+    }
+
+    fn scan(bytes: []const u8, stats: Stats, refs: ?[]Ref, norms: ?[]u32) !usize {
+        var input: Input = .{ .bytes = bytes[header_size..] };
+        var previous_doc: ?u32 = null;
+        var count: usize = 0;
+        var total_length: u64 = 0;
+        for (0..stats.doc_count) |_| {
+            const doc = try input.integer();
+            const norm = try input.integer();
+            const terms = try input.integer();
+            if (doc >= stats.doc_space or (if (previous_doc) |previous| doc <= previous else false) or terms > input.bytes.len / 2) return error.InvalidPostingDelta;
+            var field_length: u32 = 0;
+            for (0..terms) |_| {
+                if (refs) |output| output[count] = .{ .offset = @intCast(bytes.len - input.bytes.len), .doc = doc };
+                count += 1;
+                const length = try input.integer();
+                const control = try input.wideInteger();
+                const frequency = std.math.cast(u32, control >> 1) orelse return error.InvalidPostingDelta;
+                const locations = if (control & 1 != 0) frequency else 0;
+                if (frequency == 0 or frequency > maximum_frequency) return error.InvalidPostingDelta;
+                field_length = std.math.add(u32, field_length, frequency) catch return error.InvalidPostingDelta;
+                _ = try input.take(length);
+                if (locations > input.bytes.len) return error.InvalidPostingDelta;
+                var position: u32 = 0;
+                for (0..locations) |_| position = std.math.add(u32, position, try input.integer()) catch return error.InvalidPostingDelta;
+            }
+            if (norms) |output| output[doc] = if (norm == 0) field_length else norm;
+            total_length += field_length;
+            previous_doc = doc;
+        }
+        if (input.bytes.len != 0 or total_length != stats.total_field_len) return error.InvalidPostingDelta;
+        return count;
+    }
+};
+
 /// Decode one bounded field into immutable posting arrays. No source documents,
 /// analyzers, dictionary compiler or compressed posting blocks are involved.
 /// The caller retains these arrays for every escaping posting iterator.
@@ -464,4 +583,57 @@ test "normalized posting delta releases every failed reader and iterator allocat
         }
     };
     try std.testing.checkAllAllocationFailures(a, Scenario.run, .{memory.out.items});
+}
+
+test "normalized posting delta compact merge navigation preserves unicode sparse positions and allocation cleanup" {
+    const a = std.testing.allocator;
+    const inverted = @import("inverted.zig");
+    var delta = Builder.init(a);
+    defer delta.deinit();
+    try delta.add(1, &[_]inverted.InvertedIndexBuilder.TermHit{
+        .{ .term = "日本語", .freq = 2, .norm = 9, .positions = &.{ 1, 4 } },
+        .{ .term = "résumé", .freq = 1, .norm = 9, .positions = &.{2} },
+    });
+    try delta.add(4, &[_]inverted.InvertedIndexBuilder.TermHit{
+        .{ .term = "résumé", .freq = 2, .norm = 5, .positions = &.{ 3, 8 } },
+        .{ .term = "κόσμος", .freq = 1, .norm = 5, .positions = &.{} },
+    });
+    var memory = @import("../segment.zig").MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    try delta.write(&sink, 6);
+    const Check = struct {
+        fn run(allocator: A, bytes: []const u8) !void {
+            var index = try TermIndex.init(allocator, bytes, 1024 * 1024);
+            defer index.deinit();
+            try std.testing.expectEqual(@as(usize, 4), index.refs.len);
+            try std.testing.expectEqualSlices(u32, &.{ 0, 9, 0, 0, 5, 0 }, index.norms);
+            const first = index.lowerBound("résumé");
+            try std.testing.expectEqual(@as(u32, 1), index.refs[first].doc);
+            try std.testing.expectEqual(@as(u32, 4), index.refs[first + 1].doc);
+            var positions: [2]u32 = undefined;
+            index.readPositions(index.refs[first + 1], &positions);
+            try std.testing.expectEqualSlices(u32, &.{ 3, 8 }, &positions);
+            try std.testing.expectEqualStrings("日本語", index.hit(index.refs[index.lowerBound("日本語")]).term);
+        }
+    };
+    try Check.run(a, memory.out.items);
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{memory.out.items});
+    try std.testing.expectError(error.SegmentReadBudgetExceeded, TermIndex.init(a, memory.out.items, 1));
+}
+
+test "normalized posting delta compact merge navigation rejects duplicate terms without allocating a vocabulary" {
+    const a = std.testing.allocator;
+    const inverted = @import("inverted.zig");
+    var delta = Builder.init(a);
+    defer delta.deinit();
+    try delta.add(0, &[_]inverted.InvertedIndexBuilder.TermHit{
+        .{ .term = "same", .freq = 1, .positions = &.{0} },
+        .{ .term = "same", .freq = 1, .positions = &.{1} },
+    });
+    var memory = @import("../segment.zig").MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    try delta.write(&sink, 1);
+    try std.testing.expectError(error.InvalidPostingDelta, TermIndex.init(a, memory.out.items, 1024 * 1024));
 }

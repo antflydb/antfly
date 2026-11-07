@@ -32858,18 +32858,24 @@ pub const DB = struct {
             if (options.bounded_replay and self.enrichment_runtime != null) {
                 const state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
                 const first = state.source_replay_stage.fetchAdd(1, .monotonic) % 3;
-                for (0..3) |offset| switch ((first + offset) % 3) {
-                    0 => try self.runBoundedDerivedDependencyStage(stable_target, false, options),
-                    1 => try self.runEnrichmentUntilForDrain(stable_target, options),
-                    2 => {
-                        // A producer may need reclaimed output credits before
-                        // completing a multi-document source record. Consume
-                        // its already-committed effects independently; full
-                        // visibility waits fence source completion separately.
-                        try self.runBoundedDerivedDependencyStage(stable_target, true, options);
-                    },
-                    else => unreachable,
-                };
+                var capacity_deferred = false;
+                for (0..3) |offset| {
+                    const stage: anyerror!void = switch ((first + offset) % 3) {
+                        0 => self.runBoundedDerivedDependencyStage(stable_target, false, options),
+                        1 => self.runEnrichmentUntilForDrain(stable_target, options),
+                        2 => self.runBoundedDerivedDependencyStage(stable_target, true, options),
+                        else => unreachable,
+                    };
+                    stage catch |err| switch (err) {
+                        // A parked text consumer must not suppress another
+                        // consumer or producer which can independently return
+                        // retained credits. Preserve the refusal for the owner
+                        // after giving each dependency lane its bounded turn.
+                        error.TextMergeProducerDeferred => capacity_deferred = true,
+                        else => return err,
+                    };
+                }
+                if (capacity_deferred) return error.TextMergeProducerDeferred;
             } else {
                 // Foreground/full drains complete the producer boundary before
                 // consumers wait for the complete generated revision.
@@ -34495,7 +34501,14 @@ pub const DB = struct {
                     2 => try database.runArtifactRepairMetadataMaintenancePass(),
                     3 => try database.runRelationalIndexMaintenancePass(),
                     4 => try database.runDensePostingMaintenanceForIdle() != 0,
-                    5 => try database.runGraphMetricMaintenanceForIdle() != 0,
+                    5 => (database.runGraphMetricMaintenanceForIdle() catch |err| switch (err) {
+                        // A live graph reader/cleanup fence is a parked
+                        // service, not failure of the entire control sweep.
+                        // Retain its continuation while later services can
+                        // release their independent source pins and garbage.
+                        error.IntegrityTopologyBusy => return true,
+                        else => return err,
+                    }) != 0,
                     6 => try database.finalizeDenseProjectionLifecycleForIdle(),
                     7 => try database.runSourcePinCleanupStep(),
                     8 => try database.runDeferredRepairShadowCleanupPage(),
@@ -57349,6 +57362,7 @@ fn replayPendingDerivedBatches(
     }
     if (managed_indexes.len == 0) return;
 
+    var capacity_deferred = false;
     var saw_entries = false;
     var replay_ctx = ReplayApplyContext{
         .db = self,
@@ -57455,6 +57469,11 @@ fn replayPendingDerivedBatches(
             },
         ) catch |err| {
             replay_failure = err;
+            if (options.bounded_replay and err == error.TextMergeProducerDeferred) {
+                try abortReplayCapture(&replay_ctx, index_ref);
+                capacity_deferred = true;
+                continue;
+            }
             return err;
         };
         if (openProfileEnabled()) logReplayCatchUpProfile(index_ref, applied, stats);
@@ -57497,6 +57516,7 @@ fn replayPendingDerivedBatches(
         replay_completed = true;
     }
     if (options.truncate_replay) try truncateReplayJournalIfSafe(self);
+    if (capacity_deferred) return error.TextMergeProducerDeferred;
 }
 
 fn applyDerivedBatchToIndex(self: *DB, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {
@@ -78675,6 +78695,31 @@ test "db atomic text producer admission charges oversized groups and retains bac
     try std.testing.expectEqual(@as(u64, 0), runtime.producer_segment_reservations);
     var normal = try runtime.acquireProducerPermit("text", 1, 0);
     normal.release();
+}
+
+test "db blocked graph maintenance cannot starve later control services" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("db-independent-control-services");
+    defer directory.cleanup();
+    var database = try DB.open(a, directory.path(), .{ .start_index_workers = false });
+    defer database.close();
+    var state: DB.GroupSourceMaintenanceState = .{};
+    defer state.deinit();
+    database.borrowed_group_source_state = &state;
+    defer database.borrowed_group_source_state = null;
+    database.core.index_manager.graph_retirement_closed.store(true, .release);
+    defer database.core.index_manager.graph_retirement_closed.store(false, .release);
+    state.control_maintenance_slot = 5;
+    try std.testing.expect(try database.runBackgroundControlMaintenanceWithBudget(.none, std.time.ns_per_hour));
+    try std.testing.expectEqual(@as(u4, 6), state.control_maintenance_slot);
+    // The following services run while the graph gate remains closed. The
+    // earlier refusal must keep the sweep pending at its next boundary.
+    try std.testing.expect(try database.runBackgroundControlMaintenanceWithBudget(.none, std.time.ns_per_hour));
+    try std.testing.expectEqual(@as(u4, 0), state.control_maintenance_slot);
+    try std.testing.expect(state.control_maintenance_pending);
+    database.core.index_manager.graph_retirement_closed.store(false, .release);
+    try std.testing.expect(!try database.runBackgroundControlMaintenanceWithBudget(.none, std.time.ns_per_hour));
+    try std.testing.expect(!state.control_maintenance_pending);
 }
 
 test "db detached replay leaves optional maintenance to its retained continuation" {

@@ -1016,7 +1016,39 @@ pub const Detail = enum(c_int) {
     native_publication_value_not_bound,
     native_publication_value_already_bound,
     invalid_native_publication_value,
+    unexpected_native_page_kind,
+    invalid_native_page_kind,
+    invalid_native_page_magic,
+    invalid_native_page_length,
+    native_page_checksum_mismatch,
+    invalid_native_value_chain,
+    invalid_native_page_chain,
+    truncated_native_page,
+    truncated_native_value_page,
+    truncated_native_file,
+    invalid_page_id,
 };
+
+/// Page-structure failures belong to storage/recovery, never an isolated
+/// provider request. Keep their identity across reverse RPC and archive calls.
+pub const native_page_failures = [_]anyerror{
+    error.UnexpectedNativePageKind,
+    error.InvalidNativePageKind,
+    error.InvalidNativePageMagic,
+    error.InvalidNativePageLength,
+    error.NativePageChecksumMismatch,
+    error.InvalidNativeValueChain,
+    error.InvalidNativePageChain,
+    error.TruncatedNativePage,
+    error.TruncatedNativeValuePage,
+    error.TruncatedNativeFile,
+    error.InvalidPageId,
+};
+
+pub fn isNativePageFailure(err: anyerror) bool {
+    inline for (native_page_failures) |failure| if (err == failure) return true;
+    return false;
+}
 
 pub const Status = extern struct {
     // Keep the wire fields as integers so a newer peer's enum value can be
@@ -1950,6 +1982,17 @@ pub fn statusFromError(err: anyerror) Status {
         error.ReadOutputTruncated => status(.invalid_argument, .read_output_truncated),
         error.LiteReplayBacklogExceeded => status(.retryable, .lite_replay_backlog_exceeded),
         error.InvalidNativeReplayAdmission => status(.corrupt, .invalid_native_replay_admission),
+        error.UnexpectedNativePageKind => status(.corrupt, .unexpected_native_page_kind),
+        error.InvalidNativePageKind => status(.corrupt, .invalid_native_page_kind),
+        error.InvalidNativePageMagic => status(.corrupt, .invalid_native_page_magic),
+        error.InvalidNativePageLength => status(.corrupt, .invalid_native_page_length),
+        error.NativePageChecksumMismatch => status(.corrupt, .native_page_checksum_mismatch),
+        error.InvalidNativeValueChain => status(.corrupt, .invalid_native_value_chain),
+        error.InvalidNativePageChain => status(.corrupt, .invalid_native_page_chain),
+        error.TruncatedNativePage => status(.corrupt, .truncated_native_page),
+        error.TruncatedNativeValuePage => status(.corrupt, .truncated_native_value_page),
+        error.TruncatedNativeFile => status(.corrupt, .truncated_native_file),
+        error.InvalidPageId => status(.corrupt, .invalid_page_id),
         else => status(.internal, .none),
     };
 }
@@ -2848,6 +2891,17 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .document_extraction_model_required => "DocumentExtractionModelRequired",
         .lite_replay_backlog_exceeded => "LiteReplayBacklogExceeded",
         .invalid_native_replay_admission => "InvalidNativeReplayAdmission",
+        .unexpected_native_page_kind => "UnexpectedNativePageKind",
+        .invalid_native_page_kind => "InvalidNativePageKind",
+        .invalid_native_page_magic => "InvalidNativePageMagic",
+        .invalid_native_page_length => "InvalidNativePageLength",
+        .native_page_checksum_mismatch => "NativePageChecksumMismatch",
+        .invalid_native_value_chain => "InvalidNativeValueChain",
+        .invalid_native_page_chain => "InvalidNativePageChain",
+        .truncated_native_page => "TruncatedNativePage",
+        .truncated_native_value_page => "TruncatedNativeValuePage",
+        .truncated_native_file => "TruncatedNativeFile",
+        .invalid_page_id => "InvalidPageId",
         .index_rebuilding => "IndexRebuilding",
         .sql_statement_read_unavailable => "SqlStatementReadUnavailable",
         .unsupported_sql_execution => "UnsupportedSqlExecution",
@@ -3460,4 +3514,15 @@ test "native publication parameters preserve terminal errors across runtime boun
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(transported));
     }
+}
+
+test "native page failures retain corruption identity through provider fallback" {
+    inline for (native_page_failures) |failure| {
+        const transported = statusFromErrorWithFallback(failure, error.DocumentRunStoreNeedsRecovery);
+        try std.testing.expectEqual(@backingInt(Code.corrupt), transported.code);
+        try std.testing.expectEqual(failure, errorFromStatus(transported));
+        try std.testing.expect(isNativePageFailure(errorFromStatus(transported)));
+    }
+    try std.testing.expect(!isNativePageFailure(error.FileBusy));
+    try std.testing.expect(!isNativePageFailure(error.ResourceBudgetExceeded));
 }

@@ -6235,6 +6235,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
     db_test_mod.addImport("vopr", vopr_mod);
 
+    const lite_replay_control_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "db blocked graph maintenance cannot starve later control services", "db detached replay leaves optional maintenance to its retained continuation" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lite-replay-control-test", "Verify bounded replay and independent parked control services")
+        .dependOn(&addFilteredTestRunArtifact(b, lite_replay_control_tests).step);
+
     const db_split_workload_default_filters = [_][]const u8{
         "db split sim default workload stays green",
         "db split sim reopen-heavy workload stays green",

@@ -124,6 +124,27 @@ strand retained file-wide credits behind unrelated hot namespaces. Merge
 completion changes scheduling eligibility; it does not advance coverage or refund
 credits before the required physical records are deleted.
 
+Capacity refusal is local to a consumer. Both the manual executor used by Lite
+and the general replay driver give independent consumers a bounded turn before
+returning that refusal. Source, producer-output and consumer lanes retain their
+own progress; a parked text consumer cannot prevent another consumer from
+releasing shared journal references. Optional graph maintenance similarly keeps
+its continuation while the control sweep visits later cleanup services.
+
+Merge capture precedes optional control work, so a refused control service cannot
+prevent the artifact task that restores text capacity from starting. Private
+construction owns its scratch context and directory bytes captured under the
+catalog lock. It never dereferences a relocatable catalog entry from its worker;
+final publication still validates the current index identity.
+
+Normalized posting deltas use a merge-only navigation representation: retained
+encoded bytes, one eight-byte reference per term contribution and document
+norms. Positions are decoded for the current term instead of expanding every
+input vocabulary into hash-map accumulators. Admission inspects physical layout
+without constructing that vocabulary, reserves both retained navigation and
+temporary term expansion, and reduces the selected prefix when its known demand
+exceeds capacity. Query readers and the durable posting format are unchanged.
+
 Source preparation reads an independently retained immutable cut. It does not
 require an allocator proof for that obsolete cut to match a moving writer tip.
 The admitted publisher rebases and authenticates the current allocator before
@@ -151,6 +172,12 @@ Source computation still retains its independently captured immutable epoch.
 Unexpected page failures are counted separately from cooperative yields and remain
 visible without per-operation tracing. Qualification rejects them even if later
 integrity checks succeed.
+
+Native page failures also retain their identities across the document-provider
+RPC boundary. They stop the provider runtime as storage failures rather than
+entering document retry or isolation policy. The qualification fault marker covers
+this path as well as maintenance, so an apparently successful importer cannot
+hide a provider's persisted storage error.
 
 Physical service has independent deadlines and bounded retirement batches. It
 can reclaim eligible storage while writers remain active, rather than depending

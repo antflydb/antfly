@@ -2300,6 +2300,9 @@ const EnrichmentErrorDisposition = enum {
 };
 
 fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
+    // Storage faults must stop the runtime before document retry/isolation
+    // policy can mistake them for bad source content or provider responses.
+    if (@import("antfly_runtime_abi").error_abi.isNativePageFailure(err)) return .fatal_worker;
     if (!@import("antfly_readers").document_failure.fromError(err).retryable) return .terminal_request;
     if (document_extraction_mod.remoteContentErrorIsPermanent(err)) return .terminal_request;
     // These stages describe deterministic failures of the fetched PDF bytes.
@@ -8431,6 +8434,8 @@ const PlatformEnrichmentRuntime = struct {
 
     fn recordError(self: *EnrichmentRuntime, io: Io, err: anyerror) void {
         std.log.err("enrichment worker failed: {s}", .{@errorName(err)});
+        if (@import("antfly_runtime_abi").error_abi.isNativePageFailure(err))
+            std.log.warn("antfly_native_maintenance_page_failure phase=provider error={s}", .{@errorName(err)});
         var status: enrichment_state.RuntimeStatus = .{};
         self.mutex.lockUncancelable(io);
         self.last_error_code = types.RuntimeErrorName.init(@errorName(err));
@@ -43831,6 +43836,9 @@ test "index document checkpoint native storage rejects changed sources and super
 }
 
 test "enrichment maintenance document failures share durable retry policy" {
+    inline for (@import("antfly_runtime_abi").error_abi.native_page_failures) |failure| {
+        try std.testing.expectEqual(EnrichmentErrorDisposition.fatal_worker, enrichmentErrorDisposition(failure));
+    }
     for ([_]anyerror{ error.DocumentSourceLimitExceeded, error.DocumentPixelLimitExceeded, error.CloudflareAuthenticationFailed, error.DocumentUnresolved }) |err| {
         try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(err));
     }

@@ -2545,7 +2545,7 @@ pub const RecordPageReader = struct {
                     file.page_cache.releaseRaw(file.allocator, lease);
                     self.lease = null;
                     self.lease_file = null;
-                    return error.UnexpectedNativePageKind;
+                    return unexpectedNativePageKind(@src());
                 }
                 self.payload = lease.bytes[page_header_size..][0..validation.payload_len];
             } else {
@@ -7585,7 +7585,7 @@ pub const NativeFile = struct {
         reader.init();
         defer reader.deinit(self);
         if (page & packed_record_flag != 0) {
-            if (page != checkpoint.namespace_directory_root_page) return error.UnexpectedNativePageKind;
+            if (page != checkpoint.namespace_directory_root_page) return unexpectedNativePageKind(@src());
             _ = try reader.readPayload(self, checkpoint, page, 1, .catalog);
             return .{ .history = page };
         }
@@ -7593,7 +7593,7 @@ pub const NativeFile = struct {
         if (raw[4] != @backingInt(PageKind.catalog_index)) {
             // Namespace-directory records have their own delta-chain format.
             // Metadata and index catalogs must carry the revision-3 descriptor.
-            if (page != checkpoint.namespace_directory_root_page) return error.UnexpectedNativePageKind;
+            if (page != checkpoint.namespace_directory_root_page) return unexpectedNativePageKind(@src());
             _ = try reader.payload(raw, .catalog);
             return .{ .history = page };
         }
@@ -10453,7 +10453,7 @@ pub const NativeFile = struct {
             if (self.lease) |lease| {
                 if (raw.ptr == lease.bytes.ptr and raw.len == lease.bytes.len) {
                     const validation = lease.validation.?;
-                    if (validation.kind != expected) return error.UnexpectedNativePageKind;
+                    if (validation.kind != expected) return unexpectedNativePageKind(@src());
                     return raw[page_header_size..][0..validation.payload_len];
                 }
             }
@@ -10467,7 +10467,7 @@ pub const NativeFile = struct {
             if (reference & packed_record_flag != 0) {
                 const bundle = try self.payload(raw, .record_bundle);
                 const record = if (self.lease) |lease| try lease.packedRecord(reference) else try packedRecordPayload(bundle, reference);
-                if (record.kind != expected) return error.UnexpectedNativePageKind;
+                if (record.kind != expected) return unexpectedNativePageKind(@src());
                 return record.bytes;
             }
             return self.payload(raw, expected);
@@ -11491,7 +11491,7 @@ pub const NativeFile = struct {
             if (use_link_cache) blk: {
                 const links = (try self.page_cache.getLinksCopy(self.allocator, page_id)) orelse break :blk;
                 defer if (links.key) |key| self.allocator.free(key);
-                if (links.kind != kind) return error.UnexpectedNativePageKind;
+                if (links.kind != kind) return unexpectedNativePageKind(@src());
                 switch (kind) {
                     .catalog => {
                         const entry_key = links.key orelse &[_]u8{};
@@ -12408,7 +12408,7 @@ pub const NativeFile = struct {
             if (use_link_cache) {
                 if (try self.page_cache.getLinksCopy(self.allocator, page_id)) |links| {
                     defer if (links.key) |key| self.allocator.free(key);
-                    if (links.kind != .value) return error.UnexpectedNativePageKind;
+                    if (links.kind != .value) return unexpectedNativePageKind(@src());
                     chunk_len = links.chunk_len;
                     next_page = links.link_page;
                     resolved = true;
@@ -14264,6 +14264,32 @@ fn decodePagePayloadAlloc(allocator: Allocator, raw: []const u8, expected_kind: 
     return try allocator.dupe(u8, try decodePagePayload(raw, expected_kind));
 }
 
+var native_page_diagnostic_count: std.atomic.Value(usize) = .init(0);
+
+// Opt-in failure evidence contains only code locations and stack addresses,
+// never a document, key or database path. Provider RPCs can otherwise retain
+// only an opaque recovery error after the original page-read context unwinds.
+fn unexpectedNativePageKind(comptime source: std.builtin.SourceLocation) error{UnexpectedNativePageKind} {
+    if (comptime builtin.link_libc) {
+        if (std.c.getenv("ANTFLY_NATIVE_PAGE_DIAGNOSTICS")) |raw| {
+            if (std.mem.eql(u8, std.mem.span(raw), "1") and native_page_diagnostic_count.fetchAdd(1, .monotonic) < 8) {
+                std.log.warn("antfly_native_page_kind_failure function={s} line={d} image_anchor=0x{x}", .{ source.fn_name, source.line, @intFromPtr(&unexpectedNativePageKind) });
+                if (comptime builtin.os.tag == .macos) {
+                    const Trace = struct {
+                        extern "c" fn backtrace(buffer: [*]usize, size: c_int) c_int;
+                    };
+                    var addresses: [32]usize = undefined;
+                    const count = Trace.backtrace(&addresses, addresses.len);
+                    if (count > 0) for (addresses[0..@intCast(count)], 0..) |address, frame| {
+                        std.log.warn("antfly_native_page_kind_frame frame={d} pc=0x{x}", .{ frame, address });
+                    };
+                } else std.debug.dumpCurrentStackTrace(.{});
+            }
+        }
+    }
+    return error.UnexpectedNativePageKind;
+}
+
 fn decodePagePayload(raw: []const u8, expected_kind: PageKind) ![]const u8 {
     if (raw.len < page_header_size) return error.TruncatedNativePage;
     if (!std.mem.eql(u8, raw[0..page_magic.len], page_magic)) return error.InvalidNativePageMagic;
@@ -14282,7 +14308,7 @@ fn decodePagePayload(raw: []const u8, expected_kind: PageKind) ![]const u8 {
         @backingInt(PageKind.key) => .key,
         else => return error.InvalidNativePageKind,
     };
-    if (kind != expected_kind) return error.UnexpectedNativePageKind;
+    if (kind != expected_kind) return unexpectedNativePageKind(@src());
 
     const payload_len = std.mem.readInt(u32, raw[8..12], .little);
     if (payload_len > raw.len - page_header_size) return error.InvalidNativePageLength;

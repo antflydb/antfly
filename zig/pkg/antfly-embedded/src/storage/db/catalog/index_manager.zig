@@ -512,6 +512,7 @@ const PhaseTrackingAllocator = struct {
 /// allocation then competes inside that fixed byte ceiling, so post-snapshot
 /// writes cannot grow process memory beyond the admitted working set.
 const TextMergeBudgetAllocator = struct {
+    var diagnostic_refusals: std.atomic.Value(usize) = .init(0);
     backing: Allocator,
     reservation: ?resource_manager_mod.Reservation,
     /// All bytes competing inside the reservation, including persistent
@@ -591,6 +592,13 @@ const TextMergeBudgetAllocator = struct {
         while (true) {
             if (bytes > limit -| live) {
                 self.budget_denied.store(true, .release);
+                if (comptime builtin.link_libc) if (std.c.getenv("ANTFLY_RESOURCE_ALLOCATION_DIAGNOSTICS")) |raw| {
+                    if (std.mem.eql(u8, std.mem.span(raw), "1") and diagnostic_refusals.fetchAdd(1, .monotonic) < 8) {
+                        std.log.warn("text merge task allocation denied requested={d} live={d} reserved={d}", .{ bytes, live, limit });
+                        std.debug.dumpCurrentStackTrace(.{});
+                    }
+                };
+
                 return false;
             }
             live = self.live_bytes.cmpxchgWeak(live, live + bytes, .acq_rel, .acquire) orelse return true;
@@ -2557,6 +2565,14 @@ pub const IndexManager = struct {
 
         pub fn mergeAllocator(self: *const TextMergeTask) Allocator {
             return self.deletion_state.budget.allocator();
+        }
+
+        pub fn memoryObservation(self: *const TextMergeTask) struct { reserved_bytes: u64, peak_task_bytes: u64, denied: bool } {
+            return .{
+                .reserved_bytes = self.bufferReservationBytes() orelse 0,
+                .peak_task_bytes = self.deletion_state.budget.peakTaskLiveBytes(),
+                .denied = self.deletion_state.budget.denied(),
+            };
         }
 
         fn bufferReservationBytes(self: *const TextMergeTask) ?u64 {
@@ -26573,18 +26589,17 @@ pub const IndexManager = struct {
         return true;
     }
 
-    pub fn executePrivateTextMergeTask(task: *const TextMergeTask, canceled: *const std.atomic.Value(bool)) !segment_mod.PrivateMergeResult {
+    pub fn executePrivateTextMergeTask(task: *const TextMergeTask, scratch: segment_mod.MergeScratchOptions, canceled: *const std.atomic.Value(bool)) !segment_mod.PrivateMergeResult {
         const task_alloc = task.mergeAllocator();
         const inputs = try task_alloc.alloc(segment_mod.MergeInput, task.source.len);
         defer task_alloc.free(inputs);
         for (task.source, task.merge_indices, inputs) |source, source_idx, *input| {
             input.* = .{ .reader = &task.snapshot.segments[source_idx].reader, .deleted = source.deleted };
         }
-        return segment_mod.preparePrivateMerge(task_alloc, inputs, .{
-            .io = task.persistent.io orelse return error.Unsupported,
-            .directory = task.persistent.privateScratchDirectory(".") orelse return error.Unsupported,
-            .resource_manager = task.persistent.writer.resource_manager,
-        }, canceled, std.math.maxInt(u32)) catch |err| task.deletion_state.allocationError(err);
+        // Detached workers own their input snapshot and scratch context. They
+        // must not dereference the inline catalog entry after capture: optional
+        // control work can change that catalog while construction is running.
+        return segment_mod.preparePrivateMerge(task_alloc, inputs, scratch, canceled, std.math.maxInt(u32)) catch |err| task.deletion_state.allocationError(err);
     }
 
     pub fn executeTextMergeTask(alloc: Allocator, task: *const TextMergeTask) !TextMergeResult {
@@ -27158,12 +27173,16 @@ pub const IndexManager = struct {
         const manager = self.resource_manager orelse return null;
 
         var source_bytes: u64 = 0;
+        var largest_delta_bytes: u64 = 0;
+        var normalized_only = true;
         var deletion_tracking_bytes: u64 = 0;
         var merge_working_set_bytes: u64 = 8 * 1024 * 1024;
         const file_backed_merge = persistent.supportsFileBackedSegmentArtifacts();
         const native_scratch = file_backed_merge and persistent.io != null and persistent.privateScratchDirectory(".") != null;
         for (planned) |seg_idx| {
             const seg = &snap.segments[seg_idx];
+            normalized_only = normalized_only and seg.reader.isNormalizedPostingDelta();
+            if (native_scratch and seg.reader.isNormalizedPostingDelta()) largest_delta_bytes = @max(largest_delta_bytes, seg.reader.mergeLayoutStats().inverted_text_bytes);
             source_bytes = std.math.add(u64, source_bytes, @as(u64, @intCast(seg.data.len()))) catch return error.ResourceBudgetExceeded;
             merge_working_set_bytes = try std.math.add(u64, merge_working_set_bytes, if (native_scratch) 1024 else @as(u64, seg.reader.doc_count) * 8 + 64);
             deletion_tracking_bytes = std.math.add(
@@ -27181,6 +27200,10 @@ pub const IndexManager = struct {
             ) catch return error.ResourceBudgetExceeded;
         }
 
+        // Positions for one streamed term may expand while all compact input
+        // references remain live. Cover varint expansion, arena growth and
+        // the temporary input copy independently of the retained references.
+        merge_working_set_bytes = try std.math.add(u64, merge_working_set_bytes, try std.math.mul(u64, largest_delta_bytes, 8));
         const segment_overhead = std.math.mul(u64, @as(u64, @intCast(planned.len)), 1024) catch return error.ResourceBudgetExceeded;
         // File-backed output is streamed into its final artifact. Heap-backed
         // output remains resident alongside its builders and publication
@@ -27195,7 +27218,11 @@ pub const IndexManager = struct {
             ) catch return error.ResourceBudgetExceeded;
         var reservation_bytes = std.math.add(u64, reservation_base, segment_overhead) catch return error.ResourceBudgetExceeded;
         reservation_bytes = std.math.add(u64, reservation_bytes, deletion_tracking_bytes) catch return error.ResourceBudgetExceeded;
-        if (file_backed_merge) {
+        // Frozen legacy layout estimates remain conservative envelopes. A
+        // normalized-only plan has a direct encoded-size bound: do not clip
+        // that known demand to the cap and start a doomed task. Admission can
+        // select a smaller prefix before any construction is launched.
+        if (file_backed_merge and !normalized_only) {
             const hard_limit = manager.sliceStats(.text_merge_buffers).hard_limit_bytes;
             if (hard_limit > 0) {
                 const enforced_cap = std.math.mul(u64, hard_limit, 2) catch std.math.maxInt(u64);
@@ -27356,7 +27383,7 @@ pub const IndexManager = struct {
     }
 
     fn estimateTextMergeWorkingSetBytes(seg: *const index_mod.SegmentEntry, native_scratch: bool, provenance: bool) !u64 {
-        const layout = seg.layoutStats(false);
+        const layout = if (native_scratch and seg.reader.isNormalizedPostingDelta()) seg.reader.mergeLayoutStats() else seg.layoutStats(false);
 
         // Native plans retain per-input navigation and caches, not one
         // coordinate or sort-key object per document. The task allocator
@@ -27366,6 +27393,10 @@ pub const IndexManager = struct {
             768 * 1024 + (if (provenance and layout.index_sort_bytes == 0) @as(u64, seg.reader.doc_count) * 4 else 0)
         else
             try std.math.mul(u64, seg.reader.doc_count, per_doc_bytes);
+        // Retain encoded bytes plus one eight-byte reference per
+        // contribution (at least two encoded bytes). No vocabulary hash map
+        // or complete decoded posting corpus remains resident during merging.
+        if (native_scratch and seg.reader.isNormalizedPostingDelta()) bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_text_bytes, 5));
         // Streamed posting block/impact navigation still scales with a term's
         // document frequency. Cover its compact tables even though coordinate
         // plans and position payloads spill to bounded private runs.

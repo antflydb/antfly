@@ -62,6 +62,7 @@ const PendingTextMerge = struct {
     catalog: PublicationCatalog,
     name: []const u8,
     task: IndexManager.TextMergeTask,
+    scratch: segment_mod.MergeScratchOptions,
     config_hash: u64,
     input_uses: std.ArrayListUnmanaged(segment_mod.SegmentSource) = .empty,
     thread: ?std.Thread = null,
@@ -98,7 +99,7 @@ const PendingTextMerge = struct {
             }
             if (test_private_merge_budget_failures.swap(0, .acq_rel) != 0) return error.ResourceBudgetExceeded;
         }
-        var result = try IndexManager.executePrivateTextMergeTask(&self.task, &self.canceled);
+        var result = try IndexManager.executePrivateTextMergeTask(&self.task, self.scratch, &self.canceled);
         errdefer result.deinit();
         if (result.run) |output| {
             self.key_range = try persistent_mod.PersistentIndex.privateMergeKeyRange(self.task.mergeAllocator(), (try output.sealedView()).source, &self.canceled);
@@ -2592,15 +2593,10 @@ pub const Owner = struct {
 
     fn noteMaintenanceFailure(self: *Owner, err: anyerror, table_id: u64, phase: MaintenanceFailurePhase) void {
         self.publication_stats.maintenance_errors +|= 1;
-        switch (err) {
-            error.UnexpectedNativePageKind, error.InvalidNativePageKind, error.InvalidNativePageMagic, error.InvalidNativePageLength, error.NativePageChecksumMismatch, error.InvalidNativeValueChain, error.InvalidNativePageChain, error.TruncatedNativePage, error.TruncatedNativeValuePage, error.TruncatedNativeFile, error.InvalidPageId => {
-                self.publication_stats.maintenance_page_errors +|= 1;
-                // Later successful work must not hide a failed storage-page
-                // read. This bounded diagnostic remains visible without the
-                // per-operation benchmark tracing switch.
-                std.log.warn("antfly_native_maintenance_page_failure phase={s} error={s}", .{ @tagName(phase), @errorName(err) });
-            },
-            else => {},
+        if (@import("antfly_runtime_abi").error_abi.isNativePageFailure(err)) {
+            self.publication_stats.maintenance_page_errors +|= 1;
+            // A later retry cannot erase evidence of a failed storage read.
+            std.log.warn("antfly_native_maintenance_page_failure phase={s} error={s}", .{ @tagName(phase), @errorName(err) });
         }
         switch (phase) {
             inline else => |kind| @field(self.publication_stats.maintenance_failures, @tagName(kind)) +|= 1,
@@ -3035,26 +3031,42 @@ pub const Owner = struct {
             }
         }
         if (!admission_held) self.gate.mutex.unlock(h.handleLockIo());
+        var scratch: segment_mod.MergeScratchOptions = undefined;
+        var config_hash: u64 = undefined;
+        var scratch_directory: ?[]u8 = null;
+        defer if (scratch_directory) |directory| alloc.free(directory);
         try database.lockApplyForPortableRuntime();
-        var task = database.core.index_manager.beginTextMergeTaskAboveSegmentCount(minimum_segments) catch |err| {
-            database.core.unlockApply();
-            return err;
-        } orelse {
-            database.core.unlockApply();
-            return false;
+        var task = capture: {
+            defer database.core.unlockApply();
+            var captured = (try database.core.index_manager.beginTextMergeTaskAboveSegmentCount(minimum_segments)) orelse return false;
+            errdefer {
+                database.core.index_manager.cancelTextMergeTask(&captured);
+                captured.deinit(alloc);
+            }
+            // Copy every mutable-catalog borrow before releasing apply. The
+            // resource manager and IO belong to the retained runtime owner;
+            // the path bytes belong to the pending job's arena below.
+            config_hash = h.db_mod.types.indexConfigHash(database.core.index_manager.textIndexEntry(captured.index_name).?.config);
+            scratch_directory = try alloc.dupe(u8, captured.persistent.privateScratchDirectory(".") orelse return error.Unsupported);
+            scratch = .{
+                .io = captured.persistent.io orelse return error.Unsupported,
+                .directory = scratch_directory.?,
+                .resource_manager = captured.persistent.writer.resource_manager,
+            };
+            // Fresh runtimes reconstruct deletion deltas from current active
+            // inputs at publication; no scheduler registration stays borrowed.
+            database.core.index_manager.cancelTextMergeTask(&captured);
+            break :capture captured;
         };
-        // Fresh runtimes reconstruct deletion deltas from the current active
-        // inputs at publication; do not keep scheduler registrations borrowed.
-        database.core.index_manager.cancelTextMergeTask(&task);
-        database.core.unlockApply();
         var task_owned = true;
         errdefer if (task_owned) task.deinit(alloc);
         const pending = try alloc.create(PendingTextMerge);
-        pending.* = .{ .owner = self, .root = root, .database = database, .arena = .init(alloc), .catalog = catalog.*, .name = undefined, .task = task, .config_hash = h.db_mod.types.indexConfigHash(database.core.index_manager.textIndexEntry(task.index_name).?.config) };
+        pending.* = .{ .owner = self, .root = root, .database = database, .arena = .init(alloc), .catalog = catalog.*, .name = undefined, .task = task, .scratch = scratch, .config_hash = config_hash };
         task_owned = false;
         errdefer pending.deinit();
         const owned = pending.arena.allocator();
         pending.name = try owned.dupe(u8, name);
+        pending.scratch.directory = try owned.dupe(u8, scratch.directory);
         for (&pending.catalog.paths, catalog.paths) |*path, original| path.* = try owned.dupe(u8, original);
         try pending.input_uses.ensureTotalCapacity(alloc, task.source.len);
         for (task.merge_indices) |index| {
@@ -3092,6 +3104,17 @@ pub const Owner = struct {
         defer if (!admission_held) self.gate.mutex.unlock(h.handleLockIo());
         const schedule = self.maintenance_schedules.getPtr(.{ .table_id = pending.database.core.identity_namespace.table_id, .incarnation = pending.database.root_incarnation }) orelse return;
         if (failed) {
+            if (qualificationMetricsEnabled()) {
+                const memory = pending.task.memoryObservation();
+                std.log.info("antfly_bench_text_merge_budget_refusal sources={d} reserved_bytes={d} peak_task_bytes={d} denied={any} phase={s}", .{
+                    pending.task.source.len,
+                    memory.reserved_bytes,
+                    memory.peak_task_bytes,
+                    memory.denied,
+                    if (pending.failure != null) "prepare" else if (pending.publication != null) "publication" else "staging",
+                });
+            }
+
             if (schedule.text_merge_caps.count() >= 64) schedule.text_merge_caps.clearRetainingCapacity();
             try schedule.text_merge_caps.put(alloc, pending.config_hash, @intCast(@max(2, pending.task.source.len / 2)));
             // The failed private worker still owes a merge. Recording its
@@ -3973,7 +3996,10 @@ pub const Owner = struct {
         // providers, replay, relational sweeps or status snapshot publication.
         const source_more = run_source and (pending or projected or publication.index_inputs_changed or maintenance_error != null);
         const source_completed = run_source and maintenance_error == null and !source_capacity_yield;
-        const source_advanced = if (source_completed) replay_progress.?.advanced(database) else false;
+        // Another consumer may have advanced before a sibling capacity yield.
+        // Its durable fragment/coverage is useful progress even though the
+        // complete source round must remain pending.
+        const source_advanced = if (run_source and maintenance_error == null) replay_progress.?.advanced(database) else false;
         // The schedule map can grow while the owner gate is released.
         var artifact_more = !run_database and captured_artifact_pending;
         var artifact_delay_ns: u64 = 100 * std.time.ns_per_ms;
@@ -4028,27 +4054,31 @@ pub const Owner = struct {
             };
             artifact_more = retirement_more;
             pending = pending or retirement_more;
+            // Capacity-restoring construction is independent of optional
+            // control/LSM service. Capture it first: a graph reader fence or
+            // another optional service refusal must not prevent the text
+            // merge that makes the source and its journal credits runnable.
+            if (maintenance_error == null and self.pending_text_merge == null) {
+                const started = self.beginPendingTextMerge(root, database, publication_name, &catalog.?, 0) catch |err| failed: {
+                    maintenance_error = err;
+                    maintenance_error_phase = .artifacts;
+                    break :failed false;
+                };
+                artifact_more = artifact_more or started;
+            }
+            if (self.pending_text_merge) |active| {
+                if (std.mem.eql(u8, active.name, publication_name)) artifact_more = true;
+            }
             const more = if (serving_physical_serviced) serving_index_more else database.runBackgroundTurnWithCancellation(cancellation, .index_storage) catch |err| blk: {
-                maintenance_error = err;
-                maintenance_error_phase = .artifacts;
+                if (maintenance_error == null) {
+                    maintenance_error = err;
+                    maintenance_error_phase = .artifacts;
+                }
                 break :blk true;
             };
             artifact_more = artifact_more or more;
-            pending = pending or more;
+            pending = pending or artifact_more;
             retain_artifact_runtime = more and maintenance_error == null;
-            if (maintenance_error == null) {
-                if (self.pending_text_merge == null and maintenance_error == null) {
-                    const started = self.beginPendingTextMerge(root, database, publication_name, &catalog.?, 0) catch |err| failed: {
-                        maintenance_error = err;
-                        maintenance_error_phase = .artifacts;
-                        break :failed false;
-                    };
-                    artifact_more = artifact_more or started;
-                }
-                if (self.pending_text_merge) |active| {
-                    if (std.mem.eql(u8, active.name, publication_name)) artifact_more = true;
-                }
-            }
             if (!retirement_more and !group_state.control_maintenance_pending) {
                 if (database.core.index_manager.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay| {
                     artifact_delay_ns = delay;
@@ -6993,6 +7023,41 @@ fn seedPausedPrivateMergeFixture(fixture: *AdmissionFollowupFixture, table_name:
         try std.testing.expect(pending.root.maintenance_runtime_references.load(.acquire) >= 2);
     try std.testing.expect(!pending.done.load(.acquire));
     return pending;
+}
+
+test "capi native private text construction owns scratch across inline catalog relocation" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("private-merge-owned-scratch", 5000, .batch);
+    defer fixture.deinit();
+    defer test_pause_private_merge.store(false, .release);
+    const pending = try seedPausedPrivateMergeWithDeletes(&fixture, null, false);
+    const manager = pending.database.core.index_manager;
+    {
+        try pending.database.lockApplyForPortableRuntime();
+        defer pending.database.core.unlockApply();
+        manager.catalog_mutex.lockExclusive();
+        defer manager.catalog_mutex.unlockExclusive();
+        // Mirror the backing-array relocation caused by an unrelated index
+        // creation. The worker is paused after capture, so its old persistent
+        // pointer must never be consulted when construction resumes.
+        const old = manager.text_indexes.allocatedSlice();
+        const replacement = try manager.alloc.alloc(@TypeOf(old[0]), old.len + 1);
+        @memcpy(replacement[0..manager.text_indexes.items.len], manager.text_indexes.items);
+        manager.text_indexes.items = replacement[0..manager.text_indexes.items.len];
+        manager.text_indexes.capacity = replacement.len;
+        manager.alloc.free(old);
+    }
+    test_pause_private_merge.store(false, .release);
+    for (0..1000) |_| {
+        if (pending.done.load(.acquire)) break;
+        try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(pending.done.load(.acquire));
+    if (pending.failure) |err| return err;
+    try std.testing.expect(pending.result != null);
+    try std.testing.expect(pending.result.?.run != null);
+    fixture.connection.owner.discardPendingTextMerge();
+    try std.testing.expect(fixture.connection.owner.pending_text_merge == null);
 }
 
 test "capi native asynchronous text merge coowns reusable runtimes through replay and cache eviction" {
@@ -11676,6 +11741,43 @@ test "capi native detached source preparation does not require a stale allocator
     try std.testing.expect((try current.owned_lite_backend.?.native_docstore.?.file.check()).valid);
 }
 
+test "capi native a parked text consumer does not starve independent replay" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("independent-replay-consumers", 5000, .batch);
+    defer fixture.deinit();
+    defer test_pause_private_merge.store(false, .release);
+    const owner = fixture.connection.owner;
+    owner.test_text_merge_segment_limit = 12;
+    defer owner.test_text_merge_segment_limit = null;
+    _ = try seedPausedPrivateMergeWithDeletes(&fixture, null, false);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"healthy\",\"type\":\"full_text\"}")));
+    var initial: u32 = 0;
+    {
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const root = try owner.refresh();
+        initial = root.db.core.index_manager.textIndexEntry("healthy").?.persistent.snapshot().liveDocCount();
+    }
+    try fixture.writeReplaySource(.{ .writes = &.{.{ .key = "independent-source", .value = "{\"text\":\"healthy sibling must advance\"}" }}, .sync_level = .write });
+    for (0..64) |_| {
+        _ = try owner.maintenanceTurn();
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const root = try owner.refresh();
+        if (root.db.core.index_manager.textIndexEntry("healthy").?.persistent.snapshot().liveDocCount() == initial + 1) break;
+    }
+    try std.testing.expect(owner.publication_stats.replay_capacity_yields != 0);
+    try std.testing.expectEqual(@as(u64, 0), owner.publication_stats.text_merge_jobs_applied);
+    var lease = try fixture.connection.acquire();
+    defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    defer lease.close();
+    const root = try owner.refresh();
+    try std.testing.expectEqual(initial + 1, root.db.core.index_manager.textIndexEntry("healthy").?.persistent.snapshot().liveDocCount());
+    try std.testing.expect((try root.owned_lite_backend.?.native_docstore.?.file.check()).valid);
+}
+
 test "capi native replay capacity yield starts a merge before any result is pending" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("replay-capacity-starts-merge", 5000, .batch);
@@ -11708,6 +11810,14 @@ test "capi native replay capacity yield starts a merge before any result is pend
     const ColdSource = struct {
         owner: *Owner,
         cleared: bool = false,
+        fn afterCapture(_: *anyopaque, root: *h.Handle) void {
+            // Optional graph cleanup cannot run until its independent reader
+            // fence opens. Keep that service refused while text needs merge
+            // capacity: neither its failure nor its retry cursor may starve
+            // the text lane that returns replay credits.
+            root.db.core.index_manager.graph_retirement_closed.store(true, .release);
+            root.db.borrowed_group_source_state.?.control_maintenance_slot = 5;
+        }
         fn beforeCapture(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const pending = self.owner.pending_text_merge orelse return;
@@ -11723,6 +11833,8 @@ test "capi native replay capacity yield starts a merge before any result is pend
     };
     var cold: ColdSource = .{ .owner = owner };
     owner.test_before_maintenance_capture = .{ .ptr = &cold, .notify = ColdSource.beforeCapture };
+    owner.test_after_capture = .{ .ptr = &cold, .notify = ColdSource.afterCapture };
+    defer owner.test_after_capture = null;
     defer owner.test_before_maintenance_capture = null;
     for (0..512) |_| {
         _ = try owner.maintenanceTurn();
@@ -11730,6 +11842,8 @@ test "capi native replay capacity yield starts a merge before any result is pend
         try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
     }
     owner.test_before_maintenance_capture = null;
+    owner.test_after_capture = null;
+    try std.testing.expectEqual(@as(u64, 0), owner.publication_stats.maintenance_failures.artifacts);
     if (!cold.cleared) return error.TestColdSourceQueueWasNotCleared;
     if (owner.publication_stats.text_merge_jobs_applied == 0) return error.TestColdSourceMergeDidNotPublish;
     if (!owner.runnable_sources.pending(h.handleLockIo())) return error.TestCapacityRestoredWithoutSourceWake;
