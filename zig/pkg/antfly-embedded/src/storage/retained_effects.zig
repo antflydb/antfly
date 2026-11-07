@@ -907,7 +907,7 @@ pub const Capture = struct {
                     else => return err,
                 };
                 if (raw_timestamp) |raw| {
-                    if (raw.len != 8) return error.RetainedEffectsCorrupt;
+                    if (raw.len != 8 and raw.len != 24) return error.RetainedEffectsCorrupt;
                     timestamp.* = std.mem.readInt(u64, raw[0..8], .little);
                 }
                 // Typed query/TTL readers use the packed row metadata. Refuse

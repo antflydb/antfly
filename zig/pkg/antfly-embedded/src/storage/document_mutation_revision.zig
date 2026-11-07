@@ -112,7 +112,7 @@ pub fn loadWindowWithRevisions(txn: anytype, a: std.mem.Allocator, physical: []c
             revisions[entry.row] = std.mem.readInt(u64, raw[0..8], .little);
         },
         .timestamp => {
-            if (raw.len != 8) return error.InvalidTimestamp;
+            if (raw.len != 8 and raw.len != 24) return error.InvalidTimestamp;
             timestamps[entry.row] = std.mem.readInt(u64, raw[0..8], .little);
         },
     };

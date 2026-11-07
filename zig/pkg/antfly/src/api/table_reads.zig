@@ -13765,6 +13765,7 @@ fn tryApplyProvisionedAlgebraicDistributedAggregations(
     defer if (pipeline_requests.len > 0) alloc.free(pipeline_requests);
     var pipeline_filled: usize = 0;
 
+    var histogram_output_budget = db_mod.aggregations.contract.HistogramOutputBudget{};
     for (requests) |request| {
         if (db_mod.aggregations.isPipelineAggregation(request.type)) {
             pipeline_requests[pipeline_filled] = request;
@@ -13775,7 +13776,7 @@ fn tryApplyProvisionedAlgebraicDistributedAggregations(
         defer request_plan.deinit(alloc);
         var merged = (try collectProvisionedAlgebraicDistributedPartials(self, alloc, group_ids, table_name, req, first_entry.index.name, request_plan.access_paths, request_plan.asProgram(), first_db, required_identity_generations)) orelse return false;
         defer merged.deinit(alloc);
-        var result = (try algebraicAggregationFromDistributedPartialsAlloc(alloc, first_entry.index, request, constraints, merged)) orelse return false;
+        var result = (try algebraicAggregationFromDistributedPartialsAlloc(alloc, first_entry.index, request, constraints, merged, &histogram_output_budget)) orelse return false;
         var result_owned = true;
         errdefer if (result_owned) result.deinit(alloc);
         try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, &result);
@@ -14068,6 +14069,7 @@ fn applyHostedAlgebraicDistributedAggregationsWithPlanner(
     defer if (pipeline_requests.len > 0) alloc.free(pipeline_requests);
     var pipeline_filled: usize = 0;
 
+    var histogram_output_budget = db_mod.aggregations.contract.HistogramOutputBudget{};
     for (requests) |request| {
         if (db_mod.aggregations.isPipelineAggregation(request.type)) {
             pipeline_requests[pipeline_filled] = request;
@@ -14078,7 +14080,7 @@ fn applyHostedAlgebraicDistributedAggregationsWithPlanner(
         defer request_plan.deinit(alloc);
         var merged = (try collectHostedAlgebraicDistributedPartials(self, alloc, group_ids, table_name, req, planner_index_name, request_plan.access_paths, request_plan.asProgram(), consistency, required_identity_generations)) orelse return false;
         defer merged.deinit(alloc);
-        var result = (try algebraicAggregationFromDistributedPartialsAlloc(alloc, planner_index, request, constraints, merged)) orelse return false;
+        var result = (try algebraicAggregationFromDistributedPartialsAlloc(alloc, planner_index, request, constraints, merged, &histogram_output_budget)) orelse return false;
         var result_owned = true;
         errdefer if (result_owned) result.deinit(alloc);
         try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, &result);
@@ -14831,6 +14833,7 @@ fn algebraicAggregationFromDistributedPartialsAlloc(
     request: db_mod.aggregations.SearchAggregationRequest,
     constraints: []const db_mod.aggregations.FixedConstraint,
     merged: db_mod.algebraic.distributed.MergeSet,
+    histogram_output_budget: *db_mod.aggregations.contract.HistogramOutputBudget,
 ) !?db_mod.aggregations.SearchAggregationResult {
     if (std.mem.eql(u8, request.type, "stats")) {
         return try db_mod.aggregations.algebraicStatsAggregationFromDistributedPartialsAlloc(alloc, index, request, constraints, merged);
@@ -14842,7 +14845,7 @@ fn algebraicAggregationFromDistributedPartialsAlloc(
         return try db_mod.aggregations.algebraicCardinalityAggregationFromDistributedPartialsAlloc(alloc, request, merged);
     }
     if (std.mem.eql(u8, request.type, "date_histogram")) {
-        return try db_mod.aggregations.algebraicDateHistogramAggregationFromDistributedPartialsAlloc(alloc, index, request, constraints, merged);
+        return try db_mod.aggregations.algebraicDateHistogramAggregationFromDistributedPartialsWithContextAlloc(alloc, index, request, constraints, merged, .{ .histogram_output_budget = histogram_output_budget });
     }
     if (std.mem.eql(u8, request.type, "histogram")) {
         return try db_mod.aggregations.algebraicHistogramAggregationFromDistributedPartialsAlloc(alloc, index, request, constraints, merged);

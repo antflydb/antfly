@@ -240,10 +240,11 @@ test "aggregation contract preserves candidate budget identity" {
 }
 
 /// Shared output work limit, independent of how many source documents exist.
-pub const GapFillBudget = struct {
+pub const HistogramOutputBudget = struct {
     remaining_cells: usize = 100_000,
     pub fn charge(self: *@This(), buckets: usize, metrics: usize) !void {
-        const cells = std.math.mul(usize, buckets, metrics + 1) catch return error.QueryCandidateBudgetExceeded;
+        const width = std.math.add(usize, metrics, 1) catch return error.QueryCandidateBudgetExceeded;
+        const cells = std.math.mul(usize, buckets, width) catch return error.QueryCandidateBudgetExceeded;
         if (cells > self.remaining_cells) return error.QueryCandidateBudgetExceeded;
         self.remaining_cells -= cells;
     }

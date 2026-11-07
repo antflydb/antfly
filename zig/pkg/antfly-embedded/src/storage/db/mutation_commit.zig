@@ -165,6 +165,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const directGraphNeighborContextHintsAlloc = S.directGraphNeighborContextHintsAlloc;
         const documentRangeLowerAlloc = S.documentRangeLowerAlloc;
         const encodeTimestampValue = S.encodeTimestampValue;
+        const encodeDocumentTimestampValue = S.encodeDocumentTimestampValue;
         const freeOwnedKeySlice = S.freeOwnedKeySlice;
         const generatedPrecomputeModeForSyncLevel = S.generatedPrecomputeModeForSyncLevel;
         const graphCleanupReplayWritesAlloc = S.graphCleanupReplayWritesAlloc;
@@ -1673,15 +1674,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         const logical = try std.json.parseFromSliceLeaky(std.json.Value, group_alloc, cleaned, .{});
                         group_changes[i] = try plan.prepareRow(group_alloc, write.key, logical);
                     };
-                    const resolved_write_timestamp_ns: ?u64 = if (!use_preprepared_rows and shouldWriteTimestamp(write.key))
-                        (if (opts.restore_timestamps) |timestamps| timestamps.get(write.key) else null) orelse if (prepared_relational) |*prepared|
-                            try resolveWriteTimestampFromValue(self, batch_timestamp_ns, prepared.parsedValue())
+                    const restored_version = if (opts.restore_timestamps) |timestamps| timestamps.get(write.key) else null;
+                    const resolved_write_timestamp_ns: ?i128 = if (!use_preprepared_rows and shouldWriteTimestamp(write.key))
+                        if (prepared_relational) |*prepared|
+                            if (restored_version) |version| @as(i128, version) else try resolveWriteTimestampFromValue(self, batch_timestamp_ns, prepared.parsedValue())
                         else
                             try resolveWriteTimestampNs(self, batch_timestamp_ns, write.value)
                     else
                         null;
                     if (!use_preprepared_rows) if (prepared_relational) |*prepared|
-                        try prepared.finalizeMetadata(resolved_write_timestamp_ns orelse 0);
+                        try prepared.finalizeMetadata(std.math.cast(u64, resolved_write_timestamp_ns orelse 0) orelse return error.InvalidArgument);
                     // Covering values carry the authoritative full-row timestamp
                     // and semantic hash. Prepare/stage fallback index effects only
                     // after those metadata fields have been finalized.
@@ -1743,7 +1745,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         const timestamp_start_ns = monotonicTimeNs();
                         const timestamp_key = if (use_preprepared_rows) preparation.effects.?[i].timestamp_key.? else try makeTimestampKey(S.ownerField(self, "alloc").*, write.key);
                         const timestamp_value = if (use_preprepared_rows) preparation.effects.?[i].timestamp_value.? else blk: {
-                            break :blk try encodeTimestampValue(S.ownerField(self, "alloc").*, resolved_write_timestamp_ns.?);
+                            break :blk if (prepared_relational != null)
+                                try encodeTimestampValue(S.ownerField(self, "alloc").*, @intCast(resolved_write_timestamp_ns.?))
+                            else
+                                try encodeDocumentTimestampValue(S.ownerField(self, "alloc").*, batch_timestamp_ns, resolved_write_timestamp_ns.?, restored_version);
                         };
                         try write_buffers.timestamp_writes.append(S.ownerField(self, "alloc").*, .{
                             .key = timestamp_key,

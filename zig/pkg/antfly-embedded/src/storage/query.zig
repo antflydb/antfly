@@ -534,9 +534,9 @@ pub fn executeTemporalQuery(alloc: std.mem.Allocator, db: *db_mod.DB, body: []co
     const time = @import("antfly_platform").time;
     if (schema) |view| if (!contract.temporalRangeVisibleThroughDeadline(req, constraints, view.tableSchema().ttl_field, view.visibilityTtlDurationNs(), time.realtimeNs(), time.monotonicNs())) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_ttl_visibility, .{});
     const signature = try std.json.Stringify.valueAlloc(a, .{ .name = entry.index.name, .config = entry.index.config() }, .{});
-    var budget = @import("db/aggregations_contract.zig").GapFillBudget{};
+    var budget = @import("db/aggregations_contract.zig").HistogramOutputBudget{};
     var scan_budget = db_mod.algebraic.index.TemporalScanBudget{ .control = execution };
-    const ctx: db_mod.aggregations.Context = .{ .control = execution, .gap_fill_budget = &budget, .temporal_materializations_exact = true, .temporal_scan_budget = &scan_budget };
+    const ctx: db_mod.aggregations.Context = .{ .control = execution, .histogram_output_budget = &budget, .temporal_materializations_exact = true, .temporal_scan_budget = &scan_budget };
     if (wire.shards_json) |json| {
         if (json.len > contract.temporal_max_bytes) return std.json.Stringify.valueAlloc(alloc, contract.TemporalDecline.scan_temporal_budget, .{});
         const shards = try std.json.parseFromSliceLeaky([]const contract.TemporalShard, a, json, .{});

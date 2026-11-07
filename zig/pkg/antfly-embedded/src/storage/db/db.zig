@@ -9948,11 +9948,11 @@ pub const DB = struct {
         if (!internal_keys.isInternalUserKey(key)) {
             const ttl_duration_ns = if (schema_view) |view| view.visibilityTtlDurationNs() else 0;
             if (ttl_duration_ns != 0) {
-                const timestamp_ns = if (internal_keys.isRelationalRowKey(store_key))
+                const timestamp_ns: ?i128 = if (internal_keys.isRelationalRowKey(store_key))
                     try relational_store.rowWriteTimestampNs(raw)
                 else
-                    try self.getTimestamp(alloc, key);
-                if (timestamp_ns != 0 and ttl_mod.isExpired(timestamp_ns, ttl_duration_ns, currentTimeNs())) {
+                    try ttl_mod.readSourceTimestamp(self.core.store, alloc, key);
+                if (timestamp_ns != null and ttl_mod.isExpired(timestamp_ns.?, ttl_duration_ns, currentTimeNs())) {
                     try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
                     return null;
                 }
@@ -19773,11 +19773,11 @@ pub const DB = struct {
         if (!internal_keys.isInternalUserKey(key)) {
             const ttl_duration_ns = if (schema_view) |view| view.visibilityTtlDurationNs() else 0;
             if (ttl_duration_ns != 0) {
-                const timestamp_ns = if (ordinal_row) |row|
+                const timestamp_ns: ?i128 = if (ordinal_row) |row|
                     row.writeTimestampNs()
                 else
-                    primary_timestamp orelse try lookupSnapshotTimestamp(alloc, key, probe);
-                if (timestamp_ns != 0 and ttl_mod.isExpired(timestamp_ns, ttl_duration_ns, currentTimeNs())) return null;
+                    try lookupSnapshotTtlTimestamp(alloc, key, probe);
+                if (timestamp_ns != null and ttl_mod.isExpired(timestamp_ns.?, ttl_duration_ns, currentTimeNs())) return null;
             }
         }
         try checkLookupOptionsActive(opts);
@@ -19832,6 +19832,16 @@ pub const DB = struct {
         return .{ .json = stored, .version = version, .expected_content_digest = digest };
     }
 
+    fn lookupSnapshotTtlTimestamp(alloc: Allocator, key: []const u8, probe: *docstore_mod.DocStore.Txn) !?i128 {
+        const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, key);
+        defer alloc.free(timestamp_key);
+        const bytes = probe.get(timestamp_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return ttl_mod.sourceTimestamp(bytes) orelse error.InvalidTimestamp;
+    }
+
     fn lookupSnapshotTimestamp(alloc: Allocator, key: []const u8, probe: *docstore_mod.DocStore.Txn) !u64 {
         const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, key);
         defer alloc.free(timestamp_key);
@@ -19840,7 +19850,7 @@ pub const DB = struct {
             else => return err,
         };
         const bytes = timestamp orelse return 0;
-        if (bytes.len != 8) return error.InvalidTimestamp;
+        if (bytes.len != 8 and bytes.len != 24) return error.InvalidTimestamp;
         return std.mem.readInt(u64, bytes[0..8], .little);
     }
 
@@ -41885,7 +41895,7 @@ pub const DB = struct {
                 else
                     null;
                 if (state.ttl_duration_ns != 0) {
-                    const timestamp = if (relational)
+                    const timestamp: ?i128 = if (relational)
                         ordinal_row.?.writeTimestampNs()
                     else blk: {
                         state.ttl_key_scratch.clearRetainingCapacity();
@@ -41896,11 +41906,11 @@ pub const DB = struct {
                             else => return err,
                         };
                         break :blk if (timestamp_bytes) |value|
-                            if (value.len >= @sizeOf(u64)) std.mem.readInt(u64, value[0..8], .little) else 0
+                            ttl_mod.sourceTimestamp(value)
                         else
-                            0;
+                            null;
                     };
-                    if (timestamp != 0 and ttl_mod.isExpired(timestamp, state.ttl_duration_ns, state.now_ns))
+                    if (timestamp != null and ttl_mod.isExpired(timestamp.?, state.ttl_duration_ns, state.now_ns))
                         return .@"continue";
                 }
 
@@ -45086,7 +45096,7 @@ pub const DB = struct {
         var kept = std.ArrayListUnmanaged([]const u8).empty;
         defer kept.deinit(alloc);
         for (doc_ids, timestamps) |doc_id, ts| {
-            if (ts != 0 and ttl_mod.isExpired(ts, duration_ns, expiry_now)) continue;
+            if (ts != null and ttl_mod.isExpired(ts.?, duration_ns, expiry_now)) continue;
             try kept.append(alloc, doc_id);
         }
         return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, kept.items, generation);
@@ -51519,6 +51529,7 @@ const ttlTimestampNsFromJsonValue = local_mutation.ttlTimestampNsFromJsonValue;
 const ttlTimestampNsFromString = local_mutation.ttlTimestampNsFromString;
 
 const encodeTimestampValue = local_mutation.encodeTimestampValue;
+const encodeDocumentTimestampValue = local_mutation.encodeDocumentTimestampValue;
 
 fn ttlDurationNs(self: *DB) u64 {
     var schema_view = self.core.acquireSchemaView();
@@ -51529,15 +51540,14 @@ fn ttlDurationNs(self: *DB) u64 {
 fn isExpiredDocumentKey(self: *DB, alloc: Allocator, key: []const u8) !bool {
     const duration_ns = ttlDurationNs(self);
     if (duration_ns == 0) return false;
-    const ts = try self.getTimestamp(alloc, key);
-    if (ts == 0) return false;
+    const ts = (try ttl_mod.readSourceTimestamp(self.core.store, alloc, key)) orelse return false;
     return ttl_mod.isExpired(ts, duration_ns, currentTimeNs());
 }
 
-fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]u64 {
-    const timestamps = try alloc.alloc(u64, keys.len);
+fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]?i128 {
+    const timestamps = try alloc.alloc(?i128, keys.len);
     errdefer alloc.free(timestamps);
-    @memset(timestamps, 0);
+    @memset(timestamps, null);
     if (keys.len == 0) return timestamps;
 
     const PendingTimestampLoad = struct {
@@ -51580,8 +51590,7 @@ fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const
 
     for (pending.items, 0..) |item, i| {
         const raw = read_values[i] orelse continue;
-        if (raw.len != 8) continue;
-        timestamps[item.original_index] = std.mem.readInt(u64, raw[0..8], .little);
+        timestamps[item.original_index] = ttl_mod.sourceTimestamp(raw) orelse continue;
     }
     return timestamps;
 }
@@ -51715,8 +51724,7 @@ fn filterVisibleSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
     const timestamps = try loadDocumentTimestampsMany(self, alloc, parent_ids);
     defer alloc.free(timestamps);
     for (timestamps, 0..) |ts, i| {
-        if (ts == 0) continue;
-        keep[i] = !ttl_mod.isExpired(ts, duration_ns, expiry_now);
+        if (ts) |source| keep[i] = !ttl_mod.isExpired(source, duration_ns, expiry_now);
     }
     return keep;
 }
@@ -52622,7 +52630,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
             }
         }
         for (guard.candidates) |candidate| {
-            const current = (try ttl_mod.readTimestamp(ctx.store, ctx.alloc, candidate.key)) orelse continue;
+            const current = (try ttl_mod.readSourceTimestamp(ctx.store, ctx.alloc, candidate.key)) orelse continue;
             if (current != candidate.timestamp_ns or
                 !ttl_mod.isExpiredWithGrace(current, guard.duration_ns, guard.grace_period_ns, guard.now_ns)) continue;
             try eligible.append(ctx.alloc, candidate.key);
@@ -148340,4 +148348,40 @@ test "privacy protected hit hydration bounds row scratch and retains only select
         }
         std.debug.print("\nPrivacy projected hydration rows={d} peak_bytes={d}\n", .{ count, budget.peak_live_bytes });
     }
+}
+
+test "time series historical TTL sources preserve write versions and signed visibility" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("historical-ttl");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_field = "observed_at", .ttl_duration_ns = 40_000 * std.time.ns_per_day });
+    try db.batch(.{
+        .timestamp_ns = 12345,
+        .writes = &.{.{ .key = "historical", .value = "{\"observed_at\":\"1969-12-31T23:59:59Z\",\"v\":1}" }},
+    });
+    try std.testing.expectEqual(@as(u64, 12345), try db.getTimestamp(a, "historical"));
+    try std.testing.expectEqual(@as(?i128, -1_000_000_000), try ttl_mod.readSourceTimestamp(db.core.store, a, "historical"));
+    const value = (try db.get(a, "historical")) orelse return error.TestUnexpectedResult;
+    a.free(value);
+    var reading = (try db.lookup(a, "historical", .{})) orelse return error.TestUnexpectedResult;
+    defer reading.deinit(a);
+    try std.testing.expectEqual(@as(?u64, 12345), reading.version);
+    try db.setSchema(.{ .version = 2, .ttl_field = "observed_at", .ttl_duration_ns = std.time.ns_per_day });
+    try db.batch(.{
+        .timestamp_ns = 12346,
+        .writes = &.{.{ .key = "epoch", .value = "{\"observed_at\":\"1970-01-01T00:00:00Z\",\"v\":2}" }},
+    });
+    try std.testing.expect((try db.get(a, "historical")) == null);
+    try std.testing.expect((try db.lookup(a, "historical", .{})) == null);
+    try std.testing.expect((try db.get(a, "epoch")) == null);
+    var result = try db.search(a, .{ .query = .{ .match_all = {} }, .limit = 10 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+    try initStoppedTtlRuntimeForTest(&db, .{ .enabled = true, .batch_size = 8, .grace_period_ns = 0 });
+    try db.ttl_runtime.?.runOnce();
+    try db.runUntilIdle();
+    try std.testing.expect((try ttl_mod.readSourceTimestamp(db.core.store, a, "historical")) == null);
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(a, "epoch"));
 }

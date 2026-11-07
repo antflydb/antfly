@@ -958,7 +958,10 @@ def test_sdk_retention_preset_lifecycle(stateful_api, shards):
     finish_create_table(api, name, api._request("POST", f"/tables/{name}", config))
     start_seconds = int(time.time()) // 300 * 300
     start = datetime.fromtimestamp(start_seconds, UTC)
-    stamp = lambda value: value.isoformat().replace("+00:00", "Z")
+
+    def stamp(value):
+        return value.isoformat().replace("+00:00", "Z")
+
     documents = {
         "a": {
             "device_id": "sensor",
@@ -1050,3 +1053,197 @@ def test_sdk_retention_preset_lifecycle(stateful_api, shards):
         result
     )
     assert result["aggregations"]["series"].get("buckets", []) == [], result
+
+
+@pytest.mark.parametrize("shards", [1, 2])
+def test_sdk_nested_sql_and_json_paths_agree(stateful_api, shards):
+    api = stateful_api
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/time-series-sdk-nested.json").read_text()
+    )
+    config = copy.deepcopy(fixture["table"])
+    config["num_shards"] = shards
+    name = f"series_nested_{shards}_{time.time_ns()}"
+    finish_create_table(api, name, api._request("POST", f"/tables/{name}", config))
+
+    def reading(device, value, observed="2026-11-06T12:01:00Z"):
+        return {
+            "attrs": {
+                "device_id": device,
+                "region": "west",
+                "temperature": value,
+                "observed_at": observed,
+            }
+        }
+
+    api.batch_write(
+        name,
+        inserts={
+            "a": reading("sensor", 1),
+            "b": reading("sensor", 3),
+            "c": reading("sensor", 6, "2026-11-06T12:06:00Z"),
+            "other": reading("other", 999),
+            "null_measure": reading("sensor", None, "2026-11-06T12:11:00Z"),
+            "null_group": reading(None, 999),
+            "null_group_2": reading(None, 999),
+            "null_group_3": reading(None, 999),
+            "null_group_4": reading(None, 999),
+            "null_group_5": reading(None, 999),
+            "missing_measure": {
+                "attrs": {
+                    "device_id": "sensor",
+                    "region": "west",
+                    "observed_at": "2026-11-06T12:06:00Z",
+                }
+            },
+            "missing_group": {
+                "attrs": {
+                    "region": "west",
+                    "observed_at": "2026-11-06T12:01:00Z",
+                    "temperature": 999,
+                }
+            },
+        },
+        sync_level="full_index",
+    )
+    payload = api.post("/query", dict(fixture["query"], table=name))
+    result = payload.get("responses", [payload])[0]
+    groups = result["aggregations"]["series"]["buckets"]
+    assert len(groups) == 1
+    assert json.loads(groups[0]["key"]) == ["sensor", "west"]
+    points = groups[0]["sub_aggregations"]["points"]["buckets"]
+    expected = [
+        [
+            "sensor",
+            "west",
+            point["key"],
+            point["sub_aggregations"]["average"]["avg"]
+            if point["sub_aggregations"]["average"].get("count", 0)
+            else None,
+            point["sub_aggregations"]["total"]["value"]
+            if point["sub_aggregations"]["__antfly_series_count_total"].get("count", 0)
+            else None,
+            point["doc_count"],
+        ]
+        for point in points
+    ]
+    sql = dict(fixture["sql"])
+    sql["statement"] = sql["statement"].replace('"fixture"', f'"{name}"')
+    response = api._request("POST", "/sql", sql)
+    assert response.status_code == 200, response.text
+    actual = response.json()["rows"]
+    for row in actual:
+        row[2] = row[2].replace(".000000000Z", "Z")
+        row[-1] = int(row[-1])
+    assert actual == expected
+
+
+@pytest.mark.parametrize("shards", [1, 2])
+def test_populated_histogram_cannot_bypass_output_cell_budget(stateful_api, shards):
+    api = stateful_api
+    name = f"series_cell_budget_{shards}_{time.time_ns()}"
+    config = {"num_shards": shards, "schema": _schema()}
+    finish_create_table(api, name, api._request("POST", f"/tables/{name}", config))
+    from datetime import UTC, datetime, timedelta
+
+    start = datetime(2026, 11, 6, 12, tzinfo=UTC)
+
+    def stamp(value):
+        return value.isoformat().replace("+00:00", "Z")
+
+    api.batch_write(
+        name,
+        inserts={
+            str(i): {
+                "observed_at": stamp(start + timedelta(minutes=i)),
+                "temperature": 1,
+                "device_id": "sensor",
+                "region": "west",
+            }
+            for i in range(101)
+        },
+        sync_level="full_index",
+    )
+    for minimum in [0, 1]:
+        histogram = {
+            "type": "date_histogram",
+            "field": "observed_at",
+            "fixed_interval": "1m",
+            "min_doc_count": minimum,
+            "sub_aggregations": {
+                f"m{i}": {"type": "sum", "field": "temperature"} for i in range(1000)
+            },
+        }
+        response = api._request(
+            "POST",
+            "/query",
+            {"table": name, "limit": 0, "aggregations": {"points": histogram}},
+        )
+        assert response.status_code == 422, (
+            minimum,
+            response.status_code,
+            response.text[:500],
+        )
+        assert "query_candidate_budget_exceeded" in response.text
+
+
+@pytest.mark.parametrize("shards", [1, 2])
+def test_retention_accepts_and_expires_signed_historical_readings(stateful_api, shards):
+    api = stateful_api
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/time-series-sdk.json").read_text()
+    )
+    for retention, visible in [("40000d", True), ("7d", False)]:
+        config = copy.deepcopy(fixture["retentionTable"])
+        config["num_shards"] = shards
+        config["schema"]["ttl"]["duration"] = retention
+        name = f"series_signed_ttl_{shards}_{retention}_{time.time_ns()}"
+        finish_create_table(api, name, api._request("POST", f"/tables/{name}", config))
+        api.batch_write(
+            name,
+            inserts={
+                "historical": {
+                    "observed_at": "1969-12-31T23:59:59Z",
+                    "temperature": 1,
+                    "device_id": "sensor",
+                    "region": "west",
+                },
+                "epoch": {
+                    "observed_at": "1970-01-01T00:00:00Z",
+                    "temperature": 2,
+                    "device_id": "sensor",
+                    "region": "west",
+                },
+            },
+            sync_level="full_index",
+        )
+        payload = api.post("/query", {"table": name, "limit": 10})
+        result = payload.get("responses", [payload])[0]
+        assert result["hits"]["total"]["value"] == (2 if visible else 0), result
+        request = copy.deepcopy(fixture["query"])
+        request["table"] = name
+        bounds = {"start": "1969-12-31T23:55:00Z", "end": "1970-01-01T00:05:00Z"}
+        request["filter_query"]["conjuncts"][0].update(bounds)
+        request["aggregations"]["series"]["sub_aggregations"]["points"][
+            "date_bounds"
+        ] = bounds
+        answer = api.post("/query", request)
+        grouped = answer.get("responses", [answer])[0]["aggregations"]["series"].get(
+            "buckets", []
+        )
+        assert len(grouped) == (1 if visible else 0), grouped
+        if visible:
+            points = grouped[0]["sub_aggregations"]["points"]["buckets"]
+            assert [point["doc_count"] for point in points] == [1, 1]
+            assert [
+                point["sub_aggregations"]["total"]["value"] for point in points
+            ] == [1, 2]
+        sql = api._request(
+            "POST", "/sql", {"statement": f'SELECT COUNT(*) FROM "{name}"'}
+        )
+        assert sql.status_code == 200, sql.text
+        assert int(sql.json()["rows"][0][0]) == (2 if visible else 0)
+        if visible:
+            document, version = api.lookup_key_with_version(name, "historical")
+            assert document["observed_at"] == "1969-12-31T23:59:59Z"
+            assert version and int(version) > 0

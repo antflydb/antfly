@@ -529,6 +529,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const encodeStoreLookupKeyWithPinnedSchemaAlloc = commit.encodeStoreLookupKeyWithPinnedSchemaAlloc;
         pub const encodeThinReplayRecordPayload = commit.encodeThinReplayRecordPayload;
         pub const encodeTimestampValue = preparation.encodeTimestampValue;
+        pub const encodeDocumentTimestampValue = preparation.encodeDocumentTimestampValue;
         pub const enforcePortableRuntimeGateOptional = commit.enforcePortableRuntimeGateOptional;
         pub const envBoolEnabled = commit.envBoolEnabled;
         pub const extractAssetSourceValue = materialization.extractAssetSourceValue;

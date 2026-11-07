@@ -269,10 +269,9 @@ pub const Session = struct {
                         else => return err,
                     };
                     if (timestamp) |value| {
-                        if (value.len != 8) return error.InvalidData;
-                        const ns = std.mem.readInt(u64, value[0..8], .little);
-                        if (duration != 0 and ns != 0 and ttl.isExpired(ns, duration, session.now_ns)) return .@"continue";
-                        break :version ns;
+                        const source = ttl.sourceTimestamp(value) orelse return error.InvalidData;
+                        if (duration != 0 and ttl.isExpired(source, duration, session.now_ns)) return .@"continue";
+                        break :version std.mem.readInt(u64, value[0..8], .little);
                     }
                     break :version 0;
                 };

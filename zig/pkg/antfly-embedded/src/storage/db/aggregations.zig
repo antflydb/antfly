@@ -82,7 +82,7 @@ pub fn cloneSearchAggregationResultLabelsDeep(alloc: Allocator, result: *SearchA
 pub const containsDateHistogram = contract.containsDateHistogram;
 
 pub const Context = struct {
-    gap_fill_budget: ?*contract.GapFillBudget = null,
+    histogram_output_budget: ?*contract.HistogramOutputBudget = null,
     /// Scoped to one histogram; nested histograms establish their own reservation.
     histogram_budget_reserved: ?*bool = null,
     temporal_materializations_exact: bool = false,
@@ -178,9 +178,9 @@ pub fn computeSearchAggregations(
     if (comptime storage_engine.enabled) return @import("../aggregation_engine.zig").compute(alloc, requests, result, ctx);
     if (result.hits.len > max_aggregation_source_hits) return error.QueryCandidateBudgetExceeded;
     try contract.validateTemporalRequests(requests);
-    var budget = contract.GapFillBudget{};
+    var budget = contract.HistogramOutputBudget{};
     var controlled = ctx;
-    if (controlled.gap_fill_budget == null) controlled.gap_fill_budget = &budget;
+    if (controlled.histogram_output_budget == null) controlled.histogram_output_budget = &budget;
     return try computeSearchAggregationsAtDepth(alloc, requests, result, controlled, true);
 }
 
@@ -240,7 +240,9 @@ fn computeSingleAggregation(
     errdefer result.deinit(alloc);
     // Scan and temporal folds reserve and complete their primary extent before
     // pipelines. Never regenerate buckets removed by a pipeline afterward.
-    if (!reserved and request.date_bounds_start.len > 0) try completeDateHistogram(alloc, request, &result, controlled);
+    if (!reserved) {
+        if (request.min_doc_count == 0) try completeDateHistogram(alloc, request, &result, controlled) else try reserveDateHistogramOutput(request, result.buckets.len, controlled);
+    }
     return result;
 }
 
@@ -302,16 +304,46 @@ pub fn completeDateHistogram(alloc: Allocator, request: SearchAggregationRequest
             return left_ns < right_ns;
         }
     }.lessThan);
+    const completed = try buckets.toOwnedSlice(alloc);
     if (result.buckets.len > 0) alloc.free(result.buckets);
-    result.buckets = &.{};
-    result.buckets = try buckets.toOwnedSlice(alloc);
+    result.buckets = completed;
+}
+
+fn reserveDateHistogramOutput(request: SearchAggregationRequest, buckets: usize, ctx: Context) !void {
+    try ctx.control.check();
+    if (ctx.histogram_budget_reserved) |reserved| if (reserved.*) return;
+    var local = contract.HistogramOutputBudget{};
+    try (ctx.histogram_output_budget orelse &local).charge(buckets, request.aggregations.len);
+    if (ctx.histogram_budget_reserved) |reserved| reserved.* = true;
+}
+
+/// Legacy executors enumerate keys before constructing metric results. Reserve
+/// the final extent here, including explicit bounds, and complete it before pipelines.
+fn reserveLegacyHistogramOutput(a: Allocator, request: SearchAggregationRequest, keys: []const i128, ctx: Context) !void {
+    if (request.min_doc_count != 0) return reserveDateHistogramOutput(request, keys.len, ctx);
+    const extent = try dateHistogramExtentKeysAlloc(a, request, keys, ctx);
+    a.free(extent);
+}
+
+fn completeLegacyHistogramBuckets(a: Allocator, request: SearchAggregationRequest, buckets: *[]SearchAggregationBucket, ctx: Context) !void {
+    if (request.min_doc_count != 0) return;
+    var result: SearchAggregationResult = .{ .name = request.name, .field = request.field, .type = request.type, .buckets = buckets.* };
+    errdefer buckets.* = result.buckets;
+    var reserved = true; // reserveLegacyHistogramOutput already charged this extent.
+    var controlled = ctx;
+    controlled.histogram_budget_reserved = &reserved;
+    try completeDateHistogram(a, request, &result, controlled);
+    buckets.* = result.buckets;
 }
 
 /// Reserve the complete presentation extent before constructing metric results.
 /// Explicit bounds extend populated buckets; they never filter observations.
 fn dateHistogramExtentKeysAlloc(a: Allocator, request: SearchAggregationRequest, present: []const i128, ctx: Context) ![]i128 {
     try ctx.control.check();
-    if (request.min_doc_count != 0) return a.dupe(i128, present);
+    if (request.min_doc_count != 0) {
+        try reserveDateHistogramOutput(request, present.len, ctx);
+        return a.dupe(i128, present);
+    }
     const interval = try parseDateInterval(request);
     var first: ?i128 = if (present.len > 0) present[0] else null;
     var last: ?i128 = if (present.len > 0) present[present.len - 1] else null;
@@ -324,11 +356,7 @@ fn dateHistogramExtentKeysAlloc(a: Allocator, request: SearchAggregationRequest,
     }
     const keys = if (first) |lo| try fillDateHistogramBucketKeys(a, lo, last.?, interval) else try a.alloc(i128, 0);
     errdefer a.free(keys);
-    if (ctx.histogram_budget_reserved == null or !ctx.histogram_budget_reserved.?.*) {
-        var local = contract.GapFillBudget{};
-        try (ctx.gap_fill_budget orelse &local).charge(keys.len, request.aggregations.len);
-        if (ctx.histogram_budget_reserved) |reserved| reserved.* = true;
-    }
+    try reserveDateHistogramOutput(request, keys.len, ctx);
     return keys;
 }
 
@@ -618,7 +646,7 @@ fn computeAlgebraicAggregation(
     }
 
     if (std.mem.eql(u8, request.type, "date_histogram")) {
-        const maybe_result = computeAlgebraicDateHistogramAggregation(alloc, index, store, request, ctx.algebraic_constraints, ctx.identity_read_generation) catch |err| switch (err) {
+        const maybe_result = computeAlgebraicDateHistogramAggregation(alloc, index, store, request, ctx.algebraic_constraints, ctx.identity_read_generation, ctx) catch |err| switch (err) {
             error.UnsupportedAggregation => {
                 try recordAlgebraicBucketObservation(alloc, index, store, request, ctx.algebraic_constraints, "date_histogram_unsupported");
                 index.recordPlannerFallback("date_histogram_unsupported", null, null);
@@ -3833,9 +3861,25 @@ pub fn algebraicDateHistogramAggregationFromDistributedPartialsAlloc(
     constraints: []const FixedConstraint,
     merged: algebraic_mod.distributed.MergeSet,
 ) !?SearchAggregationResult {
-    var result = (try algebraicDateHistogramAggregationFromDistributedPartialsImpl(alloc, index, request, constraints, merged)) orelse return null;
+    return algebraicDateHistogramAggregationFromDistributedPartialsWithContextAlloc(alloc, index, request, constraints, merged, .{});
+}
+
+pub fn algebraicDateHistogramAggregationFromDistributedPartialsWithContextAlloc(
+    alloc: Allocator,
+    index: *algebraic_mod.index.Index,
+    request: SearchAggregationRequest,
+    constraints: []const FixedConstraint,
+    merged: algebraic_mod.distributed.MergeSet,
+    ctx: Context,
+) !?SearchAggregationResult {
+    var reserved = false;
+    var controlled = ctx;
+    controlled.histogram_budget_reserved = &reserved;
+    var result = (try algebraicDateHistogramAggregationFromDistributedPartialsImpl(alloc, index, request, constraints, merged, controlled)) orelse return null;
     errdefer result.deinit(alloc);
-    if (request.date_bounds_start.len > 0) try completeDateHistogram(alloc, request, &result, .{});
+    if (!reserved) {
+        if (request.min_doc_count == 0) try completeDateHistogram(alloc, request, &result, controlled) else try reserveDateHistogramOutput(request, result.buckets.len, controlled);
+    }
     return result;
 }
 
@@ -3845,6 +3889,7 @@ fn algebraicDateHistogramAggregationFromDistributedPartialsImpl(
     request: SearchAggregationRequest,
     constraints: []const FixedConstraint,
     merged: algebraic_mod.distributed.MergeSet,
+    ctx: Context,
 ) !?SearchAggregationResult {
     if (request.field.len == 0) return null;
     const bucket_name = algebraicBucketName(request) orelse return null;
@@ -3852,7 +3897,7 @@ fn algebraicDateHistogramAggregationFromDistributedPartialsImpl(
     const child_aggs = try splitAggregationRequests(alloc, request.aggregations);
     defer child_aggs.deinit(alloc);
     if (termsChildAggsAllCardinality(child_aggs.primary)) {
-        return try algebraicHistogramCardinalityAggregationFromDistributedPartialsAlloc(alloc, index, request, true, child_aggs.primary, child_aggs.pipeline, merged);
+        return try algebraicHistogramCardinalityAggregationFromDistributedPartialsAlloc(alloc, index, request, true, child_aggs.primary, child_aggs.pipeline, merged, ctx);
     }
     const time_field = index.fieldConfig(request.field, .time) orelse return null;
     for (child_aggs.primary) |child| {
@@ -3938,6 +3983,7 @@ fn algebraicDateHistogramAggregationFromDistributedPartialsImpl(
         break :blk keys;
     };
     defer if (bucket_keys.len > 0) alloc.free(bucket_keys);
+    try reserveLegacyHistogramOutput(alloc, request, bucket_keys, ctx);
 
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_keys.len);
     var buckets_filled: usize = 0;
@@ -3945,28 +3991,37 @@ fn algebraicDateHistogramAggregationFromDistributedPartialsImpl(
         for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
+    var candidate_index: usize = 0;
     for (bucket_keys, 0..) |bucket_key, idx| {
         const formatted = try formatRfc3339Bucket(alloc, bucket_key);
         defer alloc.free(formatted);
+        const key_json = try std.json.Stringify.valueAlloc(alloc, formatted, .{});
+        errdefer alloc.free(key_json);
         var candidate_opt: ?DateBucketAccum = null;
-        for (candidates) |candidate| {
-            if (std.mem.eql(u8, candidate.bucket_start, formatted)) {
-                candidate_opt = candidate;
-                break;
+        while (candidate_index < candidates.len) {
+            const candidate = candidates[candidate_index];
+            const candidate_ns = @import("../../datetime.zig").parseRfc3339ToSignedNs(candidate.bucket_start) orelse return error.InvalidAggregation;
+            if (candidate_ns < bucket_key) {
+                candidate_index += 1;
+                continue;
             }
+            if (candidate_ns == bucket_key) candidate_opt = candidate;
+            break;
         }
         const nested = if (candidate_opt) |candidate|
             try algebraicNestedMetricFoldResults(alloc, child_aggs.primary, candidate.child_folds)
         else
             try alloc.alloc(SearchAggregationResult, 0);
         buckets[idx] = .{
-            .key_json = try std.json.Stringify.valueAlloc(alloc, formatted, .{}),
+            .key_json = key_json,
             .count = if (candidate_opt) |candidate| candidate.count else 0,
             .aggregations = nested,
         };
         buckets_filled = idx + 1;
     }
 
+    try completeLegacyHistogramBuckets(alloc, request, &buckets, ctx);
+    buckets_filled = buckets.len;
     try applyPipelineAggregations(alloc, child_aggs.pipeline, &buckets);
     return .{
         .name = request.name,
@@ -4180,7 +4235,7 @@ pub fn algebraicHistogramAggregationFromDistributedPartialsAlloc(
         const child_aggs = try splitAggregationRequests(alloc, request.aggregations);
         defer child_aggs.deinit(alloc);
         if (termsChildAggsAllCardinality(child_aggs.primary)) {
-            return try algebraicHistogramCardinalityAggregationFromDistributedPartialsAlloc(alloc, index, request, false, child_aggs.primary, child_aggs.pipeline, merged);
+            return try algebraicHistogramCardinalityAggregationFromDistributedPartialsAlloc(alloc, index, request, false, child_aggs.primary, child_aggs.pipeline, merged, .{});
         }
     }
     const bucket_field = index.fieldConfig(request.field, .group) orelse {
@@ -4748,6 +4803,7 @@ fn algebraicHistogramCardinalityAggregationFromDistributedPartialsAlloc(
     child_requests: []const SearchAggregationRequest,
     pipeline_aggs: []const SearchAggregationRequest,
     merged: algebraic_mod.distributed.MergeSet,
+    ctx: Context,
 ) !?SearchAggregationResult {
     if (!termsChildAggsAllCardinality(child_requests)) return null;
     if (cardinalityChildrenRequireApproximate(child_requests)) return error.UnsupportedAggregation;
@@ -4824,6 +4880,7 @@ fn algebraicHistogramCardinalityAggregationFromDistributedPartialsAlloc(
         (if (numeric_keys.len > 0) numeric_keys.len else candidates.len);
     if (exceedsAlgebraicResultBucketLimit(index, bucket_count)) return error.AlgebraicResultBucketLimit;
 
+    if (date) try reserveDateHistogramOutput(request, bucket_count, ctx);
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_count);
     var buckets_filled: usize = 0;
     errdefer {
@@ -5812,7 +5869,7 @@ fn computeAlgebraicHistogramAggregation(
         defer algebraic_mod.distributed.freePartials(index.alloc, partials);
         var merged = try algebraic_mod.distributed.mergePartialsAlloc(alloc, partials);
         defer merged.deinit(alloc);
-        return try algebraicHistogramCardinalityAggregationFromDistributedPartialsAlloc(alloc, index, request, false, child_aggs.primary, child_aggs.pipeline, merged);
+        return try algebraicHistogramCardinalityAggregationFromDistributedPartialsAlloc(alloc, index, request, false, child_aggs.primary, child_aggs.pipeline, merged, .{});
     }
     for (child_aggs.primary) |child| {
         if (!isAlgebraicFoldMetricType(child.type)) return null;
@@ -6270,6 +6327,7 @@ fn computeAlgebraicDateHistogramAggregation(
     request: SearchAggregationRequest,
     constraints: []const FixedConstraint,
     generation: ?u64,
+    ctx: Context,
 ) !?SearchAggregationResult {
     if (request.field.len == 0) return null;
     const time_field = index.fieldConfig(request.field, .time) orelse return null;
@@ -6292,6 +6350,7 @@ fn computeAlgebraicDateHistogramAggregation(
             child_aggs.primary,
             child_aggs.pipeline,
             generation,
+            ctx,
         );
     }
     const child_metrics = try algebraicChildMetricsAlloc(alloc, child_aggs.primary);
@@ -6319,9 +6378,10 @@ fn computeAlgebraicDateHistogramAggregation(
                 derived,
                 plan_result.derived_child_join_folds,
                 generation,
+                ctx,
             );
         }
-        return try computeAdaptiveDateHistogramAggregation(alloc, index, store, request, time_field.name, bucket_name, interval, constraints, child_aggs.primary, child_aggs.pipeline);
+        return try computeAdaptiveDateHistogramAggregation(alloc, index, store, request, time_field.name, bucket_name, interval, constraints, child_aggs.primary, child_aggs.pipeline, ctx);
     };
     const child_plans = plan_result.child_metrics;
     if (try algebraicMaterializationExceedsScanBudget(index, store, count_plan.materialization.name)) return error.AlgebraicPlannerScanTooLarge;
@@ -6432,6 +6492,7 @@ fn computeAlgebraicDateHistogramAggregation(
         break :blk keys;
     };
     defer if (bucket_keys.len > 0) alloc.free(bucket_keys);
+    try reserveLegacyHistogramOutput(alloc, request, bucket_keys, ctx);
 
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_keys.len);
     var buckets_filled: usize = 0;
@@ -6439,27 +6500,36 @@ fn computeAlgebraicDateHistogramAggregation(
         for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
+    var candidate_index: usize = 0;
     for (bucket_keys, 0..) |bucket_key, idx| {
         const formatted = try formatRfc3339Bucket(alloc, bucket_key);
         defer alloc.free(formatted);
+        const key_json = try std.json.Stringify.valueAlloc(alloc, formatted, .{});
+        errdefer alloc.free(key_json);
         var candidate_opt: ?DateBucketAccum = null;
-        for (candidates) |candidate| {
-            if (std.mem.eql(u8, candidate.bucket_start, formatted)) {
-                candidate_opt = candidate;
-                break;
+        while (candidate_index < candidates.len) {
+            const candidate = candidates[candidate_index];
+            const candidate_ns = @import("../../datetime.zig").parseRfc3339ToSignedNs(candidate.bucket_start) orelse return error.InvalidAggregation;
+            if (candidate_ns < bucket_key) {
+                candidate_index += 1;
+                continue;
             }
+            if (candidate_ns == bucket_key) candidate_opt = candidate;
+            break;
         }
         const nested = if (candidate_opt) |candidate|
             try algebraicNestedMetricFoldResults(alloc, child_aggs.primary, candidate.child_folds)
         else
             try alloc.alloc(SearchAggregationResult, 0);
         buckets[idx] = .{
-            .key_json = try std.json.Stringify.valueAlloc(alloc, formatted, .{}),
+            .key_json = key_json,
             .count = if (candidate_opt) |candidate| candidate.count else 0,
             .aggregations = nested,
         };
         buckets_filled = idx + 1;
     }
+    try completeLegacyHistogramBuckets(alloc, request, &buckets, ctx);
+    buckets_filled = buckets.len;
     try applyPipelineAggregations(alloc, child_aggs.pipeline, &buckets);
 
     return .{
@@ -6481,6 +6551,7 @@ fn computeAlgebraicDateHistogramFromVisibleDocFactsAlloc(
     child_requests: []const SearchAggregationRequest,
     pipeline_requests: []const SearchAggregationRequest,
     generation: ?u64,
+    ctx: Context,
 ) !?SearchAggregationResult {
     const entries = try index.scalarDocFactEntriesForFieldAlloc(store, .time, time_field_name);
     defer {
@@ -6528,6 +6599,7 @@ fn computeAlgebraicDateHistogramFromVisibleDocFactsAlloc(
     else
         try alloc.dupe(i128, present_keys.items);
     defer if (bucket_keys.len > 0) alloc.free(bucket_keys);
+    try reserveLegacyHistogramOutput(alloc, request, bucket_keys, ctx);
     if (exceedsAlgebraicResultBucketLimit(index, bucket_keys.len)) return error.AlgebraicResultBucketLimit;
 
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_keys.len);
@@ -6562,6 +6634,8 @@ fn computeAlgebraicDateHistogramFromVisibleDocFactsAlloc(
         };
         buckets_filled = idx + 1;
     }
+    try completeLegacyHistogramBuckets(alloc, request, &buckets, ctx);
+    buckets_filled = buckets.len;
     try applyPipelineAggregations(alloc, pipeline_requests, &buckets);
 
     return .{
@@ -6582,6 +6656,7 @@ fn computeDerivedJoinDateHistogramAggregation(
     derived: algebraic_mod.index.DerivedJoinFoldRequest,
     child_derived: []const algebraic_mod.index.DerivedJoinFoldRequest,
     generation: ?u64,
+    ctx: Context,
 ) !?SearchAggregationResult {
     if (derived.op != .count or derived.group_by.len != 0 or derived.measure != null) return null;
     if (derived.time_field == null or derived.time_bucket == null) return null;
@@ -6677,6 +6752,7 @@ fn computeDerivedJoinDateHistogramAggregation(
         break :blk keys;
     };
     defer if (bucket_keys.len > 0) alloc.free(bucket_keys);
+    try reserveLegacyHistogramOutput(alloc, request, bucket_keys, ctx);
 
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_keys.len);
     var buckets_filled: usize = 0;
@@ -6684,27 +6760,36 @@ fn computeDerivedJoinDateHistogramAggregation(
         for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
+    var candidate_index: usize = 0;
     for (bucket_keys, 0..) |bucket_key, idx| {
         const formatted = try formatRfc3339Bucket(alloc, bucket_key);
         defer alloc.free(formatted);
+        const key_json = try std.json.Stringify.valueAlloc(alloc, formatted, .{});
+        errdefer alloc.free(key_json);
         var candidate_opt: ?DateBucketAccum = null;
-        for (candidates) |candidate| {
-            if (std.mem.eql(u8, candidate.bucket_start, formatted)) {
-                candidate_opt = candidate;
-                break;
+        while (candidate_index < candidates.len) {
+            const candidate = candidates[candidate_index];
+            const candidate_ns = @import("../../datetime.zig").parseRfc3339ToSignedNs(candidate.bucket_start) orelse return error.InvalidAggregation;
+            if (candidate_ns < bucket_key) {
+                candidate_index += 1;
+                continue;
             }
+            if (candidate_ns == bucket_key) candidate_opt = candidate;
+            break;
         }
         const nested = if (candidate_opt) |candidate|
             try algebraicNestedMetricFoldResults(alloc, child_requests, candidate.child_folds)
         else
             try alloc.alloc(SearchAggregationResult, 0);
         buckets[idx] = .{
-            .key_json = try std.json.Stringify.valueAlloc(alloc, formatted, .{}),
+            .key_json = key_json,
             .count = if (candidate_opt) |candidate| candidate.count else 0,
             .aggregations = nested,
         };
         buckets_filled = idx + 1;
     }
+    try completeLegacyHistogramBuckets(alloc, request, &buckets, ctx);
+    buckets_filled = buckets.len;
     return .{
         .name = request.name,
         .field = request.field,
@@ -6724,6 +6809,7 @@ fn computeAdaptiveDateHistogramAggregation(
     constraints: []const FixedConstraint,
     child_requests: []const SearchAggregationRequest,
     pipeline_aggs: []const SearchAggregationRequest,
+    ctx: Context,
 ) !?SearchAggregationResult {
     const query = algebraic_mod.ir.Query{
         .kind = .date_histogram,
@@ -6816,6 +6902,7 @@ fn computeAdaptiveDateHistogramAggregation(
         break :blk keys;
     };
     defer if (bucket_keys.len > 0) alloc.free(bucket_keys);
+    try reserveLegacyHistogramOutput(alloc, request, bucket_keys, ctx);
 
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_keys.len);
     var buckets_filled: usize = 0;
@@ -6823,18 +6910,25 @@ fn computeAdaptiveDateHistogramAggregation(
         for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
+    var candidate_index: usize = 0;
     for (bucket_keys, 0..) |bucket_key, idx| {
         const formatted = try formatRfc3339Bucket(alloc, bucket_key);
         defer alloc.free(formatted);
+        const key_json = try std.json.Stringify.valueAlloc(alloc, formatted, .{});
+        errdefer alloc.free(key_json);
         var candidate_opt: ?DateBucketAccum = null;
-        for (candidates) |candidate| {
-            if (std.mem.eql(u8, candidate.bucket_start, formatted)) {
-                candidate_opt = candidate;
-                break;
+        while (candidate_index < candidates.len) {
+            const candidate = candidates[candidate_index];
+            const candidate_ns = @import("../../datetime.zig").parseRfc3339ToSignedNs(candidate.bucket_start) orelse return error.InvalidAggregation;
+            if (candidate_ns < bucket_key) {
+                candidate_index += 1;
+                continue;
             }
+            if (candidate_ns == bucket_key) candidate_opt = candidate;
+            break;
         }
         buckets[idx] = .{
-            .key_json = try std.json.Stringify.valueAlloc(alloc, formatted, .{}),
+            .key_json = key_json,
             .count = if (candidate_opt) |candidate| candidate.count else 0,
             .aggregations = if (candidate_opt) |candidate|
                 try algebraicNestedMetricFoldResults(alloc, child_requests, candidate.child_folds)
@@ -6843,6 +6937,8 @@ fn computeAdaptiveDateHistogramAggregation(
         };
         buckets_filled = idx + 1;
     }
+    try completeLegacyHistogramBuckets(alloc, request, &buckets, ctx);
+    buckets_filled = buckets.len;
     try applyPipelineAggregations(alloc, pipeline_aggs, &buckets);
     return .{
         .name = request.name,
@@ -13603,6 +13699,7 @@ test "algebraic aggregation planner can execute derived bounded join date histog
         plan.derived_join_fold.?,
         plan.derived_child_join_folds,
         null,
+        .{},
     )).?;
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), result.buckets.len);
@@ -16553,9 +16650,9 @@ fn foldTemporalPartialsAlloc(a: Allocator, index: *algebraic_mod.index.Index, pl
         for (output.items) |*bucket| bucket.deinit(a);
         output.deinit(a);
     }
-    var budget = contract.GapFillBudget{};
+    var budget = contract.HistogramOutputBudget{};
     var controlled = ctx;
-    if (controlled.gap_fill_budget == null) controlled.gap_fill_budget = &budget;
+    if (controlled.histogram_output_budget == null) controlled.histogram_output_budget = &budget;
     for (groups.items[0..limit]) |*group| {
         if (group.count < shape.request.min_doc_count) continue;
         std.mem.sort(DateBucketAccum, group.points.items, {}, struct {
@@ -16568,8 +16665,13 @@ fn foldTemporalPartialsAlloc(a: Allocator, index: *algebraic_mod.index.Index, pl
         if (shape.groupCount() > 0 or histogram_ctx.histogram_budget_reserved == null) histogram_ctx.histogram_budget_reserved = &reserved;
         const present = try a.alloc(i128, group.points.items.len);
         defer a.free(present);
-        for (group.points.items, 0..) |point, i| present[i] = @import("../../datetime.zig").parseRfc3339ToSignedNs(point.bucket_start).?;
-        const extent = try dateHistogramExtentKeysAlloc(a, shape.histogram, present, histogram_ctx);
+        var present_count: usize = 0;
+        for (group.points.items) |point| {
+            if (point.count < shape.histogram.min_doc_count) continue;
+            present[present_count] = @import("../../datetime.zig").parseRfc3339ToSignedNs(point.bucket_start).?;
+            present_count += 1;
+        }
+        const extent = try dateHistogramExtentKeysAlloc(a, shape.histogram, present[0..present_count], histogram_ctx);
         a.free(extent);
         var points = std.ArrayList(SearchAggregationBucket).empty;
         errdefer {
@@ -16648,7 +16750,7 @@ fn computeTemporalMaterializedAggregation(a: Allocator, index: *algebraic_mod.in
         };
     }
     var result = foldTemporalPartialsAlloc(a, index, plan, rows.items, ctx) catch |err| switch (err) {
-        error.QueryCandidateBudgetExceeded => return null,
+        error.QueryCandidateBudgetExceeded, error.AlgebraicResultBucketLimit => return null,
         else => return err,
     };
     errdefer result.deinit(a);
@@ -16671,9 +16773,9 @@ pub fn tryTemporalMaterializedAggregations(a: Allocator, requests: []const Searc
     defer if (!moved) {
         for (output.items) |*item| item.deinit(a);
     };
-    var budget = contract.GapFillBudget{};
+    var budget = contract.HistogramOutputBudget{};
     var controlled = ctx;
-    controlled.gap_fill_budget = &budget;
+    controlled.histogram_output_budget = &budget;
     var scan_budget = algebraic_mod.index.TemporalScanBudget{ .control = ctx.control };
     if (controlled.temporal_scan_budget == null) controlled.temporal_scan_budget = &scan_budget;
     for (requests) |request| {
@@ -16701,8 +16803,8 @@ test "time series signed origins and request wide gap budget" {
     var invalid = request;
     invalid.aggregations = &.{request};
     try std.testing.expectError(error.InvalidAggregation, computeSearchAggregations(a, &.{invalid}, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, .{}));
-    var budget = contract.GapFillBudget{ .remaining_cells = 6 };
-    try std.testing.expectError(error.QueryCandidateBudgetExceeded, computeSearchAggregations(a, &.{ request, request }, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, .{ .gap_fill_budget = &budget }));
+    var budget = contract.HistogramOutputBudget{ .remaining_cells = 6 };
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, computeSearchAggregations(a, &.{ request, request }, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, .{ .histogram_output_budget = &budget }));
 }
 
 test "time series grouped materializations merge globally and reduce extra dimensions" {
@@ -16785,6 +16887,33 @@ test "time series grouped materializations merge globally and reduce extra dimen
     // per-shard series limit before merge would lose the correct winner.
     try std.testing.expectEqualStrings("\"s2\"", local.buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 2), local.buckets[0].count);
+    var legacy_budget = contract.HistogramOutputBudget{ .remaining_cells = 0 };
+    var legacy_histogram = request.aggregations[0];
+    legacy_histogram.min_doc_count = 1;
+    legacy_histogram.date_bounds_start = "";
+    legacy_histogram.date_bounds_end = "";
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, computeAlgebraicDateHistogramFromVisibleDocFactsAlloc(a, &left, &left_store, legacy_histogram, "ts", try parseDateInterval(legacy_histogram), &.{}, legacy_histogram.aggregations, &.{}, null, .{ .histogram_output_budget = &legacy_budget }));
+    const LegacyAllocation = struct {
+        fn run(render_alloc: Allocator, index: *algebraic_mod.index.Index, store: *docstore_mod.DocStore, legacy_request: SearchAggregationRequest) !void {
+            var answer = (try computeAlgebraicDateHistogramFromVisibleDocFactsAlloc(render_alloc, index, store, legacy_request, "ts", try parseDateInterval(legacy_request), &.{}, legacy_request.aggregations, &.{}, null, .{})) orelse return error.TestUnexpectedResult;
+            defer answer.deinit(render_alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, LegacyAllocation.run, .{ &left, &left_store, legacy_histogram });
+    var legacy_filled = legacy_histogram;
+    legacy_filled.min_doc_count = 0;
+    legacy_filled.date_bounds_start = "2026-11-06T11:50:00Z";
+    legacy_filled.date_bounds_end = "2026-11-06T12:20:00Z";
+    try std.testing.checkAllAllocationFailures(a, LegacyAllocation.run, .{ &left, &left_store, legacy_filled });
+    const limited_config = try std.fmt.allocPrint(a, "{{\"max_result_buckets\":1,{s}", .{config[1..]});
+    defer a.free(limited_config);
+    var limited = try algebraic_mod.index.Index.open(a, "limited", limited_config);
+    defer limited.close();
+    try limited.applyBatch(&left_store, .{ .documents = &.{
+        .{ .key = "limited-a", .action = .upsert, .cleaned_value = "{\"device\":\"s1\",\"region\":\"west\",\"ts\":\"2026-11-06T12:01:00Z\",\"v\":10}" },
+        .{ .key = "limited-b", .action = .upsert, .cleaned_value = "{\"device\":\"s2\",\"region\":\"west\",\"ts\":\"2026-11-06T12:06:00Z\",\"v\":20}" },
+    } });
+    try std.testing.expect((try computeTemporalMaterializedAggregation(a, &limited, &left_store, request, &constraints, .{})) == null);
 }
 
 /// Export complete maintained states under the caller's read lease. The caller
@@ -16863,8 +16992,8 @@ test "time series histogram allocation and in-flight cancellation are failure at
         };
         deinitResults(a, result);
     }
-    var budget = contract.GapFillBudget{ .remaining_cells = 5 };
-    try std.testing.expectError(error.QueryCandidateBudgetExceeded, computeSearchAggregations(std.testing.allocator, &.{Fixture.request}, .{ .alloc = std.testing.allocator, .hits = @constCast(&Fixture.hits), .total_hits = 2 }, .{ .gap_fill_budget = &budget }));
+    var budget = contract.HistogramOutputBudget{ .remaining_cells = 5 };
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, computeSearchAggregations(std.testing.allocator, &.{Fixture.request}, .{ .alloc = std.testing.allocator, .hits = @constCast(&Fixture.hits), .total_hits = 2 }, .{ .histogram_output_budget = &budget }));
     try std.testing.expectEqual(@as(usize, 5), budget.remaining_cells);
     var pipeline = Fixture.request;
     pipeline.aggregations = &.{ Fixture.request.aggregations[0], .{ .name = "selected", .type = "bucket_sort", .field = "", .bucket_path = "_count", .sort_order = "desc", .size = 2 } };
@@ -16897,4 +17026,23 @@ test "time series explicit null exclusion preserves ordinary terms defaults" {
     defer deinitResults(a, composite);
     try std.testing.expectEqual(@as(usize, 2), composite[0].buckets.len);
     for (composite[0].buckets) |bucket| try std.testing.expectEqual(@as(i64, 1), bucket.count);
+}
+
+test "time series populated histogram output budget is shared across roots and groups" {
+    const a = std.testing.allocator;
+    var request: SearchAggregationRequest = .{ .name = "points", .type = "date_histogram", .field = "ts", .fixed_interval = "1m", .min_doc_count = 1, .aggregations = &.{.{ .name = "total", .type = "sum", .field = "v" }} };
+    const hits = [_]types.SearchHit{
+        .{ .id = @constCast("a"), .stored_data = @constCast("{\"ts\":\"2026-11-06T12:00:00Z\",\"v\":1,\"device\":\"a\"}"), .score = 1 },
+        .{ .id = @constCast("b"), .stored_data = @constCast("{\"ts\":\"2026-11-06T12:01:00Z\",\"v\":2,\"device\":\"b\"}"), .score = 1 },
+    };
+    for ([_]i64{ 0, 1 }) |minimum| {
+        request.min_doc_count = minimum;
+        var budget = contract.HistogramOutputBudget{ .remaining_cells = 3 };
+        try std.testing.expectError(error.QueryCandidateBudgetExceeded, computeSearchAggregations(a, &.{request}, .{ .alloc = a, .hits = @constCast(&hits), .total_hits = 2 }, .{ .histogram_output_budget = &budget }));
+        budget.remaining_cells = 6;
+        try std.testing.expectError(error.QueryCandidateBudgetExceeded, computeSearchAggregations(a, &.{ request, request }, .{ .alloc = a, .hits = @constCast(&hits), .total_hits = 2 }, .{ .histogram_output_budget = &budget }));
+        budget.remaining_cells = 3;
+        const grouped: SearchAggregationRequest = .{ .name = "series", .type = "terms", .field = "device", .aggregations = &.{request} };
+        try std.testing.expectError(error.QueryCandidateBudgetExceeded, computeSearchAggregations(a, &.{grouped}, .{ .alloc = a, .hits = @constCast(&hits), .total_hits = 2 }, .{ .histogram_output_budget = &budget }));
+    }
 }

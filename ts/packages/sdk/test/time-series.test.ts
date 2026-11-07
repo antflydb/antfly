@@ -439,7 +439,8 @@ it("stops latest-series admission, cancels siblings, and joins before rejecting"
   const siblings: (() => void)[] = [];
   const signals: AbortSignal[] = [];
   const query = vi.spyOn(client, "query").mockImplementation((_request, execution) => {
-    signals.push(execution!.signal!);
+    if (!execution?.signal) throw new Error("Expected a cancellation signal");
+    signals.push(execution.signal);
     if (signals.length === 1)
       return new Promise((_resolve, reject) => {
         rejectFirst = reject;
@@ -469,7 +470,7 @@ it("stops latest-series admission, cancels siblings, and joins before rejecting"
   await vi.waitFor(() => expect(signals.every((signal) => signal.aborted)).toBe(true));
   expect(settled).toBe(false);
   expect(query).toHaveBeenCalledTimes(4);
-  siblings.forEach((finish) => finish());
+  for (const finish of siblings) finish();
   expect(await outcome).toBe(failure);
   expect(query).toHaveBeenCalledTimes(4);
 });
@@ -502,11 +503,11 @@ it("returns latest-series results in selection order with bounded concurrency", 
   const results = await client.latestSeries({ ...options, series });
   expect(peak).toBe(4);
   expect(active).toBe(0);
-  results.forEach((result, i) =>
+  for (const [i, result] of results.entries()) {
     expect(result?.table).toBe(
       JSON.stringify(seriesRead({ ...options, dimensions: series[i] }).filter_query)
-    )
-  );
+    );
+  }
 });
 
 it("shares the retention preset with native lifecycle tests", () => {
@@ -533,7 +534,8 @@ it("joins outstanding latest-series calls when the caller aborts in flight", asy
   const finishes: (() => void)[] = [];
   const signals: AbortSignal[] = [];
   const query = vi.spyOn(client, "query").mockImplementation((_request, execution) => {
-    signals.push(execution!.signal!);
+    if (!execution?.signal) throw new Error("Expected a cancellation signal");
+    signals.push(execution.signal);
     return new Promise((resolve) => finishes.push(() => resolve({})));
   });
   let settled = false;
@@ -549,7 +551,58 @@ it("joins outstanding latest-series calls when the caller aborts in flight", asy
   abort.abort(reason);
   expect(signals.every((signal) => signal.aborted)).toBe(true);
   expect(settled).toBe(false);
-  finishes.forEach((finish) => finish());
+  for (const finish of finishes) finish();
   expect(await outcome).toBe(reason);
   expect(query).toHaveBeenCalledTimes(4);
+});
+
+describe("time-series empty results and nested SQL", () => {
+  it("normalizes both empty grouped wire representations without inventing a group", () => {
+    for (const series of [{}, { buckets: [] }]) {
+      expect(seriesResults({ aggregations: { series } })).toEqual([]);
+    }
+    expect(seriesResults({ aggregations: { points: {} } })).toEqual([{ key: "all", points: [] }]);
+  });
+  it("resolves nested source paths while retaining literal CTE output identifiers", () => {
+    const sql = seriesSQL({
+      ...options,
+      timestamp: "attrs.observed_at",
+      groupBy: ["attrs.device_id"],
+      dimensions: { "attrs.region": "west" },
+      measures: { temperature: { op: "avg", field: "attrs.temperature" } },
+    });
+    expect(sql.statement).toContain(
+      `jsonb_extract_path_text("__antfly_series_source"."attrs", 'observed_at')::datetime`
+    );
+    expect(sql.statement).toContain(
+      `jsonb_extract_path_text("attrs", 'device_id') AS "attrs.device_id"`
+    );
+    expect(sql.statement).toContain(`"__antfly_series_selected"."attrs.device_id"`);
+    expect(sql.statement).toContain(`::double precision`);
+    expect(sql.parameters).toContain("west");
+  });
+  it("supports literal dotted columns and safely quotes nested segments", () => {
+    const sql = seriesSQL({ ...options, timestamp: "a.b" }, { fieldPaths: { "a.b": ["a.b"] } });
+    expect(sql.statement).toContain('"__antfly_series_source"."a.b"::datetime');
+    const nested = seriesSQL(
+      { ...options, timestamp: "a.b" },
+      { fieldPaths: { "a.b": ["a", "b'c"] } }
+    );
+    expect(nested.statement).toContain(`'b''c'`);
+    expect(() => seriesSQL(options, { fieldPaths: { observed_at: [] } })).toThrow(/segments/);
+    expect(
+      seriesSQL({ ...options, timestamp: "constructor" }, { fieldPaths: {} }).statement
+    ).toContain('"__antfly_series_source"."constructor"::datetime');
+  });
+});
+
+it("shares the executable nested SQL/JSON fixture with native API tests", () => {
+  const fixture = JSON.parse(
+    readFileSync(
+      new URL("../../../../zig/e2e/antfly/fixtures/time-series-sdk-nested.json", import.meta.url),
+      "utf8"
+    )
+  );
+  expect(JSON.parse(JSON.stringify(seriesQuery(fixture.options)))).toEqual(fixture.query);
+  expect(seriesSQL(fixture.options)).toEqual(fixture.sql);
 });

@@ -1299,9 +1299,12 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
                     else
                         0,
                 });
+                if (timestamp_value) |value| if (value.len == 24) {
+                    doc_batch.items[doc_batch.items.len - 1].ttl_source_ns = @import("ttl.zig").sourceTimestamp(value);
+                };
                 owned_key_pending = false;
                 owned_value_pending = false;
-                doc_batch_bytes += user_key.len + owned_value.len;
+                doc_batch_bytes += user_key.len + owned_value.len + 17 + @as(usize, if (doc_batch.items[doc_batch.items.len - 1].ttl_source_ns != null) 16 else 0);
 
                 if (doc_batch_bytes >= batch_target_bytes) {
                     try flushDocBatch(alloc, out, &doc_batch, &counts);
@@ -4699,6 +4702,8 @@ fn validatePortableDocumentEntryAgainstArchive(
 /// the archive-wide, schema-aware preflight has succeeded.
 fn validatePortableDocumentEntry(entry: backup_codec.DocumentEntry) !void {
     if (entry.value_flags & ~backup_codec.doc_value_known_flags != 0) return error.InvalidBackupRequest;
+    if (entry.value_flags & backup_codec.doc_value_flag_ttl_source != 0 and entry.ttl_source_ns == null) return error.InvalidBackupRequest;
+    if (entry.ttl_source_ns != null and entry.value_flags & backup_codec.doc_value_flag_relational_row != 0) return error.InvalidBackupRequest;
     if (entry.value_flags & backup_codec.doc_value_flag_relational_row == 0) return;
     if (entry.value_flags & backup_codec.doc_value_flag_compressed != 0) return error.InvalidBackupRequest;
     _ = relational_store.rowSchemaVersion(entry.value) catch return error.InvalidBackupRequest;
@@ -5092,10 +5097,10 @@ fn importDecodedDocumentEntriesWithExtra(alloc: Allocator, store: *DocStore, ent
             break :blk decompressed;
         } else e.value;
         try writes.append(alloc, .{ .key = store_key, .value = value });
-        if (e.timestamp_ns != 0) {
+        if (e.timestamp_ns != 0 or e.ttl_source_ns != null) {
             const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, e.key);
             try owned_keys.append(alloc, timestamp_key);
-            const timestamp_value = try timestampValueAlloc(alloc, e.timestamp_ns);
+            const timestamp_value = try @import("ttl.zig").encodeTimestampAlloc(alloc, e.timestamp_ns, e.ttl_source_ns orelse @as(i128, e.timestamp_ns));
             try owned_keys.append(alloc, timestamp_value);
             try writes.append(alloc, .{ .key = timestamp_key, .value = timestamp_value });
         }
@@ -7774,4 +7779,19 @@ test "portable backup native resolver authority retains heads policy and queue i
     defer incomplete.deinit(alloc);
     try validateMetadataEntries(alloc, &.{.{ .key = native.lite_marker, .value = "1" }}, &incomplete);
     try std.testing.expectError(error.InvalidMetadataBatch, incomplete.finish(alloc));
+}
+
+test "time series portable restore retains signed TTL source independently of version" {
+    const a = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var store = try openTestStore(a, &directory);
+    defer store.close();
+    const encoded = try backup_codec.encodeDocumentBatch(a, &.{.{ .key = "historical", .value_flags = 0, .value = "{\"observed_at\":\"1969-12-31T23:59:59Z\"}", .timestamp_ns = 12345, .ttl_source_ns = -1_000_000_000 }});
+    defer a.free(encoded);
+    try importDocumentBatch(a, &store, encoded);
+    const ttl = @import("ttl.zig");
+    try std.testing.expectEqual(@as(?u64, 12345), try ttl.readTimestamp(&store, a, "historical"));
+    try std.testing.expectEqual(@as(?i128, -1_000_000_000), try ttl.readSourceTimestamp(&store, a, "historical"));
+    try std.testing.expect(try ttl.isDocExpired(&store, a, "historical", .{ .duration_ns = 1_000_000_000 }, 1));
 }

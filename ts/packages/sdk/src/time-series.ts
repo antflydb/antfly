@@ -238,9 +238,12 @@ export function seriesResults(result: QueryResult, fill: null | 0 = null): TimeS
           ])
       ),
     }));
-  const groups = result.aggregations?.series?.buckets;
-  return groups
-    ? groups.map((group) => ({ key: group.key, points: points(group.sub_aggregations?.points) }))
+  const grouped = result.aggregations?.series;
+  return grouped
+    ? (grouped.buckets ?? []).map((group) => ({
+        key: group.key,
+        points: points(group.sub_aggregations?.points),
+      }))
     : [{ key: "all", points: points(result.aggregations?.points) }];
 }
 
@@ -355,10 +358,13 @@ export function seriesBatch(
 /** Parameterized SQL equivalent for populated buckets (empty filling is a JSON
  * presentation option). Identifier quoting preserves names without SQL injection.
  */
-export function seriesSQL(options: SeriesQueryOptions): SQLRequest {
+export function seriesSQL(
+  options: SeriesQueryOptions,
+  sqlOptions: { fieldPaths?: Record<string, readonly string[]> } = {}
+): SQLRequest {
   // SQL emits populated buckets, so JSON presentation limits do not apply.
   seriesQuery({ ...options, emptyBuckets: false });
-  const quote = (name: string) => `"${name.replace(/"/g, '\"\"')}"`;
+  const quote = (name: string) => `"${name.replace(/"/g, '""')}"`;
   const parameters: unknown[] = [options.start, options.end];
   const parameter = (value: unknown) => {
     parameters.push(value);
@@ -380,7 +386,28 @@ export function seriesSQL(options: SeriesQueryOptions): SQLRequest {
   const source = internal("__antfly_series_source");
   const selected = internal("__antfly_series_selected");
   const selectedCount = internal("__antfly_series_documents");
-  const column = (field: string, prefix = "") => `${prefix}${quote(field)}`;
+  // JSON field names denote dotted paths. Explicit segments disambiguate a
+  // literal dotted column from a nested path without interpolating SQL syntax.
+  const validPath = (path: unknown): path is readonly [string, ...string[]] =>
+    Array.isArray(path) &&
+    path.length > 0 &&
+    path.every((part) => typeof part === "string" && part.length > 0);
+  const segments = (field: string) => {
+    const explicit =
+      sqlOptions.fieldPaths && Object.getOwnPropertyDescriptor(sqlOptions.fieldPaths, field)
+        ? sqlOptions.fieldPaths[field]
+        : undefined;
+    const path = explicit ?? field.split(".");
+    if (!validPath(path)) throw new TypeError("SQL field paths require nonempty segments");
+    return path;
+  };
+  const column = (field: string, prefix = "") => {
+    const [root, ...path] = segments(field);
+    const base = `${prefix}${quote(root)}`;
+    return path.length
+      ? `jsonb_extract_path_text(${base}, ${path.map((part) => `'${part.replace(/'/g, "''")}'`).join(", ")})`
+      : base;
+  };
   // The preset's logical JSON column is a string. Cast source instants as well
   // as parameters; textual comparison would order timezone offsets incorrectly.
   const timestamp = `${column(options.timestamp, `${source}.`)}::datetime`;
@@ -402,10 +429,14 @@ export function seriesSQL(options: SeriesQueryOptions): SQLRequest {
     ].join(" AND ");
   const dimensions = groupBy.map((field) => column(field, `${source}.`));
   const columns = [
-    ...dimensions,
+    ...groupBy.map((field) => {
+      const expression = column(field, `${source}.`);
+      return segments(field).length > 1 ? `${expression} AS ${quote(field)}` : expression;
+    }),
     `${bucket} AS "bucket"`,
     ...Object.entries(options.measures).map(([name, metric]) => {
-      const aggregate = `${metric.op.toUpperCase()}(${metric.op === "count" ? "*" : column(metric.field, `${source}.`)})`;
+      const argument = metric.op === "count" ? "*" : column(metric.field, `${source}.`);
+      const aggregate = `${metric.op.toUpperCase()}(${metric.op !== "count" && segments(metric.field).length > 1 ? `(${argument})::double precision` : argument})`;
       const value =
         options.fill === 0 && metric.op !== "count" ? `COALESCE(${aggregate}, 0)` : aggregate;
       return `${value} AS ${quote(name)}`;
@@ -416,12 +447,15 @@ export function seriesSQL(options: SeriesQueryOptions): SQLRequest {
     fields.length === 1
       ? fields[0]
       : `concat('[', ${fields.map((field) => `COALESCE(to_jsonb(${field})::text, 'null')`).join(", ',', ")}, ']')`;
-  const topDimensions = groupBy.map(quote);
+  const topDimensions = groupBy.map((field) => column(field));
+  const selectedDimensions = groupBy.map((field, i) =>
+    segments(field).length > 1 ? `${topDimensions[i]} AS ${quote(field)}` : topDimensions[i]
+  );
   const cte = groupBy.length
-    ? `WITH ${selected} AS (SELECT ${topDimensions.join(", ")}, COUNT(*) AS ${selectedCount} FROM ${quote(options.table)} WHERE ${predicates()} GROUP BY ${topDimensions.join(", ")} ORDER BY COUNT(*) DESC, ${key(topDimensions)} ASC LIMIT ${parameter(options.maxSeries ?? 100)}) `
+    ? `WITH ${selected} AS (SELECT ${selectedDimensions.join(", ")}, COUNT(*) AS ${selectedCount} FROM ${quote(options.table)} WHERE ${predicates()} GROUP BY ${topDimensions.join(", ")} ORDER BY COUNT(*) DESC, ${key(topDimensions)} ASC LIMIT ${parameter(options.maxSeries ?? 100)}) `
     : "";
   const join = groupBy.length
-    ? ` JOIN ${selected} ON ${groupBy.map((field) => `${column(field, `${source}.`)} IS NOT DISTINCT FROM ${column(field, `${selected}.`)}`).join(" AND ")}`
+    ? ` JOIN ${selected} ON ${groupBy.map((field) => `${column(field, `${source}.`)} IS NOT DISTINCT FROM ${selected}.${quote(field)}`).join(" AND ")}`
     : "";
   const count = `${selected}.${selectedCount}`;
   return {

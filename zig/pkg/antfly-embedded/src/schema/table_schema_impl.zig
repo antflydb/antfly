@@ -869,7 +869,7 @@ pub fn documentTtlTimestampNs(
     alloc: std.mem.Allocator,
     schema: TableSchema,
     value_json: []const u8,
-) !?u64 {
+) !?i128 {
     if (schema.ttl_duration_ns == 0) return null;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
@@ -1223,6 +1223,10 @@ fn validateDocumentValueInternal(
         const is_ttl_field = schema.ttl_duration_ns > 0 and std.mem.eql(u8, field_name, schema.ttl_field);
         if (is_ttl_field) {
             try validateTtlFieldValue(entry.value_ptr.*);
+            // Relational TTL's coordinated observation protocol uses an unsigned
+            // row version as its timestamp; document metadata has a signed source.
+            if (schema.storage_mode == .relational and entry.value_ptr.* != .null)
+                _ = std.math.cast(u64, try parseTtlTimestampNs(entry.value_ptr.*)) orelse return error.InvalidBatchRequest;
         }
 
         if (document_schema) |resolved_document_schema| {
@@ -6472,23 +6476,8 @@ fn validateRegexPattern(pattern: []const u8) !void {
     _ = try regexMatch(pattern, "");
 }
 
-fn parseTtlTimestampNs(value: std.json.Value) !u64 {
-    return switch (value) {
-        .integer => |integer| blk: {
-            if (integer < 0) return error.InvalidBatchRequest;
-            break :blk std.math.cast(u64, integer) orelse return error.InvalidBatchRequest;
-        },
-        .number_string => |text| std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch return error.InvalidBatchRequest,
-        .string => |text| try parseTtlStringTimestampNs(text),
-        else => error.InvalidBatchRequest,
-    };
-}
-
-fn parseTtlStringTimestampNs(text: []const u8) !u64 {
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len == 0) return error.InvalidBatchRequest;
-    if (std.fmt.parseInt(u64, trimmed, 10)) |timestamp| return timestamp else |_| {}
-    return storage_schema.parseRfc3339ToNs(trimmed) orelse error.InvalidBatchRequest;
+fn parseTtlTimestampNs(value: std.json.Value) !i128 {
+    return @import("../storage/ttl.zig").parseSourceTimestamp(value) catch return error.InvalidBatchRequest;
 }
 
 fn parseRfc3339ToNs(text: []const u8) ?u64 {
@@ -7466,7 +7455,7 @@ test "validate ttl field values and schema bindings" {
     try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":\"2024-01-02T03:04:05Z\"}" }});
     try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":\" 15 \"}" }});
     try std.testing.expectEqual(
-        @as(?u64, 1_700_000_000_000_000_000),
+        @as(?i128, 1_700_000_000_000_000_000),
         try documentTtlTimestampNs(std.testing.allocator, parsed, "{\"expires_at\":1700000000000000000}"),
     );
     try std.testing.expectError(
@@ -7477,10 +7466,7 @@ test "validate ttl field values and schema bindings" {
         error.InvalidBatchRequest,
         validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":\"not-a-time\"}" }}),
     );
-    try std.testing.expectError(
-        error.InvalidBatchRequest,
-        validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":-1}" }}),
-    );
+    try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"expires_at\":-1}" }});
 
     var numeric_ttl = try parseSchema(
         std.testing.allocator,

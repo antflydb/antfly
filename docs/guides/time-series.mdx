@@ -162,7 +162,12 @@ precision, matching SQL floating measurements. Exact decimal SQL values retain
 their separate numeric type semantics. Use `date_trunc('day', observed_at)` for UTC
 calendar grouping. SQL emits populated groups; bounded empty generation is a JSON
 presentation option. `seriesSQL(options)` produces parameterized SQL with quoted
-identifiers. SQL expressions outside the materialization planner's proven shapes
+identifiers. Dotted field names resolve to nested JSON paths in timestamps,
+dimensions, grouping, and measurements. To address a literal dotted SQL column,
+pass explicit segments, for example
+`seriesSQL(options, { fieldPaths: { "sensor.time": ["sensor.time"] } })`.
+Nested measurements are cast to floating-point values before aggregation.
+SQL expressions outside the materialization planner's proven shapes
 retain normal scan execution.
 
 ### PostgreSQL and TimescaleDB conventions
@@ -256,6 +261,12 @@ AVG merges sum and non-null count state, never averages of averages. Late insert
 overwrite corrections, and deletes follow the ordinary algebraic maintenance
 path. Authorization and snapshot coverage still gate reuse.
 
+The document-table preset accepts pre-1970 observations with retention enabled.
+Retention uses the signed event instant, independently of the unsigned write
+version. Old observations are accepted normally and immediately hidden when
+expired; sufficiently long retention can keep a pre-1970 observation visible.
+Existing timestamp metadata remains readable without rewriting retained data.
+
 Table TTL expires raw observations and removes their contributions from exact
 aggregate indexes. These indexes are rebuildable accelerators over retained raw
 data. They do **not** preserve historical summaries after source expiration.
@@ -271,7 +282,8 @@ range. It is not a live subscription or an automatically advancing window.
 
 
 Bounded empty histograms accept metric children only and share a request-wide
-budget of 100,000 generated cells (bucket plus metrics), in addition to the 10,000
+output budget of 100,000 cells (bucket plus metrics), shared across groups and
+root histograms for both populated-only and empty-filled results, in addition to the 10,000
 bucket limit per histogram. The complete extent is reserved before constructing
 metric results, including on populated scans. Histograms without explicit bounds
 still fill interior gaps when `min_doc_count` is zero. Nested bounded bucket generation
