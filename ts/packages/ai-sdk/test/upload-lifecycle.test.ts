@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AntflyClient } from "@antfly/sdk";
@@ -170,4 +170,85 @@ it("rejects an empty media upload before source access or file creation", async 
   );
   expect(fetchMock).not.toHaveBeenCalled();
   expect(await readdir(root)).toEqual([]);
+});
+
+it("repeating an upload preserves the published object's inode", async () => {
+  const { stat } = await import("node:fs/promises");
+  const { options } = environment();
+  await uploadFile(options);
+  const path = join(root, "objects", "sha256", `${digest}.mp4`);
+  const before = await stat(path);
+  await uploadFile(options);
+  const after = await stat(path);
+  expect(after.ino).toBe(before.ino);
+});
+
+it("private media files and their store directory are owner-only", async () => {
+  const { stat } = await import("node:fs/promises");
+  const { options } = environment();
+  await uploadFile(options);
+  const path = join(root, "objects", "sha256", `${digest}.mp4`);
+  expect((await stat(path)).mode & 0o077).toBe(0);
+  expect((await stat(join(root, "objects", "sha256"))).mode & 0o077).toBe(0);
+});
+
+it.each([0, 1])("does not publish when durability barrier %s fails", async (barrier) => {
+  const { open } = await import("node:fs/promises");
+  const file = await open(join(root, "prototype-probe"), "wx", 0o600);
+  const prototype = Object.getPrototypeOf(file);
+  await file.close();
+  const { options, fetchMock } = environment();
+  const failure = new Error("disk sync failed");
+  const sync = vi.spyOn(prototype, "sync");
+  if (barrier === 1) sync.mockResolvedValueOnce(undefined);
+  sync.mockRejectedValueOnce(failure);
+  try {
+    await expect(uploadFile(options)).rejects.toBe(failure);
+    expect(
+      fetchMock.mock.calls.some(([input]) =>
+        new URL(input instanceof Request ? input.url : String(input)).pathname.endsWith("/sync")
+      )
+    ).toBe(false);
+  } finally {
+    sync.mockRestore();
+  }
+});
+
+it("concurrent identical uploads converge without replacing the final object", async () => {
+  const { stat } = await import("node:fs/promises");
+  const { options } = environment();
+  await uploadFile(options);
+  const path = join(root, "objects", "sha256", `${digest}.mp4`);
+  const original = await stat(path);
+  await Promise.all(Array.from({ length: 4 }, () => uploadFile(options)));
+  expect((await stat(path)).ino).toBe(original.ino);
+  expect((await stat(path)).mtimeMs).toBe(original.mtimeMs);
+});
+
+it("freshly enumerates new uploads after failed inventories", async () => {
+  const { options, fetchMock } = environment();
+  await uploadFile(options);
+  const call = fetchMock.mock.calls.find(([input]) =>
+    new URL(input instanceof Request ? input.url : String(input)).pathname.endsWith("/sync")
+  );
+  if (!call) throw new Error("Expected upload sync request");
+  const [input, init] = call;
+  const request = input instanceof Request ? input : new Request(input, init);
+  expect(await request.json()).toMatchObject({ source_id: sourceId, restart: true });
+});
+
+it("rejects corrupt existing content without replacing it or starting sync", async () => {
+  const { options, fetchMock } = environment();
+  await uploadFile(options);
+  const path = join(root, "objects", "sha256", `${digest}.mp4`);
+  await writeFile(path, new Uint8Array(bytes.length));
+  fetchMock.mockClear();
+  await expect(uploadFile(options)).rejects.toThrow("repair it before retrying");
+  expect(await readFile(path)).toEqual(Buffer.alloc(bytes.length));
+  expect(await readdir(join(root, "objects", "sha256"))).toEqual([`${digest}.mp4`]);
+  expect(
+    fetchMock.mock.calls.some(([input]) =>
+      new URL(input instanceof Request ? input.url : String(input)).pathname.endsWith("/sync")
+    )
+  ).toBe(false);
 });

@@ -1,4 +1,5 @@
 import type { AntflyClient } from "@antfly/sdk";
+import { abortable } from "../abort.js";
 import { AssetNotFoundError, resolveCatalogResource } from "./catalog.js";
 import { type AntflyAssetReference, decodeAssetReference } from "./reference.js";
 
@@ -70,6 +71,9 @@ export function createAssetDisplayHandler(
 ): (request: Request) => Promise<Response> {
   const fetchFn = options.fetch ?? globalThis.fetch;
   return async (request: Request): Promise<Response> => {
+    request.signal.throwIfAborted();
+    if (request.method !== "GET" && request.method !== "HEAD")
+      return new Response(null, { status: 405, headers: { Allow: "GET, HEAD" } });
     let reference: AntflyAssetReference;
     try {
       reference = decodeAssetReference(options.referenceId(request));
@@ -79,15 +83,19 @@ export function createAssetDisplayHandler(
 
     let authorized: boolean;
     try {
-      authorized = await options.authorize(request, reference);
+      authorized = await abortable(
+        Promise.resolve(options.authorize(request, reference)),
+        request.signal
+      );
     } catch {
       authorized = false;
     }
+    request.signal.throwIfAborted();
     if (!authorized) return new Response("Forbidden", { status: 403 });
 
     let resource: Awaited<ReturnType<typeof resolveCatalogResource>>;
     try {
-      resource = await resolveCatalogResource(options.client, reference);
+      resource = await resolveCatalogResource(options.client, reference, request.signal);
     } catch (error) {
       if (error instanceof AssetNotFoundError) return new Response("Not found", { status: 404 });
       throw error;
@@ -101,6 +109,7 @@ export function createAssetDisplayHandler(
     // `resource.uri` is the capability URL; it is read here, server-side,
     // and in no other field of this response.
     const upstream = await fetchFn(resource.uri, {
+      method: request.method,
       headers: upstreamHeaders,
       signal: request.signal,
     });
@@ -118,6 +127,10 @@ export function createAssetDisplayHandler(
     headers.set("cache-control", "private, no-store");
     headers.set("x-content-type-options", "nosniff");
 
-    return new Response(upstream.body, { status: upstream.status, headers });
+    if (request.method === "HEAD") await upstream.body?.cancel();
+    return new Response(request.method === "HEAD" ? null : upstream.body, {
+      status: upstream.status,
+      headers,
+    });
   };
 }

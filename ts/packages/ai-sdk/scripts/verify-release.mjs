@@ -43,8 +43,8 @@ run("npm", [
   "--no-audit",
   "--no-fund",
   artifact,
-  "ai@7.0.162",
-  "zod@4.6.7",
+  `ai@${manifest.peerDependencies.ai.slice(1)}`,
+  `zod@${manifest.peerDependencies.zod.slice(1)}`,
   "typescript@5.9.3",
   "@types/node@25.9.3",
 ]);
@@ -63,7 +63,7 @@ for (const extension of ["mjs", "cjs"]) {
 
 writeFileSync(
   resolve(consumer, "contract.mts"),
-  `import type { ProviderV4 } from '@ai-sdk/provider'; import { createAntfly } from '@antfly/ai-sdk'; const provider: ProviderV4 = createAntfly({ baseUrl: 'http://localhost:8080' }); void provider;`
+  `import type { LanguageModel, EmbeddingModel } from 'ai'; import { createAntfly } from '@antfly/ai-sdk'; const provider=createAntfly({ baseUrl:'http://localhost:8080' }); const language:LanguageModel=provider.languageModel('m'); const embedding:EmbeddingModel=provider.embeddingModel('m'); void language;void embedding;`
 );
 run("node", [
   "node_modules/typescript/bin/tsc",

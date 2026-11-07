@@ -284,7 +284,8 @@ func migrateLocalRun(ctx context.Context, opts MigrateLocalOptions, result Migra
 		}
 		updated.Identity.Namespace = namespace
 	}
-	snapshot := migrationSnapshot{Source: source, Connections: connections}
+	receipt := migrationReceipt(updated, opts, connections[opts.FromConnection], connections[opts.ToConnection])
+	snapshot := migrationSnapshot{Source: source, Connections: connections, Migration: &receipt}
 	job, rekeys, err := repointer.repoint(ctx, source.ID, snapshot, updated)
 	if err != nil {
 		return result, err
@@ -348,6 +349,13 @@ func resolveMigrationSource(profile Profile, opts MigrateLocalOptions) (Source, 
 	}
 	if toConnection.Provider != ProviderS3 && toConnection.Provider != ProviderGCS {
 		return Source{}, Connection{}, Connection{}, fmt.Errorf("%w: migrate-local only supports S3-compatible and GCS destinations (connection %q has provider %q)", ErrInvalidInput, opts.ToConnection, toConnection.Provider)
+	}
+	if source.Connection == opts.ToConnection {
+		receipt, exists := profile.LocalMigrations[source.ID]
+		wanted := migrationReceipt(source, opts, fromConnection, toConnection)
+		if !exists || receipt != wanted || validateMigrationReceipt(profile, source, receipt) != nil {
+			return Source{}, Connection{}, Connection{}, fmt.Errorf("%w: bucket-backed source has no matching durable local-migration receipt; original store and destination must match the first cutover", ErrInvalidInput)
+		}
 	}
 	return source, fromConnection, toConnection, nil
 }
@@ -473,7 +481,7 @@ func (s *Service) repoint(ctx context.Context, sourceID string, expected migrati
 	if err != nil {
 		return SyncJob{}, false, err
 	}
-	out, err := serviceAdminCall(ctx, s, http.MethodPut, "/v1/sources/"+sourceID, updated, migrationHeaders(revision, expected.Connections))
+	out, err := serviceAdminCall(ctx, s, http.MethodPut, "/v1/sources/"+sourceID, updated, migrationHeaders(revision, expected.Connections, expected.Migration))
 	if err != nil {
 		return SyncJob{}, false, err
 	}
@@ -564,7 +572,7 @@ func (c *liveAdminClient) call(ctx context.Context, method, path string, body an
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	if method == http.MethodGet && path == "/v1/profile" && resp.StatusCode == http.StatusOK && resp.Header.Get("X-Antfly-Source-Preconditions") != "1" {
+	if method == http.MethodGet && path == "/v1/profile" && resp.StatusCode == http.StatusOK && resp.Header.Get("X-Antfly-Source-Preconditions") != "2" {
 		return 0, nil, fmt.Errorf("live server does not support conditional source cutover; upgrade antfly-source before migrating")
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -624,7 +632,7 @@ func (c *liveAdminClient) repoint(ctx context.Context, sourceID string, expected
 	if err != nil {
 		return SyncJob{}, false, err
 	}
-	status, putBody, err := c.callSerialized(ctx, http.MethodPut, "/v1/sources/"+sourceID, updated, migrationHeaders(revision, expected.Connections))
+	status, putBody, err := c.callSerialized(ctx, http.MethodPut, "/v1/sources/"+sourceID, updated, migrationHeaders(revision, expected.Connections, expected.Migration))
 	if err != nil {
 		return SyncJob{}, false, err
 	}
@@ -912,9 +920,10 @@ func prepareMigrationCutover(profile Profile, expected migrationSnapshot, update
 type migrationSnapshot struct {
 	Source
 	Connections map[string]Connection
+	Migration   *LocalMigrationReceipt
 }
 
-func migrationHeaders(revision string, connections map[string]Connection) http.Header {
+func migrationHeaders(revision string, connections map[string]Connection, receipts ...*LocalMigrationReceipt) http.Header {
 	headers := http.Header{"If-Match": {revision}}
 	if len(connections) > 0 {
 		revisions := make(map[string]string, len(connections))
@@ -923,6 +932,10 @@ func migrationHeaders(revision string, connections map[string]Connection) http.H
 		}
 		raw, _ := json.Marshal(revisions)
 		headers.Set("X-Antfly-Migration-Connections", string(raw))
+	}
+	if len(receipts) > 0 && receipts[0] != nil {
+		raw, _ := json.Marshal(receipts[0])
+		headers.Set("X-Antfly-Local-Migration", string(raw))
 	}
 	return headers
 }

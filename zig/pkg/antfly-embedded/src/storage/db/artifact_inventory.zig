@@ -24,7 +24,7 @@ pub const resolver_key = "\x00\x00__metadata__:resolvers";
 pub const ordered_key = "\x00\x00__metadata__:ordered_artifact_catalog";
 pub const local_key = "\x00\x00__metadata__:artifact_inventory";
 
-pub const max_effect_protocol: u16 = 17;
+pub const max_effect_protocol: u16 = 18;
 
 pub const Binding = struct {
     epoch: u64,
@@ -55,7 +55,7 @@ pub const Catalogs = struct {
     /// Select capabilities from this immutable definition cut, independently
     /// of the database's monotonic reader floor. Resolver/producer receipts
     /// need protocol 15; grouped producer ownership needs protocol 16.
-    /// Generated base dense vectors need protocol 17 for execution-aware refresh.
+    /// Base dense vectors need protocol 17; scoped chunk vectors need protocol 18.
     pub fn requiredEffectProtocol(self: Catalogs, alloc: std.mem.Allocator) !u16 {
         const enrichments = @import("catalog/enrichment_catalog.zig");
         const producers = if (self.enrichments.len != 0)
@@ -74,8 +74,10 @@ pub const Catalogs = struct {
             const indexes = @import("catalog/index_manager.zig");
             const configs = try indexes.deserializeCatalog(alloc, self.indexes);
             defer @import("types.zig").freeIndexConfigs(alloc, configs);
-            for (configs) |cfg| if (cfg.kind == .dense_vector and
-                try indexes.onlineBaseGeneratedVectorConfig(alloc, cfg, producers)) return 17;
+            for (configs) |cfg| {
+                if (try indexes.onlineGeneratedChunkVectorConfig(alloc, cfg, producers)) return 18;
+                if (cfg.kind == .dense_vector and try indexes.onlineBaseGeneratedVectorConfig(alloc, cfg, producers)) required = @max(required, 17);
+            }
         }
         if (self.resolvers.len != 0) {
             const configs = try @import("catalog/resolver_catalog.zig").deserializeCatalog(alloc, self.resolvers);
@@ -188,6 +190,8 @@ test "grouped sources production ordered artifact inventory compatibility binds 
     extended.effect_protocol = 17;
     try std.testing.expect(extended.supportsProducerWitnesses());
     extended.effect_protocol = 18;
+    try std.testing.expect(extended.supportsProducerWitnesses());
+    extended.effect_protocol = 19;
     try std.testing.expect(!extended.supportsProducerWitnesses());
     try std.testing.expect(!extended.valid() and !extended.compatible(extended));
 }

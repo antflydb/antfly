@@ -8,6 +8,15 @@ const registrySDK = process.argv.includes("--registry-sdk");
 const registrySDKVersion = process.env.ANTFLY_SDK_VERSION ?? "0.2.2";
 const packedNames = registrySDK ? ["ai-sdk"] : ["sdk", "ai-sdk"];
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
+const manifest = JSON.parse(readFileSync(resolve(root, "ts/packages/ai-sdk/package.json"), "utf8"));
+const latestPeers = process.argv.includes("--latest-peers");
+function peerVersion(name) {
+  const range = manifest.peerDependencies[name];
+  if (!/^\^\d+\.\d+\.\d+$/.test(range)) throw new Error(`Expected a caret peer range for ${name}`);
+  if (!latestPeers) return range.slice(1);
+  const values = JSON.parse(run("npm", ["view", `${name}@${range}`, "version", "--json"], root));
+  return Array.isArray(values) ? values.at(-1) : values;
+}
 const state = resolve(root, ".state/ai-sdk");
 mkdirSync(state, { recursive: true });
 const consumer = mkdtempSync(resolve(state, "consumer-"));
@@ -24,6 +33,9 @@ function run(command, args, cwd = consumer) {
     throw new Error(`${command} ${args.join(" ")} failed:\n${result.stdout}\n${result.stderr}`);
   return result.stdout;
 }
+
+const aiVersion = peerVersion("ai");
+const zodVersion = peerVersion("zod");
 
 for (const name of packedNames)
   run(
@@ -46,8 +58,8 @@ run("npm", [
   "--no-fund",
   registrySDK ? `@antfly/sdk@${registrySDKVersion}` : resolve(artifacts, "sdk.tgz"),
   resolve(artifacts, "ai-sdk.tgz"),
-  "ai@7.0.162",
-  "zod@4.6.7",
+  `ai@${aiVersion}`,
+  `zod@${zodVersion}`,
   "typescript@5.9.3",
   "@types/node@25.9.3",
 ]);
@@ -114,8 +126,8 @@ writeFileSync(
     dependencies: {
       "@antfly/sdk": sdkDependency,
       "@antfly/ai-sdk": `file:${resolve(artifacts, "ai-sdk.tgz")}`,
-      ai: "7.0.162",
-      zod: "4.6.7",
+      ai: aiVersion,
+      zod: zodVersion,
       typescript: "5.9.3",
       "@types/node": "25.9.3",
       // @ai-sdk/provider's own json-schema dependency omits its typings. Supply
@@ -167,6 +179,11 @@ for (const extension of ["mjs", "cjs"]) {
 const receipt = {
   consumer,
   node: process.version,
+  peers: {
+    selection: latestPeers ? "latest-compatible" : "minimum",
+    ai: aiVersion,
+    zod: zodVersion,
+  },
   sdk: { source: registrySDK ? "npm-registry" : "local-tarball", version: installed.version },
   esm: "passed",
   commonjs: "passed",

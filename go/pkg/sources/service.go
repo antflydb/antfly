@@ -319,7 +319,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/v1/profile" && r.Method == http.MethodGet {
-		w.Header().Set("X-Antfly-Source-Preconditions", "1")
+		w.Header().Set("X-Antfly-Source-Preconditions", "2")
 		serviceJSON(w, 200, s.profile)
 		return
 	}
@@ -653,6 +653,17 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				next.Sources[index] = source
 			}
+			if raw := r.Header.Get("X-Antfly-Local-Migration"); raw != "" {
+				if r.Header.Get("If-Match") == "" || r.Header.Get("X-Antfly-Migration-Connections") == "" {
+					serviceError(w, 400, "migration_preconditions_required")
+					return
+				}
+				if err := applyMigrationReceipt(s.profile, &next, source, raw); err != nil {
+					serviceError(w, http.StatusPreconditionFailed, "migration_lineage_mismatch")
+					return
+				}
+			}
+
 		case http.MethodDelete:
 			if index < 0 && r.URL.Query().Get("purge") == "true" {
 				// A retained source can be explicitly purged after its definition

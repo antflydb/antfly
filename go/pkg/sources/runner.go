@@ -38,13 +38,14 @@ import (
 const maxOwnedSourceObjects = 1000000
 
 type Profile struct {
-	CatalogTable      string                `json:"catalog_table,omitempty"`
-	Version           int                   `json:"version"`
-	Endpoint          string                `json:"endpoint"`
-	DataPlaneTokenEnv string                `json:"data_plane_token_env,omitempty"`
-	Principals        []string              `json:"principals,omitempty"`
-	Connections       map[string]Connection `json:"connections"`
-	Sources           []Source              `json:"sources"`
+	LocalMigrations   map[string]LocalMigrationReceipt `json:"local_migrations,omitempty"`
+	CatalogTable      string                           `json:"catalog_table,omitempty"`
+	Version           int                              `json:"version"`
+	Endpoint          string                           `json:"endpoint"`
+	DataPlaneTokenEnv string                           `json:"data_plane_token_env,omitempty"`
+	Principals        []string                         `json:"principals,omitempty"`
+	Connections       map[string]Connection            `json:"connections"`
+	Sources           []Source                         `json:"sources"`
 }
 
 // Identity names the opaque prefix that scopes a source's row keys,

@@ -1,12 +1,12 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
-import { join, posix } from "node:path";
+import { createHash } from "node:crypto";
+import { posix } from "node:path";
 import type { AntflyClient } from "@antfly/sdk";
 import type { SourceSyncJob, StandaloneSourcesClient } from "@antfly/sdk/sources";
 import localMediaTypes from "../../../../../go/pkg/sources/local_media_types.json" with {
   type: "json",
 };
 import { abortable, combinedSignal } from "../abort.js";
+import { publishLocalObject } from "./local-store.js";
 import { type AntflyAssetReference, encodeAssetReference } from "./reference.js";
 
 /**
@@ -181,7 +181,6 @@ async function uploadWithinDeadline(
   }
   const digest = createHash("sha256").update(options.data).digest("hex");
   const ext = MIME_EXTENSIONS[mimeType];
-  const objectsDir = join(options.localRoot, options.prefix ?? "", "objects", "sha256");
   const filename = `${digest}.${ext}`;
   const relativeKey = `objects/sha256/${filename}`;
   const identity = source.identity?.namespace
@@ -192,19 +191,15 @@ async function uploadWithinDeadline(
     table: options.table,
     key: `source://job/${options.sourceId}/records/${keyDigest}`,
   };
-  const finalPath = join(objectsDir, filename);
-  check();
-  await mkdir(objectsDir, { recursive: true });
-  check();
-  const tempPath = join(objectsDir, `.upload-${randomUUID()}`);
-  try {
-    await writeFile(tempPath, options.data, { signal: options.signal });
-    check();
-    await rename(tempPath, finalPath);
-  } finally {
-    await rm(tempPath, { force: true });
-  }
-  check();
+  await publishLocalObject(
+    options.localRoot,
+    prefix,
+    filename,
+    digest,
+    options.data,
+    check,
+    options.signal
+  );
   const job = await runSourceSync(options, check);
   if (job.state !== "completed") throw new SourceSyncFailedError(job);
 
@@ -238,7 +233,11 @@ async function runSourceSync(
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     check();
     try {
-      job = await options.sources.sync({ sourceId: options.sourceId, signal: options.signal });
+      job = await options.sources.sync({
+        sourceId: options.sourceId,
+        restart: true,
+        signal: options.signal,
+      });
       break;
     } catch (error) {
       const status = (error as { status?: number } | undefined)?.status;

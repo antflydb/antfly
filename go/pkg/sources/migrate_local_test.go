@@ -19,6 +19,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -1047,7 +1049,7 @@ func TestMigrateLocalRepointsCatalogForGCSAndSyncsAfterward(t *testing.T) {
 	// The write side bypasses migrateGCSWriteClient/OAuth the same way --
 	// an already-authorized plain client, directly.
 	dest := &gcsDestination{client: gcsServer.Client(), bucket: "testbucket", apiBase: gcsServer.URL, uploadBase: gcsServer.URL}
-	opts := MigrateLocalOptions{FromPrefix: "assets", ToConnection: "gcs", ToBucket: "testbucket", ToPrefix: "migrated"}
+	opts := MigrateLocalOptions{FromConnection: "local", FromPrefix: "assets", ToConnection: "gcs", ToBucket: "testbucket", ToPrefix: "migrated"}
 	result := MigrateLocalResult{SourceID: testSourceID, ToConnection: "gcs", Bucket: "testbucket", ToPrefix: "migrated"}
 
 	result, err = migrateLocalRun(t.Context(), opts, result, source, &LocalConnector{Root: root}, dest, ProviderGCS, service, profile.Connections)
@@ -1406,4 +1408,116 @@ func TestMigrationConnectionFenceIsAtomicAtPutAndSync(t *testing.T) {
 	out, err = serviceAdminCall(t.Context(), service, http.MethodPost, "/v1/sync", map[string]any{"source_id": source.ID}, headers)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusPreconditionFailed, out.status)
+}
+
+func TestMigrateLocalMopUpRejectsAnotherDestinationPrefix(t *testing.T) {
+	opts, _, stateDir, _, bucket, backend := migrateServiceFixture(t)
+	_, err := MigrateLocal(t.Context(), opts)
+	require.NoError(t, err)
+	// A new object arrives only in the bucket after initial cutover.
+	extra := []byte("arrived in bucket after migration")
+	sum := sha256.Sum256(extra)
+	bucket.mu.Lock()
+	bucket.objects["migrated/objects/sha256/"+hex.EncodeToString(sum[:])+".txt"] = extra
+	bucket.mu.Unlock()
+	service, err := NewService(ServiceOptions{Profile: opts.Profile, StateDir: stateDir, PublicURL: opts.PublicURL, AdminToken: opts.AdminToken, MediaKey: opts.MediaKey})
+	require.NoError(t, err)
+	service.mu.Lock()
+	profile := cloneProfile(service.profile)
+	service.mu.Unlock()
+	require.Equal(t, "assets", profile.LocalMigrations[testSourceID].FromPrefix)
+	require.Equal(t, "migrated", profile.LocalMigrations[testSourceID].ToPrefix)
+
+	out, err := serviceAdminCall(t.Context(), service, http.MethodPost, "/v1/sync", map[string]any{"source_id": testSourceID})
+	require.NoError(t, err)
+	var job SyncJob
+	require.NoError(t, json.Unmarshal(out.body.Bytes(), &job))
+	require.Equal(t, "completed", waitServiceJob(t, service, job.ID).State)
+	require.NoError(t, service.Close())
+	backend.mu.Lock()
+	count := len(backend.records)
+	backend.mu.Unlock()
+	require.Equal(t, 2, count)
+	opts.ToPrefix = "typo"
+	_, err = MigrateLocal(t.Context(), opts)
+	backend.mu.Lock()
+	remaining := len(backend.records)
+	backend.mu.Unlock()
+	require.Equal(t, 2, remaining, "mop-up must preserve bucket-only rows")
+	require.Error(t, err, "a mop-up must not silently change the existing destination")
+}
+
+func TestMigrationReceiptRejectsChangedRetryAndMissingLineage(t *testing.T) {
+	opts, _, _, _, _, _ := migrateServiceFixture(t)
+	original := opts.Profile.Sources[0]
+	original.Identity.Namespace = "migration-namespace"
+	opts.Profile.Sources[0] = original
+	target := original
+	target.Connection = opts.ToConnection
+	var err error
+	target.Config, err = migrateDestinationConfig(ProviderS3, opts.ToBucket, opts.ToPrefix)
+	require.NoError(t, err)
+	receipt := migrationReceipt(target, opts, opts.Profile.Connections[opts.FromConnection], opts.Profile.Connections[opts.ToConnection])
+	raw, err := json.Marshal(receipt)
+	require.NoError(t, err)
+	next := opts.Profile
+	next.Sources = []Source{target}
+	require.NoError(t, applyMigrationReceipt(opts.Profile, &next, target, string(raw)))
+	require.Equal(t, receipt, next.LocalMigrations[target.ID])
+	_, _, _, err = resolveMigrationSource(next, opts)
+	require.NoError(t, err)
+	for _, field := range []string{"from-prefix", "to-prefix", "to-bucket", "local-root", "destination-config", "missing-receipt"} {
+		t.Run(field, func(t *testing.T) {
+			changed := opts
+			profile := next
+			switch field {
+			case "from-prefix":
+				changed.FromPrefix = "different"
+			case "to-prefix":
+				changed.ToPrefix = "different"
+			case "to-bucket":
+				changed.ToBucket = "different"
+			case "local-root":
+				profile.Connections = make(map[string]Connection)
+				for key, value := range next.Connections {
+					profile.Connections[key] = value
+				}
+				connection := profile.Connections[opts.FromConnection]
+				connection.LocalRoot += "-different"
+				profile.Connections[opts.FromConnection] = connection
+			case "destination-config":
+				source := target
+				source.Config, err = migrateDestinationConfig(ProviderS3, opts.ToBucket, "different")
+				require.NoError(t, err)
+				profile.Sources = []Source{source}
+			case "missing-receipt":
+				profile.LocalMigrations = nil
+			}
+			_, _, _, err := resolveMigrationSource(profile, changed)
+			require.ErrorIs(t, err, ErrInvalidInput)
+		})
+	}
+	require.Error(t, applyMigrationReceipt(opts.Profile, &next, target, string(raw)+" {}"))
+}
+
+func TestNewUploadFreshInventoryAfterFailedSync(t *testing.T) {
+	_, service, root, _, backend := migrateLiveFixture(t)
+	backend.mu.Lock()
+	backend.dropContentAck = true
+	backend.mu.Unlock()
+	first, err := serviceAdminCall(t.Context(), service, http.MethodPost, "/v1/sync", map[string]any{})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusAccepted, first.status)
+	var job SyncJob
+	require.NoError(t, json.Unmarshal(first.body.Bytes(), &job))
+	require.Equal(t, "failed", waitServiceJob(t, service, job.ID).State)
+	localPut(t, root, "assets", ".txt", "new upload after failure")
+	second, err := serviceAdminCall(t.Context(), service, http.MethodPost, "/v1/sync", map[string]any{"source_id": testSourceID, "restart": true})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusAccepted, second.status)
+	require.NoError(t, json.Unmarshal(second.body.Bytes(), &job))
+	require.Equal(t, "completed", waitServiceJob(t, service, job.ID).State)
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	require.Len(t, backend.records, 2)
 }
