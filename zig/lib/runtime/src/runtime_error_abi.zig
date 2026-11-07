@@ -1011,6 +1011,9 @@ pub const Detail = enum(c_int) {
     unknown_privacy_category,
     sql_statement_read_unavailable,
     unsupported_sql_execution,
+    invalid_external_source_inventory,
+    invalid_external_source_snapshot,
+    external_source_snapshot_too_large,
 };
 
 pub const Status = extern struct {
@@ -1240,6 +1243,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.ExternalLakeSnapshotMismatch => status(.conflict, .external_lake_snapshot_mismatch),
         error.ExternalLakeSchemaMismatch => status(.conflict, .external_lake_schema_mismatch),
         error.ExternalLakeSchemaUnavailable => status(.unavailable, .external_lake_schema_unavailable),
+        error.InvalidExternalSourceInventory => status(.invalid_argument, .invalid_external_source_inventory),
+        error.InvalidExternalSourceSnapshot => status(.invalid_argument, .invalid_external_source_snapshot),
+        error.ExternalSourceSnapshotTooLarge => status(.invalid_argument, .external_source_snapshot_too_large),
         error.ExternalLakeFieldIdentityChanged => status(.conflict, .external_lake_field_identity_changed),
         error.ExternalLakeObjectChanged => status(.conflict, .external_lake_object_changed),
         error.EmptyExternalSourceSnapshot => status(.invalid_argument, .empty_external_source_snapshot),
@@ -2174,6 +2180,9 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .external_lake_snapshot_mismatch => "ExternalLakeSnapshotMismatch",
         .external_lake_schema_mismatch => "ExternalLakeSchemaMismatch",
         .external_lake_schema_unavailable => "ExternalLakeSchemaUnavailable",
+        .invalid_external_source_inventory => "InvalidExternalSourceInventory",
+        .invalid_external_source_snapshot => "InvalidExternalSourceSnapshot",
+        .external_source_snapshot_too_large => "ExternalSourceSnapshotTooLarge",
         .external_lake_field_identity_changed => "ExternalLakeFieldIdentityChanged",
         .external_lake_object_changed => "ExternalLakeObjectChanged",
         .empty_external_source_snapshot => "EmptyExternalSourceSnapshot",
@@ -3153,6 +3162,9 @@ test "external lake and spill errors retain exact identity across runtime archiv
         error.ExternalLakeSnapshotMismatch,
         error.ExternalLakeSchemaMismatch,
         error.ExternalLakeSchemaUnavailable,
+        error.InvalidExternalSourceInventory,
+        error.InvalidExternalSourceSnapshot,
+        error.ExternalSourceSnapshotTooLarge,
         error.ExternalLakeFieldIdentityChanged,
         error.ExternalLakeObjectChanged,
         error.EmptyExternalSourceSnapshot,
@@ -3426,4 +3438,13 @@ test "privacy failures retain identity and retry classes across runtime callback
     }
     try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.PrivacyStale).code);
     try std.testing.expectEqual(@backingInt(Code.corrupt), statusFromError(error.InvalidPrivacyReceipt).code);
+}
+
+test "manifest client failures append stable details without changing released ordinals" {
+    try std.testing.expectEqual(@backingInt(Detail.unsupported_sql_execution) + 1, @backingInt(Detail.invalid_external_source_inventory));
+    for ([_]anyerror{ error.InvalidExternalSourceInventory, error.InvalidExternalSourceSnapshot, error.ExternalSourceSnapshotTooLarge }) |err| {
+        const transported = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(Code.invalid_argument), transported.code);
+        try std.testing.expectEqual(err, errorFromStatus(transported));
+    }
 }

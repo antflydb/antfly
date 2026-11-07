@@ -175,13 +175,44 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         archive = server.root / "archive"
         objects = archive / "buckets/antfly/objects"
         objects.mkdir(parents=True)
+        bodies = [
+            ("quasar " + "archive " * ((body_bytes - 6) // 8)).strip()
+        ] * archive_rows
+        corpus_dir = os.environ.get("ANTFLY_E2E_COMPOSED_CORPUS_DIR")
+        if corpus_dir:
+            files = sorted(Path(corpus_dir).glob("*.parquet"))
+            assert files, (
+                "corpus directory must contain Parquet files with a body column"
+            )
+            bodies = [
+                body or ""
+                for path in files
+                for body in pq.read_table(path, columns=["body"])
+                .column("body")
+                .to_pylist()
+            ]
+            assert len(bodies) == archive_rows
+            # Keep deterministic correctness assertions on the first 100 rows;
+            # profiling can search an independent term in the real comments.
+            bodies[:100] = ["quasar " + body for body in bodies[:100]]
+            record_property(
+                "corpus_files_sha256",
+                json.dumps(
+                    {
+                        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in files
+                    }
+                ),
+            )
+        profile_term = os.environ.get("ANTFLY_E2E_COMPOSED_PROFILE_TERM", "quasar")
+        assert 1 <= len(profile_term) <= 64
+        record_property("profile_term", profile_term)
         payload = io.BytesIO()
         pq.write_table(
             pa.table(
                 {
                     "id": list(range(archive_rows)),
-                    "body": [("quasar " + "archive " * ((body_bytes - 6) // 8)).strip()]
-                    * archive_rows,
+                    "body": bodies,
                     "deleted": [False] * archive_rows,
                 }
             ),
@@ -278,12 +309,16 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 else (archive / "sealed.parquet-manifest.json").as_uri()
             )
 
-        def assert_highlights(value):
+        def assert_highlights(value, term="quasar"):
             if not highlights:
                 return
             for hit in value.get("hits", {}).get("hits", []):
                 assert any(
-                    fragment["text"][span["start"] : span["end"]].lower() == "quasar"
+                    fragment["text"]
+                    .encode("utf-8")[span["start"] : span["end"]]
+                    .decode("utf-8")
+                    .lower()
+                    == term.lower()
                     for fragment in hit["_highlights"]["body"]
                     for span in fragment["spans"]
                 )
@@ -733,8 +768,24 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 hashlib.sha256(Path(server.binary).read_bytes()).hexdigest(),
             )
             record_property("host", platform.platform())
+            record_property("host_load_average", json.dumps(os.getloadavg()))
+            import subprocess
+
+            commands = subprocess.check_output(["ps", "-axo", "comm,args"], text=True)
+            record_property(
+                "concurrent_zig_compilers",
+                sum(
+                    bool(
+                        re.search(
+                            r"\bzig(?:-\S+)?\s+(?:build-lib|build-exe|test)\b", line
+                        )
+                    )
+                    for line in commands.splitlines()
+                ),
+            )
             samples = []
             profile_query = {k: v for k, v in query.items() if k != "filter_query"}
+            profile_query["full_text_search"] = {"match": profile_term, "field": "body"}
             server.restart()
             read = logical_process_reader(server.proc.pid)
             for index in range(rounds + 1):
@@ -751,7 +802,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 )
                 value = response.json()
                 value = value.get("responses", [value])[0]
-                assert_highlights(value)
+                assert_highlights(value, profile_term)
                 assert len(value["hits"]["hits"]) == 7
                 samples.append({"mode": "restart" if index == 0 else "warm", **usage})
             record_property("query_samples", json.dumps(samples))
@@ -770,7 +821,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                         f"Concurrent query failed: {response.status_code}"
                     )
                     result = response.json()["responses"][0]
-                    assert_highlights(result)
+                    assert_highlights(result, profile_term)
                     assert len(result["hits"]["hits"]) == 7
                     assert result["next_source_cursor"].startswith("source3:")
                     return (time.monotonic() - started) * 1000
@@ -803,7 +854,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 response.ok
                 and len(response.json()["responses"][0]["hits"]["hits"]) == 7
             )
-            assert_highlights(response.json()["responses"][0])
+            assert_highlights(response.json()["responses"][0], profile_term)
             record_property("cold_cache_query", json.dumps(usage))
             record_property(
                 "cold_cache_startup_and_query_ms",

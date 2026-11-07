@@ -482,9 +482,9 @@ The prepared store must be constructed at its final address before publication
 selection: cloud-generation bindings retain a pointer to its inline object-store
 implementation, including during cleanup. Moving an already bound store leaves
 that pointer dangling. Mutable overlay wrappers belong to individual executions;
-retained overlays may build their physical suppression mask in a leaf's scratch
-arena, so the shared prepared reader must never retain that mask after the leaf
-returns. WAL-cache pins retain their separately owned masks as before.
+retained overlays cache their physical suppression mask in the prepared reader's
+bounded arena, so subsequent leaves can reuse it without retaining a pointer into
+a freed leaf arena. WAL-cache pins retain their separately owned masks as before.
 
 Overlay windows grow with observed suppression, up to the existing 128-row
 physical batch limit. Unfiltered indexed probes still cover every replacement
@@ -493,13 +493,15 @@ Skipping probes based only on matching buffered hits would let duplicate newer
 keys outside that ranked window evade validation. These changes preserve source
 ranks and continuation positions.
 
-Internal refills use request-local cut references. Only a returned continuation
-materializes durable leaf capabilities and its composed cursor. Counts and
-complete result sets need no retained cursor uploads. Public cursors retain the
-existing `source2:`/`lake2:` protocol and expiry; a restart must reopen the same
-published source and accepted WAL cut. This reduces redundant setup and needless
-retention writes; it does not remove mandatory fresh authority checks or the
-writes needed for an actual restart-safe continuation.
+In the initial reader-sharing implementation measured below, internal refills
+use request-local cut references. Only a returned continuation materializes
+durable leaf capabilities and its composed cursor. Counts and complete result
+sets need no retained cursor uploads. Public cursors use the existing
+`source2:`/`lake2:` protocol and expiry; a restart must reopen the same published
+source and accepted WAL cut. That implementation reduces redundant setup and
+needless retention writes while retaining fresh remote authority checks and
+continuation uploads. The native owner-admission follow-up below moves those
+remaining operations out of the supported query path.
 
 On November 7 UTC, the managed rc.10 HN qualification instance's public bindings
 were migrated to explicit `object_mutability: immutable`. The archive retains
