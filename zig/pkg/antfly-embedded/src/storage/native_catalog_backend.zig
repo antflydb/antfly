@@ -561,6 +561,16 @@ pub const Backend = struct {
         pub fn openCursor(self: *NamespaceTxn, namespace: backend_types.Namespace) !Cursor {
             return Cursor.init(self.allocator, self.rc.?.state.tree, namespace);
         }
+
+        /// This transaction's staged mutations so far, in call order --
+        /// valid only until the next `put`/`delete`/`abort`/`commit` call
+        /// (the arena backing their bytes is this transaction's own).
+        /// Mirrors `BoundTxn.pendingMutations`'s doc comment: a caller
+        /// harvesting these to fold into an externally-owned commit must
+        /// deep-copy before calling `abort()`.
+        pub fn pendingMutations(self: *const NamespaceTxn) []const Mutation {
+            return self.pending.items;
+        }
     };
 
     // Namespace-scoped cursor over a retained tree snapshot (required by
