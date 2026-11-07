@@ -147,6 +147,62 @@ fn encodeProjectionMetadata(checkpoint: ProjectionCheckpoint) [projection_metada
     return raw;
 }
 
+/// Own fixed scalar/rich progress values before admission. Their only late
+/// input is the actual logical sequence selected by the publication owner.
+pub const BoundProjectionProgress = struct {
+    scalar: @import("../../native_publication_value.zig").Builder,
+    rich: @import("../../native_publication_value.zig").Builder,
+    template: ProjectionCheckpoint,
+    bound_sequence: ?u64 = null,
+
+    pub fn deinit(self: *@This()) void {
+        self.scalar.deinit();
+        self.rich.deinit();
+        self.* = undefined;
+    }
+
+    pub fn bind(self: *@This(), sequence: u64) !void {
+        if (sequence < self.template.applied_sequence or sequence == std.math.maxInt(u64)) return error.InvalidDerivedApplyState;
+        if (self.bound_sequence) |previous| {
+            if (sequence != previous) return error.InvalidDerivedApplyState;
+            return;
+        }
+        var checkpoint = self.template;
+        checkpoint.applied_sequence = sequence;
+        var scalar: [8]u8 = undefined;
+        std.mem.writeInt(u64, &scalar, sequence, .little);
+        const rich = encodeProjectionMetadata(checkpoint);
+        try self.scalar.write(0, &scalar);
+        try self.rich.write(0, &rich);
+        try self.scalar.seal();
+        try self.rich.seal();
+        self.bound_sequence = sequence;
+    }
+};
+
+/// `prepared` owns the planned metadata effects. Discard it if this setup
+/// fails; every value remains unsealed until the publisher supplies its cut.
+pub fn bindPreparedProjectionProgress(resources: anytype, index_name: []const u8, prepared: anytype) !BoundProjectionProgress {
+    var scalar_key_buffer: [256]u8 = undefined;
+    var rich_key_buffer: [256]u8 = undefined;
+    const scalar_key = try std.fmt.bufPrint(&scalar_key_buffer, "{s}{s}", .{ metadata_prefix, index_name });
+    const rich_key = try projectionMetadataKey(&rich_key_buffer, index_name);
+    const scalar_bytes = try prepared.postimage(scalar_key);
+    const template = try decodeProjectionMetadata(try prepared.postimage(rich_key));
+    if (scalar_bytes.len != 8 or std.mem.readInt(u64, scalar_bytes[0..8], .little) != template.applied_sequence) return error.InvalidDerivedApplyState;
+    var scalar = try resources.createPublicationValue(8);
+    errdefer scalar.deinit();
+    var rich = try resources.createPublicationValue(projection_metadata_len);
+    errdefer rich.deinit();
+    var scalar_value = scalar.value();
+    defer scalar_value.deinit();
+    var rich_value = rich.value();
+    defer rich_value.deinit();
+    try prepared.bindValue(scalar_key, scalar_value);
+    try prepared.bindValue(rich_key, rich_value);
+    return .{ .scalar = scalar, .rich = rich, .template = template };
+}
+
 fn decodeProjectionMetadata(raw: []const u8) !ProjectionCheckpoint {
     if (raw.len != projection_metadata_len or !std.mem.eql(u8, raw[0..8], projection_metadata_magic) or
         raw[33] > 1 or Crc32.hash(raw[0..42]) != std.mem.readInt(u32, raw[42..46], .little))

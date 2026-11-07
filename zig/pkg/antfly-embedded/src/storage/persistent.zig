@@ -1413,7 +1413,35 @@ pub const PersistentIndex = struct {
     pub const ReplayPublicationMetadata = struct {
         participant: @import("native_publication.zig").Participant,
         seal: ?projection_seal.Seal = null,
+        /// Borrowed from the request until publication completes. Preparation
+        /// fills the merged template, including the existing baseline. The
+        /// publisher seals its fixed value only after choosing the logical cut.
+        seal_binding: ?struct {
+            value: @import("native_publication_value.zig").Value,
+            template: *?projection_seal.Seal,
+        } = null,
     };
+
+    fn saveProjectionSealInTxn(txn: *MainTxn, metadata: ReplayPublicationMetadata) !void {
+        const seal = metadata.seal orelse {
+            if (metadata.seal_binding != null) return error.InvalidDerivedApplyState;
+            return;
+        };
+        var next = seal;
+        const previous = txn.get(.meta, projection_seal.metadata_key) catch |err| if (err == error.NotFound) null else return err;
+        if (previous) |raw| {
+            const old = try projection_seal.Seal.decode(raw);
+            if (!old.sameIdentity(seal)) return error.ProjectionSealIdentityChanged;
+            if (next.baseline == null) next.baseline = old.baseline;
+            next.applied_sequence = @max(next.applied_sequence, old.applied_sequence);
+        }
+        if (metadata.seal_binding) |binding| {
+            if (binding.value.initialization_view.len != @sizeOf(projection_seal.Seal.Encoded)) return error.InvalidNativePublicationValue;
+            binding.template.* = next;
+            const write = if (txn.write) |*value| value else return error.ReadOnly;
+            try write.putPreparedValue(runtimeNamespace(.meta), projection_seal.metadata_key, binding.value);
+        } else try txn.put(.meta, projection_seal.metadata_key, &try next.encode());
+    }
 
     /// Ordinary prepared text effects use the same atomic physical activation
     /// without manufacturing or advancing a journal continuation.
@@ -1682,17 +1710,7 @@ pub const PersistentIndex = struct {
             if (segments.len != 0) try self.txn.delete(.meta, meta_active_segments);
             try saveNextSegmentId(&self.txn, self.inputs.next_segment_id);
             if (candidate_snapshot) |*candidate| try savePreparedNativeAdmissions(a, &self.txn, candidate, segments);
-            if (metadata) |joined| if (joined.seal) |seal| {
-                var next = seal;
-                const previous = self.txn.get(.meta, projection_seal.metadata_key) catch |err| if (err == error.NotFound) null else return err;
-                if (previous) |raw| {
-                    const old = try projection_seal.Seal.decode(raw);
-                    if (!old.sameIdentity(seal)) return error.ProjectionSealIdentityChanged;
-                    if (next.baseline == null) next.baseline = old.baseline;
-                    next.applied_sequence = @max(next.applied_sequence, old.applied_sequence);
-                }
-                try self.txn.put(.meta, projection_seal.metadata_key, &try next.encode());
-            };
+            if (metadata) |joined| try saveProjectionSealInTxn(&self.txn, joined);
             try self.inputs.requireCurrentRevisions();
             const prepared = try self.txn.write.?.prepareNativePublication();
             self.txn.write = null;
@@ -1933,17 +1951,7 @@ pub const PersistentIndex = struct {
             const encoded = ReplayFragment.encode(point);
             try txn.put(.meta, meta_replay_fragment, &encoded);
         }
-        if (metadata) |joined| if (joined.seal) |seal| {
-            var next = seal;
-            const previous = txn.get(.meta, projection_seal.metadata_key) catch |err| if (err == error.NotFound) null else return err;
-            if (previous) |raw| {
-                const old = try projection_seal.Seal.decode(raw);
-                if (!old.sameIdentity(seal)) return error.ProjectionSealIdentityChanged;
-                if (next.baseline == null) next.baseline = old.baseline;
-                next.applied_sequence = @max(next.applied_sequence, old.applied_sequence);
-            }
-            try txn.put(.meta, projection_seal.metadata_key, &try next.encode());
-        };
+        if (metadata) |joined| try saveProjectionSealInTxn(&txn, joined);
         if (publication) |*prepared| try prepared.detach();
         if (detached) |result| {
             const namespace_txn = if (txn.write) |*value| value else return error.ReadOnly;
@@ -9208,10 +9216,23 @@ fn testOwnedPublicationRuntimeReplacement(large: bool, detached_inputs: bool) !v
     defer if (stager_live) stager.deinit();
     var staged = [_]PreparedReplaySegment{try prepareNativeTextSegment(a, stager, beta)};
     defer staged[0].deinit();
+    var seal_builder: ?@import("native_publication_value.zig").Builder = null;
+    defer if (seal_builder) |*builder| builder.deinit();
+    var seal_template: ?projection_seal.Seal = null;
+    var metadata: ?PersistentIndex.ReplayPublicationMetadata = null;
+    {
+        seal_builder = try index.writer.native_resources.?.createPublicationValue(@sizeOf(projection_seal.Seal.Encoded));
+        var value = seal_builder.?.value();
+        defer value.deinit();
+        const Noop = struct {
+            fn stage(_: *anyopaque, _: @import("native_publication.zig").View) !void {}
+        };
+        metadata = .{ .participant = .{ .ptr = &seal_template, .stage = Noop.stage }, .seal = .{ .root = 1, .namespace = @splat(1), .generation = 1, .config_hash = 2, .applied_sequence = 1 }, .seal_binding = .{ .value = value, .template = &seal_template } };
+    }
     var inputs: ?PersistentIndex.NativePreparation = if (detached_inputs) try index.captureNativePreparation(staged.len) else null;
     var inputs_live = inputs != null;
     defer if (inputs_live) inputs.?.deinit();
-    var prepared_optional: ?*PersistentIndex.PreparedNativePublication = if (detached_inputs) null else try index.prepareOwnedNativePublication(&staged, &.{"doc:a"}, null, null);
+    var prepared_optional: ?*PersistentIndex.PreparedNativePublication = if (detached_inputs) null else try index.prepareOwnedNativePublication(&staged, &.{"doc:a"}, null, metadata);
     var prepared_live = prepared_optional != null;
     defer if (prepared_live) prepared_optional.?.deinit();
     index.close();
@@ -9221,7 +9242,7 @@ fn testOwnedPublicationRuntimeReplacement(large: bool, detached_inputs: bool) !v
     backend.deinit();
     backend_live = false;
     if (inputs) |*seed| {
-        prepared_optional = try seed.build(&staged, &.{"doc:a"}, null);
+        prepared_optional = try seed.build(&staged, &.{"doc:a"}, metadata);
         prepared_live = true;
         seed.deinit();
         inputs_live = false;
@@ -9232,6 +9253,12 @@ fn testOwnedPublicationRuntimeReplacement(large: bool, detached_inputs: bool) !v
     // Fixed native metadata can receive authoritative identities with no
     // originating runtime, mutable index, primary Store or writer gate left.
     try staged[0].ordinals.?.bind(&.{913});
+    if (seal_builder) |*builder| {
+        var seal = seal_template.?;
+        seal.applied_sequence = 19;
+        try builder.write(0, &try seal.encode());
+        try builder.seal();
+    }
     backend = try backend_mod.Handle.open(a, path, .{ .io = std.testing.io, .no_sync = true, .externally_locked = true, .reclamation = .{ .enabled = false } });
     backend_live = true;
     backend.native_docstore.?.maintenance_start_suppressed = true;
@@ -9264,6 +9291,7 @@ fn testOwnedPublicationRuntimeReplacement(large: bool, detached_inputs: bool) !v
     try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
     try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, old, "alpha"));
     try std.testing.expect(index.snapshot().native_resources.?.resource_manager.? == original_manager);
+    try std.testing.expectEqual(@as(u64, 19), (try index.loadProjectionSeal(a)).?.applied_sequence);
     const retained = index.acquireSnapshot();
     defer retained.release();
     try std.testing.expect((try backend.native_docstore.?.file.check()).valid);

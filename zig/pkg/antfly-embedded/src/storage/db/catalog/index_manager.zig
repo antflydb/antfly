@@ -1132,6 +1132,10 @@ pub const PreparedForegroundTextMetadata = struct {
 pub const OwnedForegroundTextPublication = struct {
     alloc: Allocator,
     sequence: u64,
+    previous_sequence: u64,
+    progress: ?apply_state.BoundProjectionProgress = null,
+    seal_builder: ?@import("../../native_publication_value.zig").Builder = null,
+    seal_template: ?@import("../../projection_seal.zig").Seal = null,
     config: ForegroundTextProjection,
     claims: ?PreparedForegroundTextMetadata,
     root: @import("../../native_metadata_batch.zig").Prepared,
@@ -1144,6 +1148,8 @@ pub const OwnedForegroundTextPublication = struct {
         if (self.native) |native| native.deinit();
         if (self.inputs) |*inputs| inputs.deinit();
         self.root.deinit();
+        if (self.progress) |*progress| progress.deinit();
+        if (self.seal_builder) |*builder| builder.deinit();
         if (self.claims) |*claims| claims.deinit();
         a.destroy(self);
     }
@@ -1156,6 +1162,24 @@ pub const OwnedForegroundTextPublication = struct {
         self.inputs = null;
         defer inputs.deinit();
         self.native = try inputs.build(built.staged, delete_keys, self.metadata);
+    }
+
+    pub fn bindSequence(self: *@This(), sequence: u64) !void {
+        if (sequence <= self.previous_sequence or sequence == std.math.maxInt(u64)) return error.InvalidDerivedApplyState;
+        const progress = if (self.progress) |*value| value else return error.InvalidDerivedApplyState;
+        if (progress.bound_sequence != null) return progress.bind(sequence);
+        const encoded_seal = if (self.seal_builder != null) blk: {
+            var seal = self.seal_template orelse return error.InvalidProjectionSeal;
+            if (sequence < seal.applied_sequence) return error.EnrichmentWaitCanceled;
+            seal.applied_sequence = sequence;
+            break :blk try seal.encode();
+        } else null;
+        try progress.bind(sequence);
+        if (encoded_seal) |encoded| {
+            try self.seal_builder.?.write(0, &encoded);
+            try self.seal_builder.?.seal();
+        }
+        self.sequence = sequence;
     }
 
     pub const Guard = struct {
@@ -22047,6 +22071,16 @@ pub const IndexManager = struct {
                 return error.ForegroundProjectionUnavailable;
             }
             fn planUnfenced(planner: *const @This(), txn: anytype) !void {
+                // Witness the committed source tip independently of a serving
+                // runtime's cached counter. A primary-only peer publication
+                // cannot be skipped just because index metadata is unchanged.
+                const next = txn.get(&internal_keys.replay_meta_next_sequence_key) catch |err| switch (@as(anyerror, err)) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (next) |raw| {
+                    if (raw.len != 8 or std.mem.readInt(u64, raw[0..8], .little) != planner.previous + 1) return error.EnrichmentSourceChanged;
+                } else if (planner.previous != 0) return error.EnrichmentSourceChanged;
                 const checkpoint = try apply_state.loadProjectionMetadataTxn(txn, planner.config.name);
                 if (checkpoint) |value| {
                     if (value.status != .clean or value.applied_sequence != planner.previous or value.generation != planner.config.generation or value.config_hash != planner.config.config_hash) return error.ForegroundProjectionUnavailable;
@@ -22072,11 +22106,21 @@ pub const IndexManager = struct {
             else => return err,
         };
         errdefer root.deinit();
-        result.* = .{ .alloc = self.alloc, .sequence = next_sequence, .config = config, .claims = claims, .root = root, .metadata = undefined };
-        const metadata: persistent_mod.PersistentIndex.ReplayPublicationMetadata = .{
+        result.* = .{ .alloc = self.alloc, .sequence = next_sequence, .previous_sequence = previous_sequence, .config = config, .claims = claims, .root = root, .metadata = undefined };
+        errdefer if (result.progress) |*progress| progress.deinit();
+        errdefer if (result.seal_builder) |*builder| builder.deinit();
+        const resources = config.projection.build.?.resources;
+        result.progress = try apply_state.bindPreparedProjectionProgress(resources, config.name, &result.root);
+        var metadata: persistent_mod.PersistentIndex.ReplayPublicationMetadata = .{
             .participant = result.root.participant(),
             .seal = if (authority) |selected_authority| if (self.artifact_projection_root != 0) .{ .root = self.artifact_projection_root, .namespace = selected_authority.namespace, .generation = config.generation, .config_hash = config.config_hash, .applied_sequence = next_sequence } else null else null,
         };
+        if (metadata.seal != null) {
+            result.seal_builder = try resources.createPublicationValue(@sizeOf(@import("../../projection_seal.zig").Seal.Encoded));
+            var value = result.seal_builder.?.value();
+            defer value.deinit();
+            metadata.seal_binding = .{ .value = value, .template = &result.seal_template };
+        }
         _ = delete_keys;
         result.metadata = metadata;
         result.inputs = try entry.persistent.captureNativePreparation(built.staged.len);

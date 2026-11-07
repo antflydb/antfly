@@ -38,6 +38,16 @@ pub const Prepared = struct {
     pub fn participant(self: *Prepared) publication.Participant {
         return .{ .ptr = self, .validate_fn = validate, .stage = stage };
     }
+    /// Borrow an owned planned value while constructing late bindings. This
+    /// never reads live storage or exposes an unsealed substituted value.
+    pub fn postimage(self: *const Prepared, key: []const u8) ![]const u8 {
+        if (self.admitted or self.staged) return error.InvalidDerivedApplyState;
+        for (self.writes) |write| if (std.mem.eql(u8, write.key, key)) {
+            if (write.binding != null) return error.InvalidNativePublicationValue;
+            return write.bytes;
+        };
+        return error.NotFound;
+    }
     /// Descriptors keep their fixed backing and size through native commit.
     /// The producer must seal every bound value before publication begins.
     pub fn bindValue(self: *Prepared, key: []const u8, value: values.Value) !void {

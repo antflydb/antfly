@@ -78113,18 +78113,22 @@ test "db owned document preparation transfers effects and rejects changed identi
 }
 
 test "db native foreground text shares the primary commit and binds authoritative document identities" {
-    try testNativeForegroundTextPrimary(false, false);
+    try testNativeForegroundTextPrimary(false, false, false);
 }
 
 test "db native foreground text shares dynamic claims across multiple indexes in one primary commit" {
-    try testNativeForegroundTextPrimary(true, false);
+    try testNativeForegroundTextPrimary(true, false, false);
 }
 
 test "db native foreground text shares one durable barrier with primary writes and deletes" {
-    try testNativeForegroundTextPrimary(true, true);
+    try testNativeForegroundTextPrimary(true, true, false);
 }
 
-fn testNativeForegroundTextPrimary(dynamic: bool, durable: bool) !void {
+test "db native foreground text binds reserved sequence holes without skipping committed replay" {
+    try testNativeForegroundTextPrimary(true, true, true);
+}
+
+fn testNativeForegroundTextPrimary(dynamic: bool, durable: bool, holes: bool) !void {
     const a = std.testing.allocator;
     const lite = @import("../lite/backend.zig");
     const Prepared = @import("prepared_document_batch.zig").Plan;
@@ -78168,6 +78172,11 @@ fn testNativeForegroundTextPrimary(dynamic: bool, durable: bool) !void {
             defer probe.abort();
             std.debug.print("FOREGROUND_NOT_PREPARED round={d} tip={d} checkpoint={any} config_generation={d} config_hash={d}\n", .{ round, database.core.store.lastReplaySequence(0), try apply_state.loadProjectionMetadataTxn(&probe, "text"), prepared.text.items[0].config.generation, prepared.text.items[0].config.config_hash });
             return error.ForegroundPublicationNotPrepared;
+        }
+        if (holes) {
+            const committed_tip = database.core.nextDerivedSequence();
+            for (0..3) |_| _ = database.core.reserveDerivedAppendSequence();
+            try std.testing.expectEqual(committed_tip, database.core.nextDerivedSequence());
         }
         const before = backend.native_docstore.?.file.activeCheckpoint().commit_sequence;
         const barriers = backend.native_docstore.?.file.test_durability_syncs.load(.monotonic);
@@ -78220,6 +78229,9 @@ fn testNativeForegroundTextPrimary(dynamic: bool, durable: bool) !void {
     try deleting.prepare(deletion);
     try deleting.stageForegroundText(&database);
     for (deleting.text.items) |item| if (item.publication == null) return error.ForegroundDeletionNotPrepared;
+    if (holes) for (0..3) |_| {
+        _ = database.core.reserveDerivedAppendSequence();
+    };
     const before_deletion = backend.native_docstore.?.file.activeCheckpoint().commit_sequence;
     const deletion_barriers = backend.native_docstore.?.file.test_durability_syncs.load(.monotonic);
     committed = false;
@@ -78229,6 +78241,49 @@ fn testNativeForegroundTextPrimary(dynamic: bool, durable: bool) !void {
     if (durable) try std.testing.expectEqual(@as(u64, 1), backend.native_docstore.?.file.test_durability_syncs.load(.monotonic) - deletion_barriers);
     try std.testing.expectEqual(@as(u32, 0), entry.persistent.snapshot().liveDocCount());
     try std.testing.expect((try database.get(a, "one")) == null);
+    if (holes) {
+        // The namespace and per-index clean checkpoint stay unchanged when a
+        // peer commits primary-only replay. Final native validation must still
+        // refuse a captured publication, independently of serving caches.
+        const future: types.BatchRequest = .{ .writes = &.{.{ .key = "future", .value = "{\"body\":\"muststayuncommitted\"}" }}, .sync_level = .write };
+        var captured = (try Prepared.capture(a, &database)).?;
+        defer captured.deinit();
+        try captured.prepare(future);
+        try captured.stageForegroundText(&database);
+        const publication = captured.text.items[0].publication orelse return error.ForegroundPublicationNotPrepared;
+        const tip = database.core.nextDerivedSequence();
+        try publication.bindSequence(tip + 2);
+        for (captured.text.items[0].built.staged) |*segment| {
+            const ordinals = &segment.ordinals.?;
+            @memset(ordinals.assigned, 913);
+            try ordinals.bind(ordinals.assigned);
+        }
+        const identity = publication.native.?.namespace.before.?;
+        try database.batch(.{ .writes = &.{.{ .key = "foreign", .value = "{\"body\":\"pending foreign source\"}" }}, .sync_level = .write });
+        try std.testing.expectEqual(tip, try database.core.loadAppliedSequence(a, "text"));
+        var guard = (try publication.bind(database.core.index_manager)) orelse return error.ForegroundTargetUnexpectedlyChanged;
+        defer {
+            publication.deinit();
+            captured.text.items[0].publication = null;
+            guard.release();
+        }
+        try std.testing.expect(identity.eql(publication.native.?.namespace.before.?));
+        const Primary = struct {
+            store: *docstore_mod.DocStore,
+            fn commit(raw: *anyopaque, participant: @import("../native_publication.zig").Participant) !void {
+                const primary: *@This() = @ptrCast(@alignCast(raw));
+                try primary.store.putBatchWithPublications(std.testing.io, &.{.{ .key = "uncommitted-source-witness-canary", .value = "must not commit" }}, &.{}, null, .{}, null, participant);
+            }
+        };
+        var primary: Primary = .{ .store = database.core.store };
+        const before = backend.native_docstore.?.file.activeCheckpoint().commit_sequence;
+        try std.testing.expectError(error.FileBusy, @import("../persistent.zig").PersistentIndex.commitNativePublications(&.{publication.native.?}, .{ .ptr = &primary, .commit_fn = Primary.commit }));
+        try std.testing.expectEqual(before, backend.native_docstore.?.file.activeCheckpoint().commit_sequence);
+        const canary = database.core.store.get(a, "uncommitted-source-witness-canary") catch |err| if (err == error.NotFound) null else return err;
+        defer if (canary) |value| a.free(value);
+        try std.testing.expect(canary == null);
+        try std.testing.expectEqual(tip, try database.core.loadAppliedSequence(a, "text"));
+    }
     // A foreground postimage cannot cover an older canonical record which its
     // index has not consumed. The prepared fast path must decline that gap.
     try database.batch(.{ .writes = &.{.{ .key = "gap", .value = "{\"body\":\"pending\"}" }}, .sync_level = .write });

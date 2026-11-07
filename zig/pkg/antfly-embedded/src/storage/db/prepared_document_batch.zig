@@ -197,11 +197,11 @@ pub const Plan = struct {
                 if (item.config.matches(config)) break config;
             } else continue;
             item.built.stageNative(config.stager) catch |err| switch (err) {
-                error.EnrichmentWaitCanceled, error.FileBusy, error.StaleArtifactConstruction => continue,
+                error.EnrichmentWaitCanceled, error.EnrichmentSourceChanged, error.FileBusy, error.StaleArtifactConstruction, error.Unsupported => continue,
                 else => return err,
             };
             item.publication = database.core.index_manager.captureOwnedForegroundTextPublication(database.core.store, item.config, &item.built, self.text_delete_keys, previous) catch |err| switch (err) {
-                error.EnrichmentWaitCanceled, error.FileBusy, error.StaleArtifactConstruction => null,
+                error.EnrichmentWaitCanceled, error.EnrichmentSourceChanged, error.FileBusy, error.StaleArtifactConstruction, error.Unsupported => null,
                 else => return err,
             };
         }
@@ -212,7 +212,7 @@ pub const Plan = struct {
         for (self.text.items) |*item| {
             const publication = item.publication orelse continue;
             publication.finish(&item.built, self.text_delete_keys) catch |err| switch (err) {
-                error.EnrichmentWaitCanceled, error.FileBusy, error.StaleArtifactConstruction => {
+                error.EnrichmentWaitCanceled, error.EnrichmentSourceChanged, error.FileBusy, error.StaleArtifactConstruction, error.Unsupported => {
                     publication.deinit();
                     item.publication = null;
                 },
@@ -265,14 +265,17 @@ pub const Plan = struct {
                 guard.release();
             }
         }
+        const previous = store.lastReplaySequence(0);
+        if (sequence <= previous) return false;
         for (self.text.items, 0..) |*item, index| {
             const publication = item.publication orelse continue;
-            if (publication.sequence != sequence) continue;
+            if (publication.previous_sequence != previous) continue;
             const guard = (try publication.bind(manager)) orelse continue;
             self.text_selected[selected] = index;
             self.text_guards[selected] = guard;
             self.text_candidates[selected] = publication.native.?;
             selected += 1;
+            try publication.bindSequence(sequence);
         }
         if (selected == 0) return false;
         var read = try store.beginReadTxn();
