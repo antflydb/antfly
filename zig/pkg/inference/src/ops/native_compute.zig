@@ -61600,7 +61600,8 @@ fn namedHeldWeightCase(a: std.mem.Allocator) !void {
     toBuf(q).name = original_name;
     try std.testing.expectError(error.AuthoredResidentWeightChanged, wrong_view);
     const original_shape = toBuf(q).logical_shape;
-    toBuf(q).logical_shape = &.{ 1, 4 };
+    var invalid_view_shape = [_]i64{ 1, 4 };
+    toBuf(q).logical_shape = &invalid_view_shape;
     const wrong_shape = NativeCompute.heldF32WeightShapeNamed(&cb, &store, q, "q");
     toBuf(q).logical_shape = original_shape;
     try std.testing.expectError(error.NativeWeightPreparationChanged, wrong_shape);
