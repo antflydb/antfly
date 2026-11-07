@@ -12944,6 +12944,17 @@ pub const NativeFile = struct {
     /// against `make zig-test`-level traffic, not just a synthetic repro.
     const manifest_commits_enabled = true;
 
+    /// Temporary diagnostic (test builds only, opt-in): prints which
+    /// branch of `tryBuildCommitManifest` fell back to the presynced
+    /// two-sync path, to find why an inline-publication commit
+    /// (text/graph/sparse) pays 2 syncs instead of WS1(b)'s 1. Gated on
+    /// `builtin.is_test` first so the env lookup never runs in a
+    /// production build.
+    fn debugManifestFallbackTraceEnabled() bool {
+        if (!builtin.is_test) return false;
+        return antfly_platform.env.getenv("ANTFLY_DEBUG_MANIFEST_FALLBACK_TRACE") != null;
+    }
+
     /// Builds and writes a `.commit_manifest` page covering every page this
     /// commit's `PageWriteBatch` touched (documents, catalog/index pages,
     /// allocator/free-map ledger pages, value chains, and any certificate
@@ -12973,7 +12984,10 @@ pub const NativeFile = struct {
         next.manifest_crc = 0;
         next.manifest_page_count = 0;
         next.presynced = true;
-        const manifest_page_id = builder.reserved_page orelse return false;
+        const manifest_page_id = builder.reserved_page orelse {
+            if (debugManifestFallbackTraceEnabled()) std.debug.print("manifest fallback: no reserved_page\n", .{});
+            return false;
+        };
         var used = false;
         defer if (!used) {
             var filler_buf: [max_page_size]u8 = undefined;
@@ -12981,9 +12995,15 @@ pub const NativeFile = struct {
             encodePage(filler, .commit_manifest, &[4]u8{ 0, 0, 0, 0 });
             self.file.writePositionalAll(self.runtimeIo(), filler, manifest_page_id * @as(u64, self.header.page_size)) catch {};
         };
-        if (builder.overflowed) return false;
+        if (builder.overflowed) {
+            if (debugManifestFallbackTraceEnabled()) std.debug.print("manifest fallback: overflowed\n", .{});
+            return false;
+        }
         const count = builder.entries.count();
-        if (count == 0 or count > max_single_sync_pages) return false;
+        if (count == 0 or count > max_single_sync_pages) {
+            if (debugManifestFallbackTraceEnabled()) std.debug.print("manifest fallback: count={d}\n", .{count});
+            return false;
+        }
         const entries = try self.allocator.alloc(ManifestEntry, count);
         defer self.allocator.free(entries);
         var i: usize = 0;
@@ -12995,11 +13015,17 @@ pub const NativeFile = struct {
         const payload = encodeManifestPayloadAlloc(self.allocator, entries, &builder.reused_pages, manifest_page_id) catch |err| switch (err) {
             // Not actually one contiguous appended run: fall back exactly
             // like "too big to fit one page", never a hard error.
-            error.InvalidNativeManifestRange => return false,
+            error.InvalidNativeManifestRange => {
+                if (debugManifestFallbackTraceEnabled()) std.debug.print("manifest fallback: non-contiguous range (count={d})\n", .{count});
+                return false;
+            },
             else => return err,
         };
         defer self.allocator.free(payload);
-        if (payload.len > self.maxPagePayloadBytes()) return false;
+        if (payload.len > self.maxPagePayloadBytes()) {
+            if (debugManifestFallbackTraceEnabled()) std.debug.print("manifest fallback: payload too big ({d} > {d})\n", .{ payload.len, self.maxPagePayloadBytes() });
+            return false;
+        }
         var page_buf: [max_page_size]u8 = undefined;
         const page = page_buf[0..self.header.page_size];
         encodePage(page, .commit_manifest, payload);
