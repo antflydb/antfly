@@ -574,6 +574,33 @@ describe("InferenceClient with mock fetch", () => {
       expect(cancel).toHaveBeenCalledOnce();
     });
 
+    it("unwraps the gateway's nested {error:{code,message}} envelope (source-reference failures)", async () => {
+      // zig/pkg/antfly/src/api/httpx_handler.zig's gatewayFailure nests
+      // {message, type, code} under `error`, unlike the flat
+      // {error, message, retryable} shape generation errors use.
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message: "InferenceSourceMismatch",
+              type: "invalid_request_error",
+              code: "InferenceSourceMismatch",
+            },
+          }),
+          { status: 409, headers: { "Content-Type": "application/json" } }
+        )
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      let caught: unknown;
+      try {
+        await client.generate(request);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(InferenceAPIError);
+      expect(caught).toMatchObject({ status: 409, code: "InferenceSourceMismatch" });
+    });
+
     it.each([
       "data: [DONE]",
       "data: [DONE]\n",

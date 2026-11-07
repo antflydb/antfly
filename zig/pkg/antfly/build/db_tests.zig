@@ -385,6 +385,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db deferred generated coverage remains pending until the enrichment worker decides an outcome",
         "storage.db.db.test.db deleteEnrichment rejects asset referenced by chunk enrichment",
         "storage.db.db.test.db dense enrichment republishes unchanged source hash from cached artifact after index reset",
+        "storage.db.db.test.db dense enrichment skips unchanged multimodal parts",
         "storage.db.db.test.db dense enrichment skips unchanged source hash",
         "storage.db.db.test.db encodeThinReplayRecordPayload marks generated enrichment replay for async writes",
         "storage.db.db.test.db enrichment artifact consumer resolution includes graph and default full text indexes",

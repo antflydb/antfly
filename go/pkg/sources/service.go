@@ -566,6 +566,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
+		rekeys := false
 		switch r.Method {
 		case http.MethodPut:
 			queue, err := s.readPurges()
@@ -585,11 +586,46 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if index < 0 {
+				// New sources get an opaque namespace at creation so a later
+				// connection or provider change never has to re-key anything:
+				// nothing is ever keyed before the source has a namespace.
+				if source.Identity.Namespace == "" {
+					source.Identity.Namespace = id
+				}
 				next.Sources = append(next.Sources, source)
 			} else {
 				if next.Sources[index].Table != source.Table {
 					serviceError(w, 409, "source_destination_immutable")
 					return
+				}
+				existing := next.Sources[index]
+				switch {
+				case source.Identity.Namespace == "":
+					// Omitting identity on an update leaves it exactly as it
+					// was; it is never cleared by omission.
+					source.Identity.Namespace = existing.Identity.Namespace
+				case existing.Identity.Namespace != "" && source.Identity.Namespace != existing.Identity.Namespace:
+					serviceError(w, 409, "source_identity_namespace_immutable")
+					return
+				}
+				if existing.Identity.Namespace == "" {
+					switch {
+					case source.Identity.Namespace == "":
+						// No namespace involved at all: rows are still keyed by
+						// raw acquisition identity (RecordKey's legacy formula),
+						// which a connection or config change re-keys exactly as
+						// it always has.
+						rekeys = existing.Connection != source.Connection || !bytes.Equal(existing.Config, source.Config)
+					default:
+						// A namespace is being set for the first time, possibly
+						// together with a connection/config change in the same
+						// request (migrate-local does exactly this). It only
+						// avoids a re-key if it is exactly the prefix that
+						// reproduces this source's current keys under its
+						// EXISTING connection/config -- before this request's own
+						// change, if any -- checked for real rather than assumed.
+						rekeys = !s.namespaceReproducesExistingKeys(r.Context(), id, existing, source.Identity.Namespace)
+					}
 				}
 				next.Sources[index] = source
 			}
@@ -664,10 +700,63 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.profile = next
 		s.refreshMediaRegistry()
-		serviceJSON(w, 200, map[string]any{"version": 1, "state": "configured"})
+		response := map[string]any{"version": 1, "state": "configured"}
+		if r.Method == http.MethodPut {
+			response["rekeys"] = rekeys
+		}
+		serviceJSON(w, 200, response)
 		return
 	}
 	serviceError(w, 404, "not_found")
+}
+
+// namespaceReproducesExistingKeys reports whether namespace is exactly the
+// prefix that reproduces id's current row keys under existing's connection
+// and config (LegacyNamespace), so adopting it as part of this PUT does not
+// re-key anything. existing is the source's definition as persisted BEFORE
+// this PUT, so a connection/config change arriving in the same request (as
+// migrate-local's repoint does) is checked against what produced the
+// CURRENT rows, not against the change about to take effect.
+//
+// Best-effort: unable to verify -- no such connection, a connector that
+// cannot be opened, an enumeration failure, a panic from a connector this
+// has not been exercised against, or items that disagree on their prefix --
+// is treated as "no" (report a re-key rather than risk a false claim of
+// safety). An empty inventory (nothing published under the existing
+// connection/config yet) has nothing to re-key regardless of which
+// namespace is adopted, so that alone is verified "yes".
+//
+// This runs with s.mu already held by ServeHTTP's caller and is bounded to
+// a Preview-limited enumeration (at most one item for every connector
+// today): namespace adoption happens at most once per source, so a single
+// bounded, synchronous provider round trip here is an acceptable cost for
+// an accurate answer.
+func (s *Service) namespaceReproducesExistingKeys(ctx context.Context, id string, existing Source, namespace string) (matches bool) {
+	defer func() {
+		if recover() != nil {
+			matches = false
+		}
+	}()
+	connection, ok := s.profile.Connections[existing.Connection]
+	if !ok {
+		return false
+	}
+	connector, err := s.providerConnector(ctx, connection)
+	if err != nil {
+		return false
+	}
+	inventory, err := connector.Enumerate(ctx, Request{SourceNamespace: "job/" + id, Config: existing.Config, Mode: ImportModeSource, Preview: true})
+	if err != nil {
+		return false
+	}
+	if len(inventory.Objects) == 0 {
+		return true
+	}
+	legacy, err := LegacyNamespace(id, inventory.Objects)
+	if err != nil {
+		return false
+	}
+	return legacy == namespace
 }
 func (s *Service) run(ctx context.Context, profile Profile, restart, purgeOnly bool, done chan struct{}, selection ...string) {
 	defer close(done)

@@ -13,6 +13,10 @@ direct-field dense/sparse transfer. The dated implementation narrative is in
   vector acceptance and related machinery do not enable protocol 15; the
   direct-index proof-adoption command requires data-Raft protocol 17, which is
   above the currently activated version, and no merge coordinator submits it.
+- **An unrelated row change does not re-run an embedder.** The source digest
+  covers the whole row, so the change is an acceptance miss. When the stored
+  source hash still matches, the stored output is republished under the new
+  source. See [Asset identity](asset-identity.md) for the fail-closed cases.
 - **EOF or enumeration is not completion.** Scan exhaustion, discovery
   end-of-page, census EOF, replicated baseline scan completion, queue admission,
   dispatch and transport acknowledgement never discharge an obligation, grant

@@ -924,8 +924,27 @@ function inferenceAPIError(status: number, error: InferenceError | unknown): Inf
   }
   const payload =
     typeof error === "object" && error !== null ? (error as Partial<InferenceError>) : {};
-  const code = typeof payload.error === "string" ? payload.error : undefined;
-  const message = typeof payload.message === "string" ? payload.message : undefined;
+  // The gateway's generic failure path (httpx_handler.zig's gatewayFailure --
+  // used for source-reference resolution failures such as a stale version,
+  // a disallowed host, or exhausted fetch capacity) nests {message, type,
+  // code} under `error` instead of a flat string; unwrap it so `.code` still
+  // carries the real Zig error name (e.g. "InferenceSourceMismatch").
+  const nested =
+    typeof payload.error === "object" && payload.error !== null
+      ? (payload.error as { code?: unknown; message?: unknown })
+      : undefined;
+  const code =
+    typeof payload.error === "string"
+      ? payload.error
+      : typeof nested?.code === "string"
+        ? nested.code
+        : undefined;
+  const message =
+    typeof payload.message === "string"
+      ? payload.message
+      : typeof nested?.message === "string"
+        ? nested.message
+        : undefined;
   const retryable = typeof payload.retryable === "boolean" ? payload.retryable : undefined;
   const detail =
     message && message !== code
