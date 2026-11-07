@@ -7564,6 +7564,117 @@ test "lite ride-along undurable-bytes threshold triggers exactly 1 sync" {
     try std.testing.expectEqualStrings("rode along", try read.get("byte-threshold-ride"));
 }
 
+test "lite graph metric-build background passes ride along: N passes plus one foreground write is one sync" {
+    // §3.2a / design doc's WS4-for-vectors graph extension: GraphIndex's
+    // metric-build commits (acquire-lease/prepare/scan/reduce/publish/
+    // cleanup pages) now open through `beginWriteReverseBatchWithOptions`
+    // with `.durability = .ride_along` on a `.native_catalog` backend
+    // (graph/graph.zig), so every one of them joins this Store's own
+    // group-commit queue instead of paying its own fsync. Drive a tiny
+    // degree-metric build to completion -- many worker/coordinator passes,
+    // each its own would-be commit under the old plain `beginBatch()` --
+    // then issue exactly one ordinary foreground write against the SAME
+    // underlying Store/`.aflite` file, and confirm the whole sequence costs
+    // exactly one `syncData` call: the foreground write's.
+    const alloc = std.testing.allocator;
+    const graph_mod = @import("../../graph/graph.zig");
+    const native_catalog_sink = @import("native_catalog_sink.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "graph-metric-ride-along.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{});
+    defer store.close();
+    // Keep the idle-flush timer out of this test's (much faster) sequence,
+    // matching the other ride-along tests' convention: the single sync
+    // this test observes must be unambiguously the foreground write
+    // leading the queue, never the timer forcing an earlier drain.
+    store.ride_along_idle_ns = 10 * std.time.ns_per_s;
+
+    var sink_impl = native_catalog_sink.Sink{ .store = &store, .allocator = alloc };
+    const metrics = [_]graph_mod.GraphMetricConfig{.{
+        .name = "degree",
+        .kind = .degree,
+        .refresh = .manual,
+    }};
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(
+        alloc,
+        "graph-ridealong-test/forward",
+        "graph-ridealong-test/reverse",
+        "links",
+        .{
+            .reverse_backend = .native_catalog,
+            .native_catalog_sink = sink_impl.sink(),
+            .metric_configs = &metrics,
+        },
+    );
+    defer graph.close();
+
+    // Seed a tiny graph and queue the build. These writes land on the same
+    // underlying Store and pay their own (expected) syncs; only the
+    // post-seed window below is measured.
+    try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
+    try graph.addEdge("doc-b", "doc-c", "cites", 1.0, 0, 0, "");
+    var queued = try graph.ensureGraphMetricPlannedBuild("degree", try graph.graphMetricCurrentGeneration("degree"));
+    queued.deinit(alloc);
+
+    const syncs_before = store.file.test_sync_calls.load(.monotonic);
+
+    var passes: usize = 0;
+    var published = false;
+    var guard: usize = 0;
+    while (!published) {
+        guard += 1;
+        if (guard > 500) return error.TestGraphMetricBuildDidNotConverge;
+        const worker = try graph.runGraphMetricPlannedWorkerPageStepForMetric("degree", "worker");
+        passes += 1;
+        if (worker.published) {
+            published = true;
+            break;
+        }
+        const coordinator = try graph.runGraphMetricPlannedCoordinatorStepForMetric("degree");
+        passes += 1;
+        if (coordinator.published) {
+            published = true;
+            break;
+        }
+    }
+    try std.testing.expect(passes > 1);
+
+    // Every one of those passes committed through
+    // `beginWriteReverseBatchWithOptions(.{ .durability = .ride_along })`:
+    // none of them may have forced a sync on their own.
+    try std.testing.expectEqual(syncs_before, store.file.test_sync_calls.load(.monotonic));
+
+    var fresh = try graph.graphMetricStatus("degree");
+    defer fresh.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, fresh.state);
+
+    // One ordinary foreground write against the same underlying file leads
+    // the ride-along queue and makes every passed-through metric-build
+    // commit durable together with itself (design doc §3.2a's prefix-
+    // ordered durability). It still syncs normally -- ride-along work rides
+    // on that commit instead of being stuck permanently undurable -- but it
+    // pays the native commit protocol's own fixed per-commit sync cost once,
+    // not once per ride-along pass: `expect(... > before)`, not an exact
+    // delta, matches the sibling "lite reclamation ride-along passes force
+    // no sync before the next durable write" test's own convention, since
+    // the native protocol's fsync-calls-per-durable-commit count is an
+    // implementation detail of `syncIfRequired`, not what this test exists
+    // to pin down.
+    var write = try store.beginWrite();
+    try write.put("foreground-after-metric-build", "written");
+    try write.commit();
+
+    try std.testing.expect(store.file.test_sync_calls.load(.monotonic) > syncs_before);
+
+    std.debug.print(
+        "\n[graph ride-along] metric-build passes={d}, syncs for those passes=0, foreground write still syncs normally\n",
+        .{passes},
+    );
+}
+
 test "lite a new Txn opens and stages while a group's fsync is in flight" {
     // WS2: self.mutex (PublicationMutex, a spin lock) must only be held for
     // the in-memory parts of a commit; NativeFile.sync_lock_hooks releases
