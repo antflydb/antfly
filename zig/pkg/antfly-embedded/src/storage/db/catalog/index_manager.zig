@@ -28902,6 +28902,40 @@ pub const IndexManager = struct {
         return self.keyInRange(range_key);
     }
 
+    /// WS4-for-vectors' sparse extension of the fast path above, mirroring
+    /// `graphEdgeWriteEligibleForInlinePublication`'s own shape. The
+    /// caller (`mutation_materialization.zig`'s `prepareInlineSparse
+    /// Publication`) already knows `write.indices.len != 0` matters:
+    /// `write.artifact_key` is set on nearly every write regardless (it
+    /// names where the vector would live if it ever needs loading), and
+    /// `applySparseEmbeddingWritesEntry`'s own branch
+    /// (`write.artifact_key != null and indices.len == 0`) treats ONLY
+    /// `indices.len == 0` as "go load it from that artifact" -- an
+    /// artifact-backed write needing that read is exactly the
+    /// `indices.len == 0` case, which `SparseIndex.prepareInlineSparse
+    /// Publication`'s own narrower check (backend only) cannot see. This
+    /// gate covers everything about THIS INDEX'S CONFIGURATION that fast
+    /// path cannot see instead:
+    /// - `!entry.external`: this index also derives vectors from a
+    ///   document field (`collectSparseFieldWritesProfiled`/
+    ///   `indexSparsePreparedWritesByNameWithOptions`, a second commit the
+    ///   general path runs for the SAME batch), which this fast path
+    ///   never attempts.
+    /// - `entry.chunk_name != null` or `entry.embedding_names.len != 0`:
+    ///   these index shapes key writes by artifact/chunk identity, not the
+    ///   primary document ordinal `assignSparseWriteDocNumsFromIdentity`
+    ///   (mirrored by the caller) looks up.
+    /// - the shard-range check mirrors the graph gate's own.
+    /// A caller must fall back to `applySparseEmbeddingWritesByNameWith
+    /// Options` (the normal, slow path) whenever this returns `false`;
+    /// see that function's own doc comment for why `false` must never be
+    /// read as "skip the write outright".
+    pub fn sparseEmbeddingWriteEligibleForInlinePublication(self: *const IndexManager, entry: *const SparseIndex, write: derived_types.DerivedSparseEmbeddingWrite) bool {
+        if (!entry.external or entry.chunk_name != null or entry.embedding_names.len != 0) return false;
+        if (write.indices.len == 0) return false;
+        return self.keyInRange(write.doc_key);
+    }
+
     test "graphEdgeWriteEligibleForInlinePublication rejects TTL, contributors and owner-bearing writes" {
         const alloc = std.testing.allocator;
         var manager = try IndexManager.init(alloc, ".");

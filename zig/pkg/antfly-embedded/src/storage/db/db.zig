@@ -12738,6 +12738,25 @@ pub const DB = struct {
         // rather than retiring an intent over an index that is not actually
         // open.
         if (self.core.index_manager.loadFailure(intent.index_name) != null) return false;
+        // The premise above -- that the synchronous admission backfill
+        // already covers everything -- is the normal case, but a transient
+        // fault class (or a repeated one) can leave the ordinary canonical
+        // worker still replaying its backlog toward this marker's own
+        // `replay_target_sequence` when this is checked (`startAsyncWorkers`
+        // attaches that worker unconditionally at open, independently of
+        // this repair intent, so it keeps making progress either way).
+        // Verify the durable watermark actually reached what this marker
+        // promised instead of trusting the premise outright: retiring this
+        // intent clears `markUnscopedRepairUnavailable`'s query gate
+        // (`removeIndexRepairIntentAndPinContext` -> `publishRepairAdmission`),
+        // so declaring serviceable here while real backlog remains is
+        // exactly how a worker that never caught up can make search()
+        // silently serve incomplete results instead of `IndexRebuilding`.
+        // Fail closed (not yet serviceable, keep the intent runnable) until
+        // that worker's own progress proves it; a later repair quantum
+        // re-checks this same intent and retires it once it does.
+        const applied = try self.managedIndexAppliedSequence(alloc, intent.index_name);
+        if (applied < marker.replay_target_sequence or applied < intent.target_sequence) return false;
         return true;
     }
 
@@ -33893,6 +33912,22 @@ pub const DB = struct {
         try self.flushAppliedSequencesForIdle();
     }
 
+    /// Shared tolerance for `runUntilIdleWithReplayDrainOptions`'s own
+    /// repair-driving preamble (managed-admission materialization, startup
+    /// repair-intent advancement): the same transient write/sync/publish
+    /// I/O class `catch_up_policy.isRecoverableAdmissionError`/
+    /// `isTransientIoError` already retry everywhere a derived worker
+    /// touches storage. Those sites back off and retry in place; this
+    /// preamble has no retry loop of its own and runs once per
+    /// `runUntilIdle` call, so the right response to the same fault class
+    /// here is to stop driving repair work for *this* round rather than
+    /// letting it propagate and abort the replay/catch-up stages later in
+    /// the same function that have nothing to do with repair admission.
+    fn isRecoverableIdleDrainError(err: anyerror) bool {
+        const catch_up_policy = @import("derived/catch_up_policy.zig");
+        return catch_up_policy.isRecoverableAdmissionError(err) or catch_up_policy.isTransientIoError(err);
+    }
+
     fn runUntilIdleWithReplayDrainOptions(self: *DB, options: ReplayDrainOptions) !void {
         _ = try self.retryPortableRuntimeActivationIfNeeded();
         // A managed-admission materialization can be left pending by
@@ -33908,7 +33943,18 @@ pub const DB = struct {
         // already uses to wait out background catch-up) is itself able to
         // resolve a stuck activation once the underlying I/O recovers,
         // instead of leaving the affected index `IndexRebuilding` forever.
-        if (self.managedAdmissionMaterializationPending()) try self.drainManagedIndexAdmissions(self.alloc);
+        if (self.managedAdmissionMaterializationPending()) self.drainManagedIndexAdmissions(self.alloc) catch |err| {
+            // The whole point of retrying this from an idle drain is to
+            // resolve a *transient* I/O fault once the underlying disk
+            // recovers (see the comment above). Propagating that same
+            // transient class here instead would abort this entire call --
+            // including the replay/catch-up stages below, which have
+            // nothing to do with managed admission -- on every single
+            // `runUntilIdle`, for as long as this one read keeps faulting.
+            // Recoverable: let this round skip materialization and continue
+            // into the rest of the drain; a later `runUntilIdle` retries it.
+            if (!isRecoverableIdleDrainError(err)) return err;
+        };
         // Materializing the admission marker above only converts it into a
         // durable generation-repair intent (`materializeManagedIndexAdmission
         // ValueLocked` -> `createGenerationRepairIntentAtTarget`); it does not
@@ -33943,7 +33989,16 @@ pub const DB = struct {
             while (repair_rounds < run_until_idle_max_replay_rounds) : (repair_rounds += 1) {
                 const repair_result = self.repairRecoverableStartupIndexFailures(self.alloc, 8, .{}) catch |err| switch (err) {
                     error.ReadOnly, error.NotLeader, error.Busy => break,
-                    else => return err,
+                    // `discoverRecoverableStartupIndexFailures`'s own catalog
+                    // reads (and the repair quantum it drives) have no retry
+                    // of their own at this layer. A transient I/O fault there
+                    // -- the exact class every derived-worker retry site in
+                    // `catch_up_policy.zig` treats as recoverable -- must not
+                    // abort the whole idle drain before it ever reaches the
+                    // replay/catch-up stages below: stop driving repair work
+                    // this round (a later `runUntilIdle` retries discovery
+                    // fresh) instead of propagating.
+                    else => if (isRecoverableIdleDrainError(err)) break else return err,
                 };
                 if (repair_result.remaining == 0) break;
                 if (repair_result.wake != .immediate) break;

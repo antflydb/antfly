@@ -19,6 +19,15 @@
 import argparse
 import json
 import subprocess
+import sys
+
+# ld64 emits this when a large test binary's unwind tables exceed what the
+# compact unwind format can encode. Exception handling still works through
+# the full DWARF tables, so it is not an error, but the build's Run step
+# treats any stderr output as failure.
+BENIGN_LD_WARNINGS = (
+    "__eh_frame section too large (max 16MB) to encode dwarf unwind offsets",
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--arch", required=True)
@@ -31,7 +40,7 @@ args = parser.parse_args()
 with open(args.sdk + "/SDKSettings.json") as source:
     sdk_version = json.load(source)["Version"]
 inputs = args.inputs[1:] if args.inputs[:1] == ["--"] else args.inputs
-subprocess.run(
+result = subprocess.run(
     [
         "/usr/bin/ld",
         "-arch",
@@ -50,5 +59,11 @@ subprocess.run(
         *inputs,
         "-lSystem",
     ],
-    check=True,
+    stderr=subprocess.PIPE,
+    text=True,
 )
+for line in result.stderr.splitlines():
+    if not any(warning in line for warning in BENIGN_LD_WARNINGS):
+        print(line, file=sys.stderr)
+if result.returncode != 0:
+    sys.exit(result.returncode)

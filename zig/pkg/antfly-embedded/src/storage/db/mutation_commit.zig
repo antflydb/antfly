@@ -154,6 +154,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const prepareInlineTextPublication = S.prepareInlineTextPublication;
         const InlineGraphPublication = S.InlineGraphPublication;
         const prepareInlineGraphPublication = S.prepareInlineGraphPublication;
+        const InlineSparsePublication = S.InlineSparsePublication;
+        const prepareInlineSparsePublication = S.prepareInlineSparsePublication;
         const attachPreparedUpsertDocumentProjections = S.attachPreparedUpsertDocumentProjections;
         const augmentExtractedWriteWithGraphFieldEdges = S.augmentExtractedWriteWithGraphFieldEdges;
         const augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed = S.augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed;
@@ -3141,7 +3143,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // though their actual index effects still need that worker's
             // ordinary (non-inline) catch-up. Skip the whole attempt for
             // this path instead.
-            if (append_derived_replay and effective_req.sync_level == .full_text and
+            //
+            // `.full_index` requires this text index's visibility too --
+            // it is `.full_text`'s superset (`types.SyncLevel`'s enum order
+            // is `propose`/`write`/`full_text`/`enrichments`/`full_index`)
+            // -- so the fast path must engage there as well, same as the
+            // graph extension below is already gated on `.full_index`.
+            // Without this, an `indexed`/`full_index` write with a text
+            // index never takes the fast path at all: the exact-equality
+            // check this replaces used to make every such write fall
+            // through to the slow, several-commits-per-write path even
+            // though the write's own effective sync level already demands
+            // text visibility. The `all_indexes` filter below (not just
+            // `full_text_indexes`) is what then keeps the `.full_index`
+            // no-worker fallback from re-applying an index this inline
+            // publication already made durable.
+            if (append_derived_replay and
+                (effective_req.sync_level == .full_text or effective_req.sync_level == .full_index) and
                 opts.transaction_resolution == null and materialized_derived_batch != null)
             {
                 for (sync_targets.full_text_indexes) |target_name| {
@@ -3254,6 +3272,41 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     filter_alloc.free(@constCast(sync_targets.full_text_indexes));
                     sync_targets.full_text_indexes = filtered;
                 }
+                // `.full_index` writes drive their no-worker fallback and
+                // worker-catchup bookkeeping off `sync_targets.all_indexes`,
+                // not `full_text_indexes` -- see the `.full_index` branch
+                // of the `applyDerivedBatchTargetsProfiled` dispatch below.
+                // Every name in `full_text_indexes` is also in
+                // `all_indexes` (`collectManagedSyncTargets*` adds a
+                // `.full_text` candidate's name to both arrays), so the
+                // same `inline_text_handled_names` set applies here too.
+                // Skipping this for a `.full_text` write is harmless -- its
+                // own fallback never reads `all_indexes` -- but filtering
+                // unconditionally keeps this correct if that ever changes.
+                const handled_all = try filter_alloc.alloc(bool, sync_targets.all_indexes.len);
+                defer filter_alloc.free(handled_all);
+                var kept_all_count: usize = 0;
+                for (sync_targets.all_indexes, 0..) |name, i| {
+                    handled_all[i] = for (inline_text_handled_names[0..inline_text_publication_count]) |h| {
+                        if (std.mem.eql(u8, h, name)) break true;
+                    } else false;
+                    if (!handled_all[i]) kept_all_count += 1;
+                }
+                if (kept_all_count != sync_targets.all_indexes.len) {
+                    const filtered_all = try filter_alloc.alloc([]const u8, kept_all_count);
+                    errdefer filter_alloc.free(filtered_all);
+                    var fill_all: usize = 0;
+                    for (sync_targets.all_indexes, 0..) |name, i| {
+                        if (handled_all[i]) {
+                            filter_alloc.free(@constCast(name));
+                        } else {
+                            filtered_all[fill_all] = name;
+                            fill_all += 1;
+                        }
+                    }
+                    filter_alloc.free(@constCast(sync_targets.all_indexes));
+                    sync_targets.all_indexes = filtered_all;
+                }
             }
             // lite-single-commit-write-path.md §3.3a: the graph extension
             // of the fast path above. Deliberately narrow -- exactly one
@@ -3297,6 +3350,50 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     };
                     inline_graph_publication = prepared;
                     inline_graph_handled_name = handled_name;
+                } else |_| {}
+            }
+            // lite-single-commit-write-path.md §3.3a's sparse extension of
+            // the fast path above, mirroring the graph block immediately
+            // above it. Deliberately narrow -- exactly one sparse
+            // embedding write and nothing else sparse-related in this
+            // batch (no deletes, no overwritten docs, no changed
+            // artifacts) -- so every precondition
+            // `prepareInlineSparsePublication`/`sparseEmbeddingWriteEligible
+            // ForInlinePublication` cannot itself check (multiple
+            // embeddings in one batch, an artifact-backed write needing its
+            // own read, a document-field-derived index needing a second
+            // commit) is simply never attempted here; the caller falls
+            // back to the existing `applySparseEmbeddingWritesByNameWith
+            // Options` path for all of those, same as before this change.
+            // Gated on `.full_index`, same reasoning as graph's own gate:
+            // sparse has no narrower sync level of its own.
+            var inline_sparse_publication: ?*InlineSparsePublication = null;
+            var inline_sparse_handled_name: []const u8 = &.{};
+            defer if (inline_sparse_publication) |prepared| prepared.abort();
+            defer if (inline_sparse_handled_name.len != 0) S.ownerField(self, "alloc").*.free(@constCast(inline_sparse_handled_name));
+            if (append_derived_replay and effective_req.sync_level == .full_index and
+                opts.transaction_resolution == null and materialized_derived_batch != null and
+                materialized_derived_batch.?.sparse_embeddings.len == 1 and
+                materialized_derived_batch.?.deleted_keys.len == 0 and
+                materialized_derived_batch.?.overwritten_doc_keys.len == 0 and
+                materialized_derived_batch.?.changed_artifact_keys.len == 0)
+            {
+                const write = materialized_derived_batch.?.sparse_embeddings[0];
+                const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = write.index_name, .kind = .sparse_vector };
+                if (prepareInlineSparsePublication(
+                    S.ownerField(self, "alloc").*,
+                    S.ownerField(self, "core").*.store,
+                    S.ownerField(self, "core").*.index_manager,
+                    write,
+                    index_ref,
+                    sequence,
+                )) |prepared| {
+                    const handled_name = S.ownerField(self, "alloc").*.dupe(u8, write.index_name) catch |dup_err| {
+                        prepared.abort();
+                        return dup_err;
+                    };
+                    inline_sparse_publication = prepared;
+                    inline_sparse_handled_name = handled_name;
                 } else |_| {}
             }
             var commit_participants: @import("../commit_participant.zig").List = .{};
@@ -3347,6 +3444,41 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // above this point committed anything for it yet.
                     prepared.abort();
                     inline_graph_publication = null;
+                }
+            }
+            if (inline_sparse_publication) |prepared| {
+                if (commit_participants.append(prepared.participant())) {
+                    // Mirrors the graph block above: exclude this write's
+                    // sparse index name from `sync_targets.all_indexes` so
+                    // the `.full_index` no-worker fallback further down
+                    // never re-applies an index this inline publication
+                    // already made durable.
+                    const filter_alloc = S.ownerField(self, "alloc").*;
+                    var kept_count: usize = 0;
+                    for (sync_targets.all_indexes) |name| {
+                        if (!std.mem.eql(u8, name, inline_sparse_handled_name)) kept_count += 1;
+                    }
+                    if (kept_count != sync_targets.all_indexes.len) {
+                        const filtered = try filter_alloc.alloc([]const u8, kept_count);
+                        errdefer filter_alloc.free(filtered);
+                        var fill: usize = 0;
+                        for (sync_targets.all_indexes) |name| {
+                            if (std.mem.eql(u8, name, inline_sparse_handled_name)) {
+                                filter_alloc.free(@constCast(name));
+                            } else {
+                                filtered[fill] = name;
+                                fill += 1;
+                            }
+                        }
+                        filter_alloc.free(@constCast(sync_targets.all_indexes));
+                        sync_targets.all_indexes = filtered;
+                    }
+                } else |_| {
+                    // Same reasoning as the graph block above: never
+                    // silently drop this write's sparse effect because
+                    // the commit-participant list happened to be full.
+                    prepared.abort();
+                    inline_sparse_publication = null;
                 }
             }
             const combined_commit_participant: ?@import("../commit_participant.zig").Participant =
@@ -3538,6 +3670,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_graph_handled_name, sequence);
                 }
             }
+            if (inline_sparse_publication) |prepared| {
+                prepared.install();
+                inline_sparse_publication = null;
+                if (S.ownerField(self, "executor").*.hasWorkers()) {
+                    _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_sparse_handled_name, sequence);
+                }
+            }
             snapshot_mutation.release();
             if (split_shadow_ticket) |ticket| {
                 const apply_shadow_start_ns = monotonicTimeNs();
@@ -3643,16 +3782,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         }
                     } else if (effective_req.sync_level == .full_index) {
                         // Mirrors the `.full_text` branch above for the
-                        // graph inline fast path: `sync_targets.all_indexes`
-                        // already excludes the inline-handled graph index
-                        // name (filtered once, above, before this no-
-                        // workers fallback and the has-workers notify/wait
-                        // path both run). Applying only to what is left is
-                        // equivalent to the original unfiltered
-                        // `applyDerivedBatchProfiled` call when nothing was
-                        // handled inline (every managed index not actually
-                        // relevant to this batch is already a no-op there
-                        // via `batchAdvancesManagedIndexApplyState`), and
+                        // text and graph inline fast paths:
+                        // `sync_targets.all_indexes` already excludes every
+                        // inline-handled text index name and the
+                        // inline-handled graph index name (each filtered
+                        // once, above, before this no-workers fallback and
+                        // the has-workers notify/wait path both run).
+                        // Applying only to what is left is equivalent to
+                        // the original unfiltered `applyDerivedBatchProfiled`
+                        // call when nothing was handled inline (every
+                        // managed index not actually relevant to this batch
+                        // is already a no-op there via
+                        // `batchAdvancesManagedIndexApplyState`), and
                         // correctly skips re-applying an index this commit
                         // already published inline when something was.
                         if (sync_targets.all_indexes.len != 0) {

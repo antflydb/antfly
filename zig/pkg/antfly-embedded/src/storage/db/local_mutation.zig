@@ -392,6 +392,8 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const prepareInlineTextPublication = materialization.prepareInlineTextPublication;
         pub const InlineGraphPublication = materialization.InlineGraphPublication;
         pub const prepareInlineGraphPublication = materialization.prepareInlineGraphPublication;
+        pub const InlineSparsePublication = materialization.InlineSparsePublication;
+        pub const prepareInlineSparsePublication = materialization.prepareInlineSparsePublication;
         pub const applyGraphArtifactMutationPages = materialization.applyGraphArtifactMutationPages;
         pub const applyGraphDocClearsForIndex = materialization.applyGraphDocClearsForIndex;
         pub const applyPrecomputeAssetProducerOutput = materialization.applyPrecomputeAssetProducerOutput;
