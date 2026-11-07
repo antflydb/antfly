@@ -286,6 +286,7 @@ pub const safetensors_index_candidates = [_][]const u8{
 /// decision describes the same metadata snapshot that listing parsed.
 pub const listing_compatibility_sidecars = [_][]const u8{
     "encoder_config/config.json",
+    "adapters/retrieval/adapter_config.json",
     "antfly_inference_bundle.json",
     "antfly_inference_variants.json",
     "gliner_config.json",
@@ -323,6 +324,10 @@ pub const ModelManifest = struct {
     gliner_head_gguf_path: ?[]const u8 = null,
     gliner_head_safetensors_path: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
+    jina_adapter_config_path: ?[]const u8 = null,
+    jina_adapter_weights_path: ?[]const u8 = null,
+    /// Even an absent adapter is a captured selection, never a later default.
+    jina_adapter_selection_captured: bool = false,
     model_manifest_path: ?[]const u8 = null,
     tokenizer_json_path: ?[]const u8 = null,
     vocab_txt_path: ?[]const u8 = null,
@@ -556,6 +561,8 @@ pub const ModelManifest = struct {
         if (self.gliner_head_gguf_path) |p| self.allocator.free(p);
         if (self.gliner_head_safetensors_path) |p| self.allocator.free(p);
         if (self.config_path) |p| self.allocator.free(p);
+        if (self.jina_adapter_config_path) |p| self.allocator.free(p);
+        if (self.jina_adapter_weights_path) |p| self.allocator.free(p);
         if (self.model_manifest_path) |p| self.allocator.free(p);
         if (self.tokenizer_json_path) |p| self.allocator.free(p);
         if (self.vocab_txt_path) |p| self.allocator.free(p);
@@ -716,6 +723,13 @@ pub const ModelManifest = struct {
         if (self.safetensors_index_path != null) return .sharded_safetensors;
         if (self.gguf_path != null) return .gguf;
         return null;
+    }
+
+    pub const JinaRetrievalAdapter = struct { config: []const u8, weights: []const u8 };
+
+    pub fn jinaRetrievalAdapter(self: *const ModelManifest) !?JinaRetrievalAdapter {
+        if (self.jina_adapter_config_path == null and self.jina_adapter_weights_path == null) return null;
+        return .{ .config = self.jina_adapter_config_path orelse return error.IncompleteJinaV5Adapter, .weights = self.jina_adapter_weights_path orelse return error.IncompleteJinaV5Adapter };
     }
 
     pub const NativeCompanion = enum { none, gliner_gguf, gliner_safetensors, projector };
@@ -1659,6 +1673,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     if (manifest.safetensors_index_path == null) manifest.safetensors_index_path = try findFileInSubdirs(allocator, catalog, &safetensors_index_candidates, &.{""});
     if (manifest.gliner_head_gguf_path == null) manifest.gliner_head_gguf_path = try findFileInSubdirs(allocator, catalog, &.{"gliner_head.gguf"}, &.{""});
     if (manifest.gliner_head_safetensors_path == null) manifest.gliner_head_safetensors_path = try findFileInSubdirs(allocator, catalog, &.{"gliner_head.safetensors"}, &.{""});
+    try discoverJinaRetrievalAdapter(&manifest, catalog);
     if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, catalog, &.{"config.json"}, &.{""});
     if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, catalog, &.{"model_manifest.json"}, &.{""});
     if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, catalog, &.{"tokenizer.json"}, &.{""});
@@ -1850,6 +1865,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     if (manifest.safetensors_index_path == null) manifest.safetensors_index_path = try findFileInSubdirs(allocator, &catalog, &safetensors_index_candidates, &.{""});
     if (manifest.gliner_head_gguf_path == null) manifest.gliner_head_gguf_path = try findFileInSubdirs(allocator, &catalog, &.{"gliner_head.gguf"}, &.{""});
     if (manifest.gliner_head_safetensors_path == null) manifest.gliner_head_safetensors_path = try findFileInSubdirs(allocator, &catalog, &.{"gliner_head.safetensors"}, &.{""});
+    try discoverJinaRetrievalAdapter(&manifest, &catalog);
     if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, &catalog, &.{"config.json"}, &.{""});
     if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, &catalog, &.{"model_manifest.json"}, &.{""});
     if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, &catalog, &.{"tokenizer.json"}, &.{""});
@@ -2597,6 +2613,13 @@ fn findMetadataEntry(parsed: *const gguf_format.File, key: []const u8) ?*const g
         if (std.mem.eql(u8, entry.key, key)) return entry;
     }
     return null;
+}
+
+fn discoverJinaRetrievalAdapter(manifest: *ModelManifest, catalog: *const ArtifactCatalog) !void {
+    manifest.jina_adapter_selection_captured = true;
+    if (!std.mem.eql(u8, manifest.config_model_arch, "jina_embeddings_v5")) return;
+    manifest.jina_adapter_config_path = try catalog.resolve("adapters/retrieval/adapter_config.json");
+    manifest.jina_adapter_weights_path = try catalog.resolve("adapters/retrieval/adapter_model.safetensors");
 }
 
 fn findPrimaryOnnx(manifest: *ModelManifest, catalog: *const ArtifactCatalog) !void {
@@ -8636,6 +8659,9 @@ test "manifest clone owns metadata and unwinds every allocation failure" {
         .allocator = allocator,
         .gguf_path = "model.gguf",
         .onnx_logical_path = "/captured/onnx/model.onnx",
+        .jina_adapter_config_path = "/captured/adapters/retrieval/adapter_config.json",
+        .jina_adapter_weights_path = "/captured/adapters/retrieval/adapter_model.safetensors",
+        .jina_adapter_selection_captured = true,
         .config_model_arch = "qwen3",
         .embedding_style = .qwen3_embedding,
         .hidden_size = 1024,

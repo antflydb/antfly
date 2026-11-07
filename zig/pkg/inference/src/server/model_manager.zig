@@ -88,6 +88,8 @@ const ComponentConstruction = struct {
             return;
         }
         if (man.config_path) |path| try self.artifacts().verifyPath(path);
+        const adapter = if (session_factory.usesJinaRetrievalAdapter(man, backend)) try man.jinaRetrievalAdapter() else null;
+        if (adapter) |selected| try self.artifacts().verifyPath(selected.config);
         switch (man.nativeWeightArtifactKind().?) {
             .gguf => try self.artifacts().verifyPath(man.gguf_path.?),
             .safetensors, .sharded_safetensors => {
@@ -100,6 +102,7 @@ const ComponentConstruction = struct {
             },
         }
         if (man.nativeCompanionPath()) |path| try self.artifacts().verifyPath(path);
+        if (adapter) |selected| try self.artifacts().verifyPath(selected.weights);
     }
     fn finish(self: *ComponentConstruction) !void {
         try self.artifacts().verify();
@@ -174,10 +177,7 @@ const BoundDirectoryManifest = struct {
             // but an unlisted default must not override embedded GGUF metadata.
             const requested = try std.fs.path.join(self.allocator, &.{ root, "config.json" });
             defer self.allocator.free(requested);
-            const config: ?[]u8 = proof.artifacts().constructionPath(requested) catch |err| switch (err) {
-                error.FileNotFound, error.NotDir, error.InvalidManagedDownload => null,
-                else => return err,
-            };
+            const config = try proof.artifacts().optionalConstructionPath(requested);
             if (config) |path| {
                 const kind = (std.Io.Dir.cwd().statFile(proof.io, path, .{}) catch |err| {
                     self.allocator.free(path);
@@ -187,6 +187,26 @@ const BoundDirectoryManifest = struct {
                     result.manifest.config_path = try result.own(path);
                 } else self.allocator.free(path);
             }
+        }
+        return result;
+    }
+
+    fn withJinaAdapter(self: *const BoundDirectoryManifest, proof: *ComponentConstruction) !BoundDirectoryManifest {
+        var result = BoundDirectoryManifest{ .allocator = self.allocator, .manifest = self.manifest };
+        errdefer result.deinit();
+        if (!result.manifest.jina_adapter_selection_captured and result.manifest.jina_adapter_config_path == null and result.manifest.jina_adapter_weights_path == null) {
+            if (result.manifest.source_root) |root| {
+                inline for (.{ .{ "jina_adapter_config_path", "adapters/retrieval/adapter_config.json" }, .{ "jina_adapter_weights_path", "adapters/retrieval/adapter_model.safetensors" } }) |entry| {
+                    const path = try std.fs.path.join(self.allocator, &.{ root, entry[1] });
+                    defer self.allocator.free(path);
+                    if (try proof.artifacts().optionalConstructionPath(path)) |selected| @field(result.manifest, entry[0]) = try result.own(selected);
+                }
+            }
+        }
+        result.manifest.jina_adapter_selection_captured = true;
+        if (try result.manifest.jinaRetrievalAdapter()) |_| {
+            try result.capture(proof, "jina_adapter_config_path");
+            try result.capture(proof, "jina_adapter_weights_path");
         }
         return result;
     }
@@ -226,6 +246,7 @@ const BoundModelSource = struct {
     borrowed_manifest: ?*const manifest_mod.ModelManifest = null,
     directory_manifest: ?BoundDirectoryManifest = null,
     native_manifest: ?BoundDirectoryManifest = null,
+    native_adapter_manifest: ?BoundDirectoryManifest = null,
     onnx_binding: ?struct {
         path: []u8,
         external_base_dir: []u8,
@@ -245,7 +266,14 @@ const BoundModelSource = struct {
             } else if (manifest == null) result.owned_manifest = try manifest_mod.loadFromDir(result.allocator, requested);
             if (kind == .gguf) {
                 const selected = result.view().manifest.?;
-                if (selected.nativeWeightArtifactKind() != .gguf or !std.mem.eql(u8, selected.gguf_path orelse return error.NoModelFileFound, result.path)) return error.ModelArtifactsChanging;
+                if (selected.source_root) |root| {
+                    try selected.verifyBoundRoot(proof.io, root);
+                }
+                if (selected.nativeWeightArtifactKind() != .gguf) return error.ModelArtifactsChanging;
+                const selected_path = try artifacts.constructionPath(selected.gguf_path orelse return error.NoModelFileFound);
+                defer result.allocator.free(selected_path);
+                if (!std.mem.eql(u8, selected_path, result.path)) return error.ModelArtifactsChanging;
+                if (selected.source_root) |root| try artifacts.bindDirectoryScope(root);
             }
         }
         return result;
@@ -263,7 +291,7 @@ const BoundModelSource = struct {
                 self.native_manifest = try direct.nativeSnapshot(proof);
             }
             var source = self.view();
-            source.manifest = &self.native_manifest.?.manifest;
+            source.manifest = try self.nativeManifestForBackend(proof, backend);
             return source;
         }
         if (self.kind != .directory) return self.view();
@@ -284,6 +312,9 @@ const BoundModelSource = struct {
                     graph_manifest.gguf_projector_path = null;
                     graph_manifest.gliner_head_gguf_path = null;
                     graph_manifest.gliner_head_safetensors_path = null;
+                    graph_manifest.jina_adapter_config_path = null;
+                    graph_manifest.jina_adapter_weights_path = null;
+                    graph_manifest.jina_adapter_selection_captured = true;
                     self.onnx_binding = .{ .path = path, .external_base_dir = base, .manifest = graph_manifest };
                 }
                 const graph = &self.onnx_binding.?;
@@ -294,8 +325,15 @@ const BoundModelSource = struct {
         }
         if (self.native_manifest == null) self.native_manifest = try directory.nativeSnapshot(proof);
         var source = self.view();
-        source.manifest = &self.native_manifest.?.manifest;
+        source.manifest = try self.nativeManifestForBackend(proof, backend);
         return source;
+    }
+
+    fn nativeManifestForBackend(self: *BoundModelSource, proof: *ComponentConstruction, backend: backends.BackendType) !*const manifest_mod.ModelManifest {
+        const native = &self.native_manifest.?;
+        if (!session_factory.usesJinaRetrievalAdapter(native.manifest, backend)) return &native.manifest;
+        if (self.native_adapter_manifest == null) self.native_adapter_manifest = try native.withJinaAdapter(proof);
+        return &self.native_adapter_manifest.?.manifest;
     }
 
     fn verify(self: *BoundModelSource, proof: *ComponentConstruction, backend: backends.BackendType) !void {
@@ -318,6 +356,7 @@ const BoundModelSource = struct {
             self.allocator.free(graph.path);
             self.allocator.free(graph.external_base_dir);
         }
+        if (self.native_adapter_manifest) |*adapter| adapter.deinit();
         if (self.native_manifest) |*native| native.deinit();
         if (self.directory_manifest) |*directory| directory.deinit();
         if (self.owned_manifest) |*manifest| manifest.deinit();
@@ -970,6 +1009,10 @@ pub fn compatibilitySummaryForBackend(
             };
         };
     }
+    if (candidate != .onnx) session_factory.validateJinaRetrievalAdapter(allocator, man.*, backend) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{ .level = .incompatible, .code = .artifact_unreadable, .message = "the selected Jina retrieval adapter is incomplete, invalid, or unreadable" };
+    };
     if (try validateNativeCompanionsForBackend(
         allocator,
         man,
@@ -1366,6 +1409,8 @@ fn addNativeComponentDependencies(
             "gliner_config.json",
             "added_tokens.json",
             "1_SpladePooling/config.json",
+            "adapters/retrieval/adapter_config.json",
+            "adapters/retrieval/adapter_model.safetensors",
         };
         for (manifest_dependencies) |relative_path| {
             const dependency = try std.fs.path.join(
@@ -1384,6 +1429,8 @@ fn addNativeComponentDependencies(
         native_manifest.safetensors_index_path,
         native_manifest.gliner_head_gguf_path,
         native_manifest.gliner_head_safetensors_path,
+        native_manifest.jina_adapter_config_path,
+        native_manifest.jina_adapter_weights_path,
     };
     for (native_paths) |maybe_native_path| {
         if (maybe_native_path) |native_path| try result.addDependency(native_path);
@@ -4000,12 +4047,15 @@ pub const LoadedModel = struct {
         defer self.projector_store_mutex.unlock();
         if (self.projector_store) |store| return store;
         const io = self.publicationIo(control);
-        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, self.model_dir);
-        defer publication_lease.deinit(io);
-        try self.verifyOwnerPublication(control);
-        const store = try gemma4_projector.ProjectorStore.open(self.allocator, path);
+        var proof = try ComponentConstruction.init(self.allocator, io, .{ .path = self.model_dir, .publication = self.managed_publication }, control, null);
+        defer proof.deinit();
+        proof.artifacts().verification_cache = &self.model_manager.verified_artifacts;
+        const physical = try proof.artifacts().constructionPath(path);
+        defer self.allocator.free(physical);
+        try proof.artifacts().verifyPath(physical);
+        const store = try gemma4_projector.ProjectorStore.open(self.allocator, physical);
         errdefer store.close();
-        try self.verifyOwnerPublication(control);
+        try proof.finish();
         self.projector_store = store;
         return store;
     }
@@ -7514,7 +7564,11 @@ pub const ModelManager = struct {
                         backend_runtime.backend,
                         artifact_estimate.extraBackendResidentAmounts(backend_runtime.backend),
                     );
-                const admission_plan = plan catch |err| {
+                const base_plan = plan catch |err| {
+                    rememberPreferredLoadError(&first_err, err);
+                    continue;
+                };
+                const admission_plan = (if (source.kind == .onnx) base_plan else withJinaAdapterAdmission(source.manifest.?.*, backend, base_plan)) catch |err| {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
@@ -11604,7 +11658,32 @@ pub fn projectorRunAdmissionAmounts(
     };
 }
 
+fn withJinaAdapterAdmission(man: manifest_mod.ModelManifest, backend: backends.BackendType, base: ModelLoadAdmissionPlan) !ModelLoadAdmissionPlan {
+    if (!session_factory.usesJinaRetrievalAdapter(man, backend)) return base;
+    const adapter = (try man.jinaRetrievalAdapter()) orelse return base;
+    const weights = std.math.cast(usize, try c_file.fileSize(man.allocator, adapter.weights)) orelse return error.ResourceLimitExceeded;
+    const config = std.math.cast(usize, try c_file.fileSize(man.allocator, adapter.config)) orelse return error.ResourceLimitExceeded;
+    // Mapping/header parsing and F32 staging are temporary on CPU/CUDA. Metal
+    // retains the adapter reader for lazy merges; its encoded mapping stays live.
+    const peak = try checkedScaledBytes(weights, 5, try checkedScaledBytes(config, 13, 0));
+    var result = base;
+    result.peak.host_weight_bytes = std.math.add(usize, result.peak.host_weight_bytes, peak) catch return error.ResourceLimitExceeded;
+    if (backend == .metal) result.resident.host_weight_bytes = std.math.add(usize, result.resident.host_weight_bytes, weights) catch return error.ResourceLimitExceeded;
+    return result;
+}
+
 fn estimateModelLoadAdmission(
+    model_path: []const u8,
+    man: manifest_mod.ModelManifest,
+    backend_runtime: backends.BackendRuntime,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+    laya_packed: bool,
+) !ModelLoadAdmissionPlan {
+    const base = try estimateBaseModelLoadAdmission(model_path, man, backend_runtime, a4b_request, laya_packed);
+    return withJinaAdapterAdmission(man, backend_runtime.backend, base);
+}
+
+fn estimateBaseModelLoadAdmission(
     model_path: []const u8,
     man: manifest_mod.ModelManifest,
     backend_runtime: backends.BackendRuntime,
@@ -19225,6 +19304,18 @@ test "model selection native architecture config is bound and authenticated" {
     var embedded = try manager.loadArtifactSession(root, legacy);
     defer embedded.deinit();
     try expectBoundSourceOutput(embedded.session, true);
+    // Catalog absence must also ignore an unlisted default that points outside
+    // the model. It grants no authority and must not be opened speculatively.
+    var foreign = std.testing.tmpDir(.{});
+    defer foreign.cleanup();
+    try foreign.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{}" });
+    const foreign_config = try foreign.dir.realPathFileAlloc(io, "config.json", a);
+    defer a.free(foreign_config);
+    try tmp.dir.deleteFile(io, "config.json");
+    try tmp.dir.symLink(io, foreign_config, "config.json", .{});
+    var ignored = try manager.loadArtifactSession(root, legacy);
+    defer ignored.deinit();
+    try expectBoundSourceOutput(ignored.session, true);
 }
 
 test "model selection native binding ignores unconsumed companion exports" {
@@ -19313,4 +19404,236 @@ test "native compatibility ignores head exports outside split GLiNER routes" {
         .{ .family = .unsupported },
     );
     try std.testing.expect(summary == null);
+}
+
+test "model selection direct GGUF accepts catalog aliases and directory snapshots" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |managed_model| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try writeCancellationTestModel(tmp.dir, a);
+        try tmp.dir.createDirPath(io, "blobs");
+        try tmp.dir.rename("model.gguf", tmp.dir, "blobs/clip", io);
+        try tmp.dir.symLink(io, "blobs/clip", "clip.gguf", .{});
+        try tmp.dir.symLink(io, "blobs/clip", "clip-alias.gguf", .{});
+        try writeTinyDebertaEncoderGgufForModelManagerTest(tmp.dir, a, "clap.gguf");
+        try tmp.dir.writeFile(io, .{ .sub_path = "antfly_inference_bundle.json", .data = "{\"family\":\"clipclap_gguf_bundle/v1\",\"clip\":\"clip.gguf\",\"clap\":\"clap.gguf\"}" });
+        if (managed_model) try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "clip.gguf", "clip-alias.gguf", "clap.gguf", "config.json", "tokenizer.json", "antfly_inference_bundle.json" });
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        var man = try manifest_mod.loadFromDir(a, root);
+        defer man.deinit();
+        const canonical = try tmp.dir.realPathFileAlloc(io, "clip.gguf", a);
+        defer a.free(canonical);
+        try std.testing.expect(!std.mem.eql(u8, man.gguf_path.?, canonical));
+        var sm = backends.SessionManager.initWithIo(a, io);
+        sm.preferred_backends = &.{.native};
+        sm.native_call_policy = .in_process;
+        var manager = ModelManager.init(a, sm);
+        defer manager.deinit();
+        // Directory construction succeeds using this same selected metadata.
+        var directory = try manager.loadArtifactSession(root, man);
+        defer directory.deinit();
+        try expectBoundSourceOutput(directory.session, true);
+        var direct = try manager.loadArtifactSession(man.gguf_path.?, man);
+        defer direct.deinit();
+        try expectBoundSourceOutput(direct.session, true);
+        const alternate = try std.fs.path.join(a, &.{ root, "clip-alias.gguf" });
+        defer a.free(alternate);
+        var same_file = try manager.loadArtifactSession(alternate, man);
+        defer same_file.deinit();
+        try expectBoundSourceOutput(same_file.session, true);
+    }
+}
+
+test "model selection unmanaged direct GGUF retains its directory configuration" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    var directory = try manager.loadArtifactSession(root, man);
+    defer directory.deinit();
+    try expectBoundSourceOutput(directory.session, true);
+    var direct = try manager.loadArtifactSession(man.gguf_path.?, man);
+    defer direct.deinit();
+    try expectBoundSourceOutput(direct.session, true);
+}
+
+test "model selection lazy projector authenticates before opening and reuses its store" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTinyHeadSafetensorsForModelManagerTest(tmp.dir, a, "model.safetensors");
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"bert\",\"hidden_size\":4,\"num_hidden_layers\":1,\"num_attention_heads\":2,\"intermediate_size\":8,\"vocab_size\":16}" });
+    try writeTinyProjectorGgufForModelManagerTest(tmp.dir, a, "mmproj.gguf", .gemma4_image);
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.safetensors", "config.json", "mmproj.gguf" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    try std.testing.expect(man.gguf_projector_path != null);
+    const payload = try tmp.dir.readFileAlloc(io, "mmproj.gguf", a, .limited(1024 * 1024));
+    defer a.free(payload);
+    const original_byte = payload[payload.len - 1];
+    payload[payload.len - 1] = 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = "mmproj.gguf", .data = payload });
+    const selected = ResolvedModel{ .path = root, .publication = man.managed_publication };
+    var proof = try ComponentConstruction.init(a, io, selected, null, null);
+    defer proof.deinit();
+    var bound = try BoundModelSource.init(&proof, root, .directory, &man, null);
+    defer bound.deinit();
+    _ = (try bound.forBackend(&proof, .native)).?;
+    try bound.verify(&proof, .native);
+    try bound.finish(&proof);
+    var sm = backends.SessionManager.initWithIo(a, io);
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    var model: LoadedModel = undefined;
+    model.allocator = a;
+    model.model_dir = root;
+    model.managed_publication = man.managed_publication;
+    model.session_manager = &sm;
+    model.model_manager = &manager;
+    model.manifest = man;
+    model.projector_store_mutex = .unlocked;
+    model.projector_store = null;
+    const control = selected.bind(InferenceExecutionControl{ .io = io });
+    try std.testing.expectError(error.ChecksumMismatch, model.ensureProjectorStoreWithControl(control));
+    try std.testing.expect(model.projector_store == null);
+    payload[payload.len - 1] = original_byte;
+    try tmp.dir.writeFile(io, .{ .sub_path = "mmproj.gguf", .data = payload });
+    const store = (try model.ensureProjectorStoreWithControl(control)).?;
+    defer store.close();
+    // A resident projector must not allocate or rehash its weights on warm use.
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    model.allocator = failing.allocator();
+    try std.testing.expect(store == (try model.ensureProjectorStoreWithControl(control)).?);
+    model.allocator = a;
+}
+
+fn writeJinaAdapterTestModel(dir: std.Io.Dir, a: std.mem.Allocator) !void {
+    try writeTinyHeadSafetensorsForModelManagerTest(dir, a, "model.safetensors");
+    try dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"jina_embeddings_v5\",\"hidden_size\":4,\"num_hidden_layers\":1,\"num_attention_heads\":2,\"num_key_value_heads\":2,\"intermediate_size\":8,\"vocab_size\":16}" });
+    try dir.createDirPath(std.testing.io, "adapters/retrieval");
+    try dir.writeFile(std.testing.io, .{ .sub_path = "adapters/retrieval/adapter_config.json", .data = "{\"r\":1,\"lora_alpha\":1}" });
+    try writeTinyHeadSafetensorsForModelManagerTest(dir, a, "adapters/retrieval/adapter_model.safetensors");
+}
+
+test "model selection Jina adapter absence is captured and partial publication is rejected" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeJinaAdapterTestModel(tmp.dir, a);
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.safetensors", "config.json" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    try std.testing.expect(man.jina_adapter_selection_captured);
+    try std.testing.expect((try man.jinaRetrievalAdapter()) == null);
+    // Even an invalid unlisted default cannot alter the captured construction.
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_config.json", .data = "[]" });
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    for ([_]bool{ false, true }) |legacy| {
+        var supplied = man;
+        if (legacy) supplied.jina_adapter_selection_captured = false;
+        var loaded = try manager.loadArtifactSession(root, supplied);
+        defer loaded.deinit();
+    }
+    var listing = try manifest_mod.loadListingFromDir(a, root);
+    defer listing.deinit();
+    try std.testing.expect((try listing.jinaRetrievalAdapter()) == null);
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.safetensors", "config.json", "adapters/retrieval/adapter_config.json" });
+    var partial = try manifest_mod.loadFromDir(a, root);
+    defer partial.deinit();
+    try std.testing.expectError(error.IncompleteJinaV5Adapter, manager.loadArtifactSession(root, partial));
+}
+
+test "model selection Jina adapters authenticate both files and account backend lifetime" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeJinaAdapterTestModel(tmp.dir, a);
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.safetensors", "config.json", "adapters/retrieval/adapter_config.json", "adapters/retrieval/adapter_model.safetensors" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    const adapter = (try man.jinaRetrievalAdapter()).?;
+    var proof = try ComponentConstruction.init(a, io, .{ .path = root, .publication = man.managed_publication }, null, null);
+    defer proof.deinit();
+    var bound = try BoundModelSource.init(&proof, root, .directory, &man, null);
+    defer bound.deinit();
+    const native = (try bound.forBackend(&proof, .native)).?;
+    try bound.verify(&proof, .native);
+    try std.testing.expectEqual(native.manifest, (try bound.forBackend(&proof, .native)).?.manifest);
+    try std.testing.expectEqual(native.manifest, (try bound.forBackend(&proof, .metal)).?.manifest);
+    const empty = ModelLoadAdmissionPlan{ .peak = .{}, .resident = .{} };
+    const cpu = try withJinaAdapterAdmission(native.manifest.?.*, .native, empty);
+    const gpu = try withJinaAdapterAdmission(native.manifest.?.*, .metal, empty);
+    const encoded = try c_file.fileSize(a, adapter.weights);
+    try std.testing.expect(cpu.peak.host_weight_bytes > encoded);
+    try std.testing.expectEqual(@as(usize, 0), cpu.resident.host_weight_bytes);
+    try std.testing.expectEqual(cpu.peak.host_weight_bytes, gpu.peak.host_weight_bytes);
+    try std.testing.expectEqual(encoded, gpu.resident.host_weight_bytes);
+    const session = try session_factory.createSessionFromManifest(a, native.path, native.manifest.?, .native, .{}, .dynamic, null, null, false);
+    defer session.close();
+    try bound.finish(&proof);
+    inline for (.{ "adapters/retrieval/adapter_config.json", "adapters/retrieval/adapter_model.safetensors" }) |name| {
+        const original = try tmp.dir.readFileAlloc(io, name, a, .limited(1024 * 1024));
+        defer a.free(original);
+        const changed = try a.dupe(u8, original);
+        defer a.free(changed);
+        changed[changed.len - 2] +%= 1;
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = changed });
+        try std.testing.expectError(error.ChecksumMismatch, bound.verify(&proof, .native));
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = original });
+    }
+    try bound.verify(&proof, .native);
+    try bound.finish(&proof);
+}
+
+test "model selection Jina GGUF CPU ignores adapters reserved for Metal" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    var supplied = man;
+    supplied.config_model_arch = "jina_embeddings_v5";
+    supplied.jina_adapter_config_path = "/missing/adapter-config.json";
+    supplied.jina_adapter_weights_path = "/missing/adapter.safetensors";
+    var proof = try ComponentConstruction.init(a, io, .{ .path = root, .publication = null }, null, null);
+    defer proof.deinit();
+    var bound = try BoundModelSource.init(&proof, root, .directory, &supplied, null);
+    defer bound.deinit();
+    const native = (try bound.forBackend(&proof, .native)).?;
+    try bound.verify(&proof, .native);
+    const session = try session_factory.createSessionFromManifest(a, native.path, native.manifest.?, .native, .{}, .dynamic, null, null, false);
+    defer session.close();
+    try expectBoundSourceOutput(session, true);
+    try std.testing.expectError(error.FileNotFound, bound.forBackend(&proof, .metal));
+    try std.testing.expectEqual(native.manifest, (try bound.forBackend(&proof, .native)).?.manifest);
 }

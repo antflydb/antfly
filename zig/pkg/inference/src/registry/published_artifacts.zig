@@ -96,6 +96,10 @@ pub const PublishedArtifacts = struct {
     storage_root: []u8,
     physical_root: [:0]u8,
     physical_direct: ?[]u8 = null,
+    // A standalone GGUF may be constructed with a directory metadata snapshot.
+    // Keep that dependency scope separate from the direct file's own binding.
+    directory_scope: ?[:0]u8 = null,
+    directory_scope_inode: ?@FieldType(std.Io.File.Stat, "inode") = null,
     direct_path: ?[]u8 = null,
     direct_index: ?usize = null,
     verification_cache: ?*VerificationCache = null,
@@ -145,17 +149,61 @@ pub const PublishedArtifacts = struct {
         self.allocator.free(self.storage_root);
         self.allocator.free(self.physical_root);
         if (self.physical_direct) |path| self.allocator.free(path);
+        if (self.directory_scope) |path| self.allocator.free(path);
         if (self.direct_path) |path| self.allocator.free(path);
         self.allocator.free(self.verified_stamps);
         self.canonical_index.deinit(self.allocator);
         if (self.receipt) |*receipt| receipt.deinit();
     }
+    fn constructionRoot(self: *const PublishedArtifacts) []const u8 {
+        return self.directory_scope orelse self.physical_root;
+    }
+
+    /// A supplied directory snapshot grants a standalone direct file its local
+    /// sidecar scope. It cannot change receipt authority or admit a foreign file.
+    pub fn bindDirectoryScope(self: *PublishedArtifacts, root: []const u8) !void {
+        if (self.direct_path == null) return;
+        const canonical = try std.Io.Dir.cwd().realPathFileAlloc(self.io, root, self.allocator);
+        errdefer self.allocator.free(canonical);
+        if (!std.mem.eql(u8, canonical, root)) return error.ModelArtifactsChanging;
+        const stat = try std.Io.Dir.cwd().statFile(self.io, canonical, .{});
+        if (stat.kind != .directory) return error.NotDir;
+        if (!managed.pathIsWithinRoot(canonical, self.physical_direct.?)) return error.ModelArtifactOutsideRoot;
+        if (self.receipt != null) {
+            if (!std.mem.eql(u8, self.physical_root, canonical) and !managed.pathIsWithinRoot(self.physical_root, canonical)) return error.ModelArtifactOutsideRoot;
+            self.allocator.free(canonical);
+            return;
+        }
+        if (self.directory_scope) |scope| {
+            if (!std.mem.eql(u8, scope, canonical) or self.directory_scope_inode.? != stat.inode) return error.ModelArtifactsChanging;
+            self.allocator.free(canonical);
+        } else {
+            self.directory_scope = canonical;
+            self.directory_scope_inode = stat.inode;
+        }
+    }
+
+    /// Default sidecars are optional only when absent from the captured catalog.
+    /// Explicit selections must use constructionPath and cannot silently vanish.
+    pub fn optionalConstructionPath(self: *const PublishedArtifacts, path: []const u8) !?[]u8 {
+        if (self.receipt != null) {
+            _ = self.indexForPath(path) catch |err| switch (err) {
+                error.InvalidManagedDownload => return null,
+                else => return err,
+            };
+        }
+        return self.constructionPath(path) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => null,
+            else => return err,
+        };
+    }
+
     pub fn resolve(self: *const PublishedArtifacts, relative: []const u8) !?[]u8 {
         if (self.receipt) |*receipt| {
             const artifact = receipt.find(relative) orelse return null;
             return try self.allocator.dupe(u8, artifact.canonical_path);
         }
-        return managed.resolveContainedArtifactPath(self.allocator, self.io, self.storage_root, relative) catch |err| switch (err) {
+        return managed.resolveContainedArtifactPath(self.allocator, self.io, self.directory_scope orelse self.storage_root, relative) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => null,
             else => return err,
         };
@@ -166,7 +214,7 @@ pub const PublishedArtifacts = struct {
     pub fn resolveModel(self: *const PublishedArtifacts, relative: []const u8) !?[]u8 {
         const canonical = (try self.resolve(relative)) orelse return null;
         defer self.allocator.free(canonical);
-        return try std.fs.path.join(self.allocator, &.{ self.physical_root, relative });
+        return try std.fs.path.join(self.allocator, &.{ self.constructionRoot(), relative });
     }
     /// Verify bytes actually read/mapped, avoiding a hash-then-reopen race.
     pub fn verifyBytes(self: *const PublishedArtifacts, relative: []const u8, bytes: []const u8) !void {
@@ -325,7 +373,8 @@ pub const PublishedArtifacts = struct {
         defer self.allocator.free(captured_path);
         const canonical = try std.Io.Dir.cwd().realPathFileAlloc(self.io, captured_path, self.allocator);
         defer self.allocator.free(canonical);
-        if (!managed.pathIsWithinRoot(self.physical_root, canonical)) return error.ModelArtifactOutsideRoot;
+        const scope = self.constructionRoot();
+        if (!std.mem.eql(u8, scope, canonical) and !managed.pathIsWithinRoot(scope, canonical)) return error.ModelArtifactOutsideRoot;
         // Directory importers verify their selected dependencies separately.
         // A file must always be selected through the captured receipt above.
         if (self.receipt != null and (try std.Io.Dir.cwd().statFile(self.io, canonical, .{})).kind != .directory) return error.InvalidManagedDownload;
@@ -339,6 +388,11 @@ pub const PublishedArtifacts = struct {
     }
     pub fn verify(self: *const PublishedArtifacts) !void {
         try self.verifyBinding(self.storage_root, self.physical_root);
+        if (self.directory_scope) |root| {
+            try self.verifyBinding(root, root);
+            const stat = try std.Io.Dir.cwd().statFile(self.io, root, .{});
+            if (stat.kind != .directory or stat.inode != self.directory_scope_inode.?) return error.ModelArtifactsChanging;
+        }
         if (self.direct_path) |path| try self.verifyBinding(path, self.physical_direct.?);
         if (!std.meta.eql(self.publication, try managed.publicationGeneration(self.allocator, self.io, self.root))) return error.ModelArtifactsChanging;
         // Native directory importers also discover members by relative names.
@@ -891,5 +945,47 @@ test "model selection namespace rebasing does not inspect unused alternatives" {
     defer a.free(unchanged);
     try std.testing.expectEqualStrings(outside, unchanged);
     try std.testing.expectError(error.ModelArtifactOutsideRoot, artifacts.constructionPath(unchanged));
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+}
+
+fn directDirectoryScopeAllocationScenario(a: std.mem.Allocator, file: []const u8, root: []const u8) !void {
+    var artifacts = try PublishedArtifacts.init(a, std.testing.io, file, null);
+    defer artifacts.deinit();
+    try artifacts.bindDirectoryScope(root);
+    try artifacts.bindDirectoryScope(root);
+    const path = try std.fs.path.join(a, &.{ root, "config.json" });
+    defer a.free(path);
+    const config = try artifacts.constructionPath(path);
+    defer a.free(config);
+    try artifacts.verify();
+}
+
+test "model selection direct directory scopes contain sidecars and unwind allocation failures" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.createDirPath(io, "foreign");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.gguf", .data = "weights" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "foreign/config.json", .data = "{}" });
+    const root = try tmp.dir.realPathFileAlloc(io, "model", a);
+    defer a.free(root);
+    const file = try tmp.dir.realPathFileAlloc(io, "model/model.gguf", a);
+    defer a.free(file);
+    const foreign = try tmp.dir.realPathFileAlloc(io, "foreign", a);
+    defer a.free(foreign);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, directDirectoryScopeAllocationScenario, .{ file, root });
+    var artifacts = try PublishedArtifacts.init(a, io, file, null);
+    defer artifacts.deinit();
+    try std.testing.expectError(error.ModelArtifactOutsideRoot, artifacts.bindDirectoryScope(foreign));
+    try artifacts.bindDirectoryScope(root);
+    const outside = try std.fs.path.join(a, &.{ foreign, "config.json" });
+    defer a.free(outside);
+    try std.testing.expectError(error.ModelArtifactOutsideRoot, artifacts.constructionPath(outside));
+    try tmp.dir.rename("model", tmp.dir, "previous", io);
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.gguf", .data = "weights" });
     try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
 }

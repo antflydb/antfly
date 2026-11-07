@@ -2854,10 +2854,9 @@ fn createGpuHostedSessionWithTaskOverride(
             if (tensor_store.?.kind() != .gguf) {
                 try refineArchConfigFromStore(allocator, tensor_store.?, all_names, &arch_config);
             }
-            if (backend_type == .metal and std.mem.eql(u8, mf.config_model_arch, "jina_embeddings_v5")) {
-                if (try jinaRetrievalAdapterPaths(allocator, model_path)) |paths| {
-                    defer allocator.free(paths.config);
-                    defer allocator.free(paths.weights);
+            if (usesJinaRetrievalAdapter(mf, backend_type)) {
+                if (try jinaRetrievalAdapterPaths(allocator, model_path, mf)) |paths| {
+                    defer paths.deinit(allocator);
                     const cfg = try parseJinaLoraConfig(allocator, paths.config);
                     gpu_jina_lora_adapter = try gpu_hosted_store_mod.JinaLoraAdapter.create(allocator, paths.weights, cfg.scale());
                 }
@@ -6599,10 +6598,41 @@ fn parseJinaLoraConfig(allocator: std.mem.Allocator, path: []const u8) !JinaLora
     return cfg;
 }
 
+pub fn usesJinaRetrievalAdapter(mf: manifest_mod.ModelManifest, backend: BackendType) bool {
+    if (!std.mem.eql(u8, mf.config_model_arch, "jina_embeddings_v5")) return false;
+    const kind = mf.nativeWeightArtifactKind() orelse return false;
+    return backend == .metal or ((backend == .native or backend == .cuda) and kind != .gguf);
+}
+
+pub fn validateJinaRetrievalAdapter(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest, backend: BackendType) !void {
+    if (!usesJinaRetrievalAdapter(mf, backend)) return;
+    const adapter = (try mf.jinaRetrievalAdapter()) orelse return;
+    _ = try parseJinaLoraConfig(allocator, adapter.config);
+    try safetensors_mod.validateArtifactSet(allocator, adapter.weights, null);
+}
+
+const JinaAdapterPaths = struct {
+    config: []const u8,
+    weights: []const u8,
+    owned: bool = false,
+
+    fn deinit(self: JinaAdapterPaths, allocator: std.mem.Allocator) void {
+        if (self.owned) {
+            allocator.free(self.config);
+            allocator.free(self.weights);
+        }
+    }
+};
+
 fn jinaRetrievalAdapterPaths(
     allocator: std.mem.Allocator,
     model_path: []const u8,
-) !?struct { config: []const u8, weights: []const u8 } {
+    mf: manifest_mod.ModelManifest,
+) !?JinaAdapterPaths {
+    if (mf.jina_adapter_selection_captured or mf.source_root != null or mf.jina_adapter_config_path != null or mf.jina_adapter_weights_path != null) {
+        const selected = (try mf.jinaRetrievalAdapter()) orelse return null;
+        return .{ .config = selected.config, .weights = selected.weights };
+    }
     const config_path = try std.fs.path.join(allocator, &.{ model_path, "adapters", "retrieval", "adapter_config.json" });
     errdefer allocator.free(config_path);
     const weights_path = try std.fs.path.join(allocator, &.{ model_path, "adapters", "retrieval", "adapter_model.safetensors" });
@@ -6613,13 +6643,9 @@ fn jinaRetrievalAdapterPaths(
         allocator.free(weights_path);
         return null;
     }
-    if (!c_file.fileExists(allocator, config_path) or !c_file.fileExists(allocator, weights_path)) {
-        allocator.free(config_path);
-        allocator.free(weights_path);
-        return error.IncompleteJinaV5Adapter;
-    }
+    if (!c_file.fileExists(allocator, config_path) or !c_file.fileExists(allocator, weights_path)) return error.IncompleteJinaV5Adapter;
 
-    return .{ .config = config_path, .weights = weights_path };
+    return .{ .config = config_path, .weights = weights_path, .owned = true };
 }
 
 fn applyJinaV5RetrievalAdapterIfPresent(
@@ -6628,11 +6654,10 @@ fn applyJinaV5RetrievalAdapterIfPresent(
     mf: manifest_mod.ModelManifest,
     resident_weights: *std.StringHashMapUnmanaged(LoadedWeight),
 ) !void {
-    if (!std.mem.eql(u8, mf.config_model_arch, "jina_embeddings_v5")) return;
+    if (!usesJinaRetrievalAdapter(mf, .native)) return;
 
-    const paths = try jinaRetrievalAdapterPaths(allocator, model_path) orelse return;
-    defer allocator.free(paths.config);
-    defer allocator.free(paths.weights);
+    const paths = try jinaRetrievalAdapterPaths(allocator, model_path, mf) orelse return;
+    defer paths.deinit(allocator);
 
     const cfg = try parseJinaLoraConfig(allocator, paths.config);
     var adapter = try gpu_hosted_store_mod.JinaLoraAdapter.create(allocator, paths.weights, cfg.scale());
@@ -12997,4 +13022,16 @@ test "GLiNER captured markers ignore later default token overrides" {
     label.gliner_classification_head = .label_marker_mlp;
     try applyGlinerLabelTokenIds(a, root, label, &cfg);
     try std.testing.expectEqual(@as(i64, 6), cfg.classification_token_id);
+}
+
+test "Jina legacy adapter discovery owns incomplete pair cleanup" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "adapters/retrieval");
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_config.json", .data = "{}" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    try std.testing.expectError(error.IncompleteJinaV5Adapter, jinaRetrievalAdapterPaths(a, root, .{ .allocator = a }));
 }

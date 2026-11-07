@@ -2978,6 +2978,8 @@ fn computeCompatibilitySignatureWithDependencies(
     }
     try addArtifactIdentityToSignature(allocator, io, &signature, man.model_manifest_path, true);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.config_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.jina_adapter_config_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.jina_adapter_weights_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.gguf_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.gguf_projector_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.safetensors_path, false);
@@ -51592,4 +51594,28 @@ test "model selection compatibility signature preserves aliased ONNX context" {
     manifest.onnx_logical_path = new_logical;
     const renamed = try computeCompatibilitySignatureWithDependencies(a, io, root, &manifest, dependencies.paths.items, true);
     try std.testing.expect(!std.mem.eql(u8, &after, &renamed));
+}
+
+test "model selection compatibility signature tracks selected Jina adapter files" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "adapters/retrieval");
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"jina_embeddings_v5\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "base" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_config.json", .data = "{\"r\":1}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_model.safetensors", .data = "aaaa" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadListingFromDir(a, root);
+    defer man.deinit();
+    try std.testing.expect((try man.jinaRetrievalAdapter()) != null);
+    const before = try computeCompatibilitySignatureWithDependencies(a, io, root, &man, &.{}, true);
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_config.json", .data = "{\"r\":2}" });
+    const config_changed = try computeCompatibilitySignatureWithDependencies(a, io, root, &man, &.{}, true);
+    try std.testing.expect(!std.mem.eql(u8, &before, &config_changed));
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_model.safetensors", .data = "bbbbb" });
+    const weights_changed = try computeCompatibilitySignatureWithDependencies(a, io, root, &man, &.{}, true);
+    try std.testing.expect(!std.mem.eql(u8, &config_changed, &weights_changed));
 }
