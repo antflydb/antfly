@@ -852,8 +852,10 @@ pub fn inspectArtifactSetWithBase(allocator: std.mem.Allocator, onnx_path: []con
 }
 
 pub fn inspectArtifactSetWithReader(allocator: std.mem.Allocator, onnx_path: []const u8, external_base_dir: ?[]const u8, reader: ?onnx_graph.tensor.ExternalDataReader) !OnnxArtifactSet {
-    var mapped = if (reader) |source|
-        try c_file.MmapRegion.initFromFile((try source.open(onnx_path)).file, max_onnx_model_bytes)
+    const opened = if (reader) |source| try source.open(onnx_path) else null;
+    defer if (opened) |file| file.deinit();
+    var mapped = if (opened) |file|
+        try c_file.MmapRegion.initFromFile(file.file, max_onnx_model_bytes)
     else
         try c_file.MmapRegion.init(allocator, onnx_path);
     defer mapped.deinit();
@@ -933,6 +935,7 @@ pub fn inspectArtifactSetWithReader(allocator: std.mem.Allocator, onnx_path: []c
         };
     }
 
+    if (opened) |file| try file.validate();
     return .{
         .allocator = allocator,
         .external_paths = try paths.toOwnedSlice(allocator),
@@ -949,6 +952,13 @@ fn snapshotShapeTemplate(allocator: std.mem.Allocator, model: *onnx_graph.Model)
     defer arena.deinit();
     const scratch = arena.allocator();
     var graph = (model.graph() orelse return error.InvalidOnnxGraph).*;
+    // Missing unused initializers need no snapshot data. Every referenced shape
+    // constant, however, must be captured successfully before publication.
+    var referenced: std.StringHashMapUnmanaged(void) = .empty;
+    for (graph.nodes) |node| for (node.inputs) |name| {
+        try referenced.put(scratch, name, {});
+    };
+    for (graph.outputs) |output| try referenced.put(scratch, output.name, {});
     graph.initializers = try scratch.alloc(onnx_graph.proto.TensorProto, model.initializer_map.count());
     var names = model.initializer_map.keyIterator();
     var i: usize = 0;
@@ -962,12 +972,11 @@ fn snapshotShapeTemplate(allocator: std.mem.Allocator, model: *onnx_graph.Model)
             if (!tensor.isExternal()) {
                 graph.initializers[i] = tensor.*;
             } else {
-                // An unresolved/unused external initializer must remain a
-                // parameter, just as it was in the original conversion.
-                const bytes = onnx_graph.tensor.extractNativeBytesWithReader(scratch, tensor, model.base_dir, model.external_reader) catch {
+                if (!referenced.contains(tensor.name)) {
                     graph.initializers[i].data_location = .external;
                     continue;
-                };
+                }
+                const bytes = try onnx_graph.tensor.extractNativeBytesWithReader(scratch, tensor, model.base_dir, model.external_reader);
                 graph.initializers[i].raw_data = bytes;
             }
         }
@@ -2000,7 +2009,7 @@ fn maybeDirectStaticTensor(
         if (external.offset < 0) return error.InvalidExternalOffset;
         const offset: u64 = @intCast(external.offset);
         const len: usize = if (external.length < 0) blk: {
-            const size = if (model.external_reader) |source| (try source.open(full_path)).size else try c_file.fileSize(allocator, full_path);
+            const size = if (model.external_reader) |source| try source.size(full_path) else try c_file.fileSize(allocator, full_path);
             if (offset > size) return error.ExternalRegionOutOfBounds;
             break :blk @intCast(size - offset);
         } else @intCast(external.length);
@@ -3688,4 +3697,68 @@ test "retained ONNX integer shape constants and templates consume captured handl
         a.free(actual);
     }
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, actual[0].asFloat32());
+}
+
+fn shapeSnapshotAllocationScenario(a: std.mem.Allocator, model: *onnx_graph.Model) !void {
+    const bytes = try snapshotShapeTemplate(a, model);
+    defer a.free(bytes);
+    // Inject failures into snapshot construction, not the verification parser.
+    var snapshot = try onnx_graph.parseLazyAsModel(std.testing.allocator, bytes);
+    defer snapshot.deinit();
+    const shape = snapshot.getInitializer("shape") orelse return error.MissingWeight;
+    try std.testing.expectEqual(@as(usize, 8), shape.tensor.raw_data.len);
+    try std.testing.expectEqual(@as(i64, 4), std.mem.readInt(i64, shape.tensor.raw_data[0..8], .little));
+}
+
+test "retained ONNX shape snapshot propagates reader failures" {
+    const a = std.testing.allocator;
+    const proto = onnx_graph.proto;
+    var shape_dims = [_]i64{1};
+    var external = [_]proto.ExternalDataEntry{ .{ .key = "location", .value = "shape.data" }, .{ .key = "length", .value = "8" } };
+    var constants = [_]proto.TensorProto{.{ .name = "shape", .dims = &shape_dims, .data_type = .int64, .data_location = .external, .external_data = &external }};
+    var input_dims = [_]proto.TensorShapeProto.Dimension{.{ .dim_param = "N" }};
+    var output_dims = [_]proto.TensorShapeProto.Dimension{.{ .dim_value = 4 }};
+    var inputs = [_]proto.ValueInfoProto{.{ .name = "input", .type_proto = .{ .tensor_type = .{ .elem_type = .float32, .shape = .{ .dims = &input_dims } } } }};
+    var outputs = [_]proto.ValueInfoProto{.{ .name = "output", .type_proto = .{ .tensor_type = .{ .elem_type = .float32, .shape = .{ .dims = &output_dims } } } }};
+    var ni = [_][]const u8{ "input", "shape" };
+    var no = [_][]const u8{"output"};
+    var nodes = [_]proto.NodeProto{.{ .op_type = "Reshape", .inputs = &ni, .outputs = &no }};
+    var opsets = [_]proto.OpsetImport{.{ .domain = "", .version = 14 }};
+    const bytes = try onnx_graph.serializeModel(a, &.{ .ir_version = 7, .opset_import = &opsets, .graph = .{ .name = "failed-shape", .nodes = &nodes, .initializers = &constants, .inputs = &inputs, .outputs = &outputs } });
+    defer a.free(bytes);
+    var model = try onnx_graph.parseLazyAsModelWithBaseDir(a, bytes, "/selected");
+    defer model.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const value: i64 = 4;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "shape.data", .data = std.mem.asBytes(&value) });
+    const file = try tmp.dir.openFile(std.testing.io, "shape.data", .{});
+    defer file.close(std.testing.io);
+    const Context = struct {
+        file: std.Io.File,
+        failure: ?anyerror = null,
+        fn open(raw: *anyopaque, _: []const u8) !onnx_graph.tensor.ExternalDataReader.OpenedFile {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.failure) |err| return err;
+            return .{ .file = self.file, .io = std.testing.io, .size = 8 };
+        }
+    };
+    var context = Context{ .file = file };
+    model.external_reader = .{ .context = &context, .open_fn = Context.open };
+    for ([_]anyerror{ error.OutOfMemory, error.Canceled, error.ModelArtifactsChanging, error.ChecksumMismatch, error.ReadFailed }) |err| {
+        context.failure = err;
+        try std.testing.expectError(err, snapshotShapeTemplate(a, &model));
+    }
+    context.failure = null;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, shapeSnapshotAllocationScenario, .{&model});
+
+    // Unused external initializers remain optional and do not perform IO.
+    context.failure = error.ReadFailed;
+    const unused_bytes = try onnx_graph.serializeModel(a, &.{ .ir_version = 7, .graph = .{ .name = "unused-shape", .initializers = &constants, .inputs = &inputs, .outputs = &inputs } });
+    defer a.free(unused_bytes);
+    var unused_model = try onnx_graph.parseLazyAsModelWithBaseDir(a, unused_bytes, "/selected");
+    defer unused_model.deinit();
+    unused_model.external_reader = model.external_reader;
+    const unused = try snapshotShapeTemplate(a, &unused_model);
+    defer a.free(unused);
 }

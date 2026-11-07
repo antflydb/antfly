@@ -25,22 +25,42 @@ pub const TensorProto = proto.TensorProto;
 
 pub const DataType = proto.DataType;
 
-/// Borrowed acquisition capability. Returned handles stay owned by the
-/// provider, and every read uses positional IO on those same opened files.
+/// Borrowed acquisition capability. Each opened handle is a scoped borrow:
+/// callers must deinit it, and validate it after consuming its bytes. Providers
+/// may then reuse or evict idle handles without invalidating active readers.
 pub const ExternalDataReader = struct {
     context: *anyopaque,
     open_fn: *const fn (*anyopaque, []const u8) anyerror!OpenedFile,
-    pub const OpenedFile = struct { file: std.Io.File, io: std.Io, size: u64 };
+    pub const OpenedFile = struct {
+        file: std.Io.File,
+        io: std.Io,
+        size: u64,
+        context: ?*anyopaque = null,
+        release_fn: ?*const fn (*anyopaque, std.Io.File) void = null,
+        validate_fn: ?*const fn (*anyopaque, std.Io.File) anyerror!void = null,
+
+        pub fn deinit(self: OpenedFile) void {
+            if (self.release_fn) |release| release(self.context.?, self.file);
+        }
+
+        pub fn validate(self: OpenedFile) !void {
+            if (self.validate_fn) |validate_file| try validate_file(self.context.?, self.file);
+        }
+    };
 
     pub fn open(self: ExternalDataReader, path: []const u8) !OpenedFile {
         return self.open_fn(self.context, path);
     }
     pub fn size(self: ExternalDataReader, path: []const u8) !u64 {
-        return (try self.open(path)).size;
+        const opened = try self.open(path);
+        defer opened.deinit();
+        try opened.validate();
+        return opened.size;
     }
     pub fn read(self: ExternalDataReader, allocator: std.mem.Allocator, path: []const u8, offset: i64, length: i64, max_bytes: usize) ![]u8 {
         if (offset < 0) return error.InvalidExternalOffset;
         const opened = try self.open(path);
+        defer opened.deinit();
         const off: u64 = @intCast(offset);
         if (off > opened.size) return error.ExternalRegionOutOfBounds;
         const len: u64 = if (length < 0) opened.size - off else @intCast(length);
@@ -49,6 +69,7 @@ pub const ExternalDataReader = struct {
         const bytes = try allocator.alloc(u8, @intCast(len));
         errdefer allocator.free(bytes);
         if (try opened.file.readPositionalAll(opened.io, bytes, off) != bytes.len) return error.ExternalRegionShortRead;
+        try opened.validate();
         return bytes;
     }
 };
@@ -422,9 +443,20 @@ test "retained ONNX reader preserves float and native integer data without pathn
     defer file.close(io);
     const Context = struct {
         file: std.Io.File,
+        active: usize = 0,
+        fail_validation: bool = false,
+        fn release(raw: *anyopaque, _: std.Io.File) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.active -= 1;
+        }
+        fn validate(raw: *anyopaque, _: std.Io.File) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail_validation) return error.ModelArtifactsChanging;
+        }
         fn open(raw: *anyopaque, _: []const u8) !ExternalDataReader.OpenedFile {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return .{ .file = self.file, .io = std.testing.io, .size = 16 };
+            self.active += 1;
+            return .{ .file = self.file, .io = std.testing.io, .size = 16, .context = self, .release_fn = release, .validate_fn = validate };
         }
     };
     var context = Context{ .file = file };
@@ -441,4 +473,12 @@ test "retained ONNX reader preserves float and native integer data without pathn
     const native = try extractNativeBytesWithReader(a, &tensor, "/not-a-real-model", reader);
     defer a.free(native);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&integer), native);
+    try std.testing.expectEqual(@as(usize, 0), context.active);
+    try std.testing.expectEqual(@as(u64, 16), try reader.size("unused"));
+    try std.testing.expectError(error.ExternalRegionOutOfBounds, reader.read(a, "unused", 17, 1, 1024));
+    try std.testing.expectError(error.FileTooLarge, reader.read(a, "unused", 0, -1, 1));
+    context.fail_validation = true;
+    try std.testing.expectError(error.ModelArtifactsChanging, reader.read(a, "unused", 0, -1, 1024));
+    try std.testing.expectError(error.ModelArtifactsChanging, reader.size("unused"));
+    try std.testing.expectEqual(@as(usize, 0), context.active);
 }

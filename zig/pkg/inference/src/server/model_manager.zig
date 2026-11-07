@@ -20131,3 +20131,67 @@ test "model selection retained ONNX handles defeat external leaf and parent ABA 
         try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
     };
 }
+
+test "model selection many-file ONNX model loads within a bounded descriptor budget" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const count = 96;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const proto = onnx_graph.proto;
+    const initializers = try scratch.alloc(proto.TensorProto, count);
+    const nodes = try scratch.alloc(proto.NodeProto, count);
+    const members = try scratch.alloc([]const u8, count + 1);
+    members[0] = "model.onnx";
+    var dims = [_]i64{1};
+    const value: f32 = 1;
+    var previous: []const u8 = "input";
+    for (initializers, nodes, 0..) |*tensor, *node, i| {
+        const name = try std.fmt.allocPrint(scratch, "w{d}", .{i});
+        const filename = try std.fmt.allocPrint(scratch, "w{d}.data", .{i});
+        const output = try std.fmt.allocPrint(scratch, "o{d}", .{i});
+        const ext = try scratch.alloc(proto.ExternalDataEntry, 2);
+        ext[0] = .{ .key = "location", .value = filename };
+        ext[1] = .{ .key = "length", .value = "4" };
+        tensor.* = .{ .name = name, .dims = &dims, .data_type = .float32, .data_location = .external, .external_data = ext };
+        const ni = try scratch.alloc([]const u8, 2);
+        ni[0] = previous;
+        ni[1] = name;
+        const no = try scratch.alloc([]const u8, 1);
+        no[0] = output;
+        node.* = .{ .op_type = "Add", .inputs = ni, .outputs = no };
+        previous = output;
+        members[i + 1] = filename;
+        try tmp.dir.writeFile(io, .{ .sub_path = filename, .data = std.mem.asBytes(&value) });
+    }
+    var shape = [_]proto.TensorShapeProto.Dimension{.{ .dim_value = 1 }};
+    var inputs = [_]proto.ValueInfoProto{.{ .name = "input", .type_proto = .{ .tensor_type = .{ .elem_type = .float32, .shape = .{ .dims = &shape } } } }};
+    var outputs = [_]proto.ValueInfoProto{.{ .name = previous, .type_proto = inputs[0].type_proto }};
+    var opsets = [_]proto.OpsetImport{.{ .domain = "", .version = 14 }};
+    const bytes = try onnx_graph.serializeModel(a, &.{ .ir_version = 7, .opset_import = &opsets, .graph = .{ .name = "many-files", .nodes = nodes, .initializers = initializers, .inputs = &inputs, .outputs = &outputs } });
+    defer a.free(bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = bytes });
+    try writeArtifactIdentityTestReceipt(tmp.dir, members);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "model.onnx" });
+    defer a.free(path);
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    var loaded = try manager.loadManagedSessionWithAdmission(path, &.{.native}, null, null, .{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) }, null);
+    defer loaded.deinit();
+    var input = try backends.Tensor.initFloat32(a, "input", &.{1}, &.{0});
+    defer input.deinit();
+    const actual = try loaded.session.run(&.{input}, a);
+    defer {
+        for (actual) |*tensor| tensor.deinit();
+        a.free(actual);
+    }
+    try std.testing.expectEqualSlices(f32, &.{96}, actual[0].asFloat32());
+}
