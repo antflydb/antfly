@@ -19,6 +19,11 @@ const std = @import("std");
 const A = std.mem.Allocator;
 pub const Key = [32]u8;
 pub const max_payload = 1024 * 1024;
+pub const max_token_bytes = 2 * max_payload + 4096;
+pub const max_lake_token_bytes = 16 * 1024;
+fn tokenLimit(kind: Kind) usize {
+    return if (kind == .lake) max_lake_token_bytes else max_token_bytes;
+}
 pub const Kind = enum { lake, composed };
 pub const Scope = struct { table_id: u64, object_generation: u64, owner: [16]u8 };
 const Envelope = struct { version: u8 = 1, issued_ms: u64, expires_ms: u64, payload: []const u8 };
@@ -32,20 +37,24 @@ fn signature(key: Key, bytes: []const u8) [32]u8 {
     return result;
 }
 pub fn seal(a: A, kind: Kind, scope: Scope, key: Key, payload: []const u8, now: u64, expires: u64) ![]const u8 {
-    if (payload.len == 0 or payload.len > max_payload or now == 0 or expires <= now or expires - now > std.time.ms_per_hour or scope.table_id == 0 or std.mem.allEqual(u8, &scope.owner, 0) or std.mem.allEqual(u8, &key, 0)) return error.InvalidQueryRequest;
+    if (payload.len == 0 or payload.len > max_payload or now == 0 or (expires > now and expires - now > std.time.ms_per_hour) or scope.table_id == 0 or std.mem.allEqual(u8, &scope.owner, 0) or std.mem.allEqual(u8, &key, 0)) return error.InvalidQueryRequest;
+    if (expires <= now) return error.DeadlineExceeded;
     const bytes = try std.json.Stringify.valueAlloc(a, Envelope{ .issued_ms = now, .expires_ms = expires, .payload = payload }, .{});
     defer a.free(bytes);
     const codec = std.base64.url_safe_no_pad;
-    const encoded = try a.alloc(u8, codec.Encoder.calcSize(bytes.len));
+    const encoded_size = codec.Encoder.calcSize(bytes.len);
+    if (encoded_size > tokenLimit(kind)) return error.QueryCandidateBudgetExceeded;
+    const encoded = try a.alloc(u8, encoded_size);
     defer a.free(encoded);
     _ = codec.Encoder.encode(encoded, bytes);
     const message = try std.fmt.allocPrint(a, "{s}{d}:{d}:{s}:{s}", .{ prefix(kind), scope.table_id, scope.object_generation, std.fmt.bytesToHex(&scope.owner, .lower), encoded });
     defer a.free(message);
+    if (message.len > tokenLimit(kind) - 65) return error.QueryCandidateBudgetExceeded;
     return std.fmt.allocPrint(a, "{s}:{s}", .{ message, std.fmt.bytesToHex(&signature(key, message), .lower) });
 }
 const Parts = struct { scope: Scope, message: []const u8, encoded: []const u8, mac: [32]u8 };
 fn parts(kind: Kind, token: []const u8) !Parts {
-    if (token.len > 2 * max_payload + 4096 or !std.mem.startsWith(u8, token, prefix(kind))) return error.InvalidQueryRequest;
+    if (token.len > tokenLimit(kind) or !std.mem.startsWith(u8, token, prefix(kind))) return error.InvalidQueryRequest;
     var fields = std.mem.splitScalar(u8, token[prefix(kind).len..], ':');
     const id = fields.next() orelse return error.InvalidQueryRequest;
     const generation = fields.next() orelse return error.InvalidQueryRequest;
@@ -103,4 +112,20 @@ test "owner capabilities preserve opaque bytes and fence signatures scope kind a
     tampered[tampered.len - 1] = if (tampered[tampered.len - 1] == '0') '1' else '0';
     try std.testing.expectError(error.InvalidQueryRequest, open(a, .composed, scope, key, tampered, 2000));
     try std.testing.expectError(error.InvalidQueryRequest, seal(a, .lake, scope, key, "payload", 1, std.time.ms_per_hour + 2));
+}
+
+test "owner capability encoder and decoder share encoded limits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const scope: Scope = .{ .table_id = 1, .object_generation = 1, .owner = @splat(1) };
+    const key: Key = @splat(2);
+    const payload = try a.alloc(u8, max_payload);
+    @memset(payload, 'a');
+    const token = try seal(a, .composed, scope, key, payload, 1, 1000);
+    try std.testing.expectEqualStrings(payload, (try open(a, .composed, scope, key, token, 2)).payload);
+    @memset(payload, '"');
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, seal(a, .composed, scope, key, payload, 1, 1000));
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, seal(a, .lake, scope, key, payload, 1, 1000));
+    try std.testing.expectError(error.DeadlineExceeded, seal(a, .composed, scope, key, "payload", 1000, 1000));
 }

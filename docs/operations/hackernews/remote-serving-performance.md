@@ -620,3 +620,58 @@ rc.10 measurements or a full-archive claim. The roughly 1.16-second GCS warm
 result still includes remote admission and continuation work; the proposed
 authoritative owner cuts, precomputed cursor references and broader warming
 remain planned work, not measured improvements in this candidate.
+
+
+### Native owner admission and reusable capabilities
+
+The follow-up candidate admits a compact serving cut through native metadata.
+A cut binds the table incarnation, owner epoch, desired index recipe, immutable
+publication, accepted WAL watermark and retained image references. The compact
+projection is updated in the same transaction as lifecycle authority and is
+included in native snapshot recovery. Older metadata peers use the existing
+linearizable lifecycle read until their compact projection endpoint is available.
+
+Enable `lake_indexes.serving_cuts.enabled` only after all writers and maintenance
+workers run a compatible release. Ownership is durable and remains enforced if
+that option is later disabled. Managed Iceberg catalog and WAL heads carry a
+conditional owner claim: writers that bypass native acknowledgment cannot
+silently change an owned source. A sealed Parquet manifest fixes archive
+membership and pins each object's generation or ETag. Mutable inventories and
+shared external REST catalogs retain strict remote authority checks.
+
+Publication and write-acceptance work constructs durable retained images before
+queries need them. Fresh owned reads admit their snapshot and WAL position from
+native authority, open captured metadata, and issue authenticated `lake3:` or
+`source3:` references without uploading cursor state. Queries use a read-only
+artifact store. Immutable cache misses still fetch remote blocks; this does not
+promise a zero-I/O cold request. A remote commit whose native acknowledgment is
+unconfirmed returns an unknown outcome and no read receipt. Producers retain and
+retry the exact request until native acknowledgment is confirmed.
+
+Capabilities authenticate kind, scope, incarnation, owner and expiry. Raw payloads
+are bounded to 1 MiB; composed encoded tokens to 2 MiB + 4096 bytes, and leaf tokens
+to 16 KiB. Encoding checks the same limits as decoding, including JSON escaping,
+before issuing a token. The HN gateway accepts opaque ASCII cursors in POST bodies
+within the composed limit and reserves capacity before reading the body.
+Legacy `source2:` and `lake2:` continuations remain supported.
+
+A retained physical suppression mask belongs to the prepared reader's arena,
+never a leaf's temporary arena. Prepared readers are limited to 16 entries and a
+64 MiB request budget. Object-store bindings are constructed at their final
+address before binding cloud generations. Bounded background warming uses the
+same authenticated caches and yields when the scheduler denies speculative work.
+
+Serving-cut renewal runs independently before WAL drain and publication work.
+Blocked warehouse writes must not prevent renewal over an existing publication
+and durable pending WAL. Increasing cursor retention also forces renewal rather
+than reusing a cut with an insufficient horizon. Old retained cursors continue
+to use their original protected generation and accepted watermark.
+
+Qualification must use the candidate binary, with matched owned/strict modes,
+nonempty pending replacements across restart, real GCS generations, both index
+selectors, and stored-source/Parquet hydration with highlights. First requests
+after restart, warm requests and requests after deleting the fixture's durable
+serving cache are different measurements. Clearing that cache does not flush the
+OS or provider caches. No earlier rc.10 or reader-sharing measurements establish
+the performance of native owner admission, and synthetic fixture results do not
+qualify the full Hacker News archive or the deployed Cloud service.

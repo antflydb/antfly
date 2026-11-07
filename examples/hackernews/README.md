@@ -1195,6 +1195,8 @@ current table uses managed Iceberg with immutable files. Accepted WAL positions,
 publication generations and retained image references live in native metadata.
 Queries issue signed `lake3:` and `source3:` capabilities to images built during
 publication/write acceptance, avoiding query-time cursor uploads for these cuts.
+The gateway transports opaque cursors in POST bodies, bounds them to the native
+encoded capability limit, and acquires capacity before reading a request body.
 If remote commitment succeeds but native acknowledgment is unconfirmed, the
 changes API returns `state: unknown` without a read receipt. The producer keeps
 its exact pending transaction and checkpoint for retry; it advances only after

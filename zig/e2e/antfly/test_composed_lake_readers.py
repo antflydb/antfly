@@ -71,6 +71,15 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
     assert 6 <= body_bytes <= 4096
     record_property("archive_rows", archive_rows)
     record_property("body_bytes", body_bytes)
+    switches = {
+        name: os.environ.get("ANTFLY_E2E_COMPOSED_" + name, default)
+        for name, default in (("HIGHLIGHTS", "0"), ("STORE_SOURCE", "1"))
+    }
+    assert all(value in {"0", "1"} for value in switches.values())
+    highlights = switches["HIGHLIGHTS"] == "1"
+    store_source = switches["STORE_SOURCE"] == "1"
+    record_property("highlights", highlights)
+    record_property("store_source", store_source)
 
     gcs_bucket = os.environ.get("ANTFLY_E2E_GCS_BUCKET")
     gcs_prefix = os.environ.get("ANTFLY_E2E_GCS_PREFIX")
@@ -236,6 +245,9 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                         if remote_source
                         else "object://antfly/sample.parquet",
                         "version_id": str(version) if remote_source else "",
+                        "etag": ""
+                        if remote_source
+                        else hashlib.sha256(data).hexdigest(),
                         "byte_len": len(data),
                         "row_count": archive_rows,
                     }
@@ -266,6 +278,16 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 else (archive / "sealed.parquet-manifest.json").as_uri()
             )
 
+        def assert_highlights(value):
+            if not highlights:
+                return
+            for hit in value.get("hits", {}).get("hits", []):
+                assert any(
+                    fragment["text"][span["start"] : span["end"]].lower() == "quasar"
+                    for fragment in hit["_highlights"]["body"]
+                    for span in fragment["spans"]
+                )
+
         def call(method, path, body=None, allow=()):
             nonlocal last_call_ms
             # GCS limits repeated updates to the same mutable coordination
@@ -283,8 +305,15 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             )
             last_call_ms = (time.monotonic() - request_started) * 1000
             assert r.ok or r.status_code in allow, r.text + server.debug_logs()
-            value = r.json() if r.content else {}
-            return r.status_code, value.get("responses", [value])[0]
+            try:
+                value = r.json() if r.content else {}
+            except requests.exceptions.JSONDecodeError:
+                assert not r.ok and r.status_code in allow, r.text
+                value = {"error": r.text}
+            value = value.get("responses", [value])[0]
+            if r.status_code == 200 and body and body.get("highlight"):
+                assert_highlights(value)
+            return r.status_code, value
 
         def wait_query(name, query):
             deadline = time.monotonic() + 120
@@ -321,53 +350,76 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 },
             ),
         ):
-            call(
-                "POST",
-                "/tables/" + name,
-                {
-                    "storage": {"engine": "object"},
-                    "schema": {
-                        "storage_mode": "relational",
-                        "default_type": "row",
-                        "enforce_types": True,
-                        "relational_indexes": [
-                            {"name": name + "_id", "keys": [{"column": "id"}]}
-                        ],
-                        "base_source": {
-                            "kind": "external",
-                            "table_id": name,
-                            "object_mutability": "immutable",
-                            "schema_fingerprint": "auto",
-                            **source,
-                        },
-                        "document_schemas": {
-                            "row": {
-                                "schema": {
-                                    "type": "object",
-                                    "additionalProperties": False,
-                                    "properties": {
-                                        "id": {
-                                            "type": "integer",
-                                            "x-antfly-field": {
-                                                "type": "number",
-                                                "sortable": True,
-                                            },
-                                        },
-                                        "body": {
-                                            "type": "string",
-                                            "x-antfly-field": {"type": "text"},
-                                        },
-                                        "deleted": {"type": "boolean"},
-                                    },
-                                }
-                            }
-                        },
+            table_request = {
+                "storage": {"engine": "object"},
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "row",
+                    "enforce_types": True,
+                    "relational_indexes": [
+                        {"name": name + "_id", "keys": [{"column": "id"}]}
+                    ],
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": name,
+                        "object_mutability": "immutable",
+                        "schema_fingerprint": "auto",
+                        **source,
                     },
-                    "indexes": {
-                        "body_text": {"type": "full_text", "store_source": True}
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "id": {
+                                        "type": "integer",
+                                        "x-antfly-field": {
+                                            "type": "number",
+                                            "sortable": True,
+                                        },
+                                    },
+                                    "body": {
+                                        "type": "string",
+                                        "x-antfly-field": {"type": "text"},
+                                    },
+                                    "deleted": {"type": "boolean"},
+                                },
+                            }
+                        }
                     },
                 },
-            )
+                "indexes": {
+                    "body_text": {"type": "full_text", "store_source": store_source}
+                },
+            }
+            if owned and provider == "local" and name == "history":
+                # An inventory without any immutable object identity must be
+                # rejected before publishing the table, with a client error.
+                invalid_files = json.loads(chunk)
+                invalid_files[0]["etag"] = ""
+                invalid_chunk = json.dumps(invalid_files).encode()
+                invalid_head = json.loads(head)
+                invalid_head["chunks"][0].update(
+                    sha256=hashlib.sha256(invalid_chunk).hexdigest(),
+                    byte_len=len(invalid_chunk),
+                )
+                try:
+                    write_object("files.json", invalid_chunk)
+                    write_object(
+                        "sealed.parquet-manifest.json",
+                        json.dumps(invalid_head).encode(),
+                    )
+                    status, _ = call(
+                        "POST", "/tables/history", table_request, allow=(400,)
+                    )
+                    assert status == 400
+                    status, _ = call("GET", "/tables/history", allow=(404,))
+                    assert status == 404
+                finally:
+                    write_object("files.json", chunk)
+                    write_object("sealed.parquet-manifest.json", head)
+            call("POST", "/tables/" + name, table_request)
         call(
             "POST",
             "/tables/current/lake/catalog",
@@ -406,6 +458,8 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             },
         )
         text = {"full_text_search": {"match": "quasar", "field": "body"}}
+        if highlights:
+            text["highlight"] = {"fields": ["body"]}
         if index_selector == "explicit":
             text["full_text_index"] = "body_text"
         wait_query("history", {**text, "limit": 1})
@@ -532,6 +586,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         if owned:
             # The state is already durable: a forged inline continuation must
             # fail authentication before any retained source can be selected.
+            record_property("fresh_cursor_bytes", len(first["next_source_cursor"]))
             original_cursor = first["next_source_cursor"]
             forged = original_cursor[:-1] + ("0" if original_cursor[-1] != "0" else "1")
             status, _ = call(
@@ -696,6 +751,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 )
                 value = response.json()
                 value = value.get("responses", [value])[0]
+                assert_highlights(value)
                 assert len(value["hits"]["hits"]) == 7
                 samples.append({"mode": "restart" if index == 0 else "warm", **usage})
             record_property("query_samples", json.dumps(samples))
@@ -714,6 +770,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                         f"Concurrent query failed: {response.status_code}"
                     )
                     result = response.json()["responses"][0]
+                    assert_highlights(result)
                     assert len(result["hits"]["hits"]) == 7
                     assert result["next_source_cursor"].startswith("source3:")
                     return (time.monotonic() - started) * 1000
@@ -746,6 +803,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 response.ok
                 and len(response.json()["responses"][0]["hits"]["hits"]) == 7
             )
+            assert_highlights(response.json()["responses"][0])
             record_property("cold_cache_query", json.dumps(usage))
             record_property(
                 "cold_cache_startup_and_query_ms",
