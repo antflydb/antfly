@@ -3472,6 +3472,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     time_series_tests.step.max_rss = 5 * 1024 * 1024 * 1024;
     b.step("time-series-test", "Verify fixed temporal buckets, bounds and empty measurements").dependOn(&b.addRunArtifact(time_series_tests).step);
+    const time_series_storage_tests = b.addTest(.{
+        .name = "time-series-storage-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{ "storage.ttl.", "storage.backup_codec.", "storage.portable_backup.", "storage.retained_effects.", "storage.document_mutation_revision.", "storage.db.maintenance.ttl_runtime." },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    time_series_storage_tests.step.max_rss = 5 * 1024 * 1024 * 1024;
+    b.step("time-series-storage-test", "Verify TTL metadata, retained replay, and portable archive compatibility").dependOn(&b.addRunArtifact(time_series_storage_tests).step);
     const time_series_runtime_tests = b.addTest(.{
         .name = "time-series-runtime-tests",
         .root_module = api_http_runtime_test_mod,
