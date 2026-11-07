@@ -222,27 +222,7 @@ pub const Policy = struct {
 /// another durable checkpoint. The first observation owns a deadline: later
 /// writes and runtime adoption must not postpone it. Capacity and checkpoint
 /// pressure bypass the delay; explicit maintenance never consults this policy.
-pub const RetirementBatch = struct {
-    pub const maximum_delay_ns = 25 * std.time.ns_per_ms;
-    first_pending_ns: ?i96 = null,
-
-    pub fn due(self: *@This(), now_ns: i96, objects: u64, work_budget: usize, pressure: bool) bool {
-        if (objects == 0 and !pressure) {
-            self.first_pending_ns = null;
-            return false;
-        }
-        if (self.first_pending_ns == null) self.first_pending_ns = now_ns;
-        return pressure or objects >= @max(@as(u64, 64), work_budget) or now_ns >= self.deadline().?;
-    }
-
-    pub fn deadline(self: RetirementBatch) ?i96 {
-        return if (self.first_pending_ns) |first| first +| maximum_delay_ns else null;
-    }
-
-    pub fn serviced(self: *@This()) void {
-        self.first_pending_ns = null;
-    }
-};
+pub const RetirementBatch = @import("../maintenance_batch.zig").Batch(100 * std.time.ns_per_ms, 64);
 
 test "lite reclamation batches residual retirement without postponing debt or pressure" {
     var batch: RetirementBatch = .{};

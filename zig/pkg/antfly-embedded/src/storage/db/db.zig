@@ -35019,7 +35019,7 @@ pub const DB = struct {
     }
 
     fn runBackgroundTurnWithState(self: *DB, cancellation: types.CancellationToken, phase: types.BackgroundMaintenancePhase, state: *GroupSourceMaintenanceState) !bool {
-        const split_retirement = phase == .replay or phase == .retirement;
+        const split_retirement = phase == .replay or phase == .retirement or phase == .retirement_batched;
         if (split_retirement) {
             // A foreground drain already owns file admission. Detached
             // replay may own this state while waiting to publish through that
@@ -35035,14 +35035,21 @@ pub const DB = struct {
             self.core.store.bounded_replay_retirement = old_bounded;
         };
         if (split_retirement) self.core.store.deferred_replay_retirement = &state.replay_retirement;
-        if (phase == .retirement) {
+        if (phase == .retirement or phase == .retirement_batched) {
             self.core.store.bounded_replay_retirement = true;
+            if (phase == .retirement_batched) {
+                const latest = self.core.store.lastReplaySequence(0);
+                const queued = @max(1, latest -| state.replay_retirement.sweep_bound);
+                const now = std.Io.Clock.awake.now(self.core.index_manager.checkpointIo()).nanoseconds;
+                if (!state.replay_retirement.batch.due(now, queued, 64, state.replay_retirement.bounded_continuation)) return true;
+            }
             // Output records may have no managed-index consumers. Discover
             // their eligible hint lanes even while the producer's source
             // watermark is zero and no executor callback has scheduled a cut.
             if (self.core.store.runtime_store.capabilities().bounded_replay_admission or
                 state.replay_retirement.watermark != 0 or state.replay_retirement.partial_pending)
                 try truncateReplaySequenceAsync(self.async_context, state.replay_retirement.watermark);
+            state.replay_retirement.batch.serviced();
             return state.replay_retirement.runnable;
         }
         if (phase == .artifacts or phase == .pressure_artifacts or phase == .index_storage) {

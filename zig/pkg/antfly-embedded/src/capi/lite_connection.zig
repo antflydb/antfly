@@ -3686,7 +3686,20 @@ pub const Owner = struct {
                     break :blk true;
                 };
                 defer leaveMaintenanceWriter(root);
-                break :blk database.runBackgroundTurnWithCancellation(cancellation, .retirement) catch |err| {
+                // Batch physical journal deletion independently of each source
+                // wake. A small/tight journal bypasses the delay before its
+                // durable admission budget can obstruct another producer.
+                const debt = store.file.replayAdmission() catch |err| {
+                    maintenance_error = err;
+                    maintenance_error_phase = .retirement;
+                    break :blk true;
+                };
+                const pressure = if (debt) |value|
+                    value.bytes >= @max(@as(u64, 1), @min(1024 * 1024, value.limits.bytes / 4)) or
+                        value.records >= @max(@as(u64, 1), @min(64, value.limits.records / 4))
+                else
+                    false;
+                break :blk database.runBackgroundTurnWithCancellation(cancellation, if (pressure) .retirement else .retirement_batched) catch |err| {
                     maintenance_error = err;
                     maintenance_error_phase = .retirement;
                     break :blk true;
@@ -9162,6 +9175,25 @@ test "capi native maintenance namespaces service new unindexed source generation
     }
     try std.testing.expectEqual(before + 1, owner.publication_stats.maintenance_database_turns);
     try std.testing.expectEqual(target, owner.maintenance_schedules.getPtr(key).?.serviced_sequence);
+    const source_turns = owner.publication_stats.maintenance_source_turns;
+    // Source progress schedules a bounded physical-retirement continuation;
+    // it need not delete each journal record in the source publication turn.
+    // Advance that continuation's clock without enabling the distant audit.
+    {
+        owner.gate.mutex.lockUncancelable(h.handleLockIo());
+        defer owner.gate.mutex.unlock(h.handleLockIo());
+        const state = try owner.groupSourceStateNamed(&owner.current.?.db, "default");
+        state.replay_retirement.batch.first_pending_ns = 0;
+        const pending = owner.maintenance_schedules.getPtr(key).?;
+        try std.testing.expect(pending.artifact_pending);
+        pending.next_artifact_ns = 0;
+    }
+    for (0..16) |_| {
+        _ = try owner.maintenanceTurnForTest();
+        const state = owner.maintenance_schedules.getPtr(key).?.group_sources.?;
+        if (state.replay_retirement.sweep_bound >= target) break;
+    }
+    try std.testing.expectEqual(source_turns, owner.publication_stats.maintenance_source_turns);
     var lease = try fixture.connection.acquire();
     defer {
         lease.close();
@@ -10451,7 +10483,25 @@ test "capi native retirement coalesces consumer lanes in one physical publicatio
         try batch.commit();
     }
     const before = file.activeCheckpoint().commit_sequence;
-    try store.truncateReplayUpTo(std.testing.allocator, 41);
+    const debt_before = (try file.replayAdmission()).?;
+    const state = try fixture.connection.owner.groupSourceState(&root.db);
+    const previous_state = root.db.borrowed_group_source_state;
+    root.db.borrowed_group_source_state = state;
+    defer root.db.borrowed_group_source_state = previous_state;
+    state.replay_retirement.watermark = 41;
+    state.replay_retirement.bounded_continuation = false;
+    state.replay_retirement.batch.first_pending_ns = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds + std.time.ns_per_min;
+    const deadline = state.replay_retirement.batch.deadline();
+    // Background notifications leave physical records and credits unchanged
+    // until a batch is due. Repeated visits do not renew the debt's age.
+    for (0..2) |_| {
+        try std.testing.expect(try root.db.runBackgroundTurnWithCancellation(.none, .retirement_batched));
+        try std.testing.expectEqual(before, file.activeCheckpoint().commit_sequence);
+        try std.testing.expectEqual(deadline, state.replay_retirement.batch.deadline());
+        try std.testing.expectEqualDeep(debt_before, (try file.replayAdmission()).?);
+    }
+    // Explicit draining and pressure service bypass coalescing immediately.
+    _ = try root.db.runBackgroundTurnWithCancellation(.none, .retirement);
     try std.testing.expectEqual(before + 1, file.activeCheckpoint().commit_sequence);
     try std.testing.expectError(error.NotFound, store.get(std.testing.allocator, &keys.replayEntryKey(keys.replay_all_kind, 41)));
     inline for (@typeInfo(journal.TargetHint).@"enum".field_values) |ordinal| {

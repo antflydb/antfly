@@ -5094,6 +5094,9 @@ pub const NativeFile = struct {
     /// Private rewrite images use their separately admitted workspace instead.
     reserve_retirement_capacity: bool = false,
     maintenance_publication: bool = false,
+    // Private namespace rebinding deliberately retires all checkpoint proofs
+    // before rewriting the allocator seal under the destination namespace.
+    rebinding_epoch_namespace: bool = false,
     /// Committed reclamation activity, independent of physical file growth.
     retirement_activity_bytes: u64 = 0,
     vacuum_workspace_limit: ?u64 = null,
@@ -12797,8 +12800,15 @@ pub const NativeFile = struct {
         if (self.checkpoint_publication_uncertain) return error.OutcomeReconciliationRequired;
         if (self.recovery_tail_pending and !try self.recoverUncommittedTail()) return error.FileBusy;
         const prove = self.header.indexed_reclamation and self.header.indexed_revision >= 15 and
-            !self.no_sync and !self.maintenance_publication and self.durable_header == null and
+            !self.no_sync and (!self.maintenance_publication or self.free_pages_verified) and self.durable_header == null and
+            !self.rebinding_epoch_namespace and
             !(builtin.is_test and self.test_force_two_barrier_commit);
+        // Verified physical maintenance has the same owned COW postimages as
+        // an authored transaction. Use the checked manifest protocol rather
+        // than adding a second durability domain for allocator housekeeping.
+        // An unverified maintenance owner must retain the conservative path:
+        // manifest allocation/sealing may neither force a graph proof under
+        // admission nor certify an unchecked allocator as trusted.
         if (prove) try self.settleDurableParent();
         self.transaction_allocator_loan = try self.enterWriterAllocator();
         self.clearTransactionPostimages();
@@ -13136,6 +13146,9 @@ pub const NativeFile = struct {
     /// changed when this private image acquired its final publication name.
     fn bindPrivateEpochNamespace(self: *NativeFile, destination_path: []const u8) !void {
         if (self.transaction_header != null or self.durable_header != null or self.checkpoint_publication_uncertain) return error.InvalidTransactionState;
+        std.debug.assert(!self.rebinding_epoch_namespace);
+        self.rebinding_epoch_namespace = true;
+        defer self.rebinding_epoch_namespace = false;
         // This inode is exclusively owned and unpublished. Retire the active
         // proof through the allocator, then remove the obsolete recovery slot
         // before changing the proof namespace or rewriting its sealed root.
@@ -24190,4 +24203,73 @@ test "lite native revision sixteen retains its exact signature and upgrades befo
     defer a.free(value);
     try std.testing.expectEqualStrings("revision sixteen payload", value);
     try std.testing.expect((try upgraded.check()).valid);
+}
+
+test "lite commit proof verified maintenance uses one sync and recovers a torn allocator postimage" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "maintenance-proof.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true });
+    defer file.close();
+    for (0..4) |sequence| {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("durable", &.{@as(u8, @intCast(sequence))});
+        try file.commitTransaction();
+    }
+    try std.testing.expect(file.free_pages_verified);
+    const before = file.activeCheckpoint();
+    const barriers = file.test_durability_syncs.load(.monotonic);
+    _ = try file.reclaimPagesForMaintenanceWithCancel(16, null);
+    const tip = file.activeCheckpoint();
+    try std.testing.expectEqual(@as(u64, 1), file.test_durability_syncs.load(.monotonic) - barriers);
+    try std.testing.expectEqualDeep(before.logical, tip.logical);
+    try std.testing.expect(tip.proof.root != 0);
+    try std.testing.expect((try file.verifyCheckpointProof(tip)).checked_pages > 0);
+    try std.testing.expect((try file.check()).valid);
+    try std.testing.expect(tip.free_map_root_page != before.free_map_root_page);
+    // A valid slot alone cannot authorize a lost maintenance postimage.
+    const zero: [2 * commit_proof.witness_size]u8 = @splat(0);
+    try file.file.writePositionalAll(io, &zero, durability_witnesses_offset);
+    const damaged = try file.readPageAllocForCheckpoint(a, tip.free_map_root_page, tip);
+    defer a.free(damaged);
+    damaged[damaged.len - 1] ^= 1;
+    try file.file.writePositionalAll(io, damaged, tip.free_map_root_page * file.header.page_size);
+    var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .no_sync = true });
+    defer reopened.close();
+    try std.testing.expectEqual(before.commit_sequence, reopened.activeCheckpoint().commit_sequence);
+    const kept = (try reopened.getDocumentAlloc(a, "durable")).?;
+    defer a.free(kept);
+    try std.testing.expectEqualSlices(u8, &.{3}, kept);
+}
+
+test "lite commit proof unverified maintenance preserves conservative barriers and cannot mint a certificate" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "unverified-maintenance-proof.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true });
+    defer file.close();
+    try file.beginTransaction();
+    errdefer file.abortTransaction();
+    try file.putDocument("durable", "kept");
+    try file.commitTransaction();
+    file.free_pages_verified = false;
+    const barriers = file.test_durability_syncs.load(.monotonic);
+    _ = try file.reclaimPagesForMaintenanceWithCancel(8, null);
+    try std.testing.expectEqual(@as(u64, 2), file.test_durability_syncs.load(.monotonic) - barriers);
+    try std.testing.expect(!file.free_pages_verified);
+    try std.testing.expectEqual(@as(u64, 0), file.activeCheckpoint().proof.root);
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true });
+    defer reader.close();
+    try std.testing.expect(!try reader.inheritAllocatorCertificate());
+    const kept = (try reader.getDocumentAlloc(a, "durable")).?;
+    defer a.free(kept);
+    try std.testing.expectEqualStrings("kept", kept);
+    try std.testing.expect((try reader.check()).valid);
 }

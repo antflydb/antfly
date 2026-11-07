@@ -71,7 +71,14 @@ and reports the actual output checkpoint and physical length.
 
 ## Scope and qualification
 
-Raw native writes, legacy formats, deferred durability, maintenance and collection
+Verified allocator maintenance uses the same checked postimage protocol and
+one-sync boundary. Unverified maintenance cannot acquire this capability merely
+by sealing a ledger: it retains the conservative barriers and does not mint a
+trusted allocator certificate. Private namespace rebinding suppresses proof
+collection while retiring old proofs and rewriting their namespace-bound seals.
+Torn maintenance postimages reject the new slot just as authored postimages do.
+
+Raw native writes, legacy formats, deferred durability and collection
 overflow retain the older data-before-checkpoint barriers. Existing revision 13
 and 14 files remain readable; writable owners migrate by generation replacement.
 This protocol does not itself combine separate primary and index publications.

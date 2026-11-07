@@ -525,3 +525,30 @@ fixture size but did not improve latency or background sync count. Primary-only
 writes also still generate frequent background syncs. Those physical publications
 need attribution and coalescing; this stage does not establish end-to-end performance
 qualification or complete SQL preparation integration.
+
+### Physical work coalescing and maintenance durability
+
+A current-candidate sync-stack diagnostic attributed extra background publications
+to journal deletion and allocator reclamation, including in primary-only writes.
+The owner now distinguishes an explicit retirement drain from a coalesced background
+turn. Notifications preserve the first debt's deadline. Record/byte pressure and
+an exhausted bounded scan budget bypass the delay; a final clean scan does not
+force another immediate publication. Source acknowledgement returns no credits.
+Deletion still uses the checked consumer bounds and returns physical credits only
+after its atomic batch commits. Allocator retirement shares the bounded work policy.
+
+Verified maintenance uses the existing checked postimage protocol, rather than
+forming a separate two-sync durability boundary. Unverified maintenance retains
+the conservative protocol, and private namespace rebinding explicitly suppresses
+new proof creation while dropping old proofs. Native regressions cover torn
+maintenance postimages, logical-identity preservation, unverified fallback and
+absence of an unearned allocator certificate.
+
+[The Debug receipt](physical-service-debug.json) records the full native gate,
+C API coverage and operation counts. For 128 writes, background syncs fell from
+110 to 25 without an index and from 129 to 66 with an index; foreground syncs
+remained 128. Telemetry and shared-host timing prevent a controlled latency claim.
+The indexed run still captured 95 background source turns, including roughly
+2.07 seconds constructing their snapshots. Removing redundant source/runtime
+construction and completing owned SQL preparation remain necessary before final
+end-to-end qualification.

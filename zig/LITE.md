@@ -1212,8 +1212,10 @@ Proof metadata has bounded retirement independent of logical-only readers.
 
 Manifest collection is limited to 16,384 physical pages and 64 MiB per transaction.
 Allocation failure or overflow disables this optimization rather than publishing
-an incomplete manifest. Raw writes, deferred durability, maintenance and overflow
-retain the data-before-checkpoint protocol. `no_sync` retains its weaker
+an incomplete manifest. Verified allocator maintenance uses the same checked
+one-sync protocol. Unverified maintenance, private namespace rebinding, raw
+writes, deferred durability and overflow retain the data-before-checkpoint
+protocol. `no_sync` retains its weaker
 contract and never publishes durability witnesses. Private snapshot and generation
 publication drop proofs before changing the file namespace or allocator seal.
 See [the native commit protocol](../docs/design/lite-performance/native-commit-proofs.md)

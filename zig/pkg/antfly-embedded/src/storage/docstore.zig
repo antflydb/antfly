@@ -457,8 +457,13 @@ pub const ReplayRetirement = struct {
     // Even a record copied into every lane must retire faster than bounded
     // replay creates journal debt once cleanup is outstanding.
     pub const record_cap = max_keys / (replay_hints.len + 1);
+    /// Owner-lifetime scheduling only; no credits or acknowledgements move here.
+    batch: @import("maintenance_batch.zig").Batch(100 * std.time.ns_per_ms, 64) = .{},
     watermark: u64 = 0,
     partial_pending: bool = false,
+    // An exhausted scan/commit budget needs another productive slice. Merely
+    // owing a final clean scan must not disable background coalescing.
+    bounded_continuation: bool = false,
     lane: usize = 0,
     clean_lanes: usize = 0,
     sweep_bound: u64 = 0,
@@ -3011,6 +3016,7 @@ pub const DocStore = struct {
     fn truncateReplaySliceWithBounds(self: *DocStore, alloc: Allocator, up_to_sequence: u64, bounds: [9]u64, state: *ReplayRetirement) !void {
         if (up_to_sequence == 0) {
             state.runnable = false;
+            state.bounded_continuation = false;
             return;
         }
         var lane = state.lane;
@@ -3131,6 +3137,7 @@ pub const DocStore = struct {
         state.sweep_bound = up_to_sequence;
         state.sweep_lane_bounds = bounds;
         state.canonical_after = canonical_after;
+        state.bounded_continuation = scan_incomplete or deletes.items.len == ReplayRetirement.max_keys;
         state.runnable = clean_lanes < replay_hints.len + 1;
         if (!state.runnable and up_to_sequence >= state.watermark) state.watermark = 0;
     }
