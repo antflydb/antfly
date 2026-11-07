@@ -69,6 +69,7 @@ const backend = @import("backend.zig");
 const connection = @import("connection.zig");
 const docstore = @import("docstore.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+const index_manager = @import("../db/catalog/index_manager.zig");
 
 pub const When = sim_io.When;
 pub const PowerLoss = sim_io.PowerLoss;
@@ -1088,4 +1089,193 @@ fn reportFailures(report: *const SweepReport) !void {
         );
     }
     return error.CrashConsistencyFailuresFound;
+}
+
+// ---------------------------------------------------------------------
+// Sustained full_index visibility regression
+// (docs/design/lite-performance/throughput-profile.md §6: a sustained
+// single-writer `sync_level: full_index` run eventually acknowledges a
+// write whose content never becomes searchable, even after reopen +
+// run_until_idle()). No crash is injected here -- this is not a crash-
+// consistency gap, it is a plain correctness gap under sustained load.
+// ---------------------------------------------------------------------
+
+/// Strict synchronous-visibility check: unlike `assertSearchable` (which
+/// tolerates `error.IndexRebuilding` while a background catch-up finishes
+/// after a crash-sweep reopen), a `sync_level: full_index` batch() must
+/// already have made `key` searchable for `marker` by the time it returns
+/// -- no retry, no backoff. A failure here means the ack lied.
+fn expectSearchableNow(handle: *DbHandle, allocator: Allocator, search_index: []const u8, search_field: []const u8, key: []const u8, marker: usize) !void {
+    var text_buf: [32]u8 = undefined;
+    const text = try std.fmt.bufPrint(&text_buf, "marker{d}", .{marker});
+    var result = try handle.db.search(allocator, .{
+        .index_name = search_index,
+        .full_text = .{ .match = .{ .field = search_field, .text = text } },
+        .limit = 10,
+    });
+    defer result.deinit();
+    for (result.hits) |hit| {
+        if (std.mem.eql(u8, hit.id, key)) return;
+    }
+    std.debug.print(
+        "sustained full_index visibility: acknowledged document not searchable key={s} marker={s} hits={d}\n",
+        .{ key, text, result.hits.len },
+    );
+    return error.SustainedFullIndexWriteNotVisible;
+}
+
+// docs/design/lite-performance/throughput-profile.md §6 repro, made
+// deterministic and fast: a small key set absorbs repeated overwrites (so
+// segment merge/compaction and journal retirement both run many times
+// over the course of the run, same as the production repro's 128-key
+// wraparound did over ~7,500 writes), and a lowered merge-policy override
+// (`max_segments_per_tier`) reaches that same merge/retirement machinery
+// in a few thousand writes instead of ~7,500.
+//
+// Every write uses `sync_level: full_index`, whose contract is: the
+// acknowledged write is searchable with no further catch-up needed. This
+// test checks that contract at a sample of writes along the way (every
+// write would make a Debug run too slow) and, more importantly, for every
+// key's *final* write after a full close + reopen + run_until_idle() --
+// exactly the point the production repro's verification failed at.
+test "sustained full_index single writer keeps every acknowledged write searchable after reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    index_manager.setBenchmarkTextMergePolicyOverride(.{
+        .max_segments_per_tier = 3,
+        .max_segment_size = 5 * 1024 * 1024 * 1024,
+        .floor_segment_size = 0,
+    });
+    defer index_manager.setBenchmarkTextMergePolicyOverride(null);
+
+    const key_count = 4;
+    const total_writes = 4000;
+
+    var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+    defer handle.close();
+
+    var latest_marker: [key_count]usize = @splat(0);
+    var key_buf: [32]u8 = undefined;
+    var value_buf: [256]u8 = undefined;
+
+    var i: usize = 0;
+    while (i < total_writes) : (i += 1) {
+        const slot = i % key_count;
+        const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{slot});
+        const value = try std.fmt.bufPrint(&value_buf, "{{\"body\":\"marker{d} churn alpha beta gamma delta\"}}", .{i});
+        try handle.db.batch(.{ .writes = &.{.{ .key = key, .value = value }}, .sync_level = .full_index });
+        latest_marker[slot] = i;
+
+        if (i % 97 == 0 or i + 1 == total_writes) {
+            try expectSearchableNow(&handle, allocator, "body_text", "body", key, i);
+        }
+
+        // In production this runs automatically, once per maintenance tick,
+        // from the Owner/pool layer this low-level DB harness bypasses
+        // (capi/lite_connection.zig around `store.serviceRetirement`, demand-
+        // gated on the watermark `DocStore.requestRetirement` raises on every
+        // ack). Drive it explicitly here so this test still exercises WS5
+        // retirement running concurrently with sustained full_index writes
+        // and segment merges, the combination the production repro needed.
+        if (i % 29 == 0) try runRetirementTurn(allocator, &handle);
+    }
+
+    handle.close();
+    handle = try openDbWithIo(allocator, path, std.testing.io, false);
+    try handle.db.runUntilIdle();
+
+    for (0..key_count) |slot| {
+        var reopen_key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&reopen_key_buf, "doc-{d}", .{slot});
+        try expectSearchableNow(&handle, allocator, "body_text", "body", key, latest_marker[slot]);
+    }
+}
+
+// docs/design/lite-performance/throughput-profile.md §6 root cause, isolated
+// at the lowest level: a ride-along commit
+// (`NativeFile.commitTransactionWithDurability(false)`, the primitive
+// behind a background text-segment merge's catalog update
+// (`persistent.zig`'s `replaceSegmentsWithReservedIdOwned`,
+// `txn.setDurable(false)`), a WS5 retirement turn
+// (`DocStore.serviceRetirement` -> `commitRideAlong`), and a deferred
+// progress-v2 record (`apply_state.contributeProgressDeferred`)) stages and
+// physically writes its pages (`flushTransactionWrites` runs regardless of
+// `durable`), but deliberately withholds publishing a new checkpoint slot
+// (`commitTransactionWithDurability`'s `deferred_publication` branch: "Keep
+// the last durable checkpoint slots intact until an explicit durability
+// barrier"). Reopening from disk always resolves to the last *published*
+// checkpoint, so that write is invisible after a reopen -- not only after a
+// crash, but after a perfectly ordinary close, unless something publishes
+// it first: either a later durable commit on the same file (how ride-along
+// normally "becomes durable for free", per `Store.commitRideAlong`'s doc
+// comment), or an explicit durability barrier (`NativeFile.sync()`, which
+// `Store.syncIndexContents()` exposes). `capi/lite_connection.zig`'s
+// `Owner.deinit()` is the one real place that was missing that barrier: it
+// closed its own still-current, still-authoritative generation through the
+// `lease_snapshot`/`DB.closeImmutableSnapshot()` path meant for a
+// generation already superseded by a newer one (which never needs its own
+// pending work published, since a newer durable generation already exists),
+// silently discarding whatever was still riding along -- the fix added
+// there (`Store.syncIndexContents()` before close) is exactly the missing
+// barrier this test demonstrates is necessary.
+test "a ride-along commit needs an explicit durability barrier before close, or it is lost" {
+    const allocator = std.testing.allocator;
+
+    // Scenario A: close with no barrier after the ride-along commit. The
+    // commit itself returned success (this is the acknowledged-but-lost
+    // shape of the bug, not a crash scenario), but it never becomes
+    // recoverable.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/no-barrier.aflite", .{tmp.sub_path});
+        defer allocator.free(path);
+
+        var file = try native.NativeFile.createWithIo(allocator, std.testing.io, path, .{});
+        try file.putDocument("seed", "seed-value");
+        try file.beginTransaction();
+        try file.putDocument("ride-along-doc", "ride-along-value");
+        try file.commitTransactionWithDurability(false);
+        try std.testing.expect(file.durable_header != null);
+        file.close();
+
+        var reopened = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{});
+        defer reopened.close();
+        const seed = try reopened.getDocumentAlloc(allocator, "seed");
+        defer if (seed) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualStrings("seed-value", seed orelse return error.TestExpectedEqual);
+        const lost = try reopened.getDocumentAlloc(allocator, "ride-along-doc");
+        defer if (lost) |bytes| allocator.free(bytes);
+        try std.testing.expect(lost == null);
+    }
+
+    // Scenario B: the identical ride-along commit, but with an explicit
+    // `file.sync()` -- what `Store.syncIndexContents()` and the
+    // `Owner.deinit()` fix call -- before close. Recovered after reopen.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/with-barrier.aflite", .{tmp.sub_path});
+        defer allocator.free(path);
+
+        var file = try native.NativeFile.createWithIo(allocator, std.testing.io, path, .{});
+        try file.putDocument("seed", "seed-value");
+        try file.beginTransaction();
+        try file.putDocument("ride-along-doc", "ride-along-value");
+        try file.commitTransactionWithDurability(false);
+        try std.testing.expect(file.durable_header != null);
+        try file.sync();
+        try std.testing.expect(file.durable_header == null);
+        file.close();
+
+        var reopened = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{});
+        defer reopened.close();
+        const recovered = try reopened.getDocumentAlloc(allocator, "ride-along-doc");
+        defer if (recovered) |bytes| allocator.free(bytes);
+        try std.testing.expectEqualStrings("ride-along-value", recovered orelse return error.TestExpectedEqual);
+    }
 }
