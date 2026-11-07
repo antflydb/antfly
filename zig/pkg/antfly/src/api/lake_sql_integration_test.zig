@@ -180,6 +180,22 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
     const Source = struct {
         fixture: Fixture,
         table: [1]table_manager.TableRecord,
+        lifecycle_arena: std.heap.ArenaAllocator = .init(std.testing.allocator),
+        lifecycle_rows: std.AutoHashMapUnmanaged(u64, []const u8) = .empty,
+        fn lifecycleRead(raw: *anyopaque, alloc: std.mem.Allocator, table: u64, context: operation.RequestContext) ![]u8 {
+            try context.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return alloc.dupe(u8, self.lifecycle_rows.get(table) orelse "{}");
+        }
+        fn lifecycleMutate(raw: *anyopaque, table: u64, revision: u64, mutation: @import("../metadata/lake_index_lifecycle.zig").Mutation, context: operation.RequestContext) !void {
+            try context.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const lifecycle = @import("../metadata/lake_index_lifecycle.zig");
+            const owned = self.lifecycle_arena.allocator();
+            const before = try lifecycle.parse(owned, self.lifecycle_rows.get(table) orelse "{}");
+            if (before.revision != revision) return error.CatalogGenerationChanged;
+            try self.lifecycle_rows.put(owned, table, try lifecycle.encode(owned, try mutation.apply(owned, before)));
+        }
         fn snapshot(raw: *anyopaque, context: operation.RequestContext) !?metadata_api.AdminSnapshot {
             try context.ensureActive();
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -220,9 +236,10 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
     const schema_json = try std.json.Stringify.valueAlloc(a, schema.value, .{});
     var source: Source = .{ .fixture = .{ .lake_schema = schema_json }, .table = .{.{ .table_id = 7, .name = "events", .schema_json = schema_json, .indexes_json = "{}" }} };
     defer a.free(source.table[0].schema_json);
+    defer source.lifecycle_arena.deinit();
     var backend = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{});
     defer backend.deinit();
-    var server = server_mod.ApiHttpServer.init(a, .{ .node_config = &config, .backend_runtime = backend.ptr(), .deployment_mode = .standalone, .native_lake_artifact_base_dir = directory.path() }, .{ .ptr = &source, .vtable = &.{ .status = undefined, .linearizable_snapshot = Source.snapshot, .admin_snapshot = Source.admin, .free_admin_snapshot = Source.free, .replace_table_definition = Source.replace, .system_catalog = Source.catalog, .supports_query_definitions = true } }, .{ .ptr = &source, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } }, null);
+    var server = server_mod.ApiHttpServer.init(a, .{ .node_config = &config, .backend_runtime = backend.ptr(), .deployment_mode = .standalone, .native_lake_artifact_base_dir = directory.path(), .lake_artifact_gc_enabled = false }, .{ .ptr = &source, .vtable = &.{ .status = undefined, .linearizable_snapshot = Source.snapshot, .admin_snapshot = Source.admin, .free_admin_snapshot = Source.free, .replace_table_definition = Source.replace, .system_catalog = Source.catalog, .get_lake_index_lifecycle = Source.lifecycleRead, .mutate_lake_index_lifecycle = Source.lifecycleMutate, .supports_query_definitions = true } }, .{ .ptr = &source, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } }, null);
     defer server.deinit();
     // Keep publication deterministic while retaining runtime-backed reads.
     // This fixture invokes the production reconciliation path explicitly.

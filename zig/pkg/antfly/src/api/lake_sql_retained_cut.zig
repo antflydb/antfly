@@ -187,7 +187,7 @@ fn publishDistributed(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, i
     root.paged = .{ .count = @intCast(normalized.pending.changes.len), .bytes = encoded_len, .changes = changes.items, .keys = keys.items, .key_bytes = 32, .bloom = try savePage(a, store, identity, io, descriptor, bloom, cancellation) };
     return .{ .token = try save(a, store, identity, io, root, cancellation), .rows = normalized.pending.changes.len, .bytes = encoded_len, .paged = true };
 }
-fn domain(table: u64, identity: [32]u8) [32]u8 {
+pub fn domain(table: u64, identity: [32]u8) [32]u8 {
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("accepted-sql-transaction-cut-v1");
     hash.update(&identity);

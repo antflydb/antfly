@@ -3680,6 +3680,35 @@ test "relation mutation admission projects naming capability without materializi
 }
 
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    var required = transitionBaseDecoderVersion(command);
+    switch (command) {
+        .upsert_table => |table| required = @max(required, tableDecoderVersion(table)),
+        .compare_and_replace_table => |cas| required = @max(required, @max(tableDecoderVersion(cas.expected), tableDecoderVersion(cas.replacement))),
+        .apply_table_topology => |mutation| switch (mutation) {
+            .create => |create| required = @max(required, tableDecoderVersion(create.table)),
+            .drop => {},
+        },
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| {
+            for (delta.upsert_tables) |table| required = @max(required, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+        },
+        else => {},
+    }
+    return required;
+}
+
+// Table features compose: adding a lower-floor feature must never mask a
+// higher decoder requirement, including the prior definition in a CAS.
+fn tableDecoderVersion(table: metadata_table_manager.TableRecord) u16 {
+    var required: u16 = 0;
+    if (table.storage.engine == .object) required = @max(required, metadata_topology_protocol.object_table_engine_version);
+    if (table.lake_index_catalog_json.len != 0) required = @max(required, metadata_topology_protocol.lake_index_catalog_version);
+    if (metadata_topology_protocol.usesPrivacy(table.indexes_json)) required = @max(required, metadata_topology_protocol.privacy_version);
+    if (metadata_topology_protocol.usesResolverRecords(table.indexes_json)) required = @max(required, metadata_topology_protocol.resolver_records_version);
+    if (metadata_topology_protocol.usesResolverNamespaces(table.indexes_json)) required = @max(required, metadata_topology_protocol.resolver_namespaces_version);
+    return required;
+}
+
+fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
     if (command == .promote_sql_extension_default) return metadata_topology_protocol.sql_extension_version;
     if (command == .upsert_extension_package and command.upsert_extension_package.sql != null) return metadata_topology_protocol.sql_extension_version;
     if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlExtension(command.apply_system_catalog)) return metadata_topology_protocol.sql_extension_version;
@@ -3687,6 +3716,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         const request = command.create_restore_job_with_staging;
         if (@import("schema_reader_wire.zig").requiresSqlTruncatePreparation(request.value, request.plan_json)) return metadata_topology_protocol.sql_truncate_preparation_version;
     }
+
     if (command == .compare_and_set_job_state) return if (std.mem.startsWith(u8, command.compare_and_set_job_state.key, "privacy/")) metadata_topology_protocol.privacy_version else metadata_topology_protocol.job_state_version;
     const paired = switch (command) {
         .apply_system_catalog, .apply_sql_policy_publication => |bytes| @import("schema_reader_wire.zig").requiresCoupledSchemaPolicy(bytes),
@@ -25011,4 +25041,17 @@ test "SQL extension catalog decoder gate protects raw commands and package contr
     var unchanged = package;
     unchanged.sql = null;
     try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .upsert_extension_package = unchanged }));
+}
+
+test "metadata.lake combined table features retain the highest decoder floor" {
+    const protocol = metadata_topology_protocol;
+    for ([_][]const u8{ "{}", "{\"resolvers\":{}}", "{\"_resolver_record_store\":{}}", "{\"_privacy\":{}}" }) |indexes| {
+        var table: metadata_table_manager.TableRecord = .{ .table_id = 9, .name = "objects", .storage = .{ .engine = .object }, .min_ranges = 0, .desired_replica_count = 0, .lake_index_catalog_json = "{\"version\":1}", .indexes_json = indexes };
+        try std.testing.expectEqual(protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+        try std.testing.expectEqual(protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_table_topology = .{ .create = .{ .table = table, .ranges = &.{}, .expected_transition_generation = 0 } } }));
+        try std.testing.expectEqual(protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } }));
+        const before = table;
+        table.lake_index_catalog_json = "";
+        try std.testing.expectEqual(protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = before, .replacement = table } }));
+    }
 }

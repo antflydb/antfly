@@ -13622,6 +13622,7 @@ pub const TransitionCommand = union(enum) {
     pub fn deinit(self: *TransitionCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .apply_schema_validation => |bytes| alloc.free(bytes),
+            .mutate_lake_index_lifecycle => |*command| command.mutation.deinitOwned(alloc),
             .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
             .apply_sql_relation_boot, .apply_sql_completion_reference, .apply_table_retirement, .apply_scope_retirement, .apply_sql_graph_preparation, .apply_sql_lock_scope, .apply_sql_prepared_transaction, .apply_resolver_authority, .apply_sql_sequence_counter, .complete_relational_index_source, .accept_relational_index_delivery, .ack_relational_index_publication, .begin_relational_index_publication, .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
@@ -13817,7 +13818,11 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             }
         },
         .mutate_lake_index_lifecycle => |mutation| {
-            if (mutation.table_id == 0) return error.InvalidTableId;
+            // Row zero owns composed-query artifacts without a logical table.
+            if (mutation.table_id == 0) switch (mutation.mutation) {
+                .retain_query_store, .query_gc_progress => {},
+                else => return error.InvalidTableId,
+            };
         },
         .remove_table => |record| {
             if (record.table_id == 0) return error.InvalidTableId;
@@ -30894,6 +30899,7 @@ pub const RaftApplyStore = struct {
         var buffer: [160]u8 = undefined;
         return self.store.get(a, try lakeIndexLifecycleKeyForGroup(&buffer, group_id, table_id)) catch |err| switch (err) {
             error.NotFound => blk: {
+                if (table_id == 0) break :blk try @import("../lake_index_lifecycle.zig").encode(a, .{});
                 const table = (try self.getTable(a, group_id, table_id)) orelse return error.TableNotFound;
                 defer metadata_table_manager.freeTable(a, table);
                 var arena = std.heap.ArenaAllocator.init(a);
@@ -30927,6 +30933,7 @@ pub const RaftApplyStore = struct {
         var buffer: [160]u8 = undefined;
         const bytes = try stagingGet(txn, try lakeIndexLifecycleKeyForGroup(&buffer, group_id, table_id));
         if (bytes) |encoded| return @import("../lake_index_lifecycle.zig").parse(a, encoded);
+        if (table_id == 0) return .{};
         var table_buffer: [160]u8 = undefined;
         const table_bytes = (try stagingGet(txn, try tableKeyForGroup(&table_buffer, group_id, table_id))) orelse return error.TableNotFound;
         const table = try decodeTableRecord(a, table_bytes);
@@ -54319,6 +54326,12 @@ fn readRelationMutationGuard(alloc: std.mem.Allocator, encoded: []const u8, pos:
 fn readJsonRecord(comptime T: type, alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !T {
     const json = try readRequiredString(alloc, encoded, pos);
     defer alloc.free(json);
+    if (T == @import("../lake_index_lifecycle.zig").Mutation) {
+        // Parse errors and OOM must unwind partially decoded strings too.
+        var parsed = try std.json.parseFromSlice(T, alloc, json, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        return parsed.value.cloneOwned(alloc);
+    }
     var value = try std.json.parseFromSliceLeaky(T, alloc, json, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     errdefer deinitExtensionJsonRecord(T, alloc, &value);
     if (@hasDecl(T, "validate")) try value.validate();
@@ -78413,4 +78426,32 @@ fn verifySqlExtensionControlsCheckpointTxn(alloc: std.mem.Allocator, txn: *docst
         const auxiliary = try std.json.parseFromSliceLeaky(RaftApplyStore.StandaloneCatalogAuxiliary, a, bytes, .{ .ignore_unknown_fields = true });
         try (extension_domain.sql_package.Registry{ .packages = auxiliary.extension_packages, .controls = auxiliary.sql_extension_controls }).validateControls();
     }
+}
+
+test "metadata.lake query-only ownership reserves global row without a table" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const lifecycle = @import("../lake_index_lifecycle.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/query-global-authority", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const before = try lifecycle.parse(ca, try store.getLakeIndexLifecycle(ca, 22, 0));
+    const command: TransitionCommand = .{ .mutate_lake_index_lifecycle = .{ .table_id = 0, .expected_revision = before.revision, .mutation = .{ .retain_query_store = .{ .binding = .{ .identity = @splat(4), .locator = .{ .protocol = .filesystem, .bucket = "indexes", .prefix = "", .root = "/artifacts" } }, .until_ms = 100 } } } };
+    const encoded = try encodeTransitionCommand(ca, command);
+    var decoded = (try decodeTransitionCommand(a, encoded)).?;
+    defer decoded.deinit(a);
+    try store.applyStandaloneCommand(22, decoded);
+    const work = try std.json.parseFromSliceLeaky(lifecycle.WorkPage, ca, try store.lakeIndexLifecycleWork(ca, 22, null), .{});
+    try std.testing.expectEqual(@as(u64, 0), work.item.?.table_id);
+    try std.testing.expectEqual(@as(u64, 100), work.item.?.state.stores[0].query_until_ms);
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, 22);
+    defer a.free(snapshot);
+    try RaftApplyStore.installSnapshotFromRaft(&store, a, 22, 10, snapshot);
+    const restored = try lifecycle.parse(ca, try store.getLakeIndexLifecycle(ca, 22, 0));
+    try std.testing.expectEqual(@as(u64, 100), restored.stores[0].query_until_ms);
 }

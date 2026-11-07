@@ -169,7 +169,11 @@ const std = @import("std");
 // describe its development sequence before this rebasing. Published transition
 // tag 81 remains SQL completion references; private SQL tags begin at 82.
 pub const sql_extension_version: u16 = 178;
-pub const current_version: u16 = sql_extension_version;
+/// Main's published v83 owns durable query-artifact stores and their
+/// restartable cleanup frontier, including the composed-cursor row. This
+/// branch's earlier v83 and complete v178 SQL decoder do not decode that work.
+/// Require the unified v179 profile before admitting either ownership cut.
+pub const current_version: u16 = 179;
 /// Immutable, pre-executed statement trigger receipts/results on SQL TRUNCATE.
 pub const sql_truncate_preparation_version: u16 = 177;
 /// Atomically acknowledged trigger-schema and active row-policy pairs.
@@ -319,7 +323,8 @@ pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;
 pub const object_table_engine_version: u16 = 30;
-pub const lake_index_catalog_version: u16 = 29;
+/// Unified main-v83 query-artifact ownership/cleanup plus complete SQL profile.
+pub const lake_index_catalog_version: u16 = 179;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.

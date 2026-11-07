@@ -215,6 +215,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_routine_run = addFilteredTestRunArtifact(b, sql_routine_tests);
     sql_routine_run.addArg("--require-no-skips");
     b.step("antfly-metadata-sql-routine-test", "Verify callable overloads, native publication and bounded catalog outcome recovery").dependOn(&sql_routine_run.step);
+    const query_artifact_tests = b.addTest(.{
+        .name = "metadata-query-artifact-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{ "metadata.lake", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-metadata-query-artifacts-test", "Verify query store ownership codecs and metadata snapshot recovery")
+        .dependOn(&addFilteredTestRunArtifact(b, query_artifact_tests).step);
     const online_merge_driver_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "metadata.online_merge_driver.", "metadata module compiles" },
