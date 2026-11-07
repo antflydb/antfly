@@ -28878,6 +28878,67 @@ pub const IndexManager = struct {
         return false;
     }
 
+    /// WS4-for-graph (lite-single-commit-write-path.md §3.3a): whether
+    /// `write` (already matched to `entry` by `index_name`) is eligible for
+    /// the mutation_materialization.zig `prepareInlineGraphPublication`
+    /// fast path, which calls `entry.index.prepareInlineEdgePublication`
+    /// directly and therefore bypasses every `IndexManager`-layer side
+    /// effect `applyGraphMutationsEntryMode` would otherwise apply for this
+    /// write: the shard range check (`keyInRange`), TTL lifetime/tombstone
+    /// bookkeeping, and contributor-snapshot maintenance
+    /// (`appendGraphContributionSnapshot`/`replaceContributionSnapshots`,
+    /// gated there on `entry.ttl_duration_ns != 0 or
+    /// graphEntryHasContributors(entry)` -- exactly mirrored below). A
+    /// caller must fall back to `applyGraphMutationsByName` (the normal,
+    /// slow path) whenever this returns `false`; it must never skip the
+    /// write outright, since `false` can mean either "out of this shard's
+    /// range" (a legitimate skip there) or "needs bookkeeping this fast
+    /// path cannot replicate" (not a skip -- still needs applying, just not
+    /// inline).
+    pub fn graphEdgeWriteEligibleForInlinePublication(self: *const IndexManager, entry: *const GraphIndex, write: types.GraphEdgeWrite) bool {
+        if (entry.ttl_duration_ns != 0 or graphEntryHasContributors(entry)) return false;
+        if (write.owner.len != 0 or write.owner_document.len != 0) return false;
+        const range_key = if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source;
+        return self.keyInRange(range_key);
+    }
+
+    test "graphEdgeWriteEligibleForInlinePublication rejects TTL, contributors and owner-bearing writes" {
+        const alloc = std.testing.allocator;
+        var manager = try IndexManager.init(alloc, ".");
+        defer manager.deinit();
+
+        var plain_mutex: std.atomic.Mutex = .unlocked;
+        var plain_entry: GraphIndex = .{
+            .apply_mutex = &plain_mutex,
+            .config = .{ .name = "gr", .kind = .graph, .config_json = "{}" },
+            .edge_type_configs = &.{},
+            .metric_configs = &.{},
+            .rebuild_root_path = &.{},
+            .index = undefined,
+        };
+        const plain_write: types.GraphEdgeWrite = .{ .index_name = "gr", .source = "a", .target = "b", .edge_type = "links" };
+        try std.testing.expect(manager.graphEdgeWriteEligibleForInlinePublication(&plain_entry, plain_write));
+
+        const owner_write: types.GraphEdgeWrite = .{ .index_name = "gr", .source = "a", .target = "b", .edge_type = "links", .owner = "doc:1" };
+        try std.testing.expect(!manager.graphEdgeWriteEligibleForInlinePublication(&plain_entry, owner_write));
+
+        const owner_document_write: types.GraphEdgeWrite = .{ .index_name = "gr", .source = "a", .target = "b", .edge_type = "links", .owner_document = "doc:1" };
+        try std.testing.expect(!manager.graphEdgeWriteEligibleForInlinePublication(&plain_entry, owner_document_write));
+
+        var ttl_entry = plain_entry;
+        ttl_entry.ttl_duration_ns = 1;
+        try std.testing.expect(!manager.graphEdgeWriteEligibleForInlinePublication(&ttl_entry, plain_write));
+
+        var artifact_entry = plain_entry;
+        artifact_entry.artifact_sources = @constCast(&[_]GraphArtifactSource{undefined})[0..1];
+        try std.testing.expect(!manager.graphEdgeWriteEligibleForInlinePublication(&artifact_entry, plain_write));
+
+        var field_edge_types = [_]graph_mod.EdgeTypeConfig{.{ .name = "links", .field_name = "edges" }};
+        var field_entry = plain_entry;
+        field_entry.edge_type_configs = field_edge_types[0..];
+        try std.testing.expect(!manager.graphEdgeWriteEligibleForInlinePublication(&field_entry, plain_write));
+    }
+
     /// Older non-TTL projections did not retain contributor order. Populate
     /// it before publishing the opened index, using bounded per-artifact
     /// scratch space. Interrupted opens repeat this idempotent scan; the

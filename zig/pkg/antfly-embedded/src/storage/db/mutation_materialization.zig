@@ -3692,6 +3692,148 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return result;
         }
 
+        /// lite-single-commit-write-path.md §3.3a's graph extension of WS4
+        /// phase 2: a prepared single-edge inline publication, mirroring
+        /// `InlineTextPublication` but wrapping
+        /// `graph_mod.GraphIndex.InlineEdgePublication` (already built and
+        /// unit-tested in graph.zig) instead of building its own staged
+        /// mutations. Holds this graph index's apply guard from prepare
+        /// through `install`/`abort`, serializing against every other
+        /// writer of this index for the whole window -- same deliberate
+        /// concurrency trade as text's apply guard.
+        ///
+        /// Deliberately does NOT also take `IndexManager.
+        /// beginGraphSourceReplay`/`beginGraphPrimaryMutation`'s shared
+        /// `graph_primary_publication` lease the way
+        /// `applyDerivedBatchToIndexContextProfiled`'s own `.graph` branch
+        /// does: `prepareInlineGraphPublication`'s only caller
+        /// (`mutation_commit.zig`'s `batchInternalPreparedOwned`) already
+        /// runs inside that SAME function's own EXCLUSIVE
+        /// `beginGraphPrimaryMutation` lease at the point it calls
+        /// `prepareInlineGraphPublication` (acquired near the top of that
+        /// function, released only after the primary write is staged --
+        /// well after this type's own `prepare`, but before its `install`/
+        /// `abort`). A second, shared acquisition from the SAME thread
+        /// while that exclusive one is still held would deadlock (`std.
+        /// atomic.Mutex`-backed RW locks are not reentrant); the window
+        /// after that release, through `install`/`abort`, is covered by
+        /// `apply_guard` alone, exactly like `InlineTextPublication`, which
+        /// has no equivalent broader lease at all.
+        pub const InlineGraphPublication = struct {
+            alloc: Allocator,
+            entry: *index_manager_mod.IndexManager.GraphIndex,
+            apply_guard: index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+            publication: graph_mod.GraphIndex.InlineEdgePublication,
+            forward_scope: []const u8,
+            reverse_scope: []const u8,
+            progress: apply_state.Progress,
+
+            fn reset(_: *anyopaque) void {}
+            fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
+            fn stage(ptr: *anyopaque, view: commit_participant.View, _: []const u8) anyerror!void {
+                const self: *InlineGraphPublication = @ptrCast(@alignCast(ptr));
+                const forward_mutations = self.publication.forwardMutations();
+                if (forward_mutations.len != 0) try view.putIndexCatalog(self.forward_scope, forward_mutations);
+                const reverse_mutations = self.publication.reverseMutations();
+                if (reverse_mutations.len != 0) try view.putIndexCatalog(self.reverse_scope, reverse_mutations);
+                try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            /// Call only once the host transaction's commit has actually
+            /// returned successfully (see `InlineTextPublication.install`'s
+            /// identical warning).
+            pub fn participant(self: *InlineGraphPublication) commit_participant.Participant {
+                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+            }
+
+            pub fn install(self: *InlineGraphPublication) void {
+                std.debug.assert(self.apply_guard.locked());
+                self.entry.index.installInlineEdgePublication(&self.publication) catch |err| {
+                    std.log.err("inline graph publication install: mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+                };
+                // Matches `applyGraphMutationsEntryMode`'s own
+                // `entry.invalidateNeighborSource()` call whenever a write
+                // actually lands -- purely in-memory bookkeeping (not part
+                // of `publication`'s durable mutations), safe to run here
+                // unconditionally since this type only ever represents
+                // exactly one edge write.
+                self.entry.invalidateNeighborSource();
+                self.apply_guard.unlock();
+                self.alloc.destroy(self);
+            }
+
+            pub fn abort(self: *InlineGraphPublication) void {
+                std.debug.assert(self.apply_guard.locked());
+                self.publication.abort();
+                self.apply_guard.unlock();
+                self.alloc.destroy(self);
+            }
+        };
+
+        /// WS4-for-graph fast path: prepares one managed graph index's
+        /// single-edge inline publication. Returns
+        /// `error.InlineGraphPublicationUnsupported` for every case outside
+        /// `graph_mod.GraphIndex.prepareInlineEdgePublication`'s own narrow
+        /// scope (owner/owner_document set, TTL, metrics, non-
+        /// `.native_catalog` stores) AND for every case needing
+        /// `IndexManager`-layer bookkeeping that fast path cannot replicate
+        /// (shard range, contributor snapshots -- see
+        /// `IndexManager.graphEdgeWriteEligibleForInlinePublication`'s own
+        /// doc comment), so the caller falls back to
+        /// `applyGraphMutationsByName`, which remains correct (and is not
+        /// changed by any of this) for all of them.
+        pub fn prepareInlineGraphPublication(
+            alloc: Allocator,
+            index_manager: *index_manager_mod.IndexManager,
+            write: types.GraphEdgeWrite,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            sequence: u64,
+        ) !*InlineGraphPublication {
+            if (index_ref.kind != .graph) return error.InlineGraphPublicationUnsupported;
+            const entry = index_manager.graphIndex(index_ref.name) orelse return error.InlineGraphPublicationUnsupported;
+            if (!index_manager.graphEdgeWriteEligibleForInlinePublication(entry, write)) return error.InlineGraphPublicationUnsupported;
+
+            const forward_scope = entry.index.forwardCatalogScope() orelse return error.InlineGraphPublicationUnsupported;
+            const reverse_scope = entry.index.reverseCatalogScope() orelse return error.InlineGraphPublicationUnsupported;
+
+            var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
+            errdefer apply_guard.unlock();
+
+            const publication = entry.index.prepareInlineEdgePublication(.{
+                .source = write.source,
+                .target = write.target,
+                .edge_type = write.edge_type,
+                .edge_id = write.edge_id,
+                .owner_document = write.owner_document,
+                .weight = write.weight,
+                .created_at = write.created_at,
+                .updated_at = write.updated_at,
+                .ttl_created_ns = write.ttl_created_ns,
+                .metadata_json = write.metadata_json,
+                .owner = write.owner,
+            }) catch |err| switch (err) {
+                error.InlineEdgePublicationUnsupported => return error.InlineGraphPublicationUnsupported,
+                else => return err,
+            };
+
+            const result = try alloc.create(InlineGraphPublication);
+            result.* = .{
+                .alloc = alloc,
+                .entry = entry,
+                .apply_guard = apply_guard,
+                .publication = publication,
+                .forward_scope = forward_scope,
+                .reverse_scope = reverse_scope,
+                .progress = .{
+                    .consumer = index_ref.name,
+                    .sequence = sequence,
+                    .generation = entry.config.coverage_generation,
+                    .config_hash = types.indexConfigHash(entry.config),
+                },
+            };
+            return result;
+        }
+
         pub fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {
             try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null, false, null);
         }
