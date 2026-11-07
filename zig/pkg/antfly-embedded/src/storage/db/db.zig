@@ -21050,7 +21050,7 @@ pub const DB = struct {
         // usable cursors. The parent guard excludes readers of this new root.
         errdefer if (!existed) std.Io.Dir.cwd().deleteTree(io, root) catch {};
         profile.next("snapshot");
-        _ = self.snapshotInternal(request.id, true, token, deadline, null, false, request) catch |err| {
+        _ = self.snapshotInternal(request.id, true, token, self.snapshotMaintenanceDeadline(deadline), null, false, request) catch |err| {
             try token.check();
             return switch (err) {
                 error.NativeBackupStorageBackendUnsupported, error.NativeBackupProjectionBackendUnsupported, error.BackupSealBackendUnsupported => error.UnsupportedQueryRequest,
@@ -21088,10 +21088,27 @@ pub const DB = struct {
             if (value.source_digest) |previous| {
                 // The query-pin guard also owns initialization of the local
                 // digest epoch; foreground captures use the same guard.
-                var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
+                const renewal: cut.Control = .{ .parent = cancellation, .deadline_ns = monotonicTimeNs() +| 2 * std.time.ns_per_s };
+                var guard = try cut.lock(self.alloc, io, self.core.path, renewal.token());
                 defer guard.deinit();
-                const current = (try self.nativeQueryReuseDigest(cancellation)) orelse return false;
-                if (std.mem.eql(u8, &previous, &current)) return true;
+                const current = (try self.nativeQueryReuseDigest(renewal.token())) orelse return false;
+                if (std.mem.eql(u8, &previous, &current)) {
+                    if (value.request.expires_ms > now +| 120_000) return true;
+                    var nonce: [32]u8 = undefined;
+                    try io.randomSecure(&nonce);
+                    const id = std.fmt.bytesToHex(nonce, .lower);
+                    const request: cut.Request = .{ .id = &id, .table_id = self.core.identity_namespace.table_id, .expires_ms = now +| @import("native_query_cut_contract.zig").max_ttl_ms, .create = true, .timeout_ms = 2000 };
+                    if (try self.tryReuseNativeQueryCut(io, request, renewal.token())) {
+                        state.?.request = request;
+                        state.?.next_ms = now +| 60_000;
+                        try warming.writeState(a, io, state_path, state.?);
+                        return true;
+                    }
+                    // Never recapture an unchanged corpus on an expired
+                    // optional hint alone. Foreground capture can re-establish
+                    // a missing proof; a later tick can renew that live basis.
+                    return true;
+                }
             } else if (value.next_ms > now) return true;
         };
         if (state == null or state.?.complete or state.?.request.expires_ms <= now +| 15000) {
@@ -21276,6 +21293,8 @@ pub const DB = struct {
         return self.backend_runtime.monotonicClock().nowRealtimeNs() +| remaining_ns;
     }
 
+    /// maintenance_deadline_ns is always in BackendRuntime.monotonicClock's
+    /// domain. Query controls translate their platform deadline at admission.
     pub fn snapshotInternal(
         self: *DB,
         id: []const u8,
@@ -21360,7 +21379,7 @@ pub const DB = struct {
                     self.currentMaintenanceTargetSequence(),
                     .{},
                     cancellation,
-                    self.snapshotMaintenanceDeadline(deadline_ns),
+                    deadline_ns,
                 );
             } else {
                 try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
@@ -21428,7 +21447,7 @@ pub const DB = struct {
                 target_sequence,
                 .{},
                 cancellation,
-                if (maintenance_deadline_ns) |deadline| self.snapshotMaintenanceDeadline(deadline) else std.math.maxInt(u64),
+                maintenance_deadline_ns orelse std.math.maxInt(u64),
                 if (query_cut != null) .published_requests else .successful_requests,
             ) catch |err| switch (err) {
                 error.Cancelled => return error.Canceled,
@@ -73919,6 +73938,35 @@ test "db native checkpoint warming transfers snapshot budgets to a different run
         .clock = runtime.ptr().monotonicClock(),
     };
     try std.testing.expectError(error.EnrichmentWaitTimeout, expired.check());
+}
+
+test "db native checkpoint warming preserves public snapshot runtime deadlines" {
+    const a = std.testing.allocator;
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = @intCast(monotonicTimeNs() + 365 * std.time.ns_per_day) });
+    defer clock.deinit();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = clock.io() },
+        .filesystem_io = std.testing.io,
+    });
+    defer runtime.deinit();
+    var directory = try TestDirectory.init("snapshot-runtime-deadline");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{
+        .backend_runtime = runtime.ptr(),
+        .no_sync = true,
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+        .start_independent_maintenance = false,
+    });
+    defer db.close();
+    const now = runtime.ptr().monotonicClock().nowRealtimeNs();
+    try db.drainSnapshotMaintenance(now + std.time.ns_per_s);
+    _ = try db.snapshotWithMaintenanceDeadline("valid-runtime-budget", now + std.time.ns_per_s);
+    try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"pending text\"}" }}, .sync_level = .write });
+    try std.testing.expectError(error.EnrichmentWaitTimeout, db.snapshotWithMaintenanceDeadline("expired-runtime-budget", now -| 1));
+    _ = try db.snapshotWithMaintenanceDeadline("drained-runtime-budget", now + 5 * std.time.ns_per_s);
 }
 
 test "db idle dense query captures retain the same immutable runs" {
