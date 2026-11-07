@@ -182,7 +182,7 @@ fn debertaRerankerPrefersWeightMirrors(enabled: bool, batch: usize, seq_len: usi
 
 const sessionEnablesDebertaRerankerWeightMirrors = device_weights.sessionEnablesDebertaRerankerWeightMirrors;
 
-const sessionEnablesImmutableF32WeightBorrow = device_weights.sessionEnablesImmutableF32WeightBorrow;
+const sessionF32WeightBorrowPolicy = device_weights.sessionF32WeightBorrowPolicy;
 
 const sessionPrefersImmutableGlinerF32Mps = device_weights.sessionPrefersImmutableGlinerF32Mps;
 
@@ -1800,21 +1800,21 @@ test "sessionTaskForModelType maps classifier and extractor tasks" {
     try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.reranker, .generic));
 }
 
-test "GLiNER immutable F32 borrow policy includes declared ModernBERT span inference only" {
-    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.extractor, null), .unknown));
-    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.extractor, .extractor), .unknown));
-    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.extractor, .generic), .unknown));
-    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .modern_bert, .extractor, .modern_bert));
-    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.metal, .modern_bert, .extractor, .unknown));
-    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.metal, .modern_bert, .generic, .modern_bert));
-    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.native, .modern_bert, .extractor, .modern_bert));
+test "immutable F32 source policy preserves Model value qualification and requires mapped proof for ordinary inference" {
+    const Policy = @import("../ops/gpu_hosted_store.zig").F32WeightBorrow;
+    try std.testing.expectEqual(Policy.immutable_model_values, sessionF32WeightBorrowPolicy(.metal, null, .gliner, .extractor, .unknown));
+    try std.testing.expectEqual(Policy.immutable_model_values, sessionF32WeightBorrowPolicy(.metal, .extractor, .modern_bert, .extractor, .modern_bert));
+    try std.testing.expectEqual(Policy.canonical_mapped, sessionF32WeightBorrowPolicy(.metal, null, .modern_bert, .extractor, .unknown));
+    try std.testing.expectEqual(Policy.canonical_mapped, sessionF32WeightBorrowPolicy(.metal, null, .whisper, .generic, .unknown));
+    try std.testing.expectEqual(Policy.copy_only, sessionF32WeightBorrowPolicy(.metal, .generic, .gliner, .generic, .unknown));
     try std.testing.expect(sessionPrefersImmutableGlinerF32Mps(.metal, .gliner, .extractor));
     try std.testing.expect(!sessionPrefersImmutableGlinerF32Mps(.metal, .modern_bert, .extractor));
     inline for (std.meta.tags(BackendType)) |backend_type| {
         inline for (std.meta.tags(ArchType)) |arch_type| {
             inline for (std.meta.tags(SessionTask)) |task| {
-                const expected = backend_type == .metal and arch_type == .gliner and task == .extractor;
-                try std.testing.expectEqual(expected, sessionEnablesImmutableF32WeightBorrow(backend_type, arch_type, task, .unknown));
+                const inference: Policy = if (backend_type != .metal) .copy_only else if (arch_type == .gliner and task == .extractor) .immutable_model_values else .canonical_mapped;
+                try std.testing.expectEqual(inference, sessionF32WeightBorrowPolicy(backend_type, null, arch_type, task, .unknown));
+                try std.testing.expectEqual(Policy.copy_only, sessionF32WeightBorrowPolicy(backend_type, .generic, arch_type, task, .unknown));
             }
         }
     }

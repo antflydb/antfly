@@ -188,19 +188,23 @@ pub fn sessionEnablesDebertaRerankerWeightMirrors(
     return model_type == .reranker and arch_type == .deberta and task == .classifier;
 }
 
-pub fn sessionEnablesImmutableF32WeightBorrow(
+pub fn sessionF32WeightBorrowPolicy(
     backend_type: BackendType,
+    override: ?TaskOverride,
     arch_type: ArchType,
     task: SessionTask,
     gliner_span_encoder_family: manifest_mod.GlinerSpanEncoderFamily,
-) bool {
-    // These model-scoped lazy weights are read-only for the session lifetime.
-    // Finetuning's explicit generic sessions and caller-created WeightStores
-    // retain the copying contract; they must never inherit this capability
-    // merely because a parameter name resembles an inference weight.
-    if (backend_type != .metal or task != .extractor) return false;
-    return arch_type == .gliner or
-        (arch_type == .modern_bert and gliner_span_encoder_family == .modern_bert);
+) gpu_hosted_store_mod.F32WeightBorrow {
+    // Explicit generic overrides are used by training callers. Ordinary raw
+    // WeightStores also stay copy-only; no family or dtype can promote them.
+    if (backend_type != .metal or override == .generic) return .copy_only;
+    // Preserve the existing qualified immutable Model-owned cache contract;
+    // the independent MPS numerical policy remains unchanged.
+    if (task == .extractor and (arch_type == .gliner or
+        (arch_type == .modern_bert and gliner_span_encoder_family == .modern_bert))) return .immutable_model_values;
+    // Every other inference source must prove actual canonical mapped F32
+    // equality at lookup, rather than inherit an architecture-name exception.
+    return .canonical_mapped;
 }
 
 pub fn sessionPrefersImmutableGlinerF32Mps(
@@ -1351,7 +1355,7 @@ pub fn prepare(
         .allow_direct_quant = session_direct_quant_enabled,
         .quant_execution_mode = quant_mode,
         .prefer_f32_dense_tensors = prefer_f32_dense_tensors,
-        .allow_immutable_f32_weight_borrow = sessionEnablesImmutableF32WeightBorrow(backend_type, std.meta.activeTag(arch_config), task, mf.gliner_span_encoder_family),
+        .f32_weight_borrow = sessionF32WeightBorrowPolicy(backend_type, override, std.meta.activeTag(arch_config), task, mf.gliner_span_encoder_family),
         .prefer_immutable_gliner_f32_mps = sessionPrefersImmutableGlinerF32Mps(backend_type, std.meta.activeTag(arch_config), task),
         .mirror_kv_to_manager = false,
         .jina_lora_adapter = gpu_jina_lora_adapter,

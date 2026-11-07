@@ -32017,7 +32017,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             // fresh full-weight host copy on every request. Generic/training
             // stores retain the existing narrow embedding policy.
             const borrowed_embedding = enableNomicBorrowedF32EmbeddingWeights() and isNomicEmbeddingWeight(name);
-            if (self.data.allow_immutable_f32_weight_borrow or borrowed_embedding) {
+            if (self.data.f32_weight_borrow == .immutable_model_values or try self.data.currentMappedF32Borrow(entry) or borrowed_embedding) {
                 if (entry.host_loaded) |*loaded| {
                     if (loaded.tensor.dtype == .f32) {
                         if (loaded.tensor.asFloat32IfAligned()) |host| {
@@ -47979,7 +47979,7 @@ fn exerciseImmutableF32Borrow(allocator: std.mem.Allocator, enabled: bool) !void
     var values = [_]f32{ 1, -2.5, 0.5, 3 };
     var shape = [_]i64{ 2, 2 };
     var store = testMetalWeightStoreInit(allocator);
-    store.allow_immutable_f32_weight_borrow = enabled;
+    store.f32_weight_borrow = if (enabled) .immutable_model_values else .copy_only;
     store.prefetch = gpu_hosted_store_mod.PrefetchQueue.init(allocator, &store, gpu_hosted_store_mod.simplePrefetchProcess);
     defer store.prefetch.deinit();
     defer store.lazy_weights.deinit(allocator);
@@ -48050,7 +48050,7 @@ test "metal_compute: legacy immutable F32 MPS policy excludes mutable reduced an
     const compute = MetalCompute{ .allocator = a, .data = &store, .provider_impl = undefined };
     try std.testing.expect(!compute.isImmutableGlinerF32Pair(tensor, tensor));
     try std.testing.expect(!compute.preferImmutableGlinerF32Mps(tensor, tensor, 64, 64));
-    store.allow_immutable_f32_weight_borrow = true;
+    store.f32_weight_borrow = .immutable_model_values;
     try std.testing.expect(!compute.isImmutableGlinerF32Pair(tensor, tensor));
     try std.testing.expect(!compute.preferImmutableGlinerF32Mps(tensor, tensor, 64, 64));
     store.prefer_immutable_gliner_f32_mps = true;
@@ -48484,7 +48484,7 @@ fn exerciseLegacyGlinerMps(mode: enum { parity, allocation }) !void {
     const initial = metal_tensor_mod.memoryStatsSnapshot();
     {
         var store = testMetalWeightStoreInit(a);
-        store.allow_immutable_f32_weight_borrow = true;
+        store.f32_weight_borrow = .immutable_model_values;
         store.prefer_immutable_gliner_f32_mps = true;
         defer store.lazy_weights.deinit(a);
         try addLegacyGlinerMpsTestWeight(&store, "a.weight", &weights_a, &.{ dim, dim });
@@ -55482,7 +55482,7 @@ test "Metal immutable model parameter lookups reuse semantic linear and norm slo
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var store = testMetalWeightStoreInit(a);
-    store.allow_immutable_f32_weight_borrow = true;
+    store.f32_weight_borrow = .immutable_model_values;
     initPrefetchQueue(&store, a);
     defer {
         deinitSharedNativeProvider(&store);
@@ -59334,4 +59334,166 @@ test "Metal refuses Native declared multiquery attention before opaque provider 
     const functions = MetalCompute.vtable_impl.kernels.?;
     try std.testing.expect(!try functions.runAssignedKernel.?(foreign_context, .{ .descriptor = &descriptor, .inputs = &.{} }));
     try std.testing.expect(!supportsAssignedDescriptor(&descriptor));
+}
+
+fn mappedF32WeightBorrowCase(a: std.mem.Allocator) !void {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const Source = @import("../models/tensor_store.zig");
+    const SessionMod = @import("../backends/session.zig");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const header = "{\"projection.weight\":{\"dtype\":\"F32\",\"shape\":[64,64],\"data_offsets\":[0,16384]},\"other.weight\":{\"dtype\":\"F32\",\"shape\":[64,64],\"data_offsets\":[16384,32768]}}";
+    const padded = std.mem.alignForward(usize, header.len, 8);
+    var bytes: [8 + padded + 32768]u8 = @splat(' ');
+    std.mem.writeInt(u64, bytes[0..8], padded, .little);
+    @memcpy(bytes[8..][0..header.len], header);
+    for (0..8192) |i| std.mem.writeInt(u32, bytes[8 + padded + i * 4 ..][0..4], @bitCast(@as(f32, @floatFromInt(i + 1))), .little);
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "weights.safetensors", .data = &bytes });
+    const path = try directory.dir.realPathFileAlloc(std.testing.io, "weights.safetensors", a);
+    defer a.free(path);
+    const source = (try Source.SafetensorsStore.initAbsolute(a, path)).tensorStore();
+    var source_unowned = true;
+    defer if (source_unowned) source.deinit();
+    var store = testMetalWeightStoreInit(a);
+    store.f32_weight_borrow = .canonical_mapped;
+    store.tensor_store = source;
+    store.prefetch = gpu_hosted_store_mod.PrefetchQueue.init(a, &store, gpu_hosted_store_mod.simplePrefetchProcess);
+    var prefetch_unowned = true;
+    defer if (prefetch_unowned) store.prefetch.deinit();
+    var entries_unowned = true;
+    defer if (entries_unowned) {
+        var entries = store.lazy_weights.valueIterator();
+        while (entries.next()) |entry| if (entry.host_loaded) |*loaded| loaded.deinit();
+        store.lazy_weights.deinit(a);
+    };
+    try store.lazy_weights.put(a, "projection.weight", .{ .tensor_ref = .{ .name = "projection.weight", .byte_len = 16384 } });
+    const Close = struct {
+        store: *gpu_hosted_store_mod.WeightStore,
+        allocator: std.mem.Allocator,
+        closed: bool = false,
+        fn drop(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var entries = self.store.lazy_weights.valueIterator();
+            while (entries.next()) |entry| {
+                std.debug.assert(entry.pin_count == 0);
+                if (entry.host_loaded) |*loaded| loaded.deinit();
+            }
+            self.store.lazy_weights.deinit(self.allocator);
+            self.store.prefetch.deinit();
+            self.store.tensor_store.?.deinit();
+            self.closed = true;
+        }
+    };
+    var close = Close{ .store = &store, .allocator = a };
+    var model = SessionMod.Session.ModelLifetime{ .owner = &close, .destroy_fn = Close.drop };
+    source_unowned = false;
+    prefetch_unowned = false;
+    entries_unowned = false;
+    var original_model_live = true;
+    defer if (original_model_live) model.release();
+    var retained: ?*SessionMod.Session.ModelLifetime = null;
+    defer if (retained) |pin| pin.release();
+    var request = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = 16384 };
+    var compute = MetalCompute{ .allocator = request.allocator(), .data = &store, .provider_impl = undefined };
+    var compute_live = true;
+    defer if (compute_live) compute.deinitWeightCaches();
+    const weight = try MetalCompute.getWeightOp(&compute, "projection.weight");
+    var weight_live = true;
+    defer if (weight_live) MetalCompute.freeOp(&compute, weight);
+    const entry = store.lazy_weights.getPtr("projection.weight").?;
+    const current = &entry.host_loaded.?.tensor;
+    try std.testing.expect(try store.currentMappedF32Borrow(entry));
+    try std.testing.expect(MetalCompute.toBuf(weight).data.ptr == current.asFloat32().ptr);
+    try std.testing.expectEqual(@as(usize, 0), compute.dense_weight_cache.count());
+    try std.testing.expect(!request.denied and request.peak < 16384);
+    try std.testing.expectEqual(@as(usize, 1), entry.pin_count);
+    const again = try MetalCompute.getWeightOp(&compute, "projection.weight");
+    try std.testing.expectEqual(weight, again);
+    MetalCompute.freeOp(&compute, again);
+    {
+        const acquired = try MetalCompute.acquireWeightOp(&compute, "projection.weight");
+        defer MetalCompute.freeOp(&compute, acquired);
+        try std.testing.expectEqual(@as(usize, 2), entry.pin_count);
+        try std.testing.expect(MetalCompute.toBuf(acquired).data.ptr == current.asFloat32().ptr);
+    }
+    // Every comparison is against independently resolved CURRENT source facts;
+    // same shape, wrong backing/name, copied tables and owned overlays decline.
+    {
+        const saved = current.*;
+        defer current.* = saved;
+        var other = try source.loadTensorRef(&.{ .name = "other.weight", .byte_len = 16384 });
+        defer other.deinit();
+        current.* = other.tensor;
+        try std.testing.expect(!try store.currentMappedF32Borrow(entry));
+        current.* = saved;
+        var wrong_shape = [_]i64{ 32, 128 };
+        current.shape = &wrong_shape;
+        try std.testing.expect(!try store.currentMappedF32Borrow(entry));
+        current.* = saved;
+        current.data = current.data[1..];
+        try std.testing.expect(!try store.currentMappedF32Borrow(entry));
+        current.* = saved;
+        current.mmap_source_bytes = saved.mmap_source_bytes.?[4..];
+        try std.testing.expect(!try store.currentMappedF32Borrow(entry));
+        current.* = saved;
+        var overlay = try @import("../backends/tensor.zig").Tensor.initFloat32(a, saved.name, saved.shape, saved.asFloat32());
+        defer overlay.deinit();
+        current.* = overlay;
+        try std.testing.expect(!try store.currentMappedF32Borrow(entry));
+        current.* = saved;
+        current.dtype = .bf16;
+        try std.testing.expect(!try store.currentMappedF32Borrow(entry));
+    }
+    {
+        var copied = source.vtable.*;
+        std.mem.doNotOptimizeAway(&copied);
+        try std.testing.expect(&copied != source.vtable);
+        store.tensor_store = .{ .ptr = @ptrFromInt(1), .vtable = &copied };
+        defer store.tensor_store = source;
+        try std.testing.expect(!try store.currentMappedF32Borrow(entry));
+    }
+    {
+        const saved = entry.tensor_ref;
+        defer entry.tensor_ref = saved;
+        entry.tensor_ref.source_name = "other.weight";
+        try std.testing.expect(!try store.currentMappedF32Borrow(entry));
+        entry.tensor_ref = saved;
+        entry.tensor_ref.quantized = true;
+        try std.testing.expect(!try store.currentMappedF32Borrow(entry));
+    }
+    retained = model.retain();
+    model.release();
+    original_model_live = false;
+    try std.testing.expect(!close.closed);
+    try std.testing.expectEqual(@as(f32, 1), MetalCompute.toBuf(weight).data[0]);
+    try std.testing.expectEqual(@as(f32, 4096), MetalCompute.toBuf(weight).data[4095]);
+    MetalCompute.freeOp(&compute, weight);
+    weight_live = false;
+    try std.testing.expectEqual(@as(usize, 0), entry.pin_count);
+    compute.deinitWeightCaches();
+    // Default/trainable copying still needs the REAL request allocation and
+    // hits this unchanged cap; only declared-cap OOM is expected here.
+    store.f32_weight_borrow = .copy_only;
+    if (MetalCompute.getWeightOp(&compute, "projection.weight")) |unexpected| {
+        MetalCompute.freeOp(&compute, unexpected);
+        return error.ExpectedBoundedWeightCopyDenial;
+    } else |err| {
+        if (err != error.OutOfMemory or !request.denied) return err;
+    }
+    compute.deinitWeightCaches();
+    compute_live = false;
+    try std.testing.expectEqual(@as(usize, 0), request.live);
+    try std.testing.expectEqual(@as(usize, 0), entry.pin_count);
+    retained.?.release();
+    retained = null;
+    try std.testing.expect(close.closed);
+}
+
+test "metal mapped F32 weights prove current source and pin actual mapping beyond publishing Model lifetime under bounded metadata" {
+    try mappedF32WeightBorrowCase(std.testing.allocator);
+}
+
+test "metal mapped F32 weight borrowing unwinds source metadata and every pin allocation failure" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, mappedF32WeightBorrowCase, .{});
 }
