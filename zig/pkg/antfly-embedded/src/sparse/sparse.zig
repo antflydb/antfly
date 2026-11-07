@@ -49,6 +49,7 @@ const resource_manager_mod = @import("../storage/resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
 const mem_backend = @import("../storage/mem_backend.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
+const native_catalog_backend = @import("../storage/native_catalog_backend.zig");
 
 // ============================================================================
 // Types
@@ -2413,12 +2414,25 @@ pub const SparseIndexOptions = struct {
     lsm_cache: ?*lsm_backend.Cache = null,
     lsm_options: lsm_backend.Options = .{ .flush_threshold = 1 },
     lsm_root_generation: u64 = 0,
+    /// Required when `backend == .native_catalog` (Lite only). See
+    /// `storage/native_catalog_backend.zig:Sink`.
+    main_native_catalog_sink: ?NativeCatalogSink = null,
 };
+
+/// See `persistent.zig`'s identically-named alias: both point at the same
+/// backend-agnostic `native_catalog_backend.Sink`.
+pub const NativeCatalogSink = native_catalog_backend.Sink;
 
 pub const SparseBackend = enum {
     mem,
     lsm_memory,
     lsm,
+    /// WS4-for-vectors: one native commit per `beginBatchWithOptions`-sized
+    /// publication, via `storage/native_catalog_backend.zig`, instead of an
+    /// LSM instance (its own WAL) on Lite's virtual filesystem. See
+    /// `docs/design/lite-performance/lite-single-commit-write-path.md`.
+    /// Lite-only: the hosted server never selects this.
+    native_catalog,
 };
 
 pub const SparseIndex = struct {
@@ -2438,6 +2452,7 @@ pub const SparseIndex = struct {
         none,
         mem: *mem_backend.Backend,
         lsm: lsm_backend.BackendHandle,
+        native_catalog: *native_catalog_backend.Backend,
 
         fn close(self: *StoreOwner, alloc: Allocator) void {
             switch (self.*) {
@@ -2447,6 +2462,10 @@ pub const SparseIndex = struct {
                     alloc.destroy(backend);
                 },
                 .lsm => |*handle| handle.close(),
+                .native_catalog => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
             }
             self.* = .none;
         }
@@ -2459,20 +2478,28 @@ pub const SparseIndex = struct {
                     alloc.destroy(backend);
                 },
                 .lsm => |*handle| handle.abandonAfterCrash(),
+                // Every `.native_catalog` commit is already durable before
+                // this backend's in-memory mirror is published (see
+                // `native_catalog_backend.zig`'s `NamespaceTxn.commit`), so
+                // there is nothing to roll back here beyond an ordinary close.
+                .native_catalog => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
             }
             self.* = .none;
         }
 
         pub fn sync(self: *StoreOwner, force: bool) !void {
             switch (self.*) {
-                .none, .mem => {},
+                .none, .mem, .native_catalog => {},
                 .lsm => |*handle| try handle.backend.sync(force),
             }
         }
 
         fn checkpointLsmWalAfterDurableBoundary(self: *StoreOwner) !void {
             switch (self.*) {
-                .none, .mem => {},
+                .none, .mem, .native_catalog => {},
                 .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
             }
         }
@@ -2480,7 +2507,18 @@ pub const SparseIndex = struct {
         fn pinNativeCheckpoint(self: *StoreOwner) !lsm_backend.Backend.NativeCheckpoint {
             return switch (self.*) {
                 .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
-                .none, .mem => error.Unsupported,
+                .none, .mem, .native_catalog => error.Unsupported,
+            };
+        }
+
+        /// WS4-for-vectors: this backend's own catalog scope string (the
+        /// same value `openStore` passed as `native_catalog_backend.Options.
+        /// scope`) when `== .native_catalog`, else `null`. See
+        /// `persistent.zig`'s identically-named method on `PersistentIndex`.
+        pub fn nativeCatalogScope(self: *const StoreOwner) ?[]const u8 {
+            return switch (self.*) {
+                .native_catalog => |backend| backend.scope,
+                .none, .mem, .lsm => null,
             };
         }
     };
@@ -2529,7 +2567,31 @@ pub const SparseIndex = struct {
                 errdefer runtime.deinit();
                 return .{ .store = runtime, .owner = .{ .lsm = handle } };
             },
+            .native_catalog => {
+                const sink = opts.main_native_catalog_sink orelse return error.MissingNativeCatalogSink;
+                const backend = try alloc.create(native_catalog_backend.Backend);
+                errdefer alloc.destroy(backend);
+                backend.* = try native_catalog_backend.Backend.init(alloc, .{
+                    .sink = sink,
+                    .scope = std.mem.span(path),
+                    .backend = .{ .read_only = opts.lsm_options.backend.read_only },
+                });
+                errdefer backend.close();
+
+                var runtime = try backend.runtimeStore(alloc, .{});
+                errdefer runtime.deinit();
+                return .{ .store = runtime, .owner = .{ .native_catalog = backend } };
+            },
         }
+    }
+
+    /// WS4-for-vectors: this index's own catalog scope string when its
+    /// backend is `.native_catalog`, else `null`. A caller building
+    /// `commit_participant.IndexCatalogMutation`s for this index must scope
+    /// them exactly the same way, or they will not be found by this index's
+    /// own reads. See `persistent.zig`'s `PersistentIndex.nativeCatalogScope`.
+    pub fn nativeCatalogScope(self: *const SparseIndex) ?[]const u8 {
+        return self.owner.nativeCatalogScope();
     }
 
     pub fn beginReadTxn(self: *SparseIndex) !backend_erased.ReadTxn {
@@ -3764,7 +3826,16 @@ pub const SparseIndex = struct {
         var published = false;
         defer if (!published and task.generation == null) self.reclaimCompactionId(segment_id) catch {};
         if (!result.staged) try self.stageCompaction(segment_id, result);
-        var txn = try self.beginBatchTxn(.{});
+        // WS4-for-vectors/§3.2a: compaction publication is background
+        // maintenance -- redone from the still-live sources on a crash (the
+        // source-match check just above returns `false`, a cheap no-op,
+        // rather than publishing stale output), so it never needs to force
+        // its own durable sync. On `.native_catalog` this rides along on the
+        // next foreground group's commit; on every other backend
+        // `BatchOptions.durability` is a no-op (see `lsm_backend.zig`'s and
+        // `mem_backend.zig`'s own `beginBatchWithOptions`), so this is safe
+        // unconditionally.
+        var txn = try self.beginBatchTxn(.{ .durability = .ride_along });
         var txn_open = true;
         defer if (txn_open) txn.abort();
 

@@ -3838,6 +3838,13 @@ pub const OwnedDocument = struct {
     value: []u8,
 };
 
+/// See `NativeFile.sync_lock_hooks`.
+pub const SyncLockHooks = struct {
+    context: *anyopaque,
+    release: *const fn (context: *anyopaque) void,
+    reacquire: *const fn (context: *anyopaque) void,
+};
+
 /// Opaque identities never repeat after recovery-slot rollback. Allocator and
 /// reader-lease publications retain them; authored roots receive fresh IDs.
 pub const LogicalGenerations = struct {
@@ -4996,6 +5003,26 @@ pub const NativeFile = struct {
     reader_window_depth: usize = 0,
     reader_window_lock: ?std.Io.File = null,
     epoch_window: ?@import("reader_epochs.zig").Frontier = null,
+    /// Reader-epoch namespace directory, opened once and kept across many
+    /// commits instead of being resolved/opened/closed from scratch on every
+    /// one (see docs/design/lite-performance/throughput-profile.md
+    /// §4.1/§5.1 -- this used to be the single largest foreground cost on a
+    /// primary-only single writer, ~46% of sampled time, more than the
+    /// commit's own fsync+pwrite+pread). Invalidated and reopened whenever
+    /// `header.reader_epoch_namespace` no longer matches
+    /// `reader_namespace_binding` (covers every rebind site, e.g.
+    /// `bindPrivateEpochNamespace`/`adoptIndexPublicationHeader`, without
+    /// needing to patch each one) and closed in `close`.
+    reader_namespace: ?@import("reader_epochs.zig").CachedNamespace = null,
+    reader_namespace_binding: [32]u8 = @splat(0),
+    /// `reader_epochs.directoryFingerprint` captured immediately after the
+    /// scan that produced `reader_frontier_cache`, while still holding that
+    /// commit's exclusive data-file lock. The next commit compares its own
+    /// (also lock-held) fingerprint against this before deciding a full
+    /// `reader_epochs.scanCached` is needed; see that function's own comment
+    /// for why an unchanged fingerprint makes the cached frontier stale-safe.
+    reader_namespace_fingerprint: ?i96 = null,
+    reader_frontier_cache: @import("reader_epochs.zig").Frontier = .{},
     minimum_metadata_reader_sequence: ?u64 = null,
     reader_window_previous_metadata_frontier: ?u64 = null,
     reader_window_previous_frontier: ?u64 = null,
@@ -5074,6 +5101,16 @@ pub const NativeFile = struct {
     /// `publishCheckpoint`, or by reconciliation).
     uncertain_checkpoint: ?CheckpointSlot = null,
     uncertain_slot: ?u8 = null,
+    /// Optional hooks a caller installs (and clears) around exactly one
+    /// `commitTransactionWithDurability`/`sync` call, to release an outer
+    /// lock for the actual durability-barrier syscall and re-acquire it
+    /// immediately after (WS2): everything `syncIfRequired` does before and
+    /// after this pair -- the preceding page/slot writes, and the
+    /// checkpoint-slot publication that follows once it returns -- still
+    /// runs under that lock, since those touch state other lock holders
+    /// read. `context` is opaque here on purpose: NativeFile has no
+    /// business knowing what kind of lock a caller above it uses.
+    sync_lock_hooks: ?SyncLockHooks = null,
     /// Owner admission budget. Reuse remains permitted at the file-size cap.
     /// Null means unlimited; the owner subtracts retired/workspace capacity.
     max_file_bytes: ?u64 = null,
@@ -5409,6 +5446,8 @@ pub const NativeFile = struct {
         self.manifest_builder.deinit(self.allocator);
         const io = self.runtimeIo();
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
+        if (self.reader_namespace) |cached| cached.close(self.allocator, io);
+        self.reader_namespace = null;
         self.page_cache.deinit(self.allocator);
         self.invalidateLedger();
         if (self.writer_lock_file) |lock_file| {
@@ -5924,8 +5963,61 @@ pub const NativeFile = struct {
         const lock = try acquireDataRewriteLock(self.runtime(), self.path);
         errdefer lock.file.close(self.runtime());
         if (self.activeCheckpoint().free_map_root_page != 0 and (try lock.file.stat(self.runtime())).inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentSourceChanged;
-        if (self.header.indexed_reclamation) self.epoch_window = try @import("reader_epochs.zig").scan(self.allocator, self.runtime(), self.path, self.header.reader_epoch_namespace, (try self.file.stat(self.runtime())).inode);
+        if (self.header.indexed_reclamation) self.epoch_window = try self.scanReaderEpochsCached();
         return lock;
+    }
+
+    /// `reader_namespace`, opened once and reopened whenever it can no
+    /// longer be trusted: either `header.reader_epoch_namespace` changed
+    /// since it was cached (a rebind, e.g. `bindPrivateEpochNamespace`), or
+    /// `reader_epochs.parentUnchanged` shows the data file's parent
+    /// directory is no longer the one this cache resolved -- an external
+    /// rename/replace of that parent (a backup/restore or vacuum dance can
+    /// do this) can leave the cached directory/guard handles still valid by
+    /// inode while no longer being where a *fresh* registration would land,
+    /// so a stale cache must not go on being trusted just because its
+    /// handles still happen to work. Both checks are cheap (an in-memory
+    /// compare and one `statFile` syscall); no syscalls at all are needed
+    /// beyond that when the cache already matches.
+    fn ensureReaderNamespaceCache(self: *NativeFile) !@import("reader_epochs.zig").CachedNamespace {
+        const epochs = @import("reader_epochs.zig");
+        const io = self.runtime();
+        if (self.reader_namespace) |cached| {
+            if (std.mem.eql(u8, &self.reader_namespace_binding, &self.header.reader_epoch_namespace) and
+                epochs.parentUnchanged(io, self.path, cached)) return cached;
+            cached.close(self.allocator, io);
+            self.reader_namespace = null;
+            self.reader_namespace_fingerprint = null;
+        }
+        const cached = try epochs.openCached(self.allocator, io, self.path, self.header.reader_epoch_namespace);
+        self.allocator_work.reader_namespace_opens +|= 1;
+        self.reader_namespace = cached;
+        self.reader_namespace_binding = self.header.reader_epoch_namespace;
+        self.reader_namespace_fingerprint = null;
+        return cached;
+    }
+
+    /// The reuse frontier for this commit, amortizing `reader_epochs.zig`'s
+    /// namespace open/scan across commits instead of paying its full cost on
+    /// every one. Caller already holds the exclusive data-file lock
+    /// (`acquireDataRewriteLock`, above) -- that lock is what makes trusting
+    /// an unchanged `directoryFingerprint` safe without rescanning; see that
+    /// function's own comment for the full argument. The first call (or any
+    /// call after a rebind) always pays for one real
+    /// `reader_epochs.scanCached`; every call after that is a single
+    /// `fstat`-equivalent as long as no reader has joined or left since.
+    fn scanReaderEpochsCached(self: *NativeFile) !@import("reader_epochs.zig").Frontier {
+        const epochs = @import("reader_epochs.zig");
+        const io = self.runtime();
+        const cached = try self.ensureReaderNamespaceCache();
+        const fp = try epochs.directoryFingerprint(io, cached);
+        if (self.reader_namespace_fingerprint) |previous| if (previous == fp) return self.reader_frontier_cache;
+        const inode = (try self.file.stat(io)).inode;
+        const frontier = try epochs.scanCached(io, cached, inode);
+        self.allocator_work.reader_namespace_full_scans +|= 1;
+        self.reader_frontier_cache = frontier;
+        self.reader_namespace_fingerprint = try epochs.directoryFingerprint(io, cached);
+        return frontier;
     }
     fn beginReaderWindow(self: *NativeFile) !bool {
         const coordinator = self.reader_coordinator orelse return false;
@@ -11431,12 +11523,29 @@ pub const NativeFile = struct {
                 _ = try self.validateIndexedAllocator(checkpoint, state, self.allocator_cancel_token);
                 self.free_pages_verified = true;
             }
-            const coordinated = try self.beginReaderWindow();
+            // Nothing for the reuse-lock machinery to gain this commit: no
+            // page is already free to hand out (`state.free_pages == 0`) and
+            // no retirement backlog exists to promote (all three heaps
+            // empty, so `drainRetirement` below would immediately break out
+            // of every one of its loops regardless of the frontier it had).
+            // Skip the whole cross-process reuse-lock acquisition --
+            // `acquireDataRewriteLock` plus the reader-epoch scan -- for a
+            // purely additive (append-only) commit; a later commit that
+            // actually retires something (free_pages or any heap becomes
+            // non-empty) stops skipping on its own, so this can never starve
+            // retirement. Never skip while a window from an *outer*,
+            // already-open nested call is live (`reader_window_depth != 0`):
+            // that window is already open for free, so there is no cost to
+            // avoid and no reason to bypass it.
+            const has_retirement_backlog = state.free_pages != 0 or state.heap.count() != 0 or
+                state.metadata_heap.count() != 0 or state.chains_heap.count() != 0;
+            const skip_reuse_lock = !has_retirement_backlog and self.reader_window_depth == 0;
+            const coordinated = if (skip_reuse_lock) false else try self.beginReaderWindow();
             errdefer if (coordinated) self.endReaderWindow();
-            const lock = if (!coordinated) self.acquireEpochReuseLock() catch |err| switch (err) {
+            const lock = if (skip_reuse_lock or coordinated) null else self.acquireEpochReuseLock() catch |err| switch (err) {
                 error.WouldBlock => null,
                 else => return err,
-            } else null;
+            };
             errdefer if (lock) |held| {
                 held.file.close(self.runtimeIo());
                 self.epoch_window = null;
@@ -12787,6 +12896,14 @@ pub const NativeFile = struct {
 
     fn syncIfRequired(self: *NativeFile) !void {
         if (!self.no_sync and self.transaction_header == null) {
+            // WS2: release the caller's lock (if any) for exactly the
+            // durability-barrier syscall -- the one part of a commit slow
+            // enough to be worth not blocking a concurrent reader/writer
+            // for -- and re-acquire it before returning, so every other
+            // NativeFile field this function or its caller touches, before
+            // and after, stays under that lock. See `sync_lock_hooks`.
+            if (self.sync_lock_hooks) |hooks| hooks.release(hooks.context);
+            defer if (self.sync_lock_hooks) |hooks| hooks.reacquire(hooks.context);
             if (self.durability_policy) |policy|
                 try antfly_platform.filesystem.syncData(self.file.handle, policy)
             else
@@ -23110,6 +23227,83 @@ test "lite reader epoch aliases long filenames retain epoch reuse" {
     const captured = (try reader.getDocumentAlloc(a, "doc")).?;
     defer a.free(captured);
     try std.testing.expectEqualSlices(u8, &value, captured);
+}
+
+test "lite reader epoch namespace cache stays stale-safe when a reader registers between commits" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cache-race.aflite");
+    defer a.free(path);
+    // No reader_coordinator on the writer: its only protection against the
+    // reader opened below is the cross-process reader_epochs.zig namespace,
+    // not any in-process Coordinator state a shared coordinator would give
+    // it -- this is the "reader in another process" scenario the cache's
+    // fingerprint fast path has to stay safe against.
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    var value: [8192]u8 = @splat('a');
+    // Build retirement backlog (repeatedly overwriting the same key) so the
+    // writer's reuse-lock path actually runs and caches its namespace while
+    // nobody is registered yet.
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    const opens_before_reader = writer.allocator_work.reader_namespace_opens;
+    try std.testing.expect(opens_before_reader >= 1);
+
+    var reader_coordinator = ReaderCoordinator.init(a, io);
+    defer reader_coordinator.deinit();
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = &reader_coordinator });
+    defer reader.close();
+    try std.testing.expect(reader.reader_fence.?.epoch != null);
+
+    // Nothing rebinds or moves the writer's parent here, so it keeps
+    // reusing the very same cached namespace handle (no new
+    // `reader_epochs.openCached`) -- what must change is that its next
+    // scan notices the new registration through the directory fingerprint
+    // and falls back to a real scan picking it up, rather than trusting a
+    // "nobody registered" view cached from before the reader ever existed.
+    value[0] = 'b';
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    try std.testing.expectEqual(opens_before_reader, writer.allocator_work.reader_namespace_opens);
+    const captured = (try reader.getDocumentAlloc(a, "doc")).?;
+    defer a.free(captured);
+    try std.testing.expectEqual(@as(u8, 'a'), captured[0]);
+}
+
+test "lite reader epoch namespace cache keeps full scans at O(1) across many commits and registered readers" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cache-o1.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    var value: [8192]u8 = @splat('a');
+    try writer.putDocument("doc", &value);
+
+    // Register several independent readers directly against the on-disk
+    // namespace, exactly as separate reader processes would (bypassing any
+    // in-process Coordinator sharing).
+    const epochs = @import("reader_epochs.zig");
+    const inode = (try writer.file.stat(writer.runtime())).inode;
+    var leases: [6]epochs.Lease = undefined;
+    var registered: usize = 0;
+    defer for (leases[0..registered]) |lease| lease.close(a, writer.runtime());
+    for (0..leases.len) |i| {
+        leases[i] = try epochs.register(a, writer.runtime(), path, writer.header.reader_epoch_namespace, inode, writer.activeCheckpoint().commit_sequence, false);
+        registered += 1;
+    }
+
+    for (0..40) |_| try writer.putDocument("doc", &value);
+    // One lifetime open (nothing rebinds or moves the parent), and a small,
+    // bounded number of real scans -- never one per commit (40) and never
+    // scaling with the registered-reader count (6): the fingerprint fast
+    // path must absorb the overwhelming majority of these 40 commits.
+    try std.testing.expectEqual(@as(u64, 1), writer.allocator_work.reader_namespace_opens);
+    try std.testing.expect(writer.allocator_work.reader_namespace_full_scans >= 1);
+    try std.testing.expect(writer.allocator_work.reader_namespace_full_scans < 10);
 }
 
 test "lite reader registration path lease close retains only escaped snapshot protection" {
