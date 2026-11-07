@@ -95,6 +95,7 @@ pub const PublishedArtifacts = struct {
     requested_root: []u8,
     storage_root: []u8,
     physical_root: [:0]u8,
+    physical_root_inode: @FieldType(std.Io.File.Stat, "inode"),
     physical_direct: ?[]u8 = null,
     // A standalone GGUF may be constructed with a directory metadata snapshot.
     // Keep that dependency scope separate from the direct file's own binding.
@@ -109,8 +110,16 @@ pub const PublishedArtifacts = struct {
     canonical_index: std.StringHashMapUnmanaged(usize) = .empty,
 
     pub fn init(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: ?Expected) !PublishedArtifacts {
-        const direct = std.mem.endsWith(u8, root, ".gguf");
-        const storage_root = try managed.publicationRootAlloc(a, io, root);
+        const direct = managed.isDirectModelPath(root);
+        const publication_root = try managed.publicationRootAlloc(a, io, root);
+        defer a.free(publication_root);
+        const standalone = direct and std.mem.eql(u8, publication_root, root);
+        // ONNX external-data locations are relative to the requested graph's
+        // directory, even when the graph itself points at a shared blob.
+        const storage_root = try a.dupe(u8, if (standalone and std.mem.endsWith(u8, root, ".onnx"))
+            std.fs.path.dirname(root) orelse "."
+        else
+            publication_root);
         errdefer a.free(storage_root);
         const requested_root = try absolutePath(a, io, storage_root);
         errdefer a.free(requested_root);
@@ -118,9 +127,9 @@ pub const PublishedArtifacts = struct {
         errdefer if (direct_path) |path| a.free(path);
         const physical_root = try std.Io.Dir.cwd().realPathFileAlloc(io, storage_root, a);
         errdefer a.free(physical_root);
+        const root_stat = try std.Io.Dir.cwd().statFile(io, physical_root, .{ .follow_symlinks = false });
         const physical_direct = if (direct) try managed.resolveRegularFilePath(a, io, root) else null;
         errdefer if (physical_direct) |path| a.free(path);
-        const standalone = direct and std.mem.eql(u8, storage_root, root);
         var receipt = if (standalone) null else try managed.loadValidated(a, io, physical_root);
         errdefer if (receipt) |*value| value.deinit();
         const publication = if (receipt) |value| value.publication_generation else null;
@@ -142,7 +151,7 @@ pub const PublishedArtifacts = struct {
         } else null;
         const verified = try a.alloc(?managed.ArtifactStamp, if (receipt) |value| value.artifacts.len else 0);
         @memset(verified, null);
-        return .{ .allocator = a, .io = io, .root = root, .requested_root = requested_root, .storage_root = storage_root, .physical_root = physical_root, .physical_direct = physical_direct, .direct_path = direct_path, .direct_index = direct_index, .receipt = receipt, .publication = publication, .canonical_index = index, .verified_stamps = verified };
+        return .{ .allocator = a, .io = io, .root = root, .requested_root = requested_root, .storage_root = storage_root, .physical_root = physical_root, .physical_root_inode = root_stat.inode, .physical_direct = physical_direct, .direct_path = direct_path, .direct_index = direct_index, .receipt = receipt, .publication = publication, .canonical_index = index, .verified_stamps = verified };
     }
     pub fn deinit(self: *PublishedArtifacts) void {
         self.allocator.free(self.requested_root);
@@ -389,6 +398,8 @@ pub const PublishedArtifacts = struct {
     }
     pub fn verify(self: *const PublishedArtifacts) !void {
         try self.verifyBinding(self.storage_root, self.physical_root);
+        const root_stat = try std.Io.Dir.cwd().statFile(self.io, self.physical_root, .{ .follow_symlinks = false });
+        if (root_stat.inode != self.physical_root_inode) return error.ModelArtifactsChanging;
         if (self.directory_scope) |root| {
             try self.verifyBinding(root, root);
             const stat = try std.Io.Dir.cwd().statFile(self.io, root, .{});
@@ -1086,5 +1097,61 @@ test "model selection receipt discovery uses the captured root before opening me
     try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
     try tmp.dir.deleteFile(io, "current");
     try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    try artifacts.verify();
+}
+
+test "model selection standalone ONNX scopes unwind allocations and retain file binding" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/graph", .data = "weights" });
+    try tmp.dir.symLink(io, "graph", "model/model.onnx", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/config.json", .data = "{}" });
+    const root = try tmp.dir.realPathFileAlloc(io, "model", a);
+    defer a.free(root);
+    const file = try std.fs.path.join(a, &.{ root, "model.onnx" });
+    defer a.free(file);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, directDirectoryScopeAllocationScenario, .{ file, root });
+    var artifacts = try PublishedArtifacts.init(a, io, file, null);
+    defer artifacts.deinit();
+    const graph = try artifacts.constructionPath(file);
+    defer a.free(graph);
+    try std.testing.expect(std.mem.endsWith(u8, graph, "/model/graph"));
+    const base = try artifacts.constructionPath(root);
+    defer a.free(base);
+    try std.testing.expectEqualStrings(root, base);
+    const parent = std.fs.path.dirname(root).?;
+    try std.testing.expectError(error.ModelArtifactOutsideRoot, artifacts.constructionPath(parent));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/other", .data = "weights" });
+    try tmp.dir.deleteFile(io, "model/model.onnx");
+    try tmp.dir.symLink(io, "other", "model/model.onnx", .{});
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+}
+
+test "model selection direct ONNX receipt authority rejects unlisted and escaping aliases" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.onnx", .data = "weights" });
+    try tmp.dir.symLink(io, "model.onnx", "model/unlisted.onnx", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.onnx", .data = "weights" });
+    try tmp.dir.symLink(io, "../outside.onnx", "model/escape.onnx", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/.antfly-download-complete.json", .data = "{\"version\":2,\"artifacts\":[{\"path\":\"model.onnx\",\"size\":7}]}" });
+    const root = try tmp.dir.realPathFileAlloc(io, "model", a);
+    defer a.free(root);
+    for ([_][]const u8{ "unlisted.onnx", "escape.onnx" }) |name| {
+        const path = try std.fs.path.join(a, &.{ root, name });
+        defer a.free(path);
+        try std.testing.expectError(error.ModelArtifactNotPublished, PublishedArtifacts.init(a, io, path, null));
+    }
+    const path = try std.fs.path.join(a, &.{ root, "model.onnx" });
+    defer a.free(path);
+    var artifacts = try PublishedArtifacts.init(a, io, path, null);
+    defer artifacts.deinit();
+    try std.testing.expect(artifacts.publication != null);
     try artifacts.verify();
 }

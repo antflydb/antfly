@@ -603,11 +603,16 @@ test "validated managed receipt cleans up every allocation failure" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Runner.run, .{model_dir});
 }
 
-/// Direct GGUF files belong to the nearest managed installation, including
+/// Direct model files retain format independently of their physical targets.
+pub fn isDirectModelPath(model: []const u8) bool {
+    return std.mem.endsWith(u8, model, ".gguf") or std.mem.endsWith(u8, model, ".onnx");
+}
+
+/// Direct GGUF and ONNX files belong to the nearest managed installation, including
 /// files reached through symlinks. Preserve the original path for unmanaged
 /// standalone files; callers still fence their own pathname separately.
 pub fn publicationRootAlloc(a: std.mem.Allocator, io: std.Io, model: []const u8) ![]u8 {
-    if (!std.mem.endsWith(u8, model, ".gguf")) return a.dupe(u8, model);
+    if (!isDirectModelPath(model)) return a.dupe(u8, model);
     // Requested ancestors own rejection obligations too: a symlink inside a
     // managed installation cannot borrow a foreign target's publication.
     const requested = try resolveRequestedFilePath(a, io, model);
@@ -631,7 +636,7 @@ pub fn publicationRootAlloc(a: std.mem.Allocator, io: std.Io, model: []const u8)
 /// validation still owns artifact integrity; this token binds its source and
 /// artifact manifest to the generation actually loaded, without hashing weights.
 pub fn publicationGeneration(allocator: std.mem.Allocator, io: std.Io, model: []const u8) !?[32]u8 {
-    const owned_root = if (std.mem.endsWith(u8, model, ".gguf")) try publicationRootAlloc(allocator, io, model) else null;
+    const owned_root = if (isDirectModelPath(model)) try publicationRootAlloc(allocator, io, model) else null;
     defer if (owned_root) |path| allocator.free(path);
     const root = owned_root orelse model;
     const progress = try managedPath(allocator, root, in_progress_filename);
