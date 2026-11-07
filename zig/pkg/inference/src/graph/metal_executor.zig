@@ -1335,6 +1335,16 @@ fn submitSampledPipelineToken(cb: *const ops.ComputeBackend, token: i64, vocab_s
     }
 }
 
+/// A completed A token may make encoded, unsubmitted B unnecessary. The
+/// actual backend must acknowledge cancelling B before its owner flags move.
+fn cancelStoppedPipelineToken(cb: *const ops.ComputeBackend, token: i64, vocab_size: usize, continuation: ?model_runtime.DecodeContinuation) !bool {
+    const policy = continuation orelse return false;
+    if (!policy.stops(token)) return false;
+    if (token < 0 or @as(u64, @intCast(token)) >= vocab_size) return error.InvalidModelOutput;
+    if ((try decoder_gated_runtime.decoderRuntimePipelinedControl(cb, .cancel_pending)) == null) return error.PendingDecodeCancelDeclined;
+    return true;
+}
+
 const RuntimeContext = struct {
     references: std.atomic.Value(usize) = .init(1),
     allocator: std.mem.Allocator,
@@ -1415,6 +1425,9 @@ const RuntimeContext = struct {
         self.moe_runtime.deinit();
         self.moe_runtime = runtime.moe.runtime.MoeRuntime.init(self.allocator, self.shared_moe_cache);
         try self.kv_metadata.reset(&self.kv_storage);
+        // A successful real KV reset supersedes any cancelled successor's
+        // metadata-only append. Failed resets retain its uncertain custody.
+        self.pipelined_kv_advanced_for = null;
         self.mirrored_token_count = 0;
         self.mirrored_kv_view = null;
         self.mirrored_kv_compacted = false;
@@ -1900,6 +1913,19 @@ const RuntimeContext = struct {
         self.pipelined_kv_advanced_for = null;
     }
 
+    /// The submitted current frame still completes normally. A known final
+    /// output needs no successor KV append, encoding, submission or later wait.
+    fn awaitLastPipelinedToken(self: *RuntimeContext) !i64 {
+        const token = (try metal_runtime.decoderRuntimePipelinedAwaitToken(&self.cb)) orelse return error.PendingDecodeAwaitDeclined;
+        self.pipelined_decode_armed = false;
+        self.pipelined_decode_mode = null;
+        self.pipelined_sampling = null;
+        self.pipelined_kv_advanced_for = null;
+        self.noteDecoderRuntimeStateFromCurrentView();
+        if (token < 0 or @as(u64, @intCast(token)) >= self.definition.configuration.value.vocab_size) return error.InvalidModelOutput;
+        return token;
+    }
+
     fn decodeGreedyPipelined(
         self: *RuntimeContext,
         allocator: std.mem.Allocator,
@@ -1964,6 +1990,9 @@ const RuntimeContext = struct {
             self.pipelined_sampling = null;
             self.pipelined_next_position = request.position;
         }
+        if (request.continuation) |policy| {
+            if (policy.isLast()) return try self.awaitLastPipelinedToken();
+        }
         // Pending frame produces the token at position request.position + 1.
         // Speculatively advance KV bookkeeping and encode the next frame with
         // the device-resident token id, then wait the pending frame.
@@ -1987,7 +2016,14 @@ const RuntimeContext = struct {
             &next_step.decode_context,
         )) |token| {
             if (token < 0) return error.InvalidModelOutput;
-            if (metal_runtime.decoderRuntimePipelinedSubmitPending(&self.cb)) {
+            if (try cancelStoppedPipelineToken(&self.cb, token, self.definition.configuration.value.vocab_size, request.continuation)) {
+                self.pipelined_decode_armed = false;
+                self.pipelined_decode_mode = null;
+                self.pipelined_sampling = null;
+                // Same metadata-only speculative append as the existing
+                // cancel path; B never executes or claims written KV rows.
+                self.pipelined_kv_advanced_for = request.position + 1;
+            } else if (metal_runtime.decoderRuntimePipelinedSubmitPending(&self.cb)) {
                 self.pipelined_decode_armed = true;
                 self.pipelined_decode_mode = .greedy;
                 self.pipelined_sampling = null;
@@ -2071,6 +2107,9 @@ const RuntimeContext = struct {
         }
         errdefer self.drainPipelinedDecode();
 
+        if (request.decode.continuation) |policy| {
+            if (policy.isLast()) return try self.awaitLastPipelinedToken();
+        }
         // Encode B while submitted A executes, then wait/read A before B is
         // submitted. The single sampler scratch set is therefore never used
         // by two executing command buffers at once.
@@ -2085,6 +2124,14 @@ const RuntimeContext = struct {
             request.sampling,
             request.token_history,
         )) orelse return error.ResidentSamplingFrameFailed;
+        if (try cancelStoppedPipelineToken(&self.cb, token, self.definition.configuration.value.vocab_size, request.decode.continuation)) {
+            self.pipelined_decode_armed = false;
+            self.pipelined_decode_mode = null;
+            self.pipelined_sampling = null;
+            self.pipelined_kv_advanced_for = request.decode.position + 1;
+            self.noteDecoderRuntimeStateFromCurrentView();
+            return token;
+        }
         try submitSampledPipelineToken(&self.cb, token, self.definition.configuration.value.vocab_size);
         self.pipelined_decode_armed = true;
         self.pipelined_decode_mode = .sampled_nucleus;
@@ -3357,7 +3404,7 @@ test "cached Metal pipelined runtime settles each real request before Engine epo
     const raw = compute.provider_impl.raw_decode_runtime orelse return error.ExpectedActualMetalProvider;
     const prompt = [_]i64{ 1, 2, 3, 4 };
     var first_token: ?i64 = null;
-    for (0..2) |_| {
+    for (0..4) |mode| {
         // Both requests have independent real cleanup epochs and owning Engine
         // scopes. The cached runtime and its KV survive between these scopes.
         var cleanup = try @import("../execution/cleanup_owner.zig").Owner.beginResident(session);
@@ -3371,23 +3418,84 @@ test "cached Metal pipelined runtime settles each real request before Engine epo
         // still retires through this same current owner before Engine cleanup.
         defer instance.finishRequestWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
         try instance.resetWithCleanup(current);
+        try std.testing.expect(physical.pipelined_kv_advanced_for == null);
         _ = try instance.prepare(a, .{ .kv_tokens_hint = 16, .cleanup_epoch = current.boundary, .backend_operation = current.operation });
         const seed = blk: {
             var prefill = try instance.prefill(a, .{ .input_ids = &prompt, .seq_len = prompt.len, .query_seq_len = prompt.len, .attention_mode = .paged_prefill, .cleanup_epoch = current.boundary, .backend_operation = current.operation });
             defer prefill.deinitWithCleanup(a, current);
             break :blk try prefill.greedyTokenWithCleanup(a, config.vocab_size, current);
         };
-        var output = try instance.decodeGreedy(a, .{ .token_id = seed, .position = prompt.len, .cleanup_epoch = current.boundary, .backend_operation = current.operation });
+        // Preserve the old null-policy caller, then run the exact same model
+        // with a known final output and an explicit stop on its observed token.
+        const stop = [_]i32{if (first_token) |value| std.math.cast(i32, value) orelse return error.InvalidModelOutput else -1};
+        const continuation: ?model_runtime.DecodeContinuation = switch (mode) {
+            0, 3 => null,
+            1 => .{ .remaining_tokens = 1 },
+            else => .{ .remaining_tokens = 2, .extra_stop_tokens = &stop },
+        };
+        var output = try instance.decodeGreedy(a, .{ .token_id = seed, .position = prompt.len, .cleanup_epoch = current.boundary, .backend_operation = current.operation, .continuation = continuation });
         defer output.deinitWithCleanup(current);
         if (first_token) |expected| try std.testing.expectEqual(expected, output.token_id) else first_token = output.token_id;
-        // A one-step length limit leaves the speculative successor submitted.
-        // End-of-request settlement must consume that actual CB, not infer
-        // completion from the next Engine's empty provider state.
-        try std.testing.expect(physical.pipelined_decode_armed);
-        try std.testing.expect(metal_runtime.hasSubmittedFrame(raw));
+        if (mode == 0 or mode == 3) {
+            // Including the request AFTER EOS/reset, an old caller submits its speculative successor;
+            // the request finish hook must drain that actual command buffer.
+            try std.testing.expect(physical.pipelined_decode_armed);
+            try std.testing.expect(metal_runtime.hasSubmittedFrame(raw));
+        } else {
+            // Known-last encodes no B. EOS encodes B while A executes but
+            // cancels it before submission, preserving the old append marker.
+            try std.testing.expect(!physical.pipelined_decode_armed);
+            try std.testing.expect(!metal_runtime.hasSubmittedFrame(raw));
+            try std.testing.expect(!metal_runtime.hasActiveFrame(raw));
+            try std.testing.expectEqual(if (mode == 1) @as(?usize, null) else prompt.len + 1, physical.pipelined_kv_advanced_for);
+        }
         try instance.finishRequestWithCleanup(current);
         try std.testing.expect(!physical.pipelined_decode_armed);
         try std.testing.expect(!metal_runtime.hasSubmittedFrame(raw));
         try std.testing.expect(!metal_runtime.hasActiveFrame(raw));
     }
+}
+
+test "terminal pipeline cancels only an actual accepted stop before submit" {
+    const Probe = struct {
+        cancels: usize = 0,
+        submits: usize = 0,
+        decline: bool = false,
+        fail: bool = false,
+        fn decode(raw: *anyopaque, request: *const ops.DecoderRuntimeDecodeRequest) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (request.phase == .cancel_pending) {
+                self.cancels += 1;
+                if (self.fail) return error.InjectedCancelFailure;
+                return !self.decline;
+            }
+            if (request.phase == .submit_pending) {
+                self.submits += 1;
+                return true;
+            }
+            return error.UnexpectedDecodePhase;
+        }
+    };
+    var probe = Probe{};
+    // This protocol test exercises only the control callback. A complete table
+    // avoids undefined required fields; it confers no canonical backend proof.
+    var table = @import("../ops/native_compute.zig").vtable_impl;
+    table.regions.decoder.decode = Probe.decode;
+    const cb = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
+    const extra = [_]i32{ 9, -1 };
+    const policy = model_runtime.DecodeContinuation{ .remaining_tokens = 2, .primary_stop_token = 2, .extra_stop_tokens = &extra };
+    try std.testing.expect(!try cancelStoppedPipelineToken(&cb, 2, 32, null));
+    try std.testing.expect(!try cancelStoppedPipelineToken(&cb, 7, 32, policy));
+    try std.testing.expectEqual(@as(usize, 0), probe.cancels);
+    try std.testing.expect(try cancelStoppedPipelineToken(&cb, 2, 32, policy));
+    try std.testing.expect(try cancelStoppedPipelineToken(&cb, 9, 32, policy));
+    try std.testing.expectEqual(@as(usize, 2), probe.cancels);
+    try std.testing.expectEqual(@as(usize, 0), probe.submits);
+    probe.decline = true;
+    try std.testing.expectError(error.PendingDecodeCancelDeclined, cancelStoppedPipelineToken(&cb, 2, 32, policy));
+    probe.fail = true;
+    try std.testing.expectError(error.InjectedCancelFailure, cancelStoppedPipelineToken(&cb, 9, 32, policy));
+    try std.testing.expectEqual(@as(usize, 0), probe.submits);
+    try std.testing.expectError(error.InvalidModelOutput, cancelStoppedPipelineToken(&cb, 9, 8, policy));
+    try std.testing.expectEqual(@as(usize, 4), probe.cancels);
 }

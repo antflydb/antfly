@@ -2074,6 +2074,8 @@ fn cudaEncoderWorkspace(sequence: usize, batch: usize) !usize {
 /// inspected without decoding. Unknown audio retains its bounded decode peak.
 fn cudaGroupRequest(group: Group, options: Options) !@import("../backends/session.zig").RunRequest {
     var tokens: usize = 128;
+    // Ordered content emits one separator between parts before tokenization.
+    tokens = try std.math.add(usize, tokens, group.content.len -| 1);
     if (group.title) |title| tokens = try std.math.add(usize, tokens, title.len);
     var input: usize = 0;
     var host: usize = 64 * 1024 * 1024;
@@ -2250,6 +2252,7 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
             try rendered.appendSlice(a, titled);
         } else try rendered.appendSlice(a, prefix);
     }
+    var ordered = try @import("embedding_gemma2_content.zig").OrderedText.init(&rendered, a, "", false);
     var media = std.ArrayListUnmanaged(SoftTokens).empty;
     defer {
         for (media.items) |item| {
@@ -2262,7 +2265,7 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
     var used_prefetch = false;
     for (group.content, 0..) |part, index| {
         try effective.check();
-        if (index > 0) try rendered.append(a, '\n');
+        try ordered.beginPart();
         switch (part) {
             .text => |text| try rendered.appendSlice(a, text),
             inline .video, .sampled_video => |payload| {
@@ -4900,6 +4903,11 @@ test "embeddinggemma2 NVDEC cache admission policy is linked on portable hosts" 
 }
 
 test "embeddinggemma2 CUDA header admission scales text instead of reserving max tokens" {
+    const split = try cudaGroupRequest(.{ .content = &.{ .{ .text = "hello" }, .{ .text = "world" } } }, .{});
+    const joined = try cudaGroupRequest(.{ .content = &.{.{ .text = "hello\nworld" }} }, .{});
+    try std.testing.expectEqual(joined.sequence, split.sequence);
+    try std.testing.expectEqual(joined.workspace_bytes, split.workspace_bytes);
+    try std.testing.expectEqual(joined.input_bytes - 1, split.input_bytes);
     const short = try cudaGroupRequest(.{ .content = &.{.{ .text = "hello" }} }, .{});
     const text: [2048]u8 = @splat('a');
     const long = try cudaGroupRequest(.{ .content = &.{.{ .text = &text }} }, .{});

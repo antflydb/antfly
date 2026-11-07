@@ -1,6 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
+#include <cuda_bf16.h>
 
 // Native warp/block policy. Callers retain their own shared storage and exact
 // load/store stages; no model identity or runtime program interpreter is used.
@@ -135,3 +136,10 @@ __device__ __forceinline__ void antfly_row_layer_norm(
     for(unsigned int d=blockDim.x/2;d>=32;d>>=1){__syncthreads();if(lane<d){Reduce}} \
     Reload \
     for(int d=16;d>0;d>>=1){Shuffle}
+
+// A BF16 attention value GEMM consumes unnormalized softmax weights in BF16;
+// its normalization denominator remains F32. Keep this storage boundary typed
+// and shared by scalar/tail and tensor-core traversals.
+__device__ __forceinline__ __nv_bfloat16 antfly_attention_probability_bf16(float probability) {
+    return __float2bfloat16_rn(probability);
+}

@@ -699,6 +699,32 @@ pub const PrefillRequest = struct {
     }
 };
 
+/// Borrowed task decision for this synchronous decode call only. Backends may
+/// omit an unneeded successor, but never retain this view or infer completion
+/// of numerical work from it. Null on DecodeRequest preserves lookahead.
+pub const DecodeContinuation = struct {
+    remaining_tokens: usize,
+    primary_stop_token: i32 = -1,
+    extra_stop_tokens: []const i32 = &.{},
+
+    pub fn check(self: DecodeContinuation) !void {
+        if (self.remaining_tokens == 0) return error.InvalidDecodeContinuation;
+    }
+
+    pub fn isLast(self: DecodeContinuation) bool {
+        return self.remaining_tokens == 1;
+    }
+
+    pub fn stops(self: DecodeContinuation, token: i64) bool {
+        if (token < 0) return false;
+        if (self.primary_stop_token >= 0 and token == self.primary_stop_token) return true;
+        for (self.extra_stop_tokens) |stop| {
+            if (stop >= 0 and token == stop) return true;
+        }
+        return false;
+    }
+};
+
 pub const DecodeRequest = struct {
     cleanup_epoch: ?*const @import("../execution/retirement_sink.zig").Epoch = null,
     backend_operation: ?@import("../execution/backend_operation.zig").Borrowed = null,
@@ -708,8 +734,12 @@ pub const DecodeRequest = struct {
     position: usize,
     attention_mode: cache_mod.AttentionMode = .paged_decode,
 
+    /// Valid only during the current numerical call; never cached by a runtime.
+    continuation: ?DecodeContinuation = null,
+
     pub fn check(self: DecodeRequest) !void {
         if (self.execution_control) |control| try control.check();
+        if (self.continuation) |policy| try policy.check();
     }
 };
 
@@ -1613,4 +1643,18 @@ test "model request finish preserves actual operation epoch and uncertain state 
 test "model request finish metadata ownership survives allocation failures" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, modelRequestFinishCase, .{});
+}
+
+test "decode continuation is lexical and invalid geometry refuses before runtime dispatch" {
+    const extras = [_]i32{ 3, -1, 17 };
+    const policy = DecodeContinuation{ .remaining_tokens = 2, .primary_stop_token = 2, .extra_stop_tokens = &extras };
+    try policy.check();
+    try std.testing.expect(!policy.isLast());
+    for ([_]i64{ 2, 3, 17 }) |token| try std.testing.expect(policy.stops(token));
+    for ([_]i64{ -1, 0, 4, 18 }) |token| try std.testing.expect(!policy.stops(token));
+    const old = DecodeRequest{ .token_id = 1, .position = 0 };
+    try old.check();
+    try std.testing.expect(old.continuation == null);
+    const invalid = DecodeRequest{ .token_id = 1, .position = 0, .continuation = .{ .remaining_tokens = 0 } };
+    try std.testing.expectError(error.InvalidDecodeContinuation, invalid.check());
 }

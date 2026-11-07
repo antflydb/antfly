@@ -392,23 +392,45 @@ extern "C" __global__ void termite_embedding_gemma2_attention_bf16(
     for (unsigned int n = 0; n < 16; ++n) accum[n] = 0.0f;
     float max_score = -INFINITY, denominator = 0.0f;
     size_t qb = (((size_t)b * seq + query) * q_heads + qh) * dim;
-    for (unsigned int j = begin; j < end; ++j) {
-        if (mask && mask[(size_t)b * seq + j] == 0) continue;
-        size_t kb = (((size_t)b * seq + j) * kv_heads + kvh) * dim;
-        float dot = 0.0f;
-        for (unsigned int d = lane; d < dim; d += 32u)
-            dot += __bfloat162float(q[qb + d]) * __bfloat162float(k[kb + d]);
-        dot = antfly_row_warp_sum(dot);
-        dot = __shfl_sync(0xffffffffu, dot, 0);
-        float next_max = fmaxf(max_score, dot);
-        float prior_scale = isfinite(max_score) ? expf(max_score - next_max) : 0.0f;
-        float probability = expf(dot - next_max);
-        denominator = denominator * prior_scale + probability;
-        max_score = next_max;
+    // Match the tensor-core traversal's BF16 probability-store boundary.
+    // The row maximum is fixed across each 16-key value tile before rounding
+    // its unnormalized probabilities; the denominator retains original F32 p.
+    // Sixteen logits live in one F32 register per warp lane; the value pass
+    // shuffles their exact computed bits without rereading Q/K or allocating.
+    constexpr unsigned int KT = 16;
+    const unsigned int first_tile = (begin / KT) * KT;
+    for (unsigned int kt = first_tile; kt < end; kt += KT) {
+        float tile_max = -INFINITY;
+        float stored_score = -INFINITY;
+        for (unsigned int j = max(begin, kt); j < min(end, kt + KT); ++j) {
+            if (mask && mask[(size_t)b * seq + j] == 0) continue;
+            size_t kb = (((size_t)b * seq + j) * kv_heads + kvh) * dim;
+            float dot = 0.0f;
+            for (unsigned int d = lane; d < dim; d += 32u)
+                dot += __bfloat162float(q[qb + d]) * __bfloat162float(k[kb + d]);
+            dot = antfly_row_warp_sum(dot);
+            dot = __shfl_sync(0xffffffffu, dot, 0);
+            if (lane == j - kt) stored_score = dot;
+            tile_max = fmaxf(tile_max, dot);
+        }
+        const float next_max = fmaxf(max_score, tile_max);
+        const float prior_scale = isfinite(max_score) ? expf(max_score - next_max) : 0.0f;
+        denominator *= prior_scale;
         #pragma unroll
-        for (unsigned int n = 0; n < 16; ++n) {
-            unsigned int d = lane + n * 32u;
-            if (d < dim) accum[n] = accum[n] * prior_scale + probability * __bfloat162float(v[kb + d]);
+        for (unsigned int n = 0; n < 16; ++n) accum[n] *= prior_scale;
+        max_score = next_max;
+        for (unsigned int j = max(begin, kt); j < min(end, kt + KT); ++j) {
+            if (mask && mask[(size_t)b * seq + j] == 0) continue;
+            size_t kb = (((size_t)b * seq + j) * kv_heads + kvh) * dim;
+            const float dot = __shfl_sync(0xffffffffu, stored_score, j - kt);
+            const float probability = expf(dot - next_max);
+            denominator += probability;
+            const float value_probability = __bfloat162float(antfly_attention_probability_bf16(probability));
+            #pragma unroll
+            for (unsigned int n = 0; n < 16; ++n) {
+                unsigned int d = lane + n * 32u;
+                if (d < dim) accum[n] += value_probability * __bfloat162float(v[kb + d]);
+            }
         }
     }
     #pragma unroll
@@ -523,7 +545,7 @@ extern "C" __global__ __launch_bounds__(512, 2) void termite_embedding_gemma2_at
             const float next_max = fmaxf(old_max, tile_max);
             const float a = isfinite(old_max) ? expf(old_max - next_max) : 0.0f;
             const float p = isfinite(score) ? expf(score - next_max) : 0.0f;
-            probs[row * KT + col] = __float2bfloat16_rn(p);
+            probs[row * KT + col] = antfly_attention_probability_bf16(p);
             float tile_sum = p;
             #pragma unroll
             for (unsigned offset = KT / 2; offset != 0; offset >>= 1)

@@ -91,6 +91,26 @@ const Media = struct {
     }
 };
 
+/// Canonical ordered-content text reception shared by host and CUDA serving.
+/// A task prefix precedes the complete content whenever any text is present;
+/// emitted parts are separated by exactly one newline. Media-only input has no
+/// task prefix. Explicit manual-marker attachments do not emit a second part.
+pub const OrderedText = struct {
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    emitted: usize = 0,
+
+    pub fn init(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, prefix: []const u8, has_text: bool) !OrderedText {
+        if (has_text) try out.appendSlice(allocator, prefix);
+        return .{ .out = out, .allocator = allocator };
+    }
+
+    pub fn beginPart(self: *OrderedText) !void {
+        if (self.emitted != 0) try self.out.append(self.allocator, '\n');
+        self.emitted += 1;
+    }
+};
+
 fn appendRepeated(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: []const u8, count: usize) !void {
     const additional = std.math.mul(usize, value.len, count) catch return error.EmbeddingSequenceTooLong;
     try out.ensureUnusedCapacity(allocator, additional);
@@ -301,14 +321,15 @@ fn prepareImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok: Tok
     @memset(used, false);
     var media_order: std.ArrayListUnmanaged(Media) = .empty;
     defer media_order.deinit(allocator);
-    var prefixed = false;
+    var has_text = false;
+    for (parts) |part| if (part == .text) {
+        has_text = true;
+    };
+    var ordered = try OrderedText.init(&rendered, allocator, prefix, has_text);
     var automatic_media_index: usize = 0;
     for (parts) |part| switch (part) {
         .text => |text| {
-            if (!prefixed) {
-                try rendered.appendSlice(allocator, prefix);
-                prefixed = true;
-            }
+            try ordered.beginPart();
             if (manual_markers)
                 try appendTextWithManualMarkers(&rendered, allocator, text, media.items, used, &media_order)
             else
@@ -318,6 +339,7 @@ fn prepareImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok: Tok
             const item = media.items[automatic_media_index];
             automatic_media_index += 1;
             if (!manual_markers) {
+                try ordered.beginPart();
                 used[automatic_media_index - 1] = true;
                 try appendMediaText(&rendered, allocator, item.kind, item.tokens);
                 try media_order.append(allocator, item);
@@ -563,4 +585,86 @@ test "embeddinggemma2 CUDA resident ordered composition matches legacy BF16 boun
     defer a.free(values);
     try std.testing.expectEqual(expected.input_embeddings.len, values.len);
     for (expected.input_embeddings, values) |want, got| try std.testing.expectEqual(@as(u32, @bitCast(roundToBfloat16(want))), @as(u32, @bitCast(roundToBfloat16(got))));
+}
+
+fn orderedRenderingCase(a: std.mem.Allocator) !void {
+    const prefix = "title: none | text: ";
+    const cases = [_]struct { parts: []const []const u8, has_text: bool, expected: []const u8 }{
+        .{ .parts = &.{ "Describe this image.", "<|image><|image|><image|>" }, .has_text = true, .expected = "title: none | text: Describe this image.\n<|image><|image|><image|>" },
+        .{ .parts = &.{ "<|image><|image|><image|>", "Describe this image." }, .has_text = true, .expected = "title: none | text: <|image><|image|><image|>\nDescribe this image." },
+        .{ .parts = &.{ "Describe these inputs.", "<|audio><|audio|><audio|>", "<|image><|image|><image|>" }, .has_text = true, .expected = "title: none | text: Describe these inputs.\n<|audio><|audio|><audio|>\n<|image><|image|><image|>" },
+        .{ .parts = &.{"one text"}, .has_text = true, .expected = "title: none | text: one text" },
+        .{ .parts = &.{"<|image><|image|><image|>"}, .has_text = false, .expected = "<|image><|image|><image|>" },
+        .{ .parts = &.{"<|audio><|audio|><audio|>"}, .has_text = false, .expected = "<|audio><|audio|><audio|>" },
+    };
+    for (cases) |case| {
+        var actual: std.ArrayListUnmanaged(u8) = .empty;
+        defer actual.deinit(a);
+        var rendered = try OrderedText.init(&actual, a, prefix, case.has_text);
+        for (case.parts) |part| {
+            try rendered.beginPart();
+            try actual.appendSlice(a, part);
+        }
+        try std.testing.expectEqualStrings(case.expected, actual.items);
+        // Independent original host renderer: prefix once, then join in order.
+        var original: std.ArrayListUnmanaged(u8) = .empty;
+        defer original.deinit(a);
+        if (case.has_text) try original.appendSlice(a, prefix);
+        for (case.parts, 0..) |part, index| {
+            if (index > 0) try original.append(a, '\n');
+            try original.appendSlice(a, part);
+        }
+        try std.testing.expectEqualSlices(u8, original.items, actual.items);
+    }
+}
+
+test "embeddinggemma2 ordered content rendering preserves task prefix and processor separators" {
+    try orderedRenderingCase(std.testing.allocator);
+}
+
+test "embeddinggemma2 ordered content rendering unwinds every allocation failure" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, orderedRenderingCase, .{});
+}
+
+// These immutable IDs are the original independent processor corpus, not
+// generated from this renderer or rewritten after the observed CUDA mismatch.
+test "embeddinggemma2 ordered content matches pinned processor mixed token IDs" {
+    const model = @import("antfly_platform").env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const tokenizer_path = try std.fs.path.join(a, &.{ model, "tokenizer.json" });
+    defer a.free(tokenizer_path);
+    const bytes = try @import("../util/c_file.zig").readFile(a, tokenizer_path);
+    defer a.free(bytes);
+    const hf = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, bytes);
+    defer hf.deinitSelf();
+    const cases = [_]struct { kind: enum { text_image, image_text, mixed }, ids: []const i64 }{
+        .{ .kind = .text_image, .ids = &([_]i64{ 2, 3250, 236787, 7293, 1109, 1816, 236787, 54234, 672, 2471, 236761, 107, 255999 } ++ @as([260]i64, @splat(258880)) ++ [_]i64{ 258882, 1 }) },
+        .{ .kind = .image_text, .ids = &([_]i64{ 2, 3250, 236787, 7293, 1109, 1816, 236787, 236743, 255999 } ++ @as([260]i64, @splat(258880)) ++ [_]i64{ 258882, 107, 82858, 672, 2471, 236761, 1 }) },
+        .{ .kind = .mixed, .ids = &([_]i64{ 2, 3250, 236787, 7293, 1109, 1816, 236787, 54234, 1239, 9103, 236761, 107, 256000 } ++ @as([25]i64, @splat(258881)) ++ [_]i64{ 258883, 107, 255999 } ++ @as([260]i64, @splat(258880)) ++ [_]i64{ 258882, 1 }) },
+    };
+    for (cases) |case| {
+        var rendered: std.ArrayListUnmanaged(u8) = .empty;
+        defer rendered.deinit(a);
+        var ordered = try OrderedText.init(&rendered, a, "title: none | text: ", true);
+        if (case.kind != .image_text) {
+            try ordered.beginPart();
+            try rendered.appendSlice(a, if (case.kind == .mixed) "Describe these inputs." else "Describe this image.");
+        }
+        if (case.kind == .mixed) {
+            try ordered.beginPart();
+            try appendMediaText(&rendered, a, .audio, 25);
+        }
+        try ordered.beginPart();
+        try appendMediaText(&rendered, a, .image, 260);
+        if (case.kind == .image_text) {
+            try ordered.beginPart();
+            try rendered.appendSlice(a, "Describe this image.");
+        }
+        const ids = try hf.tokenizer().encode(a, rendered.items);
+        defer a.free(ids);
+        try std.testing.expectEqual(@as(i64, bos_token_id), case.ids[0]);
+        try std.testing.expectEqual(@as(i64, eos_token_id), case.ids[case.ids.len - 1]);
+        try std.testing.expectEqual(case.ids.len - 2, ids.len);
+        for (case.ids[1 .. case.ids.len - 1], ids) |expected, actual| try std.testing.expectEqual(expected, @as(i64, actual));
+    }
 }

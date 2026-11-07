@@ -1847,3 +1847,135 @@ test "embeddinggemma2 CUDA nonzero contrastive objective and both VJPs match ind
         }
     }
 }
+
+test "CUDA BF16 attention stores unnormalized probabilities before value multiplication" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    const a = std.testing.allocator;
+    var module = try Module.init(&ctx);
+    defer module.deinit(&ctx);
+    const Round = struct {
+        fn bf16(input: f64) u16 {
+            const f: f32 = @floatCast(input);
+            const bits: u32 = @bitCast(f);
+            return @truncate((bits +% (0x7fff + ((bits >> 16) & 1))) >> 16);
+        }
+        fn value(bits: u16) f64 {
+            const f: f32 = @bitCast(@as(u32, bits) << 16);
+            return f;
+        }
+    };
+    for ([_]u32{ 15, 65, 577 }) |sequence| for ([_]u32{ 0, 7, 512 }) |radius| {
+        if (sequence == 577 and radius != 512) continue;
+        const local = radius != 0;
+        const shape = Attention{ .batch = 1, .seq = sequence, .q_heads = 4, .kv_heads = if (local) 2 else 1, .head_dim = if (local) 256 else 512, .local_radius = radius };
+        const q_count = @as(usize, sequence) * shape.q_heads * shape.head_dim;
+        const kv_count = @as(usize, sequence) * shape.kv_heads * shape.head_dim;
+        const host_q = try a.alloc(u16, q_count);
+        defer a.free(host_q);
+        const host_k = try a.alloc(u16, kv_count);
+        defer a.free(host_k);
+        const host_v = try a.alloc(u16, kv_count);
+        defer a.free(host_v);
+        const masks = try a.alloc(i64, sequence);
+        defer a.free(masks);
+        @memset(host_q, 0);
+        @memset(host_k, 0);
+        for (0..sequence) |row| {
+            masks[row] = @intFromBool(row % 7 != 3);
+            for (0..shape.q_heads) |head| host_q[(row * shape.q_heads + head) * shape.head_dim] = Round.bf16(1);
+            for (0..shape.kv_heads) |head| {
+                host_k[(row * shape.kv_heads + head) * shape.head_dim] = Round.bf16(@as(f64, @floatFromInt(@as(i32, @intCast(row % 11)) - 5)) / 4);
+                for (0..shape.head_dim) |d| host_v[(row * shape.kv_heads + head) * shape.head_dim + d] = Round.bf16(@as(f64, @floatFromInt(@as(i32, @intCast((3 * row + 7 * d) % 17)) - 8)) / 8);
+            }
+        }
+        var q = try Buffer.alloc(&ctx, q_count * 2);
+        defer q.free(&ctx);
+        var k = try Buffer.alloc(&ctx, kv_count * 2);
+        defer k.free(&ctx);
+        var v = try Buffer.alloc(&ctx, kv_count * 2);
+        defer v.free(&ctx);
+        var mask = try Buffer.alloc(&ctx, masks.len * @sizeOf(i64));
+        defer mask.free(&ctx);
+        var output = try Buffer.alloc(&ctx, q_count * 2);
+        defer output.free(&ctx);
+        try q.copyFromHost(&ctx, std.mem.sliceAsBytes(host_q));
+        try k.copyFromHost(&ctx, std.mem.sliceAsBytes(host_k));
+        try v.copyFromHost(&ctx, std.mem.sliceAsBytes(host_v));
+        try mask.copyFromHost(&ctx, std.mem.sliceAsBytes(masks));
+        const actual = try a.alloc(u16, q_count);
+        defer a.free(actual);
+        const selected_queries = [_]u32{ 0, 3, 288, 575, 576 };
+        const untouched = Round.bf16(17);
+        if (sequence == 577) {
+            @memset(actual, untouched);
+            try output.copyFromHost(&ctx, std.mem.sliceAsBytes(actual));
+            // Exercise the SAME production scalar/tail entry and ABI without
+            // executing an unnecessary full O(sequence^2) diagnostic sweep.
+            for (selected_queries) |query| {
+                var pointers = [_]u64{ output.ptr, q.ptr, k.ptr, v.ptr, mask.ptr };
+                var b: u32 = 1;
+                var seq = sequence;
+                var qh = shape.q_heads;
+                var kh = shape.kv_heads;
+                var dim = shape.head_dim;
+                var window = radius;
+                var offset = query;
+                var args = [_]?*anyopaque{ &pointers[0], &pointers[1], &pointers[2], &pointers[3], &pointers[4], &b, &seq, &qh, &kh, &dim, &window, &offset };
+                try launch(&ctx, module.attention, &args, .{ 1, shape.q_heads, 1 }, .{ 32, 1, 1 });
+            }
+        } else try module.launchAttention(&ctx, output, q, k, v, mask, shape);
+        try output.copyToHost(&ctx, std.mem.sliceAsBytes(actual));
+        try ctx.synchronize();
+        var distinct_from_f32 = false;
+        // Independent F64 scalar oracle: exact constructed QK logits, explicit
+        // BF16 value-store node, F32-represented V, and final BF16 output.
+        // This has no dependency on the CUDA traversal/reduction implementation.
+        if (sequence == 577) for (0..sequence) |query| {
+            if (std.mem.indexOfScalar(u32, &selected_queries, @intCast(query)) == null)
+                for (actual[query * shape.q_heads * shape.head_dim ..][0 .. shape.q_heads * shape.head_dim]) |value| try std.testing.expectEqual(untouched, value);
+        };
+        for (0..sequence) |query| for (0..shape.head_dim) |d| {
+            if (sequence == 577 and std.mem.indexOfScalar(u32, &selected_queries, @intCast(query)) == null) continue;
+            const begin = if (radius != 0) query -| radius else 0;
+            const limit = if (radius != 0) @min(@as(usize, sequence), query + radius + 1) else sequence;
+            var numerator: f64 = 0;
+            var unrounded_numerator: f64 = 0;
+            var denominator: f64 = 0;
+            var maximum: f64 = -std.math.inf(f64);
+            var start: usize = begin / 16 * 16;
+            while (start < limit) : (start += 16) {
+                const first = @max(begin, start);
+                const end = @min(limit, start + 16);
+                var next = maximum;
+                for (first..end) |row| if (masks[row] != 0) {
+                    next = @max(next, @as(f64, @floatFromInt(@as(i32, @intCast(row % 11)) - 5)) / 4);
+                };
+                const scale = if (std.math.isFinite(maximum)) @exp(maximum - next) else 0;
+                numerator *= scale;
+                unrounded_numerator *= scale;
+                denominator *= scale;
+                maximum = next;
+                for (first..end) |row| if (masks[row] != 0) {
+                    const score = @as(f64, @floatFromInt(@as(i32, @intCast(row % 11)) - 5)) / 4;
+                    const probability = @exp(score - maximum);
+                    const value = @as(f64, @floatFromInt(@as(i32, @intCast((3 * row + 7 * d) % 17)) - 8)) / 8;
+                    numerator += Round.value(Round.bf16(probability)) * value;
+                    unrounded_numerator += probability * value;
+                    denominator += probability;
+                };
+            }
+            const expected = Round.bf16(numerator / denominator);
+            distinct_from_f32 = distinct_from_f32 or expected != Round.bf16(unrounded_numerator / denominator);
+            for (0..shape.q_heads) |head| {
+                const want = if (masks[query] != 0) expected else @as(u16, 0);
+                try std.testing.expectEqual(want, actual[(query * shape.q_heads + head) * shape.head_dim + d]);
+            }
+        };
+        try std.testing.expect(distinct_from_f32);
+    };
+}

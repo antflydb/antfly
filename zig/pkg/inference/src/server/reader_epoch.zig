@@ -677,6 +677,59 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 .phase_wake_io = if (ctx.worker_io) |*owner| owner.io() else null,
             };
         }
+        /// Stack-local diagnostic interval. Start owns the caller's actual
+        /// step; finish rejoins that SAME epoch before its PAGE/pool can retire.
+        pub const CudaRequestProfile = struct {
+            before: ?session_factory.CudaRuntimeStats = null,
+
+            pub fn finish(self: *CudaRequestProfile, ctx: *LightOnStreamContext, complete: bool) void {
+                if (comptime build_options.enable_cuda) {
+                    const before = self.before orelse return;
+                    self.before = null;
+                    ctx.lockStepForCleanup();
+                    defer ctx.unlockStep();
+                    const cb = if (ctx.cb) |*value| value else {
+                        std.log.warn("cuda_read_profile: status=unavailable reason=MissingReaderBackend", .{});
+                        return;
+                    };
+                    const after = @import("../ops/cuda/cuda_compute.zig").CudaCompute.drainProfileSnapshot(cb, .{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() }) catch |err| {
+                        std.log.warn("cuda_read_profile: status=unavailable reason={s} request_outcome={s}", .{ @errorName(err), if (complete) "complete" else "partial" });
+                        return;
+                    };
+                    // Ring-full automatic drains may have failed BEFORE the
+                    // successful final drain. Never publish their zeros as time.
+                    if (after.profile_collection_failures == std.math.maxInt(usize) or after.profile_collection_failures != before.profile_collection_failures) {
+                        std.log.warn("cuda_read_profile: status=unavailable reason=CudaProfileCollectionIncomplete request_outcome={s}", .{if (complete) "complete" else "partial"});
+                        return;
+                    }
+                    // A peer may have shared the resident epoch during a yield.
+                    // Never describe those aggregate counters as one request.
+                    platform.sync.lockYielding(&ctx.controls_mutex);
+                    const exclusive = ctx.registered_window_peak == 1;
+                    ctx.controls_mutex.unlock();
+                    const delta = session_factory.cudaStatsDelta(after, before);
+                    var lines: [1536]u8 = undefined;
+                    const decode = session_factory.formatCudaDecodeProfileLine(lines[0..768], delta);
+                    const prefill = session_factory.formatCudaPrefillProfileLine(lines[768..], delta);
+                    // One log record binds BOTH category sets to this scope/id;
+                    // another model's epoch cannot interleave their provenance.
+                    std.log.info("cuda_read_profile: scope={s} status=observed request_outcome={s} execution_id={d} {s} {s}", .{ if (exclusive) "request" else "shared_epoch_interval", if (complete) "complete" else "partial", ctx.execution_id, decode, prefill });
+                }
+            }
+        };
+
+        /// Called only with the initialized resident backend and step already
+        /// owned. Draining first excludes cold preparation and older references.
+        pub fn beginCudaRequestProfile(ctx: *LightOnStreamContext) !CudaRequestProfile {
+            if (comptime build_options.enable_cuda) {
+                if (!session_factory.cudaOpProfileLoggingEnabled()) return .{};
+                const cb = if (ctx.cb) |*value| value else return error.MissingReaderBackend;
+                if (cb.kind() != .cuda) return .{};
+                return .{ .before = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.drainProfileSnapshot(cb, .{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() }) };
+            }
+            return .{};
+        }
+
         pub fn lockStep(ctx: *LightOnStreamContext, control: InferenceExecutionControl) !void {
             try ctx.pageAccess(control, true).acquire();
             ctx.invalidateCudaDecodeGraph();
@@ -1683,4 +1736,13 @@ test "reader unpublished creator page and SharedPeaks preserve exact quota throu
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Oom.run, .{});
     try coldCreatorPageCase(std.testing.allocator, true, false);
     try coldCreatorPageCase(std.testing.allocator, false, true);
+}
+
+test "reader CUDA request profile disabled finish never touches retired epoch metadata" {
+    const Context = Epoch(struct {}, struct {});
+    var profile = Context.CudaRequestProfile{};
+    const unavailable: *Context = @ptrFromInt(16);
+    profile.finish(unavailable, true);
+    profile.finish(unavailable, false);
+    try std.testing.expect(profile.before == null);
 }

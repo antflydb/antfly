@@ -1601,6 +1601,8 @@ pub const RuntimeStats = struct {
     gated_down_fused_q4_0_tile16: usize = 0,
     gated_down_fused_q4: usize = 0,
     gated_down_fallbacks: usize = 0,
+    /// Cumulative collection failures, including automatic mid-request drains.
+    profile_collection_failures: usize = 0,
     decode_profile_events: usize = 0,
     decode_profile_qkv_us: u64 = 0,
     decode_profile_gqa_attention_us: u64 = 0,
@@ -8515,6 +8517,22 @@ pub const CudaCompute = struct {
             self.kernels.im2col_nct_k3_s1_p1_f32 == null or self.kernels.im2col_ntc_k3_s1_p1_f32 == null or
             self.kernels.im2col_nct_k3_s2_p1_f32 == null or self.kernels.im2col_ntc_k3_s2_p1_f32 == null)) return error.CudaKernelUnavailable;
         self.runtime_policy.seq2seq = policy;
+    }
+
+    /// Synchronous diagnostics borrow the actual receiver and current operation.
+    /// No alternate backend or saved cleanup capability is manufactured here.
+    pub fn drainProfileSnapshot(cb: *const ops.ComputeBackend, current: CacheCleanup) !RuntimeStats {
+        if (cb.vtable != &vtable and cb.vtable != &scoped_run_budget_vtable)
+            return error.UnsupportedCudaProfileBackend;
+        if (current.boundary == null) return error.MissingCurrentCleanupEpoch;
+        _ = try current.operationFor(cb);
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active)
+            return error.CudaProfileCaptureActive;
+        const failures_before = self.stats.profile_collection_failures;
+        drainCudaProfile(self);
+        if (self.stats.profile_collection_failures == std.math.maxInt(usize) or self.stats.profile_collection_failures != failures_before) return error.CudaProfileCollectionIncomplete;
+        return self.snapshotStats();
     }
 
     pub fn snapshotStats(self: *const CudaCompute) RuntimeStats {
@@ -15642,6 +15660,7 @@ pub fn drainCudaProfile(self: *CudaCompute) void {
     // One stream sync guarantees every recorded start/end event has completed,
     // so the whole batch reads back without per-op synchronization.
     self.ctx.synchronize() catch {
+        self.stats.profile_collection_failures +|= 1;
         // Sync failed: timings are untrustworthy, so recycle without counting.
         for (self.profile_pool.pending[0..self.profile_pool.pending_count]) |entry| {
             recycleProfileSlot(self, entry.slot);
@@ -15650,7 +15669,10 @@ pub fn drainCudaProfile(self: *CudaCompute) void {
         return;
     };
     for (self.profile_pool.pending[0..self.profile_pool.pending_count]) |entry| {
-        const elapsed_us = self.ctx.readProfileEventPairUs(self.profile_pool.pairs[entry.slot]) catch 0;
+        const elapsed_us = self.ctx.readProfileEventPairUs(self.profile_pool.pairs[entry.slot]) catch failed: {
+            self.stats.profile_collection_failures +|= 1;
+            break :failed 0; // Preserve the original generic counter/zero behavior.
+        };
         switch (entry.kind) {
             .prefill => |cat| notePrefillProfileUs(self, cat, elapsed_us),
             .decode => |cat| noteDecodeProfileUs(self, cat, elapsed_us),
@@ -54988,4 +55010,97 @@ test "CUDA refuses Native declared multiquery attention before opaque provider o
     const functions = vtable.kernels.?;
     try std.testing.expect(!try functions.runAssignedKernel.?(foreign_context, .{ .descriptor = &descriptor, .inputs = &.{} }));
     try std.testing.expect(!physicalReplayKernelSupportedOp(foreign_context, &descriptor));
+}
+
+test "CUDA profile snapshot refuses copied tables and missing live cleanup before opaque access" {
+    var copied = vtable;
+    copied.operation_services = null;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&vtable));
+    const unknown = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    try std.testing.expectError(error.UnsupportedCudaProfileBackend, CudaCompute.drainProfileSnapshot(&unknown, .{}));
+    const canonical = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &vtable };
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, CudaCompute.drainProfileSnapshot(&canonical, .{}));
+    const Sink = @import("../../execution/retirement_sink.zig");
+    var root = try Sink.Ref.create();
+    defer root.release();
+    var guard = try root.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    try std.testing.expectError(error.BackendCleanupAuthorityRequired, CudaCompute.drainProfileSnapshot(&canonical, .{ .boundary = &epoch }));
+    const metadata = @import("../../execution/backend_operation.zig").Borrowed{
+        .context = @ptrFromInt(16),
+        .nonce = 1,
+        .mode = .metadata,
+        .vtable = undefined, // metadata is rejected before any token callback
+    };
+    try std.testing.expectError(error.BackendCleanupNumericalAuthorityRequired, CudaCompute.drainProfileSnapshot(&canonical, .{ .boundary = &epoch, .operation = metadata }));
+}
+
+test "CUDA profile failures remain visible after a later successful collection" {
+    const Mock = struct {
+        var fail_read = true;
+        fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn sync(_: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn elapsed(out: *f32, _: driver_mod.CUevent, _: driver_mod.CUevent) callconv(.c) driver_mod.CUresult {
+            if (fail_read) return 1; // CUDA_ERROR_INVALID_VALUE
+            out.* = 1;
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn text(_: driver_mod.CUresult, out: *?[*:0]const u8) callconv(.c) driver_mod.CUresult {
+            out.* = "injected profile read failure";
+            return driver_mod.CUDA_SUCCESS;
+        }
+    };
+    var compute: CudaCompute = undefined;
+    compute.stats = .{};
+    compute.ctx.ctx = null; // First drain fails before any SDK callback.
+    compute.ctx.stats = .{};
+    compute.ctx.observation = .init(null);
+    compute.ctx.observation_enable_failed = .init(false);
+    var pairs = [_]context_mod.ProfileEventPair{.{}};
+    var free = [_]u32{0};
+    var pending = [_]CudaProfilePendingEntry{.{ .slot = 0, .kind = .{ .decode = .qkv } }};
+    compute.profile_pool = .{ .allocated = true, .pairs = &pairs, .free_stack = &free, .pending = &pending, .pending_count = 1 };
+    drainCudaProfile(&compute);
+    try std.testing.expectEqual(@as(usize, 1), compute.stats.profile_collection_failures);
+    try std.testing.expectEqual(@as(usize, 0), compute.stats.decode_profile_events);
+    try std.testing.expectEqual(@as(usize, 0), compute.profile_pool.pending_count);
+    try std.testing.expectEqual(@as(usize, 1), compute.profile_pool.free_count);
+
+    // Canonical collector, actual driver ABI injected only for event metadata.
+    // No kernel, provider table, or numerical computation is fabricated.
+    compute.ctx.ctx = @ptrFromInt(16);
+    compute.ctx.stream = null;
+    compute.ctx.driver.fns.cuCtxSetCurrent = Mock.current;
+    compute.ctx.driver.fns.cuStreamSynchronize = Mock.sync;
+    compute.ctx.driver.fns.cuEventElapsedTime = Mock.elapsed;
+    compute.ctx.driver.fns.cuGetErrorName = Mock.text;
+    compute.ctx.driver.fns.cuGetErrorString = Mock.text;
+    compute.profile_pool.pending_count = 1;
+    compute.profile_pool.free_count = 0;
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
+    Mock.fail_read = true;
+    drainCudaProfile(&compute);
+    try std.testing.expectEqual(@as(usize, 2), compute.stats.profile_collection_failures);
+    try std.testing.expectEqual(@as(usize, 1), compute.stats.decode_profile_events);
+    try std.testing.expectEqual(@as(u64, 0), compute.stats.decode_profile_qkv_us);
+    try std.testing.expectEqual(@as(usize, 0), compute.profile_pool.pending_count);
+    try std.testing.expectEqual(@as(usize, 1), compute.profile_pool.free_count);
+
+    // A successful final drain cannot erase a failure from an earlier ring.
+    compute.profile_pool.pending_count = 1;
+    compute.profile_pool.free_count = 0;
+    Mock.fail_read = false;
+    drainCudaProfile(&compute);
+    try std.testing.expectEqual(@as(usize, 2), compute.stats.profile_collection_failures);
+    try std.testing.expectEqual(@as(usize, 2), compute.stats.decode_profile_events);
+    try std.testing.expectEqual(@as(u64, 1000), compute.stats.decode_profile_qkv_us);
+    try std.testing.expectEqual(@as(usize, 0), compute.profile_pool.pending_count);
+    try std.testing.expectEqual(@as(usize, 1), compute.profile_pool.free_count);
 }

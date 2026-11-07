@@ -2082,6 +2082,14 @@ fn getenvBool(comptime name: [*:0]const u8) bool {
     return platform.env.getenvBool(name);
 }
 
+fn decodeContinuation(model: *const gpt_mod.Config, config: GenerationConfig, remaining: usize) graph_mod.model_runtime.DecodeContinuation {
+    return .{
+        .remaining_tokens = remaining,
+        .primary_stop_token = if (config.ignore_eos) -1 else model.eos_token_id,
+        .extra_stop_tokens = if (config.ignore_eos) &.{} else model.extra_eos_token_ids[0..model.extra_eos_token_ids_len],
+    };
+}
+
 fn isPureGreedyConfig(config: GenerationConfig) bool {
     return config.temperature <= 0 and !hasSamplingPenalties(config);
 }
@@ -5386,6 +5394,10 @@ pub const NativeGenerationPipeline = struct {
                         .compiled_sampling_eligible = sampled_compiled and compiledSampleRequestEligible(config, has_grammar, self.gpt_config.suppressTokenIds().len != 0),
                         .compiled_greedy_eligible = !selected_kv and pure_greedy and !has_grammar and config.grammar == null,
                         .prefetch_drain_budget = prefetch_drain_budget_per_step,
+                        .continuation = if (self.compiled_partition_backend == .metal and self.compiled_attachment_target == .whole_model)
+                            decodeContinuation(&self.gpt_config, config, max_tokens - tokens_generated)
+                        else
+                            null,
                     })) {
                         .token => |token| break :blk .{ .token = token, .grammar_complete = false },
                         .logits => |logits| {
@@ -15421,4 +15433,23 @@ test "generation invocation settles received runtime on EOS length streaming sto
 test "generation invocation finish retains received runtime through allocation failure unwind" {
     if (comptime !build_options.enable_native) return error.SkipZigTest;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, generationRequestFinishCase, .{});
+}
+
+test "decode continuation uses actual remaining count and model EOS policy" {
+    var model = gpt_mod.Config{};
+    model.eos_token_id = 2;
+    model.extra_eos_token_ids_len = 3;
+    model.extra_eos_token_ids[0..3].* = .{ 7, -1, 11 };
+    for ([_]usize{ 1, 2, 32 }) |remaining| {
+        const policy = decodeContinuation(&model, .{}, remaining);
+        try policy.check();
+        try std.testing.expectEqual(remaining == 1, policy.isLast());
+        try std.testing.expect(policy.extra_stop_tokens.ptr == model.extra_eos_token_ids[0..3].ptr);
+        for (0..16) |token| try std.testing.expectEqual(model.isEosToken(token), policy.stops(@intCast(token)));
+        const ignore = decodeContinuation(&model, .{ .ignore_eos = true }, remaining);
+        try std.testing.expectEqual(remaining == 1, ignore.isLast());
+        for (0..16) |token| try std.testing.expect(!ignore.stops(@intCast(token)));
+        try std.testing.expectEqual(@as(usize, 0), ignore.extra_stop_tokens.len);
+    }
+    try std.testing.expectError(error.InvalidDecodeContinuation, decodeContinuation(&model, .{}, 0).check());
 }

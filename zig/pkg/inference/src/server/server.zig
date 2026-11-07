@@ -9672,6 +9672,14 @@ pub const Node = struct {
             ctx.unlockStep();
             return err;
         };
+        var cuda_profile = ctx.beginCudaRequestProfile() catch |err| unavailable: {
+            std.log.warn("cuda_read_profile: status=unavailable reason={s}", .{@errorName(err)});
+            break :unavailable LightOnStreamContext.CudaRequestProfile{};
+        };
+        var cuda_profile_complete = false;
+        // Later request/result/state/lease defers finish first; the real PAGE,
+        // resident CB and current B remain alive until AFTER this observer.
+        defer cuda_profile.finish(ctx, cuda_profile_complete);
         ctx.unlockStep();
         var lease = try ctx.coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = prompt.len, .prompt_tokens = estimate.token_count, .prefill_chunk_limit = chunk, .max_tokens = max_tokens });
         defer ctx.coordinator.release(lease);
@@ -9745,7 +9753,9 @@ pub const Node = struct {
         defer result.deinit();
         try control.check();
         if (std.mem.eql(u8, result.finish_reason, "length")) return error.ReadOutputTruncated;
-        return .{ .text = try a.dupe(u8, result.text), .prompt_tokens = result.prompt_tokens, .completion_tokens = result.tokens_used, .native_execution_id = if (state.batched_decode_steps > 0) ctx.execution_id else 0, .max_native_step_items = state.max_native_step_items };
+        const text = try a.dupe(u8, result.text);
+        cuda_profile_complete = true;
+        return .{ .text = text, .prompt_tokens = result.prompt_tokens, .completion_tokens = result.tokens_used, .native_execution_id = if (state.batched_decode_steps > 0) ctx.execution_id else 0, .max_native_step_items = state.max_native_step_items };
     }
 
     fn readLightOnContinuousImages(self: *Node, allocator: std.mem.Allocator, model: *model_manager_mod.LoadedModel, model_path: []const u8, images: []const []const u8, prompt: []const u8, max_tokens: i32, control: InferenceExecutionControl) ![]Qwen3VlReadResult {

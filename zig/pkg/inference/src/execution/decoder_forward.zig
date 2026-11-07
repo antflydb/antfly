@@ -224,6 +224,7 @@ pub const EagerStepRequest = struct {
     compiled_sampling_eligible: bool = false,
     compiled_greedy_eligible: bool = false,
     prefetch_drain_budget: usize = 4,
+    continuation: ?graph_mod.model_runtime.DecodeContinuation = null,
 };
 
 /// A token is a completed selection; logits are owned by the caller's runtime
@@ -1007,11 +1008,20 @@ pub const Runtime = struct {
             "standardDecode iter={d} requesting logits query_seq_len={d} input_len={d}",
             .{ request.generated_tokens, query_rows, input_ids.len },
         );
+        // The borrowed stop-token view cannot escape into the persistent
+        // adapter/context or cached ModelRuntime. Only these synchronous
+        // compiled receivers see the current task decision.
+        var scoped: Runtime = undefined;
+        const compiled: *Runtime = if (request.continuation != null) receiver: {
+            scoped = self.*;
+            scoped.context.decode_continuation = request.continuation;
+            break :receiver &scoped;
+        } else self;
         if (request.compiled_sampling) |sampling| {
-            if (try self.forwardCompiledSampled(input_ids, request.sequence_length, &decode, sampling, request.token_history[0..request.sequence_length], request.compiled_sampling_eligible)) |token| return .{ .token = token };
+            if (try compiled.forwardCompiledSampled(input_ids, request.sequence_length, &decode, sampling, request.token_history[0..request.sequence_length], request.compiled_sampling_eligible)) |token| return .{ .token = token };
         }
         if (request.compiled_greedy_eligible) {
-            if (try self.forwardCompiledGreedy(input_ids, 1, request.sequence_length, &decode)) |token| return .{ .token = token };
+            if (try compiled.forwardCompiledGreedy(input_ids, 1, request.sequence_length, &decode)) |token| return .{ .token = token };
         }
         return .{ .logits = try self.forwardLastLogits(input_ids, 1, request.sequence_length, &decode) };
     }

@@ -102,6 +102,8 @@ pub const Context = struct {
     /// Borrowed only for this invocation; receive the actual selected session
     /// runtime before any of its numerical work can be submitted.
     request_finish: ?*model_runtime.RequestFinish = null,
+    /// Lexical task policy for one eager decode, not part of a cached runtime.
+    decode_continuation: ?model_runtime.DecodeContinuation = null,
     /// Borrowed from the actual retaining model owner. A standalone/draft
     /// execution need not acquire Session numerical/provider capabilities just
     /// to publish its physical observations. The model outlives this context.
@@ -839,6 +841,7 @@ pub fn graphForwardCompiledModelGreedyToken(
             value.cleanup_epoch = cleanup.current();
         },
     }
+    if (request == .decode) request.decode.continuation = pipeline.decode_continuation;
     const candidate = (try backend_def.candidate(pipeline.allocator, cache, attach_context, .single_device)) orelse return null;
     if (pipeline.request_finish) |finish| try finish.receive(candidate.runtime);
     return candidate.greedy(pipeline.allocator, request, vocab_size);
@@ -870,6 +873,7 @@ pub fn graphForwardCompiledModelSampledToken(
     var scoped = request;
     scoped.decode.backend_operation = pipeline.cb.operationToken();
     scoped.decode.cleanup_epoch = cleanup.current();
+    if (pipeline.decode_continuation) |policy| scoped.decode.continuation = policy;
     return candidate.sample(pipeline.allocator, scoped);
 }
 
