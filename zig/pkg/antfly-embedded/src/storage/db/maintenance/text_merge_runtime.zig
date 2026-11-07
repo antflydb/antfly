@@ -280,6 +280,7 @@ const PlatformTextMergeRuntime = struct {
         {
             return error.InvalidTextMergeBackpressureConfig;
         }
+        index_manager.text_merge_segment_limit.store(if (config.enabled) config.max_pending_segments else 0, .release);
         return .{
             .alloc = alloc,
             .io = io,

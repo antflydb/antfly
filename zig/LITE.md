@@ -1168,17 +1168,32 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native owners create revision-16 files (`AFLITE\x10P`) with packed records and
+Native owners create revision-17 files (`AFLITE\x11P`) with packed records and
 durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
 unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
-owners migrate revisions 3, 7, 8, 9, 10, 11, 12, 13, 14 and 15 through an atomic compact-generation replacement;
+owners migrate revisions 3, 7, 8, 9, 10, 11, 12, 13, 14, 15 and 16 through an atomic compact-generation replacement;
 read-only opens preserve the existing encoding. The Zig `page_reuse = false`
 option preserves revision-3 creation/open behavior. Raw native primitives also
 retain their revision-3 default for compatibility. Revision 2 remains unsupported,
-and older binaries reject the revision-16 signature before checkpoint selection.
+and older binaries reject the revision-17 signature before checkpoint selection.
 Unreleased revision-4/5/6 prototypes are rejected rather than mixing reader,
-logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-16 image.
+logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-17 image.
 
+
+Revision 17 permits normalized text posting deltas in authenticated segment-v7
+containers. Small native text publications retain the selected analyzer's exact
+terms, frequencies, positions and field lengths, together with ordinary typed
+values and native document identities. Tail queries decode bounded immutable
+posting arrays without compiling a compressed term dictionary or FST. Window
+freezing targets 256 contributed documents or 4 MiB, with a 32-fragment
+cap independent of request boundaries. Native producer admission still bounds
+total live segments and retained bytes while a freeze is in flight. Its configured
+watermark also limits window fanout, so small limits cannot deadlock waiting for
+a window that cannot fill. Frozen output uses the existing segment-v6 posting
+format; old containers remain readable. Activating a window replacement and
+retiring its source aliases uses the same checked native publication and reader
+leases as ordinary merges. Revision-16 binaries reject the new file signature
+before they can incorrectly treat a normalized tail as an empty text index.
 
 Revision 16 adds native-owned document-ordinal columns for prepared text
 publication, independently of immutable posting bytes. Older inline ordinal
@@ -1224,8 +1239,13 @@ commit. Artifact activation and projection progress participate in that same
 native transaction. Prepared text snapshots release writer serialization while
 waiting, then validate both base-snapshot identity and deletion revisions before
 binding the live writer for durable publication and allocation-free activation.
-This index transaction remains separate from its foreground primary transaction;
-combined primary/index cohorts and a crash-safe one-sync protocol are unfinished.
+Eligible owned document plans publish primary changes, native text activation,
+document ordinals, replay progress and request receipts in one native transaction.
+A bounded file-lifetime queue groups compatible, disjoint logical requests before
+writer admission. Each request retains its own sequence, receipt and result;
+conflicting key sets currently use ordered individual publication. Revision 15's
+checked postimage protocol supplies the one-sync durability boundary for eligible
+groups. Overflow and unsupported preparation retain the conservative commit path.
 
 Struct and JSON document batches capture an owned catalog plan under a short
 lifetime guard, then map document, graph-field and direct embedding inputs before

@@ -30,6 +30,11 @@ const roaring = @import("encoding/roaring.zig");
 
 /// Merge policy configuration.
 pub const MergePolicy = struct {
+    /// Live query fanout also bounds unfinished tail windows. Zero is the
+    /// ordinary standalone policy; a native publication owner supplies its
+    /// actual producer watermark, including explicitly small configurations.
+    max_live_segments: u64 = 0,
+
     max_segments_per_tier: u32 = 10,
     max_merge_at_once: u32 = 10,
     max_segment_size: u64 = 5 * 1024 * 1024 * 1024,
@@ -55,17 +60,63 @@ pub const MergePolicy = struct {
     pub fn plan(self: MergePolicy, alloc: Allocator, segments: []const SegmentInfo) !?[]usize {
         if (segments.len < 2) return null;
 
+        const delta = @import("section/posting_delta.zig");
+        var frozen_count: usize = 0;
+        var tail_count: usize = 0;
+        var tail_docs: u64 = 0;
+        var tail_bytes: u64 = 0;
         var has_deletions = false;
         for (segments) |seg| {
-            has_deletions = has_deletions or seg.has_deletions;
+            if (seg.normalized_delta) {
+                tail_count += 1;
+                tail_docs +|= seg.doc_count;
+                tail_bytes +|= seg.size;
+            } else {
+                frozen_count += 1;
+                has_deletions = has_deletions or seg.has_deletions;
+            }
         }
-
-        if (segments.len <= self.max_segments_per_tier and !has_deletions) {
-            return null;
+        const tail_limit = if (self.max_live_segments == 0) delta.maximum_fragments else @min(delta.maximum_fragments, @max(2, self.max_live_segments -| frozen_count));
+        if (tail_count >= 2 and (tail_docs >= delta.maximum_documents or tail_bytes >= delta.maximum_bytes or tail_count >= tail_limit)) {
+            var chosen: std.ArrayListUnmanaged(usize) = .empty;
+            errdefer chosen.deinit(alloc);
+            var docs: u64 = 0;
+            var bytes: u64 = 0;
+            // Tail fragments stay in publication order. Freeze a bounded
+            // prefix independently of the RPCs that contributed its rows.
+            for (segments) |seg| if (seg.normalized_delta) {
+                try chosen.append(alloc, seg.index);
+                docs +|= seg.doc_count;
+                bytes +|= seg.size;
+                if (chosen.items.len >= 2 and (chosen.items.len >= tail_limit or docs >= delta.maximum_documents or bytes >= delta.maximum_bytes)) break;
+            };
+            return try chosen.toOwnedSlice(alloc);
         }
-
-        const candidates = try alloc.dupe(SegmentInfo, segments);
+        if (self.max_live_segments != 0 and segments.len >= self.max_live_segments and frozen_count <= self.max_segments_per_tier) {
+            // A deliberately tiny producer watermark may leave one frozen
+            // segment and one tail fragment. Drain a pair before sleeping for
+            // capacity that cannot otherwise be produced by the window policy.
+            var first: usize = 0;
+            var second: usize = 1;
+            if (segments[second].size < segments[first].size) std.mem.swap(usize, &first, &second);
+            for (segments[2..], 2..) |seg, i| {
+                if (seg.size < segments[first].size) {
+                    second = first;
+                    first = i;
+                } else if (seg.size < segments[second].size) second = i;
+            }
+            return try alloc.dupe(usize, &.{ segments[first].index, segments[second].index });
+        }
+        if (frozen_count < 2 or (frozen_count <= self.max_segments_per_tier and !has_deletions)) return null;
+        // Ordinary tier compaction never rewrites a frozen corpus segment just
+        // because a partially filled normalized window exists beside it.
+        const candidates = try alloc.alloc(SegmentInfo, frozen_count);
         defer alloc.free(candidates);
+        var frozen: usize = 0;
+        for (segments) |seg| if (!seg.normalized_delta) {
+            candidates[frozen] = seg;
+            frozen += 1;
+        };
 
         std.mem.sort(SegmentInfo, candidates, {}, struct {
             fn lessThan(_: void, a: SegmentInfo, b: SegmentInfo) bool {
@@ -113,7 +164,7 @@ pub const MergePolicy = struct {
                     0.0
                 else
                     @as(f64, @floatFromInt(total_deleted)) / @as(f64, @floatFromInt(total_docs));
-                if (segments.len <= self.max_segments_per_tier) {
+                if (frozen_count <= self.max_segments_per_tier) {
                     if (!has_candidate_deletions) continue;
                     if (total_docs > 0 and delete_ratio < self.min_reclaim_delete_ratio) continue;
                 }
@@ -134,8 +185,8 @@ pub const MergePolicy = struct {
                     @as(f64, @floatFromInt(total_size)) / @as(f64, @floatFromInt(self.max_segment_size));
                 const floor_bonus: f64 = if (largest_size <= self.floor_segment_size) 0.25 else 0.0;
                 const max_segments_per_tier: usize = @max(@as(usize, 1), @as(usize, self.max_segments_per_tier));
-                const budget_pressure: f64 = if (segments.len > max_segments_per_tier)
-                    @as(f64, @floatFromInt(segments.len - max_segments_per_tier)) / @as(f64, @floatFromInt(max_segments_per_tier))
+                const budget_pressure: f64 = if (frozen_count > max_segments_per_tier)
+                    @as(f64, @floatFromInt(frozen_count - max_segments_per_tier)) / @as(f64, @floatFromInt(max_segments_per_tier))
                 else
                     0.0;
                 const width_ratio = @as(f64, @floatFromInt(len)) / @as(f64, @floatFromInt(max_merge_at_once));
@@ -171,6 +222,7 @@ pub const MergePolicy = struct {
 };
 
 pub const SegmentInfo = struct {
+    normalized_delta: bool = false,
     index: usize,
     size: u64,
     doc_count: u32,
@@ -970,4 +1022,44 @@ test "merge mapper-built segments preserves typed doc values" {
     var geo_reader = try typed_dv.TypedDocValuesReader.init(alloc, geo_section);
     try std.testing.expect((try geo_reader.getGeoPoint(0)) != null);
     try std.testing.expect((try geo_reader.getGeoPoint(1)) != null);
+}
+
+test "normalized posting delta windows freeze by retained rows bytes and fragments rather than each publication" {
+    const a = std.testing.allocator;
+    var infos: [42]SegmentInfo = undefined;
+    for (infos[0..10], 0..) |*info, i| info.* = .{ .index = i, .size = 1024 * 1024, .doc_count = 10000, .has_deletions = false };
+    for (infos[10..], 10..) |*info, i| info.* = .{ .normalized_delta = true, .index = i, .size = 1024, .doc_count = 1, .has_deletions = false };
+    const policy: MergePolicy = .{ .max_live_segments = 64 };
+    try std.testing.expect((try policy.plan(a, infos[0..41])) == null);
+    const fragments = (try policy.plan(a, &infos)).?;
+    defer a.free(fragments);
+    try std.testing.expectEqual(@as(usize, 32), fragments.len);
+    for (fragments, 10..) |chosen, expected| try std.testing.expectEqual(expected, chosen);
+    var rows = infos[10..13].*;
+    for (&rows) |*info| info.doc_count = 100;
+    const by_rows = (try policy.plan(a, &rows)).?;
+    defer a.free(by_rows);
+    try std.testing.expectEqual(@as(usize, 3), by_rows.len);
+    var bytes = infos[10..12].*;
+    for (&bytes) |*info| info.size = 3 * 1024 * 1024;
+    const by_bytes = (try policy.plan(a, &bytes)).?;
+    defer a.free(by_bytes);
+    try std.testing.expectEqual(@as(usize, 2), by_bytes.len);
+}
+
+test "normalized posting delta windows make progress under a tiny configured producer watermark" {
+    const a = std.testing.allocator;
+    const infos = [_]SegmentInfo{
+        .{ .index = 7, .size = 4096, .doc_count = 100, .has_deletions = false },
+        .{ .normalized_delta = true, .index = 9, .size = 128, .doc_count = 1, .has_deletions = false },
+    };
+    try std.testing.expect((try (MergePolicy{}).plan(a, &infos)) == null);
+    const drained = (try (MergePolicy{ .max_live_segments = 2 }).plan(a, &infos)).?;
+    defer a.free(drained);
+    try std.testing.expectEqualSlices(usize, &.{ 9, 7 }, drained);
+    var tails = infos;
+    tails[0].normalized_delta = true;
+    const frozen = (try (MergePolicy{ .max_live_segments = 2 }).plan(a, &tails)).?;
+    defer a.free(frozen);
+    try std.testing.expectEqualSlices(usize, &.{ 7, 9 }, frozen);
 }

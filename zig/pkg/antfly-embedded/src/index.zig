@@ -6002,17 +6002,23 @@ test "external lake range segment admission defers dictionary diagnostics across
     var unpublished = [_]ReplacementSegmentData{.{ .id = 4, .data = state.data(), .prepared_reader = try state.data().initReader(a) }};
     defer unpublished[0].data.deinit(a);
     defer if (unpublished[0].prepared_reader) |*reader| reader.deinit();
-    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-    writer.alloc = failing.allocator();
-    const attempted = writer.prepareSegmentsManyDataWithScratch(a, &.{3}, &unpublished);
-    writer.alloc = a;
-    if (attempted) |value| {
-        var unexpected = value;
-        unexpected.abort();
-        return error.TestExpectedError;
-    } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
-    try std.testing.expect(unpublished[0].prepared_reader == null);
-    try std.testing.expectEqual(@as(u64, 3), writer.snapshot().segments[0].id);
+    // Capturing immutable revisions is now the first writer allocation.
+    // Refusal there leaves the caller's reader intact. Refusal at the next
+    // retained-snapshot allocation happens after ownership transfer and must
+    // close the transferred reader exactly once.
+    for (0..2) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        writer.alloc = failing.allocator();
+        const attempted = writer.prepareSegmentsManyDataWithScratch(a, &.{3}, &unpublished);
+        writer.alloc = a;
+        if (attempted) |value| {
+            var unexpected = value;
+            unexpected.abort();
+            return error.TestExpectedError;
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(fail_index == 0, unpublished[0].prepared_reader != null);
+        try std.testing.expectEqual(@as(u64, 3), writer.snapshot().segments[0].id);
+    }
 }
 
 test "text statistics mixed warm cold batches fetch only missing slots" {

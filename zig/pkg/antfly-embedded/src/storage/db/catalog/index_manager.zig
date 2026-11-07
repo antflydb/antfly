@@ -2042,6 +2042,7 @@ pub const IndexManager = struct {
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
     text_merge_scheduler: TextMergeScheduler,
+    text_merge_segment_limit: std.atomic.Value(u64) = .init(0),
     dense_indexes: std.ArrayListUnmanaged(DenseIndex),
     retired_lsm_owner_stats: std.ArrayListUnmanaged(LsmOwnerStats) = .empty,
     retired_lsm_owner_overflow_stats: [2]lsm_backend_mod.Backend.MaintenanceStats = .{ .{}, .{} },
@@ -21007,7 +21008,7 @@ pub const IndexManager = struct {
         // Configuration comparison is exact and independent of process-local
         // instance counters, so a same-catalog runtime refresh can adopt it.
         const observed = try projection.ownValue(@TypeOf(entry.observed_field_analyzers), entry.observed_field_analyzers);
-        const descriptor = try std.json.Stringify.valueAlloc(a, .{ .schema = schema_bytes, .analysis = build.analysis, .observed = observed, .selected_field = selected, .source_options = source_options, .index_sort = build.options.index_sort }, .{});
+        const descriptor = try std.json.Stringify.valueAlloc(a, .{ .schema = schema_bytes, .analysis = build.analysis, .observed = observed, .selected_field = selected, .source_options = source_options, .index_sort = build.options.index_sort, .normalized_postings = build.options.normalized_postings }, .{});
         const name = try a.dupe(u8, entry.config.name);
         if (self.analysis_contributions_enabled) {
             @import("antfly_platform").sync.lockYielding(&self.analysis_contributions_mutex);
@@ -21039,6 +21040,7 @@ pub const IndexManager = struct {
         const sort = try textIndexSortFieldsForSegmentAlloc(a, if (entry.runtime_schema) |schema| schema.index_sort else &.{});
         const directory = if (textBuildSpoolDirectory(entry)) |path| try a.dupe(u8, path) else null;
         build.options = .{
+            .normalized_postings = resources.native_metadata_revision >= 17,
             .scratch_allocator = introducer_mod.textBuildScratchAllocator(),
             .postings_run_io = if (directory != null) resources.io else null,
             .postings_run_directory = directory orelse ".",
@@ -26984,6 +26986,7 @@ pub const IndexManager = struct {
             const deletion_summary = seg.deletionSummary();
             try infos.append(self.alloc, .{
                 .index = i,
+                .normalized_delta = seg.reader.isNormalizedPostingDelta(),
                 .size = seg.data.len(),
                 .doc_count = seg.reader.doc_count,
                 .deleted_count = deletion_summary.count,
@@ -26992,7 +26995,8 @@ pub const IndexManager = struct {
         }
         if (infos.items.len < 2) return null;
 
-        const policy = activeTextMergePolicy();
+        var policy = activeTextMergePolicy();
+        policy.max_live_segments = self.text_merge_segment_limit.load(.acquire);
         const planned = (try policy.plan(self.alloc, infos.items)) orelse blk: {
             // The tiered policy found nothing to merge (for example every
             // eligible segment floors to the same effective size under
@@ -27002,11 +27006,14 @@ pub const IndexManager = struct {
             // segments so producer admission always has a merge in flight to
             // wait on instead of retrying TextMergeBackpressureTimeout
             // against a scheduler that gave up.
-            if (snap.segments.len <= policy.max_segments_per_tier) return null;
+            var frozen: std.ArrayListUnmanaged(merger_mod.SegmentInfo) = .empty;
+            defer frozen.deinit(self.alloc);
+            for (infos.items) |info| if (!info.normalized_delta) try frozen.append(self.alloc, info);
+            if (frozen.items.len <= policy.max_segments_per_tier) return null;
             self.text_merge_scheduler.forced_drains += 1;
             break :blk try text_index_maintenance.planForceDrainFromInfos(
                 self.alloc,
-                infos.items,
+                frozen.items,
                 force_merge_max_segments_at_once,
             );
         };
@@ -27486,7 +27493,9 @@ pub const IndexManager = struct {
     }
 
     fn textIndexNeedsMerge(self: *IndexManager, index: *persistent_mod.PersistentIndex, policy: merger_mod.MergePolicy) !bool {
-        return try text_index_maintenance.needsMerge(self.alloc, index, policy);
+        var admitted = policy;
+        admitted.max_live_segments = self.text_merge_segment_limit.load(.acquire);
+        return try text_index_maintenance.needsMerge(self.alloc, index, admitted);
     }
 
     fn forceCompactTextIndexWithOptions(

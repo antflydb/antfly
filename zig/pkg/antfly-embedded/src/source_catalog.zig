@@ -179,6 +179,7 @@ pub const section_analysis_reuse = @import("section/analysis_reuse.zig");
 pub const section_source_offsets = @import("section/source_offsets.zig");
 pub const section_doc_values = @import("section/doc_values.zig");
 pub const section_inverted = @import("section/inverted.zig");
+pub const section_posting_delta = @import("section/posting_delta.zig");
 pub const section_nested = @import("section/nested.zig");
 pub const section_synonyms = @import("section/synonyms.zig");
 pub const section_typed_doc_values = @import("section/typed_doc_values.zig");

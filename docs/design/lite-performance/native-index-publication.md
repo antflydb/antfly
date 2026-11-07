@@ -497,3 +497,31 @@ The expanded runtime and C API component gates are recorded in
 [publication-progress-debug.json](publication-progress-debug.json). Live performance
 qualification of the rebuilt candidate, commit cohorts and durable normalized
 posting-delta windows remain outstanding.
+
+### Durable normalized posting windows
+
+Revision 17 adds segment-v7 containers for bounded analyzed document contributions.
+Small prepared native publications append term bytes, frequencies, position deltas
+and norms without building a frozen dictionary, FST or posting blocks. Typed fields,
+stored values and authoritative document ordinals retain their existing contracts.
+Queries read owned immutable posting arrays directly, including deferred positions,
+phrase scoring and term-pattern enumeration. Iterators retain their context after
+scope closure. Physical byte diagnostics report the retained delta representation.
+
+The owner freezes publication-order prefixes at 256 contributed documents, 4 MiB
+or 32 fragments. Producer segment and byte admission also bounds work while freezing
+is in flight; a deliberately smaller segment watermark lowers the fragment trigger
+and permits a mixed pair to drain rather than deadlocking. Ordinary tier compaction
+excludes incomplete tails. Freezing consumes normalized postings without reanalysis
+and emits the ordinary segment-v6 format. Oversized private builds use the existing
+spillable frozen compiler before any artifact escapes. Frequencies must fit the
+frozen representation. Revision-16 signatures remain readable, while writable
+owners upgrade atomically before enabling the new representation.
+
+[The component receipt](normalized-posting-tail-debug.json) includes successful
+reader, ownership, publication and reopen checks. It also records negative
+performance evidence: the current Debug measurement reduced the closed indexed
+fixture size but did not improve latency or background sync count. Primary-only
+writes also still generate frequent background syncs. Those physical publications
+need attribution and coalescing; this stage does not establish end-to-end performance
+qualification or complete SQL preparation integration.

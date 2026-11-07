@@ -12285,6 +12285,8 @@ fn testQueuedNativePublication(case: enum { clean, invalid_member, unknown }) !v
     const id = try publishHandle(wrapper);
     var closed = false;
     defer if (!closed) antfly_db_close(id);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice("{\"name\":\"cohort_text\",\"type\":\"full_text\",\"config_json\":{\"field\":\"body\"}}")));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(id));
     const connection = wrapper.lite_connection.?;
     const owner = connection.owner;
     owner.stopping.store(true, .release);
@@ -13073,4 +13075,104 @@ fn testSuspendedQueryPrimarySnapshot(resume_query: bool) !void {
         try std.testing.expectEqual(@as(usize, 0), captured.query_borrows);
         try std.testing.expectEqual(std.math.maxInt(u64), store.reader_frontier.load(.acquire));
     }
+}
+
+test "capi native publication serial normalized windows accumulate freeze update and reopen" {
+    const a = std.testing.allocator;
+    const io = handleLockIo();
+    var directory = try TestDirectory.init("native-normalized-window");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{directory.path()});
+    defer a.free(path);
+    const options: LiteResolvedOpenOptions = .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 5000 };
+    const wrapper = try @import("lite_connection.zig").open(path, options, true);
+    var id: ?*anyopaque = try publishHandle(wrapper);
+    defer if (id) |value| antfly_db_close(value);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice("{\"name\":\"window_text\",\"type\":\"full_text\",\"config_json\":{\"field\":\"body\"}}")));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(id));
+    // Serial synchronous callers accumulate a window. Its optional freeze is
+    // serviced by the real owner actor, separately from visibility draining.
+    const owner = wrapper.lite_connection.?.owner;
+    var frozen: usize = 0;
+    for (0..96) |sequence| {
+        var bytes: [256]u8 = undefined;
+        const request = try std.fmt.bufPrint(&bytes, "{{\"inserts\":{{\"row-{d}\":{{\"body\":\"needle résumé 日本語\",\"rank\":{d}}}}},\"sync_level\":\"full_index\"}}", .{ sequence, sequence });
+        var output: capi.Buffer = .{};
+        defer antfly_buffer_free(&output);
+        const code = antfly_db_batch_json(id, .fromSlice(request), &output);
+        if (code != .ok) std.debug.print("normalized window sequence={d} code={t} detail={s}\n", .{ sequence, code, std.mem.span(capi.lastErrorDetail()) });
+        try std.testing.expectEqual(capi.ErrorCode.ok, code);
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(id));
+        if ((sequence + 1) % 32 == 0) {
+            const until = std.Io.Clock.awake.now(io).nanoseconds + 20 * std.time.ns_per_s;
+            owner.wake.set(io);
+            while (true) {
+                const pending = pending: {
+                    const read = enterHandle(id, .read).?;
+                    defer read.leave();
+                    try std.testing.expect(read.entry_error == null);
+                    const indexes = read.handle.database().core.index_manager;
+                    const target = for (indexes.text_indexes.items) |*entry| {
+                        if (std.mem.eql(u8, entry.config.name, "window_text")) break entry;
+                    } else return error.TestMissingWindowIndex;
+                    const state = target.persistent.acquireSnapshot();
+                    defer state.release();
+                    var count: usize = 0;
+                    for (state.segments) |segment| if (segment.reader.isNormalizedPostingDelta()) {
+                        count += 1;
+                    };
+                    break :pending count;
+                };
+                if (pending < 32) break;
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until) return error.TestNormalizedWindowFreezeDidNotProgress;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+        const guard = enterHandle(id, .read).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        const manager = guard.handle.database().core.index_manager;
+        const entry = for (manager.text_indexes.items) |*entry| {
+            if (std.mem.eql(u8, entry.config.name, "window_text")) break entry;
+        } else return error.TestMissingWindowIndex;
+        const snapshot = entry.persistent.acquireSnapshot();
+        defer snapshot.release();
+        var tails: usize = 0;
+        frozen = 0;
+        for (snapshot.segments) |segment| {
+            if (segment.reader.isNormalizedPostingDelta()) tails += 1 else frozen += 1;
+        }
+        if (sequence < 31) {
+            if (tails != sequence + 1) std.debug.print("normalized window sequence={d} tail_fragments={d} frozen_segments={d}\n", .{ sequence, tails, frozen });
+            try std.testing.expectEqual(sequence + 1, tails);
+            try std.testing.expectEqual(@as(usize, 0), frozen);
+        }
+        try std.testing.expect(tails < @import("../section/posting_delta.zig").maximum_fragments);
+        var hits = try searchTextOwned(guard.handle, "window_text", .{ .match = .{ .field = "body", .text = "needle" } }, 128, 0);
+        defer hits.deinit();
+        if (hits.ids.len != sequence + 1) std.debug.print("normalized window sequence={d} needle_hits={d}\n", .{ sequence, hits.ids.len });
+        try std.testing.expectEqual(sequence + 1, hits.ids.len);
+    }
+    try std.testing.expect(frozen != 0 and frozen < 10);
+    var output: capi.Buffer = .{};
+    defer antfly_buffer_free(&output);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(id, .fromSlice("{\"inserts\":{\"row-1\":{\"body\":\"changed κόσμος\"}},\"deletes\":[\"row-0\"],\"sync_level\":\"full_index\"}"), &output));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(id));
+    antfly_db_close(id);
+    id = null;
+    const reopened = try @import("lite_connection.zig").open(path, options, false);
+    id = try publishHandle(reopened);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(id));
+    const guard = enterHandle(id, .read).?;
+    defer guard.leave();
+    try std.testing.expect(guard.entry_error == null);
+    var latest = try searchTextOwned(guard.handle, "window_text", .{ .match = .{ .field = "body", .text = "needle" } }, 128, 0);
+    defer latest.deinit();
+    try std.testing.expectEqual(@as(usize, 94), latest.ids.len);
+    var changed = try searchTextOwned(guard.handle, "window_text", .{ .match = .{ .field = "body", .text = "changed" } }, 5, 0);
+    defer changed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), changed.ids.len);
+    try std.testing.expectEqualStrings("row-1", changed.ids[0]);
+    try std.testing.expect((try guard.handle.owned_lite_backend.?.native_docstore.?.file.check()).valid);
 }

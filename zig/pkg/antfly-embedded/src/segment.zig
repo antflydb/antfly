@@ -55,6 +55,8 @@ const identity_lookup = @import("document_identity_lookup.zig");
 // ============================================================================
 
 const magic: [4]u8 = "AFSM".*; // AntFly SegMent
+const posting_delta = @import("section/posting_delta.zig");
+const delta_segment_version: u32 = 7;
 const segment_version: u32 = 6; // v6: indexed external IDs; v4/v5 remain readable.
 const integrity = @import("segment_integrity.zig");
 /// Recipe-fenced lake source bodies live in independently compressed columns.
@@ -186,6 +188,7 @@ pub const SegmentLayoutStats = struct {
 
 /// Builds a segment file from fields and their sections.
 pub const SegmentWriter = struct {
+    normalized_postings: bool = false,
     alloc: Allocator,
     fields: std.ArrayListUnmanaged(FieldBuilder),
     stored_fields: std.ArrayListUnmanaged(StoredDoc),
@@ -466,7 +469,7 @@ pub const SegmentWriter = struct {
         try sinkAppendU64BE(sink, stored_metadata_length);
         try sinkAppendU64BE(sink, sections_index_offset);
         try sinkAppendU32BE(sink, stored_metadata_crc);
-        try writeSegmentVersionChecksumAndMagic(sink, @intCast(sections_index_offset));
+        try writeSegmentVersionChecksumAndMagicAtVersion(sink, @intCast(sections_index_offset), if (self.normalized_postings) delta_segment_version else segment_version);
     }
 
     fn estimatedBuildSize(self: *const SegmentWriter) usize {
@@ -744,6 +747,8 @@ fn findSegmentField(comptime Field: type, fields: []Field, sorted: bool, name: [
 }
 
 pub const SegmentReader = struct {
+    normalized_postings: bool = false,
+    delta_navigation: ?*DeltaNavigation = null,
     postings_loader: ?PostingsLoader = null,
     alloc: Allocator,
     data: []const u8,
@@ -763,6 +768,20 @@ pub const SegmentReader = struct {
     ordinal_binding: ?@import("storage/doc_ordinal_binding.zig").Binding = null,
     native: ?*Native = null,
     deferred: ?*const fn (Allocator, SegmentSource) anyerror!SegmentReader = null,
+
+    const DeltaNavigation = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        fields: std.StringHashMapUnmanaged([]u8) = .empty,
+        fn deinit(self: *@This(), a: Allocator) void {
+            var it = self.fields.valueIterator();
+            while (it.next()) |bytes| a.free(bytes.*);
+            self.fields.deinit(a);
+            a.destroy(self);
+        }
+    };
+    pub fn isNormalizedPostingDelta(self: *const SegmentReader) bool {
+        return self.normalized_postings;
+    }
 
     pub const RoutingField = struct { name: []const u8, stats: ?InvertedFieldStats, section_mask: u16 = 0 };
     /// Compact immutable scoring inventory. Full navigation is admitted under
@@ -984,7 +1003,7 @@ pub const SegmentReader = struct {
         try input_source.readInto(input_source.len() - footer_size, &footer);
         if (!std.mem.eql(u8, footer[52..], &magic)) return error.InvalidMagic;
         const version = std.mem.readInt(u32, footer[44..48], .big);
-        if (version != 4 and version != 5 and version != segment_version) return error.UnsupportedVersion;
+        if (version != 4 and version != 5 and version != segment_version and version != delta_segment_version) return error.UnsupportedVersion;
         return footer;
     }
 
@@ -1017,8 +1036,10 @@ pub const SegmentReader = struct {
         const header_length = @min(stored_header.len, metadata.stored_metadata_length);
         try payload_source.readInto(metadata.stored_offset, stored_header[0..@intCast(header_length)]);
         if (!std.mem.eql(u8, stored_header[0..@intCast(header_length)], metadata.stored_header[0..@intCast(header_length)])) return error.InvalidSegmentAdmission;
-        const reader = try initAuthenticated(alloc, payload_source, metadata);
+        var reader = try initAuthenticated(alloc, payload_source, metadata);
         reader.native.?.catalog_admitted = true;
+        reader.normalized_postings = version == delta_segment_version;
+        reader.native.?.range.normalized_postings = reader.normalized_postings;
         reader.native.?.range.authenticated_source = false;
         reader.native.?.range.paged_source = paged;
         paged = null;
@@ -1057,8 +1078,16 @@ pub const SegmentReader = struct {
             for (out.sections) |*section| {
                 if (section.section_type == .inverted_text and section.length != 0) {
                     const view = try @import("segment_source.zig").View.init(native.range.source, section.offset, section.length);
-                    const stats = try inverted.RangeInvertedIndexReader.init(alloc, view, 1024 * 1024);
-                    out.inverted_stats = .{ .doc_count = stats.doc_count, .total_field_len = stats.total_field_len };
+                    if (native.range.normalized_postings) {
+                        var header: [posting_delta.header_size]u8 = undefined;
+                        try view.readInto(0, &header);
+                        const stats = try posting_delta.Stats.read(&header, view.length);
+                        if (stats.doc_space != native.range.doc_count) return error.InvalidPostingDelta;
+                        out.inverted_stats = .{ .doc_count = stats.doc_count, .total_field_len = stats.total_field_len };
+                    } else {
+                        const stats = try inverted.RangeInvertedIndexReader.init(alloc, view, 1024 * 1024);
+                        out.inverted_stats = .{ .doc_count = stats.doc_count, .total_field_len = stats.total_field_len };
+                    }
                 }
                 // Immutable, authenticated directory ownership follows the
                 // admitted artifact, charged to its publication allocator.
@@ -1086,7 +1115,7 @@ pub const SegmentReader = struct {
         var index_bytes: [8]u8 = undefined;
         errdefer alloc.free(validations);
         try input_source.readInto(input_source.len() - 24, &index_bytes);
-        return .{ .alloc = alloc, .data = &.{}, .native = native, .stored_offset = native.range.stored_offset, .stored_length = native.range.stored_length, .stored_metadata_length = native.range.stored_metadata_length, .stored_block_validations = validations, .index_offset = std.mem.readInt(u64, &index_bytes, .big), .doc_count = native.range.doc_count, .num_fields = @intCast(fields.len), .fields = fields, .fields_sorted = native.range.fields_sorted };
+        return .{ .normalized_postings = native.range.normalized_postings, .alloc = alloc, .data = &.{}, .native = native, .stored_offset = native.range.stored_offset, .stored_length = native.range.stored_length, .stored_metadata_length = native.range.stored_metadata_length, .stored_block_validations = validations, .index_offset = std.mem.readInt(u64, &index_bytes, .big), .doc_count = native.range.doc_count, .num_fields = @intCast(fields.len), .fields = fields, .fields_sorted = native.range.fields_sorted };
     }
 
     pub fn hasSection(self: *const SegmentReader, name: []const u8, kind: SectionType) bool {
@@ -1206,7 +1235,7 @@ pub const SegmentReader = struct {
 
         const metadata_crc = std.mem.readInt(u32, data[end - 8 ..][0..4], .big);
         const ver = std.mem.readInt(u32, data[end - 12 ..][0..4], .big);
-        if (ver != 4 and ver != 5 and ver != segment_version) return error.UnsupportedVersion;
+        if (ver != 4 and ver != 5 and ver != segment_version and ver != delta_segment_version) return error.UnsupportedVersion;
         const stored_metadata_crc = std.mem.readInt(u32, data[end - 16 ..][0..4], .big);
         const sections_index_offset = std.mem.readInt(u64, data[end - 24 ..][0..8], .big);
         const stored_metadata_length = std.mem.readInt(u64, data[end - 32 ..][0..8], .big);
@@ -1342,7 +1371,11 @@ pub const SegmentReader = struct {
         errdefer alloc.free(stored_block_validations);
         for (stored_block_validations) |*validation| validation.* = .init(integrity_unverified);
 
+        const delta_navigation = if (ver == delta_segment_version) try alloc.create(DeltaNavigation) else null;
+        if (delta_navigation) |navigation| navigation.* = .{};
         return .{
+            .normalized_postings = ver == delta_segment_version,
+            .delta_navigation = delta_navigation,
             .alloc = alloc,
             .data = data,
             .stored_offset = stored_offset,
@@ -1368,6 +1401,8 @@ pub const SegmentReader = struct {
     }
 
     pub fn deinit(self: *SegmentReader) void {
+        if (self.delta_navigation) |navigation| navigation.deinit(self.alloc);
+        self.delta_navigation = null;
         if (self.ordinal_binding) |*binding| binding.deinit();
         self.ordinal_binding = null;
         if (self.native) |native| {
@@ -1535,6 +1570,13 @@ pub const SegmentReader = struct {
     }
 
     fn invertedLayoutStats(self: *const SegmentReader, field: []const u8, section: *const SectionInfo, detailed: bool) !inverted.InvertedIndexReader.LayoutStats {
+        if (self.normalized_postings) {
+            // Attribute physical normalized bytes and logical term counts, not
+            // a query's temporary compressed posting representation.
+            var scoped = (try self.invertedIndexScoped(self.alloc, field)) orelse return .{};
+            defer scoped.deinit();
+            return scoped.layoutStats();
+        }
         if (self.native != null) {
             if (detailed) {
                 var scoped = (try self.invertedIndexScoped(self.alloc, field)) orelse return .{};
@@ -1552,7 +1594,19 @@ pub const SegmentReader = struct {
 
     /// Get an inverted index reader for a field.
     pub fn invertedIndex(self: *const SegmentReader, field_name: []const u8) !?inverted.InvertedIndexReader {
-        const section_data = (try self.getSection(field_name, .inverted_text)) orelse return null;
+        var section_data = (try self.getSection(field_name, .inverted_text)) orelse return null;
+        if (self.normalized_postings) {
+            const navigation = self.delta_navigation orelse return error.InvalidPostingDelta;
+            @import("antfly_platform").sync.lockYielding(&navigation.mutex);
+            defer navigation.mutex.unlock();
+            section_data = navigation.fields.get(field_name) orelse compiled: {
+                const bytes = try posting_delta.materialize(self.alloc, section_data);
+                errdefer self.alloc.free(bytes);
+                const field = findSegmentField(FieldInfo, self.fields, self.fields_sorted, field_name) orelse return error.InvalidSegment;
+                try navigation.fields.put(self.alloc, field.name, bytes);
+                break :compiled bytes;
+            };
+        }
         var reader = try inverted.InvertedIndexReader.init(self.alloc, section_data);
         if (self.postings_loader) |loader| {
             reader.postings_loader = loader;
@@ -1579,7 +1633,12 @@ pub const SegmentReader = struct {
         if (self.native != null or self.deferred != null) return info.inverted_stats;
         for (info.sections) |section| if (section.section_type == .inverted_text) {
             if (section.offset > self.data.len or section.length > self.data.len - section.offset) return null;
-            const reader = inverted.InvertedIndexReader.init(self.alloc, self.data[@intCast(section.offset)..][0..@intCast(section.length)]) catch return null;
+            const bytes = self.data[@intCast(section.offset)..][0..@intCast(section.length)];
+            if (self.normalized_postings) {
+                const stats = posting_delta.Stats.read(bytes, bytes.len) catch return null;
+                return .{ .doc_count = stats.doc_count, .total_field_len = stats.total_field_len };
+            }
+            const reader = inverted.InvertedIndexReader.init(self.alloc, bytes) catch return null;
             return .{ .doc_count = reader.doc_count, .total_field_len = reader.total_field_len };
         };
         return null;
@@ -1695,7 +1754,9 @@ pub const SegmentReader = struct {
     pub fn invertedIndexScopedWithOptions(self: *const SegmentReader, allocator: Allocator, field_name: []const u8, options: inverted.ScopedInvertedIndexReader.Options) !?inverted.ScopedInvertedIndexReader {
         if (self.native) |native| return native.range.invertedIndexScoped(allocator, field_name, options);
         const data = (try self.getSection(field_name, .inverted_text)) orelse return null;
-        var scoped = try inverted.ScopedInvertedIndexReader.initContiguous(allocator, data);
+        var routed = options;
+        if (self.normalized_postings) routed.normalized_doc_space = self.doc_count;
+        var scoped = try inverted.ScopedInvertedIndexReader.initContiguousWithOptions(allocator, data, routed);
         if (self.postings_loader) |loader| {
             scoped.contiguous.?.postings_loader = loader;
             scoped.contiguous.?.postings_loader.?.base = @intFromPtr(data.ptr) - @intFromPtr(self.data.ptr);
@@ -4199,7 +4260,7 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
         }
 
         if (has_inverted) {
-            if (present_count == 1 and first_present_index.? == 0 and !only_present_deleted) {
+            if (present_count == 1 and first_present_index.? == 0 and !only_present_deleted and !inputs[first_present_index.?].reader.normalized_postings) {
                 const view = inv_sections[0].?;
                 if (sink.term_observer) |observer| {
                     var scoped = try inverted.ScopedInvertedIndexReader.initRanges(alloc, view, .{});
@@ -6884,7 +6945,10 @@ fn writePageDirectoryDescriptor(sink: *SegmentSink, directory: integrity.Directo
 }
 
 fn writeSegmentVersionChecksumAndMagic(sink: *SegmentSink, metadata_offset: usize) !void {
-    try sinkAppendU32BE(sink, segment_version);
+    return writeSegmentVersionChecksumAndMagicAtVersion(sink, metadata_offset, segment_version);
+}
+fn writeSegmentVersionChecksumAndMagicAtVersion(sink: *SegmentSink, metadata_offset: usize, version: u32) !void {
+    try sinkAppendU32BE(sink, version);
     const checksum = try sink.crc32Range(metadata_offset, sink.len() - metadata_offset);
     try sinkAppendU32BE(sink, checksum);
     try sink.appendSlice(&magic);
@@ -7941,6 +8005,7 @@ pub const SegmentReadScratch = @import("segment_source.zig").Scratch;
 /// caller supplies output and scratch lifetimes; payload bytes never become
 /// segment-owned heap buffers. The source must pin one immutable generation.
 pub const RangeSegmentReader = struct {
+    normalized_postings: bool = false,
     alloc: Allocator,
     source: SegmentSource,
     fields: []Field,
@@ -7973,7 +8038,7 @@ pub const RangeSegmentReader = struct {
         var version: [4]u8 = undefined;
         try source.readInto(source.len() - 12, &version);
         const ver = std.mem.readInt(u32, &version, .big);
-        return ver == 4 or ver == 5 or ver == segment_version;
+        return ver == 4 or ver == 5 or ver == segment_version or ver == delta_segment_version;
     }
 
     pub fn init(alloc: Allocator, input_source: SegmentSource, options: Options) !RangeSegmentReader {
@@ -7984,7 +8049,7 @@ pub const RangeSegmentReader = struct {
         try source.readInto(footer_start, &footer);
         if (!std.mem.eql(u8, footer[52..], &magic)) return error.InvalidMagic;
         const version = std.mem.readInt(u32, footer[44..48], .big);
-        if (version != 4 and version != 5 and version != segment_version) return error.UnsupportedVersion;
+        if (version != 4 and version != 5 and version != segment_version and version != delta_segment_version) return error.UnsupportedVersion;
         const count = std.math.cast(u32, std.mem.readInt(u64, footer[0..8], .big)) orelse return error.InvalidSegment;
         const stored = std.mem.readInt(u64, footer[8..16], .big);
         const stored_len = std.mem.readInt(u64, footer[16..24], .big);
@@ -8038,7 +8103,7 @@ pub const RangeSegmentReader = struct {
         }
         if (options.key_range_only) {
             const fields = try keyRangeNavigation(alloc, source, navigation_start, footer_start, stored + stored_len, &checksum_scratch);
-            return .{ .alloc = alloc, .source = source, .fields = fields, .fields_sorted = true, .doc_count = count, .stored_offset = stored, .stored_length = stored_len, .stored_metadata_length = stored_meta_len, .num_blocks = blocks, .id_bytes_length = ids, .paged_source = paged_source };
+            return .{ .normalized_postings = version == delta_segment_version, .alloc = alloc, .source = source, .fields = fields, .fields_sorted = true, .doc_count = count, .stored_offset = stored, .stored_length = stored_len, .stored_metadata_length = stored_meta_len, .num_blocks = blocks, .id_bytes_length = ids, .paged_source = paged_source };
         }
         var cursor = MetadataCursor{ .source = source, .pos = navigation_start, .end = footer_start, .buffer = &checksum_scratch };
         const field_count = try cursor.int(u16);
@@ -8082,7 +8147,7 @@ pub const RangeSegmentReader = struct {
         }
         if (cursor.pos != cursor.end) return error.InvalidSegment;
         try sortSegmentFields(Field, fields);
-        return .{ .alloc = alloc, .source = source, .fields = fields, .fields_sorted = true, .doc_count = count, .stored_offset = stored, .stored_length = stored_len, .stored_metadata_length = stored_meta_len, .num_blocks = blocks, .id_bytes_length = ids, .paged_source = paged_source };
+        return .{ .normalized_postings = version == delta_segment_version, .alloc = alloc, .source = source, .fields = fields, .fields_sorted = true, .doc_count = count, .stored_offset = stored, .stored_length = stored_len, .stored_metadata_length = stored_meta_len, .num_blocks = blocks, .id_bytes_length = ids, .paged_source = paged_source };
     }
 
     pub fn deinit(self: *RangeSegmentReader) void {
@@ -8145,13 +8210,17 @@ pub const RangeSegmentReader = struct {
     }
 
     pub fn invertedIndex(self: *const RangeSegmentReader, field_name: []const u8, max_dictionary_block_bytes: usize) !?inverted.RangeInvertedIndexReader {
+        if (self.normalized_postings) return error.NativeSectionRequiresScope;
         const view = (try self.sectionView(field_name, .inverted_text)) orelse return null;
         return try inverted.RangeInvertedIndexReader.init(self.alloc, view, max_dictionary_block_bytes);
     }
 
     pub fn invertedIndexScoped(self: *const RangeSegmentReader, allocator: Allocator, field_name: []const u8, options: inverted.ScopedInvertedIndexReader.Options) !?inverted.ScopedInvertedIndexReader {
         const view = (try self.sectionView(field_name, .inverted_text)) orelse return null;
-        return try inverted.ScopedInvertedIndexReader.initRanges(allocator, view, options);
+        var routed = options;
+        routed.normalized_delta = self.normalized_postings;
+        if (self.normalized_postings) routed.normalized_doc_space = self.doc_count;
+        return try inverted.ScopedInvertedIndexReader.initRanges(allocator, view, routed);
     }
 
     pub fn typedDocValues(self: *const RangeSegmentReader, field_name: []const u8, max_metadata_bytes: usize, max_chunk_bytes: usize) !?typed_dv.RangeTypedDocValuesReader {
@@ -8269,12 +8338,16 @@ pub const RangeSegmentReader = struct {
     pub const ReadScope = struct {
         reader: *const RangeSegmentReader,
         cache: @import("segment_source.zig").BlockCache,
+        normalized_fields: std.StringHashMapUnmanaged([]u8) = .empty,
 
         pub fn init(allocator: Allocator, reader: *const RangeSegmentReader, byte_budget: usize) !ReadScope {
             return .{ .reader = reader, .cache = try @import("segment_source.zig").BlockCache.init(allocator, reader.source, byte_budget) };
         }
 
         pub fn deinit(self: *ReadScope) void {
+            var fields = self.normalized_fields.valueIterator();
+            while (fields.next()) |bytes| self.cache.allocator.free(bytes.*);
+            self.normalized_fields.deinit(self.cache.allocator);
             self.cache.deinit();
             self.* = undefined;
         }
@@ -8282,6 +8355,21 @@ pub const RangeSegmentReader = struct {
         pub fn invertedIndex(self: *ReadScope, field_name: []const u8, max_dictionary_block_bytes: usize) !?inverted.RangeInvertedIndexReader {
             var view = (try self.reader.sectionView(field_name, .inverted_text)) orelse return null;
             view.source = self.cache.borrowedSource();
+            if (self.reader.normalized_postings) {
+                const a = self.cache.allocator;
+                const encoded = self.normalized_fields.get(field_name) orelse compiled: {
+                    if (view.length > posting_delta.maximum_bytes) return error.InvalidPostingDelta;
+                    const bytes = try a.alloc(u8, @intCast(view.length));
+                    defer a.free(bytes);
+                    try view.readInto(0, bytes);
+                    const output = try posting_delta.materialize(a, bytes);
+                    errdefer a.free(output);
+                    const field = findSegmentField(Field, self.reader.fields, self.reader.fields_sorted, field_name).?;
+                    try self.normalized_fields.put(a, field.name, output);
+                    break :compiled output;
+                };
+                view = try @import("segment_source.zig").View.init(.{ .contiguous = encoded }, 0, encoded.len);
+            }
             return try inverted.RangeInvertedIndexReader.init(self.cache.allocator, view, max_dictionary_block_bytes);
         }
 

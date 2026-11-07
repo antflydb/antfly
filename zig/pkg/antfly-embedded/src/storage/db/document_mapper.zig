@@ -899,6 +899,7 @@ pub const BuildTextSegmentResult = struct {
 pub const default_text_segment_target_bytes: usize = 32 * 1024 * 1024;
 
 pub const BuildTextSegmentsOptions = struct {
+    normalized_postings: bool = false,
     contribution_cache: ?*introducer_mod.AnalyzedContributionCache = null,
     /// Encoded results belong to the caller's allocator. Transient builders
     /// may have a shorter, reclaiming lifetime even when results use a region.
@@ -1435,6 +1436,7 @@ fn buildTextSegmentFromProjectionBatchWithProfile(
 
 fn buildTextOptionsFromSegmentOptions(options: BuildTextSegmentsOptions) introducer_mod.BuildTextOptions {
     var build_options = introducer_mod.BuildTextOptions{
+        .normalized_postings = options.normalized_postings,
         .contribution_cache = options.contribution_cache,
         .profile = options.profile,
         .resource_manager = options.resource_manager,
@@ -1472,11 +1474,7 @@ pub fn buildTextSegmentsFromProjectionBatch(
         scratch_allocator: Allocator,
         segments: std.ArrayListUnmanaged([]u8) = .empty,
         pub fn consume(self: *@This(), chunk: TextProjectionBatch, build_options: introducer_mod.BuildTextOptions) !void {
-            var output = segment_mod.MemorySegmentSink.init(self.alloc);
-            defer output.deinit();
-            var sink = output.sink();
-            try introducer_mod.writeSegmentFromTextWithAnalysisOptions(self.scratch_allocator, chunk.docs, &analysis_mod.default_analyzer, self.analysis, build_options, &sink);
-            const bytes = try output.finishOwned();
+            const bytes = try introducer_mod.buildMemorySegmentFromTextWithAnalysisOptions(self.alloc, self.scratch_allocator, chunk.docs, &analysis_mod.default_analyzer, self.analysis, build_options);
             errdefer self.alloc.free(bytes);
             if (bytes.len == 0) {
                 self.alloc.free(bytes);
