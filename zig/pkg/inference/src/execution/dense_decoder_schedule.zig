@@ -941,11 +941,14 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     const q_role = RoleKey{ .kind = .self_q, .layer = 0, .part = .weight };
     const k_role = RoleKey{ .kind = .self_k, .layer = 0, .part = .weight };
     const state_role = RoleKey{ .kind = .self_slab_k, .layer = 0 };
+    const token_role = RoleKey{ .kind = .token_ids };
+    const token_shape = Shape.init(.i64, &.{1});
     var query_name = [_]u8{ 'q', 'u', 'e', 'r', 'y' };
     const parameters = [_]ParameterSpec{
         .{ .role = q_role, .shape = shape, .source_kind = .held_weight, .source_name = &query_name },
         .{ .role = k_role, .shape = shape, .source_kind = .held_weight, .source_name = "key" },
         .{ .role = state_role, .shape = shape, .source_kind = .external },
+        .{ .role = token_role, .shape = token_shape, .source_kind = .host },
     };
     const spec = ProgramSpec{
         .family = .whisper,
@@ -958,6 +961,7 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
         .{ .role = q_role, .value = query, .source_data = &weights },
         .{ .role = k_role, .value = key, .source_data = &weights },
         .{ .role = state_role, .value = first_state },
+        .{ .role = token_role },
     };
     // Independent original Builder authoring is the structural and numerical
     // reference; it does not read ProgramSpec or its cached recipe.
@@ -966,7 +970,9 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     const original_q = try original_builder.residentWeight(query, try native.NativeCompute.heldF32WeightPrimary(&cb, &weights, query));
     const original_k = try original_builder.residentWeight(key, try native.NativeCompute.heldF32WeightPrimary(&cb, &weights, key));
     const original_state = try original_builder.parameter(shape, first_state);
-    const original_sum = try original_builder.add(original_q, original_k);
+    const original_token = try original_builder.hostParameter(token_shape);
+    const original_gather = try original_builder.gather(original_q, original_token, 4);
+    const original_sum = try original_builder.add(original_gather, original_k);
     try original_builder.output(try original_builder.add(original_sum, original_state));
     const original = try Schedule.create(&original_builder);
     defer original.deinit(cleanup);
@@ -977,7 +983,9 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     const q_node = try builder.parameterRole(q_role);
     const k_node = try builder.parameterRole(k_role);
     const state_node = try builder.parameterRole(state_role);
-    try builder.output(try builder.add(try builder.add(q_node, k_node), state_node));
+    const token_node = try builder.parameterRole(token_role);
+    const gathered_node = try builder.gather(q_node, token_node, 4);
+    try builder.output(try builder.add(try builder.add(gathered_node, k_node), state_node));
     const first = try Schedule.create(&builder);
     var first_open = true;
     defer if (first_open) first.deinit(cleanup);
@@ -993,6 +1001,7 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     }
     try std.testing.expectEqualSlices(Node, original.steps, first.steps);
     try std.testing.expectEqual(q_node, try definition.parameterNode(q_role));
+    try std.testing.expectEqual(token_node, try definition.parameterNode(token_role));
     const owned = try definition.programSpec();
     try std.testing.expect(owned.hasRole(q_role));
     try std.testing.expect(try definition.matchesSpecSource(&spec, SliceSpecSource{ .entries = &parameters }));
@@ -1047,6 +1056,7 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
         const q = try extra.parameterRole(q_role);
         const k = try extra.parameterRole(k_role);
         const state = try extra.parameterRole(state_role);
+        _ = try extra.parameterRole(token_role);
         const raw = try extra.parameter(shape, first_state);
         try extra.output(try extra.add(try extra.add(try extra.add(q, k), state), raw));
         if (Schedule.create(&extra)) |unexpected| {
@@ -1110,9 +1120,28 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     }
     bound[0].source_data = &weights;
     for ([_]*Schedule{ original, first, second }) |schedule| {
-        try schedule.enter(null, cleanup, &.{});
+        const node = if (schedule == original) original_token else try schedule.definition.parameterNode(token_role);
+        var token: i64 = 0;
+        var tensor = @import("../backends/tensor.zig").Tensor{ .allocator = a, .name = "recipe.token", .dtype = .i64, .shape = &.{1}, .data = std.mem.asBytes(&token), .owns_data = false, .owns_shape = false };
+        const inputs = [_]@import("host_ingress.zig").Input{.{ .node_id = node, .value = &tensor }};
+        try std.testing.expectEqual(@as(usize, 1), schedule.selected.pool.host_input_plans.len);
+        try std.testing.expectEqual(node, schedule.selected.pool.host_input_plans[0].node);
+        try std.testing.expect(!schedule.selected.pool.supportsHostInputs(&.{}));
+        // This is the same owned i64 ingress used by actual decoder gathers:
+        // cold materialization ends, then real numerical B binds it afresh.
+        try schedule.enter(null, cleanup, &inputs);
+        try std.testing.expectEqual(@as(usize, 0), schedule.frame.?.bound_host_input_count);
         try schedule.beginExecution(cleanup);
-        const sum = try schedule.execute(&.{ query, key }, null);
+        const cold_generation = schedule.frame.?.host_input_generation;
+        for (try schedule.frame.?.rebindNativeProgramHostInputs(&inputs)) |input| schedule.values[input.node_id] = input.value;
+        try std.testing.expect(schedule.frame.?.host_input_generation > cold_generation);
+        try std.testing.expectEqual(@as(usize, 1), schedule.frame.?.bound_host_input_count);
+        const ids = schedule.values[node].?;
+        const gathered = try schedule.execute(&.{ query, ids }, null);
+        const row = try cb.toFloat32(gathered, a);
+        defer a.free(row);
+        try std.testing.expectEqualSlices(f32, &data, row);
+        const sum = try schedule.execute(&.{ gathered, key }, null);
         const output = try schedule.execute(&.{ sum, if (schedule == second) second_state else first_state }, null);
         const actual = try cb.toFloat32(output, a);
         defer a.free(actual);
