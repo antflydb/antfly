@@ -42,6 +42,7 @@ Use `text` for analyzed search and an exact scalar mapping for exact filters and
       "schema": {
         "type": "object",
         "additionalProperties": true,
+        "x-antfly-include-in-all": ["title", "body"],
         "properties": {
           "title": {
             "type": "string",
@@ -93,6 +94,20 @@ Use `text` for analyzed search and an exact scalar mapping for exact filters and
 `sortable` is the whole declaration. Antfly derives the typed field-value structures that exact sort and filters need; there is no `doc_values` to configure. The SDKs expose `DocumentFieldMapping` and `DocumentSubfieldMapping` for this `x-antfly-field` shape. `TemplateFieldMapping` is deliberately narrower: it represents one dynamic-template output and does not accept `fields`.
 
 The compact `x-antfly-types` shorthand still works for simple and multi-field search mappings, but it never enables exact sort on its own. Sort needs the detailed `x-antfly-field` form with `sortable: true`, so that doc-value storage and build cost land only on the scalar fields that asked for them. A mapping change rebuilds physical coverage. Once the write or rebuild visibility barrier completes, clients can issue `order_by` directly: Antfly validates a cold field on first use and fails closed if physical coverage is incomplete. Status reads never warm columns, so a safe but not-yet-validated field can remain `declared` until that first sort.
+
+An unfielded query such as `{"full_text_search":{"query":"cat"}}` searches the
+`_all` field. Schemaless inferred text contributes to `_all`, but an explicit
+document schema does not automatically include its declared text fields.
+Set `"x-antfly-include-in-all": ["title", "body"]` on the object schema, as above,
+to include those fields in unfielded searches.
+
+A field can be indexed and searchable without contributing to `_all`.
+For example, `{"full_text_search":{"match":"cat","field":"body"}}` searches
+`body` directly even when it is not in `x-antfly-include-in-all`. If a fielded
+query finds a document but the unfielded query does not, check this schema
+setting before treating the result as missing index coverage. Changing the
+schema requires the indexing/rebuild visibility barrier to complete before
+checking the new search behavior.
 
 Identifier-heavy fields such as SKUs, file paths, hostnames, and code symbols often need "contains" matching rather than word matching. Add `substring` to the shorthand (`"x-antfly-types": ["text", "substring"]`) or use `"type": "substring"` in a dynamic template to get a `fieldName._substring` companion that indexes every suffix of each token and of each adjacent token pair. A `match` or `prefix` query on that companion then finds `RAG3-WEAVER` for `g3we` without scanning the term dictionary, and it matches across separators, so `rag3_weaver` and `rag3weaver` are found too. The companion costs several times the size of its text, so opt in only where infix matching earns it.
 
@@ -362,6 +377,10 @@ All graph expansion work is budgeted across the whole request, including every n
 ## Exact Sort and Cursor Pagination
 
 `order_by` produces exact sorted pages over `_id` or mapped scalar fields whose capability is `queryable` or `accelerated`. Antfly appends `_id` ascending as a deterministic tie-breaker when it is omitted.
+
+On [Lite](/docs/guides/lite), an ordered query returns one exact page from live
+state, marked `live_read: true`. Lite can't retain a snapshot, so that page has
+no `remote_snapshot` and can't be continued with a cursor.
 
 First issue an ordered query without a cursor. The response returns a retained
 `remote_snapshot` token and each hit's `_sort` tuple:

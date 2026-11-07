@@ -37,6 +37,9 @@ class QueryResult:
             complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the
             configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and
             recipe. Unavailable retained generations return 409.
+        live_read (bool | Unset): True when an ordered query read live state because this deployment's storage (Lite)
+            cannot retain a snapshot. No remote_snapshot is returned, so the page cannot be continued with search_after or
+            search_before.
         evaluation (QueryResultBaseEvaluation | Unset): Function evaluation scope, population, usage, and scoped
             aggregations.
         hits (QueryHits | Unset): A list of query hits.
@@ -58,6 +61,7 @@ class QueryResult:
     source_ranking: QueryResultBaseSourceRanking | Unset = UNSET
     next_source_cursor: str | Unset = UNSET
     remote_snapshot: str | Unset = UNSET
+    live_read: bool | Unset = UNSET
     evaluation: QueryResultBaseEvaluation | Unset = UNSET
     hits: QueryHits | Unset = UNSET
     aggregations: QueryResultBaseAggregations | Unset = UNSET
@@ -81,6 +85,8 @@ class QueryResult:
         next_source_cursor = self.next_source_cursor
 
         remote_snapshot = self.remote_snapshot
+
+        live_read = self.live_read
 
         evaluation: dict[str, Any] | Unset = UNSET
         if not isinstance(self.evaluation, Unset):
@@ -128,6 +134,8 @@ class QueryResult:
             field_dict["next_source_cursor"] = next_source_cursor
         if remote_snapshot is not UNSET:
             field_dict["remote_snapshot"] = remote_snapshot
+        if live_read is not UNSET:
+            field_dict["live_read"] = live_read
         if evaluation is not UNSET:
             field_dict["evaluation"] = evaluation
         if hits is not UNSET:
@@ -174,6 +182,8 @@ class QueryResult:
         next_source_cursor = d.pop("next_source_cursor", UNSET)
 
         remote_snapshot = d.pop("remote_snapshot", UNSET)
+
+        live_read = d.pop("live_read", UNSET)
 
         _evaluation = d.pop("evaluation", UNSET)
         evaluation: QueryResultBaseEvaluation | Unset
@@ -234,6 +244,7 @@ class QueryResult:
             source_ranking=source_ranking,
             next_source_cursor=next_source_cursor,
             remote_snapshot=remote_snapshot,
+            live_read=live_read,
             evaluation=evaluation,
             hits=hits,
             aggregations=aggregations,

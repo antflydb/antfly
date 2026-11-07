@@ -70,6 +70,7 @@ pub const ModelEntry = struct {
 const DiscoverKindMode = enum {
     manifest,
     path,
+    installations,
 };
 
 test {
@@ -142,6 +143,10 @@ test "friendly alias refs parse as public model refs" {
         if (!std.mem.eql(u8, entry.alias, "bge-m3")) try std.testing.expect(!std.mem.eql(u8, "auto", ref.variant));
         if (std.mem.eql(u8, entry.alias, "bge-m3")) {
             try std.testing.expectEqualStrings("auto", ref.variant);
+        } else if (std.mem.eql(u8, entry.alias, "lightonocr3-0.8b")) {
+            try std.testing.expectEqualStrings("safetensors@" ++ lightonocr3.revision, ref.variant);
+        } else if (std.mem.eql(u8, entry.alias, "lightonocr3-4b")) {
+            try std.testing.expectEqualStrings("safetensors@" ++ lightonocr3.revision_4b, ref.variant);
         } else {
             try std.testing.expectEqualStrings("gguf", ref.variant);
         }
@@ -303,10 +308,9 @@ pub fn modelInstallDirAlloc(
 }
 
 /// Return the stable Hub request name recorded by a validated managed-model
-/// receipt. Install-directory leaves include a variant hash and are an internal
-/// cache detail; callers should publish `owner/name` for automatic selection or
-/// `owner/name:variant` for an explicit variant so every advertised value is
-/// stable, unique, and accepted by model-resolution endpoints.
+/// receipt. Install-directory leaves are an internal cache detail. A known
+/// resolved revision makes the canonical key immutable; variant-less and
+/// unpinned selectors are published separately only when unambiguous.
 pub fn managedModelRequestNameAlloc(
     allocator: std.mem.Allocator,
     io: Io,
@@ -325,15 +329,85 @@ pub fn managedModelRequestNameAlloc(
     {
         return null;
     }
-    if (std.mem.eql(u8, source.variant, "auto")) {
-        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source.owner, source.name });
-    }
-    return try std.fmt.allocPrint(
-        allocator,
-        "{s}/{s}:{s}",
-        .{ source.owner, source.name, source.variant },
-    );
+    const selection = try download.parseVariantRevision(source.variant);
+    const base = if (std.mem.eql(u8, selection.variant, "auto"))
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source.owner, source.name })
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}:{s}", .{ source.owner, source.name, selection.variant });
+    errdefer allocator.free(base);
+    // Separate revisions must not share one descriptor merely because their
+    // public unpinned selector has the same spelling.
+    if (source.resolved_revision) |revision| if (immutableHubRevision(revision)) {
+        const pinned = try std.fmt.allocPrint(allocator, "{s}@{s}", .{ base, revision });
+        allocator.free(base);
+        return pinned;
+    };
+    return base;
 }
+
+/// Candidate public selectors from a validated installation receipt. Callers
+/// must reject names shared by different installations before advertising them.
+/// The immutable revision comes from the resolved commit, never a moving ref.
+/// All returned memory belongs to allocator (normally a request arena).
+pub const ManagedSelection = struct {
+    names: []const []const u8 = &.{},
+    publication: ?[32]u8 = null,
+    rejected: bool = false,
+};
+pub fn managedModelSelectorsAlloc(allocator: std.mem.Allocator, io: Io, model_dir: []const u8) ![]const []const u8 {
+    return (try managedModelSelectionAlloc(allocator, io, model_dir)).names;
+}
+pub fn managedModelSelectionAlloc(allocator: std.mem.Allocator, io: Io, model_dir: []const u8) !ManagedSelection {
+    var receipt = (managed_receipt.loadValidated(allocator, io, model_dir) catch |err| {
+        // Candidate-local publication failures must not hide healthy models.
+        // Allocation and operational I/O failures remain actionable.
+        if (manifest_mod.isListingCandidateRejection(err)) return .{ .rejected = true };
+        return err;
+    }) orelse return .{};
+    defer receipt.deinit();
+    const publication = receipt.publication_generation;
+    if (receipt.parsed.value.version != 2) return .{ .publication = publication };
+    const source = receipt.parsed.value.source orelse return .{ .publication = publication };
+    if (!hubRepoComponentIsSafe(source.owner) or !hubRepoComponentIsSafe(source.name) or !modelVariantIsSafe(source.variant)) return .{ .rejected = true };
+    const selection = download.parseVariantRevision(source.variant) catch return .{ .rejected = true };
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    const base = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source.owner, source.name });
+    try names.append(allocator, base);
+    const qualified = if (std.mem.eql(u8, selection.variant, "auto")) base else try std.fmt.allocPrint(allocator, "{s}:{s}", .{ base, selection.variant });
+    if (qualified.ptr != base.ptr) try names.append(allocator, qualified);
+    if (source.resolved_revision) |revision| {
+        if (immutableHubRevision(revision)) {
+            try names.append(allocator, try std.fmt.allocPrint(allocator, "{s}@{s}", .{ qualified, revision }));
+            if (!std.mem.eql(u8, base, qualified)) try names.append(allocator, try std.fmt.allocPrint(allocator, "{s}@{s}", .{ base, revision }));
+        }
+    }
+    return .{ .names = try names.toOwnedSlice(allocator), .publication = publication };
+}
+fn immutableHubRevision(revision: []const u8) bool {
+    if (revision.len != 40) return false;
+    for (revision) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
+}
+
+/// Resolve a receipt-backed selector within the requested installation scope.
+/// Both native HTTP execution and direct extractor APIs use this authority.
+/// Exact legacy paths/defaults are handled by callers before this scan.
+pub fn resolveInstalledModelSelector(allocator: std.mem.Allocator, io: Io, models_dir: []const u8, requested: []const u8, task: ?[]const u8) !?[]u8 {
+    var inventory = try @import("selection.zig").Inventory.loadStable(allocator, io, models_dir);
+    defer inventory.deinit();
+    const selected = (try inventory.lookup(requested, task)) orelse return null;
+    return try allocator.dupe(u8, selected);
+}
+
+pub fn modelInTaskScope(models_dir: []const u8, path: []const u8, task_type: ?[]const u8) bool {
+    const task = task_type orelse return true;
+    const root = std.mem.trimEnd(u8, models_dir, "/");
+    if (!std.mem.startsWith(u8, path, root) or (path.len > root.len and path[root.len] != '/')) return false;
+    const relative = std.mem.trimStart(u8, path[root.len..], "/");
+    const first = relative[0 .. std.mem.indexOfScalar(u8, relative, '/') orelse relative.len];
+    return !isLegacyTaskDir(first) or std.mem.eql(u8, first, task);
+}
+
 pub const ModelRegistry = struct {
     allocator: std.mem.Allocator,
     models_dir: []const u8,
@@ -357,6 +431,12 @@ pub const ModelRegistry = struct {
     /// every manifest twice on listing-style paths.
     pub fn discoverShallow(self: *ModelRegistry, io: Io) ![]ModelEntry {
         return self.discoverWithKindMode(io, .path);
+    }
+
+    /// Enumerate installation paths using literal storage names. Public
+    /// selector ownership is derived separately, without parsing architecture.
+    pub fn discoverInstallations(self: *ModelRegistry, io: Io) ![]ModelEntry {
+        return self.discoverWithKindMode(io, .installations);
     }
 
     fn discoverWithKindMode(self: *ModelRegistry, io: Io, kind_mode: DiscoverKindMode) ![]ModelEntry {
@@ -608,12 +688,25 @@ pub const ModelRegistry = struct {
             else
                 false;
             if (cached) {
+                var publication = try @import("catalog_publication.zig").Publication.prepare(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
+                defer publication.deinit();
+                try publication.recoverDestination();
                 try download.finishVerifiedManagedInstall(self.allocator, io, dest);
+                try publication.finish();
                 return;
             }
         }
 
-        var transaction = try download.ManagedModelTransaction.begin(self.allocator, io, dest);
+        var transaction = blk: {
+            // begin() can restore a backup after an interrupted publication.
+            var publication = try @import("catalog_publication.zig").Publication.prepare(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
+            defer publication.deinit();
+            try publication.recoverDestination();
+            try publication.finish();
+            var pending = try download.ManagedModelTransaction.beginWithLease(self.allocator, io, dest, try publication.writeLease());
+            errdefer pending.deinit(io);
+            break :blk pending;
+        };
         defer transaction.deinit(io);
 
         if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
@@ -741,7 +834,10 @@ pub const ModelRegistry = struct {
                 try io.checkCancel();
             }
         }
-        try transaction.commit(io);
+        var publication = try @import("catalog_publication.zig").Publication.prepare(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
+        defer publication.deinit();
+        try publication.commit(&transaction);
+        try publication.finish();
     }
 
     /// Companion MTP assistant ref for a Gemma4 QAT gguf model
@@ -798,10 +894,10 @@ pub const ModelRegistry = struct {
                 gliner_architecture = manifest.gliner_architecture;
                 break :blk modelKindFromManifestType(manifest.model_type);
             },
-            .path => kind_hint orelse inferModelKindFromPath(model_path),
+            .path, .installations => kind_hint orelse inferModelKindFromPath(model_path),
         };
 
-        const owned_name = managedModelRequestNameAlloc(self.allocator, io, model_path) catch |err| switch (err) {
+        const owned_name = if (kind_mode == .installations) try self.allocator.dupe(u8, display_name) else managedModelRequestNameAlloc(self.allocator, io, model_path) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => null,
         } orelse try self.allocator.dupe(u8, display_name);
@@ -2837,11 +2933,10 @@ fn isManagedVariantInstallLeaf(requested_name: []const u8, candidate: []const u8
 
 /// Resolve a legacy model name by variant suffix.
 /// If `requested` isn't found in the directory, looks for sibling entries
-/// prefixed with "requested-" and returns the shortest deterministic match.
+/// prefixed with "requested-" and accepts only a single matching directory.
 /// Managed variant directories are deliberately excluded: their suffix is an
 /// opaque cache hash, and validated receipt identities must resolve them.
 /// `requested` may include an owner directory (for example `owner/model`).
-/// Matches Go inference's resolveVariant.
 /// Returns null only for a missing directory or missing match; allocation and
 /// directory iteration failures remain actionable to callers.
 pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const u8, requested: []const u8) !?[]const u8 {
@@ -2875,13 +2970,11 @@ pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const 
         if (std.mem.startsWith(u8, entry.name, prefix) and
             !isManagedVariantInstallLeaf(requested_name, entry.name))
         {
-            if (best_name == null or entry.name.len < best_name.?.len or
-                (entry.name.len == best_name.?.len and std.mem.lessThan(u8, entry.name, best_name.?)))
-            {
-                const new_best = try allocator.dupe(u8, entry.name);
-                if (best_name) |old| allocator.free(old);
-                best_name = new_best;
-            }
+            const candidate = try std.fs.path.join(allocator, &.{ search_dir, entry.name });
+            defer allocator.free(candidate);
+            if (!isModelDir(io, candidate)) continue;
+            if (best_name != null) return error.AmbiguousModelIdentifier;
+            best_name = try allocator.dupe(u8, entry.name);
         }
     }
 
@@ -2982,6 +3075,7 @@ test "resolveVariant retains legacy suffix resolution" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "models/owner/model-q4_0");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-q4_0/model.gguf", .data = "weights" });
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
     defer allocator.free(models_dir);
@@ -3217,4 +3311,113 @@ test "specialty managed pull requalifies existing task manifests before publicat
         try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, registry.writePulledModelManifest(io, path, null, null));
         try std.testing.expectEqual(download.ManagedDownloadState.incomplete, download.managedDownloadState(a, io, path));
     }
+}
+
+test "resolveVariant rejects multiple legacy suffixes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/owner/model-q4");
+    try tmp.dir.createDirPath(io, "models/owner/model-q8");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-q4/model.gguf", .data = "weights" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-q8/model.gguf", .data = "weights" });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    try std.testing.expectError(error.AmbiguousModelIdentifier, resolveVariant(a, io, root, "owner/model"));
+}
+
+test "resolveVariant ignores empty and incomplete legacy candidates" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/owner/model-q4");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-q4/model.gguf", .data = "weights" });
+    try tmp.dir.createDirPath(io, "models/owner/model-z");
+    try tmp.dir.createDirPath(io, "models/owner/model-incomplete");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-incomplete/model.gguf", .data = "weights" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-incomplete/.antfly-download-in-progress", .data = "pending" });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    const path = (try resolveVariant(a, io, root, "owner/model")).?;
+    defer a.free(path);
+    try std.testing.expect(std.mem.endsWith(u8, path, "model-q4"));
+}
+
+test "model selection registry pull publishes catalog generations and recovers cancellation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const local_http = @import("httpx");
+    const publication = @import("catalog_publication.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = @embedFile("testdata/hub_snapshot_server.py") });
+    const address = local_http.socket.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try local_http.TcpListener.init(address, io);
+    const port = listener.getLocalAddress().ip4.port;
+    listener.deinit();
+    var port_buf: [16]u8 = undefined;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", try std.fmt.bufPrint(&port_buf, "{d}", .{port}), "onnx-only" },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+    try io.sleep(std.Io.Duration.fromMilliseconds(200), .awake);
+    const temporary = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(temporary);
+    const root = try std.fs.path.join(a, &.{ temporary, "models" });
+    defer a.free(root);
+    const base_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{port});
+    defer a.free(base_url);
+    var registry = ModelRegistry.init(a, root);
+    defer registry.deinit();
+    try registry.pullWithProgress(io, "owner/model:onnx", .{ .base_url = base_url }, null, null, .auto, .{});
+    const first = try publication.read(a, io, root);
+    try std.testing.expectEqual(.publication, first.kind);
+    var cache = @import("selection.zig").Cache.init(a);
+    defer cache.deinit();
+    const pin = "owner/model:onnx@0123456789abcdef0123456789abcdef01234567";
+    const selected = (try cache.resolveSelection(a, io, root, pin, null)).?;
+    defer a.free(selected.path);
+    const cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, registry.pullWithProgress(io, "owner/model:onnx", .{ .base_url = base_url }, null, null, .auto, .{ .cancelled = &cancelled }));
+    try std.testing.expectEqual(.publication, (try publication.read(a, io, root)).kind);
+    const preserved = (try cache.resolveSelection(a, io, root, pin, null)).?;
+    defer a.free(preserved.path);
+    try std.testing.expectEqual(selected.publication, preserved.publication);
+}
+
+test "model selection unrelated failed pull recovers the journaled publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/acme/first");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/acme/first/model.gguf", .data = "decoder" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/acme/first/.antfly-download-complete.json", .data =
+        \\{"version":2,"source":{"owner":"acme","name":"first","variant":"gguf","resolved_revision":"0123456789abcdef0123456789abcdef01234567"},"artifacts":[{"path":"model.gguf","size":7}]}
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    const publication = @import("catalog_publication.zig");
+    var interrupted = try publication.Publication.begin(a, io, root, "acme/first");
+    // Simulate process death between the two publication renames.
+    try std.Io.Dir.rename(tmp.dir, "models/acme/first", tmp.dir, "models/acme/.first.antfly-download-backup", io);
+    interrupted.deinit();
+    try std.testing.expectError(error.ModelArtifactsChanging, publication.read(a, io, root));
+    var registry = ModelRegistry.init(a, root);
+    defer registry.deinit();
+    // Recovery must precede B's network operation; even its failure must leave
+    // A restored, rather than turning the interrupted publication into a 404.
+    registry.pullWithProgress(io, "other/model:onnx", .{ .base_url = "http://127.0.0.1:1" }, null, null, .auto, .{}) catch {};
+    try std.testing.expectEqual(.publication, (try publication.read(a, io, root)).kind);
+    var cache = @import("selection.zig").Cache.init(a);
+    defer cache.deinit();
+    const selected = (try cache.resolveSelection(a, io, root, "acme/first:gguf@0123456789abcdef0123456789abcdef01234567", null)).?;
+    defer a.free(selected.path);
+    try std.testing.expect(std.mem.endsWith(u8, selected.path, "/acme/first"));
 }

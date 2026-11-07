@@ -62,7 +62,7 @@ pub const RetirementPosition = struct {
     after_key: []const u8,
 
     pub fn encodeAlloc(self: @This(), alloc: std.mem.Allocator) ![]u8 {
-        if (self.after_key.len > 1024 * 1024) return error.InvalidBatchRequest;
+        if (self.after_key.len > publication.max_cursor_bytes) return error.InvalidBatchRequest;
         const raw = try alloc.alloc(u8, 72 + self.after_key.len);
         @memcpy(raw[0..4], "AUR1");
         @memcpy(raw[4..36], &self.generation);
@@ -73,7 +73,7 @@ pub const RetirementPosition = struct {
     }
     /// The key borrows raw; a page copies it before releasing the input.
     pub fn decode(raw: []const u8) !@This() {
-        if (raw.len < 72 or raw.len > 72 + 1024 * 1024 or !std.mem.eql(u8, raw[0..4], "AUR1") or
+        if (raw.len < 72 or raw.len > 72 + publication.max_cursor_bytes or !std.mem.eql(u8, raw[0..4], "AUR1") or
             std.mem.readInt(u32, raw[36..40], .little) != raw.len - 72) return error.ArtifactCatalogCorrupt;
         var checksum: publication.Digest = undefined;
         std.crypto.hash.sha2.Sha256.hash(raw[0 .. raw.len - 32], &checksum, .{});
@@ -385,7 +385,7 @@ fn UnitSessionImpl(comptime Txn: type, comptime capture_enabled: bool) type {
                 const key = if (is_unit) try @import("../internal_keys.zig").documentUnitArtifactKeyAlloc(alloc, self.request.doc_key, self.request.upstream_artifact_name, descriptor.name[1..]) else null;
                 defer if (key) |name| alloc.free(name);
                 const charged = std.math.add(usize, descriptor.name.len + 80, if (key) |name| name.len else 0) catch return error.ResourceBudgetExceeded;
-                if (charged > publication.max_payload_bytes or (key != null and key.?.len > 1024 * 1024)) return error.ResourceBudgetExceeded;
+                if (charged > publication.max_identity_bytes or (key != null and key.?.len > publication.max_cursor_bytes)) return error.ResourceBudgetExceeded;
                 // A single bounded large identity must not starve forever.
                 // Do not advance the saved position past a deferred member.
                 if (visited != 0 and bytes +| charged > max_bytes) break;
@@ -437,7 +437,7 @@ fn UnitSessionImpl(comptime Txn: type, comptime capture_enabled: bool) type {
                 const key = if (!live) try keys.documentUnitArtifactKeyAlloc(alloc, self.request.doc_key, self.request.upstream_artifact_name, unit) else null;
                 defer if (key) |selected| alloc.free(selected);
                 const charge = found.bytes +| (if (key) |selected| selected.len else @as(usize, 0));
-                if (key != null and key.?.len > 1024 * 1024) return error.ResourceBudgetExceeded;
+                if (key != null and key.?.len > publication.max_cursor_bytes) return error.ResourceBudgetExceeded;
                 if (visited != 0 and bytes +| charge > max_bytes) break;
                 if (key) |selected| try units.append(owned, try owned.dupe(u8, selected));
                 last.clearRetainingCapacity();
@@ -1635,6 +1635,9 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             reader: @TypeOf(&reopened),
             primary: []const u8,
             row: []const u8,
+            pub fn openPhysicalCursorAdapter(self: *@This()) @TypeOf(self.reader.openPhysicalCursorAdapter()) {
+                return self.reader.openPhysicalCursorAdapter();
+            }
             pub fn get(self: *@This(), selected: []const u8) ![]const u8 {
                 if (std.mem.eql(u8, selected, self.primary) or std.mem.eql(u8, selected, self.row)) return error.UnexpectedPrimaryBodyRead;
                 return self.reader.get(selected);
@@ -2203,4 +2206,15 @@ test "ordered artifact inventory unit retirement discovery cursor rejects corrup
         bytes[offset] ^= 1;
         try std.testing.expectError(error.ArtifactCatalogCorrupt, RetirementPosition.decode(bytes[0..offset]));
     }
+}
+
+test "privacy chunk retirement round trips a large physical cursor" {
+    const a = std.testing.allocator;
+    const key = try a.alloc(u8, 1_100_000);
+    defer a.free(key);
+    @memset(key, 'x');
+    const raw = try (RetirementPosition{ .generation = @splat(1), .after_key = key }).encodeAlloc(a);
+    defer a.free(raw);
+    const restored = try RetirementPosition.decode(raw);
+    try std.testing.expectEqualSlices(u8, key, restored.after_key);
 }

@@ -102,6 +102,19 @@ pub const PjrtExecutor = struct {
         retained_cache: ?*const PjrtRetainedBufferCache,
         semantic_input_bindings: []const PjrtSemanticInputBinding,
     ) ![]pjrt_lib.pjrt.Buffer {
+        return self.executeToBuffersWithAllocators(values, exec_ctx, allocator, allocator, retained_cache, semantic_input_bindings);
+    }
+
+    fn executeToBuffersWithAllocators(
+        self: *PjrtExecutor,
+        values: []?CT,
+        exec_ctx: PartitionExecutor.ExecutionContext,
+        allocator: Allocator,
+        transfer_allocator: Allocator,
+        retained_cache: ?*const PjrtRetainedBufferCache,
+        semantic_input_bindings: []const PjrtSemanticInputBinding,
+    ) ![]pjrt_lib.pjrt.Buffer {
+        const staging_allocator = @import("antfly_platform").allocator.reclaimingScratch(transfer_allocator);
         const num_inputs = self.input_bindings.len;
         const debug = pjrtExecDebugEnabled();
         if (debug) {
@@ -120,8 +133,9 @@ pub const PjrtExecutor = struct {
             if (owned_input_bufs[i]) buf.deinit();
         };
 
+        var semantic_inputs = try SemanticInputCursor.init(semantic_input_bindings, num_inputs);
         for (self.input_bindings, 0..) |binding, i| {
-            if (findSemanticInputBinding(semantic_input_bindings, i)) |semantic_binding| {
+            if (semantic_inputs.at(i)) |semantic_binding| {
                 const cache = retained_cache orelse {
                     if (debug) {
                         std.log.warn(
@@ -147,20 +161,8 @@ pub const PjrtExecutor = struct {
                     }
                     return error.MissingPastKeyValue;
                 };
-                if (try retainedBufferShapeMismatch(retained, self.input_shapes_[i])) |sizes| {
-                    if (debug) {
-                        std.log.warn(
-                            "PJRT execute input[{d}/{d}] retained buffer shape mismatch name={s} expected_shape={any} expected_bytes={d} actual_bytes={d}",
-                            .{
-                                i + 1,
-                                num_inputs,
-                                semantic_binding.name,
-                                self.input_shapes_[i],
-                                sizes.expected_bytes,
-                                sizes.actual_bytes,
-                            },
-                        );
-                    }
+                if (!try retained.matchesFloat32Shape(self.input_shapes_[i])) {
+                    if (debug) std.log.warn("PJRT retained input shape/type mismatch input={d} expected={any}", .{ i, self.input_shapes_[i] });
                     return error.UnsupportedShape;
                 }
                 if (debug and shouldLogPjrtInput(i, num_inputs)) {
@@ -182,8 +184,8 @@ pub const PjrtExecutor = struct {
                             }
                             return error.MissingValue;
                         };
-                        const f32_data = try self.host_backend.toFloat32(ct, allocator);
-                        defer allocator.free(f32_data);
+                        const f32_data = try self.host_backend.toFloat32(ct, staging_allocator);
+                        defer staging_allocator.free(f32_data);
                         const upload_shape = resolveUploadShapeFromTensor(
                             allocator,
                             self.host_backend,
@@ -226,8 +228,8 @@ pub const PjrtExecutor = struct {
                             }
                             return error.MissingValue;
                         };
-                        const f32_data = try self.host_backend.toFloat32(ct, allocator);
-                        defer allocator.free(f32_data);
+                        const f32_data = try self.host_backend.toFloat32(ct, staging_allocator);
+                        defer staging_allocator.free(f32_data);
                         const upload_shape = resolveUploadShapeFromTensor(
                             allocator,
                             self.host_backend,
@@ -375,47 +377,17 @@ pub fn createExecutor(
     var executable = try client.compile(result.hlo_bytes, result.output_node_ids.len);
     errdefer executable.deinit();
 
-    // 3. Collect shapes from graph nodes
-    const num_inputs = result.input_bindings.len;
-    const num_outputs = result.output_node_ids.len;
-
-    const input_shapes = try allocator.alloc([]i64, num_inputs);
-    errdefer {
-        for (input_shapes[0..num_inputs]) |s| allocator.free(s);
-        allocator.free(input_shapes);
-    }
-    for (result.input_shapes, 0..) |shape, i| input_shapes[i] = try allocator.dupe(i64, shape);
-
-    const output_shapes = try allocator.alloc([]i64, num_outputs);
-    errdefer {
-        for (output_shapes[0..num_outputs]) |s| allocator.free(s);
-        allocator.free(output_shapes);
-    }
-    for (result.output_shapes, 0..) |shape, i| output_shapes[i] = try allocator.dupe(i64, shape);
-
-    // 4. Take ownership of node IDs
-    const input_node_ids = try allocator.dupe(NodeId, result.input_node_ids);
-    errdefer allocator.free(input_node_ids);
-    const input_bindings = try allocator.dupe(compiler.InputBinding, result.input_bindings);
-    errdefer allocator.free(input_bindings);
-    const output_node_ids = try allocator.dupe(NodeId, result.output_node_ids);
-    errdefer allocator.free(output_node_ids);
-
-    // 5. Create executor
-    const exec = try allocator.create(PjrtExecutor);
-    exec.* = .{
-        .allocator = allocator,
-        .executable = executable,
-        .client = client,
-        .host_backend = host_backend,
-        .input_node_ids = input_node_ids,
-        .input_bindings = input_bindings,
-        .output_node_ids = output_node_ids,
-        .output_shapes = output_shapes,
-        .input_shapes_ = input_shapes,
-    };
-    exec.pe = .{ .ptr = exec, .vtable = &PjrtExecutor.vtable };
-    return exec;
+    return createExecutorFromLoadedExecutable(
+        allocator,
+        graph,
+        executable,
+        result.input_bindings,
+        result.output_node_ids,
+        result.input_shapes,
+        result.output_shapes,
+        host_backend,
+        client,
+    );
 }
 
 pub fn createExecutorFromHlo(
@@ -536,6 +508,15 @@ pub fn createExecutorFromSerializedExecutableWithShapes(
     );
 }
 
+fn validateInputNodes(graph: *const Graph, bindings: []const compiler.InputBinding) !void {
+    for (bindings) |binding| switch (binding) {
+        .graph_node => |node_id| {
+            if (node_id >= graph.nodeCount()) return error.MissingArtifactMetadata;
+        },
+        .embedding_ids, .semantic_past_graph_node => {},
+    };
+}
+
 fn createExecutorFromLoadedExecutable(
     allocator: Allocator,
     graph: *const Graph,
@@ -547,6 +528,7 @@ fn createExecutorFromLoadedExecutable(
     host_backend: *const ComputeBackend,
     client: *pjrt_lib.pjrt.Client,
 ) !*PjrtExecutor {
+    try validateInputNodes(graph, input_bindings_source);
     const num_inputs = input_bindings_source.len;
     const num_outputs = output_node_ids_source.len;
     if (input_shapes_source) |shapes| {
@@ -592,6 +574,8 @@ fn createExecutorFromLoadedExecutable(
         };
         output_shapes_initialized += 1;
     }
+
+    try executable.validateOutputShapes(output_shapes);
 
     var input_node_ids_list = std.ArrayListUnmanaged(NodeId).empty;
     errdefer input_node_ids_list.deinit(allocator);
@@ -661,16 +645,17 @@ fn inputBindingsRequireHostMaterialization(input_bindings: []const compiler.Inpu
     return false;
 }
 
-pub const PjrtRetainedBufferKind = enum {
-    key,
-    value,
-};
+pub const PjrtRetainedBufferKind = @import("pjrt_kv_identity.zig").Kind;
+const KvIdentity = @import("pjrt_kv_identity.zig").Identity;
 
 pub const PjrtSemanticOutputBinding = struct {
     output_index: usize,
     name: []const u8,
     layer_index: ?u32,
     kind: PjrtRetainedBufferKind,
+    pub fn identity(self: @This()) KvIdentity {
+        return .{ .layer_index = self.layer_index, .kind = self.kind, .name = self.name };
+    }
 };
 
 pub const PjrtSemanticInputBinding = struct {
@@ -678,17 +663,30 @@ pub const PjrtSemanticInputBinding = struct {
     name: []const u8,
     layer_index: ?u32,
     kind: PjrtRetainedBufferKind,
+    pub fn identity(self: @This()) KvIdentity {
+        return .{ .layer_index = self.layer_index, .kind = self.kind, .name = self.name };
+    }
 };
 
 pub const PjrtRetainedBufferCache = struct {
     allocator: Allocator,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
+    owns_entries: bool = true,
+    fixed_capacity: bool = false,
+    // Open-addressed table of entry index + 1, at less than 50% occupancy.
+    // Admitted runtime slots own this storage; reset clears it without allocating.
+    // Layerless bindings use their name as part of the semantic identity.
+    semantic_index: []usize = &.{},
 
     pub const Entry = struct {
-        name: []u8,
+        name: []const u8,
+        owns_name: bool = true,
         layer_index: ?u32,
         kind: PjrtRetainedBufferKind,
         buffer: pjrt_lib.pjrt.Buffer,
+        fn identity(self: @This()) KvIdentity {
+            return .{ .layer_index = self.layer_index, .kind = self.kind, .name = self.name };
+        }
     };
 
     pub fn init(allocator: Allocator) PjrtRetainedBufferCache {
@@ -697,7 +695,7 @@ pub const PjrtRetainedBufferCache = struct {
 
     pub fn deinit(self: *PjrtRetainedBufferCache) void {
         self.clear();
-        self.entries.deinit(self.allocator);
+        if (self.owns_entries) self.entries.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -708,9 +706,10 @@ pub const PjrtRetainedBufferCache = struct {
             if (debug) std.log.info("PJRT retained buffer deinit[{d}] name={s}", .{ i, entry.name });
             entry.buffer.deinit();
             if (debug) std.log.info("PJRT retained buffer deinit[{d}] complete", .{i});
-            self.allocator.free(entry.name);
+            if (entry.owns_name) self.allocator.free(entry.name);
         }
         self.entries.clearRetainingCapacity();
+        @memset(self.semantic_index, 0);
     }
 
     pub fn len(self: *const PjrtRetainedBufferCache) usize {
@@ -728,11 +727,52 @@ pub const PjrtRetainedBufferCache = struct {
         self: *const PjrtRetainedBufferCache,
         binding: PjrtSemanticInputBinding,
     ) ?*const pjrt_lib.pjrt.Buffer {
-        if (self.get(binding.name)) |buffer| return buffer;
-        for (self.entries.items) |*entry| {
-            if (retainedEntryMatchesSemanticInput(entry.*, binding)) return &entry.buffer;
+        const index = self.semanticEntryIndex(binding) orelse return null;
+        return &self.entries.items[index].buffer;
+    }
+
+    fn semanticEntryIndex(self: *const @This(), binding: PjrtSemanticInputBinding) ?usize {
+        if (self.semantic_index.len != 0) {
+            const slot = self.semanticSlot(binding.name, binding.layer_index, binding.kind);
+            const index = self.semantic_index[slot];
+            return if (index == 0) null else index - 1;
+        }
+        for (self.entries.items, 0..) |entry, i| {
+            if (retainedEntryMatchesSemanticInput(entry, binding)) return i;
         }
         return null;
+    }
+
+    /// Keep only inputs consumed by this phase. Pruning before native Execute
+    /// bounds old residency by the phase's admitted inputs; retries retain
+    /// those same inputs until successful output publication.
+    pub fn retainSemanticInputs(self: *@This(), allocator: Allocator, bindings: []const PjrtSemanticInputBinding) !void {
+        const live = try allocator.alloc(bool, self.entries.items.len);
+        defer allocator.free(live);
+        @memset(live, false);
+        for (bindings) |binding| {
+            const index = self.semanticEntryIndex(binding) orelse return error.MissingPastKeyValue;
+            live[index] = true;
+        }
+        var count: usize = 0;
+        for (self.entries.items, live) |entry, keep| {
+            if (keep) {
+                self.entries.items[count] = entry;
+                count += 1;
+            } else {
+                var buffer = entry.buffer;
+                buffer.deinit();
+                if (entry.owns_name) self.allocator.free(entry.name);
+            }
+        }
+        self.entries.items.len = count;
+        @memset(self.semantic_index, 0);
+        if (self.semantic_index.len != 0) {
+            for (self.entries.items, 0..) |entry, i| {
+                const slot = self.semanticSlot(entry.name, entry.layer_index, entry.kind);
+                self.semantic_index[slot] = i + 1;
+            }
+        }
     }
 
     pub fn put(
@@ -744,20 +784,50 @@ pub const PjrtRetainedBufferCache = struct {
     ) !void {
         const owned_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned_name);
-        for (self.entries.items) |*entry| {
-            if (!std.mem.eql(u8, entry.name, name)) continue;
+        try self.putName(owned_name, true, layer_index, kind, buffer);
+    }
+
+    /// The runtime retains the executor that owns these immutable names.
+    pub fn putBorrowed(self: *@This(), name: []const u8, layer_index: ?u32, kind: PjrtRetainedBufferKind, buffer: pjrt_lib.pjrt.Buffer) !void {
+        try self.putName(name, false, layer_index, kind, buffer);
+    }
+
+    fn semanticSlot(self: *const @This(), name: []const u8, layer: ?u32, kind: PjrtRetainedBufferKind) usize {
+        const identity = KvIdentity{ .name = name, .layer_index = layer, .kind = kind };
+        var slot = identity.hash() % self.semantic_index.len;
+        while (self.semantic_index[slot] != 0) : (slot = (slot + 1) % self.semantic_index.len) {
+            const entry = self.entries.items[self.semantic_index[slot] - 1];
+            if (entry.identity().eql(identity)) break;
+        }
+        return slot;
+    }
+
+    fn putName(self: *@This(), name: []const u8, owns_name: bool, layer_index: ?u32, kind: PjrtRetainedBufferKind, buffer: pjrt_lib.pjrt.Buffer) !void {
+        const indexed_slot: ?usize = if (!owns_name and self.semantic_index.len != 0) self.semanticSlot(name, layer_index, kind) else null;
+        const candidates = if (indexed_slot) |slot| if (self.semantic_index[slot] == 0) self.entries.items[0..0] else self.entries.items[self.semantic_index[slot] - 1 .. self.semantic_index[slot]] else self.entries.items;
+        for (candidates) |*entry| {
+            const matches = entry.identity().eql(.{ .layer_index = layer_index, .kind = kind, .name = name });
+            if (!matches) continue;
             entry.buffer.deinit();
-            self.allocator.free(entry.name);
+            if (entry.owns_name) self.allocator.free(entry.name);
             entry.* = .{
-                .name = owned_name,
+                .name = name,
+                .owns_name = owns_name,
                 .layer_index = layer_index,
                 .kind = kind,
                 .buffer = buffer,
             };
             return;
         }
+        if (self.fixed_capacity) {
+            if (self.entries.items.len == self.entries.capacity) return error.MissingArtifactMetadata;
+            if (indexed_slot) |slot| self.semantic_index[slot] = self.entries.items.len + 1;
+            self.entries.appendAssumeCapacity(.{ .name = name, .owns_name = owns_name, .layer_index = layer_index, .kind = kind, .buffer = buffer });
+            return;
+        }
         try self.entries.append(self.allocator, .{
-            .name = owned_name,
+            .name = name,
+            .owns_name = owns_name,
             .layer_index = layer_index,
             .kind = kind,
             .buffer = buffer,
@@ -769,10 +839,17 @@ fn retainedEntryMatchesSemanticInput(
     entry: PjrtRetainedBufferCache.Entry,
     binding: PjrtSemanticInputBinding,
 ) bool {
-    return entry.kind == binding.kind and entry.layer_index == binding.layer_index;
+    return entry.identity().eql(binding.identity());
 }
 
 pub const PjrtModelExecutor = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    owned_graph: ?*Graph = null,
+    metadata_budget: ?*@import("pjrt_metadata.zig").Budget = null,
+    retained_capacity: usize = 0,
+    runtime_slots: []RuntimeSlot = &.{},
+
+    artifact_owner: ?*@import("pjrt_admission.zig").Package = null,
     allocator: Allocator,
     graph: *const Graph,
     executor: *PjrtExecutor,
@@ -781,14 +858,90 @@ pub const PjrtModelExecutor = struct {
     semantic_input_bindings: []PjrtSemanticInputBinding = &.{},
     semantic_output_bindings: []PjrtSemanticOutputBinding = &.{},
     decode_variants: []DecodeVariant = &.{},
+    logits_index: ?usize = null,
 
     pub const DecodeVariant = struct {
+        logits_index: ?usize = null,
         seq_len: usize,
         executor: *PjrtExecutor,
         input_materialization: PjrtInputMaterialization,
         semantic_input_bindings: []PjrtSemanticInputBinding,
         semantic_output_bindings: []PjrtSemanticOutputBinding,
     };
+
+    /// Resolve immutable output mappings once, before publishing the executor.
+    pub fn prepareOutputMappings(self: *@This()) void {
+        self.logits_index = primaryGraphOutputIndex(self.graph, self.executor.output_node_ids, self.semantic_output_bindings);
+        for (self.decode_variants) |*variant| {
+            variant.logits_index = primaryGraphOutputIndex(self.graph, variant.executor.output_node_ids, variant.semantic_output_bindings);
+        }
+    }
+
+    const RuntimeSlot = struct {
+        busy: std.atomic.Value(bool) = .init(false),
+        runtime: PjrtModelRuntime = undefined,
+        entries: []PjrtRetainedBufferCache.Entry,
+        semantic_index: []usize,
+        values: []?CT,
+        scratch: []align(8) u8,
+    };
+
+    /// Conservative arena bound for the concrete execution allocation sites.
+    /// Shapes may coexist with an inferred shape; native argument/output lists
+    /// and wrappers coexist until the phase returns. Every term is checked.
+    fn phaseWorkspaceBytes(exec: *const PjrtExecutor) !usize {
+        var bytes: usize = 0;
+        const c = pjrt_lib.c_types;
+        try workspaceArray(&bytes, bool, exec.output_node_ids.len); // retained flags
+        try workspaceArray(&bytes, pjrt_lib.pjrt.Buffer, exec.input_bindings.len);
+        try workspaceArray(&bytes, bool, exec.input_bindings.len); // owned inputs
+        try workspaceArray(&bytes, ?*c.PjrtBuffer, exec.input_bindings.len);
+        try workspaceArray(&bytes, i64, exec.input_bindings.len); // non-donatable indices
+        try workspaceArray(&bytes, ?*c.PjrtBuffer, exec.output_node_ids.len);
+        try workspaceArray(&bytes, pjrt_lib.pjrt.Buffer, exec.output_node_ids.len);
+        for (exec.input_shapes_) |shape| {
+            try workspaceArray(&bytes, i64, shape.len);
+            try workspaceArray(&bytes, i64, shape.len);
+        }
+        for (exec.output_shapes) |shape| try workspaceArray(&bytes, i64, shape.len);
+        return bytes;
+    }
+
+    fn workspaceArray(bytes: *usize, comptime T: type, count: usize) !void {
+        bytes.* = try std.math.add(usize, bytes.*, try std.math.add(usize, try std.math.mul(usize, count, @sizeOf(T)), @alignOf(T) - 1));
+    }
+
+    /// Host metadata for every execution slot is admitted and allocated during
+    /// loading. Runtime creation and KV replacement need no allocator or live
+    /// manager, and cannot acquire unplanned metadata after fixing the pool.
+    pub fn prepareRuntimeSlots(self: *@This(), capacity: usize) !void {
+        var scratch_bytes = try phaseWorkspaceBytes(self.executor);
+        for (self.decode_variants) |variant| scratch_bytes = @max(scratch_bytes, try phaseWorkspaceBytes(variant.executor));
+        try workspaceArray(&scratch_bytes, bool, self.retained_capacity); // phase liveness marks
+        const slots = try self.allocator.alloc(RuntimeSlot, capacity);
+        errdefer self.allocator.free(slots);
+        var initialized: usize = 0;
+        errdefer for (slots[0..initialized]) |slot| {
+            self.allocator.free(slot.entries);
+            self.allocator.free(slot.semantic_index);
+            self.allocator.free(slot.values);
+            self.allocator.free(slot.scratch);
+        };
+        for (slots) |*slot| {
+            const entries = try self.allocator.alloc(PjrtRetainedBufferCache.Entry, self.retained_capacity);
+            errdefer self.allocator.free(entries);
+            const index = try self.allocator.alloc(usize, try std.math.add(usize, try std.math.mul(usize, self.retained_capacity, 2), 1));
+            @memset(index, 0);
+            errdefer self.allocator.free(index);
+            const values = try self.allocator.alloc(?CT, self.graph.nodeCount());
+            errdefer self.allocator.free(values);
+            @memset(values, null);
+            const scratch = try self.allocator.alignedAlloc(u8, .@"8", scratch_bytes);
+            slot.* = .{ .entries = entries, .semantic_index = index, .values = values, .scratch = scratch };
+            initialized += 1;
+        }
+        self.runtime_slots = slots;
+    }
 
     const executor_vtable = model_runtime.ModelExecutor.VTable{
         .create_runtime = createRuntime,
@@ -801,23 +954,43 @@ pub const PjrtModelExecutor = struct {
 
     fn createRuntime(ctx: *anyopaque, allocator: Allocator) !model_runtime.ModelRuntime {
         const self: *PjrtModelExecutor = @ptrCast(@alignCast(ctx));
-        const runtime_ctx = try allocator.create(PjrtModelRuntime);
+        var execution_lease = if (self.artifact_owner) |owner| try owner.acquireRuntime() else null;
+        errdefer if (execution_lease) |*lease| lease.release();
+        var selected: ?*RuntimeSlot = null;
+        if (self.artifact_owner != null or self.metadata_budget != null) {
+            for (self.runtime_slots) |*slot| {
+                if (slot.busy.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+                    selected = slot;
+                    break;
+                }
+            }
+            if (selected == null) return error.ResourceTemporarilyUnavailable;
+        }
+        const runtime_ctx = if (selected) |slot| &slot.runtime else try allocator.create(PjrtModelRuntime);
         runtime_ctx.* = .{
             .allocator = allocator,
+            .runtime_slot = selected,
+            .logits_index = self.logits_index,
             .graph = self.graph,
             .executor = self.executor,
             .host_backend = self.host_backend,
             .input_materialization = self.input_materialization,
-            .retained_buffers = PjrtRetainedBufferCache.init(allocator),
+            .retained_buffers = if (selected) |slot| .{ .allocator = self.allocator, .entries = .initBuffer(slot.entries), .owns_entries = false, .fixed_capacity = true, .semantic_index = slot.semantic_index } else PjrtRetainedBufferCache.init(allocator),
+            .execution_lease = execution_lease,
             .semantic_input_bindings = self.semantic_input_bindings,
             .semantic_output_bindings = self.semantic_output_bindings,
             .decode_variants = self.decode_variants,
         };
+        if (self.artifact_owner != null or self.metadata_budget != null) {
+            _ = self.references.fetchAdd(1, .monotonic);
+            runtime_ctx.artifact_executor_owner = self;
+        }
         return .{ .ptr = runtime_ctx, .vtable = &PjrtModelRuntime.runtime_vtable };
     }
 
     pub fn deinit(ctx: *anyopaque) void {
         const self: *PjrtModelExecutor = @ptrCast(@alignCast(ctx));
+        if ((self.artifact_owner != null or self.metadata_budget != null) and self.references.fetchSub(1, .acq_rel) != 1) return;
         const allocator = self.allocator;
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelExecutor deinit begin", .{});
         self.executor.partitionExecutor().deinitExecutor();
@@ -826,7 +999,22 @@ pub const PjrtModelExecutor = struct {
         freeSemanticOutputBindings(allocator, self.semantic_output_bindings);
         freeDecodeVariants(allocator, self.decode_variants);
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelExecutor decode variants deinit complete", .{});
+        if (self.owned_graph) |graph| {
+            graph.deinit();
+            allocator.destroy(graph);
+        }
+        for (self.runtime_slots) |slot| {
+            std.debug.assert(!slot.busy.load(.acquire));
+            allocator.free(slot.entries);
+            allocator.free(slot.semantic_index);
+            allocator.free(slot.values);
+            allocator.free(slot.scratch);
+        }
+        allocator.free(self.runtime_slots);
+        if (self.artifact_owner) |owner| owner.deinit();
+        const metadata = self.metadata_budget;
         allocator.destroy(self);
+        if (metadata) |budget| budget.destroy();
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelExecutor deinit complete", .{});
     }
 };
@@ -836,7 +1024,11 @@ pub fn deinitModelExecutorPtr(ctx: *anyopaque) void {
 }
 
 const PjrtModelRuntime = struct {
+    logits_index: ?usize = null,
+    execution_lease: ?@import("pjrt_admission.zig").Package.RuntimeLease = null,
+    artifact_executor_owner: ?*PjrtModelExecutor = null,
     allocator: Allocator,
+    runtime_slot: ?*PjrtModelExecutor.RuntimeSlot = null,
     graph: *const Graph,
     executor: *PjrtExecutor,
     host_backend: *const ComputeBackend,
@@ -870,7 +1062,9 @@ const PjrtModelRuntime = struct {
                 .interruption = .uninterruptible,
             };
         }
-        return runtimeCapabilitiesForInputMaterialization(self.input_materialization);
+        var result = runtimeCapabilitiesForInputMaterialization(self.input_materialization);
+        if (self.artifact_executor_owner != null) result.supports_decode = false;
+        return result;
     }
 
     fn prefill(
@@ -879,6 +1073,10 @@ const PjrtModelRuntime = struct {
         request: model_runtime.PrefillRequest,
     ) !model_runtime.ModelOutput {
         const self: *PjrtModelRuntime = @ptrCast(@alignCast(ctx));
+        try request.check();
+        // PJRT prefill starts a fresh sequence. Release prior KV before the
+        // provider allocates replacement outputs, including direct API reuse.
+        self.retained_buffers.clear();
         return self.executeEmbeddingIds(allocator, request.input_ids, request.query_seq_len, self.prefillPhase());
     }
 
@@ -888,8 +1086,11 @@ const PjrtModelRuntime = struct {
         request: model_runtime.DecodeRequest,
     ) !model_runtime.ModelOutput {
         const self: *PjrtModelRuntime = @ptrCast(@alignCast(ctx));
+        // A managed prefill executable is not a decode ABI, even when its
+        // input happens to contain one token. Never discard history silently.
+        if (self.artifact_executor_owner != null and self.decode_variants.len == 0) return error.UnsupportedDecode;
         const ids = [_]i64{request.token_id};
-        const seq_len = request.position + 1;
+        const seq_len = try std.math.add(usize, request.position, 1);
         const phase = if (self.decode_variants.len > 0)
             self.decodePhaseForSeqLen(seq_len) orelse return error.UnsupportedShape
         else
@@ -898,6 +1099,7 @@ const PjrtModelRuntime = struct {
     }
 
     const Phase = struct {
+        logits_index: ?usize,
         executor: *PjrtExecutor,
         semantic_input_bindings: []const PjrtSemanticInputBinding,
         semantic_output_bindings: []const PjrtSemanticOutputBinding,
@@ -906,16 +1108,25 @@ const PjrtModelRuntime = struct {
     fn prefillPhase(self: *const PjrtModelRuntime) Phase {
         return .{
             .executor = self.executor,
+            .logits_index = self.logits_index,
             .semantic_input_bindings = self.semantic_input_bindings,
             .semantic_output_bindings = self.semantic_output_bindings,
         };
     }
 
     fn decodePhaseForSeqLen(self: *const PjrtModelRuntime, seq_len: usize) ?Phase {
-        for (self.decode_variants) |variant| {
-            if (variant.seq_len != seq_len) continue;
-            return .{
+        var low: usize = 0;
+        var high = self.decode_variants.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const variant = self.decode_variants[middle];
+            if (variant.seq_len < seq_len) {
+                low = middle + 1;
+            } else if (variant.seq_len > seq_len) {
+                high = middle;
+            } else return .{
                 .executor = variant.executor,
+                .logits_index = variant.logits_index,
                 .semantic_input_bindings = variant.semantic_input_bindings,
                 .semantic_output_bindings = variant.semantic_output_bindings,
             };
@@ -930,27 +1141,39 @@ const PjrtModelRuntime = struct {
         query_seq_len: usize,
         phase: Phase,
     ) !model_runtime.ModelOutput {
-        const count = self.graph.nodeCount();
-        const values = try allocator.alloc(?CT, count);
+        var workspace = std.heap.FixedBufferAllocator.init(if (self.runtime_slot) |slot| slot.scratch else &.{});
+        const bookkeeping = if (self.runtime_slot != null) workspace.allocator() else allocator;
+        const values = if (self.runtime_slot) |slot| slot.values else try allocator.alloc(?CT, self.graph.nodeCount());
+        if (self.runtime_slot == null) @memset(values, null);
         defer {
-            for (values) |maybe_ct| {
-                if (maybe_ct) |ct| self.host_backend.free(ct);
+            // Only bound inputs can be populated. Clear those positions so a
+            // large traced graph causes no graph-wide work on every token.
+            for (phase.executor.input_bindings) |binding| {
+                const node_id = switch (binding) {
+                    .embedding_ids => continue,
+                    .graph_node, .semantic_past_graph_node => |id| id,
+                };
+                if (node_id >= values.len) continue;
+                if (values[node_id]) |ct| self.host_backend.free(ct);
+                values[node_id] = null;
             }
-            allocator.free(values);
+            if (self.runtime_slot == null) allocator.free(values);
         }
-        @memset(values, null);
-
+        if (self.artifact_executor_owner != null) try self.retained_buffers.retainSemanticInputs(bookkeeping, phase.semantic_input_bindings);
         try self.materializeGraphInputs(values, phase);
-
+        const retained = try bookkeeping.alloc(bool, phase.executor.output_node_ids.len);
+        defer bookkeeping.free(retained);
+        @memset(retained, false);
         const exec_ctx: PartitionExecutor.ExecutionContext = .{ .embedding_ids = input_ids };
-        var outputs = try phase.executor.executeToBuffersWithRetained(
+        var outputs = try phase.executor.executeToBuffersWithAllocators(
             values,
             exec_ctx,
+            bookkeeping,
             allocator,
             &self.retained_buffers,
             phase.semantic_input_bindings,
         );
-        defer allocator.free(outputs);
+        defer bookkeeping.free(outputs);
         const debug = pjrtExecDebugEnabled();
         if (debug) {
             std.log.info(
@@ -959,9 +1182,6 @@ const PjrtModelRuntime = struct {
             );
         }
 
-        var retained = try allocator.alloc(bool, outputs.len);
-        defer allocator.free(retained);
-        @memset(retained, false);
         defer {
             for (outputs, 0..) |*buffer, i| {
                 if (!retained[i]) {
@@ -972,19 +1192,7 @@ const PjrtModelRuntime = struct {
             }
         }
 
-        for (phase.semantic_output_bindings) |binding| {
-            if (binding.output_index >= outputs.len) return error.MissingOutput;
-            if (debug) {
-                std.log.info(
-                    "PJRT ModelRuntime retain output[{d}] name={s}",
-                    .{ binding.output_index, binding.name },
-                );
-            }
-            try self.retained_buffers.put(binding.name, binding.layer_index, binding.kind, outputs[binding.output_index]);
-            retained[binding.output_index] = true;
-        }
-
-        const logits_index = primaryGraphOutputIndex(self.graph, phase.executor.output_node_ids, phase.semantic_output_bindings) orelse return error.MissingOutput;
+        const logits_index = phase.logits_index orelse return error.MissingOutput;
         if (debug) {
             const size_bytes = try outputs[logits_index].onDeviceSizeInBytes();
             std.log.info(
@@ -992,19 +1200,45 @@ const PjrtModelRuntime = struct {
                 .{ logits_index, phase.executor.output_shapes[logits_index], size_bytes },
             );
         }
-        const output_f32 = try outputs[logits_index].toFloat32(allocator);
-        defer allocator.free(output_f32);
+        const staging_allocator = @import("antfly_platform").allocator.reclaimingScratch(allocator);
+        const output_f32 = try outputs[logits_index].toFloat32WithShapeAndScratch(staging_allocator, bookkeeping, phase.executor.output_shapes[logits_index]);
+        defer staging_allocator.free(output_f32);
         if (debug) std.log.info("PJRT ModelRuntime logits read floats={d}", .{output_f32.len});
         const logits = try sliceLastLogits(allocator, output_f32, phase.executor.output_shapes[logits_index], query_seq_len);
+        errdefer allocator.free(logits);
+        // Publish KV only after readback and host-logits allocation succeed.
+        // A failed decode can retry against the previous cache generation.
+        {
+            errdefer self.retained_buffers.clear();
+            // Managed chains consume only their immediately preceding phase.
+            // Native inputs stay alive until readback succeeds, then give way
+            // to precisely the new phase outputs rather than a historical union.
+            if (self.artifact_executor_owner != null) self.retained_buffers.clear();
+            for (phase.semantic_output_bindings) |binding| {
+                if (binding.output_index >= outputs.len) return error.MissingOutput;
+                if (debug) {
+                    std.log.info(
+                        "PJRT ModelRuntime retain output[{d}] name={s}",
+                        .{ binding.output_index, binding.name },
+                    );
+                }
+                if (self.artifact_executor_owner != null) {
+                    try self.retained_buffers.putBorrowed(binding.name, binding.layer_index, binding.kind, outputs[binding.output_index]);
+                } else try self.retained_buffers.put(binding.name, binding.layer_index, binding.kind, outputs[binding.output_index]);
+                retained[binding.output_index] = true;
+            }
+        }
         if (debug) std.log.info("PJRT ModelRuntime returning logits floats={d}", .{logits.len});
         return .{ .logits = logits };
     }
 
     fn materializeGraphInputs(self: *PjrtModelRuntime, values: []?CT, phase: Phase) !void {
+        var semantic_inputs = try SemanticInputCursor.init(phase.semantic_input_bindings, phase.executor.input_bindings.len);
         for (phase.executor.input_bindings, 0..) |binding, input_index| {
-            if (findSemanticInputBinding(phase.semantic_input_bindings, input_index) != null) continue;
+            if (semantic_inputs.at(input_index) != null) continue;
             switch (binding) {
                 .graph_node => |node_id| {
+                    if (node_id >= values.len) return error.MissingArtifactMetadata;
                     if (values[@intCast(node_id)] != null) continue;
                     const node = self.graph.node(node_id);
                     if (node.op != .parameter) return error.MissingValue;
@@ -1015,6 +1249,7 @@ const PjrtModelRuntime = struct {
                 },
                 .embedding_ids => {},
                 .semantic_past_graph_node => |node_id| {
+                    if (node_id >= values.len) return error.MissingArtifactMetadata;
                     if (values[@intCast(node_id)] != null) continue;
                 },
             }
@@ -1038,11 +1273,15 @@ const PjrtModelRuntime = struct {
     pub fn deinit(ctx: *anyopaque) void {
         const self: *PjrtModelRuntime = @ptrCast(@alignCast(ctx));
         const allocator = self.allocator;
-        if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelRuntime deinit begin", .{});
         self.retained_buffers.deinit();
-        if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelRuntime retained buffers deinit complete", .{});
-        allocator.destroy(self);
-        if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelRuntime deinit complete", .{});
+        var lease = self.execution_lease;
+        const owner = self.artifact_executor_owner;
+        if (self.runtime_slot) |slot| {
+            // All old state is copied before publishing this slot for reuse.
+            slot.busy.store(false, .release);
+        } else allocator.destroy(self);
+        if (lease) |*held| held.release();
+        if (owner) |executor| PjrtModelExecutor.deinit(executor);
     }
 };
 
@@ -1066,6 +1305,7 @@ pub fn createModelExecutor(
         .semantic_input_bindings = &.{},
         .semantic_output_bindings = &.{},
     };
+    exec.prepareOutputMappings();
     return exec;
 }
 
@@ -1106,6 +1346,7 @@ pub fn createModelExecutorFromHlo(
         .semantic_input_bindings = owned_semantic_input_bindings,
         .semantic_output_bindings = owned_semantic_output_bindings,
     };
+    exec.prepareOutputMappings();
     return exec;
 }
 
@@ -1224,6 +1465,7 @@ pub fn createModelExecutorFromHloPackages(
         .semantic_output_bindings = owned_prefill_semantic_output_bindings,
         .decode_variants = decode_variants,
     };
+    exec.prepareOutputMappings();
     return exec;
 }
 
@@ -1331,6 +1573,7 @@ pub fn createModelExecutorFromExecutablePackages(
         .semantic_output_bindings = owned_prefill_semantic_output_bindings,
         .decode_variants = decode_variants,
     };
+    exec.prepareOutputMappings();
     return exec;
 }
 
@@ -1501,34 +1744,6 @@ fn numElements(shape: []const i64) usize {
     return n;
 }
 
-const RetainedBufferSizeMismatch = struct {
-    expected_bytes: usize,
-    actual_bytes: usize,
-};
-
-fn staticNumElements(shape: []const i64) ?usize {
-    var n: usize = 1;
-    for (shape) |d| {
-        if (d < 0) return null;
-        n *= @intCast(d);
-    }
-    return n;
-}
-
-fn retainedBufferShapeMismatch(
-    buffer: *const pjrt_lib.pjrt.Buffer,
-    expected_shape: []const i64,
-) !?RetainedBufferSizeMismatch {
-    const expected_elements = staticNumElements(expected_shape) orelse return null;
-    const expected_bytes = expected_elements * @sizeOf(f32);
-    const actual_bytes = try buffer.onDeviceSizeInBytes();
-    if (actual_bytes == expected_bytes) return null;
-    return .{
-        .expected_bytes = expected_bytes,
-        .actual_bytes = actual_bytes,
-    };
-}
-
 fn resolveUploadShapeFromTensor(
     allocator: Allocator,
     backend: *const ComputeBackend,
@@ -1654,14 +1869,32 @@ fn findSemanticOutputBinding(bindings: []const PjrtSemanticOutputBinding, output
     return null;
 }
 
-fn findSemanticInputBinding(bindings: []const PjrtSemanticInputBinding, input_index: usize) ?PjrtSemanticInputBinding {
-    for (bindings) |binding| {
-        if (binding.input_index == input_index) return binding;
-    }
-    return null;
-}
+/// Bindings are sorted once by the owner. Each forward pass traverses them
+/// alongside input positions, including sparse semantic inputs, in O(inputs +
+/// bindings) time. Validation keeps direct low-level callers from silently
+/// executing with duplicate, unordered, or out-of-range binding metadata.
+const SemanticInputCursor = struct {
+    bindings: []const PjrtSemanticInputBinding,
+    position: usize = 0,
 
-fn detectInputMaterialization(
+    fn init(bindings: []const PjrtSemanticInputBinding, num_inputs: usize) !@This() {
+        for (bindings, 0..) |binding, i| {
+            if (binding.input_index >= num_inputs or (i > 0 and bindings[i - 1].input_index >= binding.input_index)) return error.MissingArtifactMetadata;
+        }
+        return .{ .bindings = bindings };
+    }
+
+    // Called with increasing input positions by both execution passes.
+    fn at(self: *@This(), input_index: usize) ?PjrtSemanticInputBinding {
+        if (self.position == self.bindings.len) return null;
+        const binding = self.bindings[self.position];
+        if (binding.input_index != input_index) return null;
+        self.position += 1;
+        return binding;
+    }
+};
+
+pub fn detectInputMaterialization(
     input_bindings: []const compiler.InputBinding,
     semantic_input_bindings: []const PjrtSemanticInputBinding,
     semantic_output_bindings: []const PjrtSemanticOutputBinding,
@@ -1693,6 +1926,14 @@ fn cloneSemanticInputBindings(
             .kind = binding.kind,
         };
         initialized += 1;
+    }
+    std.mem.sort(PjrtSemanticInputBinding, out, {}, struct {
+        fn lessThan(_: void, a: PjrtSemanticInputBinding, b: PjrtSemanticInputBinding) bool {
+            return a.input_index < b.input_index;
+        }
+    }.lessThan);
+    for (out, 0..) |binding, i| {
+        if (i > 0 and out[i - 1].input_index == binding.input_index) return error.MissingArtifactMetadata;
     }
     return out;
 }
@@ -1831,8 +2072,9 @@ test "PJRT semantic binding helper detects backend owned state with semantic cac
         PjrtInputMaterialization.backend_owned_state,
         detectInputMaterialization(&no_graph_inputs, &semantic_input_bindings, &semantic_output_bindings),
     );
-    try std.testing.expect(findSemanticInputBinding(&semantic_input_bindings, 1) != null);
-    try std.testing.expect(findSemanticInputBinding(&semantic_input_bindings, 0) == null);
+    var cursor = try SemanticInputCursor.init(&semantic_input_bindings, 2);
+    try std.testing.expect(cursor.at(0) == null);
+    try std.testing.expect(cursor.at(1) != null);
 }
 
 test "PJRT semantic cache bindings still report host-assisted when graph inputs remain" {
@@ -1892,4 +2134,192 @@ test "PJRT upload shape resolver rejects ambiguous dynamic dimensions" {
         error.UnsupportedShape,
         resolveUploadShapeFromElementCount(std.testing.allocator, &.{ -1, -1 }, 16),
     );
+}
+
+test "managed PJRT borrowed KV names replace semantic identities without allocation" {
+    const c = pjrt_lib.c_types;
+    const Fake = struct {
+        var destroyed: usize = 0;
+        fn destroy(_: *c.BufferDestroyArgs) callconv(.c) ?*c.PjrtError {
+            destroyed += 1;
+            return null;
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[58] = @ptrCast(&Fake.destroy);
+    Fake.destroyed = 0;
+    var failure = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var cache = PjrtRetainedBufferCache.init(failure.allocator());
+    var live = true;
+    defer if (live) cache.deinit();
+    try cache.entries.ensureTotalCapacityPrecise(failure.allocator(), 1);
+    failure.fail_index = failure.alloc_index;
+    const buffer = pjrt_lib.pjrt.Buffer{ .api = &api, .handle = @ptrFromInt(1) };
+    try cache.putBorrowed("prefill.key", 0, .key, buffer);
+    try cache.putBorrowed("decode.key", 0, .key, buffer);
+    try std.testing.expect(!failure.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), cache.len());
+    try std.testing.expectEqual(@as(usize, 1), Fake.destroyed);
+    try std.testing.expectEqualStrings("decode.key", cache.entries.items[0].name);
+    try std.testing.expect(cache.getForSemanticInput(.{ .input_index = 0, .name = "past.key", .layer_index = 0, .kind = .key }) != null);
+    cache.deinit();
+    live = false;
+    try std.testing.expectEqual(@as(usize, 2), Fake.destroyed);
+}
+
+test "managed PJRT indexed layerless states remain distinct across replacement and reset" {
+    const c = pjrt_lib.c_types;
+    const Fake = struct {
+        fn destroy(_: *c.BufferDestroyArgs) callconv(.c) ?*c.PjrtError {
+            return null;
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[58] = @ptrCast(&Fake.destroy);
+    var entries: [2]PjrtRetainedBufferCache.Entry = undefined;
+    var index: [5]usize = @splat(0);
+    var cache = PjrtRetainedBufferCache{ .allocator = std.testing.failing_allocator, .entries = .initBuffer(&entries), .owns_entries = false, .fixed_capacity = true, .semantic_index = &index };
+    defer cache.deinit();
+    for (0..3) |_| {
+        try cache.putBorrowed("a", null, .key, .{ .api = &api, .handle = @ptrFromInt(1) });
+        try cache.putBorrowed("b", null, .key, .{ .api = &api, .handle = @ptrFromInt(2) });
+        try cache.putBorrowed("a", null, .key, .{ .api = &api, .handle = @ptrFromInt(3) });
+        try std.testing.expectEqual(@as(usize, 2), cache.len());
+        const a = cache.getForSemanticInput(.{ .input_index = 0, .name = "a", .layer_index = null, .kind = .key }).?;
+        const b = cache.getForSemanticInput(.{ .input_index = 1, .name = "b", .layer_index = null, .kind = .key }).?;
+        try std.testing.expectEqual(@as(usize, 3), @intFromPtr(a.handle));
+        try std.testing.expectEqual(@as(usize, 2), @intFromPtr(b.handle));
+        cache.clear();
+    }
+}
+
+test "managed PJRT rejects out of range graph references before materialization" {
+    var graph = Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try std.testing.expectError(error.MissingArtifactMetadata, validateInputNodes(&graph, &.{.{ .graph_node = 2147483647 }}));
+    // Semantic KV IDs refer to the compiled phase, not the host graph.
+    try validateInputNodes(&graph, &.{.{ .semantic_past_graph_node = 2147483647 }});
+}
+
+test "managed PJRT semantic index resolves collisions without allocation" {
+    const c = pjrt_lib.c_types;
+    const Fake = struct {
+        fn destroy(_: *c.BufferDestroyArgs) callconv(.c) ?*c.PjrtError {
+            return null;
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[58] = @ptrCast(&Fake.destroy);
+    var entries: [256]PjrtRetainedBufferCache.Entry = undefined;
+    var index: [513]usize = @splat(0);
+    var cache = PjrtRetainedBufferCache{ .allocator = std.testing.failing_allocator, .entries = .initBuffer(&entries), .owns_entries = false, .fixed_capacity = true, .semantic_index = &index };
+    defer cache.deinit();
+    for (0..2) |_| {
+        for (0..256) |i| try cache.putBorrowed("present", @intCast(i), .key, .{ .api = &api, .handle = @ptrFromInt(i + 1) });
+        for (0..256) |i| {
+            const buffer = cache.getForSemanticInput(.{ .input_index = i, .name = "past", .layer_index = @intCast(i), .kind = .key }).?;
+            try std.testing.expectEqual(i + 1, @intFromPtr(buffer.handle));
+        }
+        try std.testing.expect(cache.getForSemanticInput(.{ .input_index = 0, .name = "absent", .layer_index = 999, .kind = .key }) == null);
+        var required: [128]PjrtSemanticInputBinding = undefined;
+        for (&required, 0..) |*binding, i| binding.* = .{ .input_index = i, .name = "past", .layer_index = @intCast(i * 2 + 1), .kind = .key };
+        var marks: [256]u8 = undefined;
+        var arena = std.heap.FixedBufferAllocator.init(&marks);
+        try cache.retainSemanticInputs(arena.allocator(), &required);
+        try std.testing.expectEqual(@as(usize, 128), cache.len());
+        for (0..256) |i| {
+            const buffer = cache.getForSemanticInput(.{ .input_index = i, .name = "past", .layer_index = @intCast(i), .kind = .key });
+            if (i % 2 == 1) try std.testing.expectEqual(i + 1, @intFromPtr(buffer.?.handle)) else try std.testing.expect(buffer == null);
+        }
+        // Missing inputs fail before pruning any live state, and the same
+        // admitted mark arena can be reused after index compaction.
+        try std.testing.expectError(error.MissingPastKeyValue, cache.retainSemanticInputs(arena.allocator(), &.{.{ .input_index = 0, .name = "missing", .layer_index = 999, .kind = .key }}));
+        try std.testing.expectEqual(@as(usize, 128), cache.len());
+        try cache.retainSemanticInputs(arena.allocator(), &required);
+        cache.clear();
+    }
+}
+
+test "managed PJRT semantic cursor traverses sparse inputs once" {
+    var bindings: [1024]PjrtSemanticInputBinding = undefined;
+    for (&bindings, 0..) |*binding, i| binding.* = .{ .input_index = i * 3 + 1, .name = "past", .layer_index = @intCast(i), .kind = .key };
+    var cursor = try SemanticInputCursor.init(&bindings, 3073);
+    for (0..3073) |i| {
+        const binding = cursor.at(i);
+        if (i % 3 == 1) try std.testing.expectEqual(i, binding.?.input_index) else try std.testing.expect(binding == null);
+    }
+    try std.testing.expectEqual(bindings.len, cursor.position);
+    try std.testing.expectError(error.MissingArtifactMetadata, SemanticInputCursor.init(&bindings, 100));
+    bindings[1].input_index = bindings[0].input_index;
+    try std.testing.expectError(error.MissingArtifactMetadata, SemanticInputCursor.init(&bindings, 3073));
+}
+
+test "managed PJRT binding clones canonicalize order and reject duplicates" {
+    const Scenario = struct {
+        fn run(a: Allocator) !void {
+            var bindings = [_]PjrtSemanticInputBinding{
+                .{ .input_index = 4, .name = "last", .layer_index = 1, .kind = .key },
+                .{ .input_index = 1, .name = "first", .layer_index = 0, .kind = .key },
+            };
+            const result = try cloneSemanticInputBindings(a, &bindings);
+            defer freeSemanticInputBindings(a, result);
+            var cursor = try SemanticInputCursor.init(result, 5);
+            try std.testing.expect(cursor.at(0) == null);
+            try std.testing.expectEqualStrings("first", cursor.at(1).?.name);
+            bindings[1].input_index = 4;
+            const duplicate = cloneSemanticInputBindings(a, &bindings) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.MissingArtifactMetadata, err);
+                return;
+            };
+            freeSemanticInputBindings(a, duplicate);
+            return error.TestUnexpectedResult;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+}
+
+test "managed PJRT KV identity hashing agrees with equality" {
+    const a = KvIdentity{ .name = "prefill", .layer_index = 0, .kind = .key };
+    const b = KvIdentity{ .name = "past", .layer_index = 0, .kind = .key };
+    try std.testing.expect(a.eql(b));
+    try std.testing.expectEqual(a.hash(), b.hash());
+    try std.testing.expect(!(KvIdentity{ .name = "a", .layer_index = null, .kind = .key }).eql(.{ .name = "b", .layer_index = null, .kind = .key }));
+    try std.testing.expect(!a.eql(.{ .name = "prefill", .layer_index = 0, .kind = .value }));
+}
+
+test "PJRT whole-model caches permuted logits mappings and finds sparse decode phases" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{2}));
+    const logits = try builder.parameter("logits", ml.graph.Shape.init(.f32, &.{2}));
+    try graph.markOutput(logits);
+    var prefill_ids = [_]NodeId{ input, logits, logits };
+    var decode_ids = [_]NodeId{ logits, input };
+    var prefill: PjrtExecutor = undefined;
+    prefill.output_node_ids = &prefill_ids;
+    var decode: PjrtExecutor = undefined;
+    decode.output_node_ids = &decode_ids;
+    var bindings = [_]PjrtSemanticOutputBinding{.{ .output_index = 2, .name = "present", .layer_index = 0, .kind = .key }};
+    var variants = [_]PjrtModelExecutor.DecodeVariant{
+        .{ .seq_len = 3, .executor = &decode, .input_materialization = .host_assisted_graph_inputs, .semantic_input_bindings = &.{}, .semantic_output_bindings = &.{} },
+        .{ .seq_len = 16, .executor = &decode, .input_materialization = .host_assisted_graph_inputs, .semantic_input_bindings = &.{}, .semantic_output_bindings = &.{} },
+        .{ .seq_len = 128, .executor = &decode, .input_materialization = .host_assisted_graph_inputs, .semantic_input_bindings = &.{}, .semantic_output_bindings = &.{} },
+    };
+    var model = PjrtModelExecutor{ .allocator = a, .graph = &graph, .executor = &prefill, .host_backend = undefined, .semantic_output_bindings = &bindings, .decode_variants = &variants };
+    model.prepareOutputMappings();
+    try std.testing.expectEqual(@as(?usize, 1), model.logits_index);
+    var runtime: PjrtModelRuntime = undefined;
+    runtime.decode_variants = &variants;
+    for ([_]usize{ 3, 16, 128 }) |seq_len| {
+        const phase = runtime.decodePhaseForSeqLen(seq_len).?;
+        try std.testing.expectEqual(&decode, phase.executor);
+        try std.testing.expectEqual(@as(?usize, 0), phase.logits_index);
+    }
+    for ([_]usize{ 0, 2, 4, 127, 129 }) |seq_len| try std.testing.expect(runtime.decodePhaseForSeqLen(seq_len) == null);
 }

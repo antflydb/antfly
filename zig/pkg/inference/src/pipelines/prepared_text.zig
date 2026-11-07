@@ -208,7 +208,9 @@ test "prepared text charges tokenizer scratch and denies growth before allocatio
     } };
     const tokenizer = Tokenizer{ .ptr = &probe, .vtable = &.{ .encode = Probe.encode, .decode = undefined, .encodeInto = undefined, .encodeForModel = undefined, .encodeGeneration = undefined, .specialTokens = undefined, .vocabSize = undefined, .deinit = undefined } };
     const text = @as([(16 * 1024)]u8, @splat('a'));
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, PreparedTextBatch.init(std.testing.allocator, session, tokenizer, &.{&text}, 512, null));
+    // The request's own simultaneous scratch exceeds the cap; retrying cannot
+    // make that envelope fit, so this is a permanent resource-limit failure.
+    try std.testing.expectError(error.ResourceLimitExceeded, PreparedTextBatch.init(std.testing.allocator, session, tokenizer, &.{&text}, 512, null));
     try std.testing.expectEqual(@as(usize, 0), probe.observed_peak);
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
     session.run_admission.?.limits.host_limit_bytes = 1024 * 1024;

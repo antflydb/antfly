@@ -48,6 +48,10 @@ pub fn loadPreprocessorConfigFile(allocator: std.mem.Allocator, path: []const u8
     const data = try c_file.readFile(allocator, path);
     defer allocator.free(data);
 
+    return parsePreprocessorConfig(allocator, data);
+}
+
+pub fn parsePreprocessorConfig(allocator: std.mem.Allocator, data: []const u8) !PreprocessorConfig {
     var config = PreprocessorConfig{};
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
     defer parsed.deinit();

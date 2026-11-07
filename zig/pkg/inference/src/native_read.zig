@@ -683,7 +683,7 @@ test "Florence CUDA pinned OCR reads invoice fixture" {
     };
     var reader = try readers_mod.LoadedReader.loadFromDirWithControl(a, directory, &manager.session_manager, &manager, control);
     defer reader.deinit();
-    var fence = (try readers_mod.LoadedReader.acquireExecutionFence(directory, &manager)) orelse return error.MissingFlorenceExecutionFence;
+    var fence = (try readers_mod.LoadedReader.acquireExecutionFence(directory, &manager, control)) orelse return error.MissingFlorenceExecutionFence;
     defer fence.deinit();
     try std.testing.expectEqual(backends.BackendType.cuda, fence.backend());
     var result = try reader.read(image_data, .{ .prompt = "<OCR>", .max_tokens = 128, .execution_control = control });

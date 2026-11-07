@@ -340,6 +340,18 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                   </SidebarMenuItem>
                   <SidebarMenuItem>
                     <SidebarMenuButton
+                      isActive={isTableSection("privacy")}
+                      tooltip="Privacy"
+                      disabled={!selectedTable}
+                      className="disabled:opacity-50"
+                      onClick={() => navigateTableSection("privacy")}
+                    >
+                      <Shield className="size-4" />
+                      <span>Privacy</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
                       isActive={isTableSection("artifacts")}
                       tooltip="Artifacts"
                       disabled={!selectedTable}

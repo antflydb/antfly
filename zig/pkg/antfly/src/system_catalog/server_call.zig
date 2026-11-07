@@ -108,6 +108,9 @@ pub const Call = union(enum) {
     relation_replace: RelationReplacement,
     relation_schema_mutate: RelationSchemaMutation,
     query_definition: []const u8,
+    /// Current physical definition, including runtime progress. This private
+    /// point read is deliberately independent of semantic catalog caches.
+    table_record_read: []const u8,
     /// Private body-bound native service provisioning. Old metadata peers
     /// reject this tag before any table or private source is published.
     native_memory_create: Request,
@@ -253,4 +256,10 @@ test "SQL pgwire native completion mutations require administrative grant and mu
     const read: Call = .{ .sql_completion_reference = @splat(1) };
     try std.testing.expect(read.requiresSettingAuthorityReadGrant());
     try std.testing.expect(!read.isMutation());
+}
+
+test "privacy table record transport is a service read without mutation authority" {
+    const read: Call = .{ .table_record_read = "private" };
+    try std.testing.expect(!read.isMutation());
+    try std.testing.expect(!read.requiresAdministrativeGrant());
 }

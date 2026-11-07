@@ -648,6 +648,7 @@ pub const Provider = struct {
     ) httpx.RequestOptions {
         return .{
             .attempt_observer = self.attempt_observer,
+            .follow_redirects = false,
             .json = json_body,
             .headers = self.requestHeaders(),
             .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
@@ -671,6 +672,7 @@ pub const Provider = struct {
         self.request_header_storage[count] = .{ "Content-Type", content_type_value };
         return .{
             .attempt_observer = self.attempt_observer,
+            .follow_redirects = false,
             .borrowed_body_segments = body_segments,
             .headers = self.request_header_storage[0 .. count + 1],
             .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,

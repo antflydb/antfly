@@ -27,7 +27,7 @@ pub fn keyAlloc(alloc: std.mem.Allocator, document: []const u8, producer: []cons
 }
 
 pub fn scopedKeyAlloc(alloc: std.mem.Allocator, document: []const u8, producer: []const u8, unit: ?[]const u8) ![]u8 {
-    if (document.len == 0 or producer.len == 0) return error.InvalidBatchRequest;
+    if (producer.len == 0) return error.InvalidBatchRequest;
     var result: std.ArrayListUnmanaged(u8) = .empty;
     errdefer result.deinit(alloc);
     try keys.appendDocumentPrefix(&result, alloc, document);
@@ -67,7 +67,7 @@ pub fn isScopeKey(key: []const u8, kind_byte: u8) bool {
     if (!keys.isInternalUserKey(key)) return false;
     const doc_end = keys.findComponentTerminator(key, 1) orelse return false;
     const kind = doc_end + 2;
-    if (doc_end == 1 or kind >= key.len or key[kind] != kind_byte) return false;
+    if (kind >= key.len or key[kind] != kind_byte) return false;
     const name_end = keys.findComponentTerminator(key, kind + 1) orelse return false;
     if (name_end == kind + 1) return false;
     const scope = name_end + 2;
@@ -279,7 +279,7 @@ pub fn validateReplacement(alloc: std.mem.Allocator, document: []const u8, produ
 /// Units own independent ordinal spaces. Bind the unit even for an empty
 /// replacement: another unit's matching count/hash cannot retire this scope.
 pub fn validateScopedReplacement(alloc: std.mem.Allocator, document: []const u8, producer: []const u8, unit: ?[]const u8, previous: Manifest, next: Manifest, effects: []const publication.Mutation) !void {
-    if (document.len == 0 or producer.len == 0 or (unit != null and unit.?.len == 0)) return error.InvalidBatchRequest;
+    if (producer.len == 0 or (unit != null and unit.?.len == 0)) return error.InvalidBatchRequest;
     const length = @max(previous.count, next.count);
     if (length > publication.max_mutations or effects.len != length) return error.InvalidBatchRequest;
     const ordered = try alloc.alloc(?[]const u8, length);
@@ -479,4 +479,15 @@ test "ordered artifact inventory chunk stream checkpoints resume exact binary un
         };
         try std.testing.checkAllAllocationFailures(alloc, Check.run, .{member});
     }
+}
+
+test "privacy artifact scopes admit empty documents while requiring producer names" {
+    const a = std.testing.allocator;
+    const scope = try keyAlloc(a, "", "privacy");
+    defer a.free(scope);
+    try std.testing.expect(isKey(scope));
+    const document = (try keys.decodeDocumentComponentAlloc(a, scope)).?;
+    defer a.free(document);
+    try std.testing.expectEqualStrings("", document);
+    try std.testing.expectError(error.InvalidBatchRequest, keyAlloc(a, "", ""));
 }

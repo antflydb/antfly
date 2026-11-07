@@ -371,6 +371,7 @@ pub const Provider = struct {
         defer freeHeaderPairs(alloc, signed);
 
         var resp = try self.http.request(.POST, url, .{
+            .follow_redirects = false,
             .attempt_observer = self.options.attempt_observer,
             .headers = signed,
             .body = json_body,
@@ -451,6 +452,7 @@ pub fn listFoundationModelsBodyAlloc(alloc: std.mem.Allocator, http: *httpx.Clie
     defer freeHeaderPairs(alloc, signed);
 
     var resp = try http.request(.GET, url, .{
+        .follow_redirects = false,
         .headers = signed,
         .timeout_ms = try request_context.remainingTimeoutMs(http.io),
         .cookies_enabled = false,

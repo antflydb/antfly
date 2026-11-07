@@ -62,6 +62,15 @@ pub fn containsSecretReference(value: []const u8) bool {
     return std.mem.indexOf(u8, value, "${secret:") != null;
 }
 
+/// Provider endpoint slots shared by public redaction and durable validation.
+pub fn fieldNameIsEndpoint(field: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(field, "url") or
+        std.ascii.eqlIgnoreCase(field, "api_url") or
+        std.ascii.eqlIgnoreCase(field, "base_url") or
+        std.ascii.eqlIgnoreCase(field, "endpoint") or
+        std.ascii.eqlIgnoreCase(field, "endpoint_url");
+}
+
 /// Detect credentials embedded in URL authority, query, or fragment fields.
 /// Query keys are percent-decoded before classification so alternate spelling
 /// cannot bypass the durable credential-free configuration boundary.
@@ -145,13 +154,8 @@ pub fn redactPublicProviderConfig(a: std.mem.Allocator, root: *std.json.Value) !
             while (index < object.count()) {
                 const field = object.keys()[index];
                 const entry = object.values()[index];
-                const endpoint = std.ascii.eqlIgnoreCase(field, "url") or
-                    std.ascii.eqlIgnoreCase(field, "api_url") or
-                    std.ascii.eqlIgnoreCase(field, "base_url") or
-                    std.ascii.eqlIgnoreCase(field, "endpoint") or
-                    std.ascii.eqlIgnoreCase(field, "endpoint_url");
                 if (fieldNameIsSensitive(field) or (entry == .string and
-                    (containsSecretReference(entry.string) or (endpoint and urlContainsCredentials(entry.string)))))
+                    (containsSecretReference(entry.string) or (fieldNameIsEndpoint(field) and urlContainsCredentials(entry.string)))))
                 {
                     _ = object.swapRemove(field);
                 } else index += 1;

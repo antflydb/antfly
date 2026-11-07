@@ -142,8 +142,9 @@ pub const Request = struct {
 
     pub fn releaseBodyBuffer(self: *Self, amount: usize) void {
         if (amount == 0) return;
+        const budget = self.body_budget orelse return;
         std.debug.assert(self.body_budget_reserved >= amount);
-        if (self.body_budget) |budget| budget.release(amount);
+        budget.release(amount);
         self.body_budget_reserved -= amount;
     }
 
@@ -413,6 +414,23 @@ pub const RequestBuilder = struct {
         return request;
     }
 };
+
+test "Request body reservations pair with and without a shared budget" {
+    var request = try Request.init(std.testing.allocator, .POST, "/upload");
+    defer request.deinit();
+    try std.testing.expect(request.tryReserveBodyBuffer(12));
+    request.releaseBodyBuffer(12);
+    try std.testing.expectEqual(@as(usize, 0), request.body_budget_reserved);
+
+    var budget = @import("../protocol/body_budget.zig").SharedBodyBudget.init(16);
+    request.body_budget = &budget;
+    try std.testing.expect(request.tryReserveBodyBuffer(12));
+    try std.testing.expect(!request.tryReserveBodyBuffer(5));
+    try std.testing.expectEqual(@as(usize, 12), budget.stats().in_use);
+    request.releaseBodyBuffer(12);
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+    try std.testing.expectEqual(@as(usize, 0), request.body_budget_reserved);
+}
 
 test "Request initialization" {
     const allocator = std.testing.allocator;

@@ -689,10 +689,86 @@ pub const ConnectionKind = enum {
     }
 };
 
+/// Required with decision_method=cascade, which allows no transport, model or rate-limit fields of its own. The first stage answers every input. Each later stage runs only for inputs whose previous answer falls inside its probability band, and all escalating inputs share one call. The final answer is the last answering stage's. Escalation applies to successful answers only; it is not failover. Probabilities are not calibrated across models, so set bands per model on labelled data.
+pub const DeciderCascade = struct {
+    stages: []const DeciderCascadeStage,
+    budget: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "stages", "stages", false },
+        .{ "budget", "budget", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("stages");
+        try jw.write(self.stages);
+        if (self.budget) |value| {
+            try jw.objectField("budget");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const DeciderCascadeStage = struct {
+    /// Unique within the cascade; reported in traces.
+    name: []const u8,
+    /// Inline typed or generated decider. Cascades and embedding_similarity deciders cannot be stages.
+    decider: DeciderConfig,
+    /// Required on every stage except the first, which must omit it. Inclusive band on the previous stage's answer.
+    when: ?std.json.Value = null,
+    /// Defaults to fail, including on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and is allowed only after the first stage.
+    on_failure: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "decider", "decider", false },
+        .{ "when", "when", true },
+        .{ "on_failure", "on_failure", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("decider");
+        try jw.write(self.decider);
+        if (self.when) |value| {
+            try jw.objectField("when");
+            try jw.write(value);
+        }
+        if (self.on_failure) |value| {
+            try jw.objectField("on_failure");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const DeciderConfig = struct {
     provider: ?[]const u8 = null,
-    /// Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
+    /// Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate questions only.
     decision_method: ?[]const u8 = null,
+    cascade: ?DeciderCascade = null,
     /// Required with decision_method=generated. Provider configuration belongs here rather than in the outer typed-decider fields.
     generator: ?antfly_generating_openapi.GeneratorConfig = null,
     instructions: ?[]const u8 = null,
@@ -726,6 +802,7 @@ pub const DeciderConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", true },
         .{ "decision_method", "decision_method", true },
+        .{ "cascade", "cascade", true },
         .{ "generator", "generator", false },
         .{ "instructions", "instructions", true },
         .{ "output", "output", false },
@@ -762,6 +839,10 @@ pub const DeciderConfig = struct {
         }
         if (self.decision_method) |value| {
             try jw.objectField("decision_method");
+            try jw.write(value);
+        }
+        if (self.cascade) |value| {
+            try jw.objectField("cascade");
             try jw.write(value);
         }
         if (self.generator) |value| {

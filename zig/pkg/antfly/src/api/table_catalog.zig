@@ -112,6 +112,8 @@ pub const CatalogSource = struct {
         /// is only required to confirm an eventual negative routing result.
         linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         linearizable_table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
+        /// Fresh metadata barrier with a fixed-size result, independent of jobs.
+        privacy_policy_binding: ?*const fn (*anyopaque, []const u8, ?u64) anyerror!metadata_api.PrivacyPolicyBinding = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         /// Request-scoped route capabilities may pin DB identity through this
         /// callback. When present, consumers must not re-derive identity from
@@ -222,6 +224,7 @@ pub const CatalogSource = struct {
                 .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataServiceLinearizableTableRoutingSnapshot,
+                .privacy_policy_binding = metadataServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServiceWaitForRoutingChange,
                 .requires_linearizable_publication_fence = true,
@@ -244,6 +247,7 @@ pub const CatalogSource = struct {
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataHttpServiceLinearizableTableRoutingSnapshot,
+                .privacy_policy_binding = metadataHttpServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataHttpServiceWaitForRoutingChange,
                 .requires_linearizable_publication_fence = true,
@@ -266,6 +270,7 @@ pub const CatalogSource = struct {
                 .table_routing_snapshot = metadataServerTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServerLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataServerLinearizableTableRoutingSnapshot,
+                .privacy_policy_binding = metadataServerPrivacyPolicyBinding,
                 .free_routing_snapshot = metadataServerFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServerWaitForRoutingChange,
                 .requires_linearizable_publication_fence = true,
@@ -2865,6 +2870,15 @@ fn metadataServiceLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: 
     return try svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
 }
 
+fn metadataServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+        error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return error.CatalogRoutingSnapshotTimeout,
+        else => return err,
+    };
+    return svc.privacyPolicyBinding(table_name, deadline_ns);
+}
+
 fn metadataServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     svc.freeCatalogRoutingSnapshot(snapshot);
@@ -2951,6 +2965,15 @@ fn metadataHttpServiceLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_na
     return try svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
 }
 
+fn metadataHttpServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+        error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return error.CatalogRoutingSnapshotTimeout,
+        else => return err,
+    };
+    return svc.privacyPolicyBinding(table_name, deadline_ns);
+}
+
 fn metadataHttpServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     svc.freeCatalogRoutingSnapshot(snapshot);
@@ -3035,6 +3058,15 @@ fn metadataServerLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: [
         else => return err,
     };
     return try srv.svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
+}
+
+fn metadataServerPrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    srv.svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+        error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return error.CatalogRoutingSnapshotTimeout,
+        else => return err,
+    };
+    return srv.svc.privacyPolicyBinding(table_name, deadline_ns);
 }
 
 fn metadataServerFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {

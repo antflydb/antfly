@@ -1604,7 +1604,9 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             assert fresh_envelope["state"] == old_envelope["state"]
             assert fresh_envelope["expires_ms"] >= old_envelope["expires_ms"]
             assert started_ms + 300_000 <= fresh_envelope["expires_ms"]
-            assert fresh_envelope["expires_ms"] <= finished_ms + 300_000
+            # Default five-minute retention is a minimum. Issuance rounds up
+            # within a three-second cohort to reuse immutable capabilities.
+            assert fresh_envelope["expires_ms"] < finished_ms + 303_000
             assert len(fresh_envelope["reader_token"]) == 16
             newer = call(
                 "POST",

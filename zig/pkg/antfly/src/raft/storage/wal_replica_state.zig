@@ -121,6 +121,7 @@ pub const WalReplicaState = struct {
     last_compacted_index: raft_engine.core.types.Index = 0,
     delta_records_since_checkpoint: usize = 0,
     delta_bytes_since_checkpoint: usize = 0,
+    checkpoint_encoded_bytes: usize = 0,
     stats: WalReplicaStateStats = .{},
 
     pub fn init(
@@ -400,6 +401,7 @@ pub const WalReplicaState = struct {
                 // Do not decode an older applied cursor over application that
                 // completed while this immutable checkpoint was being written.
                 owner.stats.checkpoint_persist_calls += 1;
+                owner.checkpoint_encoded_bytes = task.encoded.len;
                 owner.delta_records_since_checkpoint = 0;
                 owner.delta_bytes_since_checkpoint = 0;
                 owner.durable_applied_index = task.applied;
@@ -802,6 +804,7 @@ pub const WalReplicaState = struct {
             self.stats.wal_truncate_ns += elapsedSince(truncate_started_ns);
         }
         self.stats.persist_ns += elapsedSince(started_ns);
+        if (reason == .checkpoint) self.checkpoint_encoded_bytes = encoded.len;
     }
 
     fn encodeCurrentState(self: *WalReplicaState) ![]u8 {
@@ -916,8 +919,12 @@ pub const WalReplicaState = struct {
     fn checkpointNeeded(self: *const WalReplicaState) bool {
         const records_over_threshold = self.cfg.checkpoint_replay_records_threshold > 0 and
             self.delta_records_since_checkpoint >= self.cfg.checkpoint_replay_records_threshold;
+        // Rewriting a retained log image for each large delta is quadratic.
+        // Amortize checkpoint bytes against the previous image; the configured
+        // record limit still bounds replay work even for small subsequent deltas.
+        const byte_target = @max(self.cfg.checkpoint_replay_bytes_threshold, self.checkpoint_encoded_bytes);
         const bytes_over_threshold = self.cfg.checkpoint_replay_bytes_threshold > 0 and
-            self.delta_bytes_since_checkpoint >= self.cfg.checkpoint_replay_bytes_threshold;
+            self.delta_bytes_since_checkpoint >= byte_target;
         return records_over_threshold or bytes_over_threshold;
     }
 
@@ -1006,7 +1013,10 @@ pub const WalReplicaState = struct {
     fn decodeWalRecord(self: *WalReplicaState, bytes: []const u8) !void {
         const record_magic = try peekRecordMagic(bytes);
         switch (record_magic) {
-            magic => try self.decodeIntoStore(bytes),
+            magic => {
+                try self.decodeIntoStore(bytes);
+                self.checkpoint_encoded_bytes = bytes.len;
+            },
             delta_magic => {
                 try self.decodeDeltaIntoStore(bytes);
                 self.stats.replayed_delta_records += 1;
@@ -2760,4 +2770,44 @@ test "wal replica state async incoming snapshot owns payload and gates installat
     defer snapshot.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("snapshot", snapshot.data);
     try std.testing.expectEqual(@as(u64, 0), reopened.completedAppliedIndex());
+}
+
+test "wal replica state amortizes large privacy publications and preserves replay bounds after reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/privacy-wal-amortized", .{tmp.sub_path});
+    defer a.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(a, root, 199, 15);
+    defer layout.deinit(a);
+    const cfg: WalReplicaStateConfig = .{ .checkpoint_replay_records_threshold = 4, .checkpoint_replay_bytes_threshold = 1 };
+    const payload = try a.alloc(u8, 64 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    {
+        var state = try WalReplicaState.init(a, layout, cfg);
+        defer state.deinit();
+        for (1..9) |index| {
+            try state.groupStorage().persistReady(199, .{ .hard_state = .{ .current_term = 2, .voted_for = 1, .commit_index = index }, .entries = &.{.{ .term = 2, .index = index, .data = payload }} });
+            try state.setAppliedIndex(index);
+            try std.testing.expect(state.delta_records_since_checkpoint < cfg.checkpoint_replay_records_threshold);
+        }
+        const stats = state.statsSnapshot();
+        try std.testing.expect(stats.checkpoint_persist_calls >= 2 and stats.checkpoint_persist_calls <= 4);
+        try std.testing.expect(stats.encoded_bytes < 30 * payload.len);
+        try state.flushForShutdown();
+    }
+    {
+        var state = try WalReplicaState.init(a, layout, cfg);
+        defer state.deinit();
+        try std.testing.expectEqual(@as(u64, 8), state.appliedIndex());
+        try std.testing.expect(state.checkpoint_encoded_bytes >= 8 * payload.len);
+        for (9..13) |index| {
+            try state.groupStorage().persistReady(199, .{ .hard_state = .{ .current_term = 2, .voted_for = 1, .commit_index = index }, .entries = &.{.{ .term = 2, .index = index, .data = @constCast("small") }} });
+            try state.setAppliedIndex(index);
+            if (index == 9) try std.testing.expectEqual(@as(u64, 0), state.statsSnapshot().checkpoint_persist_calls);
+        }
+        try std.testing.expectEqual(@as(u64, 1), state.statsSnapshot().checkpoint_persist_calls);
+        try std.testing.expectEqual(@as(usize, 0), state.delta_records_since_checkpoint);
+    }
 }

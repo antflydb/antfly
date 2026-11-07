@@ -125,7 +125,34 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     if (!source.canEnumerate() or request.physical_selection != null or request.after != null or request.before != null) try source.ensureInventory(read_context);
     return openPinnedMaterialized(alloc, table, request, context, source);
 }
+/// Open one deterministic, disjoint split of an immutable pinned source.
+/// Unlike split_scan's local work queue this assignment can be reconstructed
+/// on another process after a task retry without sharing mutable iterators.
+pub fn openPinnedPartition(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource, index: usize, count: usize) !catalog.Cursor {
+    if (count == 0 or count > 65536 or index >= count) return error.InvalidSqlBackendResponse;
+    const cursor = try openPinnedMaterializedMode(alloc, table, request, context, source, .{ .index = index, .count = count });
+
+    return cursor;
+}
+
+/// Bucket groups retain the complete file iterator; manifest partition pruning
+/// chooses files, independently of the number or order of physical files.
+pub fn openPinnedBucket(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource, group: @import("../serverless/query/lake_stream.zig").Stream.BucketGroup) !catalog.Cursor {
+    if (group.groups == 0 or group.index >= group.groups or group.count == 0 or group.count % group.groups != 0) return error.InvalidSqlBackendResponse;
+    const cursor = try openPinned(alloc, table, request, context, source);
+    const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+    owner.stream.bucket_group = group;
+    return cursor;
+}
+
 fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource) !catalog.Cursor {
+    return openPinnedMaterializedMode(alloc, table, request, context, source, null);
+}
+fn openPinnedMaterializedMode(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource, partition: ?struct { index: usize, count: usize }) !catalog.Cursor {
+    if (partition != null) {
+        const deadline = try context.platformDeadline();
+        try source.ensureInventory(.{ .io = if (source.context_store) |store| store.context.io else null, .deadline_ns = deadline.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(deadline.cancellation.ptr, deadline.cancellation.is_cancelled_fn) });
+    }
     if (request.include_primary_digest or request.include_document or request.index_equality != null) return error.UnsupportedSqlExecution;
     try context.ensureActive();
     const binding = table.external_base_source orelse return error.InvalidSqlBackend;
@@ -187,8 +214,10 @@ fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catal
         try pruning.append(owned, .{ .column = column.path, .op = std.meta.stringToEnum(Predicate.Op, @tagName(condition.op)).?, .value = value });
     }
     const normalized = try context.platformDeadline();
-    var stream = try @import("../serverless/query/lake_stream.zig").Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
+    const Stream = @import("../serverless/query/lake_stream.zig").Stream;
+    var stream = if (partition != null) try Stream.initMaterialized(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{}) else try Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
     errdefer stream.deinit();
+    if (partition) |part| try stream.partitionRows(part.index, part.count);
     stream.identity_only = identity_only;
     if (request.physical_selection) |selection| {
         if (request.row_refs != null) return error.InvalidLakeCandidateReference;

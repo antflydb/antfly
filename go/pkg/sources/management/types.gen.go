@@ -256,12 +256,16 @@ type Source struct {
 	Config               map[string]interface{} `json:"config"`
 	Connection           string                 `json:"connection"`
 	Id                   string                 `json:"id"`
+	Identity             SourceIdentity         `json:"identity,omitempty,omitzero"`
 	Name                 string                 `json:"name"`
 	PermissionTtlSeconds int                    `json:"permission_ttl_seconds,omitempty,omitzero"`
 	Permissions          Permissions            `json:"permissions"`
 
 	// Publication Native acquisition is the default: text stays inline and binary originals are revision-pinned for native artifact producers.
 	Publication SourcePublication `json:"publication"`
+
+	// Rekeys Set only on a PUT response. True when the call makes the next sync re-key this source's existing rows. A new source, or one that already has a namespace, never re-keys.
+	Rekeys bool `json:"rekeys,omitempty,omitzero"`
 
 	// State Runtime lifecycle state. PUT configures a source; retirement and purge use explicit operations.
 	State string `json:"state"`
@@ -273,6 +277,12 @@ type Source struct {
 
 // SourcePublication Native acquisition is the default: text stays inline and binary originals are revision-pinned for native artifact producers.
 type SourcePublication string
+
+// SourceIdentity defines model for SourceIdentity.
+type SourceIdentity struct {
+	// Namespace Opaque prefix that scopes this source's row keys, independent of its connection or config. Assigned automatically at creation and immutable once set.
+	Namespace string `json:"namespace,omitempty,omitzero"`
+}
 
 // SourcePage defines model for SourcePage.
 type SourcePage struct {
