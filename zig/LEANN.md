@@ -474,14 +474,23 @@ full-precision rerank vectors HBC keeps) with a graph plus codes. With
 document, which is most of the remaining bytes: at 768 dimensions a stored
 embedding takes 3,100 bytes and its stub 36.
 
-`transient` is the default wherever re-embedding can reproduce the vector:
-the index has its own embedder, its input is a field or template (whole, or
-split by a fixed text chunker), and the quantizer is RaBitQ (rebuilds use
-the codes). External vectors, indexes fed by other enrichments, chunkers
-that embed audio windows or model outputs (`audio`, `policy`, `outputs`,
-`embedding`, or a non-`fixed` model), and PQ resolve to `persistent`;
-asking for `transient` there is rejected. Configs written before the option
-are `persistent`.
+Three modes:
+
+- `auto` (the default when the index has its own embedder and RaBitQ codes)
+  stubs only embeddings the producer computed from text alone: a field, a
+  text-only template, or a plain text chunk. The producer marks those with
+  the artifact header flag `text_input`. Embeddings from media (images via
+  `remoteMedia`, audio windows, PDF pages, model outputs), authored vectors,
+  and vectors written by older builds or copied by restore paths lack the
+  flag and stay stored. Re-embedding therefore only ever renders text: no
+  query fetches or decodes media.
+- `transient` stubs every covered embedding. It requires inputs that
+  re-embed from text: no media chunkers (`audio`, `policy`, `outputs`,
+  `embedding`, or a non-`fixed` model) and no stored chunk inputs.
+- `persistent` keeps every embedding. External vectors, indexes fed by other
+  enrichments, and PQ (rebuilds need vectors) resolve to it; asking for
+  `auto` or `transient` there is rejected. Configs written before the option
+  are `persistent`.
 
 - **Lifecycle.** Writes are unchanged: the enricher stores the full
   embedding, derived replay and the leader planner read it, and the graph
@@ -496,6 +505,8 @@ are `persistent`.
     the stubs inside the Raft apply transaction, so every replica changes
     the same data at the same log position. Pending keys are persisted in
     the replicated state.
+  - **`auto`:** the stub writer skips any embedding whose header lacks
+    `text_input`; the header is replicated data, so replicas agree.
   - **Local (Lite):** `LeannStore` lists keys its persisted graph covers.
     Derived replay persists the graph, then writes their stubs under the
     exclusive apply lock once its own locks are released: at the end of each
@@ -537,7 +548,9 @@ are `persistent`.
 
 1. **Transient storage follow-ups.** A per-query deadline and
    cancellation inside re-embedding, a bounded hot-embedding cache, and
-   include `leann.store` in backups so restores need not re-embed.
+   include `leann.store` in backups so restores need not re-embed. For
+   media-derived vectors, which `auto` keeps at full precision, an int8
+   stored copy would cut them about 4x without query-time embedding.
 2. **Splits.** Rebuild both children from the parent's stored vectors (or
    re-embedded text) during handoff.
 3. **Remote storage and native backups.** Store `leann.store` through the

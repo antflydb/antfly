@@ -24,10 +24,12 @@ class LeannIndexConfig:
             paper's fixed rerank ratio; prefer it only for very low dimensions (below about 64). Default:
             LeannIndexConfigQuantizer.RABITQ.
         vector_storage (LeannIndexConfigVectorStorage | Unset): Whether document embeddings stay stored after the graph
-            covers them. "transient" (the default when possible) keeps only a small stub per document and re-embeds a few
-            candidates per query from the document's field or template through the index's embedder, so the index stores
-            about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the only choice for external
-            vectors, chunked indexes, indexes fed by other enrichments, and the pq quantizer.
+            covers them. "auto" (the default when the index has its own embedder) keeps only a small stub for each embedding
+            computed from text (a field, a text-only template, or a text chunk) and re-embeds a few such candidates per
+            query, while embeddings computed from media (images, audio windows, model outputs) stay stored. "transient"
+            stubs every covered embedding, so it requires inputs that re-embed from text: no media chunkers. "persistent"
+            keeps every embedding, and is the only choice for external vectors, indexes fed by other enrichments, and the pq
+            quantizer.
         search_ef (int | Unset): Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for
             pq). Default: 0.
         bound_scale (float | Unset): Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates

@@ -44,7 +44,13 @@ pub const Flags = packed struct(u8) {
     /// dimension count and a digest of the dropped vector; readers that need
     /// the vector get `error.VectorElided` and must re-embed the source.
     vector_elided: bool = false,
-    _reserved: u3 = 0,
+    /// Dense embedding the producer computed from text alone (a field, a
+    /// text-only template, or a plain text chunk), so re-embedding the source
+    /// reproduces it. LEANN `vector_storage: auto` drops only these. Unset on
+    /// media-derived, authored, imported and older vectors, which stay stored.
+    /// Older readers ignore the bit.
+    text_input: bool = false,
+    _reserved: u2 = 0,
 };
 
 pub const Header = struct {
@@ -94,16 +100,22 @@ test "embedding reprocess generations preserve legacy hashes and isolate complet
 }
 
 pub fn encodeDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, vector: []const f32) ![]u8 {
-    return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, vector);
+    return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, false, vector);
+}
+
+/// A produced embedding, marked `text_input` when the producer embedded text
+/// alone (see `Flags.text_input`).
+pub fn encodeProducedDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, text_input: bool, vector: []const f32) ![]u8 {
+    return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, text_input, vector);
 }
 
 /// Only explicit user-vector ingress may set this origin. In particular, an
 /// absent source hash in old or imported output does not establish authorship.
 pub fn encodeAuthoredDenseEmbeddingAlloc(alloc: Allocator, vector: []const f32) ![]u8 {
-    return encodeDenseEmbeddingWithOriginAlloc(alloc, null, true, vector);
+    return encodeDenseEmbeddingWithOriginAlloc(alloc, null, true, false, vector);
 }
 
-fn encodeDenseEmbeddingWithOriginAlloc(alloc: Allocator, source_hash: ?u64, authored: bool, vector: []const f32) ![]u8 {
+fn encodeDenseEmbeddingWithOriginAlloc(alloc: Allocator, source_hash: ?u64, authored: bool, text_input: bool, vector: []const f32) ![]u8 {
     const payload_len = @sizeOf(u32) + vector.len * @sizeOf(u32);
     const total_len = header_len + payload_len;
     const out = try alloc.alloc(u8, total_len);
@@ -112,7 +124,7 @@ fn encodeDenseEmbeddingWithOriginAlloc(alloc: Allocator, source_hash: ?u64, auth
     writeHeader(out[0..header_len], .{
         .version = codec_version,
         .kind = .dense_embedding,
-        .flags = .{ .has_source_hash = source_hash != null, .authored = authored },
+        .flags = .{ .has_source_hash = source_hash != null, .authored = authored, .text_input = text_input },
         .source_hash = source_hash orelse 0,
         .payload_len = @intCast(payload_len),
     });
@@ -155,8 +167,28 @@ pub fn encodeElidedDenseEmbeddingAlloc(alloc: Allocator, header: Header, dims: u
 /// keeping the stub's header (source hash and origin).
 pub fn encodeRestoredDenseEmbeddingAlloc(alloc: Allocator, stub_header: Header, vector: []const f32) ![]u8 {
     if (stub_header.kind != .dense_embedding) return error.InvalidArtifactKind;
-    const out = try encodeDenseEmbeddingWithOriginAlloc(alloc, if (stub_header.flags.has_source_hash) stub_header.source_hash else null, stub_header.flags.authored, vector);
+    const out = try encodeDenseEmbeddingWithOriginAlloc(alloc, if (stub_header.flags.has_source_hash) stub_header.source_hash else null, stub_header.flags.authored, stub_header.flags.text_input, vector);
     return out;
+}
+
+test "dense embedding text input flag survives stubbing and restore" {
+    const alloc = std.testing.allocator;
+    const vector = [_]f32{ 1, 2, 3 };
+    const produced = try encodeProducedDenseEmbeddingAlloc(alloc, 7, true, &vector);
+    defer alloc.free(produced);
+    const header = try decodeHeader(produced);
+    try std.testing.expect(header.flags.text_input);
+    const stub = try encodeElidedDenseEmbeddingAlloc(alloc, header, 3, 99);
+    defer alloc.free(stub);
+    try std.testing.expect((try decodeHeader(stub)).flags.text_input);
+    const restored = try encodeRestoredDenseEmbeddingAlloc(alloc, try decodeHeader(stub), &vector);
+    defer alloc.free(restored);
+    const restored_header = try decodeHeader(restored);
+    try std.testing.expect(restored_header.flags.text_input and !restored_header.flags.vector_elided);
+    // Media-derived and plain encodes leave it unset.
+    const plain = try encodeDenseEmbeddingAlloc(alloc, 7, &vector);
+    defer alloc.free(plain);
+    try std.testing.expect(!(try decodeHeader(plain)).flags.text_input);
 }
 
 pub const ElidedDenseEmbedding = struct { dims: u32, vector_digest: u64 };
@@ -613,6 +645,7 @@ pub fn decodeHeaderPrefix(data: []const u8) !Header {
     if (flags.authored and (flags.has_source_hash or source_hash != 0 or
         flags.has_graph_generation or flags.portable_unbound_graph_generation or
         (kind != .dense_embedding and kind != .sparse_embedding))) return error.InvalidArtifactHeader;
+    if (flags.text_input and (flags.authored or kind != .dense_embedding)) return error.InvalidArtifactHeader;
 
     const payload_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += @sizeOf(u32);

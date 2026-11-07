@@ -1879,6 +1879,13 @@ fn reembedChunkTextAlloc(
     return null;
 }
 
+/// Whether rendered content parts are text only, so the vector they embed is
+/// reproducible from the document without fetching or decoding media.
+fn partsAreText(parts: []const template.ContentPart) bool {
+    for (parts) |part| if (part != .text) return false;
+    return parts.len > 0;
+}
+
 pub fn embedDensePartsTracked(
     runtime: *EnrichmentRuntime,
     index_names: []const []const u8,
@@ -5595,6 +5602,9 @@ const ChunkedDenseWindowItem = struct {
     source_hash: u64,
     source_record_digest: ?[32]u8 = null,
     source_record_is_parent: bool = false,
+    /// Embedded from the chunk's own text, which re-chunking the parent
+    /// reproduces (see `Flags.text_input`).
+    text_input: bool = false,
 };
 
 const ChunkEmbeddingSource = struct {
@@ -28034,7 +28044,7 @@ fn flushChunkedDenseItems(
         const digest = item.source_record_digest orelse return error.MissingChunkSourceFence;
         writes[i] = .{
             .key = key,
-            .value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(runtime.alloc, item.source_hash, vector),
+            .value = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(runtime.alloc, item.source_hash, item.text_input, vector),
             .source_key = if (item.source_record_is_parent) parent_key else item.chunk_key,
             .source_digest = digest,
             .parent_key = parent_key,
@@ -29151,7 +29161,8 @@ fn flushPlainDenseItems(
         errdefer runtime.alloc.free(source_key);
         writes[i] = .{
             .key = item.artifact_key,
-            .value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(runtime.alloc, item.source_hash, vector),
+            // Plain items embed the rendered source text alone.
+            .value = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(runtime.alloc, item.source_hash, true, vector),
             .source_key = source_key,
             .source_digest = item.source_record_digest,
             .doc_key = item.request.doc_key,
@@ -29715,6 +29726,9 @@ fn processChunkedDenseWindow(
                     .source_hash = source_hash,
                     .source_record_digest = source.source_record_digest,
                     .source_record_is_parent = source.source_record_is_parent,
+                    // Plain text chunks only: model metadata means media
+                    // windows or model outputs re-chunking cannot redo.
+                    .text_input = request.input_kind == .inline_chunks and source.metadata == null and precomputed == null,
                 });
                 owned_vector = null; // The bounded batch now owns this result.
                 request_batch_items_pending = true;
@@ -32176,6 +32190,7 @@ fn processDenseTemplateParts(
         .source_sequence = request.sequence,
         .vector = vector,
         .ordered_input = input,
+        .text_input = partsAreText(parts),
     })) return;
     try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
@@ -32764,6 +32779,8 @@ const EmbeddingArtifactWrite = struct {
     source_sequence: u64,
     vector: []const f32,
     ordered_input: ?*const producer_input.Token = null,
+    /// See `Flags.text_input`.
+    text_input: bool = false,
 };
 
 fn writeEmbeddingArtifact(runtime: *EnrichmentRuntime, write: EmbeddingArtifactWrite) !bool {
@@ -32774,7 +32791,7 @@ fn writeEmbeddingArtifact(runtime: *EnrichmentRuntime, write: EmbeddingArtifactW
     else
         try internal_keys.embeddingArtifactKeyForDocumentAlloc(runtime.alloc, write.base_key, write.artifact_name);
     defer runtime.alloc.free(key);
-    const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(runtime.alloc, write.source_hash, write.vector);
+    const payload = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(runtime.alloc, write.source_hash, write.text_input, write.vector);
     defer runtime.alloc.free(payload);
     if (write.ordered_input) |token| {
         try enqueueProducerArtifact(runtime, token, key, payload);

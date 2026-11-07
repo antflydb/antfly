@@ -3204,12 +3204,17 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try out.appendSlice(alloc, dims_json);
     try out.appendSlice(alloc, ",\"metric\":");
     try appendJsonString(alloc, &out, metric);
-    // Transient vector storage re-embeds candidates from the document's own
-    // field or template (re-chunked the way the producer chunks it), so it
-    // needs the index's embedder: no external vectors, artifacts from other
-    // enrichments, or chunkers whose vectors come from media or model output.
-    const reembeddable_chunks = if (root.get("chunker")) |chunker| textOnlyChunker(chunker) else true;
-    if (leann_algorithm) try appendLeannIndexConfig(alloc, &out, root, !external and !artifact_backed and reembeddable_chunks and embedder_json != null);
+    // Dropping stored vectors relies on re-embedding candidates from the
+    // document's own field or template (re-chunked the way the producer
+    // chunks it), so it needs the index's embedder: no external vectors or
+    // artifacts from other enrichments. `auto` keeps media-derived vectors
+    // itself; `transient` drops everything, so its chunker must be text-only.
+    const owns_input = !external and !artifact_backed and embedder_json != null;
+    const text_only_chunks = if (root.get("chunker")) |chunker| textOnlyChunker(chunker) else true;
+    if (leann_algorithm) try appendLeannIndexConfig(alloc, &out, root, .{
+        .auto = owns_input,
+        .transient = owns_input and text_only_chunks,
+    });
     if (artifact_sources.len > 0) {
         try appendArtifactIndexSources(alloc, &out, artifact_sources);
     } else {
@@ -3302,7 +3307,10 @@ const leann_default_rabitq_bits: i64 = 4;
 /// dense index's top-level `quantization_bits`, shared with HBC; HBC's
 /// `quantization_refine` does not apply, since LEANN's error bounds already
 /// decide which candidates get exact distances.
-fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), root: std.json.ObjectMap, can_reembed: bool) !void {
+/// Which `vector_storage` modes an index's input allows besides `persistent`.
+const LeannStorageAllowed = struct { auto: bool, transient: bool };
+
+fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), root: std.json.ObjectMap, allowed: LeannStorageAllowed) !void {
     var max_degree: i64 = 30;
     var quantizer: []const u8 = "rabitq";
     var search_ef: i64 = 0;
@@ -3335,7 +3343,7 @@ fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
                 batch_size = try jsonIntegerInRange(value, 0, 1024);
             } else if (std.mem.eql(u8, key, "vector_storage")) {
                 if (value != .string) return error.InvalidCreateTableRequest;
-                if (!std.mem.eql(u8, value.string, "transient") and !std.mem.eql(u8, value.string, "persistent")) return error.InvalidCreateTableRequest;
+                if (!std.mem.eql(u8, value.string, "auto") and !std.mem.eql(u8, value.string, "transient") and !std.mem.eql(u8, value.string, "persistent")) return error.InvalidCreateTableRequest;
                 vector_storage = value.string;
             } else return error.InvalidCreateTableRequest;
         }
@@ -3346,13 +3354,16 @@ fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
     const rabitq = std.mem.eql(u8, quantizer, "rabitq");
     if (!rabitq and quantization_bits > 1) return error.InvalidCreateTableRequest;
     if (quantization_bits == 0) quantization_bits = if (rabitq) leann_default_rabitq_bits else 1;
-    // Transient storage rebuilds graphs from RaBitQ codes, so PQ keeps
-    // vectors. It is the default wherever re-embedding is possible.
-    const transient_allowed = can_reembed and rabitq;
+    // Dropping vectors rebuilds graphs from RaBitQ codes, so PQ keeps them.
+    // `auto` is the default wherever the index owns its input: it drops the
+    // vectors re-embedding can reproduce from text and keeps the rest.
+    const auto_allowed = allowed.auto and rabitq;
+    const transient_allowed = allowed.transient and rabitq;
     if (vector_storage) |requested| {
         if (std.mem.eql(u8, requested, "transient") and !transient_allowed) return error.InvalidCreateTableRequest;
+        if (std.mem.eql(u8, requested, "auto") and !auto_allowed) return error.InvalidCreateTableRequest;
     }
-    const resolved_storage = vector_storage orelse if (transient_allowed) "transient" else "persistent";
+    const resolved_storage = vector_storage orelse if (auto_allowed) "auto" else "persistent";
     const json = try std.fmt.allocPrint(
         alloc,
         ",\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":{d},\"quantizer\":\"{s}\",\"quantization_bits\":{d},\"vector_storage\":\"{s}\",\"search_ef\":{d},\"bound_scale\":{d},\"batch_size\":{d}}}",
@@ -3383,11 +3394,11 @@ test "managed embedder translates leann algorithm into dense config" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"vector_storage\":\"persistent\"") != null);
 
     for ([_][2][]const u8{
-        // An embedder-backed field index defaults to transient storage.
+        // An embedder-backed field index defaults to auto storage.
         .{
             \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann"}
             ,
-            "\"vector_storage\":\"transient\"",
+            "\"vector_storage\":\"auto\"",
         },
         .{
             \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"vector_storage":"persistent"}}
@@ -3404,13 +3415,24 @@ test "managed embedder translates leann algorithm into dense config" {
         .{
             \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"chunker":{"provider":"antfly","model":"fixed","text":{"target_tokens":64}},"algorithm":"leann"}
             ,
+            "\"vector_storage\":\"auto\"",
+        },
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"chunker":{"provider":"antfly","model":"fixed","text":{"target_tokens":64}},"algorithm":"leann","leann":{"vector_storage":"transient"}}
+            ,
             "\"vector_storage\":\"transient\"",
         },
-        // Audio windows embed media parts, which re-embedding cannot redo.
+        // Audio windows and media templates default to auto too: auto keeps
+        // the media-derived vectors it cannot re-embed.
         .{
             \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"chunker":{"provider":"antfly","audio":{"window_duration_ms":30000}},"algorithm":"leann"}
             ,
-            "\"vector_storage\":\"persistent\"",
+            "\"vector_storage\":\"auto\"",
+        },
+        .{
+            \\{"template":"{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann"}
+            ,
+            "\"vector_storage\":\"auto\"",
         },
     }) |case| {
         var p = try std.json.parseFromSlice(std.json.Value, alloc, case[0], .{});
@@ -3459,6 +3481,11 @@ test "managed embedder translates leann algorithm into dense config" {
         \\{"external":true,"dimension":4,"algorithm":"leann","quantization_refine":"all"}
         ,
         \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"vector_storage":"transient"}}
+        ,
+        // External vectors cannot be re-embedded at all.
+        \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"vector_storage":"auto"}}
+        ,
+        \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"quantizer":"pq","vector_storage":"auto"}}
         ,
         \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"quantizer":"pq","vector_storage":"transient"}}
         ,

@@ -102732,13 +102732,25 @@ test "db transient leann stubs covered vectors through ordinary writes" {
     // without background index workers.
     const alloc = std.testing.allocator;
     const n = 300; // past LeannStore's default build threshold of 256
-    for ([_]bool{ false, true }) |workers| {
+    // `auto` stubs these too: the producer marks field text as `text_input`.
+    // Text chunks re-embed by re-chunking their parent, so chunked indexes
+    // take both modes as well.
+    for ([_][]const u8{ "transient", "auto" }) |storage| {
+        for ([_]bool{ false, true }) |chunked| {
+            for ([_]bool{ false, true }) |workers| try runTransientLeannStubCase(alloc, storage, chunked, workers, n);
+        }
+    }
+}
+
+fn runTransientLeannStubCase(alloc: Allocator, storage: []const u8, chunked: bool, workers: bool, comptime n: usize) !void {
+    {
         var path_tmp = try TestDirectory.init("db-leann-stubs");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
 
         var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var config_buf: [640]u8 = undefined;
         var db = try DB.open(alloc, std.mem.span(path), .{
             .start_index_workers = workers,
             .ttl_cleanup = .{ .enabled = false },
@@ -102748,7 +102760,10 @@ test "db transient leann stubs covered vectors through ordinary writes" {
         try db.addIndex(.{
             .name = "leann_idx",
             .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":8,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"leann_idx\"},\"algorithm\":\"leann\",\"leann\":{\"max_degree\":8,\"quantizer\":\"rabitq\",\"quantization_bits\":4,\"vector_storage\":\"transient\"}}",
+            .config_json = try std.fmt.bufPrint(&config_buf, "{{\"field\":\"embedding\",\"dims\":8,\"metric\":\"cosine\",\"generator\":{{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"leann_idx\"{s}}},\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":8,\"quantizer\":\"rabitq\",\"quantization_bits\":4,\"vector_storage\":\"{s}\"}}}}", .{
+                if (chunked) ",\"artifact_name\":\"leann_idx_chunks\",\"chunk_size\":8,\"chunk_overlap\":0" else "",
+                storage,
+            }),
         });
         const entry = db.core.index_manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
         try std.testing.expect(entry.leann_transient);
@@ -102771,8 +102786,12 @@ test "db transient leann stubs covered vectors through ordinary writes" {
         var stubs: usize = 0;
         while (true) {
             stubs = 0;
-            for (key_slices) |key| {
-                const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, key, "leann_idx");
+            for (key_slices) |key| for (0..@as(usize, if (chunked) 8 else 1)) |chunk_id| {
+                const artifact_key = if (chunked) blk: {
+                    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, key, "leann_idx_chunks", @intCast(chunk_id));
+                    defer alloc.free(chunk_key);
+                    break :blk try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "leann_idx");
+                } else try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, key, "leann_idx");
                 defer alloc.free(artifact_key);
                 const raw = db.core.store.get(alloc, artifact_key) catch |err| switch (err) {
                     error.NotFound => continue,
@@ -102780,7 +102799,7 @@ test "db transient leann stubs covered vectors through ordinary writes" {
                 };
                 defer alloc.free(raw);
                 if (try enrichment_artifact_codec.elidedDenseEmbedding(raw) != null) stubs += 1;
-            }
+            };
             // Vectors still in LEANN's exact buffer stay stored until a build.
             if (stubs > 0 and !db.core.index_manager.localLeannElisionPending()) break;
             if (monotonicTimeNs() >= deadline) break;
