@@ -321,7 +321,10 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
         // Persistence is a lifecycle contract. Never turn TEMP or UNLOGGED
         // syntax into an ordinary global durable table.
         if (intent.persistence != .permanent and !backend.supports_native_relation_lifetimes) return error.UnsupportedSqlExecution;
-        const source = if (intent.query != null)
+        // A first TEMP destination publishes its private namespace. Let its
+        // DDL owner do that before the source captures a catalog revision;
+        // an already-bound query cannot survive our own namespace mutation.
+        const source = if (intent.query != null and intent.persistence != .temporary)
             try @import("relation_population.zig").Source.init(arena, backend, compiled, intent, parameters, limits)
         else
             null;

@@ -1454,8 +1454,9 @@ pub const PopulationSource = struct {
     finish: *const fn (*anyopaque) anyerror!void,
 };
 
-/// A request-owned definition-bound producer factory. Refresh binds the stored
-/// query after resolving its logical descriptor; workers never retain callbacks.
+/// A request-owned definition-bound producer factory. TEMP creation admits its
+/// private namespace before binding the query; refresh first resolves its stored
+/// definition. Workers never retain callbacks.
 pub const PopulationPreparation = struct {
     ptr: *anyopaque,
     prepare: *const fn (*anyopaque, std.mem.Allocator, ast.RelationPopulation) anyerror!PopulationSource,

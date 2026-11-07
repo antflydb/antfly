@@ -114,6 +114,35 @@ const Campaign = struct {
         try self.command(ctx, "INSERT INTO usage_records(id,status) VALUES ('" ++ first_id ++ "','closed'),('" ++ second_id ++ "','closed')");
         var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
         defer corpus.deinit();
+        const original_owner = self.connection;
+        self.connection = try open(ctx);
+        // This owner has never declared a TEMP relation. Its first original
+        // CTAS must publish its namespace before binding the source snapshot.
+        try self.original(ctx, &corpus, "sql-0367");
+        try self.populated(ctx, "usage_session_archive");
+        try self.original(ctx, &corpus, "sql-0367");
+        try self.populated(ctx, "usage_session_archive");
+        // PostgreSQL still analyzes the query for an existing target, but
+        // does not evaluate it. Neither error may alter the admitted rows.
+        for ([_]struct { sql: []const u8, code: []const u8 }{
+            .{ .sql = "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT id FROM missing_ctas_source", .code = "42P01" },
+            .{ .sql = "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT missing_ctas_column FROM usage_records", .code = "42703" },
+        }) |negative| {
+            var response = try client.executeConnected(ctx, null, &self.connection, negative.sql, .write_admission);
+            defer response.deinit(ctx.alloc);
+            try std.testing.expect(response.status >= 400);
+            var failure = try std.json.parseFromSlice(struct { code: []const u8 }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+            defer failure.deinit();
+            try std.testing.expectEqualStrings(negative.code, failure.value.code);
+        }
+        try self.command(ctx, "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT 1/0 AS n");
+        try self.populated(ctx, "usage_session_archive");
+        const fresh_close_target = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/connections/{s}", .{self.connection});
+        defer ctx.alloc.free(fresh_close_target);
+        var fresh_closed = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, fresh_close_target, .DELETE, null, 30000);
+        defer fresh_closed.deinit(ctx.alloc);
+        try std.testing.expect(fresh_closed.status == 200 or fresh_closed.status == 204);
+        self.connection = original_owner;
         // An unrelated named PREPARED keeps its own row/range custody. It
         // must not become part of this implicit TEMP statement's read set.
         try self.command(ctx, "CREATE UNLOGGED TABLE lifetime_unrelated_prepared(id INT)");

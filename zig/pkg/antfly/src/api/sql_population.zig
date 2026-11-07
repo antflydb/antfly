@@ -169,7 +169,6 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
         if (intent.materialized()) return error.UnsupportedSqlExecution;
         if (@import("../metadata/topology_protocol.zig").current_version < @import("../metadata/topology_protocol.zig").sql_relation_persistence_version) return error.SqlRelationOwnerUnavailable;
     }
-    const source = input.source orelse return error.InvalidSqlBackendResponse;
     const io = server.sharedApiIo() orelse server.restore_job_store.io orelse return error.AsyncRestoreUnavailable;
     var context = try request_context.platformDeadline();
     if (context.deadline_ns == null) context.deadline_ns = time.monotonicNs() +| 30 * std.time.ns_per_s;
@@ -212,6 +211,14 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     var trusted = context;
     trusted.setting_admin = true;
     const ns = try namespaceId(server, a, trusted, target);
+    // Namespace admission is row-free and precedes the initial query binding.
+    // The factory is invoked once in the runtime result arena, which outlives
+    // this callback and owns its release. Never refresh/replay a bound producer
+    // after changing the catalog it captured.
+    const source = input.source orelse if (input.preparation) |preparation|
+        try preparation.prepare(preparation.ptr, allocators.result, intent)
+    else
+        return error.InvalidSqlBackendResponse;
     const physical = try server.catalogStorageNameAlloc(a);
     // Use the same native/storage defaults as ordinary CREATE. Metadata owns
     // physical identity allocation and still verifies the complete shape.

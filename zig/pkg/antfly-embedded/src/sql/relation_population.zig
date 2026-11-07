@@ -298,8 +298,9 @@ const Fixture = struct {
     pending_publication: bool = false,
     incomplete_producer: bool = false,
     skip_population: bool = false,
+    deferred_population: bool = false,
     fn backend(self: *Fixture) catalog.Backend {
-        return .{ .ptr = self, .execution_io = std.testing.io, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint, .ddl = ddl } };
+        return .{ .ptr = self, .execution_io = std.testing.io, .supports_native_relation_lifetimes = self.deferred_population, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint, .ddl = ddl } };
     }
     fn resolve(_: *anyopaque, _: A, _: ast.Name, _: catalog.Action) !catalog.Table {
         return error.TableNotFound;
@@ -318,12 +319,16 @@ const Fixture = struct {
         const self: *Fixture = @ptrCast(@alignCast(raw));
         if (self.cancelled) return error.QueryCanceled;
     }
-    fn ddl(raw: *anyopaque, _: catalog.DdlAllocators, request: catalog.Ddl) !catalog.DdlOutcome {
+    fn ddl(raw: *anyopaque, allocators: catalog.DdlAllocators, request: catalog.Ddl) !catalog.DdlOutcome {
         const self: *Fixture = @ptrCast(@alignCast(raw));
         self.population_calls += 1;
         if (request != .populate) return error.UnexpectedMutation;
+        const producer = if (self.deferred_population) deferred: {
+            try std.testing.expect(request.populate.source == null);
+            const factory = request.populate.preparation orelse return error.SourceSnapshotIncomplete;
+            break :deferred try factory.prepare(factory.ptr, allocators.result, request.populate.intent);
+        } else request.populate.source orelse return error.SourceSnapshotIncomplete;
         if (self.skip_population) return .{ .population_skipped = true };
-        const producer = request.populate.source orelse return error.SourceSnapshotIncomplete;
         if (self.incomplete_producer) return error.SourceSnapshotIncomplete;
         while (try producer.next(producer.ptr, delivery.max_page_rows)) |rows| {
             self.population_pages += 1;
@@ -438,6 +443,28 @@ test "SQL relation population runtime routes complete producer cohorts through t
     }
 }
 
+test "SQL relation population TEMP source binding belongs to the destination DDL owner" {
+    const a = std.testing.allocator;
+    var compiled = try compiler.compile(a, "CREATE TEMP TABLE dst AS SELECT 1::BIGINT AS n", .{});
+    defer compiled.deinit();
+    var fixture: Fixture = .{ .deferred_population = true };
+    var result = try runtime.execute(a, fixture.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("SELECT", result.output.command_tag);
+    try std.testing.expectEqual(@as(u64, 1), result.output.rows_affected);
+    try std.testing.expectEqual(@as(usize, 1), fixture.population_calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.scan_calls);
+
+    // IF NOT EXISTS suppresses execution, not query analysis. The destination
+    // owner still binds the source exactly once before declaring a no-op.
+    var invalid = try compiler.compile(a, "CREATE TEMP TABLE IF NOT EXISTS dst AS SELECT * FROM missing_source", .{});
+    defer invalid.deinit();
+    var skipped: Fixture = .{ .deferred_population = true, .skip_population = true };
+    try std.testing.expectError(error.TableNotFound, runtime.execute(a, skipped.backend(), &invalid, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 1), skipped.population_calls);
+    try std.testing.expectEqual(@as(usize, 0), skipped.scan_calls);
+}
+
 test "SQL relation population prepared parameters retain widths and do not dispatch during describe" {
     const a = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(a);
@@ -543,11 +570,12 @@ test "SQL relation population conditional completion skips evaluation and report
     const a = std.testing.allocator;
     for ([_]struct { sql: []const u8, tag: []const u8 }{
         .{ .sql = "CREATE TABLE IF NOT EXISTS dst AS SELECT 1/0 AS n", .tag = "CREATE TABLE AS" },
+        .{ .sql = "CREATE TEMP TABLE IF NOT EXISTS dst AS SELECT 1/0 AS n", .tag = "CREATE TABLE AS" },
         .{ .sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS dst AS SELECT 1/0 AS n", .tag = "CREATE MATERIALIZED VIEW" },
     }) |case| {
         var compiled = try compiler.compile(a, case.sql, .{});
         defer compiled.deinit();
-        var fixture: Fixture = .{ .skip_population = true };
+        var fixture: Fixture = .{ .skip_population = true, .deferred_population = compiled.statement.catalog_ddl.population.?.persistence == .temporary };
         var result = try runtime.execute(a, fixture.backend(), &compiled, &.{}, .{});
         defer result.deinit();
         try std.testing.expectEqualStrings(case.tag, result.output.command_tag);
