@@ -207,22 +207,33 @@ pub fn CachedDecoder(comptime Architecture: type) type {
         /// may use a retained view only while its backing stays unchanged for
         /// this COMPLETE head call; neither it nor a Frame borrow can escape.
         pub fn selectOwnedHidden(context: Context, input: CT, events: *HeadEvents, suppress_tokens: []const i32, fused_lm_head_allowed: bool, allow_cuda_graph: bool) !u32 {
+            return selectHidden(true, context, input, events, suppress_tokens, fused_lm_head_allowed, allow_cuda_graph);
+        }
+
+        /// Lexical borrow: the caller retains the input's owner through this
+        /// synchronous call. Replay replacements, logits and tokens remain owned.
+        pub fn selectBorrowedHidden(context: Context, input: CT, events: *HeadEvents, suppress_tokens: []const i32, fused_lm_head_allowed: bool, allow_cuda_graph: bool) !u32 {
+            return selectHidden(false, context, input, events, suppress_tokens, fused_lm_head_allowed, allow_cuda_graph);
+        }
+
+        fn selectHidden(comptime input_owned: bool, context: Context, input: CT, events: *HeadEvents, suppress_tokens: []const i32, fused_lm_head_allowed: bool, allow_cuda_graph: bool) !u32 {
             var head = ScalarHead{ .context = context };
             defer events.* = head.head_events;
-            return head.selectOwned(input, suppress_tokens, fused_lm_head_allowed, allow_cuda_graph);
+            return head.select(input_owned, input, suppress_tokens, fused_lm_head_allowed, allow_cuda_graph);
         }
 
         const ScalarHead = struct {
             context: Context,
             head_events: HeadEvents = .{},
-            fn selectOwned(self: *ScalarHead, input: CT, suppress_tokens: []const i32, fused_lm_head_allowed: bool, allow_cuda_graph: bool) !u32 {
+            fn select(self: *ScalarHead, comptime input_owned: bool, input: CT, suppress_tokens: []const i32, fused_lm_head_allowed: bool, allow_cuda_graph: bool) !u32 {
                 const allocator = self.context.allocator;
                 const cb = self.context.backend;
                 const model = self.context.model.*;
                 self.head_events = .{};
                 var owned_hidden = input;
                 var owned_live = true;
-                errdefer if (owned_live) cb.free(owned_hidden);
+                var hidden_owned = input_owned;
+                errdefer if (owned_live and hidden_owned) cb.free(owned_hidden);
                 const hidden = &owned_hidden;
                 const hidden_live = &owned_live;
 
@@ -232,13 +243,14 @@ pub fn CachedDecoder(comptime Architecture: type) type {
                     if (allow_cuda_graph) {
                         if (suppress_tokens.len == 0) {
                             if (try cb.debugCudaGraphPrepareGreedyTokenReplayInput(self.context.replay_key, hidden.*, 0)) |prepared| {
-                                cb.free(hidden.*);
+                                if (hidden_owned) cb.free(hidden.*);
                                 hidden.* = prepared;
+                                hidden_owned = true;
                                 hidden_live.* = true;
                                 _ = try cb.debugCudaGraphPrepareDecodeScalars(0, 0, 0, 0, 0);
                                 if (try cb.debugCudaGraphReplayFinalHidden(hidden.*)) |token_tensor| {
                                     defer cb.free(token_tensor);
-                                    cb.free(hidden.*);
+                                    if (hidden_owned) cb.free(hidden.*);
                                     hidden_live.* = false;
                                     self.head_events.cuda_graph_replay = true;
                                     self.head_events.cuda_graph_replay_steps += 1;
@@ -269,7 +281,7 @@ pub fn CachedDecoder(comptime Architecture: type) type {
                             self.head_events.cuda_graph_capture_steps += 1;
                             capture_graph = false;
                         }
-                        cb.free(hidden.*);
+                        if (hidden_owned) cb.free(hidden.*);
                         hidden_live.* = false;
                         if (self.head_events.lm_head_path == null) self.head_events.lm_head_path = "fused_argmax";
                         return try self.downloadToken(token_tensor);
@@ -282,7 +294,12 @@ pub fn CachedDecoder(comptime Architecture: type) type {
                     if (self.head_events.lm_head_path == null) self.head_events.lm_head_path = "full_logits_fused_unavailable";
                 }
 
-                const logits = try Architecture.decoderLmHeadLogitsFromFinalHiddenTensor(cb, allocator, model, hidden.*);
+                const logits = if (comptime input_owned)
+                    try Architecture.decoderLmHeadLogitsFromFinalHiddenTensor(cb, allocator, model, hidden.*)
+                else if (hidden_owned)
+                    try Architecture.decoderLmHeadLogitsFromFinalHiddenTensor(cb, allocator, model, hidden.*)
+                else
+                    try Architecture.decoderLmHeadLogitsFromBorrowedFinalHiddenTensor(cb, allocator, model, hidden.*);
                 hidden_live.* = false;
                 defer cb.free(logits);
 
@@ -585,7 +602,7 @@ test "cached decoder owner matches actual native scalar batch and compacted stat
 
 const CachedHeadFault = enum { replay, download, capture_commit, recording_decline };
 
-fn checkActualCachedHeadFault(mode: CachedHeadFault) !void {
+fn checkActualCachedHeadFault(mode: CachedHeadFault, borrowed: bool) !void {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
     const a = std.testing.allocator;
     const native = @import("../ops/native_compute.zig");
@@ -666,16 +683,29 @@ fn checkActualCachedHeadFault(mode: CachedHeadFault) !void {
     defer base.free(encoder);
     var decoder = try TestDecoder.init(.{ .allocator = a, .backend = &cb, .model = &config }, .scalar, encoder, 1, 1, 4);
     defer decoder.deinit();
-    decoder.hidden = try base.fromFloat32Shape(&.{ -1, 2, 3, 0 }, &.{ 1, 4 });
+    const hidden = try base.fromFloat32Shape(&.{ -1, 2, 3, 0 }, &.{ 1, 4 });
+    defer if (borrowed) base.free(hidden);
+    if (!borrowed) decoder.hidden = hidden;
+    const Select = struct {
+        fn run(owner: *TestDecoder, input: CT, borrow: bool) !u32 {
+            if (borrow) return TestDecoder.selectBorrowedHidden(owner.context, input, &owner.head_events, &.{}, true, true);
+            return owner.selectScalar(&.{}, true, true);
+        }
+    };
     switch (mode) {
-        .replay => try std.testing.expectError(error.InjectedCommittedReplay, decoder.selectScalar(&.{}, true, true)),
-        .download => try std.testing.expectError(error.InjectedReadbackFailure, decoder.selectScalar(&.{}, true, true)),
-        .capture_commit => try std.testing.expectError(error.InjectedCaptureCommit, decoder.selectScalar(&.{}, true, true)),
+        .replay => try std.testing.expectError(error.InjectedCommittedReplay, Select.run(&decoder, hidden, borrowed)),
+        .download => try std.testing.expectError(error.InjectedReadbackFailure, Select.run(&decoder, hidden, borrowed)),
+        .capture_commit => try std.testing.expectError(error.InjectedCaptureCommit, Select.run(&decoder, hidden, borrowed)),
         .recording_decline => {
-            _ = try decoder.selectScalar(&.{}, true, true);
+            _ = try Select.run(&decoder, hidden, borrowed);
         },
     }
     try std.testing.expect(decoder.hidden == null);
+    if (borrowed) {
+        const retained = try base.toFloat32(hidden, a);
+        defer a.free(retained);
+        try std.testing.expectEqualSlices(f32, &.{ -1, 2, 3, 0 }, retained);
+    }
     try std.testing.expectEqual(@as(usize, 1), probe.replays);
     try std.testing.expectEqual(@as(usize, if (mode == .capture_commit or mode == .recording_decline) 1 else 0), probe.projections);
     try std.testing.expectEqual(@as(usize, if (mode == .download or mode == .recording_decline) 1 else 0), probe.downloads);
@@ -684,14 +714,41 @@ fn checkActualCachedHeadFault(mode: CachedHeadFault) !void {
 }
 
 test "cached decoder replay error propagates without eager projection or readback" {
-    try checkActualCachedHeadFault(.replay);
+    for ([_]bool{ false, true }) |borrowed| try checkActualCachedHeadFault(.replay, borrowed);
 }
 test "cached decoder replay readback error cannot replay numerical work" {
-    try checkActualCachedHeadFault(.download);
+    for ([_]bool{ false, true }) |borrowed| try checkActualCachedHeadFault(.download, borrowed);
 }
 test "cached decoder capture commit error aborts metadata without eager replay" {
-    try checkActualCachedHeadFault(.capture_commit);
+    for ([_]bool{ false, true }) |borrowed| try checkActualCachedHeadFault(.capture_commit, borrowed);
 }
 test "cached decoder recording decline performs one ordinary projection" {
-    try checkActualCachedHeadFault(.recording_decline);
+    for ([_]bool{ false, true }) |borrowed| try checkActualCachedHeadFault(.recording_decline, borrowed);
+}
+
+fn checkBorrowedScalarHead(cb_value: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cb = &cb_value;
+    const config = TestArchitecture.Config{ .d_model = 4, .decoder_layers = 1, .decoder_attention_heads = 1, .decoder_ffn_dim = 8, .vocab_size = 4 };
+    const hidden = try cb.fromFloat32Shape(&.{ -1, 2, 3, 0 }, &.{ 1, 4 });
+    defer cb.free(hidden);
+    const context = TestDecoder.Context{ .allocator = a, .backend = cb, .model = &config };
+    for ([_]bool{ false, true }) |fused| {
+        for ([_][]const i32{ &.{}, &.{0} }) |suppressed| {
+            const owned = try cb.fromFloat32Shape(&.{ -1, 2, 3, 0 }, &.{ 1, 4 });
+            var original_events: TestDecoder.HeadEvents = .{};
+            const expected = try TestDecoder.selectOwnedHidden(context, owned, &original_events, suppressed, fused, false);
+            var actual_events: TestDecoder.HeadEvents = .{};
+            const actual = try TestDecoder.selectBorrowedHidden(context, hidden, &actual_events, suppressed, fused, false);
+            try std.testing.expectEqual(expected, actual);
+            try std.testing.expectEqualStrings(original_events.lm_head_path.?, actual_events.lm_head_path.?);
+            const retained = try cb.toFloat32(hidden, a);
+            defer a.free(retained);
+            try std.testing.expectEqualSlices(f32, &.{ -1, 2, 3, 0 }, retained);
+        }
+    }
+}
+
+test "borrowed scalar head preserves actual Native hidden through original fused and logits suppression paths" {
+    try @import("../ops/media_residency_test.zig").onNative(populateTestWeights, checkBorrowedScalarHead);
 }

@@ -145,6 +145,17 @@ pub fn create(ctx: Context) Suite {
     runtime_build.configureCudaVideo(b, tests.root_module, ctx.target, ctx.backend.enable_cuda, ctx.paths);
     tests.root_module.link_libc = ctx.backend.link_libc;
 
+    // Reuse the exact configured test module and runner without requesting an
+    // emitted binary. This performs semantic checking without LLVM or linking.
+    const test_check = b.addTest(.{
+        .name = "inference-test-check",
+        .root_module = tests.root_module,
+        .filters = main_test_filters,
+        .test_runner = runtime_filter_test_runner,
+        .max_rss = tests.step.max_rss,
+    });
+    ctx.step("check-inference-tests", "Type-check the inference tests without emitting a binary").dependOn(&test_check.step);
+
     // Keep the standalone server's CLI and configuration parsing covered too.
     // `src/inference.zig` does not import `src/main.zig`, so tests declared by
     // the executable root otherwise compile only when invoked manually.

@@ -760,9 +760,10 @@ pub const Schedule = struct {
     }
     /// Values and planes belong to this request. Only the frozen pure recipe
     /// enters through the retained Definition; no graph operation is reauthored.
-    pub fn instantiate(a: std.mem.Allocator, cb: *const ops.ComputeBackend, definition: *Definition, spec: *const ProgramSpec, bound: []const BoundParameter) !*Schedule {
+    pub fn instantiate(a: std.mem.Allocator, cb: *const ops.ComputeBackend, definition: *Definition, bound: []const BoundParameter) !*Schedule {
         if (cb.vtable != &@import("../ops/native_compute.zig").vtable_impl) return error.UnsupportedDenseSchedule;
-        if (!definition.matchesSpec(spec) or bound.len != spec.parameters.len) return error.DenseDefinitionChanged;
+        const spec = try definition.programSpec();
+        if (bound.len != spec.parameters.len) return error.DenseDefinitionChanged;
         for (spec.parameters, bound) |parameter, current| try checkBound(parameter, current);
         const values = try a.alloc(?CT, definition.graph.nodeCount());
         errdefer a.free(values);
@@ -1112,7 +1113,7 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(u64, 0), slot.trySnapshot().?.hits);
     try std.testing.expectEqual(@as(u64, 1), slot.trySnapshot().?.misses);
     for (bound[2..][0..state_count], second_states) |*binding, value| binding.value = value;
-    const second = try Schedule.instantiate(a, &cb, definition, owned, &bound);
+    const second = try Schedule.instantiate(a, &cb, definition, &bound);
     var second_open = true;
     defer if (second_open) second.deinit(cleanup);
     try std.testing.expect(first.definition == second.definition);
@@ -1140,7 +1141,7 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     }
     // Same physical weight bytes and shape, different checkpoint role: deny.
     bound[0].value = key;
-    if (Schedule.instantiate(a, &cb, definition, owned, &bound)) |unexpected| {
+    if (Schedule.instantiate(a, &cb, definition, &bound)) |unexpected| {
         unexpected.deinit(cleanup);
         return error.ExpectedNamedRoleDenial;
     } else |err| switch (err) {
@@ -1151,7 +1152,7 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     const wrong_shape = try cb.fromFloat32Shape(&data, &.{ 2, 2 });
     defer cb.free(wrong_shape);
     bound[2].value = wrong_shape;
-    if (Schedule.instantiate(a, &cb, definition, owned, &bound)) |unexpected| {
+    if (Schedule.instantiate(a, &cb, definition, &bound)) |unexpected| {
         unexpected.deinit(cleanup);
         return error.ExpectedCurrentShapeDenial;
     } else |err| switch (err) {
@@ -1160,7 +1161,7 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     }
     bound[2].value = second_state;
     bound[0].source_data = @ptrFromInt(16);
-    if (Schedule.instantiate(a, &cb, definition, owned, &bound)) |unexpected| {
+    if (Schedule.instantiate(a, &cb, definition, &bound)) |unexpected| {
         unexpected.deinit(cleanup);
         return error.ExpectedCurrentModelDenial;
     } else |err| switch (err) {

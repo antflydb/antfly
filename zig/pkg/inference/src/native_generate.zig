@@ -8043,7 +8043,7 @@ fn acquireCliGenerationResources(
                 .resources = .{
                     .backend_class = if (component.backend == .native) .cpu else .gpu,
                     .limits = limits,
-                    .amounts = memory.AdmissionAmounts.fromEstimate(try component.estimate(prompt_tokens, max_tokens, chunk.*)),
+                    .amounts = try memory.AdmissionAmounts.fromEstimate(try component.estimate(prompt_tokens, max_tokens, chunk.*)),
                 },
             };
         }
@@ -9557,8 +9557,8 @@ test "native generate admits target draft transients beside residency and shrink
         .intermediate_size = 256,
         .vocab_size = 1024,
     };
-    const small = memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 32));
-    const large = memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 256));
+    const small = try memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 32));
+    const large = try memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 256));
     const resident_bytes = 4 * large.hostTotalBytes();
     const limits = memory.Limits{ .host_limit_bytes = resident_bytes + 2 * small.hostTotalBytes(), .combined_limit_bytes = resident_bytes + 2 * small.hostTotalBytes() };
     var resources = try model_manager_mod.ModelManager.SharedResources.init(a, limits);

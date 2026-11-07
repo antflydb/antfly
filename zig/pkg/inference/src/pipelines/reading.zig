@@ -1475,11 +1475,9 @@ pub const ReadingPipeline = struct {
             self.head_events = .{};
             const hidden = self.hidden orelse return error.MissingDecoderHidden;
             self.hidden = null;
-            const shape = [_]i64{ 1, @intCast(self.context.model.d_model) };
-            // A retained header protects the exact unchanged Frame row through
-            // the original consuming head call; no numerical copy or CT escape.
-            const owned = try self.context.backend.primReshape(hidden, &shape);
-            return FlorenceDecoder.selectOwnedHidden(self.context, owned, &self.head_events, suppressed, fused, graph);
+            // This private decoder and its receiving B retain the Frame row
+            // until the synchronous original scalar head returns or unwinds.
+            return FlorenceDecoder.selectBorrowedHidden(self.context, hidden, &self.head_events, suppressed, fused, graph);
         }
     };
 

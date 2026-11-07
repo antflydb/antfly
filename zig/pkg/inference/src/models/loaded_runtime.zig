@@ -507,12 +507,16 @@ pub const Runtime = struct {
         if (assets.gliner_span_tokenizer_digest) |digest|
             try session_factory.sealGlinerDecisionTokenizerDigest(session, digest);
 
-        var managed_whisper_prompt = assets.managed_whisper_prompt;
-        assets.managed_whisper_prompt = null;
-        if (!assets.whisper_prompt_prepared and session_factory.getWhisperConfig(session) != null) {
+        const prompt_preparation = assets.whisper_prompt;
+        assets.whisper_prompt = .unprepared;
+        var managed_whisper_prompt: ?ManagedWhisperPrompt = switch (prompt_preparation) {
+            .unprepared => null,
+            .prepared => |prompt| prompt,
+        };
+        errdefer if (managed_whisper_prompt) |*prompt| prompt.deinit();
+        if (prompt_preparation == .unprepared and session_factory.getWhisperConfig(session) != null) {
             managed_whisper_prompt = .{ .cache = try whisper_prompt.PromptCache.init(allocator, model_dir, if (hf_tok) |ht| ht.tokenizer() else sp_tok.?.tokenizer()), .admission = null };
         }
-        errdefer if (managed_whisper_prompt) |*prompt| prompt.deinit();
 
         // Embedding checkpoints can ship their decoder backbone's chat
         // template, but embedding execution never uses it. Qwen rerankers use
@@ -1820,8 +1824,11 @@ const encoder_decoder = @import("../pipelines/encoder_decoder.zig");
 const florence_arch = @import("../architectures/florence.zig");
 
 pub const Assets = struct {
-    managed_whisper_prompt: ?ManagedWhisperPrompt = null,
-    whisper_prompt_prepared: bool = false,
+    /// Prepared null is an actual producer outcome, distinct from raw loading.
+    whisper_prompt: union(enum) {
+        unprepared,
+        prepared: ?ManagedWhisperPrompt,
+    } = .unprepared,
     manifest: manifest_mod.ModelManifest,
     hf_tok: ?*hf_tokenizer.HfTokenizer,
     sp_tok: ?*sentencepiece.Processor,
@@ -1842,7 +1849,10 @@ pub const Assets = struct {
 
     fn deinit(self: *Assets, allocator: std.mem.Allocator) void {
         self.session.deinit();
-        if (self.managed_whisper_prompt) |*prompt| prompt.deinit();
+        switch (self.whisper_prompt) {
+            .unprepared => {},
+            .prepared => |*maybe| if (maybe.*) |*prompt| prompt.deinit(),
+        }
         if (self.hf_tok) |tokenizer| tokenizer.deinitSelf();
         if (self.sp_tok) |tokenizer| {
             tokenizer.deinit();
@@ -1863,7 +1873,7 @@ test "loaded runtime owned asset construction unwinds model and shared state at 
     const directory = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..] });
     defer a.free(directory);
     const Case = struct {
-        fn run(allocator: std.mem.Allocator, path: []const u8) !void {
+        fn run(allocator: std.mem.Allocator, path: []const u8, prompt_mode: enum { raw, absent, cached }) !void {
             // Backend/artifact construction has independent failure coverage.
             // Keep its process/IO warmup outside this runtime allocator sweep.
             const source_allocator = std.testing.allocator;
@@ -1874,8 +1884,23 @@ test "loaded runtime owned asset construction unwinds model and shared state at 
             var session_owned = true;
             defer if (session_owned) session.close();
             const revision = try resolutionModelRevision(source_allocator, std.testing.io, manifest);
+            const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+            defer domain.release();
+            var prompt: ?ManagedWhisperPrompt = null;
+            defer if (prompt) |*value| value.deinit();
+            if (prompt_mode == .cached) {
+                var tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(source_allocator,
+                    \\{"version":"1.0","added_tokens":[{"id":0,"content":"<unk>"},{"id":10,"content":"<|en|>"},{"id":12,"content":"<|transcribe|>"},{"id":13,"content":"<|notimestamps|>"}],"model":{"type":"BPE","vocab":{"<unk>":0,"<|en|>":10,"<|transcribe|>":12,"<|notimestamps|>":13},"merges":[]}}
+                );
+                defer tokenizer.deinitSelf();
+                var cache = try whisper_prompt.PromptCache.initFromBytes(allocator, null, null, tokenizer.tokenizer());
+                errdefer cache.deinit();
+                const lease = try domain.controller.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = 4096 }, false);
+                prompt = .{ .cache = cache, .admission = lease };
+            }
             var sessions = backends.SessionManager.init(source_allocator);
             const assets = Assets{
+                .whisper_prompt = if (prompt_mode == .raw) .unprepared else .{ .prepared = prompt },
                 .manifest = manifest,
                 .hf_tok = null,
                 .sp_tok = null,
@@ -1893,18 +1918,27 @@ test "loaded runtime owned asset construction unwinds model and shared state at 
                 .tokenizer_resource_lease = null,
                 .kernel_jit_profile_bundle = null,
             };
+            prompt = null;
             manifest_owned = false;
             session_owned = false;
             const model = try Runtime.fromOwnedAssets(allocator, assets, null);
             defer allocator.destroy(model);
-            defer model.deinit();
+            var model_live = true;
+            defer if (model_live) model.deinit();
+            try std.testing.expectEqual(prompt_mode == .cached, model.whisper_prompt_cache != null);
+            try std.testing.expectEqual(@as(usize, if (prompt_mode == .cached) 4096 else 0), domain.controller.snapshot().host_weight_bytes);
             try std.testing.expect(model.shared_prefetch != null);
             try std.testing.expect(model.native_generate_coordinator != null);
             try std.testing.expectEqual(&model.session.model_lifetime.?.execution_gate, model.session.execution_gate.?);
             try std.testing.expectEqual(&model.embedding_cohort_scheduler, model.session.cohort_scheduler.?);
+            model.deinit();
+            model_live = false;
+            try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Case.run, .{directory});
+    inline for (.{ .raw, .absent, .cached }) |mode| {
+        try std.testing.checkAllAllocationFailures(a, Case.run, .{ directory, mode });
+    }
 }
 
 pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
@@ -2072,8 +2106,7 @@ pub fn loadPrimary(allocator: std.mem.Allocator, model_dir: []const u8, source_s
     errdefer if (managed_prompt) |*prompt| prompt.deinit();
     try tokenizer_artifacts.verify();
     const assets = Assets{
-        .managed_whisper_prompt = managed_prompt,
-        .whisper_prompt_prepared = true,
+        .whisper_prompt = .{ .prepared = managed_prompt },
         .manifest = man,
         .hf_tok = hf_tok,
         .sp_tok = sp_tok,

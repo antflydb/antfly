@@ -58139,7 +58139,7 @@ test "Qwen cold frame metadata all OOM and move preserve allocator custody witho
                 .num_hidden_layers = 1,
                 .num_attention_heads = 1,
                 .num_key_value_heads = 1,
-                .head_dim = 128,
+                .attention_head_dim = 128,
                 .vocab_size = 64,
             };
             const gated = @import("../backends/decoder_gated_runtime.zig");

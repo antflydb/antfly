@@ -1249,7 +1249,7 @@ fn runPjrtHloArtifactFull(
     if (compare_host) {
         var reference = try artifactHostEstimate(model.session, artifact, .execute);
         reference.scratch_bytes = 0; // already covered by host preparation
-        var reference_admission = try model_manager.acquireRunResourceAmounts(.cpu, run_budget.limits, runtime.tier.memory.AdmissionAmounts.fromEstimate(reference));
+        var reference_admission = try model_manager.acquireRunResourceAmounts(.cpu, run_budget.limits, try runtime.tier.memory.AdmissionAmounts.fromEstimate(reference));
         defer reference_admission.release();
         try run_budget.reserveEstimate(reference);
         defer run_budget.releaseEstimate(reference);
@@ -2640,7 +2640,7 @@ test "run-artifact host KV exists only during native paged execution" {
         // without adding another cache or another invocation KV reservation.
         var controller = runtime.tier.memory.AdmissionController{};
         controller.tightenInvocationQuotas(.{ .kv_limit_bytes = execute.kv_bytes });
-        var tracing = try controller.tryAcquire(.cpu, .{}, runtime.tier.memory.AdmissionAmounts.fromEstimate(trace), false);
+        var tracing = try controller.tryAcquire(.cpu, .{}, try runtime.tier.memory.AdmissionAmounts.fromEstimate(trace), false);
         defer tracing.release();
         var reference = try controller.tryAcquire(.cpu, .{}, .{ .host_kv_bytes = execute.kv_bytes }, false);
         reference.release();
@@ -3319,7 +3319,7 @@ fn managedExecutorMetadataScenario(a: std.mem.Allocator, prefill: []const u8, pl
     manager_live = false;
     var run = try owned.createRuntime(quota.allocator());
     defer run.deinit();
-    const controller = &executor.metadata_budget.?.lifetime.domain.admission;
+    const controller = executor.metadata_budget.?.lifetime.domain.admission;
     const admitted = controller.snapshot();
     const retained = quota.live_bytes;
     try std.testing.expect(admitted.hostTotalBytes() >= retained);

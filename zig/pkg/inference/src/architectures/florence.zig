@@ -1274,6 +1274,15 @@ pub fn decoderLmHeadLogitsRowsFromFinalHiddenTensor(
     hidden: CT,
     rows: usize,
 ) !CT {
+    return decoderLmHeadLogitsRowsWithCustody(true, cb, allocator, config, hidden, rows);
+}
+
+/// The hidden owner stays live in the caller through this synchronous head.
+pub fn decoderLmHeadLogitsFromBorrowedFinalHiddenTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden: CT) !CT {
+    return decoderLmHeadLogitsRowsWithCustody(false, cb, allocator, config, hidden, 1);
+}
+
+fn decoderLmHeadLogitsRowsWithCustody(comptime consume_hidden: bool, cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden: CT, rows: usize) !CT {
     const lm_w = try lmHeadWeight(cb);
     var logits = try cb.linearNoBias(hidden, lm_w, rows, config.d_model, config.vocab_size);
     errdefer cb.free(logits);
@@ -1290,7 +1299,7 @@ pub fn decoderLmHeadLogitsRowsFromFinalHiddenTensor(
             logits = biased;
         }
     }
-    cb.free(hidden);
+    if (consume_hidden) cb.free(hidden);
     return logits;
 }
 
@@ -4892,7 +4901,7 @@ pub const PreparedSingleToken = struct {
         const bound = try source.bind(self.allocator, spec);
         defer self.allocator.free(bound);
         if (preparation) |prepared| if (prepared.cached) |definition| {
-            const schedule = try Dense.Schedule.instantiate(self.allocator, &self.backend, definition, spec, bound);
+            const schedule = try Dense.Schedule.instantiate(self.allocator, &self.backend, definition, bound);
             errdefer schedule.deinit(.{ .outside_execution = true });
             const token_node = try definition.parameterNode(.{ .kind = .token_ids });
             const position_node = try definition.parameterNode(.{ .kind = .position_ids });

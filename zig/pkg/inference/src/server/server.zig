@@ -37687,7 +37687,9 @@ test "trusted model resolution caller ownership stays flat across every return s
 
 test "download remote content accepts data uri" {
     const alloc = std.testing.allocator;
+    var host_caches = HostCaches{ .allocator = alloc };
     const node = Node{
+        .host_caches = &host_caches,
         .config = .{},
         .allocator = undefined,
         .session_manager = undefined,
@@ -37933,7 +37935,9 @@ test "download remote content honors an explicit file allowlist" {
 test "download remote content blocks private ip urls when configured" {
     const alloc = std.testing.allocator;
     const allowed_hosts = [_][]u8{@constCast("127.0.0.1")};
+    var host_caches = HostCaches{ .allocator = alloc };
     const node = Node{
+        .host_caches = &host_caches,
         .config = .{ .content_security = .{
             .allowed_hosts = &allowed_hosts,
             .block_private_ips = true,
@@ -37955,7 +37959,9 @@ test "download remote content blocks private ip urls when configured" {
 test "download remote content blocks hosts outside allowlist" {
     const alloc = std.testing.allocator;
     const allowed_hosts = [_][]u8{@constCast("cdn.example.com")};
+    var host_caches = HostCaches{ .allocator = alloc };
     const node = Node{
+        .host_caches = &host_caches,
         .config = .{ .content_security = .{ .allowed_hosts = &allowed_hosts } },
         .allocator = undefined,
         .session_manager = undefined,

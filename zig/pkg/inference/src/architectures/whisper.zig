@@ -1262,7 +1262,7 @@ pub const PreparedSingleToken = struct {
         const bound = try source.bind(a, spec, slabs);
         defer a.free(bound);
         if (preparation) |prepared| if (prepared.cached) |definition| {
-            const schedule = try schedule_mod.Schedule.instantiate(a, cb, definition, spec, bound);
+            const schedule = try schedule_mod.Schedule.instantiate(a, cb, definition, bound);
             errdefer schedule.deinit(.{ .outside_execution = true });
             return .{ .schedule = schedule, .token_node = try definition.parameterNode(.{ .kind = .token_ids }), .position_node = try definition.parameterNode(.{ .kind = .position_ids }) };
         };
