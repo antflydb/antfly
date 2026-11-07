@@ -2792,9 +2792,9 @@ pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         if (options.timings) |t| t.max_prepared_audio = @max(t.max_prepared_audio, slot.clips.len + if (options.prepare_ahead) next_count else 0);
         if (slot.retained > 0) {
             var execution_waiter = Scheduler.Waiter{};
-            const staged_cuda = session.backend() == .cuda;
-            if (!staged_cuda) try enterModel(session, lock, control, &execution_waiter);
-            defer if (!staged_cuda) leaveModel(lock, &execution_waiter);
+            const staged = audioUsesStagedExecution(session.backend());
+            if (!staged) try enterModel(session, lock, control, &execution_waiter);
+            defer if (!staged) leaveModel(lock, &execution_waiter);
             try consumePreparedAudios(out, slot, tokenizer, cfg, options, vectors[offset..][0..slot.consumed], token_counts[offset..][0..slot.consumed], &observation, if (next_count > 0 and options.prepare_ahead) &slots[next] else null, lock);
         }
         slot.deinit();
@@ -2814,6 +2814,12 @@ pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     }
     try control.check();
     return .{ .vectors = vectors, .input_tokens = token_counts, .execution = observation.execution(observation.native_items + observation.serial_items) };
+}
+
+// Native media getters need the same actual Model/B cache loan as CUDA;
+// ordinary Metal keeps its original provider and numerical lane.
+fn audioUsesStagedExecution(backend: @import("../backends/backends.zig").BackendType) bool {
+    return backend == .native or backend == .cuda;
 }
 
 fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparation.zig").Wave, tokenizer: Tokenizer, cfg: encoder.Config, options: Options, vectors: [][]f32, token_counts: []usize, observation: *BatchExecution.Observation, future: ?*@import("audio_preparation.zig").Wave, lock: ?*std.atomic.Mutex) !void {
@@ -2837,6 +2843,7 @@ fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparati
     };
     defer permit.deinit();
     const staged_cuda = slot.session.backend() == .cuda;
+    const staged = audioUsesStagedExecution(slot.session.backend());
     var execution_waiter = Scheduler.Waiter{};
     var stage_counters = StageLane.Counters{};
     defer collectStageCounters(options.timings, stage_counters);
@@ -2844,13 +2851,13 @@ fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparati
     defer lane.deinit();
     var unstaged: ?compute_provider.ManagedComputeBackend = null;
     defer if (unstaged) |*managed| managed.deinit();
-    if (staged_cuda) {
+    if (staged) {
         // Original admission/reclaim and future-wave retry stay outside ALL
         // numerical owners. The final Stage owns the same primary permit.
         try lane.prepareBeforeExecutionOwningPermit();
         try lane.enterInitial(a, slot.control);
     } else unstaged = try compute_provider.acquire(slot.session, a, null, slot.control);
-    const cb = if (staged_cuda) lane.backend() else &unstaged.?.backend;
+    const cb = if (staged) lane.backend() else &unstaged.?.backend;
     const before = MediaTransferSnapshot.init(cb);
     defer observeResidentTransfers(cb, before, options);
     var order: [4]usize = undefined;
@@ -2888,7 +2895,7 @@ fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparati
             t.resident_cohorts += 1;
         }
         if (staged_cuda) try lane.prepareCudaInputHandoff(&projected.embeddings);
-        const result = try runResidentMediaBatchObservedUsing(a, cb, cfg, tokenizer, &projected, options, true, if (cursor + count == slot.retained) &permit else null, null, if (staged_cuda) &lane else null);
+        const result = try runResidentMediaBatchObservedUsing(a, cb, cfg, tokenizer, &projected, options, true, if (cursor + count == slot.retained) &permit else null, null, if (staged) &lane else null);
         defer {
             for (result) |vector| a.free(vector);
             a.free(result);
@@ -3610,7 +3617,7 @@ fn runResidentMediaBatchObservedUsing(a: std.mem.Allocator, cb: *const ComputeBa
     defer batch_inputs.deinit(a, cb);
     if (options.timings) |t| t.pack_ns += mediaNow() - started;
     const encoder_started = mediaNow();
-    if (stage) |owner| try owner.prepareCudaInputHandoff(&batch_inputs.embeddings);
+    if (cb.kind() == .cuda) if (stage) |owner| try owner.prepareCudaInputHandoff(&batch_inputs.embeddings);
     if (permit) |phase| {
         if (stage) |owner| {
             if (try packedPhaseRequest(phase, batch, batch_inputs)) |request| try owner.retain(request);

@@ -18896,9 +18896,17 @@ test "actual Native Source Q6_K active packed-input and head banks preserve exac
 }
 
 fn nativePanelActualStageCase(a: std.mem.Allocator, cancel_during_fund: bool) !void {
+    return nativeCacheActualStageCase(a, cancel_during_fund, .panels);
+}
+
+const NativeStageCacheCase = enum { panels, audio, audio_denied };
+fn nativeCacheActualStageCase(a: std.mem.Allocator, cancel_during_fund: bool, mode: NativeStageCacheCase) !void {
     if (comptime !build_options.enable_native) return error.SkipZigTest;
-    if (@import("../backends/native.zig").useBlas()) return error.SkipZigTest;
-    const names = [_][]const u8{ "language_model.layers.0.mlp.gate_proj.weight", "language_model.layers.0.mlp.up_proj.weight" };
+    if (mode == .panels and @import("../backends/native.zig").useBlas()) return error.SkipZigTest;
+    const names = if (mode == .panels)
+        [_][]const u8{ "language_model.layers.0.mlp.gate_proj.weight", "language_model.layers.0.mlp.up_proj.weight" }
+    else
+        [_][]const u8{ "audio_tower.subsample_conv_projection.layer0.conv.weight", "audio_tower.subsample_conv_projection.layer0.norm.weight" };
     const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
     defer domain.release();
     const pin = domain.pin();
@@ -18913,12 +18921,15 @@ fn nativePanelActualStageCase(a: std.mem.Allocator, cancel_during_fund: bool) !v
     native_mod.initPrefetchQueue(data, a);
     try data.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = 1 << 20 }, .{});
     try data.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+    if (mode == .audio_denied) data.tier_cache.?.configureHardBudget(.{ .host_limit_bytes = 1 });
     var raw: [2][64 * 64]u16 = .{ @splat(0x3f80), @splat(0x4000) };
     for (names, 0..) |name, index| {
         const key = try a.dupe(u8, name);
         var moved = false;
         defer if (!moved) a.free(key);
-        try data.resident_weights.put(a, key, .{ .tensor = .{ .data = std.mem.sliceAsBytes(&raw[index]), .shape = &.{ 64, 64 }, .dtype = .bf16, .name = key, .allocator = a, .owns_data = false, .owns_shape = false } });
+        const shape: []const i64 = if (mode == .panels) &.{ 64, 64 } else if (index == 0) &.{ 128, 1, 3, 3 } else &.{128};
+        const elements: usize = if (mode == .panels) 64 * 64 else if (index == 0) 128 * 3 * 3 else 128;
+        try data.resident_weights.put(a, key, .{ .tensor = .{ .data = std.mem.sliceAsBytes(raw[index][0..elements]), .shape = shape, .dtype = .bf16, .name = key, .allocator = a, .owns_data = false, .owns_shape = false } });
         moved = true;
     }
     session.run_admission = .{ .controller = pin.controller(), .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1 << 20 }, .static_workspace_bytes = 0, .check_live_memory = false };
@@ -18984,15 +18995,62 @@ fn nativePanelActualStageCase(a: std.mem.Allocator, cancel_during_fund: bool) !v
     var probe = Probe{ .data = data, .gate = session.execution_gate.?, .lane = &lane, .cancel_on_fund = cancel_during_fund };
     try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
     defer probe.armed = false;
-    var permit = try session.admit(.{});
+    var permit = try session.admit(if (mode == .panels) .{} else .{ .workspace_bytes = 64 * 1024 });
     defer permit.deinit();
     var waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
     var stage = StagedExecution{ .session = session, .gate = session.execution_gate, .execution_lane = &lane, .waiter = &waiter, .cb = undefined, .control = .{ .ptr = &probe, .check_fn = Probe.check, .native_call_policy = .in_process }, .permit = &permit, .idle_backend = 0, .active = false };
     defer stage.deinit();
-    try stage.prepareBeforeExecution();
+    if (mode == .panels) try stage.prepareBeforeExecution() else try stage.prepareBeforeExecutionOwningPermit();
     try stage.enterInitial(a, stage.control);
     const cb = stage.backend();
     try std.testing.expect(cb.embedding_stage == null and cb.native_weight_cache != null);
+    if (mode != .panels) {
+        try std.testing.expect(stage.epoch() != null and waiter.acquired);
+        try std.testing.expect(!try stage.epoch().?.isSealed());
+        probe.armed = true;
+        if (cancel_during_fund) {
+            const attempted = cb.getWeight(names[0]);
+            if (attempted) |unexpected| {
+                cb.free(unexpected);
+                return error.ExpectedColdAudioCancellation;
+            } else |err| switch (err) {
+                error.Cancelled => {},
+                else => return err,
+            }
+            try std.testing.expect(stage.active and waiter.acquired and !probe.violation);
+            const compute: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+            try std.testing.expect(!compute.mirror_source_claim and !compute.mirror_cache_receiving);
+            probe.cancelled = false;
+            probe.cancel_on_fund = false;
+        }
+        // Real rank-four BF16 convolution and rank-one normalization sources,
+        // through all three PUBLIC getter forms under this actual Stage/B.
+        for (0..3) |access| {
+            const name = names[if (access == 2) 1 else 0];
+            const weight = switch (access) {
+                0 => try cb.getWeight(name),
+                1 => try cb.acquireWeight(name),
+                else => try cb.getEmbeddingWeight(name),
+            };
+            defer cb.free(weight);
+            const values = try cb.toFloat32(weight, a);
+            defer a.free(values);
+            try std.testing.expectEqual(@as(usize, if (access == 2) 128 else 128 * 3 * 3), values.len);
+            for (values) |value| try std.testing.expectEqual(@as(f32, if (access == 2) 2 else 1), value);
+            try std.testing.expect(stage.active and waiter.acquired and !probe.violation);
+            const compute: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+            try std.testing.expect(!compute.mirror_source_claim and !compute.mirror_cache_receiving);
+        }
+        if (mode == .audio_denied) {
+            try std.testing.expectEqual(@as(u32, 0), data.embeddinggemma2_f32_cache.count());
+        } else {
+            const cached = data.embeddinggemma2_f32_cache.get(names[0]) orelse return error.MissingColdAudioMirror;
+            try std.testing.expect(cached.prepared_physical_bytes > cached.bytes);
+            try std.testing.expect(probe.panel_calls > 0);
+        }
+        probe.armed = false;
+        return;
+    }
     try std.testing.expect(data.canonical_panel_source_readers != 0);
     var replacement_values: [64 * 64]f32 = @splat(3);
     var replacement: ?@import("../backends/tensor.zig").Tensor = try @import("../backends/tensor.zig").Tensor.initFloat32(a, names[0], &.{ 64, 64 }, &replacement_values);
@@ -20470,4 +20528,26 @@ test "GLiNER CUDA bound source retains reduced precision release gates" {
         try std.testing.expectError(error.UnqualifiedGlinerCudaPrecision, createSessionFromManifest(std.testing.allocator, "/never-opened", &manifest, .cuda, .{}, .dynamic, null, precision, false));
         try std.testing.expectError(error.UnsupportedGlinerCudaPrecision, createSessionFromManifest(std.testing.allocator, "/never-opened", &manifest, .cuda, .{}, .dynamic, null, precision, true));
     }
+}
+
+test "actual managed Native audio BF16 getter Stage keeps current B and supplier callbacks outside the lane" {
+    try nativeCacheActualStageCase(std.testing.allocator, false, .audio);
+    try nativeCacheActualStageCase(std.testing.allocator, false, .audio_denied);
+}
+
+test "actual managed Native audio BF16 getter Stage restores cancellation before explicit recovery" {
+    try nativeCacheActualStageCase(std.testing.allocator, true, .audio);
+}
+
+test "actual managed Native audio BF16 getter Stage unwinds every allocation failure and optional cache denial" {
+    const Case = struct {
+        fn cached(a: std.mem.Allocator) !void {
+            try nativeCacheActualStageCase(a, false, .audio);
+        }
+        fn denied(a: std.mem.Allocator) !void {
+            try nativeCacheActualStageCase(a, false, .audio_denied);
+        }
+    };
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.cached, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.denied, .{});
 }
