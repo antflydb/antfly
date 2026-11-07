@@ -37244,6 +37244,7 @@ test "download remote content accepts data uri" {
     const node = Node{
         .config = .{},
         .allocator = undefined,
+        .host_caches = undefined,
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
@@ -37493,6 +37494,7 @@ test "download remote content blocks private ip urls when configured" {
             .block_private_ips = true,
         } },
         .allocator = undefined,
+        .host_caches = undefined,
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
@@ -37512,6 +37514,7 @@ test "download remote content blocks hosts outside allowlist" {
     const node = Node{
         .config = .{ .content_security = .{ .allowed_hosts = &allowed_hosts } },
         .allocator = undefined,
+        .host_caches = undefined,
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
