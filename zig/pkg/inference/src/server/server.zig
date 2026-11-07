@@ -2843,13 +2843,12 @@ fn collectOnnxDependenciesForPath(
     allocator: std.mem.Allocator,
     dependencies: *OnnxDependencies,
     maybe_path: ?[]const u8,
+    primary: bool,
+    logical_path: ?[]const u8,
 ) !void {
     const path = maybe_path orelse return;
-    if (!std.mem.endsWith(u8, path, ".onnx")) return;
-    var artifacts = backends_mod.imported_onnx_session.inspectArtifactSet(
-        allocator,
-        path,
-    ) catch |err| {
+    if (!primary and !std.mem.endsWith(u8, path, ".onnx")) return;
+    var artifacts = backends_mod.imported_onnx_session.inspectArtifactSetWithBase(allocator, path, if (logical_path) |logical| std.fs.path.dirname(logical) else null) catch |err| {
         if (err == error.OutOfMemory) return err;
         dependencies.valid = false;
         return;
@@ -2874,7 +2873,7 @@ fn collectCompatibilityOnnxDependencies(
         man.visual_projection_path,
         man.audio_projection_path,
     };
-    for (paths) |path| try collectOnnxDependenciesForPath(allocator, &dependencies, path);
+    for (paths, 0..) |path, index| try collectOnnxDependenciesForPath(allocator, &dependencies, path, index == 0, if (index == 0) man.onnx_logical_path else null);
     return dependencies;
 }
 
@@ -2942,6 +2941,7 @@ fn addCompatibilityManifestFacts(
     const native_arch_hint: u8 = @backingInt(man.native_arch_hint);
     signature.update(&.{ model_type, model_type_origin, native_arch_hint });
     updateCompatibilitySignatureSlice(signature, man.config_model_arch);
+    updateCompatibilitySignatureSlice(signature, man.onnx_logical_path orelse "");
     updateCompatibilitySignatureSlice(signature, man.gliner_model_type);
     updateCompatibilitySignatureSlice(signature, man.inference_bundle_family);
     signature.update(&.{
@@ -2978,6 +2978,8 @@ fn computeCompatibilitySignatureWithDependencies(
     }
     try addArtifactIdentityToSignature(allocator, io, &signature, man.model_manifest_path, true);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.config_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.jina_adapter_config_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.jina_adapter_weights_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.gguf_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.gguf_projector_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.safetensors_path, false);
@@ -51553,4 +51555,67 @@ test "model selection VAD admission failures retain retry semantics" {
     var budget_response = try Node.sileroModelFailureResponse(&ctx, .load, error.MemoryBudgetExceeded);
     defer budget_response.deinit();
     try std.testing.expectEqual(@as(u16, 507), budget_response.status.code);
+}
+
+test "model selection compatibility signature preserves aliased ONNX context" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const ml = @import("ml");
+    const onnx = @import("onnx_graph");
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const weight = try builder.parameter("weight", ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(weight);
+    const values = [_]f32{ 1, 2, 3, 4 };
+    var exported = try onnx.exportGraphWithExternalData(a, &graph, .{ .parameter_initializers = &.{.{ .name = "weight", .shape = ml.graph.Shape.init(.f32, &.{4}), .data = .{ .raw_bytes = std.mem.asBytes(&values) } }} }, "weights.data");
+    defer exported.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "blobs");
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/graph", .data = exported.model_bytes });
+    try tmp.dir.symLink(io, "blobs/graph", "model.onnx", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights.data", .data = exported.external_data.?.bytes });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var manifest = try manifest_mod.loadFromDir(a, root);
+    defer manifest.deinit();
+    var dependencies = try collectCompatibilityOnnxDependencies(a, &manifest);
+    defer dependencies.deinit(a);
+    try std.testing.expect(dependencies.valid);
+    try std.testing.expectEqual(@as(usize, 1), dependencies.paths.items.len);
+    const before = try computeCompatibilitySignatureWithDependencies(a, io, root, &manifest, dependencies.paths.items, true);
+    const changed = [_]f32{ 5, 6, 7, 8 };
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights.data", .data = std.mem.asBytes(&changed) });
+    const after = try computeCompatibilitySignatureWithDependencies(a, io, root, &manifest, dependencies.paths.items, true);
+    try std.testing.expect(!std.mem.eql(u8, &before, &after));
+    const new_logical = try std.fs.path.join(a, &.{ root, "text_model.onnx" });
+    a.free(manifest.onnx_logical_path.?);
+    manifest.onnx_logical_path = new_logical;
+    const renamed = try computeCompatibilitySignatureWithDependencies(a, io, root, &manifest, dependencies.paths.items, true);
+    try std.testing.expect(!std.mem.eql(u8, &after, &renamed));
+}
+
+test "model selection compatibility signature tracks selected Jina adapter files" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "adapters/retrieval");
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"jina_embeddings_v5\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "base" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_config.json", .data = "{\"r\":1}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_model.safetensors", .data = "aaaa" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadListingFromDir(a, root);
+    defer man.deinit();
+    try std.testing.expect((try man.jinaRetrievalAdapter()) != null);
+    const before = try computeCompatibilitySignatureWithDependencies(a, io, root, &man, &.{}, true);
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_config.json", .data = "{\"r\":2}" });
+    const config_changed = try computeCompatibilitySignatureWithDependencies(a, io, root, &man, &.{}, true);
+    try std.testing.expect(!std.mem.eql(u8, &before, &config_changed));
+    try tmp.dir.writeFile(io, .{ .sub_path = "adapters/retrieval/adapter_model.safetensors", .data = "bbbbb" });
+    const weights_changed = try computeCompatibilitySignatureWithDependencies(a, io, root, &man, &.{}, true);
+    try std.testing.expect(!std.mem.eql(u8, &config_changed, &weights_changed));
 }
