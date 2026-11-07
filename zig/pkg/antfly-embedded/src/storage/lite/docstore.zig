@@ -1681,10 +1681,21 @@ pub const Store = struct {
     group_max_requests: usize = 64,
     group_max_bytes: usize = 4 * 1024 * 1024,
     /// Ride-along bookkeeping (WS2): background work (e.g. a ride-along
-    /// write) never pays its own fsync. `ride_along_pending_bytes` and
-    /// `ride_along_last_enqueue_ns` are guarded by `commit_mutex` (updated
-    /// alongside the queue itself); the other fields manage the idle-flush
-    /// background task. See `Store.stageRideAlong`/`forceDrainDurable`.
+    /// write) never pays its own fsync. `ride_along_pending_bytes`,
+    /// `ride_along_pending_count` and `ride_along_last_enqueue_ns` are
+    /// guarded by `commit_mutex` (updated alongside the queue itself); the
+    /// other fields manage the idle-flush background task. See
+    /// `Store.stageRideAlong`/`forceDrainDurable`.
+    ///
+    /// `ride_along_pending_count` (not `..._bytes`) is the idle-flush
+    /// loop's "is there anything queued at all" signal: a caller is free to
+    /// leave `MutationPlan.estimated_bytes` at its default 0 (most do --
+    /// only the byte-threshold barrier in `stageRideAlong` actually needs
+    /// an estimate), which would otherwise leave `ride_along_pending_bytes`
+    /// stuck at 0 forever despite real, unapplied work sitting in the
+    /// queue, and `rideAlongFlushLoop` checking that field directly would
+    /// then never fire its barrier (a) at all.
+    ride_along_pending_count: usize = 0,
     ride_along_pending_bytes: usize = 0,
     ride_along_last_enqueue_ns: i96 = 0,
     ride_along_idle_ns: u64 = 50 * std.time.ns_per_ms,
@@ -2915,7 +2926,20 @@ pub const Store = struct {
         var changes = native.ChangeCapture{};
         defer changes.deinit(self.allocator);
         var latest = blk: {
-            lockStore(self);
+            // Exclusive, not plain lockStore: `takeResidualVacuumChangesAssumeLocked`
+            // -> `captureFullReadSnapshot` requires `self.header` to already
+            // match what is actually on disk. A foreground group's
+            // writePositionalAll for its checkpoint slot runs *before* it
+            // releases `self.mutex` for the sync (`syncIfRequired`'s hooks),
+            // so a plain `lockStore` here could acquire the mutex during
+            // that released window and see the new slot bytes already on
+            // disk (an ordinary write is visible to a fresh read without an
+            // intervening fsync) while `self.header` still reflects the
+            // pre-commit state -- a real mismatch, not a bug in the check,
+            // reported as `EnrichmentWaitCanceled`. `lockStoreExclusive`
+            // waits out that window first, same as every other path that
+            // reads or publishes a checkpoint on `self.file`.
+            lockStoreExclusive(self);
             defer self.mutex.unlock();
             break :blk try self.takeResidualVacuumChangesAssumeLocked(capture, &changes);
         };
@@ -3202,6 +3226,7 @@ pub const Store = struct {
         const become_leader = !self.commit_draining and !ride_along;
         if (become_leader) self.commit_draining = true;
         if (ride_along) {
+            self.ride_along_pending_count +|= 1;
             self.ride_along_pending_bytes +|= plan.estimated_bytes;
             self.ride_along_last_enqueue_ns = std.Io.Clock.awake.now(io).nanoseconds;
         }
@@ -3303,7 +3328,7 @@ pub const Store = struct {
             if (self.ride_along_flush_cancel.requested.load(.acquire)) break;
             self.commit_mutex.lockUncancelable(io);
             const last_ns = self.ride_along_last_enqueue_ns;
-            const pending = self.ride_along_pending_bytes > 0;
+            const pending = self.ride_along_pending_count > 0;
             self.commit_mutex.unlock(io);
             if (!pending) continue;
             const now = std.Io.Clock.awake.now(io).nanoseconds;
@@ -3353,7 +3378,10 @@ pub const Store = struct {
             tail = request;
             batch.size += 1;
             bytes +|= request.estimated_bytes;
-            if (request.ride_along) self.ride_along_pending_bytes -|= request.estimated_bytes;
+            if (request.ride_along) {
+                self.ride_along_pending_count -|= 1;
+                self.ride_along_pending_bytes -|= request.estimated_bytes;
+            }
         }
         return batch;
     }
