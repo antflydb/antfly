@@ -52818,7 +52818,12 @@ fn pruneStaleGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: Gr
     defer ctx.alloc.free(due_key);
     const expected_value = try graph_edge_ttl_expiration.encodeAlloc(ctx.alloc, candidate);
     defer ctx.alloc.free(expected_value);
-    var txn = try ctx.store.beginWriteTxn();
+    // Pruning a stale due-record is pure background bookkeeping: losing it in
+    // a crash just means the next TTL sweep re-observes the same due-record,
+    // re-runs this exact staleness check and prunes it again. Join the next
+    // foreground group's commit instead of forcing its own fsync
+    // (lite-single-commit-write-path.md §3.2a's ride-along pattern).
+    var txn = try ctx.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     const actual_value = txn.get(due_key) catch |err| switch (err) {
         error.NotFound => {
@@ -52867,7 +52872,10 @@ fn pruneStaleDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candida
     defer ctx.alloc.free(due_key);
     const expected_value = try graph_edge_ttl_expiration.encodeDirectAlloc(ctx.alloc, candidate);
     defer ctx.alloc.free(expected_value);
-    var txn = try ctx.store.beginWriteTxn();
+    // See pruneStaleGraphTtlCandidateContext: a stale due-record prune is
+    // safe to lose on crash (redone from the same durable due-record on the
+    // next sweep), so it rides along rather than forcing its own fsync.
+    var txn = try ctx.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     const actual_value = txn.get(due_key) catch |err| switch (err) {
         error.NotFound => {

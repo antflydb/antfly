@@ -840,7 +840,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try self.lockApplyForPortableRuntime();
             defer S.ownerField(self, "core").*.unlockApply();
             const deletes = [_][]const u8{key};
-            try S.ownerField(self, "core").*.store.putBatch(&.{}, deletes[0..]);
+            // This removal only ever follows a successful `dispatcher.applyDispatch`
+            // (see `document_child_range_outbox.drain`). Losing it in a crash just
+            // means the next drain re-scans this same outbox entry and re-dispatches
+            // an idempotent child-range batch, so it rides along with the next
+            // foreground group's commit instead of paying its own fsync per entry
+            // (lite-single-commit-write-path.md §3.2a).
+            try S.ownerField(self, "core").*.store.putBatchWithReplayWithOptions(null, &.{}, deletes[0..], null, .{ .durability = .ride_along });
         }
 
         pub fn denseArtifactCounterBootstrapKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
@@ -5530,7 +5536,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             borrowed_write_count = writes.items.len;
             try appendArtifactRepairSummaryDirtyForStore(ctx.alloc, ctx.store, &writes, &deletes, &owned_delete_keys);
-            try ctx.store.putBatch(writes.items, deletes.items);
+            // Repair-issue bookkeeping, not primary data: if this clear is lost
+            // in a crash, the issue row just survives until the next pass
+            // observes the same healthy artifact and clears it again. Ride
+            // along instead of paying a dedicated fsync per cleared issue
+            // (lite-single-commit-write-path.md §3.2a).
+            try ctx.store.putBatchWithReplayWithOptions(null, writes.items, deletes.items, null, .{ .durability = .ride_along });
         }
 
         /// Requires artifact_repair_issue_mutex. Preserve the diagnosis and
