@@ -52,6 +52,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const Allocator = execution_resources.Allocator;
         const ChunkCacheEntry = execution_resources.ChunkCacheEntry;
         const ChunkEmbeddingSource = execution_resources.ChunkEmbeddingSource;
+        const EmbeddingArtifactOrigin = execution_resources.EmbeddingArtifactOrigin;
         const GeneratedBatchWritePlan = execution_resources.GeneratedBatchWritePlan;
         const GeneratedDenseMemoJob = execution_resources.GeneratedDenseMemoJob;
         const GeneratedEmbeddingMemo = execution_resources.GeneratedEmbeddingMemo;
@@ -878,7 +879,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     embedding_name,
                     request.source_field,
                     source.key,
-                    .{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation) },
+                    // Inline text chunks re-embed by re-chunking the parent;
+                    // stored chunk inputs cannot.
+                    if (request.input_kind == .inline_chunks)
+                        EmbeddingArtifactOrigin{ .generated_text = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation) }
+                    else
+                        EmbeddingArtifactOrigin{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation) },
                     vector,
                 );
                 defer alloc.free(artifact_key);

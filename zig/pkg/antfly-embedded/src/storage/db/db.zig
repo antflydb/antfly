@@ -50248,7 +50248,7 @@ fn testEmbeddingArtifactOrigins(alloc: Allocator) !void {
             try std.testing.expectEqual(origin == .authored, header.flags.authored);
             try std.testing.expectEqual(switch (origin) {
                 .authored => @as(?u64, null),
-                .generated => |hash| hash,
+                .generated, .generated_text => |hash| hash,
             }, try enrichment_artifact_codec.sourceHash(write.value));
         }
     }

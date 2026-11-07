@@ -1881,7 +1881,7 @@ fn reembedChunkTextAlloc(
 
 /// Whether rendered content parts are text only, so the vector they embed is
 /// reproducible from the document without fetching or decoding media.
-fn partsAreText(parts: []const template.ContentPart) bool {
+pub fn partsAreText(parts: []const template.ContentPart) bool {
     for (parts) |part| if (part != .text) return false;
     return parts.len > 0;
 }

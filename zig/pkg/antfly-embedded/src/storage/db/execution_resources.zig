@@ -2313,6 +2313,10 @@ pub const GraphContenderChanges = std.StringHashMapUnmanaged(std.ArrayListUnmana
 pub const EmbeddingArtifactOrigin = union(enum) {
     authored,
     generated: ?u64,
+    /// Generated from text alone, so re-embedding the source reproduces it
+    /// (dense artifacts carry `text_input`; sparse ones treat it as
+    /// `generated`).
+    generated_text: ?u64,
 };
 
 pub const StoreWritePositions = std.StringHashMapUnmanaged(usize);

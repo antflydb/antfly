@@ -2048,6 +2048,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const payload = switch (origin) {
                 .authored => try enrichment_artifact_codec.encodeAuthoredDenseEmbeddingAlloc(alloc, vector),
                 .generated => |hash| try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, hash, vector),
+                .generated_text => |hash| try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(alloc, hash, true, vector),
             };
             var payload_owned = true;
             errdefer if (payload_owned) alloc.free(payload);
@@ -3173,7 +3174,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             errdefer if (key_owned) alloc.free(key);
             const payload = switch (origin) {
                 .authored => try enrichment_artifact_codec.encodeAuthoredSparseEmbeddingAlloc(alloc, indices, values),
-                .generated => |hash| try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, hash, indices, values),
+                .generated, .generated_text => |hash| try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, hash, indices, values),
             };
             var payload_owned = true;
             errdefer if (payload_owned) alloc.free(payload);
@@ -6382,7 +6383,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         embedding_name,
                         request.source_field,
                         null,
-                        .{ .generated = null },
+                        if (enrichment_runtime_mod.partsAreText(parts)) .{ .generated_text = null } else .{ .generated = null },
                         vector,
                     );
                     defer alloc.free(artifact_key);
@@ -6446,7 +6447,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 embedding_name,
                 request.source_field,
                 null,
-                .{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source_text.?, request.producer_json, request.reprocess_generation) },
+                .{ .generated_text = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source_text.?, request.producer_json, request.reprocess_generation) },
                 vector,
             );
             defer alloc.free(artifact_key);
