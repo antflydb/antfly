@@ -927,6 +927,11 @@ the stored hash matches.
   configured source.
 - A write that does not change the configured source hash must not call the
   embedder/chunker and must not rewrite downstream dense/sparse/full-text state.
+  Under ordered authority the whole-row source digest still changes, so the
+  stored output is republished unchanged under the new source receipt.
+- The hash covers the provider's model revision when the provider reports one,
+  so a new model behind the same alias re-embeds. Multimodal template parts hash
+  their rendered bytes; parts holding an unfetched URL have no hash and re-embed.
 - Ordinary document updates must keep existing enrichment artifact rows long
   enough for the worker to compare source hashes. If the write path deletes the
   artifact before the worker runs, unchanged-source updates are forced to
@@ -1576,7 +1581,8 @@ Version rules:
      projection still reads JSON chunk rows.
 6. Add tests matching Go behavior.
    - Rewriting a document with unchanged source text does not call the embedder.
-   - Rewriting unrelated fields does not rewrite embedding artifacts.
+   - Rewriting unrelated fields does not rewrite embedding artifacts. Under
+     ordered authority it republishes the same artifact bytes.
    - Changing the source text updates the hash and regenerates output.
    - Chunk artifacts carry source hash and codec version.
    - Dense embedding artifacts carry source hash, codec version, dims, and

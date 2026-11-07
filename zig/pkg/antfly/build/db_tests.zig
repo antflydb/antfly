@@ -31,6 +31,25 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const native_query_maintenance_filters = [_][]const u8{
+        "db native checkpoint warming",
+        "db idle dense query captures",
+        "external lake native warming",
+        "source vector payloads debt policy bounds background deferral",
+        "source vector payloads background verification defers small copies",
+        "source pin cleanup supervisor preserves bounded backoff",
+        "sparse background compaction retires fully deleted inputs",
+        "text merge scheduler completion cannot retire a superseding task",
+    };
+    const native_query_maintenance_tests = b.addTest(.{
+        .name = "native-query-maintenance-tests",
+        .root_module = antfly_test_mod,
+        .filters = &native_query_maintenance_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-storage-native-query-maintenance-test", "Run idle native query capture and warming regressions")
+        .dependOn(&addCuratedTestRunArtifact(b, native_query_maintenance_tests, &native_query_maintenance_filters).step);
     const row_preparation_filters = [_][]const u8{
         "prepared relational",
         "relational durable preparation",
@@ -148,7 +167,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, retirement_tests).step);
     const ordered_artifact_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "ordered artifact inventory", "storage.db.derived.apply_state", "artifact footprint", "artifact publication upload", "artifact publication compact transport", "db derived coverage snapshot", "db dense target reads atomic outcome and source coverage snapshot", "db dense target reads atomic artifact and source coverage snapshot", "online admission facts are unbound", "native source admission", "api module compiles", "metadata module compiles", "db lookup includes chunk artifacts", "db search includes chunk artifacts", "db scan includes chunk artifacts", "db lookup does not load chunks", "db lookup loads chunks" },
+        .filters = &.{ "document extraction metadata fingerprint", "document extraction v5 fingerprint", "document extraction checksum", "document extraction rejects a malformed digest", "document extraction verified fingerprints", "document extraction fingerprint binds", "shared PDF enrollment skips completed metadata", "ordered artifact inventory", "storage.db.derived.apply_state", "artifact footprint", "artifact publication upload", "artifact publication compact transport", "db derived coverage snapshot", "db dense target reads atomic outcome and source coverage snapshot", "db dense target reads atomic artifact and source coverage snapshot", "online admission facts are unbound", "native source admission", "api module compiles", "metadata module compiles", "db lookup includes chunk artifacts", "db search includes chunk artifacts", "db scan includes chunk artifacts", "db lookup does not load chunks", "db lookup loads chunks" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-ordered-artifact-test", "Run ordered artifact inventory, wire, and durable owner regressions")
@@ -385,6 +404,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db deferred generated coverage remains pending until the enrichment worker decides an outcome",
         "storage.db.db.test.db deleteEnrichment rejects asset referenced by chunk enrichment",
         "storage.db.db.test.db dense enrichment republishes unchanged source hash from cached artifact after index reset",
+        "storage.db.db.test.db dense enrichment skips unchanged multimodal parts",
         "storage.db.db.test.db dense enrichment skips unchanged source hash",
         "storage.db.db.test.db encodeThinReplayRecordPayload marks generated enrichment replay for async writes",
         "storage.db.db.test.db enrichment artifact consumer resolution includes graph and default full text indexes",
