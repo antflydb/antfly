@@ -5632,7 +5632,7 @@ pub const NativeCompute = struct {
     pub fn beginWeightCacheOperation(cb: *const ComputeBackend, expected_data: *const anyopaque, request: ops.NativeWeightCachePreparation, current: @import("../execution/cleanup_context.zig").Context) !bool {
         return switch (request) {
             .weight, .acquire, .embedding, .constant => beginF32MirrorCacheOperation(cb, expected_data, current),
-            .panels => if (native.useBlas()) beginF32MirrorCacheOperation(cb, expected_data, current) else beginPanelCacheOperation(cb, expected_data, current),
+            .panels => |panels| if (native.useBlas() or panels.in_dim < 64) beginF32MirrorCacheOperation(cb, expected_data, current) else beginPanelCacheOperation(cb, expected_data, current),
         };
     }
     fn hasPreparedWeightResult(self: *NativeCompute, request: ops.NativeWeightCachePreparation) !bool {
@@ -60551,6 +60551,10 @@ fn nativeF32JoinedColdCase(a: std.mem.Allocator, count: usize, below: bool, expe
     const request = ops.NativeWeightCachePreparation{ .panels = .{ .names = names[0..count], .widths = widths[0..count], .in_dim = 4 } };
     try std.testing.expect(try NativeCompute.beginWeightCacheOperation(&cb, &data, request, current));
     errdefer NativeCompute.abortWeightCacheOperation(&cb, &data);
+    // The original small-width producer is F32 on BOTH BLAS and no-BLAS.
+    // Begin must claim the same source lifetime as prepare and receive.
+    try std.testing.expect(compute.mirror_source_claim);
+    try std.testing.expectEqual(@as(usize, 1), data.canonical_panel_source_readers);
     try std.testing.expect(try NativeCompute.weightCacheOperationNeedsPreparation(&cb, &data, request));
     // A cold miss has no actual F32 borrow: preserve original optional reclaim.
     try std.testing.expectEqual(@as(usize, 0), data.embeddinggemma2_f32_readers);

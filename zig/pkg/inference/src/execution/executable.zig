@@ -1081,42 +1081,19 @@ test "prepared physical CUDA capture failure falls back before submission and re
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
     const ml = @import("ml");
-    const Replay = ops.physical_storage.Replay;
+    const driver = @import("../ops/cuda/driver.zig");
     const Failure = struct {
-        inner: Replay,
-        var original_factory: @FieldType(ops.KernelBackend, "createPhysicalReplay") = null;
-        const vtable = Replay.VTable{ .begin = begin, .commit = commit, .abort = abort, .launch = launch, .retains = retains, .deinit = deinit };
-        fn create(ctx: *anyopaque) !?Replay {
-            const inner = (try original_factory.?(ctx)) orelse return null;
-            errdefer inner.deinit();
-            const owner = try std.testing.allocator.create(@This());
-            owner.* = .{ .inner = inner };
-            return .{ .ptr = owner, .vtable = &vtable };
-        }
-        fn begin(raw: *anyopaque, leases: []const ?*ops.physical_storage.Lease) !bool {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            return self.inner.begin(leases);
-        }
-        fn commit(_: *anyopaque) !void {
-            // Simulate optional graph-executable memory pressure after real
-            // CUDA recording, before any graph submission.
-            return error.OutOfMemory;
-        }
-        fn abort(raw: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.inner.abort();
-        }
-        fn launch(_: *anyopaque) !void {
-            return error.TestUnexpectedResult;
-        }
-        fn retains(raw: *anyopaque, lease: *const ops.physical_storage.Lease) bool {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            return self.inner.retains(lease);
-        }
-        fn deinit(raw: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.inner.deinit();
-            std.testing.allocator.destroy(self);
+        var calls: usize = 0;
+        var last_graph: driver.CUgraph = null;
+        var last_flags: c_ulonglong = 0;
+        fn instantiate(exec: *driver.CUgraphExec, graph: driver.CUgraph, flags: c_ulonglong) callconv(.c) driver.CUresult {
+            calls += 1;
+            last_graph = graph;
+            last_flags = flags;
+            exec.* = null;
+            // Actual capture ended and produced an SDK graph. Fail only its
+            // executable creation, before any captured operation is submitted.
+            return driver.CUDA_ERROR_OUT_OF_MEMORY;
         }
     };
     var context = @import("../backends/compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (@as(anyerror, err)) {
@@ -1125,14 +1102,16 @@ test "prepared physical CUDA capture failure falls back before submission and re
     };
     defer context.deinit(a);
     const original = context.computeBackend();
-    var functions = original.vtable.kernels.?.*;
-    Failure.original_factory = functions.createPhysicalReplay;
-    functions.createPhysicalReplay = Failure.create;
-    var failure_vtable = original.vtable.*;
-    functions.implementation_table = &failure_vtable; // Explicit fixture physical-program opt-in.
-    failure_vtable.kernels = &functions;
-    var failing_backend = original;
-    failing_backend.vtable = &failure_vtable;
+    const compute = context.cuda;
+    const original_instantiate = compute.ctx.driver.fns.cuGraphInstantiate;
+    const original_instantiate_params = compute.ctx.driver.fns.cuGraphInstantiateWithParams;
+    defer {
+        compute.ctx.driver.fns.cuGraphInstantiate = original_instantiate;
+        compute.ctx.driver.fns.cuGraphInstantiateWithParams = original_instantiate_params;
+    }
+    Failure.calls = 0;
+    Failure.last_graph = null;
+    Failure.last_flags = 0;
     var graph = ml.graph.Graph.init(a);
     defer graph.deinit();
     var b = ml.graph.Builder.init(&graph);
@@ -1143,7 +1122,7 @@ test "prepared physical CUDA capture failure falls back before submission and re
     try graph.markOutput(out);
     var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
     defer program.deinit();
-    var failed = try prepare(a, &program, &failing_backend, .partitioned);
+    var failed = try prepare(a, &program, &original, .partitioned);
     defer failed.deinit();
     var recovered = try prepare(a, &program, &original, .partitioned);
     defer recovered.deinit();
@@ -1151,24 +1130,32 @@ test "prepared physical CUDA capture failure falls back before submission and re
     recovered.configureExecutionDiagnostics(true);
     var retained_failure: ?@import("invocation_report.zig").Report = null;
     for ([_]*Executable{ &failed, &recovered }, 0..) |executable, mode| for (0..3) |iteration| {
+        // Keep the canonical ComputeBackend, KernelBackend and Replay owner.
+        // Only the real SDK instantiation boundary is replaced in failed mode.
+        compute.ctx.driver.fns.cuGraphInstantiateWithParams = if (mode == 0) null else original_instantiate_params;
+        compute.ctx.driver.fns.cuGraphInstantiate = if (mode == 0) Failure.instantiate else original_instantiate;
+        if (mode == 0 and iteration == 1) @import("../test_error_logs.zig").expectErrorLogs(1);
         const values: [8]f32 = @splat(@floatFromInt(iteration + 1));
         const input = try original.fromFloat32Shape(&values, &.{ 1, 8 });
         defer original.free(input);
         var inputs = [_]interpreter.RuntimeInput{.{ .node_id = x, .value = input }};
         var result = try executable.run(a, .{ .runtime_inputs = try program.remapInputs(&inputs), .activation_readbacks = .forbidden, .output_placement = .producer });
         defer result.deinit(&executable.runtime);
+        try std.testing.expect(!compute.debug_cuda_graph_capture_active);
+        try std.testing.expect(!try compute.ctx.streamCaptureActive());
+        try std.testing.expectEqual(@as(usize, 0), compute.capturing_physical_storage.values.items.len);
         const actual = try original.toFloat32(result.outputs[0], a);
         defer a.free(actual);
         for (actual) |value| try std.testing.expectEqual(@as(f32, @floatFromInt(iteration + 1)) * 9, value);
         if (mode == 0 and iteration >= 1) {
             try std.testing.expectEqual(@import("stats.zig").PhysicalReplayDecision.capture_failed, result.stats.physical_replay);
-            try std.testing.expectEqualStrings("OutOfMemory", result.stats.physical_replay_error.?);
+            try std.testing.expectEqualStrings("CudaDriverError", result.stats.physical_replay_error.?);
             const report = executable.diagnostics.snapshot().?.report.?;
             try std.testing.expectEqualStrings("success", report.outcome);
             try std.testing.expectEqual(@as(u8, 0), report.failure.len);
             try std.testing.expectEqualStrings("capture_failed", report.program_route_decision.?);
             const reason = report.program_failure.?;
-            try std.testing.expectEqualStrings("OutOfMemory", reason.bytes[0..reason.len]);
+            try std.testing.expectEqualStrings("CudaDriverError", reason.bytes[0..reason.len]);
             try std.testing.expect(!reason.truncated);
             retained_failure = report;
             try std.testing.expectEqual(@as(u64, if (iteration == 1) 1 else 0), result.stats.physical_capture_failures);
@@ -1177,9 +1164,12 @@ test "prepared physical CUDA capture failure falls back before submission and re
         if (mode == 1) try std.testing.expect(executable.diagnostics.snapshot().?.report.?.program_failure == null);
         if (mode == 1 and iteration == 2) try std.testing.expectEqual(@as(u64, 1), result.stats.physical_graph_replays);
     };
+    try std.testing.expectEqual(@as(usize, 1), Failure.calls);
+    try std.testing.expect(Failure.last_graph != null);
+    try std.testing.expectEqual(@as(c_ulonglong, 0), Failure.last_flags);
     failed.configureExecutionDiagnostics(false);
     const retained_reason = retained_failure.?.program_failure.?;
-    try std.testing.expectEqualStrings("OutOfMemory", retained_reason.bytes[0..retained_reason.len]);
+    try std.testing.expectEqualStrings("CudaDriverError", retained_reason.bytes[0..retained_reason.len]);
 }
 
 test "assigned single-axis reductions use the Metal plan output and preserve held frames" {

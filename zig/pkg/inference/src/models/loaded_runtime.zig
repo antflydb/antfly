@@ -1929,7 +1929,9 @@ test "loaded runtime owned asset construction unwinds model and shared state at 
         }
     };
     inline for (.{ .raw, .absent, .cached }) |mode| {
-        try std.testing.checkAllAllocationFailures(a, Case.run, .{ directory, mode });
+        // Keep every Runtime failpoint independent of backing resize/remap
+        // placement; source construction still uses its original allocator.
+        try platform.allocator.checkAllAllocationFailures(a, Case.run, .{ directory, mode });
     }
 }
 

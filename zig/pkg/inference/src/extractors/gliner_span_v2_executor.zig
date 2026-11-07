@@ -1868,10 +1868,20 @@ test "gliner specialty scratch reserves prepared span geometry and every physica
     const markers: [42]usize = undefined;
     var groups = [_]processor.Group{std.mem.zeroes(processor.Group)};
     groups[0].child_markers = markers[0..2];
-    var samples: [1]processor.Sample = undefined;
-    samples[0].input_ids = &ids;
-    samples[0].words = words[0..8];
-    samples[0].groups = &groups;
+    var samples = [_]processor.Sample{.{
+        .original_text = pii.items[0].text,
+        .schema_fingerprint = @splat(0),
+        .input_ids = &ids,
+        .words = words[0..8],
+        .groups = &groups,
+        .queries = &.{},
+        .classification_labels = &.{},
+        .enum_choices = &.{},
+        .prefix_word_count = 0,
+        .body_word_count = 8,
+        .terminal_period_added = false,
+        .is_joint_ie = false,
+    }};
     var batches: [1]processor.PreparedBatch = undefined;
     batches[0].samples = &samples;
     var ranges = [_]TaskRange{.{ .start = 0, .end = 0 }};
@@ -1879,6 +1889,7 @@ test "gliner specialty scratch reserves prepared span geometry and every physica
     var request_plan = Plan{ .items = &items, .prompt_tokens = 512 };
     const small = try plannedDeviceScratchUpperBound(config, &pii, &request_plan, .{ .specialty_profile = .pii });
     samples[0].words = &words;
+    samples[0].body_word_count = words.len;
     groups[0].child_markers = &markers;
     const large = try plannedDeviceScratchUpperBound(config, &pii, &request_plan, .{ .specialty_profile = .pii });
     const encoder = try deviceScratchUpperBound(config, 512);

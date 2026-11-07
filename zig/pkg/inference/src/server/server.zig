@@ -53947,7 +53947,10 @@ test "model selection direct GGUF files retain the installation publication fenc
     defer alias_lease.deinit(io);
     var lease = try @import("../registry/publication_lease.zig").Lease.shared(a, io, file);
     defer lease.deinit(io);
-    const writer_dir = try std.Io.Dir.cwd().openDir(io, root, .{});
+    // Linux non-iterating directory handles use O_PATH and cannot be flocked.
+    // This is a real competing writer, so open the readable directory handle
+    // just like publication_lease.sharedParent; never mask a failed lock probe.
+    const writer_dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer writer_dir.close(io);
     const writer_file = std.Io.File{ .handle = writer_dir.handle, .flags = .{ .nonblocking = false } };
     try std.testing.expect(!try writer_file.tryLock(io, .exclusive));
