@@ -96,6 +96,10 @@ const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 const transactions_mod = @import("../transactions.zig");
 const transform_mod = @import("transform.zig");
 const types = @import("types.zig");
+/// `InlineDensePublication`'s staged-write type (lite-single-commit-write-
+/// path.md §3.3a): the same module `../hbc_adapter.zig` (imported above as
+/// `hbc_mod`) itself imports to return it from `HBCIndex.insertWithMetadataStaged`.
+const vectorindex_hbc_index = @import("antfly_vectorindex").hbc_index;
 
 pub fn ImplementationFor(comptime S: type, comptime D: type) type {
     return struct {
@@ -3946,6 +3950,178 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .apply_guard = apply_guard,
                 .publication = publication,
                 .scope = scope,
+                .progress = .{
+                    .consumer = index_ref.name,
+                    .sequence = sequence,
+                    .generation = entry.config.coverage_generation,
+                    .config_hash = types.indexConfigHash(entry.config),
+                },
+            };
+            return result;
+        }
+
+        /// lite-single-commit-write-path.md §3.3a's dense extension of WS4
+        /// phase 2, mirroring `InlineGraphPublication`/`InlineSparsePublication`
+        /// but wrapping `hbc_mod.HBCIndex.insertWithMetadataStaged` (the
+        /// library's own stage-without-commit single-vector insert; see its
+        /// doc comment for the full stage/install/abort contract) instead of
+        /// a graph/sparse-specific staged-publication type. Holds this dense
+        /// index's apply guard from prepare through `install`/`abort`,
+        /// serializing against every other writer of this index for the
+        /// whole window -- same deliberate concurrency trade as text's,
+        /// graph's and sparse's own apply guards.
+        ///
+        /// Side effects `applyDenseEmbeddingWritesEntry`'s slow path
+        /// performs for an eligible (caller-supplied-vector, external,
+        /// non-chunked, single-write) batch that this type deliberately does
+        /// NOT replicate, and why that is still correct:
+        /// - The "_embeddings" artifact write (`writeDenseEmbeddingArtifactTxn`)
+        ///   is already staged into this SAME primary transaction by the
+        ///   ordinary document-write path, well before this type ever runs
+        ///   (`mutation_commit.zig`'s `write_buffers.explicit_embedding_
+        ///   artifact_writes`, merged into `write_buffers.store_writes`
+        ///   before any inline publication is prepared). The slow path's own
+        ///   second write of the identical bytes is itself a no-op there
+        ///   (the `existing` equality check in `writeDenseEmbeddingArtifactTxn`).
+        /// - The posting-sidecar capture lease, the local HBC streaming
+        ///   session and the exact-vector-mutation capture it feeds are
+        ///   derived-batch/bulk-replay machinery with no single-write
+        ///   equivalent; `denseEmbeddingWriteEligibleForInlinePublication`
+        ///   also excludes the one case (`experimentalPostingWalAuthoritative`)
+        ///   where the capture lease would not already be a no-op.
+        /// - Derived-coverage accounting (`accountDenseCoverageWithPlan`) and
+        ///   embedding-artifact repair-issue bookkeeping
+        ///   (`clearPublishedEmbeddingArtifactRepairIssuesContext`) are
+        ///   skipped exactly as `InlineSparsePublication` already skips
+        ///   their sparse equivalents: both are recomputable bookkeeping
+        ///   under lite-single-commit-write-path.md §3.2a's ride-along
+        ///   model, not data this write's durability depends on, and their
+        ///   keys (`replay_namespace`-prefixed) are outside
+        ///   `commit_participant.View.put`'s `\x00\x00`-only write surface
+        ///   in any case.
+        pub const InlineDensePublication = struct {
+            alloc: Allocator,
+            index_manager: *index_manager_mod.IndexManager,
+            entry: *index_manager_mod.IndexManager.DenseIndex,
+            apply_guard: index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+            staged: vectorindex_hbc_index.StagedWrite,
+            scope: []const u8,
+            index_name: []const u8,
+            doc_key: []const u8,
+            vector_id: u64,
+            vector: []const f32,
+            progress: apply_state.Progress,
+
+            fn reset(_: *anyopaque) void {}
+            fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
+            fn stage(ptr: *anyopaque, view: commit_participant.View, _: []const u8) anyerror!void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                if (self.staged.mutations.len != 0) {
+                    // `vectorindex`'s own generic `store.PendingMutation` (the
+                    // HBC library's stage-only harvest type) has the exact
+                    // same fields as `native_catalog_backend.Mutation` (what
+                    // `View.putIndexCatalog` requires) but is a distinct
+                    // nominal type -- graph's and sparse's own staged
+                    // publications are built to return the latter directly,
+                    // HBC's is not. Converted on a short-lived scratch
+                    // allocation; one vector insert touches a bounded number
+                    // of HBC namespace records (routing-tree nodes,
+                    // posting/vector payload, metadata), never a batch-sized
+                    // count.
+                    const converted = try self.alloc.alloc(native_catalog_backend.Mutation, self.staged.mutations.len);
+                    defer self.alloc.free(converted);
+                    for (self.staged.mutations, converted) |pending, *out| {
+                        out.* = .{ .namespace = pending.namespace, .key = pending.key, .value = pending.value, .is_delete = pending.is_delete };
+                    }
+                    try view.putIndexCatalog(self.scope, converted);
+                }
+                try self.index_manager.writeDenseVectorMappingForInlinePublicationTxn(view, self.index_name, self.doc_key, self.vector_id, self.vector);
+                try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            /// Call only once the host transaction's commit has actually
+            /// returned successfully (see `InlineTextPublication.install`'s
+            /// identical warning).
+            pub fn participant(self: *InlineDensePublication) commit_participant.Participant {
+                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+            }
+
+            pub fn install(self: *InlineDensePublication) void {
+                std.debug.assert(self.apply_guard.locked());
+                self.entry.index.installStagedWrite(&self.staged) catch |err| {
+                    std.log.err("inline dense publication install: mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+                };
+                self.apply_guard.unlock();
+                self.alloc.destroy(self);
+            }
+
+            pub fn abort(self: *InlineDensePublication) void {
+                std.debug.assert(self.apply_guard.locked());
+                self.entry.index.abortStagedWrite(&self.staged);
+                self.apply_guard.unlock();
+                self.alloc.destroy(self);
+            }
+        };
+
+        /// WS4-for-vectors' dense extension of the fast path above: prepares
+        /// one managed dense index's single-vector inline publication.
+        /// Returns `error.InlineDensePublicationUnsupported` for every case
+        /// outside `IndexManager.denseEmbeddingWriteEligibleForInlinePublication`'s
+        /// own narrow scope (non-`.native_catalog` stores, via
+        /// `nativeCatalogScope()`) AND for every case needing a vector-id
+        /// collision resolved through `reserveDenseVectorIdTxn`'s durable
+        /// counter (`assignDenseVectorIdInlineTxn` returning `null`) or the
+        /// library's own staged-publication support (`insertWithMetadataStaged`
+        /// returning `error.StagedPublicationUnsupported`, e.g. a LEANN-backed
+        /// index), so the caller falls back to
+        /// `applyDenseEmbeddingWritesByNameWithOptions`, which remains
+        /// correct (and is not changed by any of this) for all of them.
+        pub fn prepareInlineDensePublication(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_manager: *index_manager_mod.IndexManager,
+            write: derived_types.DerivedDenseEmbeddingWrite,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            sequence: u64,
+        ) !*InlineDensePublication {
+            if (index_ref.kind != .dense_vector) return error.InlineDensePublicationUnsupported;
+            const entry = index_manager.denseIndex(index_ref.name) orelse return error.InlineDensePublicationUnsupported;
+            if (!index_manager.denseEmbeddingWriteEligibleForInlinePublication(entry, write)) return error.InlineDensePublicationUnsupported;
+
+            const scope = entry.index.nativeCatalogScope() orelse return error.InlineDensePublicationUnsupported;
+
+            var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
+            errdefer apply_guard.unlock();
+
+            // Mirrors `prepareInlineSparsePublication`'s own read-only probe
+            // transaction: the deterministic, conflict-free branch of vector
+            // id assignment only needs point reads against the primary
+            // store's durable state as of just before this write, not a
+            // mutable transaction (the one real mutation path --
+            // `reserveDenseVectorIdTxn`'s durable counter -- is exactly what
+            // `assignDenseVectorIdInlineTxn` refuses to reach).
+            var probe_txn = try store.beginProbeTxn();
+            defer probe_txn.abort();
+            const assignment = (try index_manager.assignDenseVectorIdInlineTxn(&probe_txn, entry, index_ref.name, write.doc_key)) orelse
+                return error.InlineDensePublicationUnsupported;
+
+            const staged = entry.index.insertWithMetadataStaged(assignment.vector_id, write.vector, write.doc_key) catch |err| switch (err) {
+                error.StagedPublicationUnsupported => return error.InlineDensePublicationUnsupported,
+                else => return err,
+            };
+
+            const result = try alloc.create(InlineDensePublication);
+            result.* = .{
+                .alloc = alloc,
+                .index_manager = index_manager,
+                .entry = entry,
+                .apply_guard = apply_guard,
+                .staged = staged,
+                .scope = scope,
+                .index_name = index_ref.name,
+                .doc_key = write.doc_key,
+                .vector_id = assignment.vector_id,
+                .vector = write.vector,
                 .progress = .{
                     .consumer = index_ref.name,
                     .sequence = sequence,
