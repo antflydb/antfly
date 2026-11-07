@@ -28,14 +28,25 @@ struct MenuContent: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
       Text("Antfly Dictation").font(.headline)
+      Text(store.phase.label).font(.headline)
       Text(store.message).font(.caption).textSelection(.enabled)
+      if !store.processingWarning.isEmpty {
+        Text(store.processingWarning).font(.caption).foregroundStyle(.secondary)
+      }
       if !store.preview.isEmpty { Text(store.preview).lineLimit(8).textSelection(.enabled) }
       HStack {
         Button(store.state == .recording ? "Finish" : "Record") {
           if store.state == .recording { store.finish() } else { store.start() }
         }.disabled(store.state == .processing)
         Button("Cancel") { store.cancel() }.disabled(store.state == .idle)
-        Button("Copy") { store.copy(store.result) }.disabled(store.result.isEmpty)
+        Button("Copy") { store.copy(store.result.isEmpty ? store.preview : store.result) }.disabled(
+          store.result.isEmpty && store.preview.isEmpty)
+      }
+      if store.canRecoverRaw {
+        HStack {
+          Button("Insert original") { store.insertOriginal() }
+          Button("Retry cleanup") { store.retryCleanup() }
+        }
       }
       Button("Settings & history") {
         openWindow(id: "settings")
@@ -60,9 +71,7 @@ struct SettingsView: View {
           Text("Push to talk, with your vocabulary.").foregroundStyle(.secondary)
         }
         Spacer()
-        Text(
-          store.state == .recording
-            ? "● Recording" : store.state == .processing ? "Processing" : "Ready")
+        Text(store.phase.label)
       }
       TabView {
         settings.tabItem { Text("Settings") }.tag(0)
@@ -87,13 +96,21 @@ struct SettingsView: View {
       Form {
         Section("Connection — audio is processed on this server") {
           TextField("Server origin", text: $store.config.server).onChange(of: store.config.server) {
-            _, value in store.token = Credentials.read(server: value)
+            _, _ in store.connectionChanged()
           }
           SecureField("Bearer token (Keychain only)", text: $store.token)
           HStack {
             Button("Discover models") { store.discover() }
             Button("Create storage table") { store.setup() }
           }
+          Toggle(
+            "Allow parallel recognition and cleanup",
+            isOn: Binding(
+              get: { store.config.concurrentRequests == 2 },
+              set: { store.config.concurrentRequests = $0 ? 2 : 1 }))
+          Text(
+            "Requires at least two inference slots on the server. Leave off for a single-slot local server."
+          ).font(.caption).foregroundStyle(.secondary)
           TextField("Antfly table", text: $store.config.table)
           TextField("Settings profile", text: $store.config.profile)
           HStack {
@@ -155,32 +172,28 @@ struct SettingsView: View {
         ForEach($store.config.presets) { $preset in
           Section(preset.name) {
             TextField("Name", text: $preset.name)
-            TextField("Transcriber model or alias", text: $preset.model)
-            Menu("Choose discovered transcriber") {
-              ForEach(store.models.filter { $0.task == "transcribe" }) { model in
-                Button("\(model.id) · \(model.executor ?? "runtime")") {
-                  preset.selectTranscriber(model)
-                }
+            Picker(
+              "Output",
+              selection: Binding(get: { preset.outputMode }, set: { preset.outputMode = $0 })
+            ) {
+              ForEach(DictationMode.allCases, id: \.self) { Text($0.label).tag($0) }
+            }.pickerStyle(.segmented)
+            Text(store.processingDescription(preset)).font(.caption).foregroundStyle(.secondary)
+            if preset.outputMode == .rewrite {
+              Picker(
+                "Tone",
+                selection: Binding(
+                  get: { preset.style == "verbatim" ? "clean" : preset.style },
+                  set: { preset.style = $0 })
+              ) {
+                Text("Natural").tag("clean")
+                Text("Formal").tag("formal")
+                Text("Casual").tag("casual")
               }
-            }.disabled(store.models.isEmpty)
-            TextField("Cleanup generator alias (empty = raw)", text: $preset.cleanupModel)
-            Menu("Choose discovered cleanup generator") {
-              Button("No cleanup") { preset.cleanupModel = "" }
-              ForEach(preset.cleanupChoices(from: store.models)) { model in
-                Button(model.id) { preset.cleanupModel = model.id }
-              }
-            }
-            if !preset.usesNamedTranscriber {
-              Text(
-                "Runtime transcribers use a raw cleanup model name. Choose a named transcriber to select shared cleanup above."
-              ).font(.caption).foregroundStyle(.secondary)
-            }
-            TextField("Language (empty = model default)", text: $preset.language)
-            Picker("Style", selection: $preset.style) {
-              ForEach(["clean", "formal", "casual", "verbatim"], id: \.self) { Text($0).tag($0) }
+              TextField("Rewrite instructions", text: $preset.instructions, axis: .vertical)
             }
             TextField("Destination context", text: $preset.context)
-            TextField("Cleanup instructions", text: $preset.instructions, axis: .vertical)
+            TextField("Language (empty = model default)", text: $preset.language)
             TextField(
               "Dictionary",
               text: Binding(
@@ -190,11 +203,41 @@ struct SettingsView: View {
               "App bundle IDs (automatic selection)",
               text: Binding(
                 get: { preset.appIDs.joined(separator: ", ") }, set: { preset.appIDs = terms($0) }))
-            Toggle(
-              "Live Whisper preview (requires transcription sessions)", isOn: $preset.livePreview)
-            Text(
-              "Apple example: transcribers/apple-speech, en-US. Live preview is Whisper-only. Final dictation uses the full recorded clip."
-            ).font(.caption).foregroundStyle(.secondary)
+            DisclosureGroup("Processing & models") {
+              Picker(
+                "Processing strategy",
+                selection: Binding(
+                  get: { preset.processingStrategy }, set: { preset.processingStrategy = $0 })
+              ) {
+                ForEach(ProcessingStrategy.allCases, id: \.self) { Text($0.label).tag($0) }
+              }
+              Text(
+                "Automatic uses only advertised capabilities. Incremental requires final recognition segments; Rewrite needs the complete utterance. The selected engine never changes automatically."
+              ).font(.caption)
+              TextField("Transcriber model or alias", text: $preset.model)
+              Menu("Choose discovered transcriber") {
+                ForEach(store.models.filter { $0.task == "transcribe" }) { model in
+                  Button("\(model.id) · \(model.executor ?? "runtime")") {
+                    preset.selectTranscriber(model)
+                  }
+                }
+              }.disabled(store.models.isEmpty)
+              TextField("Cleanup generator (empty = recognition only)", text: $preset.cleanupModel)
+              Menu("Choose discovered cleanup generator") {
+                Button("No cleanup") { preset.cleanupModel = "" }
+                ForEach(preset.cleanupChoices(from: store.models)) { model in
+                  Button(model.id) { preset.cleanupModel = model.id }
+                }
+              }.disabled(preset.outputMode == .verbatim)
+              if !preset.usesNamedTranscriber {
+                Text(
+                  "Raw runtime transcribers use raw cleanup models and recorded-clip processing. Choose a named transcriber for shared incremental cleanup."
+                ).font(.caption)
+              }
+              Toggle(
+                "Legacy live preview when stable sessions are unavailable",
+                isOn: $preset.livePreview)
+            }
             Button("Delete preset") {
               store.config.presets.removeAll { $0.id == preset.id }
               if store.config.selectedPreset == preset.id {
@@ -216,12 +259,35 @@ struct SettingsView: View {
         Text(store.preview.isEmpty ? "Your transcript will appear here." : store.preview)
           .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
       }.frame(maxHeight: 160)
+      if !store.draft.isEmpty {
+        Text("Cleanup preview — not inserted").font(.headline)
+        Text(store.draft).lineLimit(5).textSelection(.enabled)
+      }
       Text("Final text").font(.headline)
       TextEditor(text: $store.result).disabled(store.state != .idle)
       HStack {
         Button("Copy") { store.copy(store.result) }
         Button("Export text…") { store.exportResult() }
-        Button("Retry failed audio (copy only)") { store.retry() }
+        Button("Retry recording (copy only)") { store.retry() }
+        if store.canRecoverRaw {
+          Button("Insert original") { store.insertOriginal() }
+          Button("Retry cleanup (copy only)") { store.retryCleanup() }
+          Button("Copy original") { store.copy(store.preview) }
+        }
+      }
+      DisclosureGroup("Processing details") {
+        Text(store.processingNote).font(.caption)
+        if let timing = store.timing {
+          Text(
+            String(
+              format:
+                "Recognition requests: %.2f s · Cleanup requests: %.2f s · Session: %.2f s · Release to result: %.2f s",
+              timing.recognition, timing.cleanup, timing.total, timing.afterRelease)
+          ).font(.caption)
+          Text(
+            "Request durations include transport and queueing; overlapping stages do not add up to session duration."
+          ).font(.caption).foregroundStyle(.secondary)
+        }
       }
     }.padding()
   }

@@ -3281,6 +3281,14 @@ components:
           type: string
           format: byte
           description: Base64-encoded audio clip (WAV, Opus, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows.
+        transcript_text:
+          type: string
+          maxLength: 65536
+          description: |
+            Clean an already finalized recognition segment without running recognition
+            again. Supported by named transcribers advertising text_cleanup. Set
+            audio to the empty string and omit attachments and recognition hints.
+            Partial hypotheses must never be submitted as finalized segments.
         language:
           type: string
           description: Force the transcript language (ISO 639-1). Omit for automatic detection.

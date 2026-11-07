@@ -24484,6 +24484,13 @@ export interface components {
              */
             audio: string;
             /**
+             * @description Clean an already finalized recognition segment without running recognition
+             *     again. Supported by named transcribers advertising text_cleanup. Set
+             *     audio to the empty string and omit attachments and recognition hints.
+             *     Partial hypotheses must never be submitted as finalized segments.
+             */
+            transcript_text?: string;
+            /**
              * @description Force the transcript language (ISO 639-1). Omit for automatic detection.
              * @example en
              */

@@ -79,7 +79,10 @@ final class FixtureProtocol: URLProtocol, @unchecked Sendable {
       case "/ai/v1/transcription/sessions":
         return (200, "application/json", "{\"id\":\"session_123\"}")
       case "/ai/v1/transcription/sessions/session_123/audio":
-        return (200, "application/json", "{\"data\":[{\"text\":\"hello\"}]}")
+        return (
+          200, "application/json",
+          "{\"data\":[{\"text\":\"hello\",\"type\":\"final\",\"sequence\":1,\"start_ms\":0,\"end_ms\":1000}]}"
+        )
       default:
         #expect(request.httpMethod == "DELETE")
         #expect(request.url!.path == "/ai/v1/transcription/sessions/session_123")
@@ -88,10 +91,71 @@ final class FixtureProtocol: URLProtocol, @unchecked Sendable {
     }
     let client = try client()
     let id = try await client.createSession(preset: Configuration().presets[0], dictionary: [])
-    let text = try await client.appendSession(id, audio: Data(), sampleRate: 16000)
+    let text = try await client.appendSession(id, audio: Data(), sampleRate: 16000, commit: true)
     #expect(text == "hello")
     await client.closeSession(id)
   }
+  @Test func presetModesControlCleanupAndInstructionsOnTheWire() async throws {
+    FixtureProtocol.reply = { request in
+      let bytes = try fixtureBody(request)
+      let size = bytes.withUnsafeBytes {
+        $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian
+      }
+      let body =
+        try JSONSerialization.jsonObject(with: bytes.subdata(in: 40..<(40 + Int(size))))
+        as! [String: Any]
+      #expect(body["style"] as? String == "verbatim")
+      #expect(body["instructions"] as? String == "")
+      #expect(body["cleanup_model"] == nil)
+      return (
+        200, "text/event-stream",
+        "data: {\"type\":\"dictation.transcript\",\"transcript\":{\"text\":\"um hello\"}}\n\ndata: {\"type\":\"dictation.completed\",\"text\":\"um hello\"}\n\ndata: [DONE]\n\n"
+      )
+    }
+    var preset = Preset(id: "v", name: "Verbatim", style: "formal")
+    preset.outputMode = .verbatim
+    preset.cleanupModel = "generators/cleanup"
+    preset.instructions = "Rewrite everything"
+    let result = try await client().dictate(
+      audio: Data([1]), preset: preset, dictionary: [], progress: { _ in })
+    #expect(result.text == "um hello")
+  }
+  @Test func textCleanupAndLiveAudioUseTheirDeclaredTransports() async throws {
+    FixtureProtocol.reply = { request in
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      #expect(body["audio"] as? String == "")
+      #expect(body["transcript_text"] as? String == "um hello")
+      #expect(body["style"] as? String == "clean")
+      #expect(body["instructions"] as? String == "")
+      return (
+        200, "text/event-stream",
+        "data: {\"type\":\"dictation.transcript\",\"transcript\":{\"text\":\"um hello\"}}\n\ndata: {\"type\":\"dictation.completed\",\"text\":\"Hello.\"}\n\ndata: [DONE]\n\n"
+      )
+    }
+    var preset = Preset(id: "c", name: "Clean", style: "formal")
+    preset.outputMode = .clean
+    preset.instructions = "Custom rewrite"
+    preset.cleanupModel = "generators/cleanup"
+    let result = try await client().cleanupText("um hello", preset: preset, dictionary: [])
+    #expect(result.text == "Hello.")
+    FixtureProtocol.reply = { request in
+      #expect(request.value(forHTTPHeaderField: "Content-Type") == AttachmentEnvelope.contentType)
+      let bytes = try fixtureBody(request)
+      #expect(String(decoding: bytes.prefix(8), as: UTF8.self) == "AFATT001")
+      let size = bytes.withUnsafeBytes {
+        $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).littleEndian
+      }
+      let body =
+        try JSONSerialization.jsonObject(with: bytes.subdata(in: 40..<(40 + Int(size))))
+        as! [String: Any]
+      #expect(body["audio"] as? String == "attachment:0")
+      #expect(body["format"] as? String == "pcm_f32")
+      return (200, "application/json", "{\"data\":[]}")
+    }
+    _ = try await client().appendSessionEvents(
+      "session", audio: Data([0, 0, 0, 0]), sampleRate: 16000)
+  }
+
 }
 
 @Test func binaryAudioEnvelopeHasExactLittleEndianLayout() throws {
@@ -121,4 +185,21 @@ final class FixtureProtocol: URLProtocol, @unchecked Sendable {
   let frame = try AttachmentEnvelope.audio(metadata: metadata, recording: audio)
   #expect(frame.count == audio.count + metadata.count + 49)
   #expect(frame.count - audio.count < 1024)
+}
+
+private func fixtureBody(_ request: URLRequest) throws -> Data {
+  if let body = request.httpBody { return body }
+  guard let stream = request.httpBodyStream else {
+    throw DictationError.invalid("Missing request body")
+  }
+  stream.open()
+  defer { stream.close() }
+  var body = Data()
+  var buffer = [UInt8](repeating: 0, count: 4096)
+  while true {
+    let count = stream.read(&buffer, maxLength: buffer.count)
+    if count < 0 { throw DictationError.invalid("Failed reading fixture body") }
+    if count == 0 { return body }
+    body.append(contentsOf: buffer.prefix(count))
+  }
 }

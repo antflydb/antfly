@@ -7,6 +7,12 @@ public enum DictationError: Error, LocalizedError {
   case invalid(String)
   public var errorDescription: String? {
     if case .invalid(let message) = self { return message }
+    if case .cleanupFailed(_, let message) = self { return message }
+    return nil
+  }
+  case cleanupFailed(raw: String, message: String)
+  public var rawTranscript: String? {
+    if case .cleanupFailed(let raw, _) = self { return raw }
     return nil
   }
 }
@@ -22,6 +28,8 @@ public struct Preset: Codable, Identifiable, Equatable, Sendable {
   public var instructions: String
   public var dictionary: [String]
   public var appIDs: [String]
+  public var mode: DictationMode?
+  public var processing: ProcessingStrategy?
   public var livePreview: Bool
   public init(id: String, name: String, style: String = "clean", context: String = "") {
     self.id = id
@@ -64,6 +72,7 @@ public struct Configuration: Codable, Equatable, Sendable {
   public var autoPaste = true
   public var retainHistory = false
   public var retainAudio = false
+  public var concurrentRequests: Int?
   public var microphoneID = ""
   public var selectedPreset = "slack"
   public var dictionary = ["Antfly", "Colony"]
@@ -86,6 +95,9 @@ public struct Configuration: Codable, Equatable, Sendable {
       throw DictationError.invalid(
         "Server must be an HTTP(S) origin without credentials or a path.")
     }
+    guard (1...2).contains(concurrentRequests ?? 1) else {
+      throw DictationError.invalid("Inference concurrency must be one or two.")
+    }
     guard !presets.isEmpty, presets.count <= 64, Set(presets.map(\.id)).count == presets.count,
       presets.contains(where: { $0.id == selectedPreset })
     else { throw DictationError.invalid("Choose a valid preset; preset IDs must be unique.") }
@@ -101,6 +113,9 @@ public struct Configuration: Codable, Equatable, Sendable {
       shortcutModifiers & ~UInt32(0x1b00) == 0
     else { throw DictationError.invalid("Shortcut needs a modifier and a valid macOS key code.") }
     for preset in presets {
+      if preset.outputMode == .rewrite && preset.processingStrategy == .incremental {
+        throw DictationError.invalid("Rewrite requires Automatic or Whole utterance processing.")
+      }
       guard !preset.model.isEmpty,
         ["clean", "formal", "casual", "verbatim"].contains(preset.style),
         preset.context.utf8.count <= 4096, preset.instructions.utf8.count <= 4096
@@ -181,14 +196,18 @@ public enum RecordingState: Equatable, Sendable {
 public struct DictationResult: Sendable {
   public var raw: String
   public var text: String
-  public init(raw: String, text: String) {
+  public var timing: DictationTiming?
+  public init(raw: String, text: String, timing: DictationTiming? = nil) {
     self.raw = raw
     self.text = text
+    self.timing = timing
   }
 }
 
 public struct DiscoveredModel: Decodable, Identifiable, Sendable {
   public struct DictationCapabilities: Decodable, Sendable {
+    public var stable_segments: Bool?
+    public var text_cleanup: Bool?
     public var live_preview: Bool
     public var recognition_hints: Bool
     public var readiness_error: String?

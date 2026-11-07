@@ -71,6 +71,102 @@ curl -X POST http://127.0.0.1:8080/ai/v1/dictate \
 
 For live captions the same models sit behind a session API that returns `partial` and `final` transcript events as audio arrives.
 
+## A consistent push-to-talk experience
+
+The native [dictation example](https://github.com/antflydb/antfly/tree/main/examples/dictation)
+separates the desired output from how the selected backend executes it:
+
+| Preset mode | Result | Cleanup execution |
+| --- | --- | --- |
+| **Verbatim** | The recognizer's text, including its wording | No generative cleanup |
+| **Clean** (default) | Punctuation, filler removal, and dictionary corrections | Final segments are cleaned while speaking when supported |
+| **Rewrite** | Tone, formatting, or custom instructions | One cleanup pass over the complete utterance |
+
+A cleanup generator must be configured for Clean or Rewrite to perform cleanup.
+Without one, settings explicitly show recognition-only operation. Clean ignores
+rewrite instructions and tone; switching back to Rewrite preserves those settings.
+Existing presets infer their mode from style/instructions until explicitly changed.
+
+Hold the shortcut to record, or use press-to-toggle. A nonactivating overlay shows
+**Listening**, then the actual remaining stage (**Transcribing** or **Cleaning**).
+It never moves focus away from the captured text field. Provisional recognition
+and completed cleanup segments are previews; the app sends one paste only after
+recognition and cleanup finish successfully. A focus change leaves the result
+available to copy. Silence returns to idle without inserting text.
+
+Under **Processing & models**, choose:
+
+- **Automatic:** use stable-session recognition where advertised. Clean overlaps
+  cleanup with recognition; Rewrite waits for the complete transcript. If session
+  setup or recognition fails, the recorded clip can use the same transcriber on
+  release, with an explicit explanation. This never changes providers.
+- **Incremental:** require stable-session support. Unsupported backends and Rewrite
+  are rejected before recording. Recognition failures do not silently select a
+  different processing strategy.
+- **Whole utterance:** cleanup waits for the entire transcript. Recognition can
+  still run while speaking when stable sessions are available.
+
+Named Antfly/Whisper transcribers advertise `stable_segments` and `text_cleanup`.
+The current Apple Speech adapter advertises `text_cleanup` but not stable sessions:
+it recognizes the recorded file after release, followed by optional cleanup.
+Unknown capabilities use recorded-clip processing. Legacy live preview remains
+available for older Whisper servers, but does not count as authoritative session
+recognition and still requires the final clip pass.
+
+### Compose recognition and cleanup without repeating recognition
+
+`stream: true` on `/ai/v1/dictate` controls **response delivery**. Incremental
+execution uses transcription sessions plus text-only cleanup requests:
+
+1. Create a transcription session; append microphone audio sequentially. Preserve
+   each event's sequence and time range. Display `partial` hypotheses, but clean
+   only `final` events. A partial's `stable_text` can change and is not final.
+2. Submit finalized text to the same named-transcriber dictation cleanup path:
+
+   ```json
+   {
+     "model": "transcribers/whisper",
+     "audio": "",
+     "transcript_text": "um ant fly is ready",
+     "cleanup_model": "generators/cleanup",
+     "style": "clean",
+     "dictionary": ["Antfly"],
+     "stream": true
+   }
+   ```
+
+   `audio` must be empty; attachments and recognition hints are forbidden with
+   `transcript_text`. This route does not invoke recognition. It accepts at most
+   65,536 UTF-8 bytes, including an empty transcript, which skips cleanup. Raw
+   runtime model requests do not support this option; check advertised capabilities.
+3. On release, stop capture, finish the in-flight append, and commit the remaining
+   audio. Wait for cleanup of all final segments, then assemble the result. Do not
+   transcribe the complete recording again or run a second whole-utterance cleanup
+   in incremental mode. Coalesce pending finalized segments to bound model calls.
+4. Delete the session on completion, failure, or cancellation. Ignore late callbacks
+   from an old recording. Replayed events must not duplicate cleaned text; conflicting
+   final segments must fail rather than revise text already considered final.
+
+The example uses bounded binary AFATT001 uploads for both final WAV and live PCM
+chunks. One FIFO request gate per recording client serializes recognition and
+cleanup network requests, so a server configured for one inference invocation can
+still make progress while microphone capture continues independently. Enable **Allow parallel recognition and cleanup** for a server with at least two
+inference slots; the client then allows two concurrent requests. Leave it off for
+a single-slot server. Buffered
+Apple cleanup emits complete text for each cleaned batch; it does not provide
+provisional generation tokens. This is distinct from overlapping the pipeline.
+
+Cleanup failures preserve the full final raw transcript. Offer **Insert original**,
+**Copy original**, and **Retry cleanup**. Retrying cleanup sends text, not audio, and
+uses corrected settings with automatic insertion disabled. Never substitute partial
+cleanup for a completed result. Failed recognition retains the recording for an
+explicit retry; its provisional transcript is not treated as complete speech.
+
+The Transcript tab exposes recognition-request, cleanup-request, session, and
+release-to-result durations. Request durations include transport and queueing and
+can overlap; they should not be added to estimate session duration. History sync
+runs separately and never delays the next recording.
+
 ## Before You Start
 
 Antfly running in standalone mode with a transcriber and a generator pulled:

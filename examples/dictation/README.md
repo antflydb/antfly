@@ -3,7 +3,7 @@
 A native macOS push-to-talk app demonstrating Antfly inference and application
 state: hold **Control–Option–Space**, speak, release, and paste into the original
 text field. It includes Apple Speech and Whisper selection, cleanup presets,
-per-app preset selection, a dictionary, live Whisper preview, JSON import/export,
+per-app preset selection, a dictionary, incremental Whisper cleanup, JSON import/export,
 Antfly settings snapshots, and optional searchable history.
 
 The app uses SwiftUI, AVAudioEngine, Carbon global hotkeys, Accessibility, and
@@ -79,9 +79,10 @@ hints and decoding options on the recognition stage.
 
 ## Presets and shortcuts
 
-Each preset stores a transcriber, optional cleanup generator, language, style,
-context, instructions, local dictionary, optional application bundle IDs, and a
-live-preview choice. The first preset matching the frontmost app's bundle ID wins;
+Each preset stores an output mode (Verbatim, Clean, or Rewrite), processing strategy
+(Automatic, Incremental, or Whole utterance), transcriber, optional cleanup
+generator, language, tone, context, instructions, local dictionary, application
+bundle IDs, and an optional legacy live-preview choice. The first preset matching the frontmost app's bundle ID wins;
 otherwise the selected default is used. For example, use `com.apple.mail` for
 Mail. Global dictionary entries are combined with preset entries, up to 256 terms.
 
@@ -99,12 +100,35 @@ Final clips use the binary AFATT001 attachment envelope, keeping audio out of
 JSON and avoiding base64 expansion and metadata allocation limits. A server can
 impose a smaller audio limit; shorten the recording if that limit is reached.
 
-Apple is a recorded-file backend. Enable live preview only for Whisper models
-with transcription sessions. Preview chunks are appended sequentially and sessions
-are deleted on stop/cancel; idle expiry bounds sessions whose creation response
-was interrupted. The final full clip is submitted to `/dictate` for authoritative
-transcription and cleanup, so preview deliberately adds recognition work. Provider
-cleanup may deliver one entire-text delta, while the raw transcript arrives first.
+**Clean** is the default. It fixes punctuation, filler words, and dictionary
+spellings when a generator is configured. **Rewrite** applies tone and custom
+instructions using the complete utterance. **Verbatim** skips generation. Without
+a cleanup generator, settings explain that only recognition runs. Existing JSON
+presets infer their mode from their style/instructions; explicit choices persist.
+
+Automatic uses named Whisper transcribers advertising `stable_segments` and
+`text_cleanup`: final ASR segments are cleaned during recording, release commits
+the remaining audio, and the app assembles completed cleanup without another full
+clip pass. Partial hypotheses (including `stable_text`) are display-only. Queued
+finals are coalesced; event sequence/timing guards prevent duplication and reject
+revised final segments. A per-client FIFO gate serializes inference requests so
+servers with concurrency one work while microphone capture proceeds independently.
+For servers with at least two inference slots, enable Allow parallel recognition
+and cleanup in Connection settings to run those requests concurrently.
+
+Whole utterance can recognize during recording but cleans once on release.
+Incremental explicitly requires stable sessions and disallows Rewrite. Automatic
+and Whole utterance can fall back to the recorded clip using the same provider if
+session recognition fails; the UI explains this. Explicit Incremental fails instead.
+
+Apple currently recognizes recorded files, so Automatic explains that transcription
+and cleanup run after release. Unknown capability metadata also uses recorded clips.
+Legacy live preview on older Whisper servers remains provisional and requires the
+final full clip pass. Sessions are deleted on completion/failure/cancel; idle expiry
+bounds sessions whose creation response was interrupted. Live chunks also use binary
+attachments. Cleanup may return one complete-text delta per batch; pipeline overlap
+does not imply token-streaming generation. No provider is changed automatically.
+
 Only naturally completed, nonempty cleanup output can replace the transcript.
 Truncation, filtering, tool calls, missing completion evidence, or empty cleanup
 produce an error while preserving the raw transcript for recovery. Empty speech
@@ -117,10 +141,13 @@ tokens against that budget. There is no silent engine or cloud fallback.
 
 The app captures the frontmost application's process and focused Accessibility
 text element at recording start. It does not activate that app later or steal
-focus for a recording overlay. Paste runs only if both the application and text
+focus for its nonactivating recording overlay. Paste runs only if both the application and text
 field still match. A focus change, missing permissions, or an insertion error
 leaves the text available to copy. The menu bar icon indicates recording and
-processing; the popover and Transcript tab show preview/final text.
+processing; the overlay shows Listening, Transcribing, Cleaning, and completion.
+The popover and Transcript tab keep raw, cleanup-preview, and final text separate.
+The app pastes once after successful completion, rather than revising text in another app.
+Silence produces no insertion. Expand Processing details for timings and fallback explanations.
 
 Paste temporarily places the text on the clipboard, sends Command-V, then restores
 the previous clipboard if no other app changed it. The OS does not acknowledge
@@ -129,8 +156,11 @@ Secure or custom text controls may need manual copy/paste.
 
 Cancel stops microphone capture, cancels inference, invalidates pending callbacks,
 and prevents further insertion. A paste already sent cannot be undone by cancel.
-A failed clip remains in memory for retry until a new recording, cancellation, or
-app exit. Retry uses the current connection and the updated version of the original preset,
+Cleanup failures offer Insert original, Copy original, and Retry cleanup. The latter
+sends finalized text through `/dictate` with `transcript_text` and `audio: ""`, never
+repeating recognition; it produces copyable text using corrected settings. Audio
+is released after recognition when retention is off. A failed recognition clip
+remains in memory for retry until a new recording, cancellation, or app exit. Retry uses the current connection and the updated version of the original preset,
 produces copyable text, and never reuses an old insertion target.
 Completed transcripts can be edited, copied, or exported as plain text.
 
@@ -169,6 +199,9 @@ History and audio retention are off by default:
   settings with retention disabled deletes retained local data; remote transcripts
   require explicit deletion. Inference providers have their own retention policy.
 
+See the [voice dictation guide](../../docs/guides/voice-dictation.mdx) for the
+complete mode/capability matrix and the stable-session/text-cleanup API contract.
+
 ## Validation
 
 ```bash
@@ -194,6 +227,12 @@ command with `ANTFLY_TEST_APPLE_SPEECH=1`. This checks native capability discove
 file recognition, shared cleanup, Verbatim, and streaming without using a microphone
 or downloading model assets.
 
+With an installed `openai/whisper-tiny` and ready native Apple generation, add
+`ANTFLY_TEST_WHISPER_SESSIONS=1` to exercise real Whisper VAD finals, binary live
+PCM uploads, native cleanup before release, and a final tail commit, with server
+inference concurrency one. `ANTFLY_TEST_WHISPER_MODEL` can select another already
+installed Whisper model. This opt-in test never downloads assets.
+
 Manual macOS smoke test:
 
 1. Launch the signed app bundle; verify the menu bar item and settings tabs.
@@ -203,7 +242,11 @@ Manual macOS smoke test:
 4. Switch text fields/apps during processing; verify no paste goes to the new target.
 5. Cancel recording and inference; verify no later result is inserted.
 6. Test Apple with installed assets and with a missing/unsupported locale. Test
-   Whisper with live preview. Verify dictionary cleanup and Verbatim behavior.
+   Whisper with Automatic Clean and pauses between phrases; confirm cleanup preview
+   arrives while recording and only the remaining tail is processed on release.
+   Compare Rewrite/Whole utterance and Verbatim. Confirm explicit Incremental rejects
+   Apple/unknown capabilities before microphone capture. The overlay must not steal focus.
+   Fail cleanup and verify all three recovery actions; copy-only results remain visible.
 7. Restart the app to check local settings/history; publish then replace an Antfly
    snapshot and search a saved transcript. Export JSON and confirm no credentials.
 8. Stop the server, retry, deny Accessibility, or choose a conflicting shortcut;

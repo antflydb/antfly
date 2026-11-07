@@ -23006,6 +23006,10 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
+        if (body.transcript_text != null) return ctx.status(400).json(.{
+            .@"error" = "UNSUPPORTED_FEATURE",
+            .message = "text cleanup requires a named transcriber advertising text_cleanup",
+        });
         const model_name = std.mem.trim(u8, body.model, " \t\r\n");
         if (model_name.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model is required" });

@@ -599,7 +599,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
         // Raw runtime cleanup models retain their existing forwarding path.
         // Named cleanup generators use the same orchestration as Apple, so
         // Whisper can also clean up through Apple or a hosted generator.
-        if (cfg.provider == .antfly and (cleanup_name == null or !named.contains(.generate, cleanup_name.?))) {
+        if (cfg.provider == .antfly and !request.object.contains("transcript_text") and (cleanup_name == null or !named.contains(.generate, cleanup_name.?))) {
             const operation = execution_options.operation orelse "dictate";
             const encoded = try tasks.transcriptionBody(a, cfg, request);
             return forward(server, ctx, try std.fmt.allocPrint(a, "transcribers/{s}", .{target.configured.name}), operation, encoded, false, observation, execution_options);
@@ -877,7 +877,16 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             const run_cleanup = cleanup_name.len > 0 and cleanup.needsCleanup(options);
             if (run_cleanup) _ = try executor.generatorConfig(a, cleanup_name);
             const attachment = try dictationAttachment(value.audio, execution_options.attachments);
-            const transcript = if (transcription_cfg.provider == .antfly) blk: {
+            const transcript = if (value.transcript_text) |text| blk: {
+                if (value.audio.len != 0 or execution_options.attachments != null or text.len > 65536 or
+                    value.transcript_prompt != null or value.vad != null or value.audio_context != null)
+                    return error.InvalidInferenceRequest;
+                break :blk try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, .{
+                    .text = text,
+                    .duration_ms = @as(u64, 0),
+                    .segments = @as([]const struct {}, &.{}),
+                }, .{}), .{});
+            } else if (transcription_cfg.provider == .antfly) blk: {
                 const recognized = try nativeDictationTranscript(server, ctx, a, request, named, name, observation, execution_options);
                 switch (recognized) {
                     .transcript => |value_| break :blk value_,
@@ -1598,6 +1607,8 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
                 .recorded_clips = true,
                 .cleanup = true,
                 .live_preview = cfg.provider == .antfly,
+                .stable_segments = cfg.provider == .antfly,
+                .text_cleanup = true,
                 .recognition_hints = cfg.provider == .antfly,
                 .executor = @tagName(cfg.provider),
             }, .{}), .{});

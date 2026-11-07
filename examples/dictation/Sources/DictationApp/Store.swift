@@ -10,9 +10,15 @@ import SwiftUI
   @Published var config = Configuration()
   @Published var history: [HistoryEntry] = []
   @Published var state = RecordingState.idle
-  @Published var preview = ""
+  @Published var phase = DictationPhase.idle { didSet { updateOverlay() } }
+  @Published var draft = "" { didSet { updateOverlay() } }
+  @Published var processingNote = ""
+  @Published var processingWarning = "" { didSet { updateOverlay() } }
+  @Published var timing: DictationTiming?
+  @Published var canRecoverRaw = false { didSet { updateOverlay() } }
+  @Published var preview = "" { didSet { updateOverlay() } }
   @Published var result = ""
-  @Published var message = "Ready. Control–Option–Space to dictate."
+  @Published var message = "Ready. Control–Option–Space to dictate." { didSet { updateOverlay() } }
   @Published var discovery = ""
   @Published var models: [DiscoveredModel] = []
   @Published var searchText = ""
@@ -22,6 +28,11 @@ import SwiftUI
   @Published var historySyncStatus = "History sync idle."
   @Published var historyWorking = false
   private let hotkey: Hotkey?
+  private var overlay: RecordingOverlay?
+  private var live: LiveDictation?
+  private var plan: ProcessingPlan?
+  private var liveFailure: String?
+  private var overlayTask: Task<Void, Never>?
   private(set) var outbox: HistoryOutbox?
   private var historyRevision: UInt64 = 0
   private var microphone: Microphone?
@@ -30,6 +41,7 @@ import SwiftUI
   private var recordingConfig: Configuration?
   private(set) var requestTask: Task<Void, Never>?
   private var previewTask: Task<Void, Never>?
+  private var cadenceTask: Task<Void, Never>?
   private var timeoutTask: Task<Void, Never>?
   private var generation = UUID()
   private var registered: (UInt32, UInt32)?
@@ -75,6 +87,17 @@ import SwiftUI
     } catch { historySyncStatus = "History sync unavailable: " + error.localizedDescription }
     token = registerHotkey ? Credentials.read(server: config.server) : ""
     hotkey?.changed = { [weak self] down in self?.shortcut(down: down) }
+    if registerHotkey {
+      overlay = RecordingOverlay(
+        cancel: { [weak self] in self?.dismissFeedback() },
+        copy: { [weak self] in
+          guard let self else { return }
+          self.copy(self.result.isEmpty ? self.preview : self.result)
+        },
+        insert: { [weak self] in self?.insertOriginal() },
+        retry: { [weak self] in self?.retryCleanup() })
+      refreshModels()
+    }
   }
   private func client(_ snapshot: Configuration? = nil) throws -> AntflyClient {
     let settings = snapshot ?? config
@@ -153,15 +176,15 @@ import SwiftUI
         throw DictationError.invalid("Allow microphone access in Settings before recording.")
       }
       generation = UUID()
+      overlayTask?.cancel()
       let run = generation
       target = InsertionTarget.capture()
       let preset = snapshot.preset(for: target?.bundleID)
-      if preset.livePreview,
-        models.first(where: { $0.id == preset.model })?.dictation?.live_preview == false
-      {
-        throw DictationError.invalid(
-          "This transcriber supports recorded clips only. Disable live preview for this preset.")
-      }
+      let effective = try ProcessingPlan(
+        preset: preset, model: models.first(where: { $0.id == preset.model }))
+      plan = effective
+      processingNote = effective.explanation
+      processingWarning = ""
       if let error = models.first(where: { $0.id == preset.model })?.dictation?.readiness_error {
         throw DictationError.invalid("Transcriber unavailable on this server: " + error)
       }
@@ -171,6 +194,12 @@ import SwiftUI
       try mic.start(deviceID: snapshot.microphoneID)
       microphone = mic
       state = .recording
+      canRecoverRaw = false
+      timing = nil
+      draft = ""
+      phase = .listening
+      live = nil
+      liveFailure = nil
       preview = ""
       result = ""
       retryAudio = nil
@@ -185,6 +214,48 @@ import SwiftUI
       let buffer = mic.buffer
       let rate = mic.sampleRate
       let connection = try client(snapshot)
+      if effective.session {
+        previewTask = Task { [weak self] in
+          do {
+            let pipeline = try await LiveDictation.open(
+              client: connection, preset: preset,
+              dictionary: snapshot.dictionary, plan: effective
+            ) { [weak self] event in
+              await self?.receive(event, run: run)
+            }
+            guard let self, generation == run, !Task.isCancelled else {
+              await pipeline.cancel()
+              return
+            }
+            live = pipeline
+            while !Task.isCancelled && state == .recording {
+              let tick = Task { _ = try? await Task.sleep(for: .milliseconds(750)) }
+              cadenceTask = tick
+              await tick.value
+              try Task.checkCancellation()
+              if state != .recording { break }
+              let chunk = try buffer.drain()
+              if !chunk.isEmpty { try await pipeline.append(chunk) }
+            }
+          } catch {
+            guard let self, generation == run, !Task.isCancelled else { return }
+            liveFailure = error.localizedDescription
+            if let live { await live.cancel() }
+            live = nil
+            processingNote =
+              preset.processingStrategy != .incremental
+              ? "Live processing failed. The recorded clip will use the same transcriber on release."
+              : "Incremental processing failed. Your recording remains available for retry."
+            processingWarning = processingNote
+            message = processingNote
+            while !Task.isCancelled && state == .recording {
+              try? await Task.sleep(for: .milliseconds(750))
+              _ = try? buffer.drain()
+            }
+          }
+        }
+        return
+      }
       previewTask = Task { [weak self] in
         var sessionID: String?
         do {
@@ -218,6 +289,7 @@ import SwiftUI
         if let id = sessionID { await Task.detached { await connection.closeSession(id) }.value }
       }
     } catch {
+      phase = .failed
       microphone?.stop()
       microphone = nil
       state = .idle
@@ -229,8 +301,9 @@ import SwiftUI
       let snapshot = recordingConfig
     else { return }
     mic.stop()
+    cadenceTask?.cancel()
     microphone = nil
-    previewTask?.cancel()
+    if plan?.session != true { previewTask?.cancel() }
     timeoutTask?.cancel()
     do {
       let audio = try mic.wav()
@@ -242,8 +315,31 @@ import SwiftUI
       if snapshot.retainAudio {
         try write(audio, to: directory.appendingPathComponent("last-recording.wav"))
       }
-      submit(audio: audio, preset: preset, snapshot: snapshot, destination: target)
+      if plan?.session == true {
+        let pump = previewTask
+        let run = generation
+        runSubmission(preset: preset, snapshot: snapshot, destination: target) { [self] in
+          await pump?.value
+          try Task.checkCancellation()
+          guard self.generation == run else { throw CancellationError() }
+          if let pipeline = self.live {
+            return try await pipeline.finish(mic.buffer.drain())
+          }
+          guard preset.processingStrategy != .incremental else {
+            throw DictationError.invalid(self.liveFailure ?? "Incremental processing failed.")
+          }
+          let connection = try self.client(snapshot)
+          return try await connection.dictate(
+            audio: audio, preset: preset, dictionary: snapshot.dictionary,
+            events: { [weak self] in await self?.receive($0, run: run) }, progress: { _ in })
+        }
+      } else {
+        submit(audio: audio, preset: preset, snapshot: snapshot, destination: target)
+      }
     } catch {
+      previewTask?.cancel()
+      if let live { Task { await live.cancel() } }
+      phase = .failed
       state = .idle
       message = error.localizedDescription
     }
@@ -251,22 +347,36 @@ import SwiftUI
   func submit(
     audio: Data, preset: Preset, snapshot: Configuration, destination: InsertionTarget?
   ) {
+    let run = generation
+    runSubmission(preset: preset, snapshot: snapshot, destination: destination) { [self] in
+      let connection = try self.client(snapshot)
+      return try await connection.dictate(
+        audio: audio, preset: preset, dictionary: snapshot.dictionary,
+        events: { [weak self] in await self?.receive($0, run: run) }, progress: { _ in })
+    }
+  }
+  private func runSubmission(
+    preset: Preset, snapshot: Configuration, destination: InsertionTarget?,
+    operation: @escaping @MainActor () async throws -> DictationResult
+  ) {
     state = .processing
-    message = "Transcribing · \(snapshot.server)"
+    phase = .transcribing
+    message = phase.label
     let run = generation
     requestTask = Task { [weak self] in
       guard let self else { return }
       do {
-        let connection = try client(snapshot)
-        let output = try await connection.dictate(
-          audio: audio, preset: preset, dictionary: snapshot.dictionary
-        ) { [weak self] text in
-          await self?.updatePreview(text, run: run)
-        }
+        let released = ProcessInfo.processInfo.systemUptime
+        var output = try await operation()
+        if output.timing == nil { output.timing = DictationTiming() }
+        output.timing?.afterRelease = ProcessInfo.processInfo.systemUptime - released
         try Task.checkCancellation()
         guard generation == run else { return }
         result = output.text
         preview = output.raw
+        draft = ""
+        timing = output.timing
+        canRecoverRaw = false
         var status = "ready"
         if snapshot.autoPaste
           && !output.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -288,7 +398,9 @@ import SwiftUI
           message = "Transcript ready to copy."
         }
         guard generation == run else { return }
-        if snapshot.retainHistory {
+        if snapshot.retainHistory
+          && !output.raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
           let entry = HistoryEntry(
             preset: preset.name, model: preset.model, application: destination?.bundleID ?? "",
             raw: output.raw, text: output.text, status: status)
@@ -297,12 +409,21 @@ import SwiftUI
         guard generation == run else { return }
         if !snapshot.retainAudio { retryAudio = nil }
         state = .idle
+        phase =
+          output.raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .noSpeech : .ready
+        if phase == .noSpeech { message = phase.label }
+        if status == "paste_sent" || phase == .noSpeech { dismissOverlayLater() }
       } catch {
         guard generation == run else { return }
         state = .idle
+        phase = .failed
         message = error.localizedDescription
+        if let failure = error as? DictationError, let original = failure.rawTranscript {
+          preview = original
+          canRecoverRaw = !original.isEmpty
+          if !snapshot.retainAudio { retryAudio = nil }
+        }
         let transcriptionFailed = result.isEmpty
-        if result.isEmpty && !preview.isEmpty { result = preview }
         if snapshot.retainHistory && transcriptionFailed {
           let entry = HistoryEntry(
             preset: preset.name, model: preset.model, application: destination?.bundleID ?? "",
@@ -313,11 +434,123 @@ import SwiftUI
       }
     }
   }
-  private func updatePreview(_ text: String, run: UUID) { if generation == run { preview = text } }
+  private func receive(_ event: DictationProgress, run: UUID) {
+    guard generation == run else { return }
+    preview = event.raw
+    draft = event.draft
+    phase = state == .recording ? .listening : event.phase
+    message = phase.label
+  }
+  private func updateOverlay() {
+    overlay?.show(
+      phase: phase, raw: phase == .ready ? result : preview, draft: draft, message: message,
+      note: processingWarning,
+      recover: canRecoverRaw)
+  }
+  func dismissFeedback() {
+    if state == .idle { overlay?.hide() } else { cancel() }
+  }
+  private func dismissOverlayLater() {
+    overlayTask?.cancel()
+    overlayTask = Task { [weak self] in
+      try? await Task.sleep(for: .seconds(2))
+      guard !Task.isCancelled, self?.state == .idle else { return }
+      self?.overlay?.hide()
+    }
+  }
+  func insertOriginal() {
+    guard state == .idle, canRecoverRaw, !preview.isEmpty else { return }
+    let original = preview
+    let captured = target
+    let run = generation
+    state = .processing
+    Task {
+      do {
+        guard let captured else {
+          throw DictationError.invalid("No original text field. Copy the transcript instead.")
+        }
+        try await captured.paste(original)
+        guard generation == run else { return }
+        state = .idle
+        result = original
+        canRecoverRaw = false
+        phase = .ready
+        message = "Original transcript pasted."
+        dismissOverlayLater()
+      } catch {
+        guard generation == run else { return }
+        state = .idle
+        phase = .failed
+        message = error.localizedDescription
+      }
+    }
+  }
+  func retryCleanup() {
+    guard state == .idle, !working, canRecoverRaw else { return }
+    do {
+      var snapshot = try config.validated()
+      let preset =
+        snapshot.presets.first(where: { $0.id == retryPreset?.id }) ?? snapshot.preset(for: nil)
+      guard preset.usesNamedTranscriber, preset.runsCleanup else {
+        throw DictationError.invalid(
+          "Choose a named transcriber and cleanup generator before retrying cleanup.")
+      }
+      let original = preview
+      snapshot.autoPaste = false
+      generation = UUID()
+      let run = generation
+      runSubmission(preset: preset, snapshot: snapshot, destination: nil) { [self] in
+        try await self.client(snapshot).cleanupText(
+          original, preset: preset, dictionary: snapshot.dictionary,
+          events: { [weak self] in await self?.receive($0, run: run) })
+      }
+      phase = .cleaning
+      message = phase.label
+    } catch { message = error.localizedDescription }
+  }
+  func refreshModels() {
+    let snapshot = config
+    Task { [weak self] in
+      do {
+        guard let self else { return }
+        let data = try await client(snapshot).models()
+        let catalog = try JSONDecoder().decode(ModelCatalog.self, from: Data(data.utf8))
+        guard config.server == snapshot.server else { return }
+        models = catalog.data
+      } catch { /* Explicit Discover models surfaces connection/readiness errors. */  }
+    }
+  }
+  func connectionChanged() {
+    models = []
+    token = Credentials.read(server: config.server)
+    refreshModels()
+  }
+  func processingDescription(_ preset: Preset) -> String {
+    do {
+      return try ProcessingPlan(preset: preset, model: models.first { $0.id == preset.model })
+        .explanation
+    } catch { return error.localizedDescription }
+  }
   func cancel() {
     generation = UUID()
     requestTask?.cancel()
     previewTask?.cancel()
+    cadenceTask?.cancel()
+    if let live {
+      let pump = previewTask
+      let active = requestTask
+      Task {
+        await pump?.value
+        await active?.value
+        await live.cancel()
+      }
+    }
+    live = nil
+    overlayTask?.cancel()
+    canRecoverRaw = false
+    draft = ""
+    phase = .canceled
+    overlay?.hide()
     timeoutTask?.cancel()
     microphone?.stop()
     microphone = nil

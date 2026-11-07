@@ -221,6 +221,8 @@ def test_named_dictation_cleanup_and_streaming(tmp_path, provider):
             if item["id"] == "transcribers/speech"
         )
         assert described["dictation"]["live_preview"] is (provider == "antfly")
+        assert described["dictation"]["stable_segments"] is (provider == "antfly")
+        assert described["dictation"]["text_cleanup"] is True
         if provider == "apple":
             assert described["dictation"]["native_status"]["speech_available"]
         request = {
@@ -244,6 +246,35 @@ def test_named_dictation_cleanup_and_streaming(tmp_path, provider):
         assert "Antfly" in prompt and "Slack" in prompt and "Keep it brief" in prompt
         if provider == "antfly":
             assert state["recognition"][-1]["dictionary"] == ["Antfly"]
+
+        # Final session segments reuse shared cleanup without recognizing audio again.
+        recognized_before = len(state["recognition"])
+        segment_request = {**request, "audio": "", "transcript_text": "um ant fly"}
+        cleaned_segment = requests.post(
+            server.url + "/ai/v1/dictate", json=segment_request, timeout=40
+        )
+        assert cleaned_segment.status_code == 200, cleaned_segment.text
+        assert cleaned_segment.json()["transcript"]["text"] == "um ant fly"
+        assert cleaned_segment.json()["text"] == "Antfly."
+        assert len(state["recognition"]) == recognized_before
+        for invalid in [
+            {**segment_request, "audio": request["audio"]},
+            {**segment_request, "transcript_text": "x" * 65537},
+        ]:
+            rejected = requests.post(
+                server.url + "/ai/v1/dictate", json=invalid, timeout=40
+            )
+            assert rejected.status_code == 400, rejected.text
+        clean_before = len(state["cleanup"])
+        empty_segment = requests.post(
+            server.url + "/ai/v1/dictate",
+            json={**segment_request, "transcript_text": ""},
+            timeout=40,
+        )
+        assert (
+            empty_segment.status_code == 200 and empty_segment.json()["text"] == ""
+        ), empty_segment.text
+        assert len(state["cleanup"]) == clean_before
 
         framed_result = requests.post(
             server.url + "/ai/v1/dictate",
@@ -488,3 +519,129 @@ def test_named_dictation_cleanup_and_streaming(tmp_path, provider):
         fixture.shutdown()
         fixture.server_close()
         thread.join(timeout=5)
+
+
+@pytest.mark.e2e_resource("antfly_process")
+@pytest.mark.skipif(
+    os.environ.get("ANTFLY_TEST_WHISPER_SESSIONS") != "1",
+    reason="Requires an installed Whisper model and ready native Apple cleanup",
+)
+def test_real_whisper_final_segments_clean_before_release_and_flush_tail(tmp_path):
+    """Real session finals compose with native cleanup, without a second clip pass."""
+    models_dir = Path.home() / ".antfly/inference/models"
+    model = os.environ.get("ANTFLY_TEST_WHISPER_MODEL", "openai/whisper-tiny")
+    if not (models_dir / model / "model_manifest.json").exists():
+        pytest.skip("Whisper model is not installed; this test never downloads models")
+    config = tmp_path / "live-config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "public_inference": {"enabled": True, "default_timeout_ms": 120000},
+                "resources": {
+                    "inference": {"admission": {"max_concurrent_requests": 1}}
+                },
+                "inference": {"models_dir": str(models_dir)},
+                "transcribers": {"speech": {"provider": "antfly", "model": model}},
+                "generators": {"cleanup": {"provider": "apple", "max_tokens": 256}},
+            }
+        )
+    )
+    binary = harness.resolve_binary_path(
+        os.environ.get("ANTFLY_BIN", str(harness.DEFAULT_ANTFLY_BIN))
+    )
+    server = harness.StandaloneAntflyServer(binary, "127.0.0.1", 0, config_path=config)
+    session_id = None
+    try:
+        session = requests.post(
+            server.url + "/ai/v1/transcription/sessions",
+            json={
+                "model": "transcribers/speech",
+                "language": "en",
+                "emit_partials": False,
+                "max_segment_ms": 10000,
+            },
+            timeout=120,
+        )
+        assert session.status_code == 200, session.text
+        session_id = session.json()["id"]
+        path = server.url + f"/ai/v1/transcription/sessions/{session_id}"
+        fixture = (
+            Path(__file__).resolve().parents[2]
+            / "lib/transcribing/src/testdata/apple-speech.wav"
+        )
+        with wave.open(str(fixture)) as audio:
+            assert audio.getnchannels() == 1 and audio.getsampwidth() == 2
+            rate = audio.getframerate()
+            pcm = audio.readframes(audio.getnframes())
+        samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
+        phrase = struct.pack(
+            f"<{len(samples)}f", *(sample / 32768 for sample in samples)
+        )
+        step = rate * 4 * 3 // 4
+
+        def append(audio, commit=False):
+            metadata = {"format": "pcm_f32", "sample_rate": rate, "commit": commit}
+            if audio:
+                metadata["audio"] = "attachment:0"
+                encoded = json.dumps(metadata).encode()
+                mime = b"audio/pcm"
+                frame = (
+                    b"AFATT001"
+                    + struct.pack("<QII", len(encoded), 1, 0)
+                    + struct.pack("<IIQ", len(mime), 0, len(audio))
+                    + encoded
+                    + mime
+                    + audio
+                )
+                response = requests.post(
+                    path + "/audio",
+                    data=frame,
+                    headers={"Content-Type": "application/vnd.antfly.attachments.v1"},
+                    timeout=120,
+                )
+            else:
+                response = requests.post(path + "/audio", json=metadata, timeout=120)
+            assert response.status_code == 200, response.text
+            return [
+                event for event in response.json()["data"] if event["type"] == "final"
+            ]
+
+        def cleanup(event):
+            response = requests.post(
+                server.url + "/ai/v1/dictate",
+                json={
+                    "model": "transcribers/speech",
+                    "audio": "",
+                    "transcript_text": event["text"],
+                    "cleanup_model": "generators/cleanup",
+                    "style": "clean",
+                },
+                timeout=120,
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["transcript"]["text"] == event["text"]
+            return response.json()["text"]
+
+        finals = []
+        first_utterance = phrase + bytes(rate * 4)
+        for offset in range(0, len(first_utterance), step):
+            finals.extend(append(first_utterance[offset : offset + step]))
+        assert finals, "VAD should finalize the first utterance before release"
+        cleaned = [cleanup(event) for event in finals]
+        assert "fox" in " ".join(cleaned).lower()
+        for offset in range(0, len(phrase), step):
+            emitted = append(phrase[offset : offset + step])
+            finals.extend(emitted)
+            cleaned.extend(cleanup(event) for event in emitted)
+        tail = append(b"", commit=True)
+        assert tail, "Release must flush the second utterance"
+        assert tail[0]["sequence"] > finals[-1]["sequence"]
+        cleaned.extend(cleanup(event) for event in tail)
+        assembled = " ".join(cleaned).lower()
+        assert assembled.count("fox") == 2 and assembled.count("dog") == 2, assembled
+    finally:
+        if session_id:
+            requests.delete(
+                server.url + f"/ai/v1/transcription/sessions/{session_id}", timeout=40
+            )
+        server.stop()

@@ -27,7 +27,9 @@
       "instructions": "",
       "dictionary": [],
       "appIDs": [],
-      "livePreview": true
+      "livePreview": true,
+      "mode": "clean",
+      "processing": "automatic"
     },
     {
       "id": "email",
@@ -42,7 +44,9 @@
       "appIDs": [
         "com.apple.mail"
       ],
-      "livePreview": true
+      "livePreview": true,
+      "mode": "rewrite",
+      "processing": "automatic"
     },
     {
       "id": "verbatim",
@@ -55,7 +59,9 @@
       "instructions": "",
       "dictionary": [],
       "appIDs": [],
-      "livePreview": true
+      "livePreview": true,
+      "mode": "verbatim",
+      "processing": "automatic"
     }
   ]
 }
