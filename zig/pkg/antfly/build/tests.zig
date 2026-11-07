@@ -3478,7 +3478,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = selectTestFilters(b, &.{ "date histogram", "storage.ttl.", "storage.backup_codec.", "storage.portable_backup.", "storage.retained_effects.", "storage.document_mutation_revision.", "storage.db.maintenance.ttl_runtime." }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    time_series_storage_tests.step.max_rss = 5 * 1024 * 1024 * 1024;
+    // Portable archive and legacy histogram coverage peaks around 6.6 GB on
+    // native macOS ReleaseFast. Reserve enough for bounded build scheduling.
+    time_series_storage_tests.step.max_rss = 8 * 1024 * 1024 * 1024;
     b.step("time-series-storage-test", "Verify histogram limits, TTL metadata, retained replay, and portable archive compatibility").dependOn(&b.addRunArtifact(time_series_storage_tests).step);
     const time_series_runtime_tests = b.addTest(.{
         .name = "time-series-runtime-tests",
