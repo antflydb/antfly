@@ -114,3 +114,18 @@ def test_projection_version_round_trip_preserves_completeness_marker():
         if version is not None:
             wire["upstream_revisions_version"] = version
         assert DecisionCascadeStageTrace.from_dict(wire).to_dict() == wire
+
+
+def test_projection_completeness_preserves_false_and_true():
+    from antfly.client_generated.models import DecisionCascadeStageTrace
+
+    for complete in (False, True):
+        wire = {
+            "name": "proxy",
+            "decision_method": "typed",
+            "escalated": False,
+            "upstream_revisions": [],
+            "upstream_revisions_version": 2,
+            "upstream_revisions_complete": complete,
+        }
+        assert DecisionCascadeStageTrace.from_dict(wire).to_dict() == wire

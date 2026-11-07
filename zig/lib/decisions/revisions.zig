@@ -30,7 +30,9 @@ pub const Manifest = struct {
     paths: [max_nodes][max_depth][]const u8 = undefined,
     len: usize = 0,
     visited: usize = 0,
-    historical: bool = false,
+    /// Unknown provenance is metadata, not an additional dependency node.
+    incomplete: bool = false,
+    mode: enum { current, historical, previous } = .current,
 
     pub fn items(self: *const Manifest) []const Node {
         return self.nodes[0..self.len];
@@ -49,22 +51,35 @@ pub const Manifest = struct {
         self.nodes[self.len].path = self.paths[self.len][0..node.path.len];
         self.len += 1;
     }
-    pub fn markIncomplete(self: *Manifest) !void {
-        try self.add(.{ .kind = .unverified, .path = &.{}, .identity = "0000000000000000000000000000000000000000000000000000000000000000" });
+    fn record(self: *Manifest, node: Node) !void {
+        try validateNode(node);
+        if (self.mode == .current and node.kind == .unverified) {
+            self.incomplete = true;
+        } else try self.add(node);
+    }
+    fn markIncomplete(self: *Manifest) !void {
+        if (self.mode == .current) self.incomplete = true else try self.add(.{ .kind = .unverified, .path = &.{}, .identity = "0000000000000000000000000000000000000000000000000000000000000000" });
     }
     pub fn collect(self: *Manifest, response: V) !void {
-        self.historical = false;
+        self.mode = .current;
         try self.collectInner(response);
     }
     /// Binding recognition only: reproduce the pre-versioned projection digest.
     /// This result must never authorize replay or be sent to a verifier.
     pub fn collectHistorical(self: *Manifest, response: V) !void {
-        self.historical = true;
+        self.mode = .historical;
+        try self.collectInner(response);
+    }
+    /// Recognize the preceding writer's hashes with injected marker nodes.
+    /// Like collectHistorical, this can recognize a binding, never authorize it.
+    pub fn collectPrevious(self: *Manifest, response: V) !void {
+        self.mode = .previous;
         try self.collectInner(response);
     }
     fn collectInner(self: *Manifest, response: V) !void {
         self.len = 0;
         self.visited = 0;
+        self.incomplete = false;
         try self.walk(response, &.{});
     }
     fn walk(self: *Manifest, response: V, path: []const []const u8) !void {
@@ -72,14 +87,23 @@ pub const Manifest = struct {
         if (self.visited > 128) return error.InvalidDecisionOutput;
         if (response != .object) return error.InvalidDecisionOutput;
         const version = response.object.get("upstream_revisions_version");
-        if (version) |v| if (v != .integer or v.integer != 1 or !response.object.contains("upstream_revisions")) return error.InvalidDecisionOutput;
+        const complete = response.object.get("upstream_revisions_complete");
+        if (version) |v| {
+            if (v != .integer or !response.object.contains("upstream_revisions") or
+                (v.integer != 1 and !(self.mode == .current and v.integer == 2))) return error.InvalidDecisionOutput;
+        }
+        if (self.mode == .current) {
+            if (version != null and version.?.integer == 2) {
+                if (complete == null or complete.? != .bool) return error.InvalidDecisionOutput;
+            } else if (complete != null) return error.InvalidDecisionOutput;
+        }
         if (response.object.get("upstream_revisions")) |flat| {
             // A stage projection replaces hidden upstream provenance. It must
             // never override a supplied public trace, even with an empty list.
             if (response.object.contains("cascade")) return error.InvalidDecisionOutput;
             const first = self.len;
             if (flat != .array or flat.array.items.len > max_nodes) return error.InvalidDecisionOutput;
-            for (flat.array.items) |entry| {
+            for (flat.array.items, 0..) |entry, index| {
                 if (entry != .object) return error.InvalidDecisionOutput;
                 const kind = entry.object.get("kind") orelse return error.InvalidDecisionOutput;
                 const identity = entry.object.get("identity") orelse return error.InvalidDecisionOutput;
@@ -93,7 +117,20 @@ pub const Manifest = struct {
                 }
                 const model = entry.object.get("model");
                 if (model != null and model.? != .string) return error.InvalidDecisionOutput;
-                try self.add(.{ .kind = std.meta.stringToEnum(@FieldType(Node, "kind"), kind.string) orelse return error.InvalidDecisionOutput, .identity = identity.string, .path = joined[0 .. path.len + relative.array.items.len], .model = if (model) |m| m.string else null });
+                // Validate duplicate selectors before collapsing legacy markers.
+                // The source array stays bounded to 32 entries and depth eight.
+                for (flat.array.items[0..index]) |old| {
+                    if (!std.mem.eql(u8, old.object.get("kind").?.string, kind.string)) continue;
+                    const old_path = old.object.get("path").?.array.items;
+                    if (old_path.len != relative.array.items.len) continue;
+                    var same = true;
+                    for (old_path, relative.array.items) |l, r| {
+                        if (r != .string) return error.InvalidDecisionOutput;
+                        same = same and std.mem.eql(u8, l.string, r.string);
+                    }
+                    if (same) return error.InvalidDecisionOutput;
+                }
+                try self.record(.{ .kind = std.meta.stringToEnum(@FieldType(Node, "kind"), kind.string) orelse return error.InvalidDecisionOutput, .identity = identity.string, .path = joined[0 .. path.len + relative.array.items.len], .model = if (model) |m| m.string else null });
             }
             // A projection cannot erase the final generated revision that is
             // still visible in the stage's public answer.
@@ -119,9 +156,14 @@ pub const Manifest = struct {
                     if (!found) return error.InvalidDecisionOutput;
                 }
             }
-            if (!self.historical) {
-                var incomplete = false;
+            if (self.mode != .historical) {
+                var incomplete = complete != null and complete.? == .bool and !complete.?.bool;
                 var definition = false;
+                // Legacy explicit markers are folded into the out-of-band flag.
+                for (flat.array.items) |entry| if (std.mem.eql(u8, entry.object.get("kind").?.string, "unverified")) {
+                    if (self.mode == .current and complete != null and complete.?.bool) return error.InvalidDecisionOutput;
+                    incomplete = true;
+                };
                 var reported: ?[]const u8 = null;
                 if (response.object.get("upstream_agreement")) |summary| {
                     if (summary != .object) return error.InvalidDecisionOutput;
@@ -142,7 +184,9 @@ pub const Manifest = struct {
                 if (version != null and response.object.contains("upstream_agreement") and !definition and !incomplete) return error.InvalidDecisionOutput;
                 // Historical projections could drop definition-only subtrees,
                 // even while retaining other models. Nonempty is not proof.
-                if (version == null and !incomplete) try self.add(.{ .kind = .unverified, .path = path, .identity = reported orelse "0000000000000000000000000000000000000000000000000000000000000000" });
+                if (self.mode == .current) {
+                    self.incomplete = self.incomplete or incomplete or version == null;
+                } else if (version == null and !incomplete) try self.add(.{ .kind = .unverified, .path = path, .identity = reported orelse "0000000000000000000000000000000000000000000000000000000000000000" });
             }
             return;
         }
@@ -163,7 +207,7 @@ pub const Manifest = struct {
                     next[path.len] = name.string;
                     try self.walk(stage, next[0 .. path.len + 1]);
                 }
-                if (!self.historical or self.len != before) try self.add(.{ .kind = .cascade, .path = path, .identity = identity.string });
+                if (self.mode != .historical or self.len != before) try self.add(.{ .kind = .cascade, .path = path, .identity = identity.string });
                 return;
             }
             try self.markIncomplete();
@@ -174,8 +218,8 @@ pub const Manifest = struct {
             if (summary != .object) return error.InvalidDecisionOutput;
             if (summary.object.get("definition_sha256")) |identity| {
                 if (identity != .string) return error.InvalidDecisionOutput;
-                try self.add(.{ .kind = .unverified, .path = path, .identity = identity.string });
-            } else try self.add(.{ .kind = .unverified, .path = path, .identity = "0000000000000000000000000000000000000000000000000000000000000000" });
+                try self.record(.{ .kind = .unverified, .path = path, .identity = identity.string });
+            } else try self.record(.{ .kind = .unverified, .path = path, .identity = "0000000000000000000000000000000000000000000000000000000000000000" });
             return;
         }
         if (response.object.contains("name")) {
@@ -184,7 +228,7 @@ pub const Manifest = struct {
             if (std.mem.eql(u8, method.string, "typed")) {
                 // Historical typed stages may have been Decisions proxies;
                 // their hidden upstream trace was discarded without a marker.
-                try self.add(.{ .kind = .unverified, .path = path, .identity = "0000000000000000000000000000000000000000000000000000000000000000" });
+                try self.record(.{ .kind = .unverified, .path = path, .identity = "0000000000000000000000000000000000000000000000000000000000000000" });
             }
         }
         const answers = response.object.get("answers") orelse return error.InvalidDecisionOutput;
@@ -204,7 +248,7 @@ pub const Manifest = struct {
     }
     pub fn digest(self: *const Manifest, selectors_only: bool) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("decision-dependencies-v1");
+        hash.update(if (self.incomplete) "decision-dependencies-incomplete-v1" else "decision-dependencies-v1");
         for (self.items()) |node| {
             hashText(&hash, @tagName(node.kind));
             var depth: [4]u8 = undefined;
@@ -284,15 +328,18 @@ test "flat dependencies distinguish complete empty projections from historical o
     const a = arena.allocator();
     var manifest: Manifest = .{};
     try manifest.collect(try std.json.parseFromSliceLeaky(V, a, "{\"upstream_agreement\":{}}", .{}));
-    try std.testing.expectEqual(.unverified, manifest.nodes[0].kind);
+    try std.testing.expect(manifest.incomplete);
+    try std.testing.expectEqual(@as(usize, 0), manifest.len);
     try manifest.collect(try std.json.parseFromSliceLeaky(V, a, "{\"upstream_agreement\":{},\"upstream_revisions\":[]}", .{}));
-    try std.testing.expectEqual(.unverified, manifest.nodes[0].kind);
+    try std.testing.expect(manifest.incomplete);
+    try std.testing.expectEqual(@as(usize, 0), manifest.len);
     try manifest.collect(try std.json.parseFromSliceLeaky(V, a, "{\"upstream_revisions_version\":1,\"upstream_revisions\":[]}", .{}));
     try std.testing.expectEqual(@as(usize, 0), manifest.len);
     try manifest.collect(try std.json.parseFromSliceLeaky(V, a,
         \\{"name":"proxy","decision_method":"typed","answers":[{"decision_method":"typed"}]}
     , .{}));
-    try std.testing.expectEqual(.unverified, manifest.nodes[0].kind);
+    try std.testing.expect(manifest.incomplete);
+    try std.testing.expectEqual(@as(usize, 0), manifest.len);
     try std.testing.expectError(error.InvalidDecisionOutput, manifest.collect(try std.json.parseFromSliceLeaky(V, a,
         \\{"model":"gen","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","answers":[{"decision_method":"generated"}],"upstream_revisions":[]}
     , .{})));
@@ -332,8 +379,8 @@ test "definition-only cascades are pinned and legacy projections cannot prove co
     try projection.object.put(a, "upstream_revisions", try current.value(a));
     var replay: Manifest = .{};
     try replay.collect(projection);
-    try std.testing.expectEqual(@as(usize, 2), replay.len);
-    try std.testing.expectEqual(.unverified, replay.nodes[1].kind);
+    try std.testing.expectEqual(@as(usize, 1), replay.len);
+    try std.testing.expect(replay.incomplete);
     try old.collectHistorical(projection);
     try std.testing.expectEqual(@as(usize, 1), old.len);
     try projection.object.put(a, "upstream_revisions_version", .{ .integer = 1 });
@@ -347,8 +394,8 @@ test "definition-only cascades are pinned and legacy projections cannot prove co
     try std.testing.expectError(error.InvalidDecisionOutput, replay.collect(projection));
     _ = projection.object.swapRemove("upstream_revisions_version");
     try replay.collect(projection);
-    try std.testing.expectEqual(.unverified, replay.nodes[0].kind);
-    try std.testing.expectEqualStrings(id, replay.nodes[0].identity);
+    try std.testing.expect(replay.incomplete);
+    try std.testing.expectEqual(@as(usize, 0), replay.len);
     for ([_][]const u8{ "0", "2", "null", "true", "\"1\"" }) |raw| {
         try projection.object.put(a, "upstream_revisions_version", try std.json.parseFromSliceLeaky(V, a, raw, .{}));
         try std.testing.expectError(error.InvalidDecisionOutput, replay.collect(projection));
@@ -356,4 +403,77 @@ test "definition-only cascades are pinned and legacy projections cannot prove co
     try projection.object.put(a, "upstream_revisions_version", .{ .integer = 1 });
     _ = projection.object.swapRemove("upstream_revisions");
     try std.testing.expectError(error.InvalidDecisionOutput, replay.collect(projection));
+}
+
+test "uncertainty preserves every real node at the 32-node boundary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for ([_]usize{ 0, 1, 31, 32 }) |count| {
+        var source: Manifest = .{};
+        for (0..count) |i| try source.add(.{ .kind = .model, .path = &.{try std.fmt.allocPrint(a, "b{d}", .{i})}, .identity = id, .model = "model" });
+        var projection = V{ .object = .empty };
+        try projection.object.put(a, "upstream_revisions", try source.value(a));
+        var partial: Manifest = .{};
+        try partial.collect(projection);
+        try std.testing.expect(partial.incomplete);
+        try std.testing.expectEqual(count, partial.len);
+        var previous: Manifest = .{};
+        if (count == max_nodes) {
+            try std.testing.expectError(error.InvalidDecisionOutput, previous.collectPrevious(projection));
+        } else {
+            try previous.collectPrevious(projection);
+            try std.testing.expectEqual(count + 1, previous.len);
+        }
+        const partial_hash = partial.digest(false);
+        try projection.object.put(a, "upstream_revisions_version", .{ .integer = 2 });
+        try projection.object.put(a, "upstream_revisions_complete", .{ .bool = false });
+        var replay: Manifest = .{};
+        try replay.collect(projection);
+        try std.testing.expect(replay.incomplete);
+        try std.testing.expectEqual(count, replay.len);
+        try std.testing.expectEqualSlices(u8, &partial_hash, &replay.digest(false));
+        try projection.object.put(a, "upstream_revisions_complete", .{ .bool = true });
+        try replay.collect(projection);
+        try std.testing.expect(!replay.incomplete);
+        try std.testing.expectEqualSlices(u8, &source.digest(false), &replay.digest(false));
+        try std.testing.expect(!std.mem.eql(u8, &partial_hash, &replay.digest(false)));
+        // Prior projection readers reject version 2 rather than ignore false.
+        try std.testing.expectError(error.InvalidDecisionOutput, previous.collectPrevious(projection));
+    }
+}
+
+test "projection completeness validates flags and collapses legacy uncertainty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var value = try std.json.parseFromSliceLeaky(V, a,
+        \\{"upstream_revisions_version":1,"upstream_revisions":[{"kind":"unverified","identity":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","path":[]}]}
+    , .{});
+    var manifest: Manifest = .{};
+    try manifest.collect(value);
+    try std.testing.expect(manifest.incomplete);
+    try std.testing.expectEqual(@as(usize, 0), manifest.len);
+    try value.object.put(a, "upstream_revisions_complete", .{ .bool = false });
+    try std.testing.expectError(error.InvalidDecisionOutput, manifest.collect(value));
+    try value.object.put(a, "upstream_revisions_version", .{ .integer = 2 });
+    try manifest.collect(value);
+    try std.testing.expect(manifest.incomplete);
+    try value.object.put(a, "upstream_revisions_complete", .{ .bool = true });
+    try std.testing.expectError(error.InvalidDecisionOutput, manifest.collect(value));
+    try value.object.put(a, "upstream_revisions_complete", .{ .bool = false });
+    const nodes = value.object.getPtr("upstream_revisions").?;
+    try nodes.array.append(nodes.array.items[0]);
+    try std.testing.expectError(error.InvalidDecisionOutput, manifest.collect(value));
+    nodes.array.items.len = 1;
+    for ([_][]const u8{ "null", "0", "\"false\"" }) |bad| {
+        try value.object.put(a, "upstream_revisions_complete", try std.json.parseFromSliceLeaky(V, a, bad, .{}));
+        try std.testing.expectError(error.InvalidDecisionOutput, manifest.collect(value));
+    }
+    _ = value.object.swapRemove("upstream_revisions_complete");
+    try std.testing.expectError(error.InvalidDecisionOutput, manifest.collect(value));
+    try value.object.put(a, "upstream_revisions_complete", .{ .bool = false });
+    _ = value.object.swapRemove("upstream_revisions");
+    try std.testing.expectError(error.InvalidDecisionOutput, manifest.collect(value));
 }

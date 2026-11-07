@@ -603,11 +603,13 @@ pub const DecisionCascadeAgreementStatus = enum {
 };
 
 pub const DecisionCascadeStageTrace = struct {
-    /// Version 1 attests that upstream_revisions includes every reported model and cascade definition, including definition-only subtrees. Omitted historical projections may have lost definitions and cannot authorize replay.
+    /// Whether the version-2 projection has complete provenance. False preserves uncertainty without consuming a dependency slot. Required with version 2; absent with version 1, whose legacy unverified entries still imply incompleteness. Unversioned projections remain incomplete.
+    upstream_revisions_complete: ?bool = null,
+    /// Version 2 requires upstream_revisions_complete and separates provenance from the bounded dependency nodes. Version 1 uses legacy unverified entries to represent incompleteness. Unversioned historical projections may have lost definitions and cannot authorize identity verdict reuse.
     upstream_revisions_version: ?i32 = null,
     /// Sorted question names compared by this stage. Present only when a local comparison ran. Allows upstream consumers to verify scoped agreement directly from the stage answers without reconstructing its policy. Historical traces may omit this field; ambiguous historical agreement abstains.
     agreement_questions: ?[]const []const u8 = null,
-    /// Bounded upstream execution dependencies. With upstream_revisions_version 1, this is complete and an empty array records no versioned dependencies. Historical projections without a version may have dropped cascade definitions even when nonempty and cannot authorize replay.
+    /// Bounded upstream execution dependencies. New version-2 projections contain actual dependencies and use upstream_revisions_complete for uncertainty. Complete empty projections record no versioned dependencies. Version-1 legacy unverified entries are still readable; unversioned projections cannot prove completeness.
     upstream_revisions: ?[]const DecisionRevisionDependency = null,
     upstream_agreement: ?DecisionCascadeUpstreamAgreement = null,
     agreement_status: ?DecisionCascadeAgreementStatus = null,
@@ -632,6 +634,7 @@ pub const DecisionCascadeStageTrace = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "upstream_revisions_complete", "upstream_revisions_complete", true },
         .{ "upstream_revisions_version", "upstream_revisions_version", true },
         .{ "agreement_questions", "agreement_questions", true },
         .{ "upstream_revisions", "upstream_revisions", true },
@@ -660,6 +663,10 @@ pub const DecisionCascadeStageTrace = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.upstream_revisions_complete) |value| {
+            try jw.objectField("upstream_revisions_complete");
+            try jw.write(value);
+        }
         if (self.upstream_revisions_version) |value| {
             try jw.objectField("upstream_revisions_version");
             try jw.write(value);

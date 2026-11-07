@@ -35,16 +35,20 @@ class DecisionCascadeStageTrace:
         name (str):
         decision_method (DecisionCascadeStageTraceDecisionMethod):
         escalated (bool): Whether this answer fell inside the next stage's band, sending the input on.
-        upstream_revisions_version (int | Unset): Version 1 attests that upstream_revisions includes every reported
-            model and cascade definition, including definition-only subtrees. Omitted historical projections may have lost
-            definitions and cannot authorize replay.
+        upstream_revisions_complete (bool | Unset): Whether the version-2 projection has complete provenance. False
+            preserves uncertainty without consuming a dependency slot. Required with version 2; absent with version 1, whose
+            legacy unverified entries still imply incompleteness. Unversioned projections remain incomplete.
+        upstream_revisions_version (int | Unset): Version 2 requires upstream_revisions_complete and separates
+            provenance from the bounded dependency nodes. Version 1 uses legacy unverified entries to represent
+            incompleteness. Unversioned historical projections may have lost definitions and cannot authorize identity
+            verdict reuse.
         agreement_questions (list[str] | Unset): Sorted question names compared by this stage. Present only when a local
             comparison ran. Allows upstream consumers to verify scoped agreement directly from the stage answers without
             reconstructing its policy. Historical traces may omit this field; ambiguous historical agreement abstains.
-        upstream_revisions (list[DecisionRevisionDependency] | Unset): Bounded upstream execution dependencies. With
-            upstream_revisions_version 1, this is complete and an empty array records no versioned dependencies. Historical
-            projections without a version may have dropped cascade definitions even when nonempty and cannot authorize
-            replay.
+        upstream_revisions (list[DecisionRevisionDependency] | Unset): Bounded upstream execution dependencies. New
+            version-2 projections contain actual dependencies and use upstream_revisions_complete for uncertainty. Complete
+            empty projections record no versioned dependencies. Version-1 legacy unverified entries are still readable;
+            unversioned projections cannot prove completeness.
         upstream_agreement (DecisionCascadeUpstreamAgreement | Unset): Bounded agreement summary reported by the stage's
             upstream provider. This preserves upstream abstention without recursively embedding its trace; the upstream
             definition is not locally verified. A disagreed or unverified upstream stops the input, including at the first
@@ -71,6 +75,7 @@ class DecisionCascadeStageTrace:
     name: str
     decision_method: DecisionCascadeStageTraceDecisionMethod
     escalated: bool
+    upstream_revisions_complete: bool | Unset = UNSET
     upstream_revisions_version: int | Unset = UNSET
     agreement_questions: list[str] | Unset = UNSET
     upstream_revisions: list[DecisionRevisionDependency] | Unset = UNSET
@@ -113,6 +118,8 @@ class DecisionCascadeStageTrace:
         decision_method = self.decision_method.value
 
         escalated = self.escalated
+
+        upstream_revisions_complete = self.upstream_revisions_complete
 
         upstream_revisions_version = self.upstream_revisions_version
 
@@ -190,6 +197,8 @@ class DecisionCascadeStageTrace:
                 "escalated": escalated,
             }
         )
+        if upstream_revisions_complete is not UNSET:
+            field_dict["upstream_revisions_complete"] = upstream_revisions_complete
         if upstream_revisions_version is not UNSET:
             field_dict["upstream_revisions_version"] = upstream_revisions_version
         if agreement_questions is not UNSET:
@@ -241,6 +250,8 @@ class DecisionCascadeStageTrace:
         decision_method = DecisionCascadeStageTraceDecisionMethod(d.pop("decision_method"))
 
         escalated = d.pop("escalated")
+
+        upstream_revisions_complete = d.pop("upstream_revisions_complete", UNSET)
 
         upstream_revisions_version = d.pop("upstream_revisions_version", UNSET)
 
@@ -403,6 +414,7 @@ class DecisionCascadeStageTrace:
             name=name,
             decision_method=decision_method,
             escalated=escalated,
+            upstream_revisions_complete=upstream_revisions_complete,
             upstream_revisions_version=upstream_revisions_version,
             agreement_questions=agreement_questions,
             upstream_revisions=upstream_revisions,

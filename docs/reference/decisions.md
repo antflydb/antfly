@@ -368,11 +368,17 @@ entries and eight stage path levels. It records every successful generated
 model revision and the upstream cascade definitions, including dependencies
 before a typed final answer. A cascade definition remains a versioned dependency
 even when every stage is typed or no provider reports a model revision.
-`upstream_revisions_version: 1` marks complete projections; only a versioned empty
-manifest explicitly records no versioned dependencies. Older projections may
+New projections use `upstream_revisions_version: 2` with an explicit
+`upstream_revisions_complete` boolean. The node array retains actual model and
+cascade dependencies; false carries uncertainty without consuming any of its
+32 slots. Version-1 projections remain readable, with legacy `unverified` entries
+folded into uncertainty. Only a complete empty projection establishes that no
+versioned dependencies were reported. Older projections may
 have dropped definition-only subtrees even while retaining other model nodes.
-Their old hashes are recognized for migration, but cannot establish completeness
-or authorize replay. Unavailable verification preserves the committed artifact;
+Their old hashes (including the preceding synthetic-marker format) are recognized
+for migration, but cannot establish completeness or authorize identity verdict
+reuse by themselves. A validated historical veto can still retract MATCH to REVIEW
+offline at the full 32-dependency limit. Unavailable verification preserves the committed artifact;
 explicit configuration/source invalidation permits fresh inference. Resolver replay requires an
 authoritative verifier for composite routes and preserves stored receipts when
 that verification is unavailable. Stored successful responses are reclassified

@@ -533,7 +533,7 @@ fn validateDisagreedQuestions(agreement: Agreement, answers: V) !void {
 pub fn responseAgreement(response: V) !?Agreement {
     if (response != .object) return error.InvalidDecisionOutput;
     const raw = response.object.get("cascade") orelse return null;
-    if (raw != .object or response.object.contains("upstream_revisions") or response.object.contains("upstream_revisions_version")) return error.InvalidDecisionOutput;
+    if (raw != .object or response.object.contains("upstream_revisions") or response.object.contains("upstream_revisions_version") or response.object.contains("upstream_revisions_complete")) return error.InvalidDecisionOutput;
     const agreement = try readAgreement(raw.object);
     try validateReportedIdentity(raw.object);
     if (agreement) |reported| try validateDisagreedQuestions(reported, response.object.get("answers") orelse return error.InvalidDecisionOutput);
@@ -557,7 +557,7 @@ pub fn responseAgreement(response: V) !?Agreement {
             if (index == 0 and local != null) return error.InvalidDecisionOutput;
             if (fields.contains("agreement_questions") and (local == null or local.?.status == .unverified)) return error.InvalidDecisionOutput;
             if (fields.get("error")) |failure| {
-                if (failure != .string or failure.string.len == 0 or index == 0 or escalated.bool or fields.contains("answers") or fields.contains("upstream_agreement") or fields.contains("upstream_revisions") or fields.contains("upstream_revisions_version")) return error.InvalidDecisionOutput;
+                if (failure != .string or failure.string.len == 0 or index == 0 or escalated.bool or fields.contains("answers") or fields.contains("upstream_agreement") or fields.contains("upstream_revisions") or fields.contains("upstream_revisions_version") or fields.contains("upstream_revisions_complete")) return error.InvalidDecisionOutput;
                 if (local) |state| if (state.status != .unverified) return error.InvalidDecisionOutput;
                 aggregate = combineAgreement(aggregate, local);
             } else {
@@ -792,7 +792,7 @@ pub fn validateTrace(definition: *const Definition, response: V) !usize {
         if (name != .string or !std.mem.eql(u8, name.string, stage.name) or method != .string or !std.mem.eql(u8, method.string, @tagName(stage.method)) or escalated != .bool) return error.InvalidDecisionOutput;
         const has_next = index + 1 < executed.array.items.len;
         if (fields.get("error")) |err| {
-            if (err != .string or err.string.len == 0 or fields.contains("answers") or index == 0 or has_next or escalated.bool or stage.on_failure != .keep_previous or fields.contains("upstream_agreement") or fields.contains("upstream_revisions") or fields.contains("agreement_questions") or fields.contains("upstream_revisions_version")) return error.InvalidDecisionOutput;
+            if (err != .string or err.string.len == 0 or fields.contains("answers") or index == 0 or has_next or escalated.bool or stage.on_failure != .keep_previous or fields.contains("upstream_agreement") or fields.contains("upstream_revisions") or fields.contains("agreement_questions") or fields.contains("upstream_revisions_version") or fields.contains("upstream_revisions_complete")) return error.InvalidDecisionOutput;
             const expected: ?Agreement = if (stage.require_agreement) .{ .status = .unverified } else null;
             try validateAgreement(fields, expected);
             if (expected) |agreement| aggregate = agreement;
@@ -800,7 +800,7 @@ pub fn validateTrace(definition: *const Definition, response: V) !usize {
         }
         const answers = fields.get("answers") orelse return error.InvalidDecisionOutput;
         try @import("votes.zig").validateResponse(entry, stage.method == .generated);
-        if (fields.contains("upstream_revisions") or fields.contains("upstream_revisions_version")) {
+        if (fields.contains("upstream_revisions") or fields.contains("upstream_revisions_version") or fields.contains("upstream_revisions_complete")) {
             var dependencies: @import("revisions.zig").Manifest = .{};
             try dependencies.collect(entry);
         }
@@ -1029,7 +1029,8 @@ fn appendTrace(a: A, row: *Row, stage: Stage, response: ?V, usage: ?V, err: ?any
     var entry = try trace(a, stage, response, usage, err);
     if (response != null) {
         try put(a, &entry.object, "upstream_revisions", try dependencies.value(a));
-        try put(a, &entry.object, "upstream_revisions_version", .{ .integer = 1 });
+        try put(a, &entry.object, "upstream_revisions_version", .{ .integer = 2 });
+        try put(a, &entry.object, "upstream_revisions_complete", .{ .bool = !dependencies.incomplete });
     }
     var reference: ?AgreementRef = null;
     if (upstream) |agreement| {
@@ -1069,7 +1070,7 @@ fn assemble(a: A, definition: *const Definition, name: []const u8, row: *Row, fi
     var root = std.json.ObjectMap{};
     // Retain the answering stage's metadata (model, identity, provenance).
     for (final.object.keys(), final.object.values()) |key, value| {
-        if (std.mem.eql(u8, key, "usage") or std.mem.eql(u8, key, "cascade") or std.mem.eql(u8, key, "upstream_revisions") or std.mem.eql(u8, key, "upstream_revisions_version")) continue;
+        if (std.mem.eql(u8, key, "usage") or std.mem.eql(u8, key, "cascade") or std.mem.eql(u8, key, "upstream_revisions") or std.mem.eql(u8, key, "upstream_revisions_version") or std.mem.eql(u8, key, "upstream_revisions_complete")) continue;
         try put(a, &root, key, value);
     }
     var usage = std.json.ObjectMap{};

@@ -175,6 +175,8 @@ projections are stage provenance and cannot override a supplied public trace.
 
 Choice and predicate evidence validation is shared by local stages, upstream full
 traces, and resolver thresholds. Complete stage dependency projections carry
-`upstream_revisions_version: 1`. Cascade definitions are pinned independently of
-model revisions; pre-versioned projections are incomplete provenance and old hash
-recognition alone cannot authorize replay.
+`upstream_revisions_version: 2` and an explicit `upstream_revisions_complete`
+boolean. Uncertainty does not consume the 32 actual dependency slots. Version-1
+markers remain readable and older hashes can be recognized without authorizing
+identity verdict reuse. Cascade definitions are pinned independently of model
+revisions; validated historical vetoes can still abstain offline at the node limit.

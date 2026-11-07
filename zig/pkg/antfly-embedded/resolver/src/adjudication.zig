@@ -199,6 +199,7 @@ pub const Config = struct {
     pub const RevisionCache = struct {
         /// Recognition of old stored hashes only; never used with an executor.
         historical: bool = false,
+        previous: bool = false,
         budget: ?ExecutionBudget = null,
         stages: [@import("antfly_decisions").cascade.max_stages]RevisionProbe = @splat(.{}),
         proxies: std.AutoHashMapUnmanaged([32]u8, RevisionProbe) = .empty,
@@ -231,12 +232,12 @@ pub const Config = struct {
 
     fn proxyRevision(self: Config, a: std.mem.Allocator, decider: std.json.Value, response: std.json.Value, executor: ?Executor, cache: *RevisionCache, index: usize) !?[32]u8 {
         var dependencies: @import("antfly_decisions").revisions.Manifest = .{};
-        if (cache.historical) {
+        if (cache.historical or cache.previous) {
             if (executor != null) return error.InvalidAdjudicationOutput;
-            dependencies.collectHistorical(response) catch return error.InvalidAdjudicationOutput;
+            if (cache.historical) dependencies.collectHistorical(response) catch return error.InvalidAdjudicationOutput else dependencies.collectPrevious(response) catch return error.InvalidAdjudicationOutput;
         } else dependencies.collect(response) catch return error.InvalidAdjudicationOutput;
-        if (dependencies.len == 0) return null;
-        const scalar = dependencies.len == 1 and dependencies.nodes[0].kind == .model and dependencies.nodes[0].path.len == 0;
+        if (dependencies.len == 0 and !dependencies.incomplete) return null;
+        const scalar = !dependencies.incomplete and dependencies.len == 1 and dependencies.nodes[0].kind == .model and dependencies.nodes[0].path.len == 0;
         const recorded: [32]u8 = if (scalar) blk: {
             var digest: [32]u8 = undefined;
             _ = std.fmt.hexToBytes(&digest, dependencies.nodes[0].identity) catch return error.InvalidAdjudicationOutput;
@@ -244,9 +245,7 @@ pub const Config = struct {
         } else dependencies.digest(false);
         // Incomplete historical projection cannot establish current execution
         // dependencies. Preserve the stored receipt until explicitly rerun.
-        if (executor != null) for (dependencies.items()) |node| {
-            if (node.kind == .unverified) return error.CapabilityDiscoveryUnavailable;
-        };
+        if (executor != null and dependencies.incomplete) return error.CapabilityDiscoveryUnavailable;
         const model = response.object.get("model") orelse return error.InvalidAdjudicationOutput;
         if (model != .string or model.string.len == 0 or model.string.len > 2048 or !std.unicode.utf8ValidateSlice(model.string)) return error.InvalidAdjudicationOutput;
         const current = executor orelse return recorded;
@@ -288,7 +287,20 @@ pub const Config = struct {
     pub fn historicalResponseRevision(self: Config, a: std.mem.Allocator, response: std.json.Value) !?[32]u8 {
         var cache: RevisionCache = .{ .historical = true };
         defer cache.deinit(a);
-        return self.responseRevision(a, response, null, &cache);
+        return self.responseRevision(a, response, null, &cache) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
+    }
+
+    /// Recognize the previous synthetic-marker format; never verification.
+    pub fn previousResponseRevision(self: Config, a: std.mem.Allocator, response: std.json.Value) !?[32]u8 {
+        var cache: RevisionCache = .{ .previous = true };
+        defer cache.deinit(a);
+        return self.responseRevision(a, response, null, &cache) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
     }
 
     /// Previous writers pinned only the final generated answer of a proxy.

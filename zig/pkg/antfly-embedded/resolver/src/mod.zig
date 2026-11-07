@@ -2264,6 +2264,16 @@ pub const ResolutionStage = struct {
                                 const historical = try self.adjudicate.?.historicalResponseRevision(arena, response);
                                 const historical_hash = if (historical) |digest| try fingerprintHex(arena, .{ base_receipt_hash, digest }) else base_receipt_hash;
                                 legacy = std.mem.eql(u8, evidence.execution_hash, historical_hash);
+                                if (!legacy) {
+                                    // A preceding writer hashed injected markers.
+                                    // Its capacity overflow cannot invalidate a
+                                    // valid older binding recognized above.
+                                    const previous = self.adjudicate.?.previousResponseRevision(arena, response) catch |err| switch (err) {
+                                        error.OutOfMemory => return err,
+                                        else => null,
+                                    };
+                                    if (previous) |digest| legacy = std.mem.eql(u8, evidence.execution_hash, try fingerprintHex(arena, .{ base_receipt_hash, digest }));
+                                }
                             }
                             if (!std.mem.eql(u8, evidence.execution_hash, recorded_hash) and !legacy) continue;
                             replay_statuses[i] = try classifier.?.classify(response);
@@ -4922,7 +4932,8 @@ const RevisionedAdjudicationFixture = struct {
         var manifest: @import("antfly_decisions").revisions.Manifest = .{};
         try manifest.collect(source);
         try stage.object.put(alloc, "upstream_revisions", try manifest.value(alloc));
-        try stage.object.put(alloc, "upstream_revisions_version", .{ .integer = 1 });
+        try stage.object.put(alloc, "upstream_revisions_version", .{ .integer = 2 });
+        try stage.object.put(alloc, "upstream_revisions_complete", .{ .bool = !manifest.incomplete });
         try stage.object.put(alloc, "agreement_status", .{ .string = if (veto) "unverified" else "agreed" });
         if (veto) {
             try stage.object.put(alloc, "upstream_agreement", summary);
@@ -5954,7 +5965,10 @@ test "REVIEW typed upstream cascade retains its definition dependency" {
     // absent. Keep the artifact intact and require explicit invalidation.
     const legacy = try std.json.parseFromSliceLeaky(std.json.Value, alloc, accepted_artifact, .{});
     const evidence = legacy.object.getPtr("entities").?.array.items[0].object.getPtr("adjudication").?;
-    for (evidence.object.getPtr("response").?.object.getPtr("cascade").?.object.getPtr("stages").?.array.items) |*entry| _ = entry.object.swapRemove("upstream_revisions_version");
+    for (evidence.object.getPtr("response").?.object.getPtr("cascade").?.object.getPtr("stages").?.array.items) |*entry| {
+        _ = entry.object.swapRemove("upstream_revisions_version");
+        _ = entry.object.swapRemove("upstream_revisions_complete");
+    }
     try evidence.object.put(alloc, "execution_hash", legacy.object.get("adjudication_execution_hash").?);
     const historical_bytes = try std.json.Stringify.valueAlloc(alloc, legacy, .{});
     try map.store().put("resolution", historical_bytes);
@@ -5994,20 +6008,103 @@ test "REVIEW historical composite bindings preserve evidence without authorizing
     const old = try std.json.parseFromSliceLeaky(std.json.Value, scratch, map.map.get("resolution").?, .{});
     const evidence = old.object.getPtr("entities").?.array.items[0].object.getPtr("adjudication").?;
     const response = evidence.object.getPtr("response").?;
-    for (response.object.getPtr("cascade").?.object.getPtr("stages").?.array.items) |*entry| _ = entry.object.swapRemove("upstream_revisions_version");
+    for (response.object.getPtr("cascade").?.object.getPtr("stages").?.array.items) |*entry| {
+        _ = entry.object.swapRemove("upstream_revisions_version");
+        _ = entry.object.swapRemove("upstream_revisions_complete");
+    }
     const historical = (try config.value.historicalResponseRevision(scratch, response.*)).?;
     var cache: adjudication.Config.RevisionCache = .{};
     defer cache.deinit(scratch);
     const current = (try config.value.responseRevision(scratch, response.*, null, &cache)).?;
     try testing.expect(!std.mem.eql(u8, &historical, &current));
-    try evidence.object.put(scratch, "execution_hash", .{ .string = try fingerprintHex(scratch, .{ old.object.get("adjudication_execution_hash").?.string, historical }) });
-    const bytes = try std.json.Stringify.valueAlloc(scratch, old, .{});
-    try map.store().put("resolution", bytes);
+    const previous = (try config.value.previousResponseRevision(scratch, response.*)).?;
+    try testing.expect(!std.mem.eql(u8, &historical, &previous));
+    for ([_][32]u8{ historical, previous }) |binding| {
+        try evidence.object.put(scratch, "execution_hash", .{ .string = try fingerprintHex(scratch, .{ old.object.get("adjudication_execution_hash").?.string, binding }) });
+        const bytes = try std.json.Stringify.valueAlloc(scratch, old, .{});
+        try map.store().put("resolution", bytes);
+        stage.adjudicator = null;
+        try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), null, "source", "resolution"));
+        stage.adjudicator = fixture.executor();
+        try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+        try testing.expectEqualStrings(bytes, map.map.get("resolution").?);
+        try testing.expectEqual(@as(usize, 1), fixture.base.calls);
+        try testing.expectEqual(@as(usize, 0), fixture.probes);
+    }
+}
+
+test "REVIEW maximum historical dependency receipts can still retract a veto" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const cfg = try adjudication.Config.parse(a, adjudication_test_config);
+    defer cfg.deinit();
+    const response = try AgreementUpstreamFixture.response(scratch, cfg.value, @splat(0xaa), true);
+    const entries = response.object.get("cascade").?.object.get("stages").?.array.items;
+    for (entries) |*entry| {
+        _ = entry.object.swapRemove("upstream_revisions_version");
+        _ = entry.object.swapRemove("upstream_revisions_complete");
+    }
+    const nodes = entries[1].object.getPtr("upstream_revisions").?;
+    for (0..30) |index| {
+        var node = std.json.Value{ .object = .empty };
+        try node.object.put(scratch, "kind", .{ .string = "model" });
+        try node.object.put(scratch, "identity", .{ .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+        try node.object.put(scratch, "model", .{ .string = "leaf-a" });
+        var path = std.json.Array.init(scratch);
+        try path.append(.{ .string = try std.fmt.allocPrint(scratch, "branch{d}", .{index}) });
+        try node.object.put(scratch, "path", .{ .array = path });
+        try nodes.array.append(node);
+    }
+    try testing.expectEqual(adjudication.Status.abstained, try adjudication.classify(scratch, cfg.value, response));
+    var historical: @import("antfly_decisions").revisions.Manifest = .{};
+    try historical.collectHistorical(response);
+    try testing.expectEqual(@as(usize, 32), historical.len);
+    var cache: adjudication.Config.RevisionCache = .{};
+    defer cache.deinit(scratch);
+    try testing.expect((try cfg.value.responseRevision(scratch, response, null, &cache)) != null);
+    var fixture = AdjudicationFixture{ .response = try std.json.Stringify.valueAlloc(scratch, try AgreementUpstreamFixture.response(scratch, cfg.value, @splat(0xaa), false), .{}) };
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = cfg.value, .adjudicator = fixture.executor(), .work_retention = .none };
+    _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+    const old = try std.json.parseFromSliceLeaky(std.json.Value, scratch, map.map.get("resolution").?, .{});
+    const evidence = old.object.getPtr("entities").?.array.items[0].object.getPtr("adjudication").?;
+    try evidence.object.put(scratch, "response", response);
+    try evidence.object.put(scratch, "specification_hash", .{ .string = try fingerprintHex(scratch, .{ try cfg.value.semantic(scratch), historical.digest(false) }) });
+    try evidence.object.put(scratch, "execution_hash", .{ .string = try fingerprintHex(scratch, .{ old.object.get("adjudication_execution_hash").?.string, historical.digest(false) }) });
+    try map.store().put("resolution", try std.json.Stringify.valueAlloc(scratch, old, .{}));
     stage.adjudicator = null;
+    _ = try stage.run(a, map.store(), null, "source", "resolution");
+    var replay = try parseResolution(a, map.map.get("resolution").?);
+    defer replay.deinit();
+    try testing.expectEqual(Decision.review, replay.entities[0].decision);
+    try testing.expectEqual(adjudication.Status.abstained, replay.entities[0].adjudication.?.status);
+    try testing.expectEqual(@as(usize, 1), fixture.calls);
+    // The same capacity fix cannot authorize an incomplete positive verdict.
+    const metadata = response.object.getPtr("cascade").?;
+    const strong = &metadata.object.getPtr("stages").?.array.items[1];
+    const fast = &metadata.object.getPtr("stages").?.array.items[0].object.getPtr("answers").?.array.items[0];
+    try fast.object.put(scratch, "choice", .{ .string = "same" });
+    try fast.object.getPtr("probabilities").?.array.items[0].object.put(scratch, "probability", .{ .float = 0.97 });
+    try fast.object.getPtr("probabilities").?.array.items[1].object.put(scratch, "probability", .{ .float = 0.03 });
+    for ([_]*std.json.Value{ metadata, strong }) |fields| {
+        try fields.object.put(scratch, "agreement_status", .{ .string = "agreed" });
+        try fields.object.put(scratch, "agreed", .{ .bool = true });
+        _ = fields.object.swapRemove("disagreed_questions");
+    }
+    try testing.expectEqual(adjudication.Status.accepted, try adjudication.classify(scratch, cfg.value, response));
+    const positive = try std.json.Stringify.valueAlloc(scratch, old, .{});
+    try map.store().put("resolution", positive);
     try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), null, "source", "resolution"));
     stage.adjudicator = fixture.executor();
-    try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
-    try testing.expectEqualStrings(bytes, map.map.get("resolution").?);
-    try testing.expectEqual(@as(usize, 1), fixture.base.calls);
-    try testing.expectEqual(@as(usize, 0), fixture.probes);
+    try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+    try testing.expectEqualStrings(positive, map.map.get("resolution").?);
+    try testing.expectEqual(@as(usize, 1), fixture.calls);
 }
