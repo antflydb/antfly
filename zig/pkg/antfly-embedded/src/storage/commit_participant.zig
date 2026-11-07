@@ -51,6 +51,12 @@ fn isAllowedReplayKey(key: []const u8) bool {
     return false;
 }
 
+/// Read-only cursor type returned by `View.openCursor`. `backend_erased.zig`
+/// is itself backend-agnostic (a type-erased vtable, not a Lite-specific
+/// module), so referencing its `Cursor` here keeps this file's "never import
+/// a Lite-specific module" property intact.
+pub const Cursor = @import("backend_erased.zig").Cursor;
+
 /// Unwraps every level of pointer indirection. `View.from`'s `txn:
 /// anytype` argument is sometimes a single pointer (`&concrete_txn`) and
 /// sometimes a pointer-to-a-copied-pointer (callers that themselves
@@ -77,12 +83,22 @@ pub const View = struct {
     /// exactly as `native_catalog_backend.Options.scope`/
     /// `native_catalog_sink.zig`'s `Sink.submit` already use.
     put_index_catalog_fn: ?*const fn (*anyopaque, scope: []const u8, mutations: []const IndexCatalogMutation) anyerror!void = null,
-    /// WS4 phase 2 (coverage/repair-issue ride-along): optional delete
-    /// capability into the primary keyspace, wired whenever the host
-    /// transaction supports it. `null` on a host with no such method
-    /// (every backend `View.from` sees today supports it, but `putReplay`/
-    /// `deleteReplay` only need the restriction, not the guarantee).
+    /// WS4 phase 2 (coverage/repair-issue ride-along) and algebraic inline
+    /// apply (see `mutation_materialization.zig`'s
+    /// `InlineAlgebraicPublication`): optional delete capability into the
+    /// private metadata namespace, wired whenever the host transaction
+    /// supports it. Algebraic index storage already lives entirely under
+    /// that namespace (`\x00\x00__algebraic__:` and sibling prefixes in
+    /// `storage/db/algebraic/index.zig`), so its read-modify-write fact
+    /// maintenance needs `delete`/`openCursor` on the SAME restricted
+    /// surface as `put` above, not a second catalog root. `null` on a host
+    /// with no such method (every backend `View.from` sees today supports
+    /// it, but `putReplay`/`deleteReplay`/algebraic fall back safely via
+    /// `error.DeleteUnsupported`/`error.CursorUnsupported`).
     delete_fn: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+    open_cursor_fn: ?*const fn (*anyopaque) anyerror!Cursor = null,
+    append_put_fn: ?*const fn (*anyopaque, []const u8, []const u8) anyerror!void = null,
+    get_many_sorted_fn: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
 
     pub fn get(self: View, key: []const u8) ![]const u8 {
         return self.get_fn(self.ptr, key);
@@ -94,6 +110,39 @@ pub const View = struct {
         // is writable through this restricted commit view.
         if (key.len < 2 or key[0] != 0 or key[1] != 0) return error.InvalidCommitMetadata;
         return self.put_fn(self.ptr, key, value);
+    }
+
+    /// Same private-metadata-only restriction as `put`, for the same reason.
+    pub fn delete(self: View, key: []const u8) !void {
+        if (key.len < 2 or key[0] != 0 or key[1] != 0) return error.InvalidCommitMetadata;
+        const delete_fn = self.delete_fn orelse return error.DeleteUnsupported;
+        return delete_fn(self.ptr, key);
+    }
+
+    /// Read-only: ranges over the host transaction's full keyspace (not
+    /// restricted to the private metadata namespace), exactly like `get`
+    /// above. `error.CursorUnsupported` when the host transaction does not
+    /// expose one.
+    pub fn openCursor(self: View) !Cursor {
+        const open_cursor_fn = self.open_cursor_fn orelse return error.CursorUnsupported;
+        return open_cursor_fn(self.ptr);
+    }
+
+    /// Same private-metadata-only restriction as `put`; same bulk-append
+    /// shortcut the host transaction's own `appendPut` provides.
+    /// `error.AppendPutUnsupported` when the host transaction does not
+    /// expose one (a participant may always fall back to `put`).
+    pub fn appendPut(self: View, key: []const u8, value: []const u8) !void {
+        if (key.len < 2 or key[0] != 0 or key[1] != 0) return error.InvalidCommitMetadata;
+        const append_put_fn = self.append_put_fn orelse return error.AppendPutUnsupported;
+        return append_put_fn(self.ptr, key, value);
+    }
+
+    /// Read-only, unrestricted keyspace, like `get`. `error.GetManySortedUnsupported`
+    /// when the host transaction does not expose one.
+    pub fn getManySorted(self: View, keys: []const []const u8, values: []?[]const u8) !void {
+        const get_many_sorted_fn = self.get_many_sorted_fn orelse return error.GetManySortedUnsupported;
+        return get_many_sorted_fn(self.ptr, keys, values);
     }
 
     /// Stage `mutations` into the host transaction's index-catalog root
@@ -149,6 +198,18 @@ pub const View = struct {
                 const typed: T = @ptrCast(@alignCast(ptr));
                 return typed.*.delete(key);
             }
+            fn openCursor(ptr: *anyopaque) !Cursor {
+                const typed: T = @ptrCast(@alignCast(ptr));
+                return typed.*.openCursor();
+            }
+            fn appendPut(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
+                const typed: T = @ptrCast(@alignCast(ptr));
+                return typed.*.appendPut(key, value);
+            }
+            fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) !void {
+                const typed: T = @ptrCast(@alignCast(ptr));
+                return typed.*.getManySorted(keys, values);
+            }
         };
         return .{
             .ptr = @ptrCast(txn),
@@ -156,6 +217,9 @@ pub const View = struct {
             .put_fn = Bridge.put,
             .put_index_catalog_fn = if (@hasDecl(BaseType(T), "putIndexCatalogBatch")) Bridge.putIndexCatalog else null,
             .delete_fn = if (@hasDecl(BaseType(T), "delete")) Bridge.delete else null,
+            .open_cursor_fn = if (@hasDecl(BaseType(T), "openCursor")) Bridge.openCursor else null,
+            .append_put_fn = if (@hasDecl(BaseType(T), "appendPut")) Bridge.appendPut else null,
+            .get_many_sorted_fn = if (@hasDecl(BaseType(T), "getManySorted")) Bridge.getManySorted else null,
         };
     }
 };
@@ -361,6 +425,44 @@ test "view putIndexCatalog reports unsupported when the host transaction has no 
 
     const view = View.from(&txn);
     try std.testing.expectError(error.IndexCatalogUnsupported, view.putIndexCatalog("scope", &.{}));
+}
+
+test "view delete and openCursor report unsupported when the host transaction has neither" {
+    var txn = TestTxn{};
+    defer txn.deinit();
+
+    const view = View.from(&txn);
+    try std.testing.expectError(error.DeleteUnsupported, view.delete("\x00\x00k"));
+    try std.testing.expectError(error.CursorUnsupported, view.openCursor());
+}
+
+const DeletingTxn = struct {
+    values: std.StringHashMapUnmanaged([]const u8) = .empty,
+
+    pub fn get(self: *DeletingTxn, key: []const u8) ![]const u8 {
+        return self.values.get(key) orelse error.NotFound;
+    }
+    pub fn put(self: *DeletingTxn, key: []const u8, value: []const u8) !void {
+        try self.values.put(std.testing.allocator, key, value);
+    }
+    pub fn delete(self: *DeletingTxn, key: []const u8) !void {
+        if (!self.values.remove(key)) return error.NotFound;
+    }
+    pub fn deinit(self: *DeletingTxn) void {
+        self.values.deinit(std.testing.allocator);
+    }
+};
+
+test "view delete reaches a host transaction that implements delete, restricted to private metadata keys" {
+    var txn = DeletingTxn{};
+    defer txn.deinit();
+
+    const view = View.from(&txn);
+    try view.put("\x00\x00k", "v");
+    try std.testing.expectEqualStrings("v", try txn.get("\x00\x00k"));
+    try view.delete("\x00\x00k");
+    try std.testing.expectError(error.NotFound, txn.get("\x00\x00k"));
+    try std.testing.expectError(error.InvalidCommitMetadata, view.delete("public-key"));
 }
 
 const IndexCatalogTxn = struct {
