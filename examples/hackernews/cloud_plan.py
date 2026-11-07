@@ -124,6 +124,10 @@ def native_plan(project, archive_auth, current_auth, archive_prefix="archive"):
     archive["schema"]["base_source"] = {
         "kind": "external",
         "format": "parquet",
+        # HN exports use fresh object names. This promises immutable file
+        # contents, not immutable prefix membership, and avoids per-file HEAD
+        # revalidation when using the published index.
+        "object_mutability": "immutable",
         "table_id": "hn-archive",
         "uri": f"gs://{project}-hn-archive/{archive_prefix}",
         "credentials": {"ref": connection(archive_auth)},
