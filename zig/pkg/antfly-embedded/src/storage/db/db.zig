@@ -93459,6 +93459,39 @@ test "db dense repair reprocesses corrupt managed source before rebuilding" {
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 
+test "db dense enrichment skips unchanged multimodal parts" {
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedSingleCall;
+        }
+        fn parts(ptr: *anyopaque, a: Allocator, _: []const u8, _: []const template_mod.ContentPart, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return a.dupe(f32, &.{ 1, 0, 0 });
+        }
+    };
+    var probe = Probe{};
+    var directory = try TestDirectory.init("parts-source-hash");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_parts_fn = Probe.parts } } });
+    defer db.close();
+    try db.addIndex(.{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{body}}\"}}" });
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"same source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"same source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"new source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+}
+
 test "db dense enrichment skips unchanged source hash" {
     try testDenseSourceHashReuse(.{});
 }
