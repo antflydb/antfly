@@ -49,7 +49,8 @@ const AssetResolver = struct {
     fn resolve(self: *AssetResolver, relative: []const u8) ![]u8 {
         if (!metadata_mod.isSafeRelativeAssetPath(relative))
             return error.InvalidMetadata;
-        const canonical = (self.published.resolve(relative) catch |err| switch (err) {
+        const selected = if (std.mem.endsWith(u8, relative, ".onnx")) self.published.resolveModel(relative) else self.published.resolve(relative);
+        const canonical = (selected catch |err| switch (err) {
             error.ModelArtifactOutsideRoot => return error.ModelAssetOutsideRoot,
             else => return err,
         }) orelse return error.FileNotFound;
