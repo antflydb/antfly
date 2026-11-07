@@ -3381,7 +3381,7 @@ pub const GraphIndex = struct {
         // both lease takeover and the new expiry on the time at which the
         // transaction is actually ready to commit, not the pre-scan probe.
         const lease_started_at_ms = self.clock.nowRealtimeMs();
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
 
         // The disabled marker is checked in the same transaction that creates
@@ -3552,7 +3552,7 @@ pub const GraphIndex = struct {
         }
         var partition_plan = try self.prepareGraphMetricPartitionPlan(cfg);
         defer partition_plan.deinit(self.alloc);
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         try partition_plan.validateMetricSnapshot(self, &batch, cfg, job.target_generation);
         try self.planGraphMetricBuildManifestInBatch(&batch, metric_name, cfg, job, partition_plan);
@@ -3754,7 +3754,7 @@ pub const GraphIndex = struct {
         }
         defer state.deinit(self.alloc);
         const boundary_digest = if (complete) state.boundaryDigest() else @as([32]u8, @splat(0));
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current = batch.get(key) catch |err| switch (err) {
             error.NotFound => "",
@@ -3904,7 +3904,7 @@ pub const GraphIndex = struct {
         }
         defer state.deinit(self.alloc);
         const boundary_digest = if (complete) state.boundaryDigest() else @as([32]u8, @splat(0));
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current = batch.get(graph_metric_partition_census_key) catch |err| switch (err) {
             error.NotFound => "",
@@ -3991,7 +3991,7 @@ pub const GraphIndex = struct {
             }
             complete = item == null;
         }
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current = batch.get(typed_edges.cursor_key) catch |err| switch (err) {
             error.NotFound => "",
@@ -4924,7 +4924,7 @@ pub const GraphIndex = struct {
     ) !?GraphMetricBuildPage {
         if (worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
         var candidate_page_id: ?u64 = null;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         if (try self.metricBuildPage(&batch, metric_name, job_id, phase, iteration, 0)) |summary_page| {
             if (summary_page.range_kind == .summary and summary_page.state != .complete) {
@@ -5040,7 +5040,7 @@ pub const GraphIndex = struct {
         now_ms: u64,
     ) !?GraphMetricBuildPage {
         if (worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const claimed = try self.claimGraphMetricBuildPageInBatch(&batch, metric_name, job_id, phase, iteration, page_id, worker_id, now_ms);
         try batch.commit();
@@ -5137,7 +5137,7 @@ pub const GraphIndex = struct {
         completed_units: u64,
         total_units: u64,
     ) !GraphMetricBuildPage {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const page = try self.updateGraphMetricBuildPageProgressInBatch(
             &batch,
@@ -5201,7 +5201,7 @@ pub const GraphIndex = struct {
         seed_mass: f64,
     ) !GraphMetricBuildPage {
         if (!std.math.isFinite(rank_sum) or !std.math.isFinite(seed_mass) or seed_mass < 0) return error.InvalidGraphMetricScore;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job_id, phase, iteration, page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (page.range_kind != .summary) return error.InvalidGraphMetricBuildPage;
@@ -5233,7 +5233,7 @@ pub const GraphIndex = struct {
         total_delta: f64,
         rank_sum: f64,
     ) !GraphMetricBuildPage {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job_id, .check_convergence, iteration, page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (page.state != .leased or !std.mem.eql(u8, page.worker_id, worker_id)) return error.GraphMetricBuildPageNotLeased;
@@ -5333,7 +5333,7 @@ pub const GraphIndex = struct {
         rank_sum: f64,
         converged: bool,
     ) !GraphMetricBuildPage {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job_id, phase, iteration, page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (page.state == .complete) {
@@ -5397,7 +5397,7 @@ pub const GraphIndex = struct {
         expected_attempt: u64,
         last_error: []const u8,
     ) !GraphMetricBuildPage {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job_id, phase, iteration, page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (page.state != .leased or !std.mem.eql(u8, page.worker_id, worker_id)) return error.GraphMetricBuildPageNotLeased;
@@ -5424,7 +5424,7 @@ pub const GraphIndex = struct {
         phase: GraphMetricBuildPhase,
         iteration: u32,
     ) !GraphMetricBuildPhaseSummary {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
         if (job.job_id != job_id) return error.GraphMetricBuildJobMismatch;
@@ -5584,7 +5584,7 @@ pub const GraphIndex = struct {
     }
 
     fn advanceGraphMetricBuildPhaseWithRetirement(self: *GraphIndex, metric_name: []const u8, job_id: u64, phase: GraphMetricBuildPhase, iteration: u32, retired: ?*usize) !bool {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
         if (job.job_id != job_id) return error.GraphMetricBuildJobMismatch;
@@ -5764,7 +5764,7 @@ pub const GraphIndex = struct {
         job_id: u64,
         iteration: u32,
     ) !GraphMetricBuildIterationSummary {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
         if (job.job_id != job_id) return error.GraphMetricBuildJobMismatch;
@@ -5813,7 +5813,7 @@ pub const GraphIndex = struct {
         metric_name: []const u8,
         job_id: u64,
     ) !GraphMetricBuildPublishVerification {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
         if (job.job_id != job_id) return error.GraphMetricBuildJobMismatch;
@@ -5901,7 +5901,7 @@ pub const GraphIndex = struct {
     }
 
     fn releaseGraphMetricBuildLease(self: *GraphIndex, metric_name: []const u8) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const key = try self.graphMetricBuildLeaseKeyAlloc(metric_name);
         defer self.alloc.free(key);
@@ -5930,7 +5930,7 @@ pub const GraphIndex = struct {
         completed_units: u64,
         total_units: u64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const key = try self.graphMetricBuildLeaseKeyAlloc(metric_name);
         defer self.alloc.free(key);
@@ -5974,7 +5974,7 @@ pub const GraphIndex = struct {
     }
 
     fn completeGraphMetricBuildJob(self: *GraphIndex, metric_name: []const u8) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const job = try self.metricBuildJob(&batch, metric_name) orelse {
             try batch.commit();
@@ -6029,7 +6029,7 @@ pub const GraphIndex = struct {
         metric_name: []const u8,
         job_id: u64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var manifest = try self.metricBuildManifest(&batch, metric_name, job_id) orelse return error.GraphMetricBuildManifestNotFound;
         manifest.config_fingerprint +%= 1;
@@ -6472,7 +6472,7 @@ pub const GraphIndex = struct {
     fn recordGraphMetricFailureReasonAtGeneration(self: *GraphIndex, requested_name: []const u8, failure_reason: []const u8, preparation_generation: ?u64, preparation_task: ?[]const u8) !void {
         const metric_name = if (preparation_task != null) try self.graphMetricLifecycleOwnerName(requested_name) else requested_name;
         const pair_cfg = if (self.metricConfig(metric_name)) |cfg| self.pairedHitsMetricConfig(cfg) else null;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         if (preparation_task) |task_name| {
             const task_key = try topologyTaskKeyAlloc(self.alloc, task_name);
@@ -6645,6 +6645,16 @@ pub const GraphIndex = struct {
         // Rebuild is exclusive maintenance, not a query-time fallback. Its
         // marker remains durable until counters and the final cursor commit.
         // Opening the index resumes it before readers/workers can observe it.
+        //
+        // §3.2a audit: stays durable, not `.ride_along`, deliberately. This
+        // (and `rebuildCounterPage`'s own commit below) runs synchronously
+        // inside `openWithPrivateStores` on every reopen while
+        // `counters_pending`, before the index is otherwise live -- there is
+        // no guaranteed later foreground group within that same admission
+        // sequence to carry a ride-along member's durability. Confirmed by
+        // the crash-sweep harness: converting this site surfaced a real
+        // `InvalidNativeAllocator` failure on the ordinary (uncrashed)
+        // graph-add-index-with-metrics discovery pass.
         {
             var batch = try self.beginWriteReverseBatch();
             errdefer batch.abort();
@@ -6688,6 +6698,7 @@ pub const GraphIndex = struct {
         }
     }
 
+    // §3.2a audit: stays durable -- see `rebuildCounterMetadata`'s note above.
     fn rebuildCounterPage(self: *GraphIndex) !bool {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -6965,7 +6976,7 @@ pub const GraphIndex = struct {
     }
 
     pub fn publishArtifactRebuildSequence(self: *GraphIndex, sequence: u64) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const previous = try readU64OrZero(&batch, artifact_rebuild_sequence_key);
         try putU64(&batch, artifact_rebuild_sequence_key, @max(previous, sequence));
@@ -7394,7 +7405,7 @@ pub const GraphIndex = struct {
         if (snapshots.len == 0) return;
         var read = try self.beginReadReverseTxn();
         defer read.abort();
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var seen = std.StringHashMapUnmanaged(void).empty;
         defer {
@@ -7492,7 +7503,7 @@ pub const GraphIndex = struct {
     pub fn publishContributionOrderingReady(self: *GraphIndex) !void {
         try self.sync(true);
         {
-            var batch = try self.beginWriteReverseBatch();
+            var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer batch.abort();
             try batch.put(contribution_ordering_ready_key, "1");
             try bumpReverseReadGeneration(&batch);
@@ -8348,7 +8359,7 @@ pub const GraphIndex = struct {
     /// Reference oracle for endpoint-maintenance cost. Abort leaves the same
     /// durable fixture available to every sample; WAL/commit are not measured.
     pub fn benchmarkTypedMembershipUpdates(self: *GraphIndex, alloc: Allocator, writes: []const BatchWrite, reference: bool) !usize {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         defer batch.abort();
         var updates = typed_edges.Updates.init(alloc);
         defer updates.deinit();
@@ -8366,7 +8377,7 @@ pub const GraphIndex = struct {
         const key = try self.graphMetricPartitionPlanKeyAlloc(filter);
         defer self.alloc.free(key);
         {
-            var batch = try self.beginWriteReverseBatch();
+            var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer batch.abort();
             batch.delete(key) catch |err| if (err != error.NotFound) return err;
             if (filter.mode == .all) batch.delete(graph_metric_partition_census_key) catch |err| if (err != error.NotFound) return err;
@@ -9788,6 +9799,13 @@ pub const GraphIndex = struct {
     /// Upgrade old edge-ordered membership once, in bounded durable pages.
     /// The metadata directory also holds recovery identities across store commits.
     /// Normal producer cleanup then seeks only that producer's key range.
+    ///
+    /// §3.2a audit: `ensureLegacyOwnerDirectoryPage`'s commit stays durable,
+    /// not `.ride_along` -- same reason as `rebuildCounterMetadata`/
+    /// `rebuildCounterPage` above: `openWithPrivateStores` calls this
+    /// unconditionally on every writable open/reopen, before the index is
+    /// otherwise live, with no guaranteed later foreground group in that
+    /// same admission sequence to carry a ride-along member's durability.
     fn ensureLegacyOwnerDirectory(self: *GraphIndex) !void {
         while (!try self.ensureLegacyOwnerDirectoryPage()) {}
     }
@@ -9884,7 +9902,7 @@ pub const GraphIndex = struct {
             complete = if (row) |entry| !std.mem.startsWith(u8, entry.key, prefix) else true;
         }
         if (keys.items.len == 0) return true;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         for (keys.items) |key| try batch.delete(key);
         for (due.items) |key| try batch.delete(key);
@@ -9933,7 +9951,7 @@ pub const GraphIndex = struct {
             complete = if (row) |entry| !std.mem.startsWith(u8, entry.key, prefix) else true;
         }
         if (keys.items.len == 0) return true;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         for (keys.items) |key| try batch.delete(key);
         for (due.items) |key| try batch.delete(key);
@@ -10167,7 +10185,7 @@ pub const GraphIndex = struct {
         var cursor = try source.openCursor();
         defer cursor.close();
         cursor.setUpperBound(if (range_upper.len > 0) range_upper else null);
-        var batch = try dest.beginWriteOutgoingBatch();
+        var batch = try dest.beginWriteOutgoingBatchWithOptions(.{ .durability = .ride_along });
         var active = true;
         errdefer if (active) batch.abort();
         var copied: usize = 0;
@@ -10198,7 +10216,7 @@ pub const GraphIndex = struct {
             if (bytes >= 4 * 1024 * 1024 or copied % reverse_rebuild_batch_size == 0) {
                 try batch.commit();
                 active = false;
-                batch = try dest.beginWriteOutgoingBatch();
+                batch = try dest.beginWriteOutgoingBatchWithOptions(.{ .durability = .ride_along });
                 active = true;
                 bytes = 0;
             }
@@ -12815,7 +12833,7 @@ pub const GraphIndex = struct {
     /// Benchmark fixture only: one canonical leaf with maximum producer fan-in.
     pub fn benchmarkMembershipFixture(self: *GraphIndex, nodes: []const []const u8) !void {
         if (nodes.len > graph_metric_build_target_reduce_page_units) return error.InvalidBenchmarkResult;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         try self.putGraphMetricBuildManifestInBatch(&batch, "bench-membership", .{ .job_id = 1, .node_count = nodes.len });
         try self.putGraphMetricBuildPageInBatch(&batch, "bench-membership", .{ .job_id = 1, .phase = .initialize_ranks, .page_id = graph_metric_build_summary_leaf_base, .range_kind = .summary, .state = .complete, .completed_units = nodes.len, .total_units = nodes.len });
@@ -13194,7 +13212,7 @@ pub const GraphIndex = struct {
     }
 
     pub fn prepareSealedVectorBenchmark(self: *GraphIndex) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var chunk: vector_chunk.Chunk = @splat(0);
         for (0..vector_chunk.entries) |slot| try vector_chunk.put(&chunk, slot, 0.5);
@@ -13323,7 +13341,7 @@ pub const GraphIndex = struct {
             }
         }.lessThan);
         const completed = std.math.add(u64, prior, topology.scanned) catch return error.InvalidGraphMetricBuildProgress;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current = try self.metricBuildPage(&batch, metric_name, job.job_id, page.phase, page.iteration, page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(page, current);
@@ -13469,7 +13487,7 @@ pub const GraphIndex = struct {
                 if (state.count != 0) try outputs.append(temp, try ordinal_blocks.encodeTopology(temp, .{ .edges = state.pending[0..state.count], .cursor = @constCast(""), .scanned = state.count, .complete = true }));
             }
         }
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current = try self.metricBuildPage(&batch, metric_name, job.job_id, claimed.phase, claimed.iteration, claimed.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed, current);
@@ -13933,7 +13951,7 @@ pub const GraphIndex = struct {
             const packed_records = try self.compactOrdinalAdjacencyChunk(metric_name, job, claimed, producer_phase, chunk, @min(max_records, graph_metric_build_adoption_page_units));
             return packed_records + try self.executeOrdinalReduceSummaryCheckpoint(metric_name, cfg, job, claimed, max_nodes, max_records, false);
         }
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var current = try self.metricBuildPage(&batch, metric_name, job.job_id, claimed.phase, claimed.iteration, claimed.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed, current);
@@ -14009,7 +14027,7 @@ pub const GraphIndex = struct {
             break :read end;
         };
         if (pack) |chunk| return self.compactOrdinalAdjacencyChunk(metric, job, claimed, producer, chunk, @min(max_records, graph_metric_build_adoption_page_units));
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var current = try self.metricBuildPage(&batch, metric, job.job_id, claimed.phase, 0, claimed.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed, current);
@@ -14153,7 +14171,7 @@ pub const GraphIndex = struct {
         };
 
         if (!adopted_topology and page.phase == .initialize_ranks and page.page_id >= graph_metric_build_summary_leaf_base) {
-            var batch = try self.beginWriteReverseBatch();
+            var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer batch.abort();
             const current = try self.metricBuildPage(&batch, metric_name, job.job_id, page.phase, page.iteration, page.page_id) orelse return error.GraphMetricBuildPageNotFound;
             try self.validateGraphMetricBuildPageExecutionLease(page, current);
@@ -14311,7 +14329,7 @@ pub const GraphIndex = struct {
                 else => return err,
             }
         }
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current = try self.metricBuildPage(&batch, metric_name, job.job_id, claimed.phase, claimed.iteration, claimed.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed, current);
@@ -14547,7 +14565,7 @@ pub const GraphIndex = struct {
         completed_units: u64,
         total_units: u64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current_page = try self.metricBuildPage(&batch, metric_name, job.job_id, .scan_edges_and_out_degree, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
@@ -14703,7 +14721,7 @@ pub const GraphIndex = struct {
         initialized: []const PageRankInitializeNode,
         initial_rank: f64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current_page = try self.metricBuildPage(&batch, metric_name, job.job_id, .initialize_ranks, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
@@ -14755,7 +14773,7 @@ pub const GraphIndex = struct {
         completed_units: u64,
         total_units: u64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current_page = try self.metricBuildPage(&batch, metric_name, job.job_id, .iterate_contributions, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
@@ -14895,7 +14913,7 @@ pub const GraphIndex = struct {
         output_fingerprint: u64,
         complete_page: bool,
     ) !GraphMetricBuildPage {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job.job_id, .reduce_ranks, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (page.state == .complete) {
@@ -15048,7 +15066,7 @@ pub const GraphIndex = struct {
         initialized_nodes: []const PageRankInitializeNode,
         initial_rank: f64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current_page = try self.metricBuildPage(&batch, metric_name, job.job_id, .initialize_ranks, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
@@ -15262,7 +15280,7 @@ pub const GraphIndex = struct {
         initialized_nodes: []const PageRankInitializeNode,
         initial_rank: f64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current_page = try self.metricBuildPage(&batch, metric_name, job.job_id, .initialize_ranks, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
@@ -15507,7 +15525,7 @@ pub const GraphIndex = struct {
         output_fingerprint: u64,
         complete_page: bool,
     ) !GraphMetricBuildPage {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job.job_id, phase, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (page.state == .complete) {
@@ -15575,7 +15593,7 @@ pub const GraphIndex = struct {
         completed_units: u64,
         total_units: u64,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current_page = try self.metricBuildPage(&batch, metric_name, job.job_id, .hits_hub_contributions, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
@@ -15653,7 +15671,7 @@ pub const GraphIndex = struct {
         claimed_page: GraphMetricBuildPage,
         worker_id: []const u8,
     ) !HitsHubRawSummary {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var expected_page = claimed_page;
         expected_page.worker_id = worker_id;
@@ -16059,7 +16077,7 @@ pub const GraphIndex = struct {
         const progress_cursor = if (reached_page_end) adoption_cursor else last_scanned_key.items;
         const progress_units = if (reached_page_end and page.total_units != 0) page.total_units else completed_units;
         {
-            var score_batch = try self.beginWriteReverseBatch();
+            var score_batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer score_batch.abort();
             const current_page = try self.metricBuildPage(&score_batch, metric_name, job.job_id, .scan_edges_and_out_degree, page.iteration, page.page_id) orelse return error.GraphMetricBuildPageNotFound;
             var expected_page = page;
@@ -16241,7 +16259,7 @@ pub const GraphIndex = struct {
         output_fingerprint: u64,
         complete_page: bool,
     ) !GraphMetricBuildPage {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job.job_id, .reduce_ranks, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (page.state == .complete) {
@@ -16364,7 +16382,7 @@ pub const GraphIndex = struct {
         graphMetricConfigFingerprintHashU64(&hasher, graphMetricScoresFingerprint(pair_scores.items));
         const output_fingerprint = hasher.final();
 
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job.job_id, .publish_generation, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, page);
@@ -16438,7 +16456,7 @@ pub const GraphIndex = struct {
         const cleanup_prefix = try self.graphMetricBuildCleanupPagePrefixAlloc(metric_name, kind, job.job_id, cleanup_page);
         defer self.alloc.free(cleanup_prefix);
 
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var delete_page = try self.deleteKeysWithPrefixPageInBatch(&batch, cleanup_prefix, cleanup_page.cursor, graph_metric_build_cleanup_delete_page_units);
         defer delete_page.deinit(self.alloc);
@@ -17046,7 +17064,7 @@ pub const GraphIndex = struct {
     /// pointer swaps. The two-slot queue absorbs a publish followed by an
     /// operator action while cleanup catches up, then applies backpressure.
     pub fn cleanupRetiredGraphMetricScoreGenerationPage(self: *GraphIndex, metric_name: []const u8) !bool {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const generation_key = try self.graphMetricRetiredScoreGenerationKeyAlloc(metric_name);
         defer self.alloc.free(generation_key);
@@ -17211,7 +17229,7 @@ pub const GraphIndex = struct {
 
     pub fn queueGraphMetricBuild(self: *GraphIndex, metric: []const u8, generation: u64) !GraphMetricStatus {
         const name = try self.graphMetricLifecycleOwnerName(metric);
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const key = try self.graphMetricControlKeyAlloc(&.{ name, "requested" });
         defer self.alloc.free(key);
@@ -17313,7 +17331,7 @@ pub const GraphIndex = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const temp = arena.allocator();
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         if (generation != try self.graphMetricFilterGeneration(&batch, cfg.edge_filter)) return error.GraphMetricBuildSnapshotChanged;
         const filter = try topology_owner.filterDigest(temp, cfg.edge_filter);
@@ -17496,7 +17514,7 @@ pub const GraphIndex = struct {
     }
 
     fn retireTopologyTaskPage(self: *GraphIndex, key: []const u8, name: []const u8, raw: []u8) !bool {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const current = batch.get(key) catch |err| switch (err) {
             error.NotFound => {
@@ -17740,7 +17758,7 @@ pub const GraphIndex = struct {
             if (item == null or !std.mem.startsWith(u8, item.?.key, prefix)) next_cursor = null;
         }
         if (obsolete.items.len > 0) {
-            var batch = try self.beginWriteReverseBatch();
+            var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer batch.abort();
             for (obsolete.items) |key| batch.delete(key) catch |err| if (err != error.NotFound) return err;
             try batch.commit();
@@ -17789,7 +17807,7 @@ pub const GraphIndex = struct {
         };
         // Revalidate all liveness under the writer transaction. A job may pin
         // this owner between the read-only census and acquisition of the lock.
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const id: topology_owner.Id = key[topology_owner.catalog_prefix.len..][0..64].*;
         const owner_raw = batch.get(key) catch |err| switch (err) {
@@ -17952,7 +17970,7 @@ pub const GraphIndex = struct {
     }
 
     fn cleanupGraphMetricBuildJobKeys(self: *GraphIndex, metric_name: []const u8, job_id: u64) !usize {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const removed = try self.cleanupGraphMetricBuildJobKeysInBatch(&batch, metric_name, job_id);
         try batch.commit();
@@ -17986,7 +18004,7 @@ pub const GraphIndex = struct {
         const job_id = std.fmt.parseInt(u64, job_id_text, 10) catch return error.InvalidGraphMetricBuildManifest;
         const job_prefix = try self.graphMetricBuildJobNamespacePrefixAlloc(metric_name, job_id);
         defer self.alloc.free(job_prefix);
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         var deleted = try self.deleteKeysWithPrefixPageInBatch(&batch, job_prefix, resume_cursor, graph_metric_build_cleanup_delete_page_units);
         defer deleted.deinit(self.alloc);
@@ -18022,7 +18040,7 @@ pub const GraphIndex = struct {
         job_id: u64,
         page: GraphMetricBuildPage,
     ) !GraphMetricAttemptAdoptionResult {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const result = switch (page.phase) {
             .scan_edges_and_out_degree => if (kind == .degree)
@@ -18318,7 +18336,7 @@ pub const GraphIndex = struct {
 
     pub fn deleteGraphMetricMaterialization(self: *GraphIndex, metric_name: []const u8) !void {
         const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const now_ms = self.clock.nowRealtimeMs();
         try self.deleteGraphMetricMaterializationInBatch(&batch, cfg.name, now_ms);
@@ -18396,7 +18414,7 @@ pub const GraphIndex = struct {
         const job_id_key = try self.graphMetricDeleteCleanupJobIdKeyAlloc(metric_name);
         defer self.alloc.free(job_id_key);
 
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         if (!try self.metricDisabled(&batch, metric_name)) {
             try batch.commit();
@@ -18447,7 +18465,7 @@ pub const GraphIndex = struct {
 
     pub fn pauseGraphMetricMaintenance(self: *GraphIndex, metric_name: []const u8) !GraphMetricStatus {
         const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const now_ms = self.clock.nowRealtimeMs();
         try self.pauseGraphMetricMaintenanceInBatch(&batch, cfg.name, now_ms);
@@ -18473,7 +18491,7 @@ pub const GraphIndex = struct {
 
     pub fn resumeGraphMetricMaintenance(self: *GraphIndex, metric_name: []const u8) !GraphMetricStatus {
         const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const now_ms = self.clock.nowRealtimeMs();
         try self.resumeGraphMetricMaintenanceInBatch(&batch, cfg.name, now_ms);
@@ -18530,7 +18548,7 @@ pub const GraphIndex = struct {
             const pair_disabled = if (pair_cfg) |pair| try self.metricDisabled(&txn, pair.name) else false;
             if (!requested_disabled and !pair_disabled) return;
         }
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         try self.enableGraphMetricInBatch(&batch, cfg.name);
         if (pair_cfg) |pair| {
@@ -18567,7 +18585,7 @@ pub const GraphIndex = struct {
         meta: GraphMetricMeta,
     ) !GraphMetricStatus {
         if (self.ownershipTransitionPending()) return error.MetricNotReady;
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         if (batch.get(maintenance.ownership_key)) |_| return error.MetricNotReady else |err| if (err != error.NotFound) return err;
         const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
@@ -18606,7 +18624,7 @@ pub const GraphIndex = struct {
         const verification = try self.verifyGraphMetricBuildPublishReady(metric_name, job_id);
         if (verification.config_fingerprint != meta.config_fingerprint) return error.InvalidGraphMetricBuildManifest;
 
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
         if (job.job_id != job_id) return error.GraphMetricBuildJobMismatch;
@@ -18670,7 +18688,7 @@ pub const GraphIndex = struct {
         first_meta: GraphMetricMeta,
         second_meta: GraphMetricMeta,
     ) !void {
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const cfg = self.metricConfig(first_metric_name) orelse return error.MetricNotReady;
         const score_generation = if (try self.metricBuildJob(&batch, first_metric_name)) |job| blk: {
@@ -18828,7 +18846,7 @@ pub const GraphIndex = struct {
         var commits: usize = 0;
         while (offset < scores.len) {
             const end = @min(scores.len, offset + limit);
-            var batch = try self.beginWriteReverseBatch();
+            var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer batch.abort();
             try self.putPlannedGraphMetricScorePageInBatch(&batch, "bench", job, "bench", scores[offset..end]);
             try putU64(&batch, cursor, end);
@@ -18865,7 +18883,7 @@ pub const GraphIndex = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const temp = arena.allocator();
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const persisted = try self.metricBuildJob(&batch, owner) orelse return error.GraphMetricBuildJobNotFound;
         if (persisted.job_id != job.job_id or persisted.phase != .publish_generation or persisted.iteration != job.iteration) return error.GraphMetricBuildJobMismatch;
@@ -19452,7 +19470,7 @@ pub const GraphIndex = struct {
     pub fn benchmarkTopologyBuild(self: *GraphIndex, metric: []const u8, reuse: bool) !TopologyBuildBenchmark {
         const cfg = self.metricConfig(metric) orelse return error.InvalidBenchmarkResult;
         if (!reuse) {
-            var batch = try self.beginWriteReverseBatch();
+            var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer batch.abort();
             const filter = try topology_owner.filterDigest(self.alloc, cfg.edge_filter);
             const digest = topology_owner.identity(filter, try self.graphMetricPartitionPlanRaw(&batch, cfg));
@@ -19908,7 +19926,7 @@ pub const GraphIndex = struct {
         var pair_meta = meta;
         pair_meta.config_fingerprint = graphMetricConfigFingerprint(pair);
 
-        var batch = try self.beginWriteReverseBatch();
+        var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
         errdefer batch.abort();
         const persisted_job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
         if (persisted_job.job_id != job.job_id) return error.GraphMetricBuildJobMismatch;
@@ -20593,7 +20611,7 @@ pub const GraphIndex = struct {
         for (names) |name| {
             var offset: usize = 0;
             while (offset < nodes.len) {
-                var batch = try self.beginWriteReverseBatch();
+                var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
                 errdefer batch.abort();
                 const end = @min(nodes.len, offset + 4096);
                 for (nodes[offset..end], offset..) |node, i| {
@@ -20604,7 +20622,7 @@ pub const GraphIndex = struct {
                 try batch.commit();
                 offset = end;
             }
-            var batch = try self.beginWriteReverseBatch();
+            var batch = try self.beginWriteReverseBatchWithOptions(.{ .durability = .ride_along });
             errdefer batch.abort();
             const key = try self.graphMetricPublishedGenerationKeyAlloc(name);
             defer self.alloc.free(key);
