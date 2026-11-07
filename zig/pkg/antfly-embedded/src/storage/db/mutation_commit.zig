@@ -3073,6 +3073,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // `defer` knows what still needs `abort`, but the filter at
             // `applyDerivedBatchTargetsProfiled` (further down) must still
             // know which index names were handled inline regardless.
+            // Each entry is this function's OWN duplicate of the index name
+            // (see the capture site below), never an alias into
+            // `sync_targets.full_text_indexes`: the "filter
+            // `sync_targets.full_text_indexes` once" block further down
+            // frees every handled original entry as soon as it builds the
+            // filtered array, which runs well before the `install` loop
+            // at the bottom of this function reads `inline_text_handled_names`
+            // to call `advanceAppliedSequenceIfContiguous`. Storing the
+            // alias directly here used to make that call a guaranteed
+            // use-after-free: the name compared against every registered
+            // worker's name was already-freed memory, so the comparison
+            // never matched and the fast-forward silently (and always)
+            // failed, forcing every other write back onto the slow,
+            // worker-driven catch-up path (see the regression test this
+            // fix adds for the resulting alternation).
             var inline_text_handled_names: [@import("../commit_participant.zig").List.max_participants][]const u8 = undefined;
             var inline_text_publication_count: usize = 0;
             defer for (inline_text_publications[0..inline_text_publication_count]) |maybe_prepared| {
@@ -3081,6 +3096,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // write's own commit/ticket failed) -- `install` nulls
                 // its slot out once it has taken over the cleanup.
                 if (maybe_prepared) |prepared| prepared.abort();
+            };
+            defer for (inline_text_handled_names[0..inline_text_publication_count]) |name| {
+                S.ownerField(self, "alloc").*.free(name);
             };
             // Phase 2 round 2: attempt the inline fast path regardless of
             // `executor.hasWorkers()` -- the default Lite configuration runs
@@ -3159,8 +3177,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         materialized_derived_batch.?,
                         index_ref,
                     ) catch continue;
+                    // Own a copy of the name now: `target_name` aliases
+                    // `sync_targets.full_text_indexes`, whose "filter once"
+                    // block below frees exactly this entry (it is now
+                    // known handled) long before the `install` loop at the
+                    // bottom of this function reads `inline_text_handled_names`.
+                    const handled_name = S.ownerField(self, "alloc").*.dupe(u8, target_name) catch |dup_err| {
+                        prepared.abort();
+                        return dup_err;
+                    };
                     inline_text_publications[inline_text_publication_count] = prepared;
-                    inline_text_handled_names[inline_text_publication_count] = target_name;
+                    inline_text_handled_names[inline_text_publication_count] = handled_name;
                     inline_text_publication_count += 1;
                 }
             }

@@ -816,12 +816,32 @@ test "lite write amplification ceilings" {
 // `measureSingleWriterWithSyncLevel`'s comment). Runs with the default
 // Lite configuration -- background index workers running -- which is
 // exactly the configuration the no-worker-only `!hasWorkers()` gate used
-// to exclude. Not a regression gate (no asserted ceiling): this is the
-// measurement docs/design/lite-performance/lite-single-commit-write-path.md
-// §5's "Indexed calling-path syncs/update... ≤ 1.0 with 1 writer" gate
-// means for a `full_text`-only workload specifically, reported here for
-// before/after comparison rather than enforced, since the harness has no
-// "before" binary to compare against at runtime.
+// to exclude.
+//
+// This is also WS4 phase 2 round 3's regression gate for the inline
+// fast path's steady-state commit count: `durableCommitsPerWrite` must
+// stay close to 1.0 (one native commit per write, workers on). A real
+// regression here previously measured 2.99 commits/write because
+// `inline_text_handled_names` (mutation_commit.zig) stored a name that
+// aliased `sync_targets.full_text_indexes`, which the "filter once" block
+// a few lines later frees as soon as it learns the name was handled --
+// well before the `install` loop at the bottom of
+// `batchInternalPreparedOwned` reads that same slot to call
+// `Executor.advanceAppliedSequenceIfContiguous`. The comparison inside
+// that call read already-freed memory, so it never matched the
+// registered worker and the fast-forward silently failed on every single
+// write, forcing every other write back onto the slow, worker-driven
+// catch-up path (worker.applied_sequence traced 0, 1, 1, 3, 3, 5, 5, ...
+// instead of 0, 1, 2, 3, 4, 5, 6, ...). The fix gives
+// `inline_text_handled_names` its own owned copy of the name instead of
+// aliasing `sync_targets.full_text_indexes`.
+//
+// `calling_thread_syncs_per_update`/`fsyncsPerWriteOverall` are reported
+// for comparison but not gated here: today's native commit protocol
+// issues more than one physical fsync per logical commit (see
+// `docs/design/lite-performance/lite-single-commit-write-path.md` §3.1's
+// commit protocol), which is `native.zig` commit/manifest territory, out
+// of WS4's scope.
 test "lite write amplification report: full_text sync level (WS4 phase 2 round 2)" {
     const alloc = std.testing.allocator;
     const updates = default_updates;
@@ -834,6 +854,35 @@ test "lite write amplification report: full_text sync level (WS4 phase 2 round 2
     const json_text = try std.json.Stringify.valueAlloc(alloc, report, .{ .whitespace = .indent_2 });
     defer alloc.free(json_text);
     std.debug.print("lite_write_amplification_full_text_json_begin\n{s}\nlite_write_amplification_full_text_json_end\n", .{json_text});
+
+    // Steady state (every write but the very first one, which legitimately
+    // defers to the slow worker-driven path -- see
+    // `batchInternalPreparedOwned`'s comment on "the very first write this
+    // worker has ever been asked to apply") must cost one native commit.
+    // 1.25 leaves headroom for that one amortized startup write (1/128 =
+    // 0.0078) plus slack, while still catching the alternation regression
+    // (2.99) by more than 2x.
+    try expectAtMost(full_text.durableCommitsPerWrite(), 1.25, "full_text sync-level durable commits/write (workers on)");
+}
+
+// WS4 phase 2 round 3 regression test: the inline fast path must engage on
+// every write after the first, not every other write. Uses a small update
+// count so the specific alternation signature (worker.applied_sequence
+// advancing by 2 every other write instead of by 1 every write) cannot
+// hide inside an averaged ceiling the way `durableCommitsPerWrite` alone
+// might if some other change shifted the ratio without reintroducing a
+// literal alternation.
+test "lite write amplification: full_text inline fast path engages every write in steady state" {
+    const alloc = std.testing.allocator;
+    const updates: usize = 20;
+
+    const full_text = try measureSingleWriterWithSyncLevel(alloc, "lite-write-amp-fulltext-steady", true, "full_text", updates);
+    // Every write but the first costs exactly one native commit when the
+    // fast path engages every time; the alternation bug this guards
+    // against made every *other* write cost roughly three (primary +
+    // worker-driven index commit + worker-driven progress commit),
+    // averaging close to 3x this ceiling over only 20 writes.
+    try expectAtMost(full_text.durableCommitsPerWrite(), 1.35, "full_text inline fast path steady-state durable commits/write");
 }
 
 fn expectAtMost(actual: f64, ceiling: f64, comptime label: []const u8) !void {
