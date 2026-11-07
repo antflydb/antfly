@@ -2,6 +2,7 @@ from enum import StrEnum
 
 
 class DeciderConfigDecisionMethod(StrEnum):
+    CASCADE = "cascade"
     EMBEDDING_SIMILARITY = "embedding_similarity"
     GENERATED = "generated"
     TYPED = "typed"

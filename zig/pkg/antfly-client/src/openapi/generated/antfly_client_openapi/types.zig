@@ -10359,10 +10359,86 @@ pub const DateRangeStringQuery = struct {
     }
 };
 
+/// Required with decision_method=cascade, which allows no transport, model or rate-limit fields of its own. The first stage answers every input. Each later stage runs only for inputs whose previous answer falls inside its probability band, and all escalating inputs share one call. The final answer is the last answering stage's. Escalation applies to successful answers only; it is not failover. Probabilities are not calibrated across models, so set bands per model on labelled data.
+pub const DeciderCascade = struct {
+    stages: []const DeciderCascadeStage,
+    budget: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "stages", "stages", false },
+        .{ "budget", "budget", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("stages");
+        try jw.write(self.stages);
+        if (self.budget) |value| {
+            try jw.objectField("budget");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const DeciderCascadeStage = struct {
+    /// Unique within the cascade; reported in traces.
+    name: []const u8,
+    /// Inline typed or generated decider. Cascades and embedding_similarity deciders cannot be stages.
+    decider: DeciderConfig,
+    /// Required on every stage except the first, which must omit it. Inclusive band on the previous stage's answer.
+    when: ?std.json.Value = null,
+    /// Defaults to fail, including on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and is allowed only after the first stage.
+    on_failure: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "decider", "decider", false },
+        .{ "when", "when", true },
+        .{ "on_failure", "on_failure", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("decider");
+        try jw.write(self.decider);
+        if (self.when) |value| {
+            try jw.objectField("when");
+            try jw.write(value);
+        }
+        if (self.on_failure) |value| {
+            try jw.objectField("on_failure");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const DeciderConfig = struct {
     provider: ?[]const u8 = null,
-    /// Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
+    /// Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate questions only.
     decision_method: ?[]const u8 = null,
+    cascade: ?DeciderCascade = null,
     /// Required with decision_method=generated. Provider configuration belongs here rather than in the outer typed-decider fields.
     generator: ?GeneratorConfig = null,
     instructions: ?[]const u8 = null,
@@ -10396,6 +10472,7 @@ pub const DeciderConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", true },
         .{ "decision_method", "decision_method", true },
+        .{ "cascade", "cascade", true },
         .{ "generator", "generator", true },
         .{ "instructions", "instructions", true },
         .{ "output", "output", true },
@@ -10432,6 +10509,10 @@ pub const DeciderConfig = struct {
         }
         if (self.decision_method) |value| {
             try jw.objectField("decision_method");
+            try jw.write(value);
+        }
+        if (self.cascade) |value| {
+            try jw.objectField("cascade");
             try jw.write(value);
         }
         if (self.generator) |value| {
@@ -10518,6 +10599,7 @@ pub const DecisionBatchItem = struct {
     /// Resolved model reported for a successful named gateway batch item.
     model: ?[]const u8 = null,
     answers: []const InferenceDecideAnswer,
+    cascade: ?DecisionCascadeTrace = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -10526,6 +10608,7 @@ pub const DecisionBatchItem = struct {
         .{ "error", "error", true },
         .{ "model", "model", true },
         .{ "answers", "answers", false },
+        .{ "cascade", "cascade", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -10554,8 +10637,96 @@ pub const DecisionBatchItem = struct {
         }
         try jw.objectField("answers");
         try jw.write(self.answers);
+        if (self.cascade) |value| {
+            try jw.objectField("cascade");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
+};
+
+pub const DecisionCascadeStageTrace = struct {
+    name: []const u8,
+    decision_method: []const u8,
+    model: ?[]const u8 = null,
+    /// Immutable model revision reported by this stage, when available.
+    model_revision: ?[]const u8 = null,
+    /// This stage's answers. Absent when the stage failed.
+    answers: ?[]const InferenceDecideAnswer = null,
+    usage: ?DecisionUsage = null,
+    /// Producer provenance reported for this stage, when present.
+    provenance: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Whether this answer fell inside the next stage's band, sending the input on.
+    escalated: bool,
+    /// Error code when this stage failed for the input. With on_failure keep_previous, the previous stage's answer stands.
+    @"error": ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "decision_method", "decision_method", false },
+        .{ "model", "model", true },
+        .{ "model_revision", "model_revision", true },
+        .{ "answers", "answers", true },
+        .{ "usage", "usage", true },
+        .{ "provenance", "provenance", true },
+        .{ "escalated", "escalated", false },
+        .{ "error", "error", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("decision_method");
+        try jw.write(self.decision_method);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.model_revision) |value| {
+            try jw.objectField("model_revision");
+            try jw.write(value);
+        }
+        if (self.answers) |value| {
+            try jw.objectField("answers");
+            try jw.write(value);
+        }
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        if (self.provenance) |value| {
+            try jw.objectField("provenance");
+            try jw.write(value);
+        }
+        try jw.objectField("escalated");
+        try jw.write(self.escalated);
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Present when a cascade decider answered. Lists the stages that ran for this input, in order. The top-level model and answers come from the answering stage, and usage is the sum over these stages.
+pub const DecisionCascadeTrace = struct {
+    /// The configured cascade name.
+    decider: []const u8,
+    /// Identity of the cascade definition, excluding credentials. Any change to stages, bands, failure policy or budget changes it.
+    definition_sha256: []const u8,
+    /// Name of the stage whose answer is final.
+    answered_by: []const u8,
+    stages: []const DecisionCascadeStageTrace,
 };
 
 /// Local decision models use string choice identifiers. Embedding category examples replace the description with their normalized centroid; trained models reject examples.
@@ -10949,10 +11120,40 @@ pub const DecisionTableSource = struct {
 };
 
 pub const DecisionUsage = struct {
+    /// True for estimated usage, including apportioned shared generated-batch costs and embedding-based estimates. Generated cascades divide shared totals evenly, assigning integer remainders in input order; their request aggregate remains measured.
+    estimated: ?bool = null,
     /// Encoded tokens including repeated input text for split model tasks.
     input_tokens: i64,
     /// Zero for classifiers, which generate no tokens.
     output_tokens: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "estimated", "estimated", true },
+        .{ "input_tokens", "input_tokens", false },
+        .{ "output_tokens", "output_tokens", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.estimated) |value| {
+            try jw.objectField("estimated");
+            try jw.write(value);
+        }
+        try jw.objectField("input_tokens");
+        try jw.write(self.input_tokens);
+        try jw.objectField("output_tokens");
+        try jw.write(self.output_tokens);
+        try jw.endObject();
+    }
 };
 
 /// Dense vector index algorithm (dense only). "hbc" (default) keeps quantized codes plus full-precision rerank data. "leann" keeps only a pruned proximity graph and compact RaBitQ codes and recomputes exact distances for a few candidates per query, re-embedding them (see leann.vector_storage) or reading their stored embedding, trading query-time work for index size. LEANN indexes do not yet support shard splits or native index backups.
@@ -25405,7 +25606,7 @@ pub const GraphResolverAdjudicationAcceptance = struct {
 
 /// Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges.
 pub const GraphResolverAdjudicationConfig = struct {
-    /// Frozen typed or generated decider configuration. Generated verdict-only thresholds must be zero or one.
+    /// Frozen typed, generated or cascade decider configuration. Standalone generated verdict-only thresholds must be zero or one. Mixed cascades apply shared thresholds to probabilistic stages and require categorical zero-or-one terminal verdicts. A cascade answer is validated against the stage that produced it, and the receipt keeps the response's stage trace.
     decider: DeciderConfig,
     /// Bounded interpolation of m.text, m.surface_form, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions.
     template: []const u8,
@@ -30020,6 +30221,7 @@ pub const InferenceDecideResponse = struct {
     answers: ?[]const InferenceDecideAnswer = null,
     data: ?[]const DecisionBatchItem = null,
     usage: DecisionUsage,
+    cascade: ?DecisionCascadeTrace = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -30029,6 +30231,7 @@ pub const InferenceDecideResponse = struct {
         .{ "answers", "answers", true },
         .{ "data", "data", true },
         .{ "usage", "usage", false },
+        .{ "cascade", "cascade", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -30061,6 +30264,10 @@ pub const InferenceDecideResponse = struct {
         }
         try jw.objectField("usage");
         try jw.write(self.usage);
+        if (self.cascade) |value| {
+            try jw.objectField("cascade");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

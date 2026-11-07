@@ -8,6 +8,7 @@ from attrs import define as _attrs_define
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.decision_cascade_trace import DecisionCascadeTrace
     from ..models.embedding_choice_answer import EmbeddingChoiceAnswer
     from ..models.embedding_multi_choice_answer import EmbeddingMultiChoiceAnswer
     from ..models.generated_choice_answer import GeneratedChoiceAnswer
@@ -34,6 +35,9 @@ class DecisionBatchItem:
         error (str | Unset): Named gateway and generated batches preserve valid siblings; a failed item has an empty
             answers array and this error code. Invalid input or request budgets fail validation before dispatch.
         model (str | Unset): Resolved model reported for a successful named gateway batch item.
+        cascade (DecisionCascadeTrace | Unset): Present when a cascade decider answered. Lists the stages that ran for
+            this input, in order. The top-level model and answers come from the answering stage, and usage is the sum over
+            these stages.
     """
 
     input_index: int
@@ -51,6 +55,7 @@ class DecisionBatchItem:
     id: str | Unset = UNSET
     error: str | Unset = UNSET
     model: str | Unset = UNSET
+    cascade: DecisionCascadeTrace | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.embedding_choice_answer import EmbeddingChoiceAnswer
@@ -94,6 +99,10 @@ class DecisionBatchItem:
 
         model = self.model
 
+        cascade: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.cascade, Unset):
+            cascade = self.cascade.to_dict()
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -108,11 +117,14 @@ class DecisionBatchItem:
             field_dict["error"] = error
         if model is not UNSET:
             field_dict["model"] = model
+        if cascade is not UNSET:
+            field_dict["cascade"] = cascade
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.decision_cascade_trace import DecisionCascadeTrace
         from ..models.embedding_choice_answer import EmbeddingChoiceAnswer
         from ..models.embedding_multi_choice_answer import EmbeddingMultiChoiceAnswer
         from ..models.generated_choice_answer import GeneratedChoiceAnswer
@@ -223,12 +235,20 @@ class DecisionBatchItem:
 
         model = d.pop("model", UNSET)
 
+        _cascade = d.pop("cascade", UNSET)
+        cascade: DecisionCascadeTrace | Unset
+        if isinstance(_cascade, Unset):
+            cascade = UNSET
+        else:
+            cascade = DecisionCascadeTrace.from_dict(_cascade)
+
         decision_batch_item = cls(
             input_index=input_index,
             answers=answers,
             id=id,
             error=error,
             model=model,
+            cascade=cascade,
         )
 
         return decision_batch_item
