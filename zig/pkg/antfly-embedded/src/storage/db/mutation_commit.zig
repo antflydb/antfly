@@ -1700,6 +1700,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const resolved_write_timestamp_ns: ?u64 = if (!use_preprepared_rows and shouldWriteTimestamp(write.key))
                         (if (opts.restore_timestamps) |timestamps| timestamps.get(write.key) else null) orelse if (prepared_relational) |*prepared|
                             try resolveWriteTimestampFromValue(self, batch_timestamp_ns, prepared.parsedValue())
+                        else if (prepared_document != null)
+                            opts.prepared_documents.?.timestampFor(write.key, write.value, batch_timestamp_ns) orelse return error.InvalidDerivedApplyState
                         else
                             try resolveWriteTimestampNs(self, batch_timestamp_ns, write.value)
                     else

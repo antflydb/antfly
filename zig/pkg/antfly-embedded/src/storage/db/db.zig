@@ -78114,6 +78114,47 @@ test "db owned document preparation transfers effects and rejects changed identi
     try std.testing.expectError(error.TableNotFound, prepared.matches(&database));
 }
 
+test "db owned document preparation preserves authored TTL timestamps and commit-time fallback" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("owned-ttl-postimage");
+    defer directory.cleanup();
+    var database = try DB.open(a, std.mem.span(directory.path().ptr), .{ .start_index_workers = false });
+    defer database.close();
+    try database.setSchema(.{ .version = 1, .ttl_duration_ns = std.time.ns_per_s, .ttl_field = "expires_at" });
+    const fallback = currentTimeNs();
+    const request: types.BatchRequest = .{ .writes = &.{
+        .{ .key = "date", .value = "{\"expires_at\":\"2100-01-01T00:00:00Z\"}" },
+        .{ .key = "number", .value = "{\"expires_at\":4102444800000000000}" },
+        .{ .key = "null", .value = "{\"expires_at\":null}" },
+        .{ .key = "missing", .value = "{}" },
+        .{ .key = "zero", .value = "{\"expires_at\":0}" },
+        .{ .key = "discarded", .value = "{\"expires_at\":-1}" },
+        .{ .key = "discarded", .value = "{}" },
+    }, .timestamp_ns = fallback, .sync_level = .write };
+    const Prepared = @import("prepared_document_batch.zig").Plan;
+    var plan = (try Prepared.capture(a, &database)).?;
+    defer plan.deinit();
+    try plan.prepare(request);
+    try std.testing.expectEqual(@as(?u64, 4102444800000000000), plan.timestampFor("date", request.writes[0].value, 1));
+    try std.testing.expectEqual(@as(?u64, 0), plan.timestampFor("zero", request.writes[4].value, 1));
+    try std.testing.expectEqual(@as(?u64, 2), plan.timestampFor("missing", "{}", 2));
+    var committed = false;
+    try database.batchTrackedWithPreparedDocuments(request, &committed, null, &plan);
+    try std.testing.expect(committed);
+    for ([_][]const u8{ "date", "number", "null", "missing", "zero", "discarded" }, [_]u64{ 4102444800000000000, 4102444800000000000, fallback, fallback, 0, fallback }) |key, expected| {
+        const physical = try internal_keys.ttlKeyAlloc(a, key);
+        defer a.free(physical);
+        const raw = try database.core.store.get(a, physical);
+        defer a.free(raw);
+        try std.testing.expectEqual(expected, std.mem.readInt(u64, raw[0..8], .little));
+    }
+    var invalid = (try Prepared.capture(a, &database)).?;
+    defer invalid.deinit();
+    try std.testing.expectError(error.InvalidArgument, invalid.prepare(.{ .writes = &.{.{ .key = "invalid", .value = "{\"expires_at\":-1}" }} }));
+    try database.setSchema(.{ .version = 2, .ttl_duration_ns = std.time.ns_per_s, .ttl_field = "other" });
+    try std.testing.expect(!try plan.matches(&database));
+}
+
 test "db owned document preparation strips catalog vector fields before admission" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("owned-vector-postimage");

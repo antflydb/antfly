@@ -1572,41 +1572,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return stripped;
         }
 
-        pub fn ttlTimestampNsFromDocumentValue(
-            alloc: Allocator,
-            schema: schema_mod.TableSchema,
-            value_json: []const u8,
-        ) !?u64 {
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
-            defer parsed.deinit();
-            const root = switch (parsed.value) {
-                .object => |object| object,
-                else => return null,
-            };
-            const ttl_value = root.get(schema.ttl_field) orelse return null;
-            if (ttl_value == .null) return null;
-            return try ttlTimestampNsFromJsonValue(ttl_value);
-        }
-
-        pub fn ttlTimestampNsFromJsonValue(value: std.json.Value) !u64 {
-            return switch (value) {
-                .integer => |integer| blk: {
-                    if (integer < 0) return error.InvalidArgument;
-                    break :blk std.math.cast(u64, integer) orelse return error.InvalidArgument;
-                },
-                .number_string => |text| std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch return error.InvalidArgument,
-                .string => |text| ttlTimestampNsFromString(text),
-                else => error.InvalidArgument,
-            };
-        }
-
-        pub fn ttlTimestampNsFromString(text: []const u8) !u64 {
-            const trimmed = std.mem.trim(u8, text, " \t\r\n");
-            if (trimmed.len == 0) return error.InvalidArgument;
-            if (std.fmt.parseInt(u64, trimmed, 10)) |ts| return ts else |_| {}
-            if (try parsePatternRfc3339ToNs(trimmed)) |ts| return ts;
-            return error.InvalidArgument;
-        }
+        pub const ttlTimestampNsFromDocumentValue = @import("mutation_timestamp.zig").ttlTimestampNsFromDocumentValue;
+        pub const ttlTimestampNsFromJsonValue = @import("mutation_timestamp.zig").ttlTimestampNsFromJsonValue;
+        pub const ttlTimestampNsFromString = @import("mutation_timestamp.zig").ttlTimestampNsFromString;
 
         pub fn prepareRelationalRows(
             allocator_guard: *PreparedRowAllocator,

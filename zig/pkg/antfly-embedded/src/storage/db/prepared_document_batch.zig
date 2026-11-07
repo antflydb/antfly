@@ -54,7 +54,7 @@ pub const Plan = struct {
     transform_capture_declined: bool = false,
     needs_reprepare: bool = false,
     const Text = struct { config: manager_mod.ForegroundTextProjection, built: manager_mod.PreparedTextMapperPublication, publication: ?*manager_mod.OwnedForegroundTextPublication = null };
-    const Entry = struct { value: []const u8, stored_value: ?[]u8 = null, ordinal_key: []const u8 = &.{}, template: mapper.ExtractedWrite, extracted: ?mapper.ExtractedWrite = null };
+    const Entry = struct { value: []const u8, stored_value: ?[]u8 = null, authored_timestamp_ns: ?u64 = null, ordinal_key: []const u8 = &.{}, template: mapper.ExtractedWrite, extracted: ?mapper.ExtractedWrite = null };
 
     /// Called under the short catalog lifetime fence. No borrowed DB pointer
     /// or primary snapshot survives this capture.
@@ -172,6 +172,13 @@ pub const Plan = struct {
                 try graph_fields.fromSnapshot(plan.graph_fields, a, key, parsed.value, &row);
                 try plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(a, key, parsed.value, &row);
             }
+            const authored_timestamp_ns = if (self.schema) |view|
+                if (view.tableSchema().ttl_duration_ns != 0)
+                    try @import("mutation_timestamp.zig").ttlTimestampNsFromDocumentValue(a, view.tableSchema().*, value)
+                else
+                    null
+            else
+                null;
             const stored_value: ?[]u8 = if (row.cleaned_value != null and plan.vector_store_fields.len != 0)
                 (try mapper.stripTopLevelFieldsAlloc(a, row.cleaned_value.?, plan.vector_store_fields)) orelse try a.dupe(u8, "{}")
             else
@@ -184,7 +191,7 @@ pub const Plan = struct {
             }
             const entry = try self.rows.getOrPut(a, key);
             std.debug.assert(!entry.found_existing);
-            entry.value_ptr.* = .{ .value = value, .stored_value = stored_value, .template = row };
+            entry.value_ptr.* = .{ .value = value, .stored_value = stored_value, .authored_timestamp_ns = authored_timestamp_ns, .template = row };
         }
         try self.prepareForegroundText(request);
         try self.prepareAttempt();
@@ -464,6 +471,12 @@ pub const Plan = struct {
         const entry = self.rows.get(key) orelse return null;
         if (!std.mem.eql(u8, entry.value, value)) return null;
         return entry.stored_value orelse entry.template.cleaned_value;
+    }
+
+    pub fn timestampFor(self: *const Plan, key: []const u8, value: []const u8, fallback: u64) ?u64 {
+        const entry = self.rows.get(key) orelse return null;
+        if (!std.mem.eql(u8, entry.value, value)) return null;
+        return entry.authored_timestamp_ns orelse fallback;
     }
 
     /// Transfer allocations into the ordinary commit cleanup domain. Plans

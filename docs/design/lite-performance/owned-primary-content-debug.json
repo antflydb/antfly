@@ -7,7 +7,8 @@
     "Owned document plans prebuild exact stored postimages, including direct vector-field stripping, SHA256 content proofs and projection/source certificates before writer admission.",
     "Synchronous DocStore batches borrow prebuilt authorities only for matching physical document identity, kind and exact bytes; mismatches retain authoritative computation.",
     "Borrowed proofs remain request-owned through commit/abort, preserving actual per-transaction mutation revision assignment.",
-    "Prepared content proofs enter DocStore through a direct synchronous typed capability; request-owned pointers never cross the erased storage backend ABI."
+    "Prepared content proofs enter DocStore through a direct synchronous typed capability; request-owned pointers never cross the erased storage backend ABI.",
+    "Authored TTL timestamps are parsed with the shared pure timestamp rules outside admission. Missing/null timestamps keep the actual commit-attempt fallback; schema changes invalidate the plan."
   ],
   "validation": [
     {
@@ -38,6 +39,20 @@
         "native primary/text one checkpoint and one durable barrier",
         "dynamic multi-index and sequence holes",
         "owned transform conflict and allocation cleanup"
+      ]
+    },
+    {
+      "report": "owned-ttl-batch.json",
+      "log": "owned-ttl-batch.log",
+      "passed": 10,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "coverage": [
+        "authored date/numeric/zero TTL timestamps",
+        "missing/null and discarded invalid TTL values",
+        "schema change invalidation",
+        "native foreground single-barrier and prepared content-proof regressions"
       ]
     }
   ],
