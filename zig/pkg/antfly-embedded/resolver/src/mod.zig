@@ -4204,6 +4204,13 @@ test "REVIEW adjudication cascade receipts verify the answering stage and its tr
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
+    const disabled_raw = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_config, "\"when\":", "\"require_agreement\":false,\"when\":");
+    const disabled_config = try adjudication.Config.parse(a, disabled_raw);
+    defer disabled_config.deinit();
+    // Direct embedded callers can construct or mutate Config values too.
+    try disabled_config.value.decider.object.get("cascade").?.object.get("stages").?.array.items[1].object.put(scratch, "require_agreement", .{ .bool = false });
+    try testing.expectEqualStrings(try config.value.producerSpecification(scratch), try disabled_config.value.producerSpecification(scratch));
+    try testing.expectEqualStrings(try fingerprintHex(scratch, try config.value.semantic(scratch)), try fingerprintHex(scratch, try disabled_config.value.semantic(scratch)));
     const response = try adjudicationCascadeResponse(scratch, config.value);
     const parse = struct {
         fn f(alloc: std.mem.Allocator, bytes: []const u8) !std.json.Value {
@@ -4478,7 +4485,8 @@ test "REVIEW guarded adjudication abstains durably even when operational failure
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    for ([_]bool{ false, true }) |failed| {
+    for ([_]enum { disagreed, unverified, sampled, sampled_agreed }{ .disagreed, .unverified, .sampled, .sampled_agreed }) |mode| {
+        const failed = mode == .unverified;
         const raw = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_config, "\"when\":", "\"require_agreement\":true,\"on_failure\":\"keep_previous\",\"when\":");
         var cfg_value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, raw, .{});
         try cfg_value.object.put(scratch, "on_failure", .{ .string = "mint" });
@@ -4489,11 +4497,30 @@ test "REVIEW guarded adjudication abstains durably even when operational failure
         const entries = trace.object.getPtr("stages").?.array.items;
         const first = entries[0].object.get("answers").?.array.items[0];
         if (failed) {
+            // A fallback that otherwise meets the acceptance threshold must
+            // still abstain when its required confirmation was unavailable.
+            const distribution = first.object.get("probabilities").?.array.items;
+            try distribution[0].object.put(scratch, "probability", .{ .float = 0.9 });
+            try distribution[1].object.put(scratch, "probability", .{ .float = 0.1 });
             _ = entries[1].object.swapRemove("answers");
             try entries[1].object.put(scratch, "error", .{ .string = "ProviderUnavailable" });
             try response.object.put(scratch, "answers", entries[0].object.get("answers").?);
             try response.object.put(scratch, "model", entries[0].object.get("model").?);
             try trace.object.put(scratch, "answered_by", .{ .string = "fast" });
+        } else if (mode == .sampled or mode == .sampled_agreed) {
+            // A legitimate sampled generated vote can differ from its argmax.
+            const answers = response.object.getPtr("answers").?.array.items;
+            try answers[0].object.put(scratch, "choice", .{ .string = "different" });
+            try answers[0].object.put(scratch, "raw_structured_answer", .{ .string = "different" });
+            try entries[1].object.put(scratch, "answers", response.object.get("answers").?);
+            if (mode == .sampled_agreed) {
+                var prior = first;
+                try prior.object.put(scratch, "choice", .{ .string = "different" });
+                entries[0].object.getPtr("answers").?.array.items[0] = prior;
+                const distribution = prior.object.get("probabilities").?.array.items;
+                try distribution[0].object.put(scratch, "probability", .{ .float = 0.4 });
+                try distribution[1].object.put(scratch, "probability", .{ .float = 0.6 });
+            }
         } else {
             // Prior stage votes different; final strong answer is confidently same.
             var changed = first;
@@ -4504,10 +4531,10 @@ test "REVIEW guarded adjudication abstains durably even when operational failure
             try distribution[1].object.put(scratch, "probability", .{ .float = 0.6 });
         }
         for ([_]*std.json.ObjectMap{ &trace.object, &entries[1].object }) |fields| {
-            try fields.put(scratch, "agreement_status", .{ .string = if (failed) "unverified" else "disagreed" });
+            try fields.put(scratch, "agreement_status", .{ .string = if (failed) "unverified" else if (mode == .sampled_agreed) "agreed" else "disagreed" });
             if (!failed) {
-                try fields.put(scratch, "agreed", .{ .bool = false });
-                try fields.put(scratch, "disagreed_questions", try std.json.parseFromSliceLeaky(std.json.Value, scratch, "[\"same\"]", .{}));
+                try fields.put(scratch, "agreed", .{ .bool = mode == .sampled_agreed });
+                if (mode != .sampled_agreed) try fields.put(scratch, "disagreed_questions", try std.json.parseFromSliceLeaky(std.json.Value, scratch, "[\"same\"]", .{}));
             }
         }
         try testing.expectEqual(adjudication.Status.abstained, try adjudication.classify(scratch, config.value, response));
@@ -4533,7 +4560,7 @@ test "REVIEW guarded adjudication abstains durably even when operational failure
         // Abstention does not make contradictory votes or malformed distributions valid.
         var altered = entries[0].object.get("answers").?.array.items[0];
         const original_choice = altered.object.get("choice").?;
-        try altered.object.put(scratch, "choice", .{ .string = if (failed) "different" else "same" });
+        try altered.object.put(scratch, "choice", .{ .string = if (std.mem.eql(u8, original_choice.string, "same")) "different" else "same" });
         entries[0].object.getPtr("answers").?.array.items[0] = altered;
         if (failed) response.object.getPtr("answers").?.array.items[0] = altered;
         try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
@@ -4542,4 +4569,41 @@ test "REVIEW guarded adjudication abstains durably even when operational failure
         _ = trace.object.swapRemove("agreement_status");
         try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
     }
+}
+
+test "REVIEW generated adjudication thresholds follow sampled votes and validate raw evidence" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const config = try adjudication.Config.parse(a,
+        \\{"decider":{"decision_method":"generated","generator":{"provider":"antfly","model":"strong"}},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"reject":{"choice":"different","min_probability":0.9}}
+    );
+    defer config.deinit();
+    for ([_]struct { selected: []const u8, same: f64, expected: adjudication.Status }{
+        .{ .selected = "same", .same = 0.96, .expected = .accepted },
+        .{ .selected = "different", .same = 0.04, .expected = .rejected },
+        .{ .selected = "different", .same = 0.96, .expected = .abstained },
+        .{ .selected = "same", .same = 0.04, .expected = .abstained },
+        .{ .selected = "same", .same = 0.6, .expected = .abstained },
+    }) |case| {
+        const body = try std.fmt.allocPrint(a,
+            \\{{"model":"strong","answers":[{{"name":"same","type":"choice","decision_method":"generated","probability_source":"token_logprobs","raw_structured_answer":"{s}","choice":"{s}","probabilities":[{{"value":"same","probability":{d}}},{{"value":"different","probability":{d}}}]}}]}}
+        , .{ case.selected, case.selected, case.same, 1 - case.same });
+        var response = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+        try testing.expectEqual(case.expected, try adjudication.classify(a, config.value, response));
+        const answer = &response.object.getPtr("answers").?.array.items[0];
+        try answer.object.put(a, "raw_structured_answer", .{ .string = "not-the-vote" });
+        try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(a, config.value, response));
+        try answer.object.put(a, "raw_structured_answer", .{ .string = case.selected });
+        try answer.object.put(a, "choice", .{ .string = "unknown" });
+        try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(a, config.value, response));
+    }
+    const verdict_config = try adjudication.Config.parse(a,
+        \\{"decider":{"decision_method":"generated","probabilities":"verdict_only","generator":{"provider":"antfly","model":"strong"}},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":1}}
+    );
+    defer verdict_config.deinit();
+    const wrong_verdict = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"model":"strong","answers":[{"name":"same","type":"choice","decision_method":"generated","probability_source":"verdict","raw_structured_answer":"different","choice":"different","probabilities":[{"value":"same","probability":1},{"value":"different","probability":0}]}]}
+    , .{});
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(a, verdict_config.value, wrong_verdict));
 }

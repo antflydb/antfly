@@ -297,6 +297,14 @@ answer but reports `unverified` and abstains. No agreement fields appear when
 no guard ran. A successful check remains recorded if a later unguarded stage
 runs; guard every later stage whose answer must also be confirmed.
 
+Generated choice votes retain the sampled structured answer, which need not be
+the highest-probability alternative. Resolver thresholds apply to that selected
+vote; probability mass on another choice cannot accept or reject the pair.
+
+Disabled guards are omitted from forwarded and persisted configuration, so
+unguarded cascades remain readable at epoch 30. Enabled guards require epoch 31.
+SDK constructors omit the optional guard unless explicitly configured.
+
 Agreement records matching votes; it does not establish model independence or
 calibrated confidence. Use suitable independent evidence and evaluate the
 resulting policy on representative data.

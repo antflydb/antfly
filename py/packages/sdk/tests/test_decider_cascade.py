@@ -30,7 +30,9 @@ def test_constructed_cascade_defaults_match_server_fixture_and_round_trip():
     wire = config.to_dict()
     assert wire == json.loads(fixture.read_text())
     assert wire["cascade"]["stages"][0]["on_failure"] == "fail"
-    assert wire["cascade"]["stages"][0]["require_agreement"] is False
+    assert "require_agreement" not in wire["cascade"]["stages"][0]
+    assert DeciderConfig.from_dict(wire).to_dict() == wire
+    wire["cascade"]["stages"][1]["require_agreement"] = False
     assert DeciderConfig.from_dict(wire).to_dict() == wire
     wire["cascade"]["stages"][1]["require_agreement"] = True
     assert DeciderConfig.from_dict(wire).to_dict() == wire

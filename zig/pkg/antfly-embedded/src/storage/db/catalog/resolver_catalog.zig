@@ -862,6 +862,8 @@ pub fn serializeCatalogWithEncoding(alloc: Allocator, resolvers: []const Resolve
     var projections: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (resolvers) |cfg| {
         var stored = cfg;
+        if (try @import("antfly_decisions").cascade.normalizeDisabledAgreementJson(a, cfg.adjudicate_json, &.{"decider"})) |normalized|
+            stored.adjudicate_json = normalized;
         if (cfg.namespace_curation_table_id != 0) {
             stored.merges = &.{};
             stored.curation_json = "";
@@ -1406,6 +1408,13 @@ test "resolver adjudication catalogs fence old readers from cascade deciders and
         const encoded = try serializeCatalog(a, &.{cfg.value});
         defer a.free(encoded);
         try std.testing.expectEqual(if (enabled) cascade_agreement_reader_version else decider_cascade_reader_version, try catalogReaderVersion(a, encoded));
+        if (!enabled) try std.testing.expectEqualStrings(catalog, encoded);
+        const reopened = try deserializeCatalog(a, encoded);
+        defer {
+            for (reopened) |*cfg_row| cfg_row.deinit(a);
+            a.free(reopened);
+        }
+        try std.testing.expect((std.mem.indexOf(u8, reopened[0].adjudicate_json, "require_agreement") != null) == enabled);
     }
 }
 

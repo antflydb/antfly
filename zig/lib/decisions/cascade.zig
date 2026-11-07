@@ -298,6 +298,52 @@ pub fn requiresAgreement(value: V) bool {
     return false;
 }
 
+/// Normalize a caller-owned decider tree, preserving the relative order of all
+/// retained fields. A disabled guard is the epoch-30 spelling (omission).
+/// Enabled and malformed values are retained for ordinary validation.
+pub fn omitDisabledAgreement(decider: *V) bool {
+    if (decider.* != .object) return false;
+    const method = decider.object.get("decision_method") orelse return false;
+    if (method != .string or !std.mem.eql(u8, method.string, "cascade")) return false;
+    const body = decider.object.getPtr("cascade") orelse return false;
+    return omitDisabledAgreementDefinition(body);
+}
+
+pub fn omitDisabledAgreementDefinition(body: *V) bool {
+    if (body.* != .object) return false;
+    const stages = body.object.getPtr("stages") orelse return false;
+    if (stages.* != .array) return false;
+    var changed = false;
+    for (stages.array.items) |*stage| {
+        if (stage.* != .object) continue;
+        const guard = stage.object.get("require_agreement") orelse continue;
+        if (guard == .bool and !guard.bool) {
+            _ = stage.object.orderedRemove("require_agreement");
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+/// Return an owned replacement only when an envelope's decider needs default
+/// normalization. The caller retains its original JSON otherwise. This runs at
+/// configuration/persistence boundaries, never during per-result comparison.
+pub fn normalizeDisabledAgreementJson(a: A, raw: []const u8, decider_path: []const []const u8) !?[]u8 {
+    // Escaped keys must take the parsed path too. Most pre-feature policies
+    // need neither parsing nor allocation here.
+    if (std.mem.indexOf(u8, raw, "require_agreement") == null and std.mem.indexOfScalar(u8, raw, '\\') == null) return null;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var value = try std.json.parseFromSliceLeaky(V, arena.allocator(), raw, .{ .parse_numbers = false });
+    var decider = &value;
+    for (decider_path) |key| {
+        if (decider.* != .object) return null;
+        decider = decider.object.getPtr(key) orelse return null;
+    }
+    if (!omitDisabledAgreement(decider)) return null;
+    return try std.json.Stringify.valueAlloc(a, value, .{});
+}
+
 const NamedAnswer = struct { name: []const u8, value: V };
 fn orderedAnswers(answers: V, storage: *[64]NamedAnswer) ![]NamedAnswer {
     if (answers != .array or answers.array.items.len == 0 or answers.array.items.len > storage.len) return error.InvalidDecisionOutput;
@@ -1227,4 +1273,44 @@ test "decision cascade guarded keep_previous is unverified not an agreeing vote"
     _ = try validateTrace(&definition, result.values[0].?);
     try std.testing.expect(!try agreementBlocked(result.values[0].?));
     try std.testing.expect(result.values[0].?.object.get("cascade").?.object.get("agreed").?.bool);
+}
+
+test "decision cascade disabled defaults normalize to the epoch-30 SDK fixture" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // This fixture is the constructed SDK wire form accepted by epoch 30.
+    var fixture = try std.json.parseFromSliceLeaky(V, a, @embedFile("testdata/sdk_cascade_defaults.json"), .{});
+    const baseline = try std.json.Stringify.valueAlloc(a, fixture, .{});
+    const stages = fixture.object.getPtr("cascade").?.object.getPtr("stages").?.array.items;
+    for (stages) |*stage| try stage.object.put(a, "require_agreement", .{ .bool = false });
+    const disabled = try std.json.Stringify.valueAlloc(a, fixture, .{});
+    const normalized = (try normalizeDisabledAgreementJson(a, disabled, &.{})).?;
+    try std.testing.expectEqualStrings(baseline, normalized);
+    try std.testing.expect((try normalizeDisabledAgreementJson(a, normalized, &.{})) == null);
+    // The fast path cannot allocate, and escaped property names cannot bypass normalization.
+    try std.testing.expect((try normalizeDisabledAgreementJson(std.testing.failing_allocator, baseline, &.{})) == null);
+    const escaped = try std.mem.replaceOwned(u8, a, disabled, "require_agreement", "require_\\u0061greement");
+    try std.testing.expectEqualStrings(baseline, (try normalizeDisabledAgreementJson(a, escaped, &.{})).?);
+    try stages[1].object.put(a, "require_agreement", .{ .bool = true });
+    try std.testing.expect(omitDisabledAgreement(&fixture));
+    try std.testing.expect(!stages[0].object.contains("require_agreement"));
+    try std.testing.expect(stages[1].object.get("require_agreement").?.bool);
+    try std.testing.expect(!omitDisabledAgreement(&fixture));
+    // Preserve malformed fields for validation instead of silently disabling them.
+    try stages[1].object.put(a, "require_agreement", .{ .string = "false" });
+    try std.testing.expect(!omitDisabledAgreement(&fixture));
+    try std.testing.expectError(error.InvalidDecisionCascade, compile(a, fixture.object.get("cascade").?));
+}
+
+test "decision cascade default normalization preserves opaque numeric literals and nulls" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"first","decider":{"model":"m"}},{"name":"next","decider":{"model":"m"},"require_agreement":false,"when":{"probability_between":[0.3,0.9]}}]}},"opaque":{"tiny":1e-400,"bound":1.0000000000000001,"missing":null}}
+    ;
+    const expected = try std.mem.replaceOwned(u8, a, raw, "\"require_agreement\":false,", "");
+    defer a.free(expected);
+    const normalized = (try normalizeDisabledAgreementJson(a, raw, &.{"decider"})).?;
+    defer a.free(normalized);
+    try std.testing.expectEqualStrings(expected, normalized);
 }

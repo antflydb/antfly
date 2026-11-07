@@ -11,8 +11,7 @@
           "max_input_tokens": 1000000,
           "batch_size": 32
         },
-        "on_failure": "fail",
-        "require_agreement": false
+        "on_failure": "fail"
       },
       {
         "name": "strong",
@@ -29,8 +28,7 @@
             0.9
           ]
         },
-        "on_failure": "fail",
-        "require_agreement": false
+        "on_failure": "fail"
       }
     ]
   },

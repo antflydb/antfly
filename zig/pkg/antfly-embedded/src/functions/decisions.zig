@@ -1058,3 +1058,17 @@ test "decision scalar functions abstain while ai_decide preserves guarded raw ev
         try std.testing.expectEqualStrings("raw", (try selectResult(.ai_decide, response)).object.get("model").?.string);
     }
 }
+
+test "decision provider generated normalization retains sampled choices below the maximum" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const questions = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"same":{"type":"choice","instructions":"Same?","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    const source = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"model":"strong","answers":[{"name":"same","type":"choice","decision_method":"generated","probability_source":"token_logprobs","raw_structured_answer":"different","choice":"different","probabilities":[{"value":"same","probability":0.96},{"value":"different","probability":0.04}]}],"usage":{"input_tokens":10,"output_tokens":1}}
+    , .{});
+    const normalized = try normalizeResponseWithCapabilities(a, questions, source, .{ .generated = true, .max_levels = 64 });
+    try std.testing.expectEqualStrings("different", normalized.object.get("answers").?.array.items[0].object.get("choice").?.string);
+}

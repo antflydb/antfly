@@ -340,7 +340,10 @@ reported dependency changes.
 Probability thresholds apply to the probabilistic stages; a terminal
 verdict-only stage must provide a categorical 0/1 distribution. Catalogs with a cascade policy
 require reader epoch 30; policies with an enabled `require_agreement` guard
-require epoch 31. Agreement is recomputed from validated stage answers before
+require epoch 31. Disabled guards are omitted from stored definitions, preserving
+the epoch-30 wire contract. Generated choice votes remain the sampled structured
+answer; they need not be the distribution's argmax. Thresholds act only on the
+selected vote, and raw-answer inconsistencies remain invalid. Agreement is recomputed from validated stage answers before
 thresholds apply. Disagreed or unverified comparisons commit an abstained
 receipt and remain REVIEW even with `on_failure: mint`. These receipts replay
 without fresh inference until their normal policy or dependency invalidation.

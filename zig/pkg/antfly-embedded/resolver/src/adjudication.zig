@@ -47,6 +47,7 @@ pub const Config = struct {
         var parsed = try std.json.parseFromSlice(Config, a, raw, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
         try parsed.value.validate();
+        _ = @import("antfly_decisions").cascade.omitDisabledAgreement(&parsed.value.decider);
         return parsed;
     }
     pub fn validate(self: Config) !void {
@@ -213,6 +214,7 @@ pub const Config = struct {
         defer a.free(raw);
         copy.decider = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .allocate = .alloc_always });
         redactCredentials(&copy.decider);
+        _ = @import("antfly_decisions").cascade.omitDisabledAgreement(&copy.decider);
         return copy;
     }
     pub fn producerSpecification(self: Config, a: std.mem.Allocator) ![]u8 {
@@ -222,6 +224,7 @@ pub const Config = struct {
             const raw = try std.json.Stringify.valueAlloc(a, decider, .{});
             defer a.free(raw);
             decider = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .allocate = .alloc_always });
+            _ = @import("antfly_decisions").cascade.omitDisabledAgreement(&decider);
             if (std.mem.eql(u8, method.string, "generated")) {
                 try self.boundGeneratedBatch(a, &decider);
             } else for (decider.object.get("cascade").?.object.get("stages").?.array.items) |*stage| {
@@ -387,8 +390,9 @@ fn classifyResponse(config: Config, response: std.json.Value, definition: ?*cons
     const answering = try answeringDecider(config, response, definition);
     const expected_method = answering.object.get("decision_method") orelse std.json.Value{ .string = "typed" };
     if (expected_method != .string or !std.mem.eql(u8, method.string, expected_method.string)) return error.InvalidAdjudicationOutput;
+    const generated = std.mem.eql(u8, method.string, "generated");
     var verdict_only = false;
-    if (std.mem.eql(u8, method.string, "generated")) {
+    if (generated) {
         const source = answer.object.get("probability_source") orelse return error.InvalidAdjudicationOutput;
         const policy = answering.object.get("probabilities") orelse std.json.Value{ .string = "token_logprobs" };
         verdict_only = policy == .string and std.mem.eql(u8, policy.string, "verdict_only");
@@ -399,6 +403,10 @@ fn classifyResponse(config: Config, response: std.json.Value, definition: ?*cons
     if (probabilities != .array or probabilities.array.items.len != config.question.choices.len) return error.InvalidAdjudicationOutput;
     const selected = answer.object.get("choice") orelse return error.InvalidAdjudicationOutput;
     if (selected != .string) return error.InvalidAdjudicationOutput;
+    if (generated) {
+        const raw = answer.object.get("raw_structured_answer").?;
+        if (raw != .string or !std.mem.eql(u8, raw.string, selected.string)) return error.InvalidAdjudicationOutput;
+    }
     var selected_probability: ?f64 = null;
     var maximum: f64 = 0;
     var accepted: f64 = 0;
@@ -420,7 +428,8 @@ fn classifyResponse(config: Config, response: std.json.Value, definition: ?*cons
                 else => return error.InvalidAdjudicationOutput,
             };
             if (!std.math.isFinite(probability) or probability < 0 or probability > 1) return error.InvalidAdjudicationOutput;
-            if (verdict_only and probability != 0 and probability != 1) return error.InvalidAdjudicationOutput;
+            // Verdict-only evidence must assert exactly the sampled choice.
+            if (verdict_only and probability != @as(f64, if (std.mem.eql(u8, selected.string, choice.value)) 1 else 0)) return error.InvalidAdjudicationOutput;
             total += probability;
             maximum = @max(maximum, probability);
             if (std.mem.eql(u8, selected.string, choice.value)) selected_probability = probability;
@@ -431,9 +440,12 @@ fn classifyResponse(config: Config, response: std.json.Value, definition: ?*cons
         }
         if (!found) return error.InvalidAdjudicationOutput;
     }
-    if (@abs(total - 1) > 0.001 or (selected_probability orelse return error.InvalidAdjudicationOutput) != maximum) return error.InvalidAdjudicationOutput;
+    const selected_p = selected_probability orelse return error.InvalidAdjudicationOutput;
+    // Typed choices are derived from their distribution. Generated choices are
+    // sampled decoder output and can legitimately have a lower probability.
+    if (@abs(total - 1) > 0.001 or (!generated and selected_p != maximum)) return error.InvalidAdjudicationOutput;
     if (definition != null and try @import("antfly_decisions").cascade.agreementBlocked(response)) return .abstained;
-    if (accepted >= config.accept.min_probability and accepted > 0.5) return .accepted;
-    if (config.reject) |reject| if (rejected >= reject.min_probability and rejected > 0.5) return .rejected;
+    if (std.mem.eql(u8, selected.string, config.accept.choice) and accepted >= config.accept.min_probability and accepted > 0.5) return .accepted;
+    if (config.reject) |reject| if (std.mem.eql(u8, selected.string, reject.choice) and rejected >= reject.min_probability and rejected > 0.5) return .rejected;
     return .abstained;
 }

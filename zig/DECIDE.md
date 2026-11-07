@@ -154,5 +154,8 @@ records unverified agreement. Both states block scalar and predicate consumers
 while retaining raw answers and usage. `ai_decide` retains the complete trace.
 Trace validation recomputes the gate from the frozen definition and answers.
 Absent and explicit-false guards preserve existing canonical identities.
+Configuration boundaries omit disabled guard fields before forwarding or
+persisting definitions, preserving the epoch-30 wire shape. This normalization
+runs on caller-owned trees or configuration copies, outside per-result execution.
 Enabled guards require reader epoch 31 in persisted producers and resolver
 policies; unguarded cascades retain epoch 30.

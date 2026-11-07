@@ -26,7 +26,7 @@ class DeciderCascadeStage:
             band on the previous stage's answer.
         require_agreement (bool | Unset): Require this stage to agree with the preceding stage on the band question, or
             every question when unscoped. True is allowed only after the first stage. Disagreement stops this input and
-            abstains; a keep_previous failure leaves agreement unverified and also abstains. Default: False.
+            abstains; a keep_previous failure leaves agreement unverified and also abstains.
         on_failure (DeciderCascadeStageOnFailure | Unset): Defaults to fail, including on the first stage. fail ends the
             input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and
             is allowed only after the first stage. Default: DeciderCascadeStageOnFailure.FAIL.
@@ -35,7 +35,7 @@ class DeciderCascadeStage:
     name: str
     decider: DeciderConfig
     when: DeciderCascadeStageWhen | Unset = UNSET
-    require_agreement: bool | Unset = False
+    require_agreement: bool | Unset = UNSET
     on_failure: DeciderCascadeStageOnFailure | Unset = DeciderCascadeStageOnFailure.FAIL
 
     def to_dict(self) -> dict[str, Any]:

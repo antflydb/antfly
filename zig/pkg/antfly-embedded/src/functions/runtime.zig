@@ -3099,6 +3099,8 @@ test "decision provider cascade enrichment publication and reopen preserve reade
             defer manager.deinit();
             try manager.load(&store);
             try std.testing.expect(manager.getEnrichment(.asset, "cascade") != null);
+            const stored = manager.getEnrichment(.asset, "cascade").?.producer_json;
+            try std.testing.expect((std.mem.indexOf(u8, stored, "require_agreement") != null) == (guard orelse false));
             try std.testing.expectEqual(required, manager.minimum_reader_version.load(.acquire));
         }
     }

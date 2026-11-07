@@ -225,7 +225,6 @@ components:
               description: Lower and upper bound, lower strictly below upper. The previous stage must not be verdict_only.
         require_agreement:
           type: boolean
-          default: false
           description: Require this stage to agree with the preceding stage on the band question, or every question when unscoped. True is allowed only after the first stage. Disagreement stops this input and abstains; a keep_previous failure leaves agreement unverified and also abstains.
         on_failure:
           type: string

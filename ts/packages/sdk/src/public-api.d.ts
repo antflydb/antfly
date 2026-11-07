@@ -18331,10 +18331,7 @@ export interface components {
                 /** @description Lower and upper bound, lower strictly below upper. The previous stage must not be verdict_only. */
                 probability_between: number[];
             };
-            /**
-             * @description Require this stage to agree with the preceding stage on the band question, or every question when unscoped. True is allowed only after the first stage. Disagreement stops this input and abstains; a keep_previous failure leaves agreement unverified and also abstains.
-             * @default false
-             */
+            /** @description Require this stage to agree with the preceding stage on the band question, or every question when unscoped. True is allowed only after the first stage. Disagreement stops this input and abstains; a keep_previous failure leaves agreement unverified and also abstains. */
             require_agreement?: boolean;
             /**
              * @description Defaults to fail, including on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and is allowed only after the first stage.
