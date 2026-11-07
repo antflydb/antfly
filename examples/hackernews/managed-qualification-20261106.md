@@ -194,9 +194,10 @@ ranked IDs as the pre-migration golden record for every view. Readiness passed
 after the searches. Private invocation, scale-to-zero, the pinned gateway image,
 67 stored resources, 16 outputs and zero pending operations were verified.
 
-The new timing/correlation gateway code is still in Antfly #1547; this probe-only
-rollout did not deploy that code, change the database image, or optimize existing
-table schemas. Keep those boundaries separate from the verified probe correction.
+The gateway timing code from merged Antfly #1547 and the correlation additions
+in its follow-up are not yet deployed. This probe-only rollout did not deploy
+that code, change the database image, or optimize existing table schemas. Keep
+those boundaries separate from the verified probe correction.
 
 ## Remaining scope
 
