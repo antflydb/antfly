@@ -325,14 +325,16 @@ fn reserveLegacyHistogramOutput(a: Allocator, request: SearchAggregationRequest,
     a.free(extent);
 }
 
-fn completeLegacyHistogramBuckets(a: Allocator, request: SearchAggregationRequest, buckets: *[]SearchAggregationBucket, ctx: Context) !void {
+fn completeLegacyHistogramBuckets(a: Allocator, request: SearchAggregationRequest, primary: []const SearchAggregationRequest, buckets: *[]SearchAggregationBucket, ctx: Context) !void {
     if (request.min_doc_count != 0) return;
     var result: SearchAggregationResult = .{ .name = request.name, .field = request.field, .type = request.type, .buckets = buckets.* };
     errdefer buckets.* = result.buckets;
     var reserved = true; // reserveLegacyHistogramOutput already charged this extent.
     var controlled = ctx;
     controlled.histogram_budget_reserved = &reserved;
-    try completeDateHistogram(a, request, &result, controlled);
+    var presentation = request;
+    presentation.aggregations = primary;
+    try completeDateHistogram(a, presentation, &result, controlled);
     buckets.* = result.buckets;
 }
 
@@ -2136,7 +2138,7 @@ fn computeAlgebraicTermsAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (candidates[0..limit], 0..) |candidate, idx| {
@@ -2253,7 +2255,7 @@ fn computeAlgebraicTermsFromVisibleDocFactsAlloc(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (buckets_accum.items[0..limit], 0..) |candidate, idx| {
@@ -2408,7 +2410,7 @@ fn computeAlgebraicCompositeTermsAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (candidates[0..limit], 0..) |*candidate, idx| {
@@ -2559,7 +2561,7 @@ fn computeAlgebraicPathFactTermsAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (candidates[0..limit], 0..) |candidate, idx| {
@@ -2692,7 +2694,7 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     // Build only the canonical group keys that can appear in the response. HLL
@@ -2929,7 +2931,7 @@ fn computeDerivedJoinTermsCardinalityChildrenAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (candidates[0..limit], 0..) |candidate, idx| {
@@ -3102,7 +3104,7 @@ fn computeDerivedJoinTermsAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (candidates[0..limit], 0..) |candidate, idx| {
@@ -3220,7 +3222,7 @@ pub fn algebraicTermsAggregationFromDistributedPartialsAlloc(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (candidates[0..limit], 0..) |candidate, idx| {
@@ -3302,7 +3304,7 @@ pub fn algebraicTermsCardinalityAggregationFromDistributedPartialsAlloc(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (candidates[0..limit], 0..) |candidate, idx| {
@@ -3429,7 +3431,7 @@ fn algebraicPathFactTermsCardinalityAggregationFromDistributedPartialsAlloc(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (candidates[0..limit], 0..) |candidate, idx| {
@@ -3539,7 +3541,7 @@ fn algebraicPathFactTermsAggregationFromDistributedPartialsAlloc(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (candidates[0..limit], 0..) |candidate, idx| {
@@ -3988,7 +3990,7 @@ fn algebraicDateHistogramAggregationFromDistributedPartialsImpl(
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_keys.len);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     var candidate_index: usize = 0;
@@ -4020,7 +4022,7 @@ fn algebraicDateHistogramAggregationFromDistributedPartialsImpl(
         buckets_filled = idx + 1;
     }
 
-    try completeLegacyHistogramBuckets(alloc, request, &buckets, ctx);
+    try completeLegacyHistogramBuckets(alloc, request, child_aggs.primary, &buckets, ctx);
     buckets_filled = buckets.len;
     try applyPipelineAggregations(alloc, child_aggs.pipeline, &buckets);
     return .{
@@ -4125,7 +4127,7 @@ pub fn algebraicDateRangeAggregationFromDistributedPartialsAlloc(
         var buckets = try alloc.alloc(SearchAggregationBucket, request.date_ranges.len);
         var buckets_filled: usize = 0;
         errdefer {
-            for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+            for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
             alloc.free(buckets);
         }
         for (request.date_ranges, 0..) |range_spec, idx| {
@@ -4334,7 +4336,7 @@ pub fn algebraicHistogramAggregationFromDistributedPartialsAlloc(
     var buckets = try alloc.alloc(SearchAggregationBucket, keys.len);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (keys, 0..) |bucket_index, i| {
@@ -4436,7 +4438,7 @@ fn algebraicDocFactHistogramAggregationFromDistributedPartialsAlloc(
     var buckets = try alloc.alloc(SearchAggregationBucket, keys.len);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (keys, 0..) |bucket_index, i| {
@@ -4573,7 +4575,7 @@ pub fn algebraicRangeAggregationFromDistributedPartialsAlloc(
     var buckets = try alloc.alloc(SearchAggregationBucket, request.ranges.len);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (request.ranges, 0..) |range_spec, idx| {
@@ -4618,7 +4620,7 @@ fn algebraicDocFactRangeAggregationFromDistributedPartialsAlloc(
     var buckets = try alloc.alloc(SearchAggregationBucket, request.ranges.len);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (request.ranges, 0..) |range_spec, idx| {
@@ -4685,7 +4687,7 @@ fn algebraicDocFactDateRangeAggregationFromDistributedPartialsAlloc(
     var buckets = try alloc.alloc(SearchAggregationBucket, request.date_ranges.len);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (request.date_ranges, 0..) |range_spec, idx| {
@@ -4743,7 +4745,7 @@ fn algebraicRangeCardinalityAggregationFromDistributedPartialsAlloc(
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_count);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (0..bucket_count) |idx| {
@@ -4884,7 +4886,7 @@ fn algebraicHistogramCardinalityAggregationFromDistributedPartialsAlloc(
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_count);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (0..bucket_count) |i| {
@@ -5190,7 +5192,7 @@ fn computeAdaptiveTermsAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (candidates[0..limit], 0..) |candidate, idx| {
@@ -5804,7 +5806,7 @@ fn computeDerivedJoinHistogramAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, keys.len);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (keys, 0..) |bucket_index, i| {
@@ -5989,7 +5991,7 @@ fn computeAlgebraicHistogramAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, keys.len);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (keys, 0..) |bucket_index, i| {
@@ -6497,7 +6499,7 @@ fn computeAlgebraicDateHistogramAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_keys.len);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     var candidate_index: usize = 0;
@@ -6528,7 +6530,7 @@ fn computeAlgebraicDateHistogramAggregation(
         };
         buckets_filled = idx + 1;
     }
-    try completeLegacyHistogramBuckets(alloc, request, &buckets, ctx);
+    try completeLegacyHistogramBuckets(alloc, request, child_aggs.primary, &buckets, ctx);
     buckets_filled = buckets.len;
     try applyPipelineAggregations(alloc, child_aggs.pipeline, &buckets);
 
@@ -6605,7 +6607,7 @@ fn computeAlgebraicDateHistogramFromVisibleDocFactsAlloc(
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_keys.len);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (bucket_keys, 0..) |bucket_key, idx| {
@@ -6634,7 +6636,7 @@ fn computeAlgebraicDateHistogramFromVisibleDocFactsAlloc(
         };
         buckets_filled = idx + 1;
     }
-    try completeLegacyHistogramBuckets(alloc, request, &buckets, ctx);
+    try completeLegacyHistogramBuckets(alloc, request, child_requests, &buckets, ctx);
     buckets_filled = buckets.len;
     try applyPipelineAggregations(alloc, pipeline_requests, &buckets);
 
@@ -6757,7 +6759,7 @@ fn computeDerivedJoinDateHistogramAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_keys.len);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     var candidate_index: usize = 0;
@@ -6788,7 +6790,7 @@ fn computeDerivedJoinDateHistogramAggregation(
         };
         buckets_filled = idx + 1;
     }
-    try completeLegacyHistogramBuckets(alloc, request, &buckets, ctx);
+    try completeLegacyHistogramBuckets(alloc, request, child_requests, &buckets, ctx);
     buckets_filled = buckets.len;
     return .{
         .name = request.name,
@@ -6907,7 +6909,7 @@ fn computeAdaptiveDateHistogramAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, bucket_keys.len);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     var candidate_index: usize = 0;
@@ -6937,7 +6939,7 @@ fn computeAdaptiveDateHistogramAggregation(
         };
         buckets_filled = idx + 1;
     }
-    try completeLegacyHistogramBuckets(alloc, request, &buckets, ctx);
+    try completeLegacyHistogramBuckets(alloc, request, child_requests, &buckets, ctx);
     buckets_filled = buckets.len;
     try applyPipelineAggregations(alloc, pipeline_aggs, &buckets);
     return .{
@@ -7198,7 +7200,7 @@ fn computeTermsAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (entries.items[0..limit], 0..) |entry, idx| {
@@ -7309,7 +7311,7 @@ fn computeCompositeTermsAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (entries.items[0..limit], 0..) |entry, idx| {
@@ -7578,7 +7580,7 @@ fn computeSignificantTermsAggregation(
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
     var buckets_filled: usize = 0;
     errdefer {
-        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..@min(buckets_filled, buckets.len)]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (scored.items[0..limit], 0..) |entry, idx| {
@@ -8432,35 +8434,17 @@ fn applyBucketSort(
         .buckets = buckets_ptr.*,
     }, SortContext.lessThan);
 
-    var sorted = try alloc.alloc(SearchAggregationBucket, buckets_ptr.*.len);
-    errdefer alloc.free(sorted);
-    for (permutation, 0..) |old_idx, new_idx| {
-        sorted[new_idx] = buckets_ptr.*[old_idx];
-    }
-
+    // Allocate only the retained output. Every fallible operation precedes
+    // ownership transfer, so callers can safely clean up the original on OOM.
     const original = buckets_ptr.*;
-    alloc.free(original);
-    buckets_ptr.* = sorted;
-
-    const start: usize = @intCast(request.from);
-    if (start >= buckets_ptr.*.len) {
-        for (buckets_ptr.*) |*bucket| bucket.deinit(alloc);
-        alloc.free(buckets_ptr.*);
-        buckets_ptr.* = try alloc.alloc(SearchAggregationBucket, 0);
-        return;
-    }
-    const end: usize = if (request.size > 0)
-        @min(buckets_ptr.*.len, start + @as(usize, @intCast(request.size)))
-    else
-        buckets_ptr.*.len;
-    if (start == 0 and end == buckets_ptr.*.len) return;
-
+    const start = @min(original.len, std.math.cast(usize, request.from) orelse original.len);
+    const requested = if (request.size > 0) std.math.cast(usize, request.size) orelse original.len else original.len;
+    const end = @min(original.len, start +| requested);
     const retained = try alloc.alloc(SearchAggregationBucket, end - start);
-    errdefer alloc.free(retained);
-    for (retained, 0..) |*bucket, i| bucket.* = buckets_ptr.*[start + i];
-    for (buckets_ptr.*[0..start]) |*bucket| bucket.deinit(alloc);
-    for (buckets_ptr.*[end..]) |*bucket| bucket.deinit(alloc);
-    alloc.free(buckets_ptr.*);
+    for (permutation[start..end], 0..) |old_index, new_index| retained[new_index] = original[old_index];
+    for (permutation[0..start]) |old_index| original[old_index].deinit(alloc);
+    for (permutation[end..]) |old_index| original[old_index].deinit(alloc);
+    alloc.free(original);
     buckets_ptr.* = retained;
 }
 
@@ -8565,6 +8549,8 @@ fn appendBucketAggregation(
     bucket: *SearchAggregationBucket,
     aggregation: SearchAggregationResult,
 ) !void {
+    var owned = aggregation;
+    errdefer owned.deinit(alloc);
     const existing_len = bucket.aggregations.len;
     const next = try alloc.alloc(SearchAggregationResult, existing_len + 1);
     errdefer alloc.free(next);
@@ -16895,8 +16881,11 @@ test "time series grouped materializations merge globally and reduce extra dimen
     try std.testing.expectError(error.QueryCandidateBudgetExceeded, computeAlgebraicDateHistogramFromVisibleDocFactsAlloc(a, &left, &left_store, legacy_histogram, "ts", try parseDateInterval(legacy_histogram), &.{}, legacy_histogram.aggregations, &.{}, null, .{ .histogram_output_budget = &legacy_budget }));
     const LegacyAllocation = struct {
         fn run(render_alloc: Allocator, index: *algebraic_mod.index.Index, store: *docstore_mod.DocStore, legacy_request: SearchAggregationRequest) !void {
-            var answer = (try computeAlgebraicDateHistogramFromVisibleDocFactsAlloc(render_alloc, index, store, legacy_request, "ts", try parseDateInterval(legacy_request), &.{}, legacy_request.aggregations, &.{}, null, .{})) orelse return error.TestUnexpectedResult;
+            const children = try splitAggregationRequests(render_alloc, legacy_request.aggregations);
+            defer children.deinit(render_alloc);
+            var answer = (try computeAlgebraicDateHistogramFromVisibleDocFactsAlloc(render_alloc, index, store, legacy_request, "ts", try parseDateInterval(legacy_request), &.{}, children.primary, children.pipeline, null, .{})) orelse return error.TestUnexpectedResult;
             defer answer.deinit(render_alloc);
+            if (children.pipeline.len > 0) try std.testing.expectEqual(@as(usize, 2), answer.buckets.len);
         }
     };
     try std.testing.checkAllAllocationFailures(a, LegacyAllocation.run, .{ &left, &left_store, legacy_histogram });
@@ -16905,6 +16894,15 @@ test "time series grouped materializations merge globally and reduce extra dimen
     legacy_filled.date_bounds_start = "2026-11-06T11:50:00Z";
     legacy_filled.date_bounds_end = "2026-11-06T12:20:00Z";
     try std.testing.checkAllAllocationFailures(a, LegacyAllocation.run, .{ &left, &left_store, legacy_filled });
+    const legacy_pipeline_children = [_]SearchAggregationRequest{
+        legacy_histogram.aggregations[0],
+        .{ .name = "selected", .type = "bucket_sort", .field = "", .bucket_path = "_count", .sort_order = "desc", .size = 2 },
+        .{ .name = "change", .type = "derivative", .field = "", .bucket_path = "_count" },
+    };
+    var legacy_pipeline = legacy_histogram;
+    legacy_pipeline.min_doc_count = 0;
+    legacy_pipeline.aggregations = &legacy_pipeline_children;
+    try std.testing.checkAllAllocationFailures(a, LegacyAllocation.run, .{ &left, &left_store, legacy_pipeline });
     const limited_config = try std.fmt.allocPrint(a, "{{\"max_result_buckets\":1,{s}", .{config[1..]});
     defer a.free(limited_config);
     var limited = try algebraic_mod.index.Index.open(a, "limited", limited_config);

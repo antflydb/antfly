@@ -1244,6 +1244,10 @@ def test_retention_accepts_and_expires_signed_historical_readings(stateful_api, 
         assert sql.status_code == 200, sql.text
         assert int(sql.json()["rows"][0][0]) == (2 if visible else 0)
         if visible:
-            document, version = api.lookup_key_with_version(name, "historical")
-            assert document["observed_at"] == "1969-12-31T23:59:59Z"
-            assert version and int(version) > 0
+            for key, observed in [
+                ("historical", "1969-12-31T23:59:59Z"),
+                ("epoch", "1970-01-01T00:00:00Z"),
+            ]:
+                document, version = api.lookup_key_with_version(name, key)
+                assert document["observed_at"] == observed
+                assert version and int(version) > 0

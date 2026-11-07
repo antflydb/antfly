@@ -148387,6 +148387,8 @@ test "time series historical TTL sources preserve write versions and signed visi
         .timestamp_ns = 12346,
         .writes = &.{.{ .key = "epoch", .value = "{\"observed_at\":\"1970-01-01T00:00:00Z\",\"v\":2}" }},
     });
+    try std.testing.expectEqual(@as(u64, 12346), try db.getTimestamp(a, "epoch"));
+    try std.testing.expectEqual(@as(?i128, 0), try ttl_mod.readSourceTimestamp(db.core.store, a, "epoch"));
     try std.testing.expect((try db.get(a, "historical")) == null);
     try std.testing.expect((try db.lookup(a, "historical", .{})) == null);
     try std.testing.expect((try db.get(a, "epoch")) == null);

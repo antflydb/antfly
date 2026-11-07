@@ -1879,7 +1879,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn encodeDocumentTimestampValue(alloc: Allocator, fallback_version: u64, source: i128, restored_version: ?u64) ![]u8 {
-            const version = restored_version orelse std.math.cast(u64, source) orelse fallback_version;
+            const source_version = std.math.cast(u64, source);
+            // Zero denotes a missing write version in transfer protocols. Keep
+            // the epoch as a source instant while giving new writes a real version.
+            const version = restored_version orelse if (source_version != null and source_version.? != 0) source_version.? else fallback_version;
             return @import("../ttl.zig").encodeTimestampAlloc(alloc, version, source);
         }
 
