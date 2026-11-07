@@ -42,10 +42,6 @@ pub const ProgramSpec = struct {
     semantics: struct { epsilon: f32 = 1e-5, activation: enum { gelu, gelu_exact }, norm_order: enum { pre, post }, position_offset: usize, global_final_norm: bool },
     parameters: []const ParameterSpec,
 
-    pub fn hasRole(self: *const ProgramSpec, role: RoleKey) bool {
-        for (self.parameters) |parameter| if (std.meta.eql(parameter.role, role)) return true;
-        return false;
-    }
     fn validate(self: *const ProgramSpec) !void {
         const g = self.geometry;
         if (g.width == 0 or g.heads == 0 or g.width % g.heads != 0 or (g.layers != 0 and g.ffn_dim == 0) or g.vocab_size == 0 or g.encoder_rows == 0 or g.capacity == 0 or g.query_rows == 0 or g.query_rows > g.capacity or (self.phase == .decode and g.query_rows != 1) or !std.math.isFinite(self.semantics.epsilon) or self.semantics.epsilon <= 0) return error.DenseDefinitionChanged;
@@ -62,6 +58,11 @@ const SliceSpecSource = struct {
     entries: []const ParameterSpec,
     pub fn len(self: @This()) usize {
         return self.entries.len;
+    }
+    pub fn expectedNameBytes(self: @This()) !usize {
+        var bytes: usize = 0;
+        for (self.entries) |parameter| bytes = try std.math.add(usize, bytes, parameter.source_name.len);
+        return bytes;
     }
     pub fn at(self: @This(), index: usize, _: *[256]u8) !ParameterSpec {
         return self.entries[index];
@@ -119,15 +120,26 @@ const OwnedSpec = struct {
         value.parameters = &.{};
         try value.validate();
         var scratch: [256]u8 = undefined;
-        var bytes: usize = 0;
-        for (0..source.len()) |index| {
-            const parameter = try source.at(index, &scratch);
-            try value.validateParameter(parameter);
-            bytes = try std.math.add(usize, bytes, parameter.source_name.len);
-        }
+        const count = source.len();
+        const Source = switch (@typeInfo(@TypeOf(source))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(source),
+        };
+        // This is allocation sizing only. Every actual current parameter is
+        // still fetched and validated in the fill below; a count mismatch
+        // rejects the whole construction before any metadata can escape.
+        const bytes = if (comptime @hasDecl(Source, "expectedNameBytes")) try source.expectedNameBytes() else count_names: {
+            var size: usize = 0;
+            for (0..count) |index| {
+                const parameter = try source.at(index, &scratch);
+                try value.validateParameter(parameter);
+                size = try std.math.add(usize, size, parameter.source_name.len);
+            }
+            break :count_names size;
+        };
         const names = try a.alloc(u8, bytes);
         errdefer a.free(names);
-        const parameters = try a.alloc(ParameterSpec, source.len());
+        const parameters = try a.alloc(ParameterSpec, count);
         errdefer a.free(parameters);
         var offset: usize = 0;
         for (parameters, 0..) |*copy, index| {
@@ -190,13 +202,6 @@ fn currentPlane(cb: *const ops.ComputeBackend, spec: ParameterSpec, bound: Bound
     return actual;
 }
 
-const BindingSchema = struct {
-    values: usize,
-    runtime_bindings: usize,
-    immutable_bindings: usize,
-    planes: usize,
-};
-
 /// Cold metadata may be physically freed under the actual decoder Model gate.
 /// Accept only reclaiming allocators with no admission/reclamation callbacks;
 /// never unwrap a caller quota, bounded owner or arena to bypass its contract.
@@ -244,7 +249,7 @@ pub const Definition = struct {
     parameter_recipe: []ParameterRecipe = &.{},
     runtime_recipe: []PendingBinding = &.{},
     immutable_recipe: []PendingBinding = &.{},
-    binding_schema: BindingSchema,
+    plane_count: usize,
 
     pub fn programSpec(self: *const Definition) !*const ProgramSpec {
         if (self.program_spec) |*owned| return &owned.value;
@@ -341,7 +346,7 @@ pub const Definition = struct {
         errdefer layout.deinit();
         var frozen = try @import("../graph/runtime.zig").FrozenPhysicalLayout.initConsuming(&graph, &layout, &.{&builder.backend});
         errdefer frozen.deinit();
-        self.* = .{ .allocator = a, .key = key, .shared = if (builder.preparation) |preparation| preparation.shared else null, .graph = frozen.graph().*, .descriptors = descriptors, .steps = steps, .analysis = analysis, .physical_layout = frozen, .binding_schema = builder.schema(), .program_spec = owned_spec, .parameter_recipe = recipe, .runtime_recipe = runtime_recipe, .immutable_recipe = immutable_recipe };
+        self.* = .{ .allocator = a, .key = key, .shared = if (builder.preparation) |preparation| preparation.shared else null, .graph = frozen.graph().*, .descriptors = descriptors, .steps = steps, .analysis = analysis, .physical_layout = frozen, .plane_count = builder.planes.items.len, .program_spec = owned_spec, .parameter_recipe = recipe, .runtime_recipe = runtime_recipe, .immutable_recipe = immutable_recipe };
         // No fallible work follows transfer of the finalizer. Publication is
         // sealed separately by the caller after successful private preparation.
         if (self.shared) |owner| {
@@ -370,8 +375,6 @@ pub const Preparation = struct {
 pub const Builder = struct {
     allocator: std.mem.Allocator,
     preparation: ?*Preparation = null,
-    replay_cursor: usize = 0,
-    cached_capacity_reserved: bool = false,
     program_spec: ?*const ProgramSpec = null,
     spec_storage: ?*ProgramSpecStorage = null,
     bound_parameters: []const BoundParameter = &.{},
@@ -388,14 +391,14 @@ pub const Builder = struct {
     backend: ops.ComputeBackend,
 
     pub fn init(a: std.mem.Allocator, cb: *const ops.ComputeBackend) Builder {
-        return initPrepared(a, cb, null);
+        return initFresh(a, cb, null);
     }
-    pub fn initPrepared(a: std.mem.Allocator, cb: *const ops.ComputeBackend, preparation: ?*Preparation) Builder {
+    fn initFresh(a: std.mem.Allocator, cb: *const ops.ComputeBackend, preparation: ?*Preparation) Builder {
         const graph_allocator = if (preparation) |value| if (value.shared) |owner| owner.allocator() else a else a;
-        return .{ .allocator = a, .preparation = preparation, .graph = if (preparation) |value| if (value.cached) |definition| definition.graph else .init(graph_allocator) else .init(graph_allocator), .backend = cb.withoutSynchronousBorrows() };
+        return .{ .allocator = a, .preparation = preparation, .graph = .init(graph_allocator), .backend = cb.withoutSynchronousBorrows() };
     }
     pub fn initSpec(a: std.mem.Allocator, cb: *const ops.ComputeBackend, preparation: ?*Preparation, spec: *const ProgramSpec, bound: []const BoundParameter) Builder {
-        var self = initPrepared(a, cb, preparation);
+        var self = initFresh(a, cb, preparation);
         self.program_spec = spec;
         self.bound_parameters = bound;
         return self;
@@ -409,7 +412,8 @@ pub const Builder = struct {
         if (self.backend.vtable != &@import("../ops/native_compute.zig").vtable_impl) return error.UnsupportedDenseSchedule;
         if (self.spec_validated) return;
         const spec = self.program_spec orelse return error.DenseDefinitionChanged;
-        if (self.cached() != null or self.bound_parameters.len != spec.parameters.len) return error.DenseDefinitionChanged;
+        if (self.preparation) |preparation| if (preparation.cached != null) return error.DenseDefinitionChanged;
+        if (self.bound_parameters.len != spec.parameters.len) return error.DenseDefinitionChanged;
         try spec.validate();
         try self.role_indices.ensureTotalCapacity(self.allocator, std.math.cast(u32, spec.parameters.len) orelse return error.DenseDefinitionChanged);
         for (spec.parameters, self.bound_parameters, 0..) |declared, bound, index| {
@@ -419,6 +423,10 @@ pub const Builder = struct {
             entry.value_ptr.* = .{ .index = index };
         }
         self.spec_validated = true;
+    }
+    pub fn hasParameterRole(self: *Builder, role: RoleKey) !bool {
+        try self.prepareSpec();
+        return self.role_indices.contains(role);
     }
     pub fn parameterRole(self: *Builder, role: RoleKey) !Node {
         try self.prepareSpec();
@@ -481,37 +489,6 @@ pub const Builder = struct {
         }
         if (used_roles != spec.parameters.len or recipe_index != self.parameter_recipe.items.len or runtime_index != self.bindings.items.len or immutable_index != self.immutable_resident.items.len or plane_index != self.planes.items.len) return error.DenseDefinitionChanged;
     }
-    fn cached(self: *const Builder) ?*Definition {
-        return if (self.preparation) |value| value.cached else null;
-    }
-    fn schema(self: *const Builder) BindingSchema {
-        return .{ .values = self.values.items.len, .runtime_bindings = self.bindings.items.len, .immutable_bindings = self.immutable_resident.items.len, .planes = self.planes.items.len };
-    }
-    fn reserveCachedCapacity(self: *Builder, definition: *const Definition) !void {
-        if (self.cached_capacity_reserved) return;
-        const counts = definition.binding_schema;
-        try self.values.ensureTotalCapacityPrecise(self.allocator, counts.values);
-        try self.bindings.ensureTotalCapacityPrecise(self.allocator, counts.runtime_bindings);
-        try self.immutable_resident.ensureTotalCapacityPrecise(self.allocator, counts.immutable_bindings);
-        try self.planes.ensureTotalCapacityPrecise(self.allocator, counts.planes);
-        self.cached_capacity_reserved = true;
-    }
-    fn replay(self: *Builder, shape: Shape, inputs: []const Node, descriptor: ?ops.kernel_descriptor.Descriptor) !?Node {
-        const definition = self.cached() orelse return null;
-        try self.reserveCachedCapacity(definition);
-        if (self.replay_cursor >= definition.graph.nodeCount()) return error.DenseDefinitionChanged;
-        const id: Node = @intCast(self.replay_cursor);
-        const node = definition.graph.node(id);
-        if (!node.output_shape.eq(shape) or !std.mem.eql(Node, node.getInputs(), inputs)) return error.DenseDefinitionChanged;
-        const stored = definition.descriptors[id];
-        if (descriptor) |expected| {
-            const actual = stored orelse return error.DenseDefinitionChanged;
-            if (actual.input_count != expected.input_count or !actual.output_shape.eq(expected.output_shape) or !std.meta.eql(actual.operation, expected.operation)) return error.DenseDefinitionChanged;
-            for (actual.input_shapes[0..actual.input_count], expected.input_shapes[0..expected.input_count]) |a, b| if (!a.eq(b)) return error.DenseDefinitionChanged;
-        } else if (stored != null or node.op != .parameter) return error.DenseDefinitionChanged;
-        self.replay_cursor += 1;
-        return id;
-    }
     pub fn deinit(self: *Builder) void {
         const a = self.allocator;
         self.role_indices.deinit(a);
@@ -522,19 +499,16 @@ pub const Builder = struct {
         self.immutable_resident.deinit(a);
         self.steps.deinit(self.graph.allocator);
         self.planes.deinit(a);
-        if (self.cached() == null) self.graph.deinit();
+        self.graph.deinit();
     }
     pub fn parameter(self: *Builder, shape: Shape, value: CT) !Node {
         return self.parameterWithPlane(shape, value, try residentPlane(&self.backend, value), false);
     }
     fn parameterWithPlane(self: *Builder, shape: Shape, value: CT, observed: Plane, comptime immutable: bool) !Node {
-        const reused = try self.replay(shape, &.{}, null);
-        const id = reused orelse fresh: {
-            var b = ml.graph.Builder.init(&self.graph);
-            var name: [40]u8 = undefined;
-            break :fresh try b.parameter(try std.fmt.bufPrint(&name, "dense.input.{d}", .{self.graph.nodeCount()}), shape);
-        };
-        if (reused == null) try self.descriptors.append(self.graph.allocator, null);
+        var b = ml.graph.Builder.init(&self.graph);
+        var name: [40]u8 = undefined;
+        const id = try b.parameter(try std.fmt.bufPrint(&name, "dense.input.{d}", .{self.graph.nodeCount()}), shape);
+        try self.descriptors.append(self.graph.allocator, null);
         try self.values.append(self.allocator, value);
         const index = self.planes.items.len;
         try self.planes.append(self.allocator, observed);
@@ -549,13 +523,10 @@ pub const Builder = struct {
         return self.parameterWithPlane(plane.descriptor.shape, value, plane, true);
     }
     pub fn hostParameter(self: *Builder, shape: Shape) !Node {
-        const reused = try self.replay(shape, &.{}, null);
-        const id = reused orelse fresh: {
-            var b = ml.graph.Builder.init(&self.graph);
-            var name: [40]u8 = undefined;
-            break :fresh try b.parameter(try std.fmt.bufPrint(&name, "dense.host.{d}", .{self.graph.nodeCount()}), shape);
-        };
-        if (reused == null) try self.descriptors.append(self.graph.allocator, null);
+        var b = ml.graph.Builder.init(&self.graph);
+        var name: [40]u8 = undefined;
+        const id = try b.parameter(try std.fmt.bufPrint(&name, "dense.host.{d}", .{self.graph.nodeCount()}), shape);
+        try self.descriptors.append(self.graph.allocator, null);
         try self.values.append(self.allocator, null);
         try self.bindings.append(self.allocator, .{ .node_id = id, .source = .{ .host = .{ .logical = shape, .target = .native, .owned_ingress = true, .borrowable_host = false } } });
         return id;
@@ -563,37 +534,23 @@ pub const Builder = struct {
     pub fn gather(self: *Builder, weight: Node, indices: Node, width: usize) !Node {
         const rows = self.logicalShape(indices).numElements() orelse return error.InvalidShape;
         const shape = Shape.init(.f32, &.{ rows, @intCast(width) });
-        const id = if (self.cached()) |definition| reuse: {
-            if (self.replay_cursor >= definition.graph.nodeCount()) return error.DenseDefinitionChanged;
-            const id: Node = @intCast(self.replay_cursor);
-            const descriptor = definition.descriptors[id] orelse return error.DenseDefinitionChanged;
-            if (descriptor.operation != .gather) return error.DenseDefinitionChanged;
-            break :reuse (try self.replay(shape, &.{ weight, indices }, descriptor)).?;
-        } else fresh: {
-            var b = ml.graph.Builder.init(&self.graph);
-            const id = try b.gather(weight, indices, shape);
-            try self.descriptors.append(self.graph.allocator, ops.kernel_descriptor.lower(&self.graph, id) orelse return error.UnsupportedDenseSchedule);
-            break :fresh id;
-        };
+        var b = ml.graph.Builder.init(&self.graph);
+        const id = try b.gather(weight, indices, shape);
+        try self.descriptors.append(self.graph.allocator, ops.kernel_descriptor.lower(&self.graph, id) orelse return error.UnsupportedDenseSchedule);
         try self.values.append(self.allocator, null);
-        if (self.cached() == null) try self.steps.append(self.graph.allocator, id);
+        try self.steps.append(self.graph.allocator, id);
         return id;
     }
     pub fn operation(self: *Builder, op: ml.graph.OpCode, inputs: []const Node, descriptor: ops.kernel_descriptor.Descriptor) !Node {
-        const reused = try self.replay(descriptor.output_shape, inputs, descriptor);
         var node = ml.graph.Node{ .op = op, .output_shape = descriptor.output_shape, .num_inputs = @intCast(inputs.len) };
         @memcpy(node.inputs[0..inputs.len], inputs);
-        const id = reused orelse try self.graph.addNode(node);
-        if (reused == null) try self.descriptors.append(self.graph.allocator, descriptor);
+        const id = try self.graph.addNode(node);
+        try self.descriptors.append(self.graph.allocator, descriptor);
         try self.values.append(self.allocator, null);
-        if (self.cached() == null) try self.steps.append(self.graph.allocator, id);
+        try self.steps.append(self.graph.allocator, id);
         return id;
     }
     pub fn output(self: *Builder, id: Node) !void {
-        if (self.cached() != null) {
-            for (self.graph.outputs.items) |root| if (root == id) return;
-            return error.DenseDefinitionChanged;
-        }
         try self.graph.markOutput(id);
     }
     pub fn logicalShape(self: *const Builder, id: Node) Shape {
@@ -685,10 +642,7 @@ pub const Schedule = struct {
     /// before enter, without using the architecture's compatibility allowance.
     pub fn create(builder: *Builder) !*Schedule {
         const a = builder.allocator;
-        const definition = if (builder.cached()) |value| block: {
-            if (builder.program_spec != null or builder.replay_cursor != value.graph.nodeCount() or !std.meta.eql(builder.schema(), value.binding_schema)) return error.DenseDefinitionChanged;
-            break :block value.retain();
-        } else try Definition.create(builder);
+        const definition = try Definition.create(builder);
         defer definition.release(.{ .outside_execution = true });
         const values = try builder.values.toOwnedSlice(a);
         errdefer a.free(values);
@@ -706,7 +660,7 @@ pub const Schedule = struct {
         const values = try a.alloc(?CT, definition.graph.nodeCount());
         errdefer a.free(values);
         @memset(values, null);
-        const planes = try a.alloc(Plane, definition.binding_schema.planes);
+        const planes = try a.alloc(Plane, definition.plane_count);
         defer a.free(planes);
         for (definition.parameter_recipe) |entry| {
             const parameter = spec.parameters[entry.parameter];
@@ -825,71 +779,6 @@ pub const Schedule = struct {
     }
 };
 
-fn packedColdBindingCase(a: std.mem.Allocator) !void {
-    const native = @import("../ops/native_compute.zig");
-    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
-    defer weights.deinitOwned();
-    var compute = native.NativeCompute.init(a, &weights, null);
-    defer compute.deinit();
-    const cb = compute.computeBackend();
-    const first_input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 });
-    defer cb.free(first_input);
-    const second_input = try cb.fromFloat32Shape(&.{ -1, -2, -3, -4 }, &.{ 1, 4 });
-    defer cb.free(second_input);
-    const Author = struct {
-        fn create(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, value: CT, preparation: ?*Preparation) !*Schedule {
-            var builder = Builder.initPrepared(allocator, backend, preparation);
-            defer builder.deinit();
-            const shape = Shape.init(.f32, &.{ 1, 4 });
-            var sum = try builder.parameter(shape, value);
-            // Every distinct parameter participates; this crosses cold list
-            // growth boundaries without granting authority to dead metadata.
-            for (0..16) |_| sum = try builder.add(sum, try builder.parameter(shape, value));
-            try builder.output(sum);
-            return Schedule.create(&builder);
-        }
-    };
-    const first = try Author.create(a, &cb, first_input, null);
-    var first_live = true;
-    defer if (first_live) first.deinit(.{ .outside_execution = true });
-    var preparation = Preparation{ .key = @splat(0), .cached = first.definition.retain() };
-    defer preparation.deinit(.{ .outside_execution = true });
-    const second = try Author.create(a, &cb, second_input, &preparation);
-    defer second.deinit(.{ .outside_execution = true });
-    try std.testing.expect(first.definition == second.definition);
-    const first_inputs = first.selected.pool.selection.?.inputs.entries;
-    const second_inputs = second.selected.pool.selection.?.inputs.entries;
-    try std.testing.expect(first_inputs.ptr != second_inputs.ptr);
-    const first_plane = try residentPlane(&cb, first_input);
-    const second_plane = try residentPlane(&cb, second_input);
-    try std.testing.expect(!std.meta.eql(first_plane.backing, second_plane.backing));
-    for (first_inputs, second_inputs) |first_binding, second_binding| {
-        const one = first_binding.value.resident.planes;
-        const two = second_binding.value.resident.planes;
-        try std.testing.expect(one.ptr != two.ptr);
-        try std.testing.expectEqual(@as(usize, 1), one.len);
-        try std.testing.expectEqual(@as(usize, 1), two.len);
-        try std.testing.expectEqual(first_plane.backing, one[0].backing);
-        try std.testing.expectEqual(second_plane.backing, two[0].backing);
-    }
-    first.deinit(.{ .outside_execution = true });
-    first_live = false;
-    // The cached Definition contains counts and semantic metadata only. The
-    // surviving request still validates its independently owned actual planes.
-    try second.selected.validate(second_inputs);
-    for (second_inputs) |binding| try std.testing.expectEqual(second_plane.backing, binding.value.resident.planes[0].backing);
-}
-
-test "dense decoder packed cold bindings keep request planes independent across Definition reuse" {
-    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
-    try packedColdBindingCase(std.testing.allocator);
-}
-
-test "dense decoder packed cold binding publication unwinds every allocation failure" {
-    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, packedColdBindingCase, .{});
-}
-
 fn semanticRecipeCase(a: std.mem.Allocator) !void {
     const native = @import("../ops/native_compute.zig");
     const sink = try @import("retirement_sink.zig").Ref.create();
@@ -933,47 +822,61 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     const key = try cb.getWeight("key");
     defer cb.free(key);
     try native.NativeCompute.stampHeldF32WeightSources(&cb, &weights, &.{ query, key });
-    const first_state = try cb.fromFloat32Shape(&data, &.{ 1, 4 });
-    defer cb.free(first_state);
-    const second_state = try cb.fromFloat32Shape(&.{ -1, -2, -3, -4 }, &.{ 1, 4 });
-    defer cb.free(second_state);
+    // Twenty parameters cross cold list growth boundaries; seventeen actual
+    // state roots also prove each request owns every independent plane slice.
+    const state_count = 17;
+    var first_states: [state_count]CT = undefined;
+    var first_built: usize = 0;
+    defer for (first_states[0..first_built]) |value| cb.free(value);
+    for (&first_states) |*value| {
+        value.* = try cb.fromFloat32Shape(&data, &.{ 1, 4 });
+        first_built += 1;
+    }
+    var second_states: [state_count]CT = undefined;
+    var second_built: usize = 0;
+    defer for (second_states[0..second_built]) |value| cb.free(value);
+    for (&second_states) |*value| {
+        value.* = try cb.fromFloat32Shape(&.{ -1, -2, -3, -4 }, &.{ 1, 4 });
+        second_built += 1;
+    }
+    const first_state = first_states[0];
+    const second_state = second_states[0];
     const shape = Shape.init(.f32, &.{ 1, 4 });
     const q_role = RoleKey{ .kind = .self_q, .layer = 0, .part = .weight };
     const k_role = RoleKey{ .kind = .self_k, .layer = 0, .part = .weight };
-    const state_role = RoleKey{ .kind = .self_slab_k, .layer = 0 };
     const token_role = RoleKey{ .kind = .token_ids };
     const token_shape = Shape.init(.i64, &.{1});
     var query_name = [_]u8{ 'q', 'u', 'e', 'r', 'y' };
-    const parameters = [_]ParameterSpec{
-        .{ .role = q_role, .shape = shape, .source_kind = .held_weight, .source_name = &query_name },
-        .{ .role = k_role, .shape = shape, .source_kind = .held_weight, .source_name = "key" },
-        .{ .role = state_role, .shape = shape, .source_kind = .external },
-        .{ .role = token_role, .shape = token_shape, .source_kind = .host },
-    };
+    var parameters: [state_count + 3]ParameterSpec = undefined;
+    parameters[0] = .{ .role = q_role, .shape = shape, .source_kind = .held_weight, .source_name = &query_name };
+    parameters[1] = .{ .role = k_role, .shape = shape, .source_kind = .held_weight, .source_name = "key" };
+    for (parameters[2..][0..state_count], 0..) |*parameter, index| parameter.* = .{ .role = .{ .kind = .self_slab_k, .layer = @intCast(index) }, .shape = shape, .source_kind = .external };
+    parameters[state_count + 2] = .{ .role = token_role, .shape = token_shape, .source_kind = .host };
     const spec = ProgramSpec{
         .family = .whisper,
         .phase = .decode,
-        .geometry = .{ .layers = 1, .width = 4, .heads = 1, .ffn_dim = 4, .vocab_size = 4, .encoder_rows = 1, .capacity = 4, .query_rows = 1 },
+        .geometry = .{ .layers = state_count, .width = 4, .heads = 1, .ffn_dim = 4, .vocab_size = 4, .encoder_rows = 1, .capacity = 4, .query_rows = 1 },
         .semantics = .{ .activation = .gelu, .norm_order = .pre, .position_offset = 0, .global_final_norm = true },
         .parameters = &parameters,
     };
-    var bound = [_]BoundParameter{
-        .{ .role = q_role, .value = query, .source_data = &weights },
-        .{ .role = k_role, .value = key, .source_data = &weights },
-        .{ .role = state_role, .value = first_state },
-        .{ .role = token_role },
-    };
+    var bound: [parameters.len]BoundParameter = undefined;
+    bound[0] = .{ .role = q_role, .value = query, .source_data = &weights };
+    bound[1] = .{ .role = k_role, .value = key, .source_data = &weights };
+    for (bound[2..][0..state_count], first_states, 0..) |*binding, value, index| binding.* = .{ .role = parameters[index + 2].role, .value = value };
+    bound[state_count + 2] = .{ .role = token_role };
     // Independent original Builder authoring is the structural and numerical
     // reference; it does not read ProgramSpec or its cached recipe.
     var original_builder = Builder.init(a, &cb);
     defer original_builder.deinit();
     const original_q = try original_builder.residentWeight(query, try native.NativeCompute.heldF32WeightPrimary(&cb, &weights, query));
     const original_k = try original_builder.residentWeight(key, try native.NativeCompute.heldF32WeightPrimary(&cb, &weights, key));
-    const original_state = try original_builder.parameter(shape, first_state);
+    var original_states: [state_count]Node = undefined;
+    for (&original_states, first_states) |*node, value| node.* = try original_builder.parameter(shape, value);
     const original_token = try original_builder.hostParameter(token_shape);
     const original_gather = try original_builder.gather(original_q, original_token, 4);
-    const original_sum = try original_builder.add(original_gather, original_k);
-    try original_builder.output(try original_builder.add(original_sum, original_state));
+    var original_sum = try original_builder.add(original_gather, original_k);
+    for (original_states) |state| original_sum = try original_builder.add(original_sum, state);
+    try original_builder.output(original_sum);
     const original = try Schedule.create(&original_builder);
     defer original.deinit(cleanup);
     var storage = try ProgramSpecStorage.fromSource(a, &spec, SliceSpecSource{ .entries = &parameters });
@@ -981,11 +884,16 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     var builder = Builder.initSpecStorage(a, &cb, null, &storage, &bound);
     defer builder.deinit();
     const q_node = try builder.parameterRole(q_role);
+    try std.testing.expect(try builder.hasParameterRole(q_role));
+    try std.testing.expect(!try builder.hasParameterRole(.{ .kind = .self_q, .layer = 0, .part = .bias }));
     const k_node = try builder.parameterRole(k_role);
-    const state_node = try builder.parameterRole(state_role);
+    var state_nodes: [state_count]Node = undefined;
+    for (&state_nodes, parameters[2..][0..state_count]) |*node, parameter| node.* = try builder.parameterRole(parameter.role);
     const token_node = try builder.parameterRole(token_role);
     const gathered_node = try builder.gather(q_node, token_node, 4);
-    try builder.output(try builder.add(try builder.add(gathered_node, k_node), state_node));
+    var sum_node = try builder.add(gathered_node, k_node);
+    for (state_nodes) |state| sum_node = try builder.add(sum_node, state);
+    try builder.output(sum_node);
     const first = try Schedule.create(&builder);
     var first_open = true;
     defer if (first_open) first.deinit(cleanup);
@@ -1003,7 +911,17 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     try std.testing.expectEqual(q_node, try definition.parameterNode(q_role));
     try std.testing.expectEqual(token_node, try definition.parameterNode(token_role));
     const owned = try definition.programSpec();
-    try std.testing.expect(owned.hasRole(q_role));
+    {
+        var cached_preparation = Preparation{ .key = definition.key, .cached = definition.retain() };
+        defer cached_preparation.deinit(cleanup);
+        var refused = Builder.initSpec(a, &cb, &cached_preparation, owned, &bound);
+        defer refused.deinit();
+        // Cache ownership is live, but authoring always owns a fresh graph.
+        // A HIT must use instantiate rather than silently replay or adopt it.
+        try std.testing.expectError(error.DenseDefinitionChanged, refused.parameterRole(q_role));
+        try std.testing.expectEqual(@as(usize, 0), refused.graph.nodeCount());
+        try std.testing.expect(refused.preparation.?.cached == definition);
+    }
     try std.testing.expect(try definition.matchesSpecSource(&spec, SliceSpecSource{ .entries = &parameters }));
     // Names and exact semantics are owned independently of constructor storage.
     query_name[0] = 'X';
@@ -1055,10 +973,13 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
         defer extra.deinit();
         const q = try extra.parameterRole(q_role);
         const k = try extra.parameterRole(k_role);
-        const state = try extra.parameterRole(state_role);
+        var states: [state_count]Node = undefined;
+        for (&states, parameters[2..][0..state_count]) |*node, parameter| node.* = try extra.parameterRole(parameter.role);
         _ = try extra.parameterRole(token_role);
         const raw = try extra.parameter(shape, first_state);
-        try extra.output(try extra.add(try extra.add(try extra.add(q, k), state), raw));
+        var sum = try extra.add(q, k);
+        for (states) |state| sum = try extra.add(sum, state);
+        try extra.output(try extra.add(sum, raw));
         if (Schedule.create(&extra)) |unexpected| {
             unexpected.deinit(cleanup);
             return error.ExpectedUnrepresentedParameterDenial;
@@ -1079,7 +1000,7 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     try std.testing.expect(!accepted);
     try std.testing.expectEqual(@as(u64, 0), slot.trySnapshot().?.hits);
     try std.testing.expectEqual(@as(u64, 1), slot.trySnapshot().?.misses);
-    bound[2].value = second_state;
+    for (bound[2..][0..state_count], second_states) |*binding, value| binding.value = value;
     const second = try Schedule.instantiate(a, &cb, definition, owned, &bound);
     var second_open = true;
     defer if (second_open) second.deinit(cleanup);
@@ -1088,7 +1009,24 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     const first_inputs = first.selected.pool.selection.?.inputs.entries;
     const second_inputs = second.selected.pool.selection.?.inputs.entries;
     try std.testing.expect(first_inputs.ptr != second_inputs.ptr);
-    try std.testing.expect(!std.meta.eql(first_inputs[0].value.resident.planes[0].backing, second_inputs[0].value.resident.planes[0].backing));
+    try std.testing.expectEqual(@as(usize, state_count + 1), first_inputs.len);
+    try std.testing.expectEqual(first_inputs.len, second_inputs.len);
+    try std.testing.expectEqual(@as(usize, state_count + 2), definition.plane_count);
+    for (first_inputs[0..state_count], second_inputs[0..state_count], first_states, second_states, 0..) |one, two, first_value, second_value, index| {
+        const first_planes = one.value.resident.planes;
+        const second_planes = two.value.resident.planes;
+        try std.testing.expect(first_planes.ptr != second_planes.ptr);
+        try std.testing.expectEqual(@as(usize, 1), first_planes.len);
+        try std.testing.expectEqual(@as(usize, 1), second_planes.len);
+        try std.testing.expectEqual((try residentPlane(&cb, first_value)).backing, first_planes[0].backing);
+        try std.testing.expectEqual((try residentPlane(&cb, second_value)).backing, second_planes[0].backing);
+        try std.testing.expect(!std.meta.eql(first_planes[0].backing, second_planes[0].backing));
+        for (second_inputs[0..index]) |previous| {
+            const previous_planes = previous.value.resident.planes;
+            try std.testing.expect(previous_planes.ptr != second_planes.ptr);
+            try std.testing.expect(!std.meta.eql(previous_planes[0].backing, second_planes[0].backing));
+        }
+    }
     // Same physical weight bytes and shape, different checkpoint role: deny.
     bound[0].value = key;
     if (Schedule.instantiate(a, &cb, definition, owned, &bound)) |unexpected| {
@@ -1141,17 +1079,19 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
         const row = try cb.toFloat32(gathered, a);
         defer a.free(row);
         try std.testing.expectEqualSlices(f32, &data, row);
-        const sum = try schedule.execute(&.{ gathered, key }, null);
-        const output = try schedule.execute(&.{ sum, if (schedule == second) second_state else first_state }, null);
+        var output = try schedule.execute(&.{ gathered, key }, null);
+        const current_states = if (schedule == second) &second_states else &first_states;
+        for (current_states) |value| output = try schedule.execute(&.{ output, value }, null);
         const actual = try cb.toFloat32(output, a);
         defer a.free(actual);
-        try std.testing.expectEqualSlices(f32, if (schedule == second) &.{ 1, 2, 3, 4 } else &.{ 3, 6, 9, 12 }, actual);
+        try std.testing.expectEqualSlices(f32, if (schedule == second) &.{ -15, -30, -45, -60 } else &.{ 19, 38, 57, 76 }, actual);
     }
     first.deinit(cleanup);
     first_open = false;
     // Request one's metadata and snapshots have died; request two retains only
     // the shared pure Definition and its own current facts/physical authority.
     try second.selected.validate(second_inputs);
+    for (second_inputs[0..state_count], second_states) |binding, value| try std.testing.expectEqual((try residentPlane(&cb, value)).backing, binding.value.resident.planes[0].backing);
     const second_output = second.values[second.steps[second.steps.len - 1]].?;
     const held = try cb.primReshape(second_output, &.{ 1, 4 });
     defer cb.free(held);
@@ -1159,7 +1099,7 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     second_open = false;
     const held_values = try cb.toFloat32(held, a);
     defer a.free(held_values);
-    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, held_values);
+    try std.testing.expectEqualSlices(f32, &.{ -15, -30, -45, -60 }, held_values);
 }
 
 test "dense decoder semantic recipes match original graphs and rebind named current request sources" {
@@ -1170,4 +1110,143 @@ test "dense decoder semantic recipes match original graphs and rebind named curr
 test "dense decoder semantic recipe creation and cached instantiation unwind every allocation failure" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, semanticRecipeCase, .{});
+}
+
+fn packedSpecNameCase(a: std.mem.Allocator) !void {
+    const Source = struct {
+        parameters: []const ParameterSpec,
+        fills: *usize,
+        counts: *usize,
+        adjustment: i8 = 0,
+        fail_count: bool = false,
+        fail_at: ?usize = null,
+        pub fn len(self: @This()) usize {
+            return self.parameters.len;
+        }
+        pub fn expectedNameBytes(self: @This()) !usize {
+            self.counts.* += 1;
+            if (self.fail_count) return error.TestExpectedNameCountFailure;
+            var bytes: usize = 0;
+            for (self.parameters) |parameter| bytes = try std.math.add(usize, bytes, parameter.source_name.len);
+            return if (self.adjustment < 0) try std.math.sub(usize, bytes, @intCast(-@as(i16, self.adjustment))) else try std.math.add(usize, bytes, @intCast(self.adjustment));
+        }
+        pub fn at(self: @This(), index: usize, buffer: *[256]u8) !ParameterSpec {
+            self.fills.* += 1;
+            if (self.fail_at == index) return error.TestCurrentSpecSourceFailure;
+            var parameter = self.parameters[index];
+            // This is a genuine ephemeral source view; the next call overwrites
+            // the same scratch that its returned name currently borrows.
+            parameter.source_name = try std.fmt.bufPrint(buffer, "{s}", .{parameter.source_name});
+            return parameter;
+        }
+    };
+    const Legacy = struct {
+        inner: Source,
+        pub fn len(self: @This()) usize {
+            return self.inner.len();
+        }
+        pub fn at(self: @This(), index: usize, buffer: *[256]u8) !ParameterSpec {
+            return self.inner.at(index, buffer);
+        }
+    };
+    var query_name = [_]u8{ 'q', 'u', 'e', 'r', 'y' };
+    const parameters = [_]ParameterSpec{
+        .{ .role = .{ .kind = .self_q, .layer = 0, .part = .weight }, .shape = Shape.init(.f32, &.{ 1, 4 }), .source_kind = .held_weight, .source_name = &query_name },
+        .{ .role = .{ .kind = .self_k, .layer = 0, .part = .weight }, .shape = Shape.init(.f32, &.{ 1, 4 }), .source_kind = .held_weight, .source_name = "key" },
+        .{ .role = .{ .kind = .token_ids }, .shape = Shape.init(.i64, &.{1}), .source_kind = .host },
+    };
+    const header = ProgramSpec{ .family = .whisper, .phase = .decode, .geometry = .{ .layers = 1, .width = 4, .heads = 1, .ffn_dim = 4, .vocab_size = 1, .encoder_rows = 1, .capacity = 4, .query_rows = 1 }, .semantics = .{ .activation = .gelu, .norm_order = .pre, .position_offset = 0, .global_final_norm = true }, .parameters = &.{} };
+    var fills: usize = 0;
+    var counts: usize = 0;
+    const source = Source{ .parameters = &parameters, .fills = &fills, .counts = &counts };
+    var owned_names = try ProgramSpecStorage.fromSource(a, &header, &source);
+    defer owned_names.deinit();
+    try std.testing.expectEqual(@as(usize, 1), counts);
+    try std.testing.expectEqual(parameters.len, fills);
+    try std.testing.expectEqual(@as(usize, 8), owned_names.names.len);
+    try std.testing.expectEqualStrings("query", owned_names.value.parameters[0].source_name);
+    try std.testing.expectEqualStrings("key", owned_names.value.parameters[1].source_name);
+    try std.testing.expectEqual(@intFromPtr(owned_names.names.ptr), @intFromPtr(owned_names.value.parameters[0].source_name.ptr));
+    try std.testing.expectEqual(@intFromPtr(owned_names.names.ptr) + 5, @intFromPtr(owned_names.value.parameters[1].source_name.ptr));
+    var expected = header;
+    expected.parameters = &parameters;
+    try std.testing.expectEqual(try specKey(&expected), try specKey(&owned_names.value));
+    query_name[0] = 'X';
+    try std.testing.expectEqualStrings("query", owned_names.value.parameters[0].source_name);
+    query_name[0] = 'q';
+    fills = 0;
+    counts = 0;
+    var legacy = try ProgramSpecStorage.fromSource(a, &header, Legacy{ .inner = source });
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(usize, 0), counts);
+    try std.testing.expectEqual(parameters.len * 2, fills);
+    try std.testing.expectEqual(try specKey(&owned_names.value), try specKey(&legacy.value));
+    // Both short and long pure counts are untrusted sizing hints. Exact fill
+    // extents reject before escape; all real OOM remains visible to the sweep.
+    for ([_]i8{ -1, 1 }) |adjustment| {
+        var wrong = source;
+        wrong.adjustment = adjustment;
+        if (ProgramSpecStorage.fromSource(a, &header, wrong)) |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.ExpectedPackedNameCountMismatch;
+        } else |err| switch (err) {
+            error.DenseDefinitionChanged => {},
+            else => return err,
+        }
+    }
+    var failed = source;
+    failed.fail_at = 1;
+    if (ProgramSpecStorage.fromSource(a, &header, failed)) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.ExpectedCurrentSpecSourceFailure;
+    } else |err| switch (err) {
+        error.TestCurrentSpecSourceFailure => {},
+        else => return err,
+    }
+    var invalid_parameters = parameters;
+    invalid_parameters[0].shape = Shape.init(.f32, &.{ 0, 4 });
+    var invalid = source;
+    invalid.parameters = &invalid_parameters;
+    if (ProgramSpecStorage.fromSource(a, &header, invalid)) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.ExpectedCurrentShapeFailure;
+    } else |err| switch (err) {
+        error.DenseDefinitionChanged => {},
+        else => return err,
+    }
+    fills = 0;
+    failed.fail_at = null;
+    failed.fail_count = true;
+    if (ProgramSpecStorage.fromSource(a, &header, failed)) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.ExpectedNameCountFailure;
+    } else |err| switch (err) {
+        error.TestExpectedNameCountFailure => {},
+        else => return err,
+    }
+    try std.testing.expectEqual(@as(usize, 0), fills);
+    // Host-only/zero-byte name storage is valid and still owns its descriptors.
+    fills = 0;
+    counts = 0;
+    var host_source = source;
+    host_source.parameters = parameters[2..];
+    var host = try ProgramSpecStorage.fromSource(a, &header, host_source);
+    defer host.deinit();
+    try std.testing.expectEqual(@as(usize, 0), host.names.len);
+    try std.testing.expectEqual(@as(usize, 1), fills);
+    try std.testing.expectEqual(@as(usize, 1), counts);
+    try std.testing.expectEqual(@as(usize, 1), host.value.parameters.len);
+    try std.testing.expect(host.value.parameters.ptr != parameters[2..].ptr);
+}
+
+test "owned_names semantic spec names use one current fill and reject pure count mismatches without borrowing scratch" {
+    try packedSpecNameCase(std.testing.allocator);
+}
+
+test "owned_names semantic spec exact name sizing and partial current source failures unwind every allocation" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, packedSpecNameCase, .{});
 }

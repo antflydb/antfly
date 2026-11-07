@@ -1000,7 +1000,7 @@ pub const PreparedSingleToken = struct {
         fn linear(self: @This(), x: NodeId, kind: @FieldType(schedule_mod.RoleKey, "kind"), layer: ?u32, rows: usize, width: usize, out: usize) !NodeId {
             const w = try self.weight(kind, layer, .weight);
             const bias = schedule_mod.RoleKey{ .kind = kind, .layer = layer, .part = .bias };
-            const b = if (self.spec.hasRole(bias)) try self.b.parameterRole(bias) else null;
+            const b = if (try self.b.hasParameterRole(bias)) try self.b.parameterRole(bias) else null;
             return self.b.linearRows(x, w, b, rows, width, out);
         }
         fn norm(self: @This(), x: NodeId, kind: @FieldType(schedule_mod.RoleKey, "kind"), layer: ?u32) !NodeId {
@@ -1150,6 +1150,17 @@ pub const PreparedSingleToken = struct {
                 else => return error.DenseDefinitionChanged,
             }
             return .{ .source_kind = .held_weight, .source_name = name, .value = value };
+        }
+        /// Pure checkpoint-role name sizing. No Native/source query or
+        /// allocation: current held shape/stamp/name validation stays in at().
+        pub fn expectedNameBytes(self: @This()) !usize {
+            var bytes: usize = 0;
+            var buffer: [256]u8 = undefined;
+            for (0..self.len()) |index| {
+                const resolved = try self.resolve(try self.roleAt(index), &buffer);
+                bytes = try std.math.add(usize, bytes, resolved.source_name.len);
+            }
+            return bytes;
         }
         pub fn at(self: @This(), index: usize, buffer: *[256]u8) !schedule_mod.ParameterSpec {
             const role = try self.roleAt(index);

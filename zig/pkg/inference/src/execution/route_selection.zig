@@ -196,23 +196,42 @@ pub const Selection = struct {
         return .unknown;
     }
 
-    fn bindingWitnessed(self: *const Selection, pool: *const physical.Pool, node: NodeId, runtime: []const route.InputBinding) bool {
-        for (runtime) |entry| if (entry.node_id == node) return switch (entry.value) {
+    // Only the retained snapshot reaches this path. Its existing exact index
+    // supplies both facts from one lookup; arbitrary public slices keep their
+    // original duplicate/equality validation and linear binding adapter.
+    const RetainedInput = struct { value: route.Binding, witnessed: bool };
+    fn retainedInput(self: *const Selection, pool: *const physical.Pool, node: NodeId) RetainedInput {
+        if (self.inputs.find(node)) |value| return .{ .value = value, .witnessed = switch (value) {
             .resident, .imported_host => true,
             else => false,
+        } };
+        if (pool.immutable_bindings) |immutable| if (immutable.find(node)) |value| return .{ .value = value, .witnessed = false };
+        if (node < self.plane_counts.len and self.plane_counts[node] != 0) return .{
+            .value = .{ .planned = .{ .logical = pool.plan.slotForNode(node).?.desc.shape, .planes = self.planes[node][0..self.plane_counts[node]] } },
+            .witnessed = node < self.planes_witnessed.len and self.planes_witnessed[node],
         };
-        if (pool.immutable_bindings) |immutable| if (immutable.find(node) != null) return false;
-        return node < self.plane_counts.len and self.plane_counts[node] != 0 and node < self.planes_witnessed.len and self.planes_witnessed[node];
+        return .{ .value = .unknown, .witnessed = false };
     }
 
-    fn readOnlyHostInputs(pool: *const physical.Pool, kernel: physical.KernelPlan) [3]bool {
+    fn readOnlyHostInputs(pool: *const physical.Pool, current: NodeId) [3]bool {
         var result: [3]bool = @splat(false);
         const graph = pool.coverage_graph orelse return result;
         const reachable = pool.coverage_reachable orelse return result;
         if (reachable.len != graph.nodeCount()) return result;
+        const kernel = pool.kernels[current].?;
+        // The current reachable consumer itself contradicts the original ALL
+        // CUDA-gather consumers predicate. Canonical Native identity is a pure
+        // kind proof; do not invoke an extra foreign backendKind callback.
+        // Require exact graph/kernel correspondence. Rewritten, unreachable,
+        // foreign gather or malformed backend cases retain the complete scan.
+        const known_current = current < graph.nodeCount() and reachable[current] and
+            std.mem.eql(NodeId, graph.nodes.items[current].getInputs(), kernel.inputs[0..kernel.descriptor.input_count]);
+        if (known_current and (kernel.descriptor.operation != .gather or
+            (kernel.backend_index < pool.backends.len and pool.backends[kernel.backend_index].vtable == &@import("../ops/native_compute.zig").vtable_impl))) return result;
         for (kernel.inputs[0..kernel.descriptor.input_count], 0..) |source, position| {
             const slot = pool.plan.slotForNode(source) orelse continue;
             if (slot.kind != .runtime_input or slot.roles.graph_output) continue;
+            if (known_current and position != 1) continue;
             var seen = false;
             var valid = true;
             for (graph.nodes.items, 0..) |node, id| {
@@ -276,11 +295,12 @@ pub const Selection = struct {
             var witnesses: [3]bool = @splat(false);
             var output_witnessed = true;
             for (kernel.inputs[0..kernel.descriptor.input_count], 0..) |input, index| {
-                incoming[index] = self.binding(pool, input, self.inputs.entries);
-                witnesses[index] = self.bindingWitnessed(pool, input, self.inputs.entries);
+                const retained = self.retainedInput(pool, input);
+                incoming[index] = retained.value;
+                witnesses[index] = retained.witnessed;
                 output_witnessed = output_witnessed and witnesses[index];
             }
-            const owned = (try prepare(backend.ptr, .{ .metadata_authority = authority, .allocator = self.allocator, .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .descriptor = &kernel.descriptor, .host_readonly_inputs = readOnlyHostInputs(pool, kernel.*), .inputs = incoming[0..kernel.descriptor.input_count], .inputs_witnessed = witnesses, .output = self.output(pool, node, 0) })) orelse continue;
+            const owned = (try prepare(backend.ptr, .{ .metadata_authority = authority, .allocator = self.allocator, .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .descriptor = &kernel.descriptor, .host_readonly_inputs = readOnlyHostInputs(pool, node), .inputs = incoming[0..kernel.descriptor.input_count], .inputs_witnessed = witnesses, .output = self.output(pool, node, 0) })) orelse continue;
             self.routes[node] = owned;
             const required = owned.requirements;
             if (required.auxiliaries.count > ops.kernel_descriptor.max_auxiliaries) return error.InvalidPreparedKernelRequirements;
@@ -314,7 +334,8 @@ pub const Selection = struct {
         for (pool.metadata_aliases, 0..) |alias, alias_index| {
             if (alias.node != node or !self.alias_enabled[alias_index]) continue;
             const slot = pool.plan.slotForNode(node).?;
-            const incoming = self.binding(pool, alias.source, self.inputs.entries);
+            const source = self.retainedInput(pool, alias.source);
+            const incoming = source.value;
             if (slot.backend != .native and (incoming != .planned or incoming.planned.planes.len != 1 or @import("metadata_alias.zig").activationRoot(&pool.plan, alias.source, slot.backend) == null)) {
                 // Preserve the existing ordinary GPU reshape facts/dispatch.
                 // No exact retained Frame hook is claimed for external inputs.
@@ -331,7 +352,7 @@ pub const Selection = struct {
                 const plane = alias.apply(primary orelse continue) orelse continue;
                 self.planes[node][0] = plane;
                 self.plane_counts[node] = 1;
-                self.planes_witnessed[node] = self.bindingWitnessed(pool, alias.source, self.inputs.entries);
+                self.planes_witnessed[node] = source.witnessed;
                 return true;
             }
             // A declined Native affine alias must not regain stale facts.
@@ -346,7 +367,8 @@ pub const Selection = struct {
         if (source == ml.graph.null_node) return false;
         const source_slot = pool.plan.slotForNode(source) orelse return false;
         const output_slot = pool.plan.slotForNode(node) orelse return false;
-        const binding_value = self.binding(pool, source, self.inputs.entries);
+        const retained = self.retainedInput(pool, source);
+        const binding_value = retained.value;
         for (pool.backends) |backend| {
             if (backend.kind() != output_slot.backend) continue;
             const functions = backend.vtable.kernels orelse continue;
@@ -360,7 +382,7 @@ pub const Selection = struct {
             const alias = @import("dense_alias.zig").reshapePlane(primary, source_slot.desc.shape, output_slot.desc.shape, backend.kind(), source) orelse continue;
             self.planes[node][0] = alias;
             self.plane_counts[node] = 1;
-            self.planes_witnessed[node] = self.bindingWitnessed(pool, source, self.inputs.entries);
+            self.planes_witnessed[node] = retained.witnessed;
             return true;
         }
         return false;
@@ -409,14 +431,14 @@ pub const Selection = struct {
         return self.validatePolicies(pool, runtime);
     }
     pub fn validateRetainedPolicies(self: *const Selection, pool: *const physical.Pool) !void {
-        return self.validatePolicies(pool, self.inputs.entries);
+        return self.validatePolicies(pool, null);
     }
-    fn validatePolicies(self: *const Selection, pool: *const physical.Pool, runtime: []const route.InputBinding) !void {
+    fn validatePolicies(self: *const Selection, pool: *const physical.Pool, runtime: ?[]const route.InputBinding) !void {
         for (self.invocation_nodes) |node| {
             const owned = self.routes[node].?;
             const kernel = pool.kernels[node].?;
             var incoming: [3]route.Binding = undefined;
-            for (kernel.inputs[0..kernel.descriptor.input_count], 0..) |input, index| incoming[index] = self.binding(pool, input, runtime);
+            for (kernel.inputs[0..kernel.descriptor.input_count], 0..) |input, index| incoming[index] = if (runtime) |public| self.binding(pool, input, public) else self.retainedInput(pool, input).value;
             try owned.validate(.{ .inputs = incoming[0..kernel.descriptor.input_count], .output = self.output(pool, node, owned.requirements.primary_bytes) });
         }
     }
@@ -565,4 +587,144 @@ test "prepared program witness propagates public aliases but taints model tensor
     };
     try Case.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+fn retainedRouteInputCase(a: std.mem.Allocator) !void {
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    const tensor = try backend.fromFloat32Shape(&.{ 1, 2 }, &.{2});
+    defer backend.free(tensor);
+    const shape = ml.graph.Shape.init(.f32, &.{2});
+    const plane = try @import("dense_decoder_schedule.zig").residentPlane(&backend, tensor);
+    const runtime = [_]route.InputBinding{
+        .{ .node_id = 4, .value = .{ .resident = .{ .logical = shape, .planes = &.{plane}, .implementation = .{ .context = backend.ptr, .table = backend.vtable } } } },
+        .{ .node_id = 0, .value = .{ .imported_host = .{ .logical = ml.graph.Shape.init(.i64, &.{1}), .target = .native } } },
+        .{ .node_id = 8, .value = .unknown },
+    };
+    const immutable = [_]route.InputBinding{.{ .node_id = 12, .value = .{ .planned = .{ .logical = shape, .planes = &.{plane} } } }};
+    const owned_runtime = try facts.ImmutableBindings.create(a, &runtime);
+    defer owned_runtime.release();
+    const owned_immutable = try facts.ImmutableBindings.create(a, &immutable);
+    defer owned_immutable.release();
+    const pool = physical.Pool{ .allocator = a, .plan = undefined, .kernels = &.{}, .transfers = &.{}, .backends = &.{}, .workspace_allocations = &.{}, .immutable_bindings = owned_immutable };
+    const selection = Selection{ .allocator = a, .epoch = 1, .inputs = owned_runtime, .routes = &.{}, .planes = &.{}, .plane_counts = &.{}, .literal_enabled = &.{} };
+    const reordered = [_]route.InputBinding{ runtime[2], runtime[0], runtime[1] };
+    try std.testing.expect(selection.matchesInputs(&reordered));
+    for ([_]NodeId{ 0, 4, 8, 12, 99 }) |node| {
+        const retained = selection.retainedInput(&pool, node);
+        try std.testing.expect(Selection.equalBinding(selection.binding(&pool, node, &reordered), retained.value));
+        try std.testing.expectEqual(node == 0 or node == 4, retained.witnessed);
+    }
+    try std.testing.expect(selection.retainedInput(&pool, 99).value == .unknown);
+    var duplicate = runtime;
+    duplicate[1] = runtime[0];
+    try std.testing.expect(!selection.matchesInputs(&duplicate));
+    try std.testing.expectError(error.PreparedKernelBindingChanged, selection.validate(&pool, &duplicate));
+    // Public slices retain their first-match adapter and duplicate refusal;
+    // the retained owner itself never admits a duplicate into its index.
+    try std.testing.expect(Selection.equalBinding(selection.binding(&pool, 4, &duplicate), runtime[0].value));
+    if (facts.ImmutableBindings.create(a, &duplicate)) |unexpected| {
+        unexpected.release();
+        return error.ExpectedDuplicateKernelInputDenial;
+    } else |err| switch (err) {
+        error.DuplicateKernelInputBinding => {},
+        else => return err,
+    }
+}
+
+fn currentConsumerReadOnlyCase(a: std.mem.Allocator) !void {
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const native = context.computeBackend();
+    const Metadata = struct {
+        fn cudaKind(_: *anyopaque) ops.BackendKind {
+            return .cuda;
+        }
+        fn nativeKind(_: *anyopaque) ops.BackendKind {
+            return .native;
+        }
+        const cuda_table: ops.ComputeBackend.VTable = value: {
+            var table = @import("../ops/native_compute.zig").vtable_impl;
+            table.backendKind = cudaKind;
+            break :value table;
+        };
+        const foreign_native_table: ops.ComputeBackend.VTable = value: {
+            var table = @import("../ops/native_compute.zig").vtable_impl;
+            table.backendKind = nativeKind;
+            // Distinct literal content prevents immutable table/function
+            // folding from disguising this same-kind foreign metadata case.
+            table.kernels = null;
+            break :value table;
+        };
+    };
+    // Only these context-free kind callbacks are queried. No GPU provider,
+    // kernel execution, source ownership, or capability is fabricated here.
+    try std.testing.expect(&Metadata.foreign_native_table != &@import("../ops/native_compute.zig").vtable_impl);
+    const backends = [_]ops.ComputeBackend{ native, .{ .ptr = @ptrFromInt(16), .vtable = &Metadata.cuda_table }, .{ .ptr = @ptrFromInt(16), .vtable = &Metadata.foreign_native_table } };
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const table_shape = ml.graph.Shape.init(.f32, &.{ 4, 2 });
+    const output_shape = ml.graph.Shape.init(.f32, &.{ 1, 2 });
+    const table = try builder.parameter("table", table_shape);
+    const indices = try builder.parameter("indices", ml.graph.Shape.init(.i64, &.{1}));
+    const first = try builder.gather(table, indices, output_shape);
+    const second = try builder.gather(table, indices, output_shape);
+    try graph.markOutput(first);
+    try graph.markOutput(second);
+    var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &graph, &.{&native}, .{}, false);
+    defer layout.deinit();
+    const reachable = try a.alloc(bool, graph.nodeCount());
+    defer a.free(reachable);
+    @memset(reachable, true);
+    const kernels = try a.alloc(?physical.KernelPlan, graph.nodeCount());
+    defer a.free(kernels);
+    @memset(kernels, null);
+    for ([_]NodeId{ first, second }) |node| kernels[node] = .{
+        .descriptor = ops.kernel_descriptor.lower(&graph, node).?,
+        .inputs = .{ table, indices, 0 },
+        .backend_index = 1,
+        .output_allocation = 0,
+        .workspace_bytes = 0,
+    };
+    const pool = physical.Pool{ .allocator = a, .plan = layout.buffers, .kernels = kernels, .transfers = &.{}, .backends = &backends, .workspace_allocations = &.{}, .coverage_graph = &graph, .coverage_reachable = reachable };
+    // Both live consumers are CUDA gathers of this exact source as indices.
+    try std.testing.expectEqual([_]bool{ false, true, false }, Selection.readOnlyHostInputs(&pool, first));
+    kernels[second].?.backend_index = 0;
+    try std.testing.expectEqual([_]bool{ false, false, false }, Selection.readOnlyHostInputs(&pool, first));
+    try std.testing.expectEqual([_]bool{ false, false, false }, Selection.readOnlyHostInputs(&pool, second));
+    // An unreachable current Native consumer is excluded by the ORIGINAL
+    // predicate, so the remaining reachable CUDA consumer still permits it.
+    reachable[second] = false;
+    try std.testing.expectEqual([_]bool{ false, true, false }, Selection.readOnlyHostInputs(&pool, second));
+    reachable[second] = true;
+    // A current rewritten input slice cannot prove the Native contradiction.
+    graph.nodes.items[second].inputs[1] = table;
+    try std.testing.expectEqual([_]bool{ false, true, false }, Selection.readOnlyHostInputs(&pool, second));
+    graph.nodes.items[second].inputs[1] = indices;
+    kernels[second].?.backend_index = 2;
+    try std.testing.expectEqual([_]bool{ false, false, false }, Selection.readOnlyHostInputs(&pool, second));
+    kernels[second].?.backend_index = backends.len;
+    try std.testing.expectEqual([_]bool{ false, false, false }, Selection.readOnlyHostInputs(&pool, first));
+    const saved = kernels[second].?;
+    kernels[second] = null;
+    try std.testing.expectEqual([_]bool{ false, false, false }, Selection.readOnlyHostInputs(&pool, first));
+    kernels[second] = saved;
+    kernels[second].?.backend_index = 1;
+    kernels[second].?.descriptor.operation = .{ .unary = .negate };
+    try std.testing.expectEqual([_]bool{ false, false, false }, Selection.readOnlyHostInputs(&pool, second));
+    try std.testing.expectEqual([_]bool{ false, false, false }, Selection.readOnlyHostInputs(&pool, first));
+}
+
+test "retained route input index matches public slices and preserves witnessed duplicate and absent semantics" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try retainedRouteInputCase(std.testing.allocator);
+    try currentConsumerReadOnlyCase(std.testing.allocator);
+}
+
+test "retained route input and exact mixed consumer preparation unwind every allocation failure" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, retainedRouteInputCase, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, currentConsumerReadOnlyCase, .{});
 }

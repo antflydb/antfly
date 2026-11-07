@@ -4742,6 +4742,17 @@ pub const PreparedSingleToken = struct {
             }
             return .{ .source_kind = .held_weight, .source_name = name, .value = value };
         }
+        /// Pure checkpoint-role name sizing. No Native/source query or
+        /// allocation: current held shape/stamp/name validation stays in at().
+        pub fn expectedNameBytes(self: @This()) !usize {
+            var bytes: usize = 0;
+            var buffer: [256]u8 = undefined;
+            for (0..self.len()) |index| {
+                const resolved = try self.resolve(try self.roleAt(index), &buffer);
+                bytes = try std.math.add(usize, bytes, resolved.source_name.len);
+            }
+            return bytes;
+        }
         pub fn at(self: @This(), index: usize, buffer: *[256]u8) !Dense.ParameterSpec {
             const role = try self.roleAt(index);
             const resolved = try self.resolve(role, buffer);
