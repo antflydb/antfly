@@ -134,13 +134,13 @@ pub fn PinnedSlot(comptime Value: type, comptime Key: type, comptime keyOf: fn (
             self.stats.misses +%= 1;
             return null;
         }
-        /// Retain a digest candidate only. Full semantic/provider checks run
-        /// outside the slot mutex; their caller records one qualified outcome.
-        pub fn acquireUncounted(self: *@This(), key: Key) ?Value {
+        /// Retain the singleton only. Full semantic/provider checks run outside
+        /// the mutex. Producers record an outcome only after their complete
+        /// source preflight succeeds, so a source error is not a cache miss.
+        pub fn acquireCandidate(self: *@This()) ?Value {
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
-            if (self.value) |value| if (equal(keyOf(value), key)) return retain(value);
-            return null;
+            return if (self.value) |value| retain(value) else null;
         }
         /// Cumulative lookup outcomes, including concurrent constructors. This
         /// records no ownership and calls no validation or provider callback.
@@ -207,7 +207,7 @@ test "qualified pinned lookup validates outside slot mutex and counts semantic m
     const Worker = struct {
         fn replace(slot: *Slot, replacement: *Entry) void {
             // Model/owner teardown can detach the cached root while a source
-            // qualifier still retains its digest candidate independently.
+            // qualifier still retains its singleton candidate independently.
             const old = slot.take().?;
             old.release();
             if (slot.publish(replacement) != null) @panic("unexpected replacement victim");
@@ -222,7 +222,7 @@ test "qualified pinned lookup validates outside slot mutex and counts semantic m
     defer if (replacement_open) replacement.release();
     try std.testing.expect(slot.publish(&first) == null);
     first.release();
-    const candidate = slot.acquireUncounted(0).?;
+    const candidate = slot.acquireCandidate().?;
     var candidate_live = true;
     defer if (candidate_live) candidate.release();
     try std.testing.expect(slot.mutex.tryLock());
@@ -235,7 +235,7 @@ test "qualified pinned lookup validates outside slot mutex and counts semantic m
     // Same digest is a semantic mismatch. The retained old candidate stays
     // live while the actual cache now owns a different semantic definition.
     slot.recordLookup(candidate.semantic == 9);
-    const current = slot.acquireUncounted(0).?;
+    const current = slot.acquireCandidate().?;
     var current_live = true;
     defer if (current_live) current.release();
     try std.testing.expect(slot.mutex.tryLock());

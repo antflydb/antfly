@@ -991,22 +991,6 @@ pub const PreparedSingleToken = struct {
         positions: []i64,
     };
     const Authored = struct { schedule: *schedule_mod.Schedule, token_node: NodeId, position_node: NodeId };
-    const Author = struct {
-        b: *schedule_mod.Builder,
-        spec: *const schedule_mod.ProgramSpec,
-        fn weight(self: @This(), kind: @FieldType(schedule_mod.RoleKey, "kind"), layer: ?u32, part: @FieldType(schedule_mod.RoleKey, "part")) !NodeId {
-            return self.b.parameterRole(.{ .kind = kind, .layer = layer, .part = part });
-        }
-        fn linear(self: @This(), x: NodeId, kind: @FieldType(schedule_mod.RoleKey, "kind"), layer: ?u32, rows: usize, width: usize, out: usize) !NodeId {
-            const w = try self.weight(kind, layer, .weight);
-            const bias = schedule_mod.RoleKey{ .kind = kind, .layer = layer, .part = .bias };
-            const b = if (try self.b.hasParameterRole(bias)) try self.b.parameterRole(bias) else null;
-            return self.b.linearRows(x, w, b, rows, width, out);
-        }
-        fn norm(self: @This(), x: NodeId, kind: @FieldType(schedule_mod.RoleKey, "kind"), layer: ?u32) !NodeId {
-            return self.b.norm(x, try self.weight(kind, layer, .weight), try self.weight(kind, layer, .bias), self.spec.geometry.width);
-        }
-    };
     pub const SpecSource = struct {
         cb: *const ComputeBackend,
         data: *const anyopaque,
@@ -1166,7 +1150,7 @@ pub const PreparedSingleToken = struct {
             const role = try self.roleAt(index);
             const resolved = try self.resolve(role, buffer);
             const shape = if (resolved.source_kind == .held_weight)
-                (try @import("../ops/native_compute.zig").NativeCompute.heldF32WeightPrimaryNamed(self.cb, self.data, resolved.value.?, resolved.source_name)).descriptor.shape
+                try @import("../ops/native_compute.zig").NativeCompute.heldF32WeightShapeNamed(self.cb, self.data, resolved.value.?, resolved.source_name)
             else
                 resolved.shape.?;
             if ((shape.numElements() orelse return error.UnsupportedDenseSchedule) <= 0) return error.UnsupportedDenseSchedule;
@@ -1288,50 +1272,8 @@ pub const PreparedSingleToken = struct {
         if (spec.family != .whisper or spec.semantics.activation != .gelu or spec.semantics.norm_order != .pre or spec.semantics.epsilon != 1e-5 or spec.semantics.position_offset != 0 or !spec.semantics.global_final_norm) return error.DenseDefinitionChanged;
         var b = if (storage) |owned| schedule_mod.Builder.initSpecStorage(a, cb, preparation, owned, bound) else schedule_mod.Builder.initSpec(a, cb, preparation, spec, bound);
         defer b.deinit();
-        const author = Author{ .b = &b, .spec = spec };
-        const g = spec.geometry;
-        const token_node = try b.parameterRole(.{ .kind = .token_ids });
-        const position_node = try b.parameterRole(.{ .kind = .position_ids });
-        const embedded = try b.gather(try author.weight(.embedding, null, .weight), token_node, g.width);
-        const positioned = try b.gather(try author.weight(.positions, null, .weight), position_node, g.width);
-        var sum = try b.add(embedded, positioned);
-        var pending: ?NodeId = null;
-        for (0..g.layers) |index| {
-            const layer: u32 = @intCast(index);
-            if (pending) |p| sum = try b.add(p, sum);
-            const norm = try author.norm(sum, .self_norm, layer);
-            const q = try author.linear(norm, .self_q, layer, g.query_rows, g.width, g.width);
-            const k = try author.linear(norm, .self_k, layer, g.query_rows, g.width, g.width);
-            const v = try author.linear(norm, .self_v, layer, g.query_rows, g.width, g.width);
-            try b.output(k);
-            try b.output(v);
-            const self_attention = if (spec.phase == .initial)
-                try b.attentionRows(.causal, q, k, v, g.heads, g.width / g.heads, g.query_rows, g.query_rows)
-            else prefix: {
-                const self_k = try b.parameterRole(.{ .kind = .self_slab_k, .layer = layer });
-                const self_v = try b.parameterRole(.{ .kind = .self_slab_v, .layer = layer });
-                break :prefix try b.prefix(q, self_k, self_v, g.heads, g.width / g.heads, g.capacity);
-            };
-            const self_out = try author.linear(self_attention, .self_o, layer, g.query_rows, g.width, g.width);
-            const after_self = try b.add(self_out, sum);
-            const cross_norm = try author.norm(after_self, .cross_norm, layer);
-            const cross_q = try author.linear(cross_norm, .cross_q, layer, g.query_rows, g.width, g.width);
-            const cross_k = try b.parameterRole(.{ .kind = .cross_slab_k, .layer = layer });
-            const cross_v = try b.parameterRole(.{ .kind = .cross_slab_v, .layer = layer });
-            const cross_attention = if (spec.phase == .initial) try b.attentionRows(.cross, cross_q, cross_k, cross_v, g.heads, g.width / g.heads, g.query_rows, g.encoder_rows) else try b.prefix(cross_q, cross_k, cross_v, g.heads, g.width / g.heads, g.encoder_rows);
-            const cross_out = try author.linear(cross_attention, .cross_o, layer, g.query_rows, g.width, g.width);
-            sum = try b.add(cross_out, after_self);
-            const ffn_norm = try author.norm(sum, .ffn_norm, layer);
-            const fc1 = try author.linear(ffn_norm, .fc1, layer, g.query_rows, g.width, g.ffn_dim);
-            const activated = try b.gelu(fc1);
-            pending = try author.linear(activated, .fc2, layer, g.query_rows, g.ffn_dim, g.width);
-        }
-        if (pending) |p| sum = try b.add(p, sum);
-        const norm = try author.norm(sum, .final_norm, null);
-        const last = if (g.query_rows == 1) norm else try b.lastRow(norm, g.query_rows, g.width);
-        const logits = try b.linear(last, try author.weight(.lm_head, null, .weight), null, g.width, g.vocab_size);
-        try b.output(logits);
-        return .{ .schedule = try schedule_mod.Schedule.create(&b), .token_node = token_node, .position_node = position_node };
+        const nodes = try schedule_mod.authorSemanticGraph(&b);
+        return .{ .schedule = try schedule_mod.Schedule.create(&b), .token_node = nodes.token_node, .position_node = nodes.position_node };
     }
     pub fn initInitial(self: *PreparedSingleToken, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, preparation: ?*schedule_mod.Preparation, query_rows: usize, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !void {
         if (self.initial != null or query_rows == 0 or query_rows > config.max_target_positions or query_rows > 2048) return error.UnsupportedDenseSchedule;

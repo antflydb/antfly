@@ -599,6 +599,113 @@ pub const Builder = struct {
     }
 };
 
+/// Pure semantic graph results. The architecture continues to own all current
+/// tensors, source bindings, storage admission, Schedule and execution cleanup.
+pub const SemanticNodes = struct { token_node: Node, position_node: Node, output_node: Node };
+const SemanticGraphAuthor = struct {
+    builder: *Builder,
+    spec: *const ProgramSpec,
+    fn weight(self: @This(), kind: @FieldType(RoleKey, "kind"), layer: ?u32, part: @FieldType(RoleKey, "part")) !Node {
+        return self.builder.parameterRole(.{ .kind = kind, .layer = layer, .part = part });
+    }
+    fn linear(self: @This(), input: Node, kind: @FieldType(RoleKey, "kind"), layer: ?u32, rows: usize, width: usize, output: usize) !Node {
+        const w = try self.weight(kind, layer, .weight);
+        const bias_role = RoleKey{ .kind = kind, .layer = layer, .part = .bias };
+        const bias = if (try self.builder.hasParameterRole(bias_role)) try self.builder.parameterRole(bias_role) else null;
+        return self.builder.linearRows(input, w, bias, rows, width, output);
+    }
+    fn norm(self: @This(), input: Node, kind: @FieldType(RoleKey, "kind"), layer: ?u32) !Node {
+        return self.builder.norm(input, try self.weight(kind, layer, .weight), try self.weight(kind, layer, .bias), self.spec.geometry.width);
+    }
+};
+
+/// Author the existing dense decoder operations from the Builder's complete
+/// immutable semantic Spec. No family/config/checkpoint/backend dispatch or
+/// execution owner is read here. Optional roles and explicit operation policies
+/// determine ingress normalization and the vocabulary/hidden-state graph tail.
+/// The exact residual operand order is part of this program, including delayed
+/// pre-norm fc2 consumption at the next layer and after the final layer.
+pub fn authorSemanticGraph(builder: *Builder) !SemanticNodes {
+    const spec = builder.program_spec orelse return error.DenseDefinitionChanged;
+    if (spec.semantics.epsilon != 1e-5 or builder.graph.nodeCount() != 0 or builder.values.items.len != 0 or builder.bindings.items.len != 0 or builder.immutable_resident.items.len != 0 or builder.planes.items.len != 0 or builder.parameter_recipe.items.len != 0 or builder.steps.items.len != 0 or builder.descriptors.items.len != 0) return error.DenseDefinitionChanged;
+    // Finalized recipe use is an actual ownership fact, including after the
+    // graph and optional SpecStorage have moved out of this Builder. Empty
+    // node storage alone does not make a consumed receiver fresh again.
+    var prepared_roles = builder.role_indices.iterator();
+    while (prepared_roles.next()) |entry| {
+        if (entry.value_ptr.used or entry.value_ptr.index >= spec.parameters.len) return error.DenseDefinitionChanged;
+        if (!std.meta.eql(entry.key_ptr.*, spec.parameters[entry.value_ptr.index].role)) return error.DenseDefinitionChanged;
+    }
+    if (builder.spec_validated) try spec.validate();
+    const g = spec.geometry;
+    for ([_]usize{ g.layers, g.width, g.heads, g.ffn_dim, g.vocab_size, g.encoder_rows, g.capacity, g.query_rows }) |dimension| _ = std.math.cast(u32, dimension) orelse return error.DimensionOverflow;
+    if (g.layers > spec.parameters.len) return error.DenseDefinitionChanged;
+    try builder.prepareSpec();
+    const host_shape = Shape.init(.i64, &.{@intCast(g.query_rows)});
+    for ([_]RoleKey{ .{ .kind = .token_ids }, .{ .kind = .position_ids } }) |role| {
+        const entry = builder.role_indices.get(role) orelse return error.DenseDefinitionChanged;
+        if (entry.index >= spec.parameters.len) return error.DenseDefinitionChanged;
+        const parameter = spec.parameters[entry.index];
+        if (!std.meta.eql(parameter.role, role) or parameter.source_kind != .host or !parameter.shape.eq(host_shape)) return error.DenseDefinitionChanged;
+    }
+    const author = SemanticGraphAuthor{ .builder = builder, .spec = spec };
+    const token_node = try builder.parameterRole(.{ .kind = .token_ids });
+    const position_node = try builder.parameterRole(.{ .kind = .position_ids });
+    const embedded = try builder.gather(try author.weight(.embedding, null, .weight), token_node, g.width);
+    const positioned = try builder.gather(try author.weight(.positions, null, .weight), position_node, g.width);
+    var hidden = try builder.add(embedded, positioned);
+    if (try builder.hasParameterRole(.{ .kind = .embed_norm, .part = .weight })) hidden = try author.norm(hidden, .embed_norm, null);
+    const pre_norm = spec.semantics.norm_order == .pre;
+    var pending: ?Node = null;
+    for (0..g.layers) |index| {
+        const layer: u32 = @intCast(index);
+        if (pending) |value| hidden = try builder.add(value, hidden);
+        const self_input = if (pre_norm) try author.norm(hidden, .self_norm, layer) else hidden;
+        const q = try author.linear(self_input, .self_q, layer, g.query_rows, g.width, g.width);
+        const k = try author.linear(self_input, .self_k, layer, g.query_rows, g.width, g.width);
+        const v = try author.linear(self_input, .self_v, layer, g.query_rows, g.width, g.width);
+        try builder.output(k);
+        try builder.output(v);
+        const self_attention = if (spec.phase == .initial)
+            try builder.attentionRows(.causal, q, k, v, g.heads, g.width / g.heads, g.query_rows, g.query_rows)
+        else prefix: {
+            const self_k = try builder.parameterRole(.{ .kind = .self_slab_k, .layer = layer });
+            const self_v = try builder.parameterRole(.{ .kind = .self_slab_v, .layer = layer });
+            break :prefix try builder.prefix(q, self_k, self_v, g.heads, g.width / g.heads, g.capacity);
+        };
+        const self_out = try author.linear(self_attention, .self_o, layer, g.query_rows, g.width, g.width);
+        var after_self = if (pre_norm) try builder.add(self_out, hidden) else try builder.add(hidden, self_out);
+        if (!pre_norm) after_self = try author.norm(after_self, .self_norm, layer);
+        const cross_input = if (pre_norm) try author.norm(after_self, .cross_norm, layer) else after_self;
+        const cross_q = try author.linear(cross_input, .cross_q, layer, g.query_rows, g.width, g.width);
+        const cross_k = try builder.parameterRole(.{ .kind = .cross_slab_k, .layer = layer });
+        const cross_v = try builder.parameterRole(.{ .kind = .cross_slab_v, .layer = layer });
+        const cross_attention = if (spec.phase == .initial)
+            try builder.attentionRows(.cross, cross_q, cross_k, cross_v, g.heads, g.width / g.heads, g.query_rows, g.encoder_rows)
+        else
+            try builder.prefix(cross_q, cross_k, cross_v, g.heads, g.width / g.heads, g.encoder_rows);
+        const cross_out = try author.linear(cross_attention, .cross_o, layer, g.query_rows, g.width, g.width);
+        hidden = if (pre_norm) try builder.add(cross_out, after_self) else try builder.add(after_self, cross_out);
+        if (!pre_norm) hidden = try author.norm(hidden, .cross_norm, layer);
+        const ffn_input = if (pre_norm) try author.norm(hidden, .ffn_norm, layer) else hidden;
+        const fc1 = try author.linear(ffn_input, .fc1, layer, g.query_rows, g.width, g.ffn_dim);
+        const activated = switch (spec.semantics.activation) {
+            .gelu => try builder.gelu(fc1),
+            .gelu_exact => try builder.geluExact(fc1),
+        };
+        const fc2 = try author.linear(activated, .fc2, layer, g.query_rows, g.ffn_dim, g.width);
+        if (pre_norm) pending = fc2 else hidden = try author.norm(try builder.add(hidden, fc2), .ffn_norm, layer);
+    }
+    if (pending) |value| hidden = try builder.add(value, hidden);
+    if (spec.semantics.global_final_norm) hidden = try author.norm(hidden, .final_norm, null);
+    if (try builder.hasParameterRole(.{ .kind = .lm_head, .part = .weight })) {
+        const last = if (g.query_rows == 1) hidden else try builder.lastRow(hidden, g.query_rows, g.width);
+        hidden = try builder.linear(last, try author.weight(.lm_head, null, .weight), null, g.width, g.vocab_size);
+    }
+    try builder.output(hidden);
+    return .{ .token_node = token_node, .position_node = position_node, .output_node = hidden };
+}
+
 // These facts come from the actual accepted backend, not fabricated planned
 // predecessor planes. The retained state/input owner outlives this schedule.
 pub fn residentPlane(cb: *const ops.ComputeBackend, value: CT) !@import("storage_ownership.zig").Plane {
@@ -897,6 +1004,10 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
     const first = try Schedule.create(&builder);
     var first_open = true;
     defer if (first_open) first.deinit(cleanup);
+    // Real graph AND exact-allocator SpecStorage ownership moved together;
+    // finalized role metadata must deny reentry before indexing the empty Spec.
+    try std.testing.expectError(error.DenseDefinitionChanged, authorSemanticGraph(&builder));
+    try std.testing.expectEqual(@as(usize, 0), builder.graph.nodeCount());
     try std.testing.expectEqual(@as(usize, 0), storage.value.parameters.len);
     try std.testing.expectEqual(@as(usize, 0), storage.names.len);
     const definition = first.definition.retain();
@@ -988,12 +1099,12 @@ fn semanticRecipeCase(a: std.mem.Allocator) !void {
             else => return err,
         }
     }
-    // Deliberately hold a digest candidate despite different complete semantics.
-    // The mismatch is rejected before it can contribute a cached floor.
+    // Retain the singleton despite different complete semantics. Full matching
+    // must reject it before it can contribute a cached floor.
     var slot = DefinitionSlot{};
     defer if (slot.take()) |entry| entry.release(cleanup);
     try std.testing.expect(slot.publish(definition) == null);
-    const candidate = slot.acquireUncounted(definition.key).?;
+    const candidate = slot.acquireCandidate().?;
     const accepted = candidate.matchesSpec(&changed);
     slot.recordLookup(accepted);
     candidate.release(cleanup);
@@ -1249,4 +1360,309 @@ test "owned_names semantic spec names use one current fill and reject pure count
 
 test "owned_names semantic spec exact name sizing and partial current source failures unwind every allocation" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, packedSpecNameCase, .{});
+}
+
+// Test-only frozen original pure authors. Their operation/parameter ordering
+// is copied independently from the two pre-consolidation architecture owners.
+// Production uses only authorSemanticGraph; no reference executes a kernel.
+const OriginalSemanticAuthors = struct {
+    const Pre = struct {
+        b: *Builder,
+        spec: *const ProgramSpec,
+        fn weight(self: @This(), kind: @FieldType(RoleKey, "kind"), layer: ?u32, part: @FieldType(RoleKey, "part")) !Node {
+            return self.b.parameterRole(.{ .kind = kind, .layer = layer, .part = part });
+        }
+        fn linear(self: @This(), x: Node, kind: @FieldType(RoleKey, "kind"), layer: ?u32, rows: usize, width: usize, out: usize) !Node {
+            const w = try self.weight(kind, layer, .weight);
+            const bias = RoleKey{ .kind = kind, .layer = layer, .part = .bias };
+            const b = if (try self.b.hasParameterRole(bias)) try self.b.parameterRole(bias) else null;
+            return self.b.linearRows(x, w, b, rows, width, out);
+        }
+        fn norm(self: @This(), x: Node, kind: @FieldType(RoleKey, "kind"), layer: ?u32) !Node {
+            return self.b.norm(x, try self.weight(kind, layer, .weight), try self.weight(kind, layer, .bias), self.spec.geometry.width);
+        }
+    };
+    const Post = struct {
+        builder: *Builder,
+        spec: *const ProgramSpec,
+        fn weight(self: @This(), kind: @FieldType(RoleKey, "kind"), layer: ?u32, part: @FieldType(RoleKey, "part")) !Node {
+            return self.builder.parameterRole(.{ .kind = kind, .layer = layer, .part = part });
+        }
+        fn linear(self: @This(), input: Node, kind: @FieldType(RoleKey, "kind"), layer: ?u32, width: usize, output: usize) !Node {
+            return self.builder.linear(input, try self.weight(kind, layer, .weight), try self.weight(kind, layer, .bias), width, output);
+        }
+        fn norm(self: @This(), input: Node, kind: @FieldType(RoleKey, "kind"), layer: ?u32) !Node {
+            return self.builder.norm(input, try self.weight(kind, layer, .weight), try self.weight(kind, layer, .bias), self.spec.geometry.width);
+        }
+    };
+    fn pre(b: *Builder, spec: *const ProgramSpec) !SemanticNodes {
+        const author = Pre{ .b = b, .spec = spec };
+        const g = spec.geometry;
+        const token_node = try b.parameterRole(.{ .kind = .token_ids });
+        const position_node = try b.parameterRole(.{ .kind = .position_ids });
+        const embedded = try b.gather(try author.weight(.embedding, null, .weight), token_node, g.width);
+        const positioned = try b.gather(try author.weight(.positions, null, .weight), position_node, g.width);
+        var sum = try b.add(embedded, positioned);
+        var pending: ?Node = null;
+        for (0..g.layers) |index| {
+            const layer: u32 = @intCast(index);
+            if (pending) |p| sum = try b.add(p, sum);
+            const norm = try author.norm(sum, .self_norm, layer);
+            const q = try author.linear(norm, .self_q, layer, g.query_rows, g.width, g.width);
+            const k = try author.linear(norm, .self_k, layer, g.query_rows, g.width, g.width);
+            const v = try author.linear(norm, .self_v, layer, g.query_rows, g.width, g.width);
+            try b.output(k);
+            try b.output(v);
+            const self_attention = if (spec.phase == .initial)
+                try b.attentionRows(.causal, q, k, v, g.heads, g.width / g.heads, g.query_rows, g.query_rows)
+            else prefix: {
+                const self_k = try b.parameterRole(.{ .kind = .self_slab_k, .layer = layer });
+                const self_v = try b.parameterRole(.{ .kind = .self_slab_v, .layer = layer });
+                break :prefix try b.prefix(q, self_k, self_v, g.heads, g.width / g.heads, g.capacity);
+            };
+            const self_out = try author.linear(self_attention, .self_o, layer, g.query_rows, g.width, g.width);
+            const after_self = try b.add(self_out, sum);
+            const cross_norm = try author.norm(after_self, .cross_norm, layer);
+            const cross_q = try author.linear(cross_norm, .cross_q, layer, g.query_rows, g.width, g.width);
+            const cross_k = try b.parameterRole(.{ .kind = .cross_slab_k, .layer = layer });
+            const cross_v = try b.parameterRole(.{ .kind = .cross_slab_v, .layer = layer });
+            const cross_attention = if (spec.phase == .initial) try b.attentionRows(.cross, cross_q, cross_k, cross_v, g.heads, g.width / g.heads, g.query_rows, g.encoder_rows) else try b.prefix(cross_q, cross_k, cross_v, g.heads, g.width / g.heads, g.encoder_rows);
+            const cross_out = try author.linear(cross_attention, .cross_o, layer, g.query_rows, g.width, g.width);
+            sum = try b.add(cross_out, after_self);
+            const ffn_norm = try author.norm(sum, .ffn_norm, layer);
+            const fc1 = try author.linear(ffn_norm, .fc1, layer, g.query_rows, g.width, g.ffn_dim);
+            const activated = try b.gelu(fc1);
+            pending = try author.linear(activated, .fc2, layer, g.query_rows, g.ffn_dim, g.width);
+        }
+        if (pending) |p| sum = try b.add(p, sum);
+        const norm = try author.norm(sum, .final_norm, null);
+        const last = if (g.query_rows == 1) norm else try b.lastRow(norm, g.query_rows, g.width);
+        const logits = try b.linear(last, try author.weight(.lm_head, null, .weight), null, g.width, g.vocab_size);
+        try b.output(logits);
+        return .{ .token_node = token_node, .position_node = position_node, .output_node = logits };
+    }
+    fn post(builder: *Builder, spec: *const ProgramSpec) !SemanticNodes {
+        const writer = Post{ .builder = builder, .spec = spec };
+        const g = spec.geometry;
+        const token_node = try builder.parameterRole(.{ .kind = .token_ids });
+        const position_node = try builder.parameterRole(.{ .kind = .position_ids });
+        const embedded = try builder.gather(try writer.weight(.embedding, null, .weight), token_node, g.width);
+        const positions = try builder.gather(try writer.weight(.positions, null, .weight), position_node, g.width);
+        var hidden = try writer.norm(try builder.add(embedded, positions), .embed_norm, null);
+        for (0..g.layers) |index| {
+            const layer: u32 = @intCast(index);
+            const q = try writer.linear(hidden, .self_q, layer, g.width, g.width);
+            const k = try writer.linear(hidden, .self_k, layer, g.width, g.width);
+            const v = try writer.linear(hidden, .self_v, layer, g.width, g.width);
+            try builder.output(k);
+            try builder.output(v);
+            const self_k = try builder.parameterRole(.{ .kind = .self_slab_k, .layer = layer });
+            const self_v = try builder.parameterRole(.{ .kind = .self_slab_v, .layer = layer });
+            const attended = try builder.prefix(q, self_k, self_v, g.heads, g.width / g.heads, g.capacity);
+            const projected = try writer.linear(attended, .self_o, layer, g.width, g.width);
+            const self_normed = try writer.norm(try builder.add(hidden, projected), .self_norm, layer);
+            const cross_q = try writer.linear(self_normed, .cross_q, layer, g.width, g.width);
+            const cross_k = try builder.parameterRole(.{ .kind = .cross_slab_k, .layer = layer });
+            const cross_v = try builder.parameterRole(.{ .kind = .cross_slab_v, .layer = layer });
+            const cross_attention = try builder.prefix(cross_q, cross_k, cross_v, g.heads, g.width / g.heads, g.encoder_rows);
+            const cross_projected = try writer.linear(cross_attention, .cross_o, layer, g.width, g.width);
+            const cross_normed = try writer.norm(try builder.add(self_normed, cross_projected), .cross_norm, layer);
+            const fc1 = try writer.linear(cross_normed, .fc1, layer, g.width, g.ffn_dim);
+            const activated = try builder.geluExact(fc1);
+            const fc2 = try writer.linear(activated, .fc2, layer, g.ffn_dim, g.width);
+            hidden = try writer.norm(try builder.add(cross_normed, fc2), .ffn_norm, layer);
+        }
+        if (spec.semantics.global_final_norm) hidden = try writer.norm(hidden, .final_norm, null);
+        try builder.output(hidden);
+        return .{ .token_node = token_node, .position_node = position_node, .output_node = hidden };
+    }
+};
+
+const SemanticAuthorCase = struct {
+    pre: bool,
+    phase: @FieldType(ProgramSpec, "phase") = .decode,
+    layers: usize = 2,
+    rows: usize = 1,
+    missing_bias: bool = false,
+    final_norm: bool = true,
+};
+const SemanticParameterFixture = struct {
+    allocator: std.mem.Allocator,
+    store: *@import("../ops/native_compute.zig").WeightStore,
+    parameters: std.ArrayList(ParameterSpec) = .empty,
+    geometry: @FieldType(ProgramSpec, "geometry"),
+    configuration: SemanticAuthorCase,
+    fn add(self: *@This(), role: RoleKey, shape: Shape, kind: @FieldType(ParameterSpec, "source_kind")) !void {
+        const name: []const u8 = if (kind == .held_weight) owned_name: {
+            const key = try std.fmt.allocPrint(self.allocator, "semantic.{s}.{d}.{s}", .{ @tagName(role.kind), role.layer orelse std.math.maxInt(u32), @tagName(role.part) });
+            errdefer self.allocator.free(key);
+            const elements = std.math.cast(usize, shape.numElements() orelse return error.InvalidShape) orelse return error.InvalidShape;
+            const values = try self.allocator.alloc(f32, elements);
+            defer self.allocator.free(values);
+            @memset(values, 0.25);
+            var tensor = try @import("../backends/tensor.zig").Tensor.initFloat32(self.allocator, key, shape.dims[0..shape.rank()], values);
+            errdefer tensor.deinit();
+            try self.store.resident_weights.put(self.allocator, key, .{ .tensor = tensor });
+            break :owned_name key;
+        } else "";
+        try self.parameters.append(self.allocator, .{ .role = role, .shape = shape, .source_kind = kind, .source_name = name });
+    }
+    fn norm(self: *@This(), kind: @FieldType(RoleKey, "kind"), layer: ?u32) !void {
+        for ([_]@FieldType(RoleKey, "part"){ .weight, .bias }) |part| try self.add(.{ .kind = kind, .layer = layer, .part = part }, Shape.init(.f32, &.{@intCast(self.geometry.width)}), .held_weight);
+    }
+    fn linear(self: *@This(), kind: @FieldType(RoleKey, "kind"), layer: u32, input: usize, output: usize) !void {
+        try self.add(.{ .kind = kind, .layer = layer, .part = .weight }, Shape.init(.f32, &.{ @intCast(output), @intCast(input) }), .held_weight);
+        if (!self.configuration.pre or !self.configuration.missing_bias or (kind != .self_k and kind != .fc2)) try self.add(.{ .kind = kind, .layer = layer, .part = .bias }, Shape.init(.f32, &.{@intCast(output)}), .held_weight);
+    }
+    fn populate(self: *@This()) !void {
+        const g = self.geometry;
+        try self.add(.{ .kind = .token_ids }, Shape.init(.i64, &.{@intCast(g.query_rows)}), .host);
+        try self.add(.{ .kind = .position_ids }, Shape.init(.i64, &.{@intCast(g.query_rows)}), .host);
+        try self.add(.{ .kind = .embedding, .part = .weight }, Shape.init(.f32, &.{ @intCast(g.vocab_size), @intCast(g.width) }), .held_weight);
+        try self.add(.{ .kind = .positions, .part = .weight }, Shape.init(.f32, &.{ @intCast(g.capacity + 3), @intCast(g.width) }), .held_weight);
+        if (!self.configuration.pre) try self.norm(.embed_norm, null);
+        for (0..g.layers) |index| {
+            const layer: u32 = @intCast(index);
+            try self.norm(.self_norm, layer);
+            for ([_]@FieldType(RoleKey, "kind"){ .self_q, .self_k, .self_v, .self_o }) |kind| try self.linear(kind, layer, g.width, g.width);
+            try self.norm(.cross_norm, layer);
+            try self.linear(.cross_q, layer, g.width, g.width);
+            try self.linear(.cross_o, layer, g.width, g.width);
+            try self.norm(.ffn_norm, layer);
+            try self.linear(.fc1, layer, g.width, g.ffn_dim);
+            try self.linear(.fc2, layer, g.ffn_dim, g.width);
+            if (self.configuration.phase != .initial) for ([_]@FieldType(RoleKey, "kind"){ .self_slab_k, .self_slab_v }) |kind| try self.add(.{ .kind = kind, .layer = layer }, Shape.init(.f32, &.{ @intCast(g.capacity), @intCast(g.width) }), .external);
+            for ([_]@FieldType(RoleKey, "kind"){ .cross_slab_k, .cross_slab_v }) |kind| try self.add(.{ .kind = kind, .layer = layer }, Shape.init(.f32, &.{ @intCast(g.encoder_rows), @intCast(g.width) }), .external);
+        }
+        if (self.configuration.final_norm) try self.norm(.final_norm, null);
+        if (self.configuration.pre) try self.add(.{ .kind = .lm_head, .part = .weight }, Shape.init(.f32, &.{ @intCast(g.vocab_size), @intCast(g.width) }), .held_weight);
+    }
+};
+fn semanticAuthorOrderCase(a: std.mem.Allocator, configuration: SemanticAuthorCase) !void {
+    const native = @import("../ops/native_compute.zig");
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    const geometry = @FieldType(ProgramSpec, "geometry"){ .layers = configuration.layers, .width = 4, .heads = 2, .ffn_dim = 8, .vocab_size = 7, .encoder_rows = 3, .capacity = 6, .query_rows = configuration.rows };
+    var fixture = SemanticParameterFixture{ .allocator = a, .store = &store, .geometry = geometry, .configuration = configuration };
+    defer fixture.parameters.deinit(a);
+    try fixture.populate();
+    var compute = native.NativeCompute.init(a, &store, null);
+    // Same real F32 private-provider policy as the installed authored decoder.
+    compute.cache_embeddinggemma2_bf16_weights = false;
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    const bound = try a.alloc(BoundParameter, fixture.parameters.items.len);
+    var bound_count: usize = 0;
+    defer {
+        for (bound[0..bound_count]) |current| if (current.value) |value| backend.free(value);
+        a.free(bound);
+    }
+    var held: std.ArrayList(CT) = .empty;
+    defer held.deinit(a);
+    for (fixture.parameters.items, bound) |parameter, *current| {
+        const value: ?CT = switch (parameter.source_kind) {
+            .host => null,
+            .held_weight => try backend.getWeight(parameter.source_name),
+            .external => external: {
+                const count = std.math.cast(usize, parameter.shape.numElements() orelse return error.InvalidShape) orelse return error.InvalidShape;
+                const data = try a.alloc(f32, count);
+                defer a.free(data);
+                @memset(data, 0.125);
+                const shape = [_]i32{ @intCast(parameter.shape.dims[0]), @intCast(parameter.shape.dims[1]) };
+                break :external try backend.fromFloat32Shape(data, &shape);
+            },
+        };
+        current.* = .{ .role = parameter.role, .value = value, .source_data = if (parameter.source_kind == .held_weight) &store else null };
+        bound_count += 1;
+        if (parameter.source_kind == .held_weight) try held.append(a, value.?);
+    }
+    try native.NativeCompute.stampHeldF32WeightSources(&backend, &store, held.items);
+    const spec = ProgramSpec{ .family = if (configuration.pre) .whisper else .florence, .phase = configuration.phase, .geometry = geometry, .semantics = .{ .epsilon = 1e-5, .activation = if (configuration.pre) .gelu else .gelu_exact, .norm_order = if (configuration.pre) .pre else .post, .position_offset = if (configuration.pre) 0 else 2, .global_final_norm = configuration.final_norm }, .parameters = fixture.parameters.items };
+    var reference = Builder.initSpec(a, &backend, null, &spec, bound);
+    defer reference.deinit();
+    const expected = if (configuration.pre) try OriginalSemanticAuthors.pre(&reference, &spec) else try OriginalSemanticAuthors.post(&reference, &spec);
+    var actual = Builder.initSpec(a, &backend, null, &spec, bound);
+    defer actual.deinit();
+    const found = try authorSemanticGraph(&actual);
+    try reference.validateRecipe();
+    try actual.validateRecipe();
+    try std.testing.expectEqualDeep(expected, found);
+    try std.testing.expectEqual(reference.graph.nodeCount(), actual.graph.nodeCount());
+    for (reference.graph.nodes.items, actual.graph.nodes.items) |one, two| {
+        try std.testing.expectEqualDeep(one.op, two.op);
+        try std.testing.expect(one.output_shape.eq(two.output_shape));
+        try std.testing.expectEqualSlices(Node, one.getInputs(), two.getInputs());
+    }
+    try std.testing.expectEqualSlices(Node, reference.graph.outputs.items, actual.graph.outputs.items);
+    try std.testing.expectEqualSlices(Node, reference.steps.items, actual.steps.items);
+    try std.testing.expectEqualSlices(ParameterRecipe, reference.parameter_recipe.items, actual.parameter_recipe.items);
+    try std.testing.expectEqual(reference.descriptors.items.len, actual.descriptors.items.len);
+    for (reference.descriptors.items, actual.descriptors.items) |one, two| {
+        try std.testing.expect((one == null) == (two == null));
+        if (one) |expected_descriptor| {
+            const found_descriptor = two.?;
+            try std.testing.expectEqualDeep(expected_descriptor.operation, found_descriptor.operation);
+            try std.testing.expect(expected_descriptor.output_shape.eq(found_descriptor.output_shape));
+            try std.testing.expectEqual(expected_descriptor.input_count, found_descriptor.input_count);
+            for (expected_descriptor.input_shapes[0..expected_descriptor.input_count], found_descriptor.input_shapes[0..found_descriptor.input_count]) |expected_shape, found_shape| try std.testing.expect(expected_shape.eq(found_shape));
+        }
+    }
+    try std.testing.expectEqual(reference.bindings.items.len, actual.bindings.items.len);
+    try std.testing.expectEqual(reference.immutable_resident.items.len, actual.immutable_resident.items.len);
+    try std.testing.expectEqual(reference.planes.items.len, actual.planes.items.len);
+    try std.testing.expectEqualSlices(?CT, reference.values.items, actual.values.items);
+    const nodes_before = actual.graph.nodeCount();
+    try std.testing.expectError(error.DenseDefinitionChanged, authorSemanticGraph(&actual));
+    try std.testing.expectEqual(nodes_before, actual.graph.nodeCount());
+    if (configuration.layers == 0) {
+        const owned_schedule = try Schedule.create(&actual);
+        defer owned_schedule.deinit(.{ .outside_execution = true });
+        try std.testing.expectEqual(@as(usize, 0), actual.graph.nodeCount());
+        try std.testing.expectError(error.DenseDefinitionChanged, authorSemanticGraph(&actual));
+        try std.testing.expectEqual(@as(usize, 0), actual.graph.nodeCount());
+    }
+    // Unsupported arithmetic metadata is refused before graph mutation, rather
+    // than being silently rewritten to the existing fixed-epsilon kernel.
+    var changed = spec;
+    changed.semantics.epsilon = 1e-3;
+    var refused = Builder.initSpec(a, &backend, null, &changed, bound);
+    defer refused.deinit();
+    try std.testing.expectError(error.DenseDefinitionChanged, authorSemanticGraph(&refused));
+    try std.testing.expectEqual(@as(usize, 0), refused.graph.nodeCount());
+    var oversized = spec;
+    oversized.geometry.width = std.math.maxInt(usize);
+    var overflow = Builder.initSpec(a, &backend, null, &oversized, bound);
+    defer overflow.deinit();
+    try std.testing.expectError(error.DimensionOverflow, authorSemanticGraph(&overflow));
+    try std.testing.expectEqual(@as(usize, 0), overflow.graph.nodeCount());
+    const wrong_parameters = try a.dupe(ParameterSpec, spec.parameters);
+    defer a.free(wrong_parameters);
+    wrong_parameters[0].shape = Shape.init(.i32, &.{@intCast(geometry.query_rows)});
+    var wrong_spec = spec;
+    wrong_spec.parameters = wrong_parameters;
+    var wrong_host = Builder.initSpec(a, &backend, null, &wrong_spec, bound);
+    defer wrong_host.deinit();
+    if (authorSemanticGraph(&wrong_host)) |_| return error.ExpectedHostGeometryDenial else |err| switch (err) {
+        error.DenseDefinitionChanged => {},
+        else => return err,
+    }
+    try std.testing.expectEqual(@as(usize, 0), wrong_host.graph.nodeCount());
+}
+const semantic_author_cases = [_]SemanticAuthorCase{
+    .{ .pre = true, .layers = 0 },
+    .{ .pre = true, .missing_bias = true },
+    .{ .pre = true, .phase = .initial },
+    .{ .pre = true, .phase = .initial, .rows = 3, .missing_bias = true },
+    .{ .pre = false, .final_norm = false },
+    .{ .pre = false },
+};
+test "shared semantic decoder graph preserves every original role operation descriptor and output order" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    for (semantic_author_cases) |configuration| try semanticAuthorOrderCase(std.testing.allocator, configuration);
+}
+
+test "shared semantic decoder author and original reference graphs unwind every allocation failure" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, semanticAuthorOrderCase, .{SemanticAuthorCase{ .pre = true, .phase = .initial, .rows = 3, .layers = 1, .missing_bias = true }});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, semanticAuthorOrderCase, .{SemanticAuthorCase{ .pre = false, .layers = 1 }});
 }

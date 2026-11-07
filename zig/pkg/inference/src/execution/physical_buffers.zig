@@ -920,8 +920,17 @@ pub const Pool = struct {
     /// any input-bank charge. No alias, regional, opaque, asynchronous or mutable
     /// numerical provider participates in this initially narrow borrow mode.
     fn selectNativeBorrowedHostInputs(self: *Pool) void {
-        if (self.host_input_plans.len == 0 or self.regions.len != 0 or @import("owned_coverage.zig").assess(self) != .complete) return;
+        if (self.host_input_plans.len == 0 or self.regions.len != 0) return;
         const selected = if (self.selection) |*value| value else return;
+        // Pure necessary eligibility precedes the optional whole-program proof.
+        // Integer/nonborrowable packet ingress retains its ordinary owned bank;
+        // final payload coverage is still assessed by the receiving finalizer.
+        for (self.host_input_plans) |input| {
+            if (input.shape.dtype != .f32) return;
+            const fact = selected.inputs.find(input.node) orelse return;
+            if (fact != .imported_host or !fact.imported_host.borrowable_host) return;
+        }
+        if (@import("owned_coverage.zig").assess(self) != .complete) return;
         const reachable = self.coverage_reachable orelse return;
         for (self.plan.slots) |slot| {
             if (slot.node_id >= reachable.len or !reachable[slot.node_id]) continue;
@@ -930,10 +939,6 @@ pub const Pool = struct {
                 const owned = self.preparedKernelRoute(slot.node_id) orelse return;
                 if (owned.validation_scope != .prepared_program) return;
             }
-        }
-        for (self.host_input_plans) |input| {
-            const fact = selected.inputs.find(input.node) orelse return;
-            if (input.shape.dtype != .f32 or fact != .imported_host or !fact.imported_host.borrowable_host) return;
         }
         for (self.host_input_plans) |*input| input.borrowed = true;
     }
@@ -2109,12 +2114,27 @@ pub const Frame = struct {
         if (self.retired or self.native_program_views.len == 0 or self.pool.backends.len != 1 or self.scope_backends != 1 or self.pool.backends[0].vtable != &@import("../ops/native_compute.zig").vtable_impl or self.pool.regions.len != 0 or self.pool.replay_backend != null) return error.InvalidNativeProgramRebind;
         try self.pool.validateHostInputs(inputs);
         if (self.host_input_generation == std.math.maxInt(u64)) return error.HostInputGenerationExhausted;
+        const stable_packet = self.ownedHostReleaseHasNoCallbacks();
         self.releaseHostInputs();
         try self.advanceHostInputGeneration();
-        return self.bindHostInputs(inputs) catch |err| {
+        return (if (stable_packet) self.bindValidatedHostInputs(inputs, null, null) else self.bindHostInputs(inputs)) catch |err| {
             self.retired = true;
             return err;
         };
+    }
+    // This proof grants no physical or index authority. It only establishes
+    // that releaseHostInputs cannot call a provider/allocator between the
+    // preflight above and the same binding body below. Unknown/borrowed views
+    // retain the original second validation after their release callbacks.
+    fn ownedHostReleaseHasNoCallbacks(self: *const Frame) bool {
+        if (!self.native_program_storage_sealed or self.pool.payload_coverage != .complete) return false;
+        for (self.pool.host_input_plans) |plan| if (plan.borrowed) return false;
+        for (self.host_bound_inputs[0..self.bound_host_input_count]) |input| {
+            const index = self.pool.hostInputIndex(input.node_id) orelse return false;
+            const resource = self.host_input_resources[index] orelse return false;
+            if (resource.resource.borrowed or resource.private_view == null or resource.private_view.? != input.value) return false;
+        }
+        return true;
     }
     fn endScope(self: *Frame) void {
         while (self.scope_backends != 0) {
@@ -2217,6 +2237,11 @@ pub const Frame = struct {
     pub fn bindHostInputsWithOperation(self: *Frame, inputs: []const host_ingress.Input, control: ?@import("../execution_control.zig").InferenceExecutionControl, operation: ?*const @import("backend_operation.zig").Borrowed) ![]const interpreter.RuntimeInput {
         if (self.retired or self.bound_host_input_count != 0) return error.InvalidHostIngressBinding;
         try self.pool.validateHostInputs(inputs);
+        return self.bindValidatedHostInputs(inputs, control, operation);
+    }
+    // Only public validated entry or the exact callback-free Native rebind
+    // window may reach this body. Nothing stores the validated source packet.
+    fn bindValidatedHostInputs(self: *Frame, inputs: []const host_ingress.Input, control: ?@import("../execution_control.zig").InferenceExecutionControl, operation: ?*const @import("backend_operation.zig").Borrowed) ![]const interpreter.RuntimeInput {
         errdefer self.releaseHostInputs();
         for (inputs) |input| {
             if (control) |active| try active.check();
@@ -4296,7 +4321,7 @@ fn privateNativePreparationCase(a: std.mem.Allocator) !void {
         _ = frame.finish() catch unreachable;
     };
     var data = [_]f32{ 1, -2, 3, -4 };
-    const tensor = @import("../backends/tensor.zig").Tensor{ .data = std.mem.sliceAsBytes(&data), .shape = &.{4}, .dtype = .f32, .name = "", .allocator = a, .owns_data = false, .owns_shape = false };
+    var tensor = @import("../backends/tensor.zig").Tensor{ .data = std.mem.sliceAsBytes(&data), .shape = &.{4}, .dtype = .f32, .name = "", .allocator = a, .owns_data = false, .owns_shape = false };
     const inputs = [_]host_ingress.Input{.{ .node_id = input_node, .value = &tensor }};
     const bound = try frame.bindHostInputs(&inputs);
     const values = try a.alloc(?CT, graph.nodeCount());
@@ -4310,10 +4335,46 @@ fn privateNativePreparationCase(a: std.mem.Allocator) !void {
     // Re-enter the actual numerical scope and bind its current host value;
     // the cold preparation scope did not run a kernel or lend its input.
     try frame.begin();
-    const rebound = try frame.bindHostInputs(&inputs);
+    try std.testing.expect(frame.ownedHostReleaseHasNoCallbacks());
+    const rebound = try frame.rebindNativeProgramHostInputs(&inputs);
+    try std.testing.expect(frame.ownedHostReleaseHasNoCallbacks());
+    const valid_generation = frame.host_input_generation;
+    tensor.shape = &.{8};
+    const malformed = frame.rebindNativeProgramHostInputs(&inputs);
+    tensor.shape = &.{4};
+    try std.testing.expectError(error.InvalidHostIngressBinding, malformed);
+    try std.testing.expect(!frame.retired and frame.host_input_generation == valid_generation and frame.bound_host_input_count == 1);
     for (rebound) |input| values[input.node_id] = input.value;
     const output = try frame.executeNativeProgram(&backend, values, output_node, null, &.{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 });
     try std.testing.expectEqualSlices(f32, &.{ -1, 2, -3, 4 }, (try backend.hostFloat32Read(output)).?);
+    const Callback = struct {
+        packet: *@import("../backends/tensor.zig").Tensor,
+        called: bool = false,
+        fn unbind(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.called = true;
+            self.packet.shape = &.{8};
+        }
+        fn write(_: *anyopaque, _: CT, _: route.AssignedOutput, _: []const u8) !void {
+            return error.UnexpectedRebindWrite;
+        }
+        fn deinit(_: *anyopaque) void {}
+        const table = host_ingress.Upload.VTable{ .write = write, .unbind_borrowed = unbind, .deinit = deinit };
+    };
+    var callback = Callback{ .packet = &tensor };
+    const resource = &frame.host_input_resources[0].?;
+    const original_resource = resource.resource;
+    resource.resource.context = &callback;
+    resource.resource.vtable = &Callback.table;
+    resource.resource.borrowed = true;
+    try std.testing.expect(!frame.ownedHostReleaseHasNoCallbacks());
+    // A real supported release callback changes a previously valid packet.
+    // Generic revalidation must catch it before any new binding/write.
+    const changed_after_release = frame.rebindNativeProgramHostInputs(&inputs);
+    resource.resource = original_resource;
+    tensor.shape = &.{4};
+    try std.testing.expectError(error.InvalidHostIngressBinding, changed_after_release);
+    try std.testing.expect(callback.called and frame.retired and frame.bound_host_input_count == 0);
     _ = try frame.finish();
     active = false;
     try std.testing.expect(private.pool.frames.items.len == 1);
@@ -4327,4 +4388,28 @@ test "private Native preparation consumes one Pool only after publication and ma
 test "private Native preparation preserves caller cleanup through every allocation failure" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, privateNativePreparationCase, .{});
+}
+
+fn ineligibleBorrowPreflightCase(a: std.mem.Allocator) !void {
+    const shape = ml.graph.Shape.init(.i64, &.{1});
+    const bindings = [_]route.InputBinding{.{ .node_id = 0, .value = .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true, .borrowable_host = false } } }};
+    const inputs = try prepared_routes.ImmutableBindings.create(a, &bindings);
+    defer inputs.release();
+    const selected = RouteSelection{ .allocator = a, .epoch = 1, .inputs = inputs, .routes = &.{}, .planes = &.{}, .plane_counts = &.{}, .literal_enabled = &.{} };
+    var backends = [_]ops.ComputeBackend{.{ .ptr = @ptrFromInt(16), .vtable = &@import("../ops/native_compute.zig").vtable_impl }};
+    var plans = [_]HostInputPlan{.{ .node = 0, .shape = shape, .backend_index = 0, .allocation = 0, .requirements = .{ .bytes = 8, .host_bytes = 0, .profile = 4 }, .epoch = 1 }};
+    var pool = Pool{ .allocator = a, .plan = undefined, .kernels = &.{}, .transfers = &.{}, .backends = &backends, .workspace_allocations = &.{}, .host_input_plans = &plans, .selection = selected, .coverage_backend = backends[0], .coverage_graph = @ptrFromInt(16), .coverage_reachable = &.{true}, .native_frame_dispatch = true };
+    // Typed integer ingress is necessarily owned: refuse optional borrowing
+    // before touching opaque graph/provider/coverage state, with no new credit.
+    pool.selectNativeBorrowedHostInputs();
+    try std.testing.expect(!plans[0].borrowed);
+    plans[0].shape = ml.graph.Shape.init(.f32, &.{1});
+    inputs.entries[0].value.imported_host.logical = plans[0].shape;
+    pool.selectNativeBorrowedHostInputs();
+    try std.testing.expect(!plans[0].borrowed);
+}
+
+test "Native optional host borrow preflight refuses integer and nonborrowable facts before opaque coverage" {
+    try ineligibleBorrowPreflightCase(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, ineligibleBorrowPreflightCase, .{});
 }

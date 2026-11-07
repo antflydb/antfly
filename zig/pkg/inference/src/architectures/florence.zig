@@ -4757,7 +4757,7 @@ pub const PreparedSingleToken = struct {
             const role = try self.roleAt(index);
             const resolved = try self.resolve(role, buffer);
             const shape = if (resolved.source_kind == .held_weight)
-                (try Native.heldF32WeightPrimaryNamed(&self.program.backend, self.program.source_data, resolved.value.?, resolved.source_name)).descriptor.shape
+                try Native.heldF32WeightShapeNamed(&self.program.backend, self.program.source_data, resolved.value.?, resolved.source_name)
             else
                 resolved.shape.?;
             if ((shape.numElements() orelse return error.UnsupportedDenseSchedule) <= 0) return error.UnsupportedDenseSchedule;
@@ -4814,19 +4814,6 @@ pub const PreparedSingleToken = struct {
         if (self.weights.head_bias) |bias| _ = try Native.heldF32WeightPrimaryNamed(&self.backend, self.source_data, bias, "language_model.final_logits_bias");
     }
 
-    const Author = struct {
-        builder: *Dense.Builder,
-        spec: *const Dense.ProgramSpec,
-        fn weight(self: @This(), kind: @FieldType(Dense.RoleKey, "kind"), layer: ?u32, part: @FieldType(Dense.RoleKey, "part")) !Node {
-            return self.builder.parameterRole(.{ .kind = kind, .layer = layer, .part = part });
-        }
-        fn linear(self: @This(), input: Node, kind: @FieldType(Dense.RoleKey, "kind"), layer: ?u32, width: usize, output: usize) !Node {
-            return self.builder.linear(input, try self.weight(kind, layer, .weight), try self.weight(kind, layer, .bias), width, output);
-        }
-        fn norm(self: @This(), input: Node, kind: @FieldType(Dense.RoleKey, "kind"), layer: ?u32) !Node {
-            return self.builder.norm(input, try self.weight(kind, layer, .weight), try self.weight(kind, layer, .bias), self.spec.geometry.width);
-        }
-    };
     allocator: std.mem.Allocator,
     backend: ComputeBackend,
     source_data: *const anyopaque,
@@ -4918,41 +4905,10 @@ pub const PreparedSingleToken = struct {
         if (spec.family != .florence or spec.phase != .decode or spec.geometry.query_rows != 1 or spec.semantics.activation != .gelu_exact or spec.semantics.norm_order != .post or spec.semantics.epsilon != 1e-5 or spec.semantics.position_offset != bart_position_offset) return error.DenseDefinitionChanged;
         var builder = if (storage) |owned| Dense.Builder.initSpecStorage(self.allocator, &self.backend, preparation, owned, bound) else Dense.Builder.initSpec(self.allocator, &self.backend, preparation, spec, bound);
         defer builder.deinit();
-        const writer = Author{ .builder = &builder, .spec = spec };
-        const g = spec.geometry;
-        const token_node = try builder.parameterRole(.{ .kind = .token_ids });
-        const position_node = try builder.parameterRole(.{ .kind = .position_ids });
-        const embedded = try builder.gather(try writer.weight(.embedding, null, .weight), token_node, g.width);
-        const positions = try builder.gather(try writer.weight(.positions, null, .weight), position_node, g.width);
-        var hidden = try writer.norm(try builder.add(embedded, positions), .embed_norm, null);
-        for (0..g.layers) |index| {
-            const layer: u32 = @intCast(index);
-            const q = try writer.linear(hidden, .self_q, layer, g.width, g.width);
-            const k = try writer.linear(hidden, .self_k, layer, g.width, g.width);
-            const v = try writer.linear(hidden, .self_v, layer, g.width, g.width);
-            try builder.output(k);
-            try builder.output(v);
-            const self_k = try builder.parameterRole(.{ .kind = .self_slab_k, .layer = layer });
-            const self_v = try builder.parameterRole(.{ .kind = .self_slab_v, .layer = layer });
-            const attended = try builder.prefix(q, self_k, self_v, g.heads, g.width / g.heads, g.capacity);
-            const projected = try writer.linear(attended, .self_o, layer, g.width, g.width);
-            const self_normed = try writer.norm(try builder.add(hidden, projected), .self_norm, layer);
-            const cross_q = try writer.linear(self_normed, .cross_q, layer, g.width, g.width);
-            const cross_k = try builder.parameterRole(.{ .kind = .cross_slab_k, .layer = layer });
-            const cross_v = try builder.parameterRole(.{ .kind = .cross_slab_v, .layer = layer });
-            const cross_attention = try builder.prefix(cross_q, cross_k, cross_v, g.heads, g.width / g.heads, g.encoder_rows);
-            const cross_projected = try writer.linear(cross_attention, .cross_o, layer, g.width, g.width);
-            const cross_normed = try writer.norm(try builder.add(self_normed, cross_projected), .cross_norm, layer);
-            const fc1 = try writer.linear(cross_normed, .fc1, layer, g.width, g.ffn_dim);
-            const activated = try builder.geluExact(fc1);
-            const fc2 = try writer.linear(activated, .fc2, layer, g.ffn_dim, g.width);
-            hidden = try writer.norm(try builder.add(cross_normed, fc2), .ffn_norm, layer);
-        }
-        if (spec.semantics.global_final_norm) hidden = try writer.norm(hidden, .final_norm, null);
-        try builder.output(hidden);
+        const nodes = try Dense.authorSemanticGraph(&builder);
         self.schedule = try Dense.Schedule.create(&builder);
-        self.token_node = token_node;
-        self.position_node = position_node;
+        self.token_node = nodes.token_node;
+        self.position_node = nodes.position_node;
         self.cache.?.assigned = self.schedule;
     }
     pub fn prepareInto(self: *@This(), capability: ?@import("../execution/storage_admission.zig").Capability, current: Cleanup) !void {

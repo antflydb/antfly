@@ -4350,13 +4350,20 @@ pub const NativeCompute = struct {
         const source = data.resident_weights.getPtr(name) orelse return error.UnsupportedAuthoredWeight;
         return authoredResidentF32PlaneFromLoaded(name, value, shape, source);
     }
-    fn authoredResidentF32PlaneFromLoaded(name: []const u8, value: CT, shape: @import("ml").graph.Shape, source: *const LoadedWeight) !@import("../execution/storage_ownership.zig").Plane {
+    fn validateAuthoredResidentF32FromLoaded(name: []const u8, value: CT, source: *const LoadedWeight) !void {
         const view = toBuf(value);
         if (!view.cached_weight or view.weight_handle == null or view.weight_handle.?.references == 0 or view.owned or view.retained_parent != null or view.physical_lease != null or view.source_tensor != null or view.quantized_storage != null or view.owned_quantized_storage != null or view.view_strides != null or view.view_base_offset != 0 or !std.mem.eql(u8, view.name, name) or @intFromPtr(view.data.ptr) != @intFromPtr(source.tensor.data.ptr) or std.mem.sliceAsBytes(view.data).len != source.tensor.data.len or view.logical_shape == null or !std.mem.eql(i64, view.logical_shape.?, source.tensor.shape)) return error.AuthoredResidentWeightChanged;
+    }
+    fn residentF32PlaneFromValidated(shape: @import("ml").graph.Shape, source: *const LoadedWeight) @import("../execution/storage_ownership.zig").Plane {
         var descriptor = backend_contracts.TensorDesc.init(shape, .host_f32);
         descriptor.current_backend = .native;
         descriptor.resident_backend = .native;
         return .{ .descriptor = descriptor, .role = .primary, .backing = .{ .kind = .host, .base = @intFromPtr(source.tensor.data.ptr) }, .byte_offset = 0, .logical_bytes = source.tensor.data.len, .readable_bytes = source.tensor.data.len };
+    }
+
+    fn authoredResidentF32PlaneFromLoaded(name: []const u8, value: CT, shape: @import("ml").graph.Shape, source: *const LoadedWeight) !@import("../execution/storage_ownership.zig").Plane {
+        try validateAuthoredResidentF32FromLoaded(name, value, source);
+        return residentF32PlaneFromValidated(shape, source);
     }
 
     pub fn authoredLinearPairSupported(backend: *const ops.ComputeBackend, a: CT, b: CT, descriptor: *const ops.kernel_descriptor.Descriptor) !bool {
@@ -4375,14 +4382,19 @@ pub const NativeCompute = struct {
     /// The caller retains its actual Model/store and witness through use, with
     /// the same strict source stamps required by authored decoder reception.
     pub fn heldF32WeightPrimary(backend: *const ops.ComputeBackend, expected_data: *const anyopaque, witness: CT) !@import("../execution/storage_ownership.zig").Plane {
-        return heldF32WeightPrimaryImpl(backend, expected_data, witness, null);
+        return heldF32WeightFacts(@import("../execution/storage_ownership.zig").Plane, backend, expected_data, witness, null);
     }
     /// Cold semantic role binding uses the producer's checkpoint-resolved
     /// expected name, never the witness's own name as its alleged authority.
     pub fn heldF32WeightPrimaryNamed(backend: *const ops.ComputeBackend, expected_data: *const anyopaque, witness: CT, expected_name: []const u8) !@import("../execution/storage_ownership.zig").Plane {
-        return heldF32WeightPrimaryImpl(backend, expected_data, witness, expected_name);
+        return heldF32WeightFacts(@import("../execution/storage_ownership.zig").Plane, backend, expected_data, witness, expected_name);
     }
-    fn heldF32WeightPrimaryImpl(backend: *const ops.ComputeBackend, expected_data: *const anyopaque, witness: CT, expected_name: ?[]const u8) !@import("../execution/storage_ownership.zig").Plane {
+    /// Value-only logical geometry after the SAME complete current named-source
+    /// proof. This confers no Plane/storage, quota, writable or lifetime credit.
+    pub fn heldF32WeightShapeNamed(backend: *const ops.ComputeBackend, expected_data: *const anyopaque, witness: CT, expected_name: []const u8) !@import("ml").graph.Shape {
+        return heldF32WeightFacts(@import("ml").graph.Shape, backend, expected_data, witness, expected_name);
+    }
+    fn heldF32WeightFacts(comptime Result: type, backend: *const ops.ComputeBackend, expected_data: *const anyopaque, witness: CT, expected_name: ?[]const u8) !Result {
         if (backend.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
         const self: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
         if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
@@ -4395,7 +4407,11 @@ pub const NativeCompute = struct {
         const source = try self.heldF32WeightSourceLocked(witness, false);
         const name = toBuf(witness).weight_handle.?.name();
         if (expected_name) |expected| if (!std.mem.eql(u8, expected, name)) return error.NativeWeightRoleChanged;
-        return authoredResidentF32PlaneFromLoaded(name, witness, @import("ml").graph.Shape.init(.f32, source.tensor.shape), source);
+        const shape = @import("ml").graph.Shape.init(.f32, source.tensor.shape);
+        try validateAuthoredResidentF32FromLoaded(name, witness, source);
+        if (comptime Result == @import("ml").graph.Shape) {
+            return shape;
+        } else return residentF32PlaneFromValidated(shape, source);
     }
 
     /// Cold binding of the existing cached-handle stamp, without new witness
@@ -61569,13 +61585,39 @@ fn namedHeldWeightCase(a: std.mem.Allocator) !void {
     // Deliberately identical shape, bytes, source kind and physical backing.
     // A layout check or data-pointer comparison cannot establish semantic role.
     try std.testing.expectEqualDeep(q_plane, k_plane);
+    try std.testing.expect((try NativeCompute.heldF32WeightShapeNamed(&cb, &store, q, "q")).eq(q_plane.descriptor.shape));
+    try std.testing.expect((try NativeCompute.heldF32WeightShapeNamed(&cb, &store, k, "k")).eq(k_plane.descriptor.shape));
+    try std.testing.expectError(error.NativeWeightRoleChanged, NativeCompute.heldF32WeightShapeNamed(&cb, &store, q, "k"));
+    try std.testing.expectError(error.ForeignNativeWeightModel, NativeCompute.heldF32WeightShapeNamed(&cb, @ptrFromInt(16), q, "q"));
+    var copied = vtable_impl;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(&copied != &vtable_impl);
+    const foreign = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.heldF32WeightShapeNamed(&foreign, @ptrFromInt(16), @ptrFromInt(16), "q"));
+    const original_name = toBuf(q).name;
+    toBuf(q).name = "wrong-view-name";
+    const wrong_view = NativeCompute.heldF32WeightShapeNamed(&cb, &store, q, "q");
+    toBuf(q).name = original_name;
+    try std.testing.expectError(error.AuthoredResidentWeightChanged, wrong_view);
+    const original_shape = toBuf(q).logical_shape;
+    toBuf(q).logical_shape = &.{ 1, 4 };
+    const wrong_shape = NativeCompute.heldF32WeightShapeNamed(&cb, &store, q, "q");
+    toBuf(q).logical_shape = original_shape;
+    try std.testing.expectError(error.NativeWeightPreparationChanged, wrong_shape);
+    const original_version = store.resident_weights.getPtr("q").?.source_version;
+    store.resident_weights.getPtr("q").?.source_version += 1;
+    const stale = NativeCompute.heldF32WeightShapeNamed(&cb, &store, q, "q");
+    store.resident_weights.getPtr("q").?.source_version = original_version;
+    try std.testing.expectError(error.NativeWeightPreparationChanged, stale);
     try std.testing.expectError(error.NativeWeightRoleChanged, NativeCompute.heldF32WeightPrimaryNamed(&cb, &store, q, "k"));
     try std.testing.expectError(error.NativeWeightRoleChanged, NativeCompute.heldF32WeightPrimaryNamed(&cb, &store, k, "q"));
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
     compute.allocator = failing.allocator();
     const current = NativeCompute.heldF32WeightPrimaryNamed(&cb, &store, q, "q");
+    const current_shape = NativeCompute.heldF32WeightShapeNamed(&cb, &store, q, "q");
     compute.allocator = a;
     try std.testing.expectEqualDeep(q_plane, try current);
+    try std.testing.expect((try current_shape).eq(q_plane.descriptor.shape));
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 

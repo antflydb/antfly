@@ -5370,19 +5370,25 @@ fn prepareColdNativeFlorenceImpl(session: Session, allocator: std.mem.Allocator,
     return self;
 }
 
-// Complete current semantic facts and Domain identity qualify the candidate
-// outside the cache mutex. Only then may its actual Shared bytes enter the
-// request denial floor. Digest matches alone never authorize metadata reuse.
-fn acquireDenseDefinitionForSpec(slot: *@import("dense_decoder_schedule.zig").DefinitionSlot, key: [32]u8, header: *const @import("dense_decoder_schedule.zig").ProgramSpec, source: anytype, domain: *const @import("../runtime/tier/admission_domain.zig").Pin, current: @import("cleanup_context.zig").Context) !?*@import("dense_decoder_schedule.zig").Definition {
-    var qualified = false;
-    defer slot.recordLookup(qualified);
-    const candidate = slot.acquireUncounted(key) orelse return null;
-    defer if (!qualified) candidate.release(current);
-    const shared = candidate.shared orelse return null;
-    if (shared.domain.owner != domain.owner or shared.domain.controller() != domain.controller()) return null;
-    if (!try candidate.matchesSpecSource(header, source)) return null;
-    qualified = true;
-    return candidate;
+// A retained singleton is only a candidate. Full current semantics and Domain
+// qualify it outside the mutex before any Shared floor/admission/allocation.
+// On MISS the original key validates every source before a producer records an
+// outcome. Whisper defers BOTH phase counters until both selectors succeed.
+fn selectDensePreparationForSpec(slot: ?*@import("dense_decoder_schedule.zig").DefinitionSlot, header: *const @import("dense_decoder_schedule.zig").ProgramSpec, source: anytype, domain: ?*const @import("../runtime/tier/admission_domain.zig").Pin, current: @import("cleanup_context.zig").Context) !@import("dense_decoder_schedule.zig").Preparation {
+    const Dense = @import("dense_decoder_schedule.zig");
+    const candidate: ?*Dense.Definition = if (slot) |cache| (if (domain != null) cache.acquireCandidate() else null) else null;
+    var transferred = false;
+    defer if (!transferred) if (candidate) |value| value.release(current);
+    if (candidate) |value| if (value.shared) |shared| {
+        const live_domain = domain.?;
+        if (shared.domain.owner == live_domain.owner and shared.domain.controller() == live_domain.controller()) {
+            if (try value.matchesSpecSource(header, source)) {
+                transferred = true;
+                return .{ .key = value.key, .cached = value };
+            }
+        }
+    };
+    return .{ .key = try Dense.specKeySource(header, source) };
 }
 
 fn createDenseProgramSpecStorage(preparation: *const @import("dense_decoder_schedule.zig").Preparation, fallback_allocator: std.mem.Allocator, header: *const @import("dense_decoder_schedule.zig").ProgramSpec, source: anytype) !@import("dense_decoder_schedule.zig").ProgramSpecStorage {
@@ -5405,10 +5411,11 @@ fn buildColdNativeFlorence(self: *ColdNativeFlorence, allocator: std.mem.Allocat
     const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
     const source = try program.specSource();
     const header = source.header();
-    var preparation = Dense.Preparation{ .key = try Dense.specKeySource(&header, &source) };
+    const slot: ?*Dense.DefinitionSlot = if (Dense.sharedBackingSupported(arch.allocator)) &arch.dense_decoder_definitions else null;
+    var preparation = try selectDensePreparationForSpec(slot, &header, &source, domain, current);
     defer preparation.deinit(current);
-    if (Dense.sharedBackingSupported(arch.allocator)) {
-        preparation.cached = try acquireDenseDefinitionForSpec(&arch.dense_decoder_definitions, preparation.key, &header, &source, domain, current);
+    if (slot) |cache| {
+        cache.recordLookup(preparation.cached != null);
         if (preparation.cached) |value| try metadata.setSharedMetadataFloor(value.shared.?.admittedAmounts()) else preparation.shared = try @import("cold_metadata.zig").Shared.create(arch.allocator, metadata);
     }
     var owned_spec: ?Dense.ProgramSpecStorage = null;
@@ -5537,7 +5544,8 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
     const source = (try whisper_arch.PreparedSingleToken.specSource(cb, data, config, geometry.encoder_rows, &self.weights.?, 1, false)) orelse return false;
     const header = source.header();
-    var preparation = schedule.Preparation{ .key = try schedule.specKeySource(&header, &source) };
+    const shared_lookup = domain != null and schedule.sharedBackingSupported(arch.allocator);
+    var preparation = try selectDensePreparationForSpec(if (shared_lookup) &arch.dense_decoder_definitions else null, &header, &source, domain, current);
     defer preparation.deinit(current);
     var initial_preparation = schedule.Preparation{ .key = @splat(0) };
     defer initial_preparation.deinit(current);
@@ -5546,16 +5554,16 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     if (initial_rows) |query_rows| {
         initial_source = (try whisper_arch.PreparedSingleToken.specSource(cb, data, config, geometry.encoder_rows, &self.weights.?, query_rows, true)) orelse return false;
         initial_header = initial_source.?.header();
-        initial_preparation.key = try schedule.specKeySource(&initial_header.?, &initial_source.?);
+        initial_preparation = try selectDensePreparationForSpec(if (shared_lookup) &arch.dense_decoder_initial_definitions else null, &initial_header.?, &initial_source.?, domain, current);
     }
     // Full expected semantics, roles, names and Domain are compared without
     // allocation before either cached phase enters the mandatory denial floor.
     // Raw/no-Domain callers retain request-owned preparation.
-    if (domain != null and schedule.sharedBackingSupported(arch.allocator)) {
-        preparation.cached = try acquireDenseDefinitionForSpec(&arch.dense_decoder_definitions, preparation.key, &header, &source, domain.?, current);
+    if (shared_lookup) {
+        arch.dense_decoder_definitions.recordLookup(preparation.cached != null);
         if (preparation.cached) |definition| try metadata.addSharedDefinitionFloor(definition.shared.?);
         if (initial_source != null) {
-            initial_preparation.cached = try acquireDenseDefinitionForSpec(&arch.dense_decoder_initial_definitions, initial_preparation.key, &initial_header.?, &initial_source.?, domain.?, current);
+            arch.dense_decoder_initial_definitions.recordLookup(initial_preparation.cached != null);
             if (initial_preparation.cached) |definition| try metadata.addSharedDefinitionFloor(definition.shared.?);
         }
         if (preparation.cached == null) preparation.shared = try @import("cold_metadata.zig").Shared.create(arch.allocator, metadata);
@@ -19535,7 +19543,10 @@ fn checkDenseDefinitionReuseGuards(slot: *@import("dense_decoder_schedule.zig").
         slot: *Dense.DefinitionSlot,
         calls: *usize,
         corrupt_name: bool = false,
+        corrupt_shape: bool = false,
+        invalid_shape: bool = false,
         fail: bool = false,
+        republished: ?*usize = null,
         pub fn len(self: @This()) usize {
             return self.parameters.len;
         }
@@ -19544,8 +19555,21 @@ fn checkDenseDefinitionReuseGuards(slot: *@import("dense_decoder_schedule.zig").
             self.slot.mutex.unlock();
             self.calls.* += 1;
             if (self.fail) return error.TestSpecSourceFailure;
+            if (index == 0) if (self.republished) |count| {
+                // Reentrant real root replacement must not invalidate the
+                // separately retained candidate or hold a provider under lock.
+                const root = self.slot.take() orelse return error.MissingReplacementRoot;
+                defer root.release(.{ .outside_execution = true });
+                if (self.slot.publish(root)) |victim| {
+                    victim.release(.{ .outside_execution = true });
+                    return error.UnexpectedReplacementVictim;
+                }
+                count.* += 1;
+            };
             var parameter = self.parameters[index];
             if (self.corrupt_name and parameter.source_kind == .held_weight) parameter.source_name = "different.checkpoint.role";
+            if (self.corrupt_shape and parameter.source_kind == .held_weight) parameter.shape = @import("ml").graph.Shape.init(.f32, &.{ 1, 1 });
+            if (self.invalid_shape) parameter.shape = @import("ml").graph.Shape.init(.f32, &.{ 0, 4 });
             return parameter;
         }
     };
@@ -19557,34 +19581,135 @@ fn checkDenseDefinitionReuseGuards(slot: *@import("dense_decoder_schedule.zig").
     var calls: usize = 0;
     const source = Source{ .parameters = spec.parameters, .slot = slot, .calls = &calls };
     const current = @import("cleanup_context.zig").Context{ .outside_execution = true };
-    const hit = (try acquireDenseDefinitionForSpec(slot, definition.key, spec, source, &shared.domain, current)) orelse return error.MissingQualifiedDefinition;
-    const same_owner = hit == definition;
-    hit.release(current);
-    try std.testing.expect(same_owner);
-    // Force the same digest with different semantics and a same-shaped named
-    // role. Neither candidate may become a shared metadata denial floor.
+    {
+        var hit = try selectDensePreparationForSpec(slot, spec, source, &shared.domain, current);
+        defer hit.deinit(current);
+        try std.testing.expect(hit.cached == definition);
+        try std.testing.expectEqual(definition.key, hit.key);
+        try std.testing.expectEqual(spec.parameters.len, calls); // One full pass, no key/hash pass.
+        slot.recordLookup(hit.cached != null);
+    }
+    // The singleton is a candidate even for different complete semantics.
+    // Rejection computes the unchanged original key before counting the MISS.
     var changed = spec.*;
     changed.semantics.position_offset += 1;
-    try std.testing.expect((try acquireDenseDefinitionForSpec(slot, definition.key, &changed, source, &shared.domain, current)) == null);
+    const prior_calls = calls;
+    {
+        var miss = try selectDensePreparationForSpec(slot, &changed, source, &shared.domain, current);
+        defer miss.deinit(current);
+        try std.testing.expect(miss.cached == null);
+        try std.testing.expectEqual(try Dense.specKey(&changed), miss.key);
+        try std.testing.expectEqual(prior_calls + spec.parameters.len, calls);
+        slot.recordLookup(false);
+    }
     var wrong_name = source;
     wrong_name.corrupt_name = true;
-    try std.testing.expect((try acquireDenseDefinitionForSpec(slot, definition.key, spec, wrong_name, &shared.domain, current)) == null);
+    {
+        var miss = try selectDensePreparationForSpec(slot, spec, wrong_name, &shared.domain, current);
+        defer miss.deinit(current);
+        try std.testing.expect(miss.cached == null);
+        try std.testing.expectEqual(try Dense.specKeySource(spec, wrong_name), miss.key);
+        slot.recordLookup(false);
+    }
+    var wrong_shape = source;
+    wrong_shape.corrupt_shape = true;
+    {
+        var miss = try selectDensePreparationForSpec(slot, spec, wrong_shape, &shared.domain, current);
+        defer miss.deinit(current);
+        try std.testing.expect(miss.cached == null);
+        try std.testing.expectEqual(try Dense.specKeySource(spec, wrong_shape), miss.key);
+        slot.recordLookup(false);
+    }
+    const before_errors = slot.trySnapshot().?;
     var failed_source = source;
     failed_source.fail = true;
-    try std.testing.expectError(error.TestSpecSourceFailure, acquireDenseDefinitionForSpec(slot, definition.key, spec, failed_source, &shared.domain, current));
+    if (selectDensePreparationForSpec(slot, spec, failed_source, &shared.domain, current)) |value| {
+        var unexpected = value;
+        unexpected.deinit(current);
+        return error.ExpectedCurrentSpecSourceFailure;
+    } else |err| switch (err) {
+        error.TestSpecSourceFailure => {},
+        else => return err,
+    }
+    var invalid_source = source;
+    invalid_source.invalid_shape = true;
+    if (selectDensePreparationForSpec(slot, spec, invalid_source, &shared.domain, current)) |value| {
+        var unexpected = value;
+        unexpected.deinit(current);
+        return error.ExpectedInvalidCurrentSpecShape;
+    } else |err| switch (err) {
+        error.DenseDefinitionChanged => {},
+        else => return err,
+    }
+    try std.testing.expectEqualDeep(before_errors, slot.trySnapshot().?);
+    // Mirror the actual two-phase producer boundary: an initial source error
+    // releases the successful decode candidate, with NEITHER outcome recorded.
+    {
+        var decode = try selectDensePreparationForSpec(slot, spec, source, &shared.domain, current);
+        defer decode.deinit(current);
+        try std.testing.expect(decode.cached == definition);
+        try std.testing.expectEqual(references + 1, definition.references.load(.acquire));
+        var initial_header = spec.*;
+        initial_header.phase = .initial;
+        if (selectDensePreparationForSpec(slot, &initial_header, failed_source, &shared.domain, current)) |value| {
+            var unexpected = value;
+            unexpected.deinit(current);
+            return error.ExpectedInitialCurrentSpecSourceFailure;
+        } else |err| switch (err) {
+            error.TestSpecSourceFailure => {},
+            else => return err,
+        }
+        try std.testing.expectEqual(references + 1, definition.references.load(.acquire));
+        try std.testing.expectEqualDeep(before_errors, slot.trySnapshot().?);
+    }
+    try std.testing.expectEqual(references, definition.references.load(.acquire));
     const alien = try @import("../runtime/tier/admission_domain.zig").Domain.create();
     defer alien.release();
     const alien_pin = alien.pin();
     defer alien_pin.release();
-    const prior_calls = calls;
-    try std.testing.expect((try acquireDenseDefinitionForSpec(slot, definition.key, spec, source, &alien_pin, current)) == null);
-    try std.testing.expectEqual(prior_calls, calls);
-    var missing = definition.key;
-    missing[0] ^= 1;
-    try std.testing.expect((try acquireDenseDefinitionForSpec(slot, missing, spec, source, &shared.domain, current)) == null);
+    const prior_alien_calls = calls;
+    {
+        var miss = try selectDensePreparationForSpec(slot, spec, source, &alien_pin, current);
+        defer miss.deinit(current);
+        try std.testing.expect(miss.cached == null);
+        try std.testing.expectEqual(definition.key, miss.key);
+        try std.testing.expectEqual(prior_alien_calls + spec.parameters.len, calls);
+        slot.recordLookup(false);
+    }
+    // Empty and explicitly uncached producers still validate/hash the original
+    // full source. Neither may borrow a retained Shared denial floor.
+    var empty = Dense.DefinitionSlot{};
+    const before_empty = calls;
+    {
+        var miss = try selectDensePreparationForSpec(&empty, spec, source, &shared.domain, current);
+        defer miss.deinit(current);
+        try std.testing.expect(miss.cached == null and std.mem.eql(u8, &definition.key, &miss.key));
+        empty.recordLookup(false);
+    }
+    try std.testing.expectEqual(before_empty + spec.parameters.len, calls);
+    try std.testing.expectEqual(@as(u64, 1), empty.trySnapshot().?.misses);
+    {
+        var uncached = try selectDensePreparationForSpec(null, spec, source, null, current);
+        defer uncached.deinit(current);
+        try std.testing.expect(uncached.cached == null);
+        try std.testing.expectEqual(definition.key, uncached.key);
+    }
+    var republished: usize = 0;
+    var replacement_source = source;
+    replacement_source.republished = &republished;
+    const before_replace = calls;
+    {
+        var hit = try selectDensePreparationForSpec(slot, spec, replacement_source, &shared.domain, current);
+        defer hit.deinit(current);
+        try std.testing.expect(hit.cached == definition);
+        try std.testing.expectEqual(@as(usize, 1), republished);
+        try std.testing.expectEqual(before_replace + spec.parameters.len, calls);
+        slot.recordLookup(true);
+    }
     const after = slot.trySnapshot() orelse return error.UnavailableCacheStatistics;
-    try std.testing.expectEqual(before.hits + 1, after.hits);
-    try std.testing.expectEqual(before.misses + 5, after.misses);
+    try std.testing.expectEqual(before.hits + 2, after.hits);
+    try std.testing.expectEqual(before.misses + 4, after.misses);
+    try std.testing.expectEqual(before.builds + 1, after.builds);
     try std.testing.expectEqual(references, definition.references.load(.acquire));
     try std.testing.expectEqualDeep(budget, shared.domain.controller().snapshot());
 }
