@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "server": "http://localhost:8080",
+  "table": "dictation",
+  "profile": "default",
+  "shortcutKey": 49,
+  "shortcutModifiers": 6144,
+  "toggle": false,
+  "autoPaste": true,
+  "retainHistory": false,
+  "retainAudio": false,
+  "microphoneID": "",
+  "selectedPreset": "slack",
+  "dictionary": [
+    "Antfly",
+    "Colony"
+  ],
+  "presets": [
+    {
+      "id": "slack",
+      "name": "Slack",
+      "style": "clean",
+      "context": "a Slack message",
+      "model": "transcribers/apple-speech",
+      "cleanupModel": "generators/cleanup",
+      "language": "en-US",
+      "instructions": "",
+      "dictionary": [],
+      "appIDs": [],
+      "livePreview": false
+    },
+    {
+      "id": "email",
+      "name": "Email",
+      "style": "formal",
+      "context": "an email",
+      "model": "transcribers/apple-speech",
+      "cleanupModel": "generators/cleanup",
+      "language": "en-US",
+      "instructions": "",
+      "dictionary": [],
+      "appIDs": [
+        "com.apple.mail"
+      ],
+      "livePreview": false
+    },
+    {
+      "id": "verbatim",
+      "name": "Verbatim",
+      "style": "verbatim",
+      "context": "",
+      "model": "transcribers/apple-speech",
+      "cleanupModel": "",
+      "language": "en-US",
+      "instructions": "",
+      "dictionary": [],
+      "appIDs": [],
+      "livePreview": false
+    }
+  ]
+}

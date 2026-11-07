@@ -1617,3 +1617,9 @@ test "generator config clone releases every owned field on allocation failure" {
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
 }
+
+pub const dictation = @import("dictation.zig");
+
+test {
+    _ = dictation;
+}

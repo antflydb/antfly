@@ -2388,3 +2388,5 @@ test "generating backend Cloudflare configuration owns routing through parse clo
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
+
+pub const dictation = lib.dictation;

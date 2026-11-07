@@ -805,6 +805,53 @@ export class InferenceClient {
     return data;
   }
 
+  /** Dictate a recorded clip using a runtime model or named transcriber. */
+  async dictate(
+    request: Omit<components["schemas"]["InferenceDictateRequest"], "stream">,
+    options?: RequestOptions
+  ): Promise<components["schemas"]["InferenceDictateResponse"]> {
+    const { data, error, response } = await this.client.POST("/ai/v1/dictate", {
+      body: { ...request, stream: false },
+      signal: options?.signal,
+    });
+    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!data) throw new Error("Dictation returned an empty response");
+    return data;
+  }
+
+  /** Stream raw transcription followed by cleanup; rejects incomplete streams. */
+  async *dictateStream(
+    request: Omit<components["schemas"]["InferenceDictateRequest"], "stream">,
+    options?: RequestOptions
+  ): AsyncGenerator<components["schemas"]["InferenceDictationEvent"], void, void> {
+    const response = await fetch(`${this.baseUrl}/ai/v1/dictate`, {
+      method: "POST",
+      headers: { ...this.headers, Accept: "text/event-stream" },
+      body: JSON.stringify({ ...request, stream: true }),
+      signal: options?.signal,
+    });
+    if (!response.ok) throw await inferenceAPIErrorResponse(response);
+    if (!response.headers.get("content-type")?.toLowerCase().startsWith("text/event-stream")) {
+      await response.body?.cancel();
+      throw new Error("Dictation did not return an event stream");
+    }
+    if (!response.body) throw new Error("Dictation returned an empty stream");
+    let completed = false;
+    for await (const frame of parseSSEFrames(response.body)) {
+      if (frame.data.trim() === "[DONE]") {
+        if (!completed) throw new Error("Dictation stream ended before completion");
+        return;
+      }
+      const event = JSON.parse(frame.data) as components["schemas"]["InferenceDictationEvent"];
+      if (frame.event === "error" || event.type === "error") {
+        throw new Error(event.message ?? event.error ?? "Dictation failed");
+      }
+      if (event.type === "dictation.completed") completed = true;
+      yield event;
+    }
+    throw new Error("Dictation stream closed without [DONE]");
+  }
+
   /** Read source audio with backend-specific recognition options. */
   async readAudio(
     audio: string,

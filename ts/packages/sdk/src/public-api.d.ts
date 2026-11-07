@@ -5421,6 +5421,20 @@ export interface paths {
          *     `dictionary` are applied. Clips longer than the 30 s Whisper window
          *     are transcribed in windows cut at the quietest pause near the boundary.
          *
+         *     Database nodes also accept named transcribers such as
+         *     `transcribers/apple-speech`. Apple uses the server's native SpeechAnalyzer
+         *     for recorded clips and requires an Apple-provider build, macOS 26+, and
+         *     installed locale assets. Select a named cleanup generator with its bare
+         *     name or `generators/name`; this shares cleanup with named Whisper
+         *     transcribers. The standalone runtime continues to accept local Whisper
+         *     and generator model names.
+         *
+         *     Named non-Whisper providers apply `dictionary` during cleanup; they reject
+         *     Whisper-only `transcript_prompt`, `vad`, and `audio_context` options.
+         *     Apple does not support live transcription sessions. For provider-backed
+         *     cleanup, a delta may contain the entire cleaned result; the raw transcript
+         *     is delivered before cleanup starts. Missing token usage remains absent.
+         *
          *     Set `cleanup_model` to the generator that rewrites the transcript.
          *     Without it, or with `style: verbatim`, the response carries the raw
          *     transcript and no generation runs.

@@ -1,0 +1,30 @@
+name: Dictation example
+
+on:
+  pull_request:
+    paths:
+      - 'examples/dictation/**'
+      - '.github/workflows/dictation-example.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'examples/dictation/**'
+      - '.github/workflows/dictation-example.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dictation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test configuration, streaming, and persistence clients
+        run: examples/dictation/test.sh
+      - name: Build signed application bundle
+        run: examples/dictation/build-app.sh

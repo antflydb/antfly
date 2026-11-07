@@ -67,6 +67,8 @@ pub fn isPredictorDiscoveryPath(path: []const u8) bool {
 // headers and of whether its response goes to a socket or a batch envelope.
 const ExecutionOptions = struct {
     response_delivery: enum { direct, buffered } = .direct,
+    // A composite dictation holds one admission lease across recognition and cleanup.
+    admission_held: bool = false,
     attempt_limit: u8 = 8,
     operation: ?[]const u8 = null,
     attachments: ?[]const httpx.attachment_envelope.Attachment = null,
@@ -593,7 +595,11 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
     }
     if (task == .transcribe) {
         const cfg = try named.transcribers.?.getConfig(target.configured.name);
-        if (cfg.provider == .antfly) {
+        const cleanup_name = configuredCleanupName(request);
+        // Raw runtime cleanup models retain their existing forwarding path.
+        // Named cleanup generators use the same orchestration as Apple, so
+        // Whisper can also clean up through Apple or a hosted generator.
+        if (cfg.provider == .antfly and (cleanup_name == null or !named.contains(.generate, cleanup_name.?))) {
             const operation = execution_options.operation orelse "dictate";
             const encoded = try tasks.transcriptionBody(a, cfg, request);
             return forward(server, ctx, try std.fmt.allocPrint(a, "transcribers/{s}", .{target.configured.name}), operation, encoded, false, observation, execution_options);
@@ -849,24 +855,97 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             return ctx.json(.{ .object = "list", .model = model, .data = data });
         },
         .transcribe => {
-            try only(request, &.{ "model", "audio", "language", "diarization", "url", "timestamps" });
-            const audio_url = if (request.object.get("url")) |value| try string(value) else try std.fmt.allocPrint(a, "data:audio/wav;base64,{s}", .{try string(request.object.get("audio") orelse return error.InvalidInferenceRequest)});
-            const result = executor.transcribe(a, name, .{
-                .url = audio_url,
-                .language = if (request.object.get("language")) |value| try string(value) else null,
-                .diarization = if (request.object.get("diarization")) |value| if (value == .bool) value.bool else return error.InvalidInferenceRequest else null,
-                .timestamps = if (request.object.get("timestamps")) |value| if (value == .bool) value.bool else return error.InvalidInferenceRequest else null,
-            }) catch |err| return switch (err) {
-                error.UnsupportedTranscriptionOptions => error.UnsupportedInferenceFeature,
-                else => err,
+            const Api = @import("inference_api");
+            const body = std.json.parseFromValue(Api.DictateRequest, a, request, .{}) catch |err| return payloads.requestParseError(err);
+            const value = body.value;
+            const cleanup = generating.dictation;
+            const options = cleanup.Options{
+                .style = if (value.style) |style| cleanup.Style.parse(@tagName(style)).? else .clean,
+                .dictionary = value.dictionary orelse &.{},
+                .context = value.context,
+                .instructions = value.instructions,
+                .language = value.language,
             };
-            return ctx.json(.{
+            cleanup.validate(options) catch return error.InvalidInferenceRequest;
+            if (value.max_tokens) |tokens| if (tokens < 1 or tokens > 8192) return error.InvalidInferenceRequest;
+            // These are Whisper decoding options, not portable provider hints.
+            const transcription_cfg = try named.transcribers.?.getConfig(name);
+            if (transcription_cfg.provider != .antfly and (value.transcript_prompt != null or value.vad != null or value.audio_context != null)) return error.UnsupportedInferenceFeature;
+            const cleanup_name = configuredCleanupName(request) orelse "";
+            const run_cleanup = cleanup_name.len > 0 and cleanup.needsCleanup(options);
+            if (run_cleanup) _ = try executor.generatorConfig(a, cleanup_name);
+            const transcript = if (transcription_cfg.provider == .antfly) blk: {
+                const recognized = try nativeDictationTranscript(server, ctx, a, request, named, name, observation, execution_options);
+                switch (recognized) {
+                    .transcript => |value_| break :blk value_,
+                    .failure => |upstream| {
+                        var response = upstream;
+                        defer response.deinit();
+                        _ = ctx.status(response.status.code);
+                        if (response.header("retry-after")) |retry| try ctx.setHeader("retry-after", retry);
+                        try ctx.setHeader("content-type", response.contentType() orelse "application/json");
+                        _ = ctx.response.body(response.body orelse "");
+                        return ctx.response.build();
+                    },
+                }
+            } else blk: {
+                var result = try executor.transcribe(a, name, .{
+                    .url = try std.fmt.allocPrint(a, "data:audio/wav;base64,{s}", .{value.audio}),
+                    .language = value.language,
+                    .timestamps = value.timestamps,
+                });
+                defer @import("antfly_transcribing").deinitResponse(a, &result);
+                const encoded = try std.json.Stringify.valueAlloc(a, .{ .text = result.text orelse "", .language = result.language, .duration_ms = result.duration_ms, .segments = result.segments }, .{ .emit_null_optional_fields = false });
+                break :blk try std.json.parseFromSliceLeaky(Json, a, encoded, .{ .allocate = .alloc_always });
+            };
+            const raw = try string(transcript.object.get("text") orelse return error.InvalidInferenceResponse);
+            const id = try std.fmt.allocPrint(a, "dictation-{d}", .{@import("antfly_platform").time.monotonicNs()});
+            var writer: ?httpx.StreamWriter = null;
+            if (value.stream orelse false) {
+                try ctx.setHeader("content-type", "text/event-stream");
+                try ctx.setHeader("cache-control", "no-cache");
+                writer = try ctx.streamResponse(200);
+                try dictationEvent(a, &writer.?, .{ .type = "dictation.transcript", .id = id, .model = model, .transcript = transcript });
+            }
+            defer if (writer) |*stream| stream.close() catch {};
+            var text = raw;
+            var usage: @FieldType(generating.GenerateResult, "usage") = null;
+            if (run_cleanup and std.mem.trim(u8, raw, " \t\r\n").len > 0) {
+                const messages = [_]generating.ChatMessage{
+                    .{ .role = .system, .content = .{ .text = try cleanup.buildSystemPrompt(a, options) } },
+                    .{ .role = .user, .content = .{ .text = try cleanup.buildUserPrompt(a, raw) } },
+                };
+                var generated = executor.generate(a, cleanup_name, &messages, .{ .max_tokens = value.max_tokens orelse cleanup.suggestedMaxTokens(raw.len) }) catch |err| {
+                    if (writer) |*stream| {
+                        try dictationEvent(a, stream, .{ .type = "error", .id = id, .@"error" = @errorName(err), .message = "Dictation cleanup failed; raw transcript is available." });
+                        try stream.writeEvent(null, "[DONE]");
+                        return ctx.response.build();
+                    }
+                    return err;
+                };
+                defer generated.deinit();
+                text = try cleanup.normalizeOutput(a, generated.content);
+                usage = generated.usage;
+            }
+            try executor.context.check();
+            const api_usage = if (usage) |u| .{ .prompt_tokens = u.input_tokens, .completion_tokens = u.output_tokens, .total_tokens = u.total_tokens orelse u.input_tokens +| u.output_tokens } else null;
+            if (writer) |*stream| {
+                // Provider generation can be buffered; a delta may contain the
+                // entire result. The transcript is delivered before cleanup.
+                try dictationEvent(a, stream, .{ .type = "dictation.delta", .id = id, .delta = text });
+                try dictationEvent(a, stream, .{ .type = "dictation.completed", .id = id, .model = model, .text = text, .usage = api_usage });
+                try stream.writeEvent(null, "[DONE]");
+                return ctx.response.build();
+            }
+            return ctx.openApiJson(.{
                 .object = "dictation",
-                .id = try std.fmt.allocPrint(a, "dictation-{d}", .{@import("antfly_platform").time.monotonicNs()}),
+                .id = id,
                 .created = @divTrunc(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s),
                 .model = model,
-                .text = result.text orelse "",
-                .transcript = .{ .text = result.text orelse "", .language = result.language, .duration_ms = result.duration_ms, .segments = result.segments },
+                .cleanup_model = if (run_cleanup) cleanup_name else null,
+                .text = text,
+                .transcript = transcript,
+                .usage = api_usage,
             });
         },
         .rewrite => {
@@ -1035,7 +1114,7 @@ fn executeVendorConnection(server: anytype, ctx: *httpx.Context, task: gateway.T
     defer config.deinit();
     const capability_key = try std.fmt.allocPrint(a, "{s}/{s}", .{ task.namespace(), name });
     try config.registry.inference_capabilities.put(a, capability_key, original.capabilities(target));
-    const named = gateway.View{ .providers = &config.registry, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
+    const named = gateway.View{ .providers = if (task == .transcribe) original.providers else &config.registry, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
     return executeResolvedImpl(server, ctx, task, a, request, named, .{ .configured = .{ .task = task, .name = name } }, null, fallback, observation, execution_options);
 }
 
@@ -1507,7 +1586,26 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
     }
     for (try named.catalog(a)) |target| {
         const id = try target.idAlloc(a);
-        const item = try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, try named.describe(a, target), .{}), .{});
+        var item = try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, try named.describe(a, target), .{}), .{});
+        if (target.configured.task == .transcribe) {
+            const cfg = try named.transcribers.?.getConfig(target.configured.name);
+            var facts = try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, .{
+                .recorded_clips = true,
+                .cleanup = true,
+                .live_preview = cfg.provider == .antfly,
+                .recognition_hints = cfg.provider == .antfly,
+                .executor = @tagName(cfg.provider),
+            }, .{}), .{});
+            if (cfg.provider == .apple) {
+                const native = @import("antfly_transcribing").apple_native;
+                const availability: ?[]u8 = native.invoke(a, .availability, "{}", "", 64 << 10, .{ .timeout_ms = 2000 }) catch |err| blk: {
+                    try facts.object.put(a, "readiness_error", .{ .string = @errorName(err) });
+                    break :blk null;
+                };
+                if (availability) |bytes| try facts.object.put(a, "native_status", try std.json.parseFromSliceLeaky(Json, a, bytes, .{}));
+            }
+            try item.object.put(a, "dictation", facts);
+        }
         try putCatalogItem(a, &seen, &data, item);
         const category = if (target.configured.chain) "chains" else target.configured.task.namespace();
         var group = root.object.get(category) orelse Json{ .object = .empty };
@@ -1662,8 +1760,9 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
     const connections = @import("connections.zig");
     observation.connection = connection;
     const owner = try server.inferenceConnectionAdmissionOwner(connection, operation);
-    if (owner == .caller and !server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
-    defer if (owner == .caller) server.releaseInference();
+    const acquire_admission = owner == .caller and !options.admission_held;
+    if (acquire_admission and !server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
+    defer if (acquire_admission) server.releaseInference();
     const cancellation = httpx.CancellationToken.fromCallback(ctx, struct {
         fn cancelled(raw: *const anyopaque) bool {
             const context: *const httpx.Context = @ptrCast(@alignCast(raw));
@@ -2163,4 +2262,54 @@ test "httpx inference gateway exposes one read operation and no one-shot transcr
     try std.testing.expect(ownsPath("/ai/v1/read"));
     try std.testing.expect(ownsPath("/ai/v1/dictate"));
     try std.testing.expect(ownsPath("/ai/v1/transcription/sessions"));
+}
+
+fn dictationEvent(a: std.mem.Allocator, writer: *httpx.StreamWriter, event: anytype) !void {
+    const encoded = try std.json.Stringify.valueAlloc(a, event, .{ .emit_null_optional_fields = false });
+    defer a.free(encoded);
+    try writer.writeEvent(null, encoded);
+}
+
+fn configuredCleanupName(request: Json) ?[]const u8 {
+    const value = request.object.get("cleanup_model") orelse return null;
+    if (value != .string) return null;
+    const name = std.mem.trim(u8, value.string, " \t\r\n");
+    return if (std.mem.startsWith(u8, name, "generators/")) name["generators/".len..] else name;
+}
+
+/// Buffer only the recognition stage. The nested request shares cancellation,
+/// deadline, credential resolution and attempt accounting with the outer call.
+const NativeDictationResult = union(enum) { transcript: Json, failure: httpx.Response };
+fn nativeDictationTranscript(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, request: Json, named: gateway.View, name: []const u8, observation: *tasks.Observation, options: ExecutionOptions) !NativeDictationResult {
+    var raw = request;
+    raw.object = try request.object.clone(a);
+    _ = raw.object.swapRemove("cleanup_model");
+    try raw.object.put(a, "stream", .{ .bool = false });
+    const cfg = try named.transcribers.?.getConfig(name);
+    const encoded = try tasks.transcriptionBody(a, cfg, raw);
+    var nested_request = try httpx.Request.init(a, .POST, "http://gateway/ai/v1/dictate");
+    defer nested_request.deinit();
+    var nested = httpx.Context.init(ctx.allocator, ctx.io, &nested_request);
+    defer nested.deinit();
+    nested.application_deadline_ns = ctx.application_deadline_ns;
+    if (invocationState(ctx)) |state| try nested.setData(invocation_state_key, state, null);
+    nested.cancellation_probe = .{ .ptr = ctx, .is_cancelled = struct {
+        fn cancelled(ptr: ?*const anyopaque) bool {
+            const outer: *const httpx.Context = @ptrCast(@alignCast(ptr.?));
+            return outer.isCancellationRequested();
+        }
+    }.cancelled };
+    var buffered = options;
+    buffered.response_delivery = .buffered;
+    buffered.admission_held = true;
+    // Attachments were inlined before reaching provider execution.
+    buffered.attachments = null;
+    var response = try forward(server, &nested, try std.fmt.allocPrint(a, "transcribers/{s}", .{name}), "dictate", encoded, false, observation, buffered);
+    if (response.status.code < 200 or response.status.code >= 300) return .{ .failure = response };
+    defer response.deinit();
+    const value = try std.json.parseFromSliceLeaky(Json, a, response.body orelse return error.InvalidInferenceResponse, .{ .allocate = .alloc_always });
+    if (value != .object) return error.InvalidInferenceResponse;
+    const transcript = value.object.get("transcript") orelse return error.InvalidInferenceResponse;
+    if (transcript != .object) return error.InvalidInferenceResponse;
+    return .{ .transcript = transcript };
 }
