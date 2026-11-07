@@ -2130,7 +2130,7 @@ pub const Store = struct {
     fn startMaintenanceAssumeLocked(self: *Store) void {
         if (self.read_only or self.maintenance_start_suppressed or self.maintenance_cancel.requested.load(.acquire) or
             self.maintenance_future != null) return;
-        const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
+        const retirement = self.file.recovery_tail_pending or (self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false);
         if (!retirement and (!self.maintenance_policy.options.enabled or self.file.activeCheckpoint().page_count *| self.file.header.page_size < self.maintenance_policy.options.minimum_reclaim_bytes)) return;
         self.maintenance_future = self.file.runtime().concurrent(maintenanceLoop, .{self}) catch |err| {
             self.maintenance_policy.status.state = .deferred;
@@ -2215,7 +2215,7 @@ pub const Store = struct {
         defer self.mutex.unlock();
         try self.maintenance_cancel.check();
         if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return false;
-        return self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel);
+        return self.file.recovery_tail_pending or try self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel);
     }
 
     /// One owner-controlled assessment/cycle. Public for cooperative runtimes
@@ -2338,6 +2338,7 @@ pub const Store = struct {
             self.file.allocator_cancel_token = cancel;
             defer self.file.allocator_cancel_token = previous_cancel;
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+            const tail_blocked = self.file.recovery_tail_pending and !try self.file.recoverUncommittedTail();
             try self.releaseDeferredArtifactLeases();
             _ = try artifact_source.cleanupOrphans(&self.file, &self.artifact_cleanup_cursor);
             try self.artifact_marker_sweep.run(&self.file);
@@ -2350,6 +2351,13 @@ pub const Store = struct {
                 self.maintenance_policy.retirement_batch.serviced();
                 self.maintenance_policy.status.state = if (self.maintenance_policy.options.enabled) .idle else .disabled;
                 self.maintenance_policy.status.reason = if (self.maintenance_policy.options.enabled) .none else .disabled;
+                self.maintenance_policy.status.last_error = null;
+            }
+            if (tail_blocked) {
+                // A live reader can retain a private or newer recovery prefix.
+                // Keep timed debt instead of spinning or truncating its pages.
+                self.maintenance_policy.status.state = .deferred;
+                self.maintenance_policy.status.reason = .retained_readers;
                 self.maintenance_policy.status.last_error = null;
             }
             if (cooperative and self.maintenance_policy.options.enabled and !self.defer_background_vacuum) {
@@ -3643,6 +3651,7 @@ pub const Txn = struct {
 
         lockStore(store);
         defer store.mutex.unlock();
+        if (store.file.recovery_tail_pending and !try store.file.recoverUncommittedTail()) return error.FileBusy;
 
         const checkpoint = store.file.activeCheckpoint();
         const pin = if (store.file.header.indexed_reclamation) try store.readMetadataAllocator().create(ReadPin) else null;
@@ -3672,6 +3681,7 @@ pub const Txn = struct {
 
         lockStore(store);
         defer store.mutex.unlock();
+        if (store.file.recovery_tail_pending and !try store.file.recoverUncommittedTail()) return error.FileBusy;
 
         const checkpoint = store.file.activeCheckpoint();
         const pin = if (store.file.header.indexed_reclamation) try store.readMetadataAllocator().create(ReadPin) else null;

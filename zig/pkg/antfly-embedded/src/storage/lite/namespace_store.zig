@@ -251,6 +251,16 @@ const Txn = struct {
         owner.generation_lock.lockSharedUncancelable(io);
         defer owner.generation_lock.unlockShared(io);
         owner.mutex.lock();
+        if (writable and owner.file.recovery_tail_pending) {
+            const recovered = owner.file.recoverUncommittedTail() catch |err| {
+                owner.mutex.unlock();
+                return err;
+            };
+            if (!recovered) {
+                owner.mutex.unlock();
+                return error.FileBusy;
+            }
+        }
         var snapshot = owner.file.captureLogicalReadSnapshot() catch |err| {
             owner.mutex.unlock();
             return err;

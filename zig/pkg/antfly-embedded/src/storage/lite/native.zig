@@ -5083,6 +5083,9 @@ pub const NativeFile = struct {
     // An error after slot publication may leave disk ahead of header. Do not
     // elide a subsequent write based on the old in-memory checkpoint then.
     checkpoint_publication_uncertain: bool = false,
+    /// Bytes beyond every recovered root are cleanup debt, never authority
+    /// to retry an uncertain request. Only a fresh checked writer may trim.
+    recovery_tail_pending: bool = false,
     /// Owner admission budget. Reuse remains permitted at the file-size cap.
     /// Null means unlimited; the owner subtracts retired/workspace capacity.
     max_file_bytes: ?u64 = null,
@@ -5219,7 +5222,18 @@ pub const NativeFile = struct {
             .no_sync = opts.no_sync,
             .page_cache_enabled = .init(true),
         };
+        errdefer {
+            result.page_cache.deinit(allocator);
+            result.invalidateLedger();
+        }
         if (header.indexed_reclamation and header.indexed_revision >= 15) try result.selectProvenCheckpoint(&header_bytes, file_size);
+        if (!opts.read_only) {
+            result.recovery_tail_pending = file_size > try checkpointPrefixSize(result.activeCheckpoint(), result.header.page_size);
+            // An externally admitted raw wrapper may be opened inside another
+            // wrapper's active transaction. Its parent owns reconciliation;
+            // opening an adapter must never truncate that parent's staging.
+            if (result.recovery_tail_pending and !opts.externally_locked) _ = try result.recoverUncommittedTail();
+        }
         if (opts.read_only and !opts.internal_reader and !opts.externally_locked) {
             if (opts.reader_coordinator) |coordinator| result.reader_fence = if (header.indexed_reclamation)
                 try coordinator.registerEpoch(file, path, header.reader_epoch_namespace, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint(), true)
@@ -5436,6 +5450,48 @@ pub const NativeFile = struct {
 
     pub fn activeCheckpoint(self: *const NativeFile) CheckpointSlot {
         return self.header.checkpoints[self.header.active_checkpoint];
+    }
+
+    /// Reconciliation runs under ordinary path-writer ownership. An unknown
+    /// publisher must preserve both possible outcomes until a fresh open has
+    /// authenticated the checkpoint. Readers also retain any private deferred
+    /// roots: the inode fence and an empty epoch scan are both required.
+    pub fn recoverUncommittedTail(self: *NativeFile) !bool {
+        if (self.read_only or self.transaction_header != null or self.durable_header != null or self.checkpoint_publication_uncertain) return error.OutcomeReconciliationRequired;
+        if (self.reader_window_depth != 0) return error.InvalidTransactionState;
+        if (!self.recovery_tail_pending) return true;
+        const io = self.runtime();
+        // Lock the actual descriptor being truncated. A replacement pathname
+        // (including another filesystem with a coincident inode number) must
+        // never supply this file's reader exclusion.
+        if (!try self.file.tryLock(io, .exclusive)) return false;
+        defer self.file.unlock(io);
+        const opened = try self.file.stat(io);
+        const expected = try checkpointPrefixSize(self.activeCheckpoint(), self.header.page_size);
+        if (opened.size <= expected) {
+            self.recovery_tail_pending = false;
+            return true;
+        }
+        // Retain even a complete slot whose postimage proof was refused.
+        // Recovery must not discard another checked root's physical prefix.
+        var raw: [header_size]u8 = undefined;
+        try readHeaderExactAt(self.file, io, &raw);
+        const disk = try decodeHeader(&raw);
+        if (disk.page_size != self.header.page_size or !std.mem.eql(u8, &disk.reader_epoch_namespace, &self.header.reader_epoch_namespace)) return false;
+        for (disk.checkpoints) |slot| {
+            if (!validCheckpointSlot(slot)) continue;
+            const prefix = try checkpointPrefixSize(slot, disk.page_size);
+            if (prefix <= opened.size and prefix > expected) return false;
+        }
+        if (self.header.indexed_reclamation) {
+            const readers = @import("reader_epochs.zig").scan(self.allocator, io, self.path, self.header.reader_epoch_namespace, opened.inode) catch return false;
+            if (readers.data != null or readers.metadata != null) return false;
+        }
+        try self.file.setLength(io, expected);
+        try self.syncIfRequired();
+        self.page_cache.discardFrom(self.allocator, self.activeCheckpoint().page_count);
+        self.recovery_tail_pending = false;
+        return true;
     }
 
     /// Rebind a borrowed index writer after its owner has verified the inode,
@@ -6896,9 +6952,14 @@ pub const NativeFile = struct {
         const loan = try self.enterWriterAllocator();
         defer self.leaveWriterAllocator(loan);
         const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), self.allocator_cancel_token);
+        const capacity_pressure = if (self.max_file_bytes) |limit| blk: {
+            const available = (limit / self.header.page_size -| self.activeCheckpoint().page_count) +| state.free_pages;
+            const reserve = allocator_v4.retirementReservePages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count());
+            break :blk available <= 2 *| reserve;
+        } else false;
         return .{
             .objects = state.pending.count(),
-            .pressure = state.pending.count() >= state.pending_limit / 2 or state.checkpointDue() or self.budgetedCheckpointDue(state),
+            .pressure = capacity_pressure or state.pending.count() >= state.pending_limit / 2 or state.checkpointDue() or self.budgetedCheckpointDue(state),
         };
     }
 
@@ -11939,6 +12000,7 @@ pub const NativeFile = struct {
     }
 
     fn pageAllocatorFromFreeMapWithProof(self: *NativeFile, checkpoint: CheckpointSlot, require_reuse_proof: bool) !PageAllocator {
+        if (self.recovery_tail_pending and !try self.recoverUncommittedTail()) return error.FileBusy;
         const loan = try self.enterWriterAllocator();
         errdefer self.leaveWriterAllocator(loan);
         // Read leases and their retirement must not force a whole-file proof.
@@ -12732,6 +12794,7 @@ pub const NativeFile = struct {
         if (self.read_only) return error.ReadOnly;
         if (self.transaction_header != null) return error.TransactionAlreadyActive;
         if (self.checkpoint_publication_uncertain) return error.OutcomeReconciliationRequired;
+        if (self.recovery_tail_pending and !try self.recoverUncommittedTail()) return error.FileBusy;
         const prove = self.header.indexed_reclamation and self.header.indexed_revision >= 15 and
             !self.no_sync and !self.maintenance_publication and self.durable_header == null and
             !(builtin.is_test and self.test_force_two_barrier_commit);
@@ -23952,4 +24015,141 @@ test "lite commit proof missing witness settles parent and overflow uses safe ba
     try std.testing.expectEqual(@as(u64, 0), file.activeCheckpoint().proof.root);
     try std.testing.expectEqualDeep(file.header.checkpoints[0], file.header.checkpoints[1]);
     try std.testing.expect((try file.check()).valid);
+}
+
+test "lite recovery tail read only inspection preserves bytes and fresh writer reclaims an abandoned decision" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "abandoned-decision-tail.aflite");
+    defer a.free(path);
+    var length: u64 = 0;
+    {
+        var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true });
+        defer writer.close();
+        try writer.putDocument("acknowledged", "durable");
+        try writer.beginTransaction();
+        try writer.putDocument("unresolved", "private");
+        writer.test_fail_checkpoint_publication = error.InputOutput;
+        try std.testing.expectError(error.OutcomeUnknown, writer.commitTransaction());
+        try std.testing.expect(writer.checkpoint_publication_uncertain);
+        try std.testing.expectError(error.OutcomeReconciliationRequired, writer.recoverUncommittedTail());
+        length = (try writer.file.stat(io)).size;
+    }
+    {
+        var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+        defer reader.close();
+        try std.testing.expectEqual(length, (try reader.file.stat(io)).size);
+        const report = try reader.check();
+        try std.testing.expect(!report.valid);
+        try std.testing.expectEqualStrings("tail_bytes", report.issue.?);
+    }
+    var recovered = try NativeFile.openWithIo(a, io, path, .{});
+    defer recovered.close();
+    try std.testing.expect(!recovered.recovery_tail_pending);
+    try std.testing.expect((try recovered.file.stat(io)).size < length);
+    try std.testing.expect((try recovered.check()).valid);
+    const kept = (try recovered.getDocumentAlloc(a, "acknowledged")).?;
+    defer a.free(kept);
+    try std.testing.expectEqualStrings("durable", kept);
+    try std.testing.expect((try recovered.getDocumentAlloc(a, "unresolved")) == null);
+}
+
+test "lite recovery tail never truncates a nested writer adapters unpublished parent" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "nested-private-tail.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    try writer.beginTransaction();
+    errdefer writer.abortTransaction();
+    try writer.putDocument("private", "parent owns this staging");
+    _ = try writer.materializeTransactionCheckpoint();
+    const length = (try writer.file.stat(io)).size;
+    {
+        var adapter = try NativeFile.openWithIo(a, io, path, .{ .externally_locked = true, .no_sync = true });
+        defer adapter.close();
+        try std.testing.expect(adapter.recovery_tail_pending);
+        try std.testing.expectEqual(length, (try adapter.file.stat(io)).size);
+    }
+    try writer.commitTransaction();
+    const value = (try writer.getDocumentAlloc(a, "private")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("parent owns this staging", value);
+    try std.testing.expect((try writer.check()).valid);
+}
+
+test "lite recovery tail retains a deferred snapshot after its writer closes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "deferred-reader-tail.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true });
+    var writer_live = true;
+    defer if (writer_live) writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("private", "reader owns these unpublished pages");
+    try writer.commitTransactionWithDurability(false);
+    try std.testing.expect(writer.durable_header != null);
+    var snapshot = try writer.captureFullReadSnapshot();
+    var snapshot_live = true;
+    defer if (snapshot_live) snapshot.close();
+    writer.close();
+    writer_live = false;
+    var recovered = try NativeFile.openWithIo(a, io, path, .{});
+    defer recovered.close();
+    try std.testing.expect(recovered.recovery_tail_pending);
+    const length = (try recovered.file.stat(io)).size;
+    try std.testing.expectError(error.FileBusy, recovered.putDocument("next", "must wait for the private reader"));
+    try std.testing.expectEqual(length, (try recovered.file.stat(io)).size);
+    const retained = (try snapshot.getDocumentAlloc(a, "private")).?;
+    defer a.free(retained);
+    try std.testing.expectEqualStrings("reader owns these unpublished pages", retained);
+    snapshot.close();
+    snapshot_live = false;
+    try recovered.putDocument("next", "safe after release");
+    try std.testing.expect(!recovered.recovery_tail_pending);
+    try std.testing.expect((try recovered.getDocumentAlloc(a, "private")) == null);
+    try std.testing.expect((try recovered.check()).valid);
+}
+
+test "lite recovery tail preserves a complete checkpoint despite an unknown slot write" {
+    const Fault = struct {
+        var offset: ?u64 = null;
+        fn write(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, position: u64) std.Io.File.WritePositionalError!usize {
+            const written = try std.testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, position);
+            if (offset == position) return error.Canceled;
+            return written;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "complete-unknown-tail.aflite");
+    defer a.free(path);
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileWritePositional = Fault.write;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    {
+        var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer writer.close();
+        try writer.putDocument("before", "acknowledged");
+        Fault.offset = checkpointOffset(1 - writer.header.active_checkpoint);
+        defer Fault.offset = null;
+        try writer.beginTransaction();
+        try writer.putDocument("possibly-applied", "must survive recovery");
+        try std.testing.expectError(error.OutcomeUnknown, writer.commitTransaction());
+    }
+    var recovered = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer recovered.close();
+    const value = (try recovered.getDocumentAlloc(a, "possibly-applied")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("must survive recovery", value);
+    try std.testing.expect((try recovered.check()).valid);
 }
