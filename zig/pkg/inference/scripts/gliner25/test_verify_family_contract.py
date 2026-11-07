@@ -463,6 +463,7 @@ class PortableDecideRuntimeTest(unittest.TestCase):
         external = root / "venv/lib/python3.12/site-packages"
         origins = {"torch": external / "torch/__init__.py", "pydantic": external / "pydantic/__init__.py",
                    "transformers": runtime / "transformers/__init__.py", "gliner2": upstream / "gliner2/__init__.py"}
+        origins.update({name: external / name / "__init__.py" for name in ("requests", "urllib3", "charset_normalizer")})
         def find(name):
             return mock.Mock(origin=str(origins[name]))
         with mock.patch.object(benchmark.importlib.util, "find_spec", side_effect=find), mock.patch.object(benchmark, "sys", mock.Mock(modules={})), mock.patch.object(benchmark, "verify_source", return_value={}):
@@ -509,6 +510,77 @@ class PortableDecideRuntimeTest(unittest.TestCase):
             recipe["archive"]["sha256"] = "0" * 64
             with self.assertRaisesRegex(benchmark.BenchmarkError, "archive identity"):
                 benchmark._portable_python(archive, recipe)
+
+    def source_dependency_fixture(self, root):
+        wheels, _, _, scope = self.fixture(root)
+        text = b'[project]\ndependencies=["portable>=1,<2"]\n'
+        project = wheels / "pyproject.toml"
+        project.write_bytes(text)
+        recipe = {"source_dependencies": {"revision": benchmark.strict_json(benchmark.CONTRACT)["upstream_python"]["revision"],
+                  "pyproject": {"filename": project.name, "bytes": len(text), "sha256": benchmark.sha256(project)},
+                  "base_requirements": ["portable>=1,<2"], "local_transformers_exception": {}},
+                  "wheels": {"isolated": scope}}
+        return project, recipe
+
+    def test_source_base_requirements_and_wheel_metadata_reach_authenticated_checker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project, recipe = self.source_dependency_fixture(root)
+            with mock.patch.object(benchmark, "_portable_dependency_check", return_value={"model_imports": False}) as child, mock.patch.object(benchmark.subprocess, "run") as process:
+                result = benchmark._portable_source_dependencies(root, recipe)
+                process.assert_not_called()
+            self.assertFalse(result["model_imports"])
+            payload = child.call_args.args[0]
+            self.assertEqual(["portable>=1,<2"], payload["base"])
+            self.assertEqual({"portable": "1.0"}, payload["versions"])
+            self.assertEqual(str(project), payload["pyproject"])
+            self.assertEqual(["portable-1.0-py3-none-any.whl"], [wheel["filename"] for wheel in payload["wheels"]])
+            project.write_bytes(project.read_bytes() + b"# tampered\n")
+            with mock.patch.object(benchmark.subprocess, "run") as child:
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "dependency artifact differs"):
+                    benchmark._portable_source_dependencies(root, recipe)
+                child.assert_not_called()
+
+    def test_source_dependency_refusal_propagates_without_runtime_or_golden_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, recipe = self.source_dependency_fixture(root)
+            with mock.patch.object(benchmark, "_portable_dependency_check", side_effect=benchmark.BenchmarkError("unsatisfied pinned GLiNER BASE requirement")):
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "unsatisfied"):
+                    benchmark._portable_source_dependencies(root, recipe)
+
+    def test_torch_virtual_namespaces_require_definition_type_and_registered_singleton(self):
+        import types
+        root = Path("authenticated/torch").resolve()
+        for name, definition_name, class_name, export, filename in [
+            ("torch.ops", "torch._ops", "_Ops", "ops", "_ops.py"),
+            ("torch.classes", "torch._classes", "_Classes", "classes", "_classes.py"),
+        ]:
+            definition = types.ModuleType(definition_name)
+            definition.__file__ = str(root / filename)
+            namespace_type = type(class_name, (types.ModuleType,), {"__module__": definition_name, "__file__": filename})
+            setattr(definition, class_name, namespace_type)
+            namespace = namespace_type(name)
+            setattr(definition, export, namespace)
+            package = types.ModuleType("torch")
+            setattr(package, export, namespace)
+            modules = {"torch": package, definition_name: definition, name: namespace}
+            with mock.patch.object(benchmark, "sys", mock.Mock(modules=modules)):
+                self.assertTrue(benchmark._portable_torch_virtual(name, namespace, root))
+                replacement = namespace_type(name)
+                modules[name] = replacement
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "registration differs"):
+                    benchmark._portable_torch_virtual(name, replacement, root)
+                foreign = types.ModuleType(name)
+                foreign.__file__ = str(root / filename)
+                modules[name] = foreign
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "registration differs"):
+                    benchmark._portable_torch_virtual(name, foreign, root)
+                modules[name] = namespace
+                definition.__file__ = str(root.parent / "foreign" / filename)
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "registration differs"):
+                    benchmark._portable_torch_virtual(name, namespace, root)
+                self.assertFalse(benchmark._portable_torch_virtual("torch.ops.arbitrary", namespace, root))
 
     def test_v2_dispatch_is_explicit_and_v1_default_unchanged(self):
         with mock.patch.object(benchmark, "verify_portable_runtime_dir", return_value={"v2": True}) as portable:

@@ -341,7 +341,7 @@ def prepare(model, artifacts, output, text_only=False):
     if not text_only:
         media = json.loads((artifacts / "media-oracle.json").read_text())
         for case in media["cases"]:
-            if case["name"] in ("image", "audio", "mixed"):
+            if case["name"] in ("image", "audio", "text_image", "image_text", "mixed"):
                 cases.append(
                     {
                         "name": case["name"],
@@ -435,13 +435,19 @@ def media_parts(suite, name):
             "data": base64.b64encode(raw).decode(),
         }
 
+    if name == "audio":
+        return [part("audio.wav", "audio/wav")]
+    if name not in ("image", "text_image", "image_text", "mixed"):
+        raise ValueError("unknown media case")
     image = part("image.png", "image/png")
-    audio = part("audio.wav", "audio/wav")
-    return {
-        "image": [image],
-        "audio": [audio],
-        "mixed": [{"type": "text", "text": "Describe these inputs."}, audio, image],
-    }[name]
+    if name == "image":
+        return [image]
+    text = {"type": "text", "text": "Describe this image."}
+    if name == "text_image":
+        return [text, image]
+    if name == "image_text":
+        return [image, text]
+    return [{"type": "text", "text": "Describe these inputs."}, part("audio.wav", "audio/wav"), image]
 
 
 def post(url, endpoint, body, timeout=600):
@@ -772,7 +778,7 @@ def execution_precision(backend, requested=None):
 def load_torch_media(model_dir, suite):
     """Load only the media dependencies actually required by selected cases."""
     names = {case["name"] for case in suite["cases"] if "text" not in case}
-    if not names.issubset({"image", "audio", "mixed"}):
+    if not names.issubset({"image", "audio", "text_image", "image_text", "mixed"}):
         raise ValueError("unknown media case")
     if not names:
         return None, None, None
@@ -781,7 +787,7 @@ def load_torch_media(model_dir, suite):
     processor = AutoProcessor.from_pretrained(model_dir, local_files_only=True)
     image = None
     waveform = None
-    if names.intersection({"image", "mixed"}):
+    if names.intersection({"image", "text_image", "image_text", "mixed"}):
         from PIL import Image
 
         image = Image.open(suite["assets"]["image.png"]["path"]).convert("RGB")
@@ -880,6 +886,15 @@ def torch_run(args, suite, result):
                 audio=[waveform],
                 sampling_rate=16000,
                 return_tensors="pt",
+            )
+        elif case["name"] in ("text_image", "image_text"):
+            text = (
+                "Describe this image.\n<|image|>"
+                if case["name"] == "text_image"
+                else "<|image|>\nDescribe this image."
+            )
+            encoded = processor(
+                text=["title: none | text: " + text], images=[[image]], return_tensors="pt"
             )
         else:
             encoded = processor(

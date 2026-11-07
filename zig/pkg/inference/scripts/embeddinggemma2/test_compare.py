@@ -22,6 +22,8 @@ from unittest import mock
 import copy
 import unittest
 import json
+import base64
+import hashlib
 import tempfile
 import types
 
@@ -103,11 +105,35 @@ class ComparisonContracts(unittest.TestCase):
             if name in ("wave", "numpy"):
                 raise AssertionError("unselected audio dependency")
             return original_import(name, *args, **kwargs)
-        suite = {"cases": [{"name": "image"}], "assets": {"image.png": {"path": "image-path"}}}
-        with mock.patch.dict(sys.modules, {"PIL": types.SimpleNamespace(Image=image), "transformers": types.SimpleNamespace(AutoProcessor=processor)}), mock.patch("builtins.__import__", side_effect=import_guard):
-            self.assertEqual(compare.load_torch_media(Path("model"), suite), ("actual-processor", "actual-image", None))
-        image.open.assert_called_once_with("image-path")
-        processor.from_pretrained.assert_called_once_with(Path("model"), local_files_only=True)
+        for name in ("image", "text_image", "image_text"):
+            with self.subTest(name=name):
+                image.reset_mock()
+                processor.reset_mock()
+                suite = {"cases": [{"name": name}], "assets": {"image.png": {"path": "image-path"}}}
+                with mock.patch.dict(sys.modules, {"PIL": types.SimpleNamespace(Image=image), "transformers": types.SimpleNamespace(AutoProcessor=processor)}), mock.patch("builtins.__import__", side_effect=import_guard):
+                    self.assertEqual(compare.load_torch_media(Path("model"), suite), ("actual-processor", "actual-image", None))
+                image.open.assert_called_once_with("image-path")
+                processor.from_pretrained.assert_called_once_with(Path("model"), local_files_only=True)
+
+    def test_image_content_order_and_integrity_need_no_unselected_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "image.png"
+            payload = b"exact transported image bytes"
+            image.write_bytes(payload)
+            suite = {"assets": {"image.png": {"path": str(image), "sha256": hashlib.sha256(payload).hexdigest()}}}
+            for name, order in (("image", ["media"]), ("text_image", ["text", "media"]), ("image_text", ["media", "text"])):
+                with self.subTest(name=name):
+                    parts = compare.media_parts(suite, name)
+                    self.assertEqual([part["type"] for part in parts], order)
+                    media = next(part for part in parts if part["type"] == "media")
+                    self.assertEqual(base64.b64decode(media["data"]), payload)
+                    self.assertEqual(media["mime_type"], "image/png")
+                    if name != "image":
+                        self.assertEqual(next(part for part in parts if part["type"] == "text")["text"], "Describe this image.")
+            image.write_bytes(b"changed")
+            for name in ("image", "text_image", "image_text"):
+                with self.subTest(changed=name), self.assertRaisesRegex(ValueError, "media asset changed"):
+                    compare.media_parts(suite, name)
 
     def test_selected_media_still_fails_without_requested_asset(self):
         processor = mock.Mock()

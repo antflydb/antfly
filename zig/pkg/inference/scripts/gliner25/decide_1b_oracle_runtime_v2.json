@@ -72,7 +72,7 @@
   },
   "portable_runtime": {
     "schema": "authenticated-wheel-recipes-v2",
-    "identity": "decide1b-cpython3123-macos-arm64-official-wheels-v2",
+    "identity": "decide1b-cpython3123-macos-arm64-source-complete-v2",
     "historical_byte_identity": false,
     "qualification": "pending_frozen_capture_and_holdout_validation",
     "interpreter": {
@@ -88,13 +88,13 @@
       }
     },
     "driver_sources": {
-      "benchmark_family_python.py": "214b2f9ed386774c220743138d1d69138548762839db60dd3483e578fb67eeb6",
+      "benchmark_family_python.py": "8939f7c5f6dec25c06b36da09c364e6d68e3b95f561880a91d61e6b64c6f1718",
       "verify_family_contract.py": "eae6b30fadba39c5ed59bb4d28abbc0462a3c151e8ef793440125208df8360cb",
       "family_contract.json": "0beb19e072fd46f0318bd7a1e2c0ac3b8ad1deaf47bdc0cf1ce7ca1e9c6364c5",
       "decide_1b_oracle_runtime.json": "3cefce06c367cd09d1754f467e83173e37550506ff94c1112bb038e1600478bc"
     },
     "provenance": {
-      "raw_wheel_metadata": "Exact official38wheel URL/size/SHA recipes derive complete payload+metadata+mode facts directly; no private payload inventory artifact required.",
+      "raw_wheel_metadata": "Exact official41wheel URL/size/SHA recipes derive full raw payload/metadata/mode. Pinned upstream BASErequirements and all active wheel Requires-Dist/Python/ABI tags checked using authenticated Packaging in clean interpreter.",
       "installed_metadata_distinction": "RECORD is raw authenticated wheel RECORD, not claimed equivalent to v1 installed9abc. No installer additions allowed in payload roots.",
       "new_runtime_only": "No historical byte-identity or model quality claim; old format1/default/goldens unchanged.",
       "interpreter": "Exact official CPython3.12.3 BUILD20240415 archive, published uv checksum; derive source/symlink/mode facts directly and deterministically omit all pyc before execution."
@@ -446,7 +446,10 @@
           "setuptools": "84.2.1",
           "sympy": "1.14.0",
           "torch": "2.9.1",
-          "typing-inspection": "0.4.5"
+          "typing-inspection": "0.4.5",
+          "charset-normalizer": "3.5.2",
+          "requests": "2.32.5",
+          "urllib3": "2.5.0"
         },
         "wheels": [
           {
@@ -569,8 +572,59 @@
             "sha256": "0930db9bdc62d22944e10b066448bb65dc9abe9112880c7cab8da54db4284d5f",
             "url": "https://files.pythonhosted.org/packages/a2/f0/d6613774d86fbf6d145751d43c59875e47a6f9f17daee0aef173bd36d90e/markupsafe-3.0.4-cp312-cp312-macosx_11_0_arm64.whl",
             "version": "3.0.4"
+          },
+          {
+            "name": "charset-normalizer",
+            "version": "3.5.2",
+            "filename": "charset_normalizer-3.5.2-cp312-cp312-macosx_10_13_universal2.whl",
+            "url": "https://files.pythonhosted.org/packages/e7/c8/693809898870237d82785a03f3b2b58fe4c9f14669f84a7d4e623c92a59e/charset_normalizer-3.5.2-cp312-cp312-macosx_10_13_universal2.whl",
+            "bytes": 367780,
+            "sha256": "ed2a239c0ea213acc1908150a3037257083c7c083128f1a4cec2ec4b97dca491",
+            "metadata_sha256": "89ce6362bb7be88558f4be99a98f5d1b4da93d19cd0323e5ee0bac05cf883dfb",
+            "record_sha256": "00a012aa99298171079b9fa64d276d4790eec454a9bef1c4b12e107e42c2ff44"
+          },
+          {
+            "name": "requests",
+            "version": "2.32.5",
+            "filename": "requests-2.32.5-py3-none-any.whl",
+            "url": "https://files.pythonhosted.org/packages/1e/db/4254e3eabe8020b458f1a747140d32277ec7a271daf1d235b70dc0b4e6e3/requests-2.32.5-py3-none-any.whl",
+            "bytes": 64738,
+            "sha256": "2462f94637a34fd532264295e186976db0f5d453d1cdd31473c85a6a161affb6",
+            "metadata_sha256": "65b5a08da81f4915513e760965ff14b7518f65b7bb3efe0dab364bbcc4d40cb0",
+            "record_sha256": "47ba167a94e78212959646abd75e65816c926c2b175854d958d5efae73f510ba"
+          },
+          {
+            "name": "urllib3",
+            "version": "2.5.0",
+            "filename": "urllib3-2.5.0-py3-none-any.whl",
+            "url": "https://files.pythonhosted.org/packages/a7/c2/fe1e52489ae3122415c51f387e221dd0773709bad6c6cdaa599e8a2c5185/urllib3-2.5.0-py3-none-any.whl",
+            "bytes": 129795,
+            "sha256": "e6b01673c0fa6a13e374b50871808eb3bf7046c4b125b216f6bf1cc604cff0dc",
+            "metadata_sha256": "99a6244c866dd1afa59040be84c6566c206670667225c60e791938fe7b93acd7",
+            "record_sha256": "59ef813a7c39ec76d49c5a49148f18592400da08ac5dcc17bcc65da83350fffb"
           }
         ]
+      }
+    },
+    "source_dependencies": {
+      "revision": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+      "pyproject": {
+        "filename": "gliner2-55656fbfa01d-pyproject.toml",
+        "url": "https://raw.githubusercontent.com/fastino-ai/GLiNER2/55656fbfa01d3d4a77485e1a1eeeaf682990ccdf/pyproject.toml",
+        "bytes": 3147,
+        "sha256": "3a39b46d1879e3703dead77c9e3e91fd4ead2ce650dfbce1f1187d6532eeb640"
+      },
+      "base_requirements": [
+        "pydantic>=2.0,<3",
+        "requests>=2.28,<3",
+        "tqdm>=4.64,<5",
+        "urllib3>=1.26,<3"
+      ],
+      "local_transformers_exception": {
+        "source_declared": "transformers>=4.38,<5",
+        "frozen_required": "5.17.0",
+        "status": "checkpoint_runtime_outside_upstream_declared_dependency_range",
+        "basis": "Unchanged explicit v1 contract. All BASE and active wheel requirements checked; optional local/training extras are not claimed completely installed."
       }
     }
   }
