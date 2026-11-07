@@ -406,7 +406,7 @@ describe("InferenceClient with mock fetch", () => {
       expect(await lastFetchJSONBody()).toMatchObject({ model: "gemma", stream: true });
       const [, init] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
       expect(init?.signal).toBe(controller.signal);
-      expect((init?.headers as Record<string, string>).Accept).toBe("text/event-stream");
+      expect(new Headers(init?.headers).get("Accept")).toBe("text/event-stream");
     });
 
     it("fails closed when a server does not attest a managed generation policy", async () => {
@@ -572,6 +572,33 @@ describe("InferenceClient with mock fetch", () => {
       );
       for await (const _chunk of client.generateStream(request)) break;
       expect(cancel).toHaveBeenCalledOnce();
+    });
+
+    it("unwraps the gateway's nested {error:{code,message}} envelope (source-reference failures)", async () => {
+      // zig/pkg/antfly/src/api/httpx_handler.zig's gatewayFailure nests
+      // {message, type, code} under `error`, unlike the flat
+      // {error, message, retryable} shape generation errors use.
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message: "InferenceSourceMismatch",
+              type: "invalid_request_error",
+              code: "InferenceSourceMismatch",
+            },
+          }),
+          { status: 409, headers: { "Content-Type": "application/json" } }
+        )
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      let caught: unknown;
+      try {
+        await client.generate(request);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(InferenceAPIError);
+      expect(caught).toMatchObject({ status: 409, code: "InferenceSourceMismatch" });
     });
 
     it.each([
@@ -1097,8 +1124,8 @@ describe("InferenceClient with mock fetch", () => {
       expect(url).toBe("http://localhost:8080/ai/v1/embed");
       expect(options?.method).toBe("POST");
       expect(options?.headers).toBeDefined();
-      const headers = options?.headers as Record<string, string>;
-      expect(headers.Accept).toBe(NUMERIC_RESPONSE_ACCEPT);
+      const headers = new Headers(options?.headers);
+      expect(headers.get("Accept")).toBe(NUMERIC_RESPONSE_ACCEPT);
     });
 
     it.each([
@@ -1680,4 +1707,37 @@ describe("InferenceClient with mock fetch", () => {
       }
     });
   });
+});
+
+it("isolates concurrent per-call headers and keeps numeric response negotiation", async () => {
+  const captured: Headers[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      captured.push(request.headers);
+      return Response.json({ object: "list", model: "m", data: [{ index: 0, embedding: [1, 2] }] });
+    })
+  );
+  const inference = new InferenceClient({
+    baseUrl: "http://embed.test",
+    headers: { Authorization: "Bearer configured", "X-Keep": "default" },
+  });
+  try {
+    await Promise.all([
+      inference.embed("m", ["a"], { headers: { authorization: "Bearer a", "X-Keep": undefined } }),
+      inference.embed("m", ["b"], { headers: { AUTHORIZATION: "Bearer b" } }),
+      inference.embedDense("m", ["c"], { headers: { Accept: "application/xml" } }),
+    ]);
+    expect(captured.map((h) => h.get("Authorization"))).toEqual([
+      "Bearer a",
+      "Bearer b",
+      "Bearer configured",
+    ]);
+    expect(captured[0].get("X-Keep")).toBe("default");
+    expect(captured[2].get("Accept")).toBe(NUMERIC_RESPONSE_ACCEPT);
+    expect(captured[0].get("Accept")).toBe("application/json");
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

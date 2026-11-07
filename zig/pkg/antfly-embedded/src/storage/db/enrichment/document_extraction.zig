@@ -1333,11 +1333,19 @@ pub const NativeTextConfig = struct {
     quality: TextQualityConfig = .{},
 };
 
+/// `checksum`/`checksum_field` holds a digest of the original bytes in this
+/// algorithm. Declaring it lets identity follow the digest instead of the
+/// source's location (URL, ETag, version, last-modified), and makes a
+/// mismatch between the declared digest and the downloaded bytes a named
+/// extraction failure instead of silently trusting stale output.
+pub const ChecksumAlgorithm = enum { sha256 };
+
 pub const Config = struct {
     filename: []const u8 = "",
     content_type: []const u8 = "",
     etag: []const u8 = "",
     checksum: []const u8 = "",
+    checksum_algorithm: ?ChecksumAlgorithm = null,
     version: []const u8 = "",
     last_modified: []const u8 = "",
     credentials: []const u8 = "",
@@ -2156,6 +2164,11 @@ pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
     config.content_type = try dupeStringField(alloc, object, "content_type");
     config.etag = try dupeStringField(alloc, object, "etag");
     config.checksum = try dupeStringField(alloc, object, "checksum");
+    if (object.get("checksum_algorithm")) |value| {
+        if (value != .string) return error.InvalidDocumentExtractionConfig;
+        config.checksum_algorithm = std.meta.stringToEnum(ChecksumAlgorithm, value.string) orelse
+            return error.InvalidDocumentExtractionConfig;
+    }
     config.version = try dupeStringField(alloc, object, "version");
     config.last_modified = try dupeStringField(alloc, object, "last_modified");
     config.credentials = try dupeStringField(alloc, object, "credentials");
@@ -2572,15 +2585,96 @@ pub fn applySourceMetadataFromJson(alloc: Allocator, config: *Config, doc_value:
     }
 }
 
+/// Resolves `field` against `object`, walking a dot-separated path through
+/// nested objects when it contains one (e.g. `metadata.sha256`). A field
+/// name with no dot is a single top-level lookup, exactly as before this
+/// existed, so every existing `*_field` config is unaffected. This exists
+/// because `checksum_field` is the only generic way to name where a row's
+/// digest lives, and source rows keep every acquisition-derived value
+/// (including the verified SHA-256) nested under `metadata`, not at the top
+/// level; a path lets `checksum_field` reach it without Antfly knowing
+/// anything about the source record's shape, and without inventing a second,
+/// top-level copy of the same digest for Antfly's convenience alone.
 fn dupeOptionalStringField(alloc: Allocator, object: std.json.ObjectMap, field: []const u8) !?[]const u8 {
-    const value = object.get(field) orelse return null;
-    if (value != .string) return null;
-    return try alloc.dupe(u8, value.string);
+    // Existing configs may name a literal top-level key containing dots.
+    // Its presence wins, including non-string values; traversal is a fallback.
+    if (object.get(field)) |value| {
+        if (value != .string) return null;
+        return try alloc.dupe(u8, value.string);
+    }
+    if (std.mem.indexOfScalar(u8, field, '.') == null) return null;
+    var current: std.json.Value = .{ .object = object };
+    var parts = std.mem.splitScalar(u8, field, '.');
+    while (parts.next()) |part| {
+        if (part.len == 0 or current != .object) return null;
+        current = current.object.get(part) orelse return null;
+    }
+    if (current != .string) return null;
+    return try alloc.dupe(u8, current.string);
 }
 
 pub const native_text_extraction_identity = "native-text-v8";
 
+/// True for exactly 64 ASCII hex digits (either case). SHA-256 is the only
+/// declared algorithm today.
+pub fn isValidSha256Hex(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |c| {
+        const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+        if (!is_hex) return false;
+    }
+    return true;
+}
+
+/// Identity follows the declared digest, not the source's location, once
+/// `checksum_algorithm` names a recognized algorithm and a digest is actually
+/// present (resolved from `checksum`/`checksum_field`). `source_url`, `etag`,
+/// `version`, and `last_modified` are deliberately excluded: none of them
+/// prove anything about the bytes once a digest is available, and keeping
+/// them would force a re-extraction every time the source moves even though
+/// nothing about its content changed. A malformed digest -- present, but not
+/// a well-formed digest for the declared algorithm -- is a configuration
+/// error here rather than a silent fall back to location-based identity,
+/// since silently falling back would let a typo'd digest field keep stale
+/// output alive forever.
+///
+/// Without `checksum_algorithm`, or with it declared but no digest resolved
+/// for this row, this defers to `metadataFingerprintLegacyAlloc` (the
+/// previous, unconditional v3 formula) byte for byte, so a row with only a
+/// bare `checksum_field` behaves exactly as it did before this existed.
 pub fn metadataFingerprintAlloc(
+    alloc: Allocator,
+    source_url: []const u8,
+    config_json: []const u8,
+    config: Config,
+) !?[]u8 {
+    if (config.checksum_algorithm) |algorithm| {
+        if (config.checksum.len > 0) {
+            switch (algorithm) {
+                .sha256 => {
+                    if (!isValidSha256Hex(config.checksum)) return error.InvalidChecksumDigest;
+                },
+            }
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            hashField(&hasher, "kind", "document_extraction_metadata_fingerprint_v4");
+            hashNativeTextConfig(&hasher, config.native_text);
+            hashField(&hasher, "config_json", config_json);
+            hashField(&hasher, "filename", config.filename);
+            hashField(&hasher, "content_type", config.content_type);
+            hashField(&hasher, "checksum_algorithm", @tagName(algorithm));
+            hashField(&hasher, "checksum", config.checksum);
+            var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            hasher.final(&digest);
+            return try hexBytesAlloc(alloc, &digest);
+        }
+    }
+    return metadataFingerprintLegacyAlloc(alloc, source_url, config_json, config);
+}
+
+/// The original, location-based v3 formula. Used only when no declared
+/// digest is active. A legacy fingerprint does not prove that a digest was
+/// checked against downloaded bytes, so it cannot authorize SHA-256 opt-in.
+pub fn metadataFingerprintLegacyAlloc(
     alloc: Allocator,
     source_url: []const u8,
     config_json: []const u8,
@@ -2605,6 +2699,26 @@ pub fn metadataFingerprintAlloc(
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     return try hexBytesAlloc(alloc, &digest);
+}
+
+/// Compares the declared digest against bytes actually fetched, never bytes
+/// assumed from configuration. `digest` is the already-computed SHA-256 of
+/// the complete downloaded content (every caller already computes this once
+/// for other purposes; this never hashes a second time or buffers beyond
+/// what the caller already held). Returns `error.DocumentChecksumMismatch`,
+/// a clearly named failure, when they disagree, so a wrong digest can never
+/// keep stale output alive: the caller must fail extraction, not fall back
+/// to location-based identity, on this error. A no-op when
+/// `checksum_algorithm` is unset or no digest resolved for this row.
+pub fn verifyChecksumDigestHex(config: Config, digest_hex: []const u8) !void {
+    const algorithm = config.checksum_algorithm orelse return;
+    if (config.checksum.len == 0) return;
+    switch (algorithm) {
+        .sha256 => {
+            if (!isValidSha256Hex(config.checksum)) return error.InvalidChecksumDigest;
+            if (!std.ascii.eqlIgnoreCase(config.checksum, digest_hex)) return error.DocumentChecksumMismatch;
+        },
+    }
 }
 
 fn hashNativeTextConfig(hasher: *std.crypto.hash.sha2.Sha256, native_text: NativeTextConfig) void {
@@ -2638,11 +2752,18 @@ fn hashField(hasher: *std.crypto.hash.sha2.Sha256, name: []const u8, value: []co
 
 fn hexBytesAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
     const out = try alloc.alloc(u8, bytes.len * 2);
+    hexBytesBuf(bytes, out);
+    return out;
+}
+
+/// Non-allocating hex encoding into a caller-owned buffer exactly twice as
+/// long as `bytes`, for callers (such as the already-computed content
+/// digest at a document extraction boundary) that must not allocate.
+pub fn hexBytesBuf(bytes: []const u8, out: []u8) void {
     for (bytes, 0..) |byte, idx| {
         out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
         out[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
     }
-    return out;
 }
 
 pub fn extractDownloadedAlloc(
@@ -5614,6 +5735,123 @@ test "document extraction metadata fingerprint requires version metadata" {
     try std.testing.expect(!std.mem.eql(u8, visible, tuned));
 }
 
+test "document extraction metadata fingerprint ignores config without checksum_algorithm, byte for byte" {
+    const alloc = std.testing.allocator;
+    var config = try parseConfig(alloc,
+        \\{"source":{"checksum_field":"sha256"}}
+    );
+    defer config.deinit(alloc);
+    try applySourceMetadataFromJson(alloc, &config, "{\"sha256\":\"abc\"}");
+
+    const without_algorithm = (try metadataFingerprintAlloc(alloc, "https://example.test/a", "{}", config)).?;
+    defer alloc.free(without_algorithm);
+    const legacy = (try metadataFingerprintLegacyAlloc(alloc, "https://example.test/a", "{}", config)).?;
+    defer alloc.free(legacy);
+    try std.testing.expectEqualStrings(legacy, without_algorithm);
+}
+
+test "document extraction checksum_field resolves a dotted path into a source row's nested metadata" {
+    const alloc = std.testing.allocator;
+    var config = try parseConfig(alloc,
+        \\{"checksum_algorithm":"sha256","source":{"checksum_field":"metadata.sha256"}}
+    );
+    defer config.deinit(alloc);
+    const digest = testRepeatedHexDigest('e');
+    const row = try std.fmt.allocPrint(
+        alloc,
+        "{{\"schema_version\":3,\"source\":{{\"id\":\"x\"}},\"metadata\":{{\"sha256\":\"{s}\",\"source_id\":\"src\"}}}}",
+        .{digest},
+    );
+    defer alloc.free(row);
+    try applySourceMetadataFromJson(alloc, &config, row);
+    try std.testing.expectEqualStrings(&digest, config.checksum);
+
+    // A flat top-level field name is unaffected: no dot means no path walk.
+    var flat_config = try parseConfig(alloc,
+        \\{"source":{"checksum_field":"sha256"}}
+    );
+    defer flat_config.deinit(alloc);
+    try applySourceMetadataFromJson(alloc, &flat_config, "{\"sha256\":\"abc\"}");
+    try std.testing.expectEqualStrings("abc", flat_config.checksum);
+
+    // A dotted path that does not resolve (missing intermediate object, or a
+    // non-object in the middle) leaves the field unset rather than erroring.
+    var missing_config = try parseConfig(alloc,
+        \\{"source":{"checksum_field":"metadata.sha256"}}
+    );
+    defer missing_config.deinit(alloc);
+    try applySourceMetadataFromJson(alloc, &missing_config, "{\"other\":1}");
+    try std.testing.expectEqualStrings("", missing_config.checksum);
+}
+
+fn testRepeatedHexDigest(byte: u8) [64]u8 {
+    var buf: [64]u8 = undefined;
+    @memset(&buf, byte);
+    return buf;
+}
+
+test "document extraction v4 fingerprint ignores location once a digest is declared" {
+    const alloc = std.testing.allocator;
+    const digest_a = testRepeatedHexDigest('a');
+    var config = try parseConfig(alloc,
+        \\{"checksum_algorithm":"sha256"}
+    );
+    defer config.deinit(alloc);
+    alloc.free(@constCast(config.checksum));
+    config.checksum = try alloc.dupe(u8, &digest_a);
+
+    const at_one_url = (try metadataFingerprintAlloc(alloc, "https://example.test/one", "{}", config)).?;
+    defer alloc.free(at_one_url);
+    const at_other_url = (try metadataFingerprintAlloc(alloc, "s3://other-bucket/other/key", "{}", config)).?;
+    defer alloc.free(at_other_url);
+    try std.testing.expectEqualStrings(at_one_url, at_other_url);
+
+    // Changing the digest itself still changes the fingerprint.
+    const digest_b = testRepeatedHexDigest('b');
+    alloc.free(@constCast(config.checksum));
+    config.checksum = try alloc.dupe(u8, &digest_b);
+    const changed_digest = (try metadataFingerprintAlloc(alloc, "https://example.test/one", "{}", config)).?;
+    defer alloc.free(changed_digest);
+    try std.testing.expect(!std.mem.eql(u8, at_one_url, changed_digest));
+}
+
+test "document extraction rejects a malformed digest rather than falling back to location" {
+    const alloc = std.testing.allocator;
+    var config = try parseConfig(alloc,
+        \\{"checksum_algorithm":"sha256","checksum":"not-a-real-digest"}
+    );
+    defer config.deinit(alloc);
+    try std.testing.expectError(error.InvalidChecksumDigest, metadataFingerprintAlloc(alloc, "https://example.test/a", "{}", config));
+}
+
+test "document extraction checksum verification matches, mismatches and no-ops" {
+    const alloc = std.testing.allocator;
+    const digest_c = testRepeatedHexDigest('c');
+
+    var declared = try parseConfig(alloc,
+        \\{"checksum_algorithm":"sha256"}
+    );
+    defer declared.deinit(alloc);
+    alloc.free(@constCast(declared.checksum));
+    declared.checksum = try alloc.dupe(u8, &digest_c);
+    try verifyChecksumDigestHex(declared, &digest_c);
+    const digest_d = testRepeatedHexDigest('d');
+    try std.testing.expectError(error.DocumentChecksumMismatch, verifyChecksumDigestHex(declared, &digest_d));
+    // Case-insensitive match against an uppercase downloaded digest.
+    const digest_c_upper = testRepeatedHexDigest('C');
+    try verifyChecksumDigestHex(declared, &digest_c_upper);
+
+    var no_algorithm = try parseConfig(alloc, "{}");
+    defer no_algorithm.deinit(alloc);
+    try verifyChecksumDigestHex(no_algorithm, "anything-at-all");
+
+    var no_digest = try parseConfig(alloc,
+        \\{"checksum_algorithm":"sha256"}
+    );
+    defer no_digest.deinit(alloc);
+    try verifyChecksumDigestHex(no_digest, "anything-at-all");
+}
+
 test "document extraction route matching normalizes content type parameters" {
     const alloc = std.testing.allocator;
     var downloaded = TestDownloadedContent{
@@ -6730,4 +6968,54 @@ test "native text routes independently of OCR output thresholds and counts Unico
     try std.testing.expect(assessTextQuality("     ", .{ .min_chars = 1 }).too_short);
     try std.testing.expect(assessTextQuality("\u{a0}\u{2003}\u{3000}", .{ .min_chars = 1 }).too_short);
     try std.testing.expectEqual(@as(usize, 2), assessTextQuality("世\u{3000}界", .{}).non_whitespace_chars);
+}
+
+test "document extraction dotted metadata fields preserve literal keys before traversal" {
+    const a = std.testing.allocator;
+    var config = try parseConfig(a,
+        \\{"source":{"checksum_field":"file.sha256","filename_field":"file.name","etag_field":"file.etag","content_type_field":"file.mime","version_field":"file.version","last_modified_field":"file.modified"}}
+    );
+    defer config.deinit(a);
+    try applySourceMetadataFromJson(a, &config,
+        \\{"file.sha256":"literal","file.name":"original.pdf","file.etag":"etag","file.mime":"application/pdf","file.version":"1","file.modified":"today","file":{"sha256":"nested","name":"other.pdf"}}
+    );
+    try std.testing.expectEqualStrings("literal", config.checksum);
+    try std.testing.expectEqualStrings("original.pdf", config.filename);
+    try std.testing.expectEqualStrings("etag", config.etag);
+    try std.testing.expectEqualStrings("application/pdf", config.content_type);
+    try std.testing.expectEqualStrings("1", config.version);
+    try std.testing.expectEqualStrings("today", config.last_modified);
+    // A present non-string literal also retains the legacy no-value behavior.
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"a.b\":null,\"a\":{\"b\":\"nested\"}}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), try dupeOptionalStringField(a, parsed.value.object, "a.b"));
+}
+
+test "document extraction checksum opt in requires verified identity then reuses relocation" {
+    const a = std.testing.allocator;
+    const old_json = "{\"source\":{\"checksum_field\":\"metadata.sha256\"}}";
+    const new_json = "{\"checksum_algorithm\":\"sha256\",\"source\":{\"checksum_field\":\"metadata.sha256\"}}";
+    const digest = testRepeatedHexDigest('a');
+    const row = try std.fmt.allocPrint(a, "{{\"metadata\":{{\"sha256\":\"{s}\"}}}}", .{digest});
+    defer a.free(row);
+    var old = try parseConfig(a, old_json);
+    defer old.deinit(a);
+    var new = try parseConfig(a, new_json);
+    defer new.deinit(a);
+    try applySourceMetadataFromJson(a, &old, row);
+    try applySourceMetadataFromJson(a, &new, row);
+    const legacy = (try metadataFingerprintAlloc(a, "https://old/a", old_json, old)).?;
+    defer a.free(legacy);
+    const verified = (try metadataFingerprintAlloc(a, "https://old/a", new_json, new)).?;
+    defer a.free(verified);
+    const moved = (try metadataFingerprintAlloc(a, "https://new/b", new_json, new)).?;
+    defer a.free(moved);
+    try std.testing.expect(!std.mem.eql(u8, legacy, verified));
+    try std.testing.expectEqualStrings(verified, moved);
+    // An unchanged legacy config cannot waive the opt-in integrity check.
+    const legacy_same_config = (try metadataFingerprintLegacyAlloc(a, "https://old/a", new_json, new)).?;
+    defer a.free(legacy_same_config);
+    try std.testing.expect(!std.mem.eql(u8, legacy_same_config, verified));
+    const wrong = testRepeatedHexDigest('b');
+    try std.testing.expectError(error.DocumentChecksumMismatch, verifyChecksumDigestHex(new, &wrong));
 }

@@ -425,6 +425,16 @@
           }
         }
       },
+      "SourceIdentity": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "namespace": {
+            "type": "string",
+            "description": "Opaque prefix that scopes this source's row keys, independent of its connection or config. Assigned automatically at creation and immutable once set."
+          }
+        }
+      },
       "Source": {
         "type": "object",
         "required": [
@@ -469,6 +479,14 @@
           },
           "permissions": {
             "$ref": "#/components/schemas/Permissions"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/SourceIdentity"
+          },
+          "rekeys": {
+            "type": "boolean",
+            "readOnly": true,
+            "description": "Set only on a PUT response. True when the call makes the next sync re-key this source's existing rows. A new source, or one that already has a namespace, never re-keys."
           },
           "permission_ttl_seconds": {
             "type": "integer",

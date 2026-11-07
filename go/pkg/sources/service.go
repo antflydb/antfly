@@ -269,6 +269,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveManagement(w, r)
 		return
 	}
+	var adoption *namespaceAdoptionCheck
 	// Authentication happens before decoding, but no service lock is held
 	// while a caller sends its request body or a provider builds a client.
 	if r.Method == http.MethodPut || r.Method == http.MethodPost {
@@ -303,6 +304,13 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					serviceError(w, 409, "source_destination_immutable")
 					return
 				}
+				if candidate.ID == strings.TrimPrefix(r.URL.Path, "/v1/sources/") && candidate.Identity.Namespace != "" {
+					adoption = s.prepareNamespaceAdoption(r.Context(), candidate.ID, candidate.Identity.Namespace)
+					if r.Context().Err() != nil {
+						serviceError(w, http.StatusRequestTimeout, "request_cancelled")
+						return
+					}
+				}
 			}
 		}
 		r.Body = io.NopCloser(bytes.NewReader(raw))
@@ -319,7 +327,14 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/v1/profile" && r.Method == http.MethodGet {
+		w.Header().Set("X-Antfly-Source-Preconditions", "2")
 		serviceJSON(w, 200, s.profile)
+		return
+	}
+	// Migration fences source and connection changes in the same critical
+	// section as PUT/sync admission. No provider I/O is needed for this check.
+	if !migrationConnectionsMatch(s.profile, r.Header.Get("X-Antfly-Migration-Connections")) {
+		serviceError(w, http.StatusPreconditionFailed, "migration_connection_revision_changed")
 		return
 	}
 	if r.URL.Path == "/v1/sync" && r.Method == http.MethodPost {
@@ -332,6 +347,19 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err := serviceDecode(w, r, &input); err != nil {
 			serviceError(w, 400, "invalid_request")
 			return
+		}
+		if condition := r.Header.Get("If-Match"); condition != "" {
+			matches := false
+			for _, source := range s.profile.Sources {
+				if source.ID == input.SourceID && sourceRevision(source) == condition {
+					matches = true
+					break
+				}
+			}
+			if !matches || input.PurgeOnly {
+				serviceError(w, http.StatusPreconditionFailed, "source_revision_changed")
+				return
+			}
 		}
 		if err := s.validateProfile(s.profile); err != nil {
 			serviceError(w, 400, "invalid_source_profile")
@@ -566,6 +594,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
+		rekeys := false
 		switch r.Method {
 		case http.MethodPut:
 			queue, err := s.readPurges()
@@ -584,15 +613,73 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				serviceError(w, 400, "invalid_source")
 				return
 			}
+			if condition := r.Header.Get("If-Match"); condition != "" && (index < 0 || condition != sourceRevision(next.Sources[index])) {
+				serviceError(w, http.StatusPreconditionFailed, "source_revision_changed")
+				return
+			}
+			if adoption != nil && (index < 0 || !adoption.current(s, next.Sources[index], source.Identity.Namespace)) {
+				serviceError(w, http.StatusPreconditionFailed, "namespace_adoption_revision_changed")
+				return
+			}
 			if index < 0 {
+				// New sources get an opaque namespace at creation so a later
+				// connection or provider change never has to re-key anything:
+				// nothing is ever keyed before the source has a namespace.
+				if source.Identity.Namespace == "" {
+					source.Identity.Namespace = id
+				}
 				next.Sources = append(next.Sources, source)
 			} else {
 				if next.Sources[index].Table != source.Table {
 					serviceError(w, 409, "source_destination_immutable")
 					return
 				}
+				existing := next.Sources[index]
+				switch {
+				case source.Identity.Namespace == "":
+					// Omitting identity on an update leaves it exactly as it
+					// was; it is never cleared by omission.
+					source.Identity.Namespace = existing.Identity.Namespace
+				case existing.Identity.Namespace != "" && source.Identity.Namespace != existing.Identity.Namespace:
+					serviceError(w, 409, "source_identity_namespace_immutable")
+					return
+				}
+				if existing.Identity.Namespace == "" {
+					switch {
+					case source.Identity.Namespace == "":
+						// No namespace involved at all: rows are still keyed by
+						// raw acquisition identity (RecordKey's legacy formula),
+						// which a connection or config change re-keys exactly as
+						// it always has.
+						rekeys = existing.Connection != source.Connection || !bytes.Equal(existing.Config, source.Config)
+					default:
+						// A namespace is being set for the first time, possibly
+						// together with a connection/config change in the same
+						// request (migrate-local does exactly this). It only
+						// avoids a re-key if it is exactly the prefix that
+						// reproduces this source's current keys under its
+						// EXISTING connection/config -- before this request's own
+						// change, if any -- checked for real rather than assumed.
+						if adoption == nil {
+							serviceError(w, http.StatusPreconditionFailed, "namespace_adoption_revision_changed")
+							return
+						}
+						rekeys = !adoption.matches
+					}
+				}
 				next.Sources[index] = source
 			}
+			if raw := r.Header.Get("X-Antfly-Local-Migration"); raw != "" {
+				if r.Header.Get("If-Match") == "" || r.Header.Get("X-Antfly-Migration-Connections") == "" {
+					serviceError(w, 400, "migration_preconditions_required")
+					return
+				}
+				if err := applyMigrationReceipt(s.profile, &next, source, raw); err != nil {
+					serviceError(w, http.StatusPreconditionFailed, "migration_lineage_mismatch")
+					return
+				}
+			}
+
 		case http.MethodDelete:
 			if index < 0 && r.URL.Query().Get("purge") == "true" {
 				// A retained source can be explicitly purged after its definition
@@ -664,10 +751,98 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.profile = next
 		s.refreshMediaRegistry()
-		serviceJSON(w, 200, map[string]any{"version": 1, "state": "configured"})
+		response := map[string]any{"version": 1, "state": "configured"}
+		if r.Method == http.MethodPut {
+			response["rekeys"] = rekeys
+		}
+		serviceJSON(w, 200, response)
 		return
 	}
 	serviceError(w, 404, "not_found")
+}
+
+// Provider work runs outside s.mu. The result is advisory (failure reports
+// a re-key), but its source/connection witnesses must still match at commit.
+type namespaceAdoptionCheck struct {
+	sourceRevision, connectionBinding, clientGeneration, namespace string
+	connectionExists, matches                                      bool
+}
+
+// current runs under s.mu, after normal source preconditions are checked.
+func (check namespaceAdoptionCheck) current(s *Service, source Source, namespace string) bool {
+	connection, exists := s.profile.Connections[source.Connection]
+	return check.namespace == namespace && check.sourceRevision == sourceRevision(source) &&
+		check.connectionExists == exists && check.connectionBinding == connectionMediaBinding(connection) &&
+		check.clientGeneration == s.clientGeneration(connection)
+}
+
+func (s *Service) prepareNamespaceAdoption(ctx context.Context, id, namespace string) *namespaceAdoptionCheck {
+	s.mu.Lock()
+	var existing Source
+	found := false
+	for _, source := range s.profile.Sources {
+		if source.ID == id {
+			existing, found = source, true
+			break
+		}
+	}
+	if !found || existing.Identity.Namespace != "" || s.closed || s.cancel != nil {
+		s.mu.Unlock()
+		return nil
+	}
+	connection, exists := s.profile.Connections[existing.Connection]
+	check := &namespaceAdoptionCheck{sourceRevision: sourceRevision(existing), connectionBinding: connectionMediaBinding(connection), clientGeneration: s.clientGeneration(connection), namespace: namespace, connectionExists: exists}
+	s.mu.Unlock()
+	if !exists {
+		return check
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	check.matches = s.namespaceReproducesExistingKeys(ctx, id, existing, connection, namespace)
+	return check
+}
+
+// namespaceReproducesExistingKeys reports whether namespace is exactly the
+// prefix that reproduces id's current row keys under existing's connection
+// and config (LegacyNamespace), so adopting it as part of this PUT does not
+// re-key anything. existing is the source's definition as persisted BEFORE
+// this PUT, so a connection/config change arriving in the same request (as
+// migrate-local's repoint does) is checked against what produced the
+// CURRENT rows, not against the change about to take effect.
+//
+// Best-effort: unable to verify -- no such connection, a connector that
+// cannot be opened, an enumeration failure, a panic from a connector this
+// has not been exercised against, or items that disagree on their prefix --
+// is treated as "no" (report a re-key rather than risk a false claim of
+// safety). An empty inventory (nothing published under the existing
+// connection/config yet) has nothing to re-key regardless of which
+// namespace is adopted, so that alone is verified "yes".
+func (s *Service) namespaceReproducesExistingKeys(ctx context.Context, id string, existing Source, connection Connection, namespace string) (matches bool) {
+	defer func() {
+		if recover() != nil {
+			matches = false
+		}
+	}()
+	connector, err := s.providerConnector(ctx, connection)
+	if err != nil {
+		return false
+	}
+	if collaboration, ok := connector.(*CollaborationConnector); ok {
+		connector = collaboration.newAcquisition()
+	}
+
+	inventory, err := connector.Enumerate(ctx, Request{SourceNamespace: "job/" + id, Config: existing.Config, Mode: ImportModeSource, Preview: true})
+	if err != nil {
+		return false
+	}
+	if len(inventory.Objects) == 0 {
+		return true
+	}
+	legacy, err := LegacyNamespace(id, inventory.Objects)
+	if err != nil {
+		return false
+	}
+	return legacy == namespace
 }
 func (s *Service) run(ctx context.Context, profile Profile, restart, purgeOnly bool, done chan struct{}, selection ...string) {
 	defer close(done)
@@ -809,6 +984,9 @@ func mediaMIME(item Item) string { return MediaMIME(item) }
 // the same representation MIME, including the filename fallback.
 func MediaMIME(item Item) string {
 	typ := configString(item.Metadata, "mime_type")
+	if typ == "" && item.SourceKind == ProviderLocal {
+		typ = localMediaMIMEForPath(item.Path)
+	}
 	if typ == "" {
 		typ = mime.TypeByExtension(filepath.Ext(item.Path))
 	}

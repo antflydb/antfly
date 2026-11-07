@@ -17482,6 +17482,8 @@ fn processDocumentExtractionAsset(
 
     const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(runtime.alloc, source_url, config_json, config);
     defer if (metadata_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
+    // Checksum opt-in must establish verified provenance once. Never accept
+    // legacy metadata-only evidence as a digest-verified extraction.
     if (metadata_fingerprint) |fingerprint| {
         if (try skipRuntimeDocumentExtractionByFingerprint(
             runtime,
@@ -17495,6 +17497,13 @@ fn processDocumentExtractionAsset(
         )) return;
     }
 
+    // Past this point the declared digest (if any) did not already prove
+    // this extraction unnecessary: the source is about to be fetched for
+    // real. Logged (not just counted) so a real run can confirm a provider
+    // change triggered zero of these, the same way skip_by_hash_count
+    // confirms the skip path did fire, without adding a new stats field to
+    // the table status aggregation pipeline for a one-off verification.
+    std.log.info("document extraction fetching source: doc_key={s} artifact={s}", .{ request.doc_key, artifact_name });
     var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
     defer resource_tracker.deinit();
     const fetched = prepared_sources.fetch(
@@ -17567,6 +17576,35 @@ fn processDocumentExtractionAsset(
     const prepared_source = prepared_source_lease.entry();
     const downloaded = &prepared_source.content;
     resource_tracker.setExternallyAccountedDownloadedBytes(downloaded.data.len);
+    // Verify the declared digest against the bytes actually fetched --
+    // prepared_source.content_sha256 is already computed once for every
+    // caller, so this never hashes a second time or buffers beyond what the
+    // caller already held -- before any of those bytes can be extracted,
+    // embedded, or otherwise referenced. A wrong digest must fail loudly
+    // here, not keep stale output alive under a digest that no longer
+    // matches what is actually at the source.
+    var content_digest_hex: [64]u8 = undefined;
+    document_extraction_mod.hexBytesBuf(&prepared_source.content_sha256, &content_digest_hex);
+    document_extraction_mod.verifyChecksumDigestHex(config, &content_digest_hex) catch |raw_err| {
+        try writeDocumentExtractionFailureManifest(
+            runtime,
+            request.doc_key,
+            artifact_name,
+            source_url,
+            metadata_fingerprint orelse "",
+            config.content_type,
+            @errorName(raw_err),
+            "declared checksum does not match the downloaded bytes",
+            "document_checksum_verification",
+            manifest_key,
+            previous_child_ranges,
+            existing_state,
+            from_generation,
+            window,
+        );
+        try recordIsolatedRequestError(runtime, window, request, raw_err);
+        return;
+    };
     const byte_source_fingerprint = if (metadata_fingerprint == null)
         try documentExtractionFingerprintFromDigestAlloc(runtime.alloc, &prepared_source.source_identity, config_json, config.native_text, config.content_type, config.filename, downloaded.content_type, &prepared_source.content_sha256)
     else
@@ -28376,6 +28414,10 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
 // durable acceptance can be reused without depending on the parent's old model.
 fn retainedTextEmbeddingHashAtRevision(request: enrichment_types.GeneratedEnrichmentRequest, text: []const u8, revision: ?[32]u8) u64 {
     const base = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
+    return embeddingIdentityAtRevision(base, revision);
+}
+
+fn embeddingIdentityAtRevision(base: u64, revision: ?[32]u8) u64 {
     const actual = revision orelse return base;
     var hash = std.hash.Wyhash.init(base);
     hash.update("retained-text-provider-generation-v1");
@@ -28394,34 +28436,186 @@ fn retainedTextVectorCurrent(a: Allocator, provider: embedder_mod.DenseEmbedder,
     return metadata.dense_dimensions == request.expected_dims and metadata.sourceHash() == try retainedTextEmbeddingHash(a, provider, request, text);
 }
 
+// A row can change without changing what its producer reads. The stored output
+// is then still this input's output, so it is republished under the new row's
+// receipt without calling the provider. Anything short of proof re-embeds.
+fn embeddingOutputCarriesForward(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, encoded: []const u8, source_hash: u64) !bool {
+    // The source hash already includes the durable reprocess generation. A
+    // matching hash proves this generation ran; rejecting all nonzero values
+    // would disable reuse forever after the first explicit reprocess.
+    const privacy = @import("../../../privacy/document.zig");
+    const name = requestEmbeddingName(request);
+    if (privacy.isManagedArtifactName(name) or privacy.consumerPolicyVersion(name) != null or std.mem.eql(u8, request.source_field, privacy.source_field)) return false;
+    const metadata = @import("../../artifact_payload.zig").Metadata.decode(encoded) catch return false;
+    if (metadata.reference != null or metadata.header.flags.vector_elided or metadata.sourceHash() != source_hash) return false;
+    switch (request.kind) {
+        .dense_embedding => return metadata.header.kind == .dense_embedding and metadata.dense_dimensions == request.expected_dims,
+        .sparse_embedding => {
+            if (metadata.header.kind != .sparse_embedding) return false;
+            var sparse = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(a, encoded) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return false,
+            };
+            sparse.deinit(a);
+            return true;
+        },
+        else => return false,
+    }
+}
+
+// True when the stored output was republished. The bound output guard rejects
+// the command if the artifact changes before apply, and requires protocol 17.
+fn carryProducerArtifact(runtime: *EnrichmentRuntime, token: *const producer_input.Token, request: enrichment_types.GeneratedEnrichmentRequest, key: []const u8, source_hash: u64) !bool {
+    const guard = token.output_guard orelse return false;
+    const observed = guard.content_digest orelse return false;
+    const encoded = (try storeGetOptionalAllocWithRetry(runtime, key)) orelse return false;
+    defer runtime.alloc.free(encoded);
+    if (!std.mem.eql(u8, &sourceRecordDigest(encoded), &observed)) return false;
+    if (!try embeddingOutputCarriesForward(runtime.alloc, request, encoded, source_hash)) return false;
+    runtime.skip_by_hash_count += 1;
+    try enqueueProducerArtifact(runtime, token, key, encoded);
+    return true;
+}
+
+// Each member's token already observed its output, so apply fences this read.
+fn carriedChunkVectorAlloc(a: Allocator, read: anytype, request: enrichment_types.GeneratedEnrichmentRequest, revision: ?[32]u8, payload: []const u8, output_key: []const u8, text: []const u8) !?[]const u8 {
+    if (try @import("../../../chunking/chunk.zig").modelMetadataAlloc(a, payload)) |metadata| {
+        metadata.deinit(a);
+        return null;
+    }
+    const encoded = read.get(output_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    const source_hash = retainedTextEmbeddingHashAtRevision(request, text, revision);
+    if (!try embeddingOutputCarriesForward(a, request, encoded, source_hash)) return null;
+    return try a.dupe(u8, encoded);
+}
+
+// Multimodal inputs without an unfetched URL are fully determined by their
+// bytes. A URL can serve different content, so it never proves the input equal.
+// Feed the same JSON bytes as contentPartsJsonAlloc into the legacy hash,
+// without allocating JSON or a media-sized base64 buffer. Preserving the wire
+// framing keeps already-stored hashes reusable across this optimization.
+const PartsHashWriter = struct {
+    writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain, .flush = std.Io.Writer.noopFlush }, .buffer = &.{} },
+    hash: std.hash.XxHash64 = .init(0),
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *@This() = @fieldParentPtr("writer", w);
+        for (data[0 .. data.len - 1]) |bytes| self.hash.update(bytes);
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| self.hash.update(pattern);
+        return std.Io.Writer.countSplat(data, splat);
+    }
+};
+
+fn writePartsHashJson(writer: *std.Io.Writer, parts: []const template.ContentPart, counter: ?*std.Io.Writer.Discarding) !void {
+    try writer.writeByte('[');
+    for (parts, 0..) |part, i| {
+        if (i > 0) try writer.writeByte(',');
+        switch (part) {
+            .text => |text| {
+                try writer.writeAll("{\"type\":\"text\",\"text\":");
+                try std.json.Stringify.value(text, .{}, writer);
+                try writer.writeByte('}');
+            },
+            .media_url => unreachable, // Caller rejects unfetched URLs first.
+            .binary => |binary| {
+                try writer.writeAll("{\"type\":\"media\",\"mime_type\":");
+                try std.json.Stringify.value(binary.mime_type, .{}, writer);
+                try writer.writeAll(",\"data\":\"");
+                if (counter) |count| {
+                    // Base64's alphabet never needs JSON string escaping.
+                    try writer.flush();
+                    count.count += std.base64.standard.Encoder.calcSize(binary.data.len);
+                } else {
+                    // All non-final blocks are a multiple of three bytes, so
+                    // padding is emitted only at the actual end of the input.
+                    var encoded: [4096]u8 = undefined;
+                    var offset: usize = 0;
+                    while (offset < binary.data.len) {
+                        const bytes = binary.data[offset .. offset + @min(@as(usize, 3072), binary.data.len - offset)];
+                        const length = std.base64.standard.Encoder.calcSize(bytes.len);
+                        _ = std.base64.standard.Encoder.encode(encoded[0..length], bytes);
+                        try writer.writeAll(encoded[0..length]);
+                        offset += bytes.len;
+                    }
+                }
+                try writer.writeAll("\"}");
+            },
+        }
+    }
+    try writer.writeByte(']');
+}
+
+fn densePartsSourceHash(_: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parts: []const template.ContentPart, revision: ?[32]u8) !?u64 {
+    for (parts) |part| if (part == .media_url) return null;
+    var output: PartsHashWriter = .{};
+    var length: [8]u8 = undefined;
+    if (request.producer_json.len > 0) {
+        var count_buffer: [256]u8 = undefined;
+        var counter = std.Io.Writer.Discarding.init(&count_buffer);
+        try writePartsHashJson(&counter.writer, parts, &counter);
+        std.mem.writeInt(u64, &length, counter.fullCount(), .little);
+        output.hash.update(&length);
+    }
+    try writePartsHashJson(&output.writer, parts, null);
+    if (request.producer_json.len > 0) {
+        std.mem.writeInt(u64, &length, @intCast(request.producer_json.len), .little);
+        output.hash.update(&length);
+        output.hash.update(request.producer_json);
+    }
+    const identity = enrichment_artifact_codec.hashEmbeddingIdentityForGeneration(output.hash.final(), request.reprocess_generation);
+    return embeddingIdentityAtRevision(identity, revision);
+}
+
+fn reuseDensePartsOutput(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    consumer_indexes: []const []const u8,
+    source_hash: u64,
+    input: ?*producer_input.Token,
+    window: *GeneratedReplayWindow,
+) !bool {
+    const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, requestEmbeddingName(request));
+    defer runtime.alloc.free(artifact_key);
+    if (input) |token| return carryProducerArtifact(runtime, token, request, artifact_key, source_hash);
+    if (!try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) return false;
+    if (try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
+        try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
+    }
+    return true;
+}
+
+fn chunkVectorAtRevision(request: enrichment_types.GeneratedEnrichmentRequest, text: []const u8, encoded: []const u8, revision: ?[32]u8) bool {
+    const metadata = @import("../../artifact_payload.zig").Metadata.decode(encoded) catch return false;
+    if (metadata.sourceHash() != retainedTextEmbeddingHashAtRevision(request, text, revision)) return false;
+    return if (request.kind == .dense_embedding) metadata.header.kind == .dense_embedding and metadata.dense_dimensions == request.expected_dims else metadata.header.kind == .sparse_embedding;
+}
+
+fn requireChunkProviderRevision(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, dense: ?embedder_mod.DenseEmbedder, sparse: ?embedder_mod.SparseEmbedder, generation: embedder_mod.DenseEmbedder.TextGeneration, revision: ?[32]u8, context: inference_request_context.RequestContext) !void {
+    try context.check();
+    if (dense) |provider| try provider.requireTextGenerationWithContext(a, requestEmbeddingName(request), generation, context);
+    if (sparse) |provider| if (!std.meta.eql(revision, try provider.captureRevision(a, requestEmbeddingName(request)))) return error.EnrichmentSourceChanged;
+    try context.check();
+}
+
 fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, dense: ?embedder_mod.DenseEmbedder, sparse: ?embedder_mod.SparseEmbedder, consumers: []const []const u8) !bool {
     var staged_vectors = MediaPassVectorCache{ .allocator = alloc };
     defer staged_vectors.deinit();
-    var verify_text_generation = false;
-    if (dense) |provider| {
-        var read = try runtime.store.beginProbe();
-        defer read.abort();
-        const first_key = try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, request.artifact_name, 0);
-        defer alloc.free(first_key);
-        if (try @import("../artifact_chunk_generation.zig").readMember(alloc, &read, first_key)) |payload| {
-            const metadata = try @import("../../../chunking/chunk.zig").modelMetadataAlloc(alloc, payload);
-            defer if (metadata) |value| value.deinit(alloc);
-            if (metadata) |value| if (!try terminalModelChunkEmbedding(alloc, provider, mediaEmbeddingComputationRequest(runtime, request), value) and !try modelChunkTargetCompatible(alloc, provider, mediaEmbeddingComputationRequest(runtime, request), value)) {
-                const text = (try @import("../../../chunking/chunk.zig").artifactTextAlloc(alloc, payload, request.source_field)) orelse return error.IncompatibleChunkEmbeddingTarget;
-                alloc.free(text);
-                verify_text_generation = true;
-            };
-        }
-    }
-    if (!verify_text_generation) switch (try driveOrderedChunkVectorCensus(runtime, alloc, request, .{})) {
-        .complete => return true,
-        .pending => return error.ArtifactPublicationPending,
-        .materialize => {},
-    };
+    // Capture once, outside any storage snapshot. Every accepted member must
+    // match this deployed generation before a completed census can be reused.
+    const context = assetProviderRequestContext(runtime);
+    try context.check();
+    const text_generation = if (dense) |provider| try provider.captureTextGenerationWithContext(alloc, requestEmbeddingName(request), context) else embedder_mod.DenseEmbedder.TextGeneration{};
+    const sparse_revision = if (sparse) |provider| try provider.captureRevision(alloc, requestEmbeddingName(request)) else null;
+    const execution_revision = if (dense != null) text_generation.revision else sparse_revision;
+    try context.check();
     const publication = @import("../artifact_chunk_vector_publication.zig");
     const logical = @import("../artifact_chunk_cursor.zig");
     const Candidates = @import("../artifact_chunk_vector_cursor.zig").Cursor(logical.BorrowedRead);
-    const Item = struct { input: publication.Input, text: ?[]const u8, precomputed: ?[]const f32 = null, model_hash: ?u64 = null, failed: bool = false };
+    const Item = struct { input: publication.Input, text: ?[]const u8, carried: ?[]const u8 = null, precomputed: ?[]const f32 = null, model_hash: ?u64 = null, failed: bool = false };
     const Observation = @import("../artifact_stream_observation.zig").Observation;
     const checkpoints = @import("../artifact_stream_checkpoint.zig");
     var observation: ?Observation = null;
@@ -28447,7 +28641,8 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             items.deinit(alloc);
         }
         var exhausted = false;
-        {
+        var validated_complete = false;
+        read_pass: {
             if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
             defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
             var read = try runtime.store.beginRead();
@@ -28475,6 +28670,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
                 if (try checkpoints.load(&read, &checkpoint_key.?)) |loaded| {
                     checkpoint_digest = loaded.digest;
                     const current = blk: {
+                        if (!std.meta.eql(loaded.state.execution_revision, execution_revision)) break :blk false;
                         loaded.state.observation.requireCurrent(&read, request.doc_key) catch |err| switch (err) {
                             error.EnrichmentSourceChanged => break :blk false,
                             else => return err,
@@ -28482,7 +28678,10 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
                         break :blk true;
                     };
                     if (current) {
-                        if (loaded.state.enumerated) return error.ArtifactPublicationPending;
+                        if (loaded.state.enumerated) {
+                            validated_complete = true;
+                            break :read_pass;
+                        }
                         census = loaded.state;
                         if (loaded.state.cursor.len != 0) after = try alloc.dupe(u8, loaded.state.cursor);
                         census.?.cursor = after orelse "";
@@ -28496,7 +28695,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             }
             if (!publishing) {
                 if (observation) |previous| try previous.requireCurrent(&read, request.doc_key) else observation = try Observation.capture(&read, request.doc_key);
-                if (census == null) census = .{ .root_incarnation = runtime.config.root_incarnation, .observation = observation.? };
+                if (census == null) census = .{ .root_incarnation = runtime.config.root_incarnation, .observation = observation.?, .execution_revision = execution_revision };
             }
             var borrowed: logical.BorrowedRead = .{ .read = &read };
             const captures = (try publication.captureSession(alloc, &read, request, plan.plan())) orelse return error.ArtifactCatalogDrift;
@@ -28556,25 +28755,35 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
                 defer if (previous_after) |old| alloc.free(old);
                 after = next;
                 var input = try captures.capture(alloc, key);
+                if (execution_revision != null and captures.effect_protocol < 18) {
+                    input.deinit();
+                    return error.OnlineMergeArtifactTailsUnsupported;
+                }
+                input.token.execution_identity = execution_revision;
+                input.token.execution_bound = true;
                 var input_owned = true;
                 defer if (input_owned) input.deinit();
                 if (try input.token.acceptedProof(alloc, &read)) |accepted| {
                     // A durable acceptance is publication authority, not a
                     // certificate for a mutable deployed model alias.
                     var reuse_accepted = true;
-                    if (dense) |provider| if (input.value) |payload| {
-                        const metadata = try @import("../../../chunking/chunk.zig").modelMetadataAlloc(alloc, payload);
-                        defer if (metadata) |value| value.deinit(alloc);
-                        if (metadata) |value| if (!try terminalModelChunkEmbedding(alloc, provider, mediaEmbeddingComputationRequest(runtime, request), value) and !try modelChunkTargetCompatible(alloc, provider, mediaEmbeddingComputationRequest(runtime, request), value)) {
-                            const text = (try @import("../../../chunking/chunk.zig").artifactTextAlloc(alloc, payload, request.source_field)) orelse return error.IncompatibleChunkEmbeddingTarget;
+                    if (input.value) |payload| {
+                        var fused_compatible = false;
+                        if (dense) |provider| {
+                            const metadata = try @import("../../../chunking/chunk.zig").modelMetadataAlloc(alloc, payload);
+                            defer if (metadata) |value| value.deinit(alloc);
+                            if (metadata) |value| fused_compatible = try terminalModelChunkEmbedding(alloc, provider, mediaEmbeddingComputationRequest(runtime, request), value) or try modelChunkTargetCompatible(alloc, provider, mediaEmbeddingComputationRequest(runtime, request), value);
+                        }
+                        if (!fused_compatible) {
+                            const text = (try chunkPayloadTextAlloc(alloc, payload, request.source_field)) orelse return error.IncompatibleChunkEmbeddingTarget;
                             defer alloc.free(text);
                             const vector = read.get(input.output_key) catch |err| switch (err) {
                                 error.NotFound => null,
                                 else => return err,
                             };
-                            reuse_accepted = if (vector) |encoded| try retainedTextVectorCurrent(alloc, provider, request, text, encoded) else false;
-                        };
-                    };
+                            reuse_accepted = if (vector) |encoded| chunkVectorAtRevision(request, text, encoded, execution_revision) else false;
+                        }
+                    }
                     var proof = accepted;
                     defer proof.deinit();
                     if (reuse_accepted and !publishing) {
@@ -28588,13 +28797,23 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
                 // pass may drive work, but cannot also certify completion.
                 publishing = true;
                 const text = if (input.value) |value| try chunkPayloadTextAlloc(input.token.arena.allocator(), value, request.source_field) else null;
-                bytes +|= if (text) |value| value.len else 0;
-                try items.append(alloc, .{ .input = input, .text = text });
+                const carried = if (text) |value| try carriedChunkVectorAlloc(input.token.arena.allocator(), &read, request, execution_revision, input.value.?, input.output_key, value) else null;
+                if (carried == null) bytes +|= if (text) |value| value.len else 0;
+                try items.append(alloc, .{ .input = input, .text = text, .carried = carried });
                 input_owned = false;
             }
             if (!publishing) try observation.?.requireCurrent(&read, request.doc_key);
         }
+        if (validated_complete) {
+            try requireChunkProviderRevision(alloc, request, dense, sparse, text_generation, sparse_revision, context);
+            return switch (try driveOrderedChunkVectorCensus(runtime, alloc, request, .{})) {
+                .complete => true,
+                .pending => error.ArtifactPublicationPending,
+                .materialize => error.EnrichmentSourceChanged,
+            };
+        }
         if (!publishing) {
+            try requireChunkProviderRevision(alloc, request, dense, sparse, text_generation, sparse_revision, context);
             census.?.observation = observation.?;
             census.?.enumerated = exhausted;
             var prepared_checkpoint = try checkpoints.Prepared.init(alloc, census.?);
@@ -28618,9 +28837,10 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             if (!exhausted) return error.ArtifactPublicationPending;
         }
         if (dense) |provider| for (items.items) |*item| {
+            if (item.carried != null) continue;
             if (try publishMediaWindowVectors(runtime, alloc, request, provider, &item.input, item.input.value, &staged_vectors)) item.failed = true;
         };
-        if (dense) |provider| for (items.items) |*item| if (!item.failed) if (item.input.value) |payload| {
+        if (dense) |provider| for (items.items) |*item| if (!item.failed and item.carried == null) if (item.input.value) |payload| {
             item.precomputed = storedModelChunkVectorCached(runtime, item.input.token.arena.allocator(), provider, request, payload, &staged_vectors) catch |err| {
                 if (isEnrichmentControlError(err) or err == error.EnrichmentSourceChanged or enrichmentErrorDisposition(err) == .fatal_worker) return err;
                 // A failed repair is debt for this output ordinal. Publish the
@@ -28635,9 +28855,8 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
         };
         var texts: std.ArrayList([]const u8) = .empty;
         defer texts.deinit(alloc);
-        for (items.items) |item| if (!item.failed and item.precomputed == null) if (item.text) |value| try texts.append(alloc, value);
+        for (items.items) |item| if (!item.failed and item.carried == null and item.precomputed == null) if (item.text) |value| try texts.append(alloc, value);
         var dense_vectors: ?[]const []const f32 = null;
-        var text_generation: embedder_mod.DenseEmbedder.TextGeneration = .{};
         var sparse_vectors: ?[]embedder_mod.SparseEmbedding = null;
         defer if (dense_vectors) |values| embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, values);
         defer if (sparse_vectors) |values| embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, values);
@@ -28649,22 +28868,23 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             var succeeded = false;
             defer noteEmbedBatchFinished(runtime, consumers, texts.items.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started), succeeded);
             if (dense) |provider| {
-                text_generation = try provider.captureTextGeneration(alloc, requestEmbeddingName(request));
                 dense_vectors = try embedDenseBatchWithRetryLimits(provider.withTextGeneration(text_generation), runtime, requestEmbeddingName(request), texts.items, request.expected_dims, request.reprocess_generation == 0, batch_limits);
                 if (dense_vectors.?.len != texts.items.len) return error.InvalidEmbeddingResponse;
                 try provider.requireTextGeneration(alloc, requestEmbeddingName(request), text_generation);
             } else if (sparse) |provider| {
                 sparse_vectors = try embedSparseBatchWithRetry(provider, runtime, requestEmbeddingName(request), texts.items);
                 if (sparse_vectors.?.len != texts.items.len) return error.InvalidEmbeddingResponse;
+                if (!std.meta.eql(sparse_revision, try provider.captureRevision(alloc, requestEmbeddingName(request)))) return error.EnrichmentSourceChanged;
             } else return error.InvalidArgument;
             succeeded = true;
         }
         defer if (texts.items.len != 0) finishActivePostprocess(runtime);
+        try requireChunkProviderRevision(alloc, request, dense, sparse, text_generation, sparse_revision, context);
         var vector_index: usize = 0;
         for (items.items) |*item| {
             if (item.failed) continue;
-            const value = if (item.precomputed) |vector| try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, item.model_hash.?, vector) else if (item.text) |text| blk: {
-                const hash = if (dense != null) retainedTextEmbeddingHashAtRevision(request, text, text_generation.revision) else enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
+            const value = if (item.carried) |carried| try alloc.dupe(u8, carried) else if (item.precomputed) |vector| try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, item.model_hash.?, vector) else if (item.text) |text| blk: {
+                const hash = retainedTextEmbeddingHashAtRevision(request, text, if (dense != null) text_generation.revision else sparse_revision);
                 const encoded = if (dense_vectors) |values|
                     try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, hash, values[vector_index])
                 else
@@ -28684,7 +28904,8 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
     // An independent text consumer can outlive the parent's model recipe.
     // Verify every accepted vector against its current provider generation
     // before permitting the census driver to certify these proofs.
-    if (verify_text_generation and !publishing) {
+    if (!publishing) {
+        try requireChunkProviderRevision(alloc, request, dense, sparse, text_generation, sparse_revision, context);
         if (try driveOrderedChunkVectorCensus(runtime, alloc, request, .{}) == .complete) return true;
     }
     // Enumerating members is not an exact-input stream-completion certificate.
@@ -29191,6 +29412,14 @@ fn collectPlainDenseBatchItem(
         runtime.alloc.free(artifact_key);
         return null;
     }
+    if (input) |*token| {
+        if (carryProducerArtifact(runtime, token, request, artifact_key, source_hash) catch |err| return scope.publicationFailure(err)) {
+            token.deinit();
+            runtime.alloc.free(@constCast(source_text));
+            runtime.alloc.free(artifact_key);
+            return null;
+        }
+    }
 
     return .{
         .request = request,
@@ -29320,6 +29549,7 @@ const GuardedEmbeddingWrite = struct {
     doc_key: []const u8,
     source_sequence: u64,
     ordered_input: ?*const producer_input.Token = null,
+    kind: enrichment_artifact_codec.Kind = .dense_embedding,
 };
 
 fn materializeProducerInput(ctx: *anyopaque, alloc: Allocator, key: []const u8, raw: []const u8) ![]u8 {
@@ -29449,7 +29679,7 @@ fn storeGuardedEmbeddingsTxn(runtime: *EnrichmentRuntime, txn: anytype, writes: 
     }
     try txn.commit();
     for (writes, accepted) |write, committed| {
-        if (committed) recordArtifactBytes(runtime, .dense_embedding, write.value.len);
+        if (committed) recordArtifactBytes(runtime, write.kind, write.value.len);
     }
 }
 
@@ -32291,6 +32521,17 @@ fn processDenseTemplateParts(
         };
         if (accepted) return;
     }
+    const source_hash = densePartsSourceHash(runtime.alloc, request, parts, generation.revision) catch |err| {
+        if (scope) |identity| return identity.publicationFailure(err);
+        return err;
+    };
+    if (source_hash) |hash| {
+        const reused = reuseDensePartsOutput(runtime, request, consumer_indexes, hash, input, window) catch |err| {
+            if (scope) |identity| return identity.publicationFailure(err);
+            return err;
+        };
+        if (reused) return;
+    }
     const vector = try embedDensePartsWithRetry(dense_embedder.withTextGeneration(generation), runtime, embedding_artifact_name, parts, request.expected_dims);
     defer runtime.alloc.free(vector);
     try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, context);
@@ -32306,7 +32547,7 @@ fn processDenseTemplateParts(
         .artifact_name = embedding_artifact_name,
         .source_field = request.source_field,
         .source_key = null,
-        .source_hash = null,
+        .source_hash = source_hash,
         .source_record_digest = source_digest,
         .source_sequence = request.sequence,
         .vector = vector,
@@ -32411,6 +32652,7 @@ fn processDenseEmbedding(
         }
         return;
     }
+    if (input) |*token| if (try carryProducerArtifact(runtime, token, request, artifact_key, source_hash)) return;
 
     const vectors = try embedDenseBatchWithRetry(dense_embedder.withTextGeneration(generation), runtime, embedding_artifact_name, &.{source_text}, request.expected_dims, request.reprocess_generation == 0);
     defer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
@@ -32501,6 +32743,15 @@ fn processSparseEmbedding(
     defer runtime.alloc.free(raw);
     var input = try captureProducerInput(runtime, request, doc_store_key, raw);
     defer if (input) |*token| token.deinit();
+    const revision = try sparse_embedder.captureRevision(runtime.alloc, embedding_artifact_name);
+    // Only protocol 17 can carry an execution identity or an output guard.
+    if (input) |*token| {
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        // A resolved revision cannot silently fall back to an unbound receipt
+        // on an older catalog. Admission upgrades base sparse indexes to 17.
+        try token.bindExecution(&read, revision);
+    }
     if (input) |*token| if (try producerInputAccepted(runtime, token)) return;
 
     const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
@@ -32513,7 +32764,7 @@ fn processSparseEmbedding(
         return;
     };
     defer runtime.alloc.free(source_text);
-    const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source_text, request.producer_json, request.reprocess_generation);
+    const source_hash = retainedTextEmbeddingHashAtRevision(request, source_text, revision);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
@@ -32523,6 +32774,7 @@ fn processSparseEmbedding(
         }
         return;
     }
+    if (input) |*token| if (try carryProducerArtifact(runtime, token, request, artifact_key, source_hash)) return;
 
     noteEmbedBatchStarted(runtime, consumer_indexes, 1, source_text.len, source_text.len);
     const embed_started_ns = runtime.clock.nowRealtimeNs();
@@ -32533,12 +32785,21 @@ fn processSparseEmbedding(
     noteEmbedBatchFinished(runtime, consumer_indexes, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), true);
     defer finishActivePostprocess(runtime);
     defer sparse.deinit(runtime.alloc);
-    if (input) |*token| {
-        const payload = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(runtime.alloc, source_hash, sparse.indices, sparse.values);
-        defer runtime.alloc.free(payload);
-        return enqueueProducerArtifact(runtime, token, artifact_key, payload);
-    }
-    try writeSparseEmbeddingArtifact(runtime, request.doc_key, embedding_artifact_name, source_hash, sparse.indices, sparse.values);
+    if (!std.meta.eql(revision, try sparse_embedder.captureRevision(runtime.alloc, embedding_artifact_name))) return error.EnrichmentSourceChanged;
+    const payload = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(runtime.alloc, source_hash, sparse.indices, sparse.values);
+    defer runtime.alloc.free(payload);
+    if (input) |*token| return enqueueProducerArtifact(runtime, token, artifact_key, payload);
+    var accepted: [1]bool = undefined;
+    try storeGuardedEmbeddingsWithRetry(runtime, &.{.{
+        .key = artifact_key,
+        .value = payload,
+        .source_key = doc_store_key,
+        .source_digest = sourceRecordDigest(raw),
+        .doc_key = request.doc_key,
+        .source_sequence = request.sequence,
+        .kind = .sparse_embedding,
+    }}, &accepted);
+    if (!accepted[0]) return;
     try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
 
     var embeddings = try singleSparseEmbeddingForConsumers(runtime, request.doc_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
@@ -38859,6 +39120,521 @@ test "ordered artifact inventory authored document callbacks bypass providers an
         } else try processSparseEmbedding(runtime, request, &cache, &window);
         try std.testing.expectEqual(@as(usize, 0), harness.calls);
     }
+}
+
+test "ordered artifact inventory direct producers carry unchanged input across unrelated row changes" {
+    for ([_]u64{ 0, 1 }) |generation| {
+        try testOrderedDirectProducerCarry(true, generation);
+        try testOrderedDirectProducerCarry(false, generation);
+    }
+}
+
+fn testOrderedDirectProducerCarry(dense: bool, reprocess_generation: u64) !void {
+    const alloc = std.testing.allocator;
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const publication = ordered_publication;
+    const Harness = struct {
+        encoded: ?[]u8 = null,
+        publications: usize = 0,
+        provider_calls: usize = 0,
+        generation: u8 = 1,
+        fn enqueue(ptr: *anyopaque, _: publication.Namespace, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const copy = try std.testing.allocator.dupe(u8, bytes);
+            if (self.encoded) |old| std.testing.allocator.free(old);
+            self.encoded = copy;
+            self.publications += 1;
+        }
+        fn caps(ptr: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(self.generation) };
+        }
+        fn revision(ptr: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @splat(self.generation);
+        }
+        fn embed(ptr: *anyopaque, a: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.provider_calls += 1;
+            return a.dupe(f32, &.{ @floatFromInt(self.provider_calls), 2 });
+        }
+        fn planned(raw: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, _: ?inference_request_context.RequestContext, _: inference_work.CapabilityLease) ![]const []const f32 {
+            const rows = try a.alloc([]const f32, texts.len);
+            var n: usize = 0;
+            errdefer {
+                for (rows[0..n]) |row| a.free(row);
+                a.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, a, name, text, dims);
+                n += 1;
+            }
+            return rows;
+        }
+        fn sparse(ptr: *anyopaque, a: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.provider_calls += 1;
+            const indices = try a.dupe(u32, &.{1});
+            errdefer a.free(indices);
+            return .{ .indices = indices, .values = try a.dupe(f32, &.{@floatFromInt(self.provider_calls)}) };
+        }
+    };
+    var harness: Harness = .{};
+    defer if (harness.encoded) |bytes| alloc.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/direct-carry", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false, .artifact_publication_dispatcher = .{ .ptr = &harness, .enqueue = Harness.enqueue } });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .expected_dims = if (dense) 2 else 0 });
+    try db.addIndex(.{ .name = "vector", .kind = if (dense) .dense_vector else .sparse_vector, .config_json = if (dense) "{\"field\":\"dense\",\"dims\":2,\"embedding_name\":\"model\"}" else "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
+    var index: u64 = 1;
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"same\",\"uri\":\"file:///a\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = index });
+    var catalog = try db.artifactInventoryCommand(alloc);
+    defer catalog.catalogs.deinit(alloc);
+    // Exercise admission's actual protocol selection for dense AND sparse.
+    try std.testing.expectEqual(@as(u16, 17), catalog.binding.effect_protocol);
+    index += 1;
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = index });
+    var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activation.publication_digest = activation.digest();
+    index += 1;
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = index });
+    try db.reconfigureEnrichmentRuntimePaused(.{
+        .enable_without_producers = true,
+        .dense_embedder = .{ .ptr = &harness, .dense_embed_fn = Harness.embed, .cache_revision_fn = Harness.revision, .capabilities_fn = Harness.caps, .dense_embed_batch_planned_fn = Harness.planned },
+        .sparse_embedder = .{ .ptr = &harness, .sparse_embed_fn = Harness.sparse, .cache_revision_fn = Harness.revision },
+    });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer pin.release();
+    var request = pin.plan().generated_templates[0];
+    request.doc_key = "doc";
+    request.reprocess_generation = reprocess_generation;
+    if (reprocess_generation != 0) {
+        const intent = @import("../artifact_reprocess_intent.zig");
+        const key = try intent.embeddingKeyAlloc(alloc, "doc", requestEmbeddingName(request));
+        defer alloc.free(key);
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(key, &intent.encode(request.producer_json, reprocess_generation));
+        try txn.commit();
+    }
+
+    var cache: std.ArrayListUnmanaged(WorkerChunkCacheEntry) = .empty;
+    defer freeWorkerChunkCache(alloc, &cache);
+    var sources = PreparedDocumentSourceCache.init(runtime);
+    defer sources.deinit();
+    var window: GeneratedReplayWindow = .{ .alloc = alloc };
+    defer window.deinit();
+    const output = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(output);
+
+    const Step = struct {
+        fn run(rt: *EnrichmentRuntime, is_dense: bool, req: enrichment_types.GeneratedEnrichmentRequest, c: *std.ArrayListUnmanaged(WorkerChunkCacheEntry), s: *PreparedDocumentSourceCache, w: *GeneratedReplayWindow) !void {
+            if (is_dense) return processDenseEmbedding(rt, req, c, s, w);
+            return processSparseEmbedding(rt, req, c, w);
+        }
+    };
+    const expect = std.testing;
+
+    // First execution calls the provider and publishes through ordered apply.
+    try expect.expectError(error.ArtifactPublicationPending, Step.run(runtime, dense, request, &cache, &sources, &window));
+    try expect.expectEqual(@as(usize, 1), harness.provider_calls);
+    {
+        var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+        defer decoded.deinit();
+        index += 1;
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
+    }
+    try Step.run(runtime, dense, request, &cache, &sources, &window);
+    try expect.expectEqual(@as(usize, 1), harness.provider_calls);
+    const first = blk: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        break :blk try alloc.dupe(u8, try read.get(output));
+    };
+    defer alloc.free(first);
+
+    // An unrelated change is a receipt miss, but republishes the same bytes.
+    index += 1;
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"same\",\"uri\":\"s3://b/a\"}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = index });
+    try expect.expectError(error.ArtifactPublicationPending, Step.run(runtime, dense, request, &cache, &sources, &window));
+    try expect.expectEqual(@as(usize, 1), harness.provider_calls);
+    try expect.expectEqual(@as(usize, 2), harness.publications);
+    {
+        var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+        defer decoded.deinit();
+        try expect.expectEqualSlices(u8, first, decoded.command.mutations[0].value.?);
+        index += 1;
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
+    }
+    // The carried output is itself accepted for the new row.
+    try Step.run(runtime, dense, request, &cache, &sources, &window);
+    try expect.expectEqual(@as(usize, 1), harness.provider_calls);
+    try expect.expectEqual(@as(usize, 2), harness.publications);
+
+    // A changed input is not carried.
+    index += 1;
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"different\",\"uri\":\"s3://b/a\"}" }}, .timestamp_ns = 102 }, .{ .term = 1, .index = index });
+    try expect.expectError(error.ArtifactPublicationPending, Step.run(runtime, dense, request, &cache, &sources, &window));
+    try expect.expectEqual(@as(usize, 2), harness.provider_calls);
+    {
+        var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+        defer decoded.deinit();
+        index += 1;
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
+    }
+
+    // Nor is a new model behind the same alias.
+    harness.generation = 2;
+    try expect.expectError(error.ArtifactPublicationPending, Step.run(runtime, dense, request, &cache, &sources, &window));
+    try expect.expectEqual(@as(usize, 3), harness.provider_calls);
+}
+
+test "ordered artifact inventory embedding output carry forward fails closed" {
+    const alloc = std.testing.allocator;
+    const dense: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .dense_embedding, .index_name = "v", .artifact_name = "m", .embedding_name = "m", .doc_key = "doc", .source_field = "body", .expected_dims = 2 };
+    const encoded = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 7, &.{ 1, 2 });
+    defer alloc.free(encoded);
+    const unhashed = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &.{ 1, 2 });
+    defer alloc.free(unhashed);
+    try std.testing.expect(try embeddingOutputCarriesForward(alloc, dense, encoded, 7));
+    try std.testing.expect(!try embeddingOutputCarriesForward(alloc, dense, encoded, 8));
+    try std.testing.expect(!try embeddingOutputCarriesForward(alloc, dense, unhashed, 7));
+    try std.testing.expect(!try embeddingOutputCarriesForward(alloc, dense, "not an artifact", 7));
+    var other = dense;
+    other.expected_dims = 3;
+    try std.testing.expect(!try embeddingOutputCarriesForward(alloc, other, encoded, 7));
+    other = dense;
+    other.reprocess_generation = 1;
+    const old_hash = retainedTextEmbeddingHashAtRevision(dense, "text", null);
+    const current_hash = retainedTextEmbeddingHashAtRevision(other, "text", null);
+    const before_reprocess = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, old_hash, &.{ 1, 2 });
+    defer alloc.free(before_reprocess);
+    try std.testing.expect(!try embeddingOutputCarriesForward(alloc, other, before_reprocess, current_hash));
+    const after_reprocess = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, current_hash, &.{ 1, 2 });
+    defer alloc.free(after_reprocess);
+    try std.testing.expect(try embeddingOutputCarriesForward(alloc, other, after_reprocess, current_hash));
+    other.reprocess_generation = 2;
+    try std.testing.expect(!try embeddingOutputCarriesForward(alloc, other, after_reprocess, retainedTextEmbeddingHashAtRevision(other, "text", null)));
+    other = dense;
+    other.source_field = @import("../../../privacy/document.zig").source_field;
+    try std.testing.expect(!try embeddingOutputCarriesForward(alloc, other, encoded, 7));
+    other = dense;
+    other.kind = .sparse_embedding;
+    try std.testing.expect(!try embeddingOutputCarriesForward(alloc, other, encoded, 7));
+}
+
+test "ordered artifact inventory dense parts hash covers inline bytes but never an unfetched url" {
+    const alloc = std.testing.allocator;
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .dense_embedding, .index_name = "v", .artifact_name = "m", .embedding_name = "m", .doc_key = "doc", .source_field = "body" };
+    const first = (try densePartsSourceHash(alloc, request, &.{ .{ .text = "t" }, .{ .binary = .{ .mime_type = "image/png", .data = "a" } } }, null)).?;
+    const same = (try densePartsSourceHash(alloc, request, &.{ .{ .text = "t" }, .{ .binary = .{ .mime_type = "image/png", .data = "a" } } }, null)).?;
+    const changed = (try densePartsSourceHash(alloc, request, &.{ .{ .text = "t" }, .{ .binary = .{ .mime_type = "image/png", .data = "b" } } }, null)).?;
+    const revised = (try densePartsSourceHash(alloc, request, &.{ .{ .text = "t" }, .{ .binary = .{ .mime_type = "image/png", .data = "a" } } }, @splat(1))).?;
+    try std.testing.expectEqual(first, same);
+    try std.testing.expect(first != changed);
+    try std.testing.expect(first != revised);
+    try std.testing.expectEqual(@as(?u64, null), try densePartsSourceHash(alloc, request, &.{ .{ .text = "t" }, .{ .media_url = "https://example.test/a.png" } }, null));
+}
+
+test "ordered artifact inventory dense parts hash preserves legacy bytes without allocating" {
+    const a = std.testing.allocator;
+    var bytes: [9000]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = @truncate(i);
+    for ([_]usize{ 0, 1, 2, 3, 3071, 3072, 3073, 9000 }) |size| {
+        const parts: []const template.ContentPart = &.{ .{ .text = "quote\"\n\x01/é" }, .{ .binary = .{ .mime_type = "video/mp4", .data = bytes[0..size] } } };
+        const json = try contentPartsJsonAlloc(a, parts);
+        defer a.free(json);
+        for ([_][]const u8{ "", "producer" }) |producer| for ([_]u64{ 0, 1, 2 }) |generation| {
+            const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .dense_embedding, .index_name = "v", .doc_key = "doc", .source_field = "body", .producer_json = producer, .reprocess_generation = generation };
+            const expected = retainedTextEmbeddingHashAtRevision(request, json, @splat(3));
+            const actual = (try densePartsSourceHash(std.testing.failing_allocator, request, parts, @splat(3))).?;
+            try std.testing.expectEqual(expected, actual);
+        };
+    }
+}
+
+test "ordered artifact inventory chunk vectors carry unchanged text across unrelated row changes" {
+    try testOrderedChunkVectorCarry(true);
+    try testOrderedChunkVectorCarry(false);
+}
+
+fn testOrderedChunkVectorCarry(dense: bool) !void {
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const inventory = @import("../artifact_chunk_manifest.zig");
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        encoded: ?[]u8 = null,
+        provider_calls: usize = 0,
+        publications: usize = 0,
+        generation: u8 = 1,
+        fn caps(ptr: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(self.generation) };
+        }
+        fn planned(ptr: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, _: ?inference_request_context.RequestContext, _: inference_work.CapabilityLease) ![]const []const f32 {
+            const rows = try a.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| a.free(row);
+                a.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embedDense(ptr, a, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
+        }
+        fn revision(ptr: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @splat(self.generation);
+        }
+        fn enqueue(ptr: *anyopaque, _: ordered_publication.Namespace, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const copy = try std.testing.allocator.dupe(u8, bytes);
+            if (self.encoded) |old| std.testing.allocator.free(old);
+            self.encoded = copy;
+            self.publications += 1;
+        }
+        fn embedSparse(ptr: *anyopaque, a: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.provider_calls += 1;
+            const indices = try a.dupe(u32, &.{1});
+            errdefer a.free(indices);
+            return .{ .indices = indices, .values = try a.dupe(f32, &.{@floatFromInt(self.provider_calls)}) };
+        }
+        fn embedDense(ptr: *anyopaque, a: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.provider_calls += 1;
+            return a.dupe(f32, &.{ @floatFromInt(self.provider_calls), 2 });
+        }
+        fn embedDenseBatch(ptr: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext) ![]const []const f32 {
+            try context.check();
+            const rows = try a.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| a.free(row);
+                a.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embedDense(ptr, a, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
+        }
+        fn process(self: *@This(), runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow, use_dense: bool) !void {
+            if (use_dense) {
+                var scope: FailureScope = .{};
+                return processMaterializedChunkDenseRequest(runtime, request, "chunks", "model", .{ .ptr = self, .dense_embed_fn = embedDense, .dense_embed_batch_with_context_fn = embedDenseBatch, .cache_revision_fn = revision, .capabilities_fn = caps, .dense_embed_batch_planned_fn = planned }, &.{"vector"}, window, &scope);
+            }
+            return processMaterializedChunkSparseRequest(runtime, request, "chunks", "model", .{ .ptr = self, .sparse_embed_fn = embedSparse, .cache_revision_fn = revision }, &.{"vector"}, window);
+        }
+        fn apply(self: *@This(), db: *db_mod.DB, index: u64) !void {
+            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(std.testing.allocator, self.encoded.?);
+            defer decoded.deinit();
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
+        }
+    };
+    var harness: Harness = .{};
+    defer if (harness.encoded) |bytes| alloc.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-vector-carry", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false, .artifact_publication_dispatcher = .{ .ptr = &harness, .enqueue = Harness.enqueue } });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 100 });
+    try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .source_artifact_name = "chunks", .expected_dims = if (dense) 2 else 0 });
+    try db.addIndex(.{ .name = "vector", .kind = if (dense) .dense_vector else .sparse_vector, .config_json = if (dense) "{\"field\":\"dense\",\"dims\":2,\"embedding_name\":\"model\"}" else "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"hello world\",\"uri\":\"file:///a\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    const manifest_key = try inventory.keyAlloc(alloc, "doc", "chunks");
+    defer alloc.free(manifest_key);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(manifest_key, &inventory.Builder.init().finish().encode());
+        try txn.commit();
+    }
+    var catalog = try db.artifactInventoryCommand(alloc);
+    defer catalog.catalogs.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 18), catalog.binding.effect_protocol);
+    catalog.binding.effect_protocol = 18;
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activation.publication_digest = activation.digest();
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    var chunk_request = for (plan.plan().generated_templates) |candidate| {
+        if (candidate.kind == .chunk_text) break candidate;
+    } else return error.TestUnexpectedResult;
+    chunk_request.doc_key = "doc";
+    var vector_request = for (plan.plan().generated_templates) |candidate| {
+        if (candidate.kind == (if (dense) enrichment_types.GeneratedEnrichmentKind.dense_embedding else enrichment_types.GeneratedEnrichmentKind.sparse_embedding)) break candidate;
+    } else return error.TestUnexpectedResult;
+    vector_request.doc_key = "doc";
+    var cache: std.ArrayListUnmanaged(WorkerChunkCacheEntry) = .empty;
+    defer freeWorkerChunkCache(runtime.alloc, &cache);
+    var window: GeneratedReplayWindow = .{ .alloc = runtime.alloc };
+    defer window.deinit();
+
+    try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, chunk_request, &cache, &window, null));
+    try harness.apply(&db, 4);
+    try std.testing.expectError(error.ArtifactPublicationPending, harness.process(runtime, vector_request, &window, dense));
+    try std.testing.expectEqual(@as(usize, 1), harness.provider_calls);
+    try harness.apply(&db, 5);
+    var first: ?[]u8 = null;
+    defer if (first) |bytes| alloc.free(bytes);
+    {
+        var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+        defer decoded.deinit();
+        first = try alloc.dupe(u8, decoded.command.mutations[0].value.?);
+    }
+
+    // The chunk text is unchanged, so the receipt miss republishes those bytes.
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"hello world\",\"uri\":\"s3://b/a\"}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = 6 });
+    try std.testing.expectError(error.ArtifactPublicationPending, processChunkText(runtime, chunk_request, &cache, &window, null));
+    try harness.apply(&db, 7);
+    try std.testing.expectError(error.ArtifactPublicationPending, harness.process(runtime, vector_request, &window, dense));
+    try std.testing.expectEqual(@as(usize, 1), harness.provider_calls);
+    {
+        var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+        defer decoded.deinit();
+        try std.testing.expectEqualSlices(u8, first.?, decoded.command.mutations[0].value.?);
+    }
+    const stale = try alloc.dupe(u8, harness.encoded.?);
+    defer alloc.free(stale);
+    try harness.apply(&db, 8);
+    var next_index: u64 = 9;
+    for ([_]u8{ 1, 2, 2 }) |generation| {
+        harness.generation = generation;
+        var complete = false;
+        for (0..32) |_| {
+            const before = harness.publications;
+            harness.process(runtime, vector_request, &window, dense) catch |err| switch (err) {
+                error.ArtifactPublicationPending => {
+                    if (harness.publications > before) {
+                        try harness.apply(&db, next_index);
+                        next_index += 1;
+                    }
+                    continue;
+                },
+                else => return err,
+            };
+            complete = true;
+            break;
+        }
+        try std.testing.expect(complete);
+        try std.testing.expectEqual(@as(usize, generation), harness.provider_calls);
+    }
+    // An old execution for unchanged causal input must not replace generation 2.
+    var old = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, stale);
+    defer old.deinit();
+    const output_key = old.command.mutations[0].key;
+    const before = blk: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        break :blk try alloc.dupe(u8, try read.get(output_key));
+    };
+    defer alloc.free(before);
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = old.command }, .{ .term = 1, .index = next_index });
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualSlices(u8, before, try read.get(output_key));
+}
+
+test "ordered artifact inventory legacy direct sparse writes fence the source and model generation" {
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        db: ?*db_mod.DB = null,
+        calls: usize = 0,
+        generation: u8 = 1,
+        rewrite: bool = false,
+        fn revision(ptr: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @splat(self.generation);
+        }
+        fn embed(ptr: *anyopaque, a: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.rewrite) {
+                self.rewrite = false;
+                const primary = try internal_keys.documentKeyAlloc(a, "doc");
+                defer a.free(primary);
+                var txn = try self.db.?.core.store.beginWriteTxn();
+                errdefer txn.abort();
+                try txn.put(primary, "{\"body\":\"newer\"}");
+                try txn.commit();
+            }
+            const indices = try a.dupe(u32, &.{1});
+            errdefer a.free(indices);
+            return .{ .indices = indices, .values = try a.dupe(f32, &.{1}) };
+        }
+    };
+    var harness: Harness = .{};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/legacy-sparse-fence", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    harness.db = &db;
+    try db.setSchemaJson(alloc, "{}");
+    try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body" });
+    try db.addIndex(.{ .name = "vector", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"older\"}" }}, .sync_level = .write });
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .sparse_embedder = .{ .ptr = &harness, .sparse_embed_fn = Harness.embed, .cache_revision_fn = Harness.revision } });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer pin.release();
+    var request = pin.plan().generated_templates[0];
+    request.doc_key = "doc";
+    var cache: std.ArrayListUnmanaged(WorkerChunkCacheEntry) = .empty;
+    defer freeWorkerChunkCache(runtime.alloc, &cache);
+    var window: GeneratedReplayWindow = .{ .alloc = runtime.alloc };
+    defer window.deinit();
+    const output = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(output);
+    const Stored = struct {
+        fn hash(d: *db_mod.DB, key: []const u8) !?u64 {
+            var read = try d.core.store.beginReadTxn();
+            defer read.abort();
+            const raw = read.get(key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            return enrichment_artifact_codec.sourceHash(raw);
+        }
+    };
+
+    // The row changed during inference, so the older result is not stored.
+    harness.rewrite = true;
+    try processSparseEmbedding(runtime, request, &cache, &window);
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+    try std.testing.expectEqual(@as(?u64, null), try Stored.hash(&db, output));
+
+    try processSparseEmbedding(runtime, request, &cache, &window);
+    try std.testing.expectEqual(@as(usize, 2), harness.calls);
+    const stored = (try Stored.hash(&db, output)).?;
+    try std.testing.expectEqual(retainedTextEmbeddingHashAtRevision(request, "newer", @splat(1)), stored);
+
+    // Same model and input skips; a new model behind the alias does not.
+    try processSparseEmbedding(runtime, request, &cache, &window);
+    try std.testing.expectEqual(@as(usize, 2), harness.calls);
+    harness.generation = 2;
+    try processSparseEmbedding(runtime, request, &cache, &window);
+    try std.testing.expectEqual(@as(usize, 3), harness.calls);
 }
 
 test "ordered artifact inventory chunk vector callback publishes and retires without reinference after acceptance" {

@@ -6540,6 +6540,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, source_url, config_json, config);
             defer if (metadata_fingerprint) |fingerprint| alloc.free(fingerprint);
+            // As in async replay, checksum opt-in requires verified bytes;
+            // metadata-only legacy fingerprints cannot prove that provenance.
             if (!force_reprocess) {
                 if (metadata_fingerprint) |fingerprint| {
                     if (existing_state) |state| {
@@ -6591,6 +6593,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (extraction_budgeted) |*budgeted| budgeted.deinit();
             const extraction_alloc = if (extraction_budgeted) |*budgeted| budgeted.allocator() else alloc;
 
+            // See the matching log in enrichment_runtime.zig's
+            // processDocumentExtractionAsset: past this point the declared
+            // digest, if any, did not already prove this extraction
+            // unnecessary.
+            std.log.info("document extraction fetching source: doc_key={s} artifact={s}", .{ request.doc_key, artifact_name });
             const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
                 extraction_alloc,
                 remoteRenderConfig(db, null),
@@ -6618,6 +6625,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             var downloaded_mut = downloaded;
             defer downloaded_mut.deinit(extraction_alloc);
+
+            // Verify the declared digest against the bytes actually fetched,
+            // before any of them can be extracted, embedded, or otherwise
+            // referenced. downloaded_mut.data is already fully buffered by
+            // this path, so hashing it here adds no additional buffering,
+            // only an extra pass over memory already resident.
+            if (config.checksum_algorithm != null and config.checksum.len > 0) {
+                var content_digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(downloaded_mut.data, &content_digest, .{});
+                var content_digest_hex: [64]u8 = undefined;
+                document_extraction_mod.hexBytesBuf(&content_digest, &content_digest_hex);
+                document_extraction_mod.verifyChecksumDigestHex(config, &content_digest_hex) catch |raw_err| {
+                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(raw_err), "declared checksum does not match the downloaded bytes", "document_checksum_verification", artifact_writes);
+                    return;
+                };
+            }
 
             // Downloaded bytes, inspection state, and decoded extraction results are
             // charged at their actual live allocator size. OCR render scratch plus
