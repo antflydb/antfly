@@ -190,7 +190,7 @@ final class StoreProtocol: URLProtocol, @unchecked Sendable {
   @Test @MainActor func deleteFollowsOriginalDestinationAndCancelsEveryQueuedCopy() async throws {
     let directory = try testDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
-    HistoryDeleteProtocol.hosts = []
+    HistoryDeleteProtocol.destinations = []
     HistoryDeleteProtocol.failure = false
     let options = URLSessionConfiguration.ephemeral
     options.protocolClasses = [HistoryDeleteProtocol.self]
@@ -210,7 +210,11 @@ final class StoreProtocol: URLProtocol, @unchecked Sendable {
     store.config.table = "new"
     try await store.deleteRetainedHistory()
     #expect(store.history.isEmpty)
-    #expect(Set(HistoryDeleteProtocol.hosts) == ["original.example", "copy.example"])
+    #expect(
+      Set(HistoryDeleteProtocol.destinations) == [
+        "https://original.example/db/v1/tables/dictation/batch",
+        "https://copy.example/db/v1/tables/second/batch",
+      ])
     #expect(await store.outbox?.status().pending == 0)
     let restarted = try HistoryOutbox(
       directory: directory.appendingPathComponent("outbox"), paused: true,
@@ -266,12 +270,12 @@ final class StoreProtocol: URLProtocol, @unchecked Sendable {
 
 }
 private final class HistoryDeleteProtocol: URLProtocol, @unchecked Sendable {
-  nonisolated(unsafe) static var hosts: [String] = []
+  nonisolated(unsafe) static var destinations: [String] = []
   nonisolated(unsafe) static var failure = false
   override class func canInit(with request: URLRequest) -> Bool { true }
   override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
   override func startLoading() {
-    Self.hosts.append(request.url!.host!)
+    Self.destinations.append(request.url!.absoluteString)
     let response = HTTPURLResponse(
       url: request.url!, statusCode: Self.failure ? 503 : 200,
       httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
@@ -328,4 +332,28 @@ func deletionBarrierWaitsForDispatchedUploadInsteadOfCancelingItsResponse() asyn
   #expect(await probe.wasCanceled == false)
   #expect(await queue.status().pending == 0)
   await queue.resume(token)
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func manualHistoryRetryDoesNotRetargetOldTranscriptsAfterConnectionChanges() async throws {
+  let directory = try testDirectory()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let probe = HistoryProbe()
+  await probe.release()
+  let store = Store(
+    directory: directory, registerHotkey: false,
+    historyUpload: { await probe.upload($0, to: $1) })
+  store.config.retainHistory = true
+  store.config.server = "https://original.example"
+  store.config.table = "original"
+  await store.recordHistory(historyEntry(), snapshot: store.config)
+  store.config.server = "https://new.example"
+  store.config.table = "new"
+  store.syncHistory()
+  while store.historyWorking { await Task.yield() }
+  await store.outbox?.waitUntilIdle()
+  #expect(
+    await probe.destinations == [
+      HistoryDestination(server: "https://original.example", table: "original")
+    ])
 }

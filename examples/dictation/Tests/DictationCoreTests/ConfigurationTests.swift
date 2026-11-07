@@ -127,7 +127,7 @@ import Testing
     from: Data(
       """
       {"data":[
-        {"id":"connections/openai/models/whisper-1","task":"transcribe","dictation":{"live_preview":false,"recognition_hints":false,"text_cleanup":true}},
+        {"id":"connections/openai/models/whisper-1","task":"transcribe","dictation":{"live_preview":false,"recognition_hints":false,"text_cleanup":true,"executor":"openai"}},
         {"id":"connections/local-inference/models/openai/whisper-tiny","task":"transcribe","dictation":{"live_preview":false,"recognition_hints":false,"text_cleanup":false}},
         {"id":"generators/cleanup","task":"generate"},
         {"id":"transcribers/whisper","task":"transcribe"}
@@ -136,6 +136,7 @@ import Testing
   var preset = Preset(id: "test", name: "Test")
   preset.cleanupModel = "generators/cleanup"
   preset.selectTranscriber(catalog.data[0])
+  #expect(catalog.data[0].executorName == "openai")
   #expect(preset.usesNamedTranscriber && preset.cleanupModel == "generators/cleanup")
   #expect(preset.cleanupChoices(from: catalog.data).map(\.id) == ["generators/cleanup"])
   var config = Configuration()

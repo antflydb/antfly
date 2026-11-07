@@ -246,11 +246,13 @@ public struct DiscoveredModel: Decodable, Identifiable, Sendable {
     public var live_preview: Bool
     public var recognition_hints: Bool
     public var readiness_error: String?
+    public var executor: String?
   }
   public var id: String
   public var task: String?
   public var executor: String?
   public var dictation: DictationCapabilities?
+  public var executorName: String { executor ?? dictation?.executor ?? "runtime" }
 }
 public struct ModelCatalog: Decodable, Sendable {
   public var data: [DiscoveredModel]

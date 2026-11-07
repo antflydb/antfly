@@ -218,7 +218,7 @@ struct SettingsView: View {
                   }))
               Menu("Choose discovered transcriber") {
                 ForEach(store.models.filter { $0.task == "transcribe" }) { model in
-                  Button("\(model.id) · \(model.executor ?? "runtime")") {
+                  Button("\(model.id) · \(model.executorName)") {
                     preset.selectTranscriber(model)
                   }
                 }
