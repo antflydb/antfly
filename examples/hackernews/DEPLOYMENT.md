@@ -1,10 +1,11 @@
 # Hacker News: Antfly Cloud deployment and standalone qualification
 
 The intended real deployment is an organization-owned Antfly Cloud instance.
-The standalone renderer below is an optional qualification tool, not the Cloud
-provisioning path. This candidate is not deployed or archive-qualified. Complete the regional
+The standalone renderer below is an optional qualification tool. A private bounded
+sample is deployed on Cloud with rc.10; see the qualification record below.
+Full-archive qualification and public launch remain outstanding. Complete the
 public-API gates in `docs/plans/hackernews-deployment-qualification.md` before
-selecting serving resources or exposing `hn.antfly.io`.
+exposing `hn.antfly.io`.
 
 For the real deployment, merge the required runtime fixes and publish an immutable
 Antfly release containing them. Add that image to Colony's development runtime
@@ -23,6 +24,10 @@ retained Lite state volume. The earlier standalone 20 GiB proposal is optional
 qualification infrastructure and is not attached to the real Cloud instance.
 
 ## Managed Cloud setup
+
+See the [rc.10 managed sample qualification](managed-qualification-20261106.md)
+for the existing-state format barrier and the rehearsed fresh-incarnation cutover.
+Verify source-format compatibility before targeting an existing instance.
 
 Use the runtime in `runtime.json` for the database and the producer library.
 Verify that the managed instance reports the pinned image, accepts the gateway's
