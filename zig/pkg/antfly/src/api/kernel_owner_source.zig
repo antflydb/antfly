@@ -6678,8 +6678,15 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (req.restore_staging_plan_id) |plan| if (!std.mem.eql(u8, &plan, &scope.plan_id)) return error.RestoreStagingScopeChanged;
         const empty: db_types.BatchRequest = .{};
         inline for (@typeInfo(db_types.BatchRequest).@"struct".field_names) |field| {
-            if (comptime !std.mem.eql(u8, field, "restore_staging") and !std.mem.eql(u8, field, "restore_staging_scope") and !std.mem.eql(u8, field, "restore_staging_plan_id") and !std.mem.eql(u8, field, "timestamp_ns"))
-                if (!std.meta.eql(@field(req, field), @field(empty, field))) return error.InvalidBatchRequest;
+            if (comptime std.mem.eql(u8, field, "restore_staging") or std.mem.eql(u8, field, "restore_staging_scope") or std.mem.eql(u8, field, "restore_staging_plan_id") or std.mem.eql(u8, field, "timestamp_ns")) continue;
+            const value = @field(req, field);
+            const info = @typeInfo(@TypeOf(value));
+            // The owner encoder emits empty inserts/deletes, and decoding
+            // owns those slices. Their address is not a row/control effect.
+            if (comptime info == .pointer and info.pointer.size == .slice) {
+                if (comptime @field(empty, field).len != 0) @compileError("review nonempty published restore control default: " ++ field);
+                if (value.len != 0) return error.InvalidBatchRequest;
+            } else if (!std.meta.eql(value, @field(empty, field))) return error.InvalidBatchRequest;
         }
         return .{ .group_id = group_id, .scope = captured, .plan_id = scope.plan_id };
     }
@@ -6866,7 +6873,9 @@ pub const ProvisionedKernelOwnerSource = struct {
                 !std.mem.eql(u8, actual.schema_json, descriptor.schema_json) or !std.mem.eql(u8, actual.indexes_json, descriptor.indexes_json) or
                 !std.mem.eql(u8, actual.restore_bootstrap_json, descriptor.restore_bootstrap_json)) return error.RestoreStagingScopeChanged;
         }
-        const observed = try self.catalog.sqlRelationBinding(self.alloc, .{ .node = native.owner_node_id, .binding_table = descriptor.identity.table_id, .creation_scope = creation_scope }, controls.execution_deadline_ns);
+        const publication_request: ?@import("../metadata/sql_relation_boots.zig").PublishedRestoreRequest = if (published) |selected| .{ .creation_scope = creation_scope orelse return error.RestoreStagingScopeChanged, .scope_digest = selected.scope, .table_id = descriptor.identity.table_id, .group_id = selected.group_id } else null;
+        const observed = try self.catalog.sqlRelationBinding(self.alloc, .{ .node = native.owner_node_id, .binding_table = descriptor.identity.table_id, .creation_scope = creation_scope, .published_restore = publication_request }, controls.execution_deadline_ns);
+        if (publication_request) |expected| try (observed.published_restore orelse return error.RestoreStagingScopeChanged).requireFor(expected);
         const current_boot = try self.requireCurrentNativeBoot(native, observed);
         const boot = if (published != null) published_boot: {
             if (current_boot.phase != .ready and current_boot.phase != .recovering) return error.SqlRelationOwnerChanged;
@@ -13611,8 +13620,17 @@ test "SQL relation lifetime native retirement preparation captures only exact in
             if (self.change_boot_on_read == self.boot_reads) self.observation.record.?.generation += 1;
             return self.observation;
         }
+        fn point(raw: *anyopaque, table: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (deadline_ns) |at| if (platform_time.monotonicNs() >= at) return error.CatalogRoutingSnapshotTimeout;
+            if (!std.mem.eql(u8, table, self.tables[0].name)) return error.TableNotFound;
+            // A bounded descriptor capture uses the same honest complete
+            // table/range cut, rather than the unbounded diagnostic fallback.
+            return .{ .metadata_group_id = 1, .catalog_revision = 1, .tables = &self.tables, .ranges = &self.ranges };
+        }
+        fn freePoint(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
         fn catalog(self: *@This()) table_catalog.CatalogSource {
-            return .{ .ptr = self, .vtable = &.{ .admin_snapshot = admin, .free_admin_snapshot = free, .sql_relation_boot = boot } };
+            return .{ .ptr = self, .vtable = &.{ .admin_snapshot = admin, .free_admin_snapshot = free, .sql_relation_boot = boot, .table_routing_snapshot = point, .free_routing_snapshot = freePoint } };
         }
         fn attach(self: *@This(), source: *ProvisionedKernelOwnerSource, handle: *anyopaque, process: [16]u8) !void {
             _ = self;
@@ -13837,25 +13855,37 @@ test "SQL relation lifetime published native restore control authenticates curre
     try bootstrap.validate();
     const encoded_bootstrap = try std.json.Stringify.valueAlloc(a, bootstrap, .{});
     defer a.free(encoded_bootstrap);
+    // First initialize the ordinary native image. Attaching restore bootstrap
+    // creates a hidden staging owner, whose generic binding read is fenced.
+    const binding = initialized: {
+        var initializing = try source.acquireDescriptorWithMode(172, "rows", owner_path, descriptor, true, .transient, .{ .native_initialization = true });
+        defer initializing.deinit();
+        initializing.requestTransientRetirement();
+        break :initialized try initializing.owner().nativeRelationBinding(a, "rows");
+    };
     descriptor.restore_bootstrap_json = encoded_bootstrap;
-    var initializing = try source.acquireDescriptorWithMode(172, "rows", owner_path, descriptor, true, .transient, .{ .native_initialization = true });
-    const binding = try initializing.owner().nativeRelationBinding(a, "rows");
-    initializing.requestTransientRetirement();
-    initializing.deinit();
     const root = try local.storage_db_root_signing_identity.loadOrCreate(a, io, root_path);
-    const identity: @import("../metadata/store_root_enrollment.zig").Identity = .{ .metadata_incarnation = @splat('p'), .node_id = 9, .store_id = 11, .root_incarnation = root.root_incarnation, .public_key = root.public_key };
+    const identity: @import("../metadata/store_root_enrollment.zig").Identity = .{ .metadata_incarnation = @splat('c'), .node_id = 9, .store_id = 11, .root_incarnation = root.root_incarnation, .public_key = root.public_key };
 
     const Fixture = struct {
         descriptor: descriptor_contract.Descriptor,
         expected_scope: [32]u8,
         expected_plan: [16]u8,
         published: bool = true,
+        emit_publication: bool = true,
         calls: usize = 0,
         value: boots.Observation,
         fn boot(raw: *anyopaque, _: std.mem.Allocator, query: boots.Query, _: ?u64) !boots.Observation {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (query.node != 9 or query.binding_table != 7) return error.SqlRelationOwnerChanged;
-            return self.value;
+            var result = self.value;
+            if (query.published_restore) |request| {
+                if (!self.published) return error.RestoreStagingInProgress;
+                try std.testing.expectEqual(self.expected_scope, request.scope_digest);
+                try std.testing.expectEqual(self.expected_plan, request.creation_scope.plan_id);
+                if (self.emit_publication) result.published_restore = .{ .request = request, .revision = 7 };
+            }
+            return result;
         }
         fn recover(raw: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, selected_scope: [32]u8, plan: [16]u8, use: ProvisionedKernelOwnerSource.RestoreDescriptorUse, input: request_operation.RequestContext) !ProvisionedKernelOwnerSource.OwnedRestoreDescriptor {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -13891,12 +13921,35 @@ test "SQL relation lifetime published native restore control authenticates curre
     try std.testing.expectEqualDeep(binding, proof.initialized);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expect(proof.empty_target == null);
+    // Old/malformed providers cannot substitute readiness or an initialized
+    // signature for the new exact current-definition observation.
+    fixture.emit_publication = false;
+    try std.testing.expectError(error.RestoreStagingScopeChanged, source.nativeProofForDescriptor(descriptor, selected));
+    fixture.emit_publication = true;
     // Reopen the initialized image through the actual CABI owner. Publication
     // authority remains the callback's concern; this asserts only owner open.
     {
         var opened = try source.acquireDescriptorWithMode(172, "rows", owner_path, descriptor, false, .resident, selected);
         defer opened.deinit();
-        try std.testing.expectEqualDeep(binding, try opened.owner().nativeRelationBinding(a, "rows"));
+        const actual = try opened.owner().nativeRelationBinding(a, "rows");
+        try std.testing.expect(actual.descriptor.eql(binding.descriptor));
+        try std.testing.expectEqualSlices(u8, &binding.native_instance, &actual.native_instance);
+        try std.testing.expect((try P.PhysicalPin.fromBinding(actual)).eql(try P.PhysicalPin.fromBinding(binding)));
+        // Exercise independently decoded lookup bytes through the actual CABI
+        // hidden owner, with no row scope or fabricated publication receipt.
+        const immutable_read = try table_reads.encodeStorageKernelLookupRequest(a, "", .{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}" });
+        defer a.free(immutable_read);
+        var immutable_response = try opened.owner().lookupJson("rows", immutable_read);
+        defer immutable_response.deinit();
+        const mixed_digest = try table_reads.encodeStorageKernelLookupRequest(a, "", .{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}", .include_primary_digest = true });
+        defer a.free(mixed_digest);
+        try std.testing.expectError(error.RestoreStagingInProgress, opened.owner().lookupJson("rows", mixed_digest));
+        const mixed_fields = try table_reads.encodeStorageKernelLookupRequest(a, "", .{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}", .fields = &.{"id"} });
+        defer a.free(mixed_fields);
+        try std.testing.expectError(error.RestoreStagingInProgress, opened.owner().lookupJson("rows", mixed_fields));
+        const row_read = try table_reads.encodeStorageKernelLookupRequest(a, "hidden-row", .{});
+        defer a.free(row_read);
+        try std.testing.expectError(error.RestoreStagingInProgress, opened.owner().lookupJson("rows", row_read));
     }
     const observed_calls = fixture.calls;
     // A resident hidden descriptor must not suppress the fresh published cut.
@@ -13932,6 +13985,26 @@ test "SQL relation lifetime published native restore control authenticates curre
     fixture.value.registration_current = true;
     var finish: db_types.BatchRequest = .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } }, .restore_staging_scope = scope.digest(), .restore_staging_plan_id = scope.plan_id };
     try std.testing.expect((try ProvisionedKernelOwnerSource.publishedRestoreBatchSelection(a, 172, descriptor, finish)) != null);
+    const encoded_finish = try table_writes.encodeStorageKernelBatchRequest(a, finish);
+    defer a.free(encoded_finish);
+    var decoded_finish = try local.api_batch.parseInternalBatchRequest(a, encoded_finish);
+    defer decoded_finish.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), decoded_finish.req.writes.len);
+    try std.testing.expectEqual(@as(usize, 0), decoded_finish.req.deletes.len);
+    try std.testing.expect((try ProvisionedKernelOwnerSource.publishedRestoreBatchSelection(a, 172, descriptor, decoded_finish.req)) != null);
+    var decoded_mixed = decoded_finish.req;
+    decoded_mixed.deletes = &.{"must-not-delete"};
+    const encoded_mixed = try table_writes.encodeStorageKernelBatchRequest(a, decoded_mixed);
+    defer a.free(encoded_mixed);
+    var roundtrip_mixed = try local.api_batch.parseInternalBatchRequest(a, encoded_mixed);
+    defer roundtrip_mixed.deinit(a);
+    try std.testing.expectError(error.InvalidBatchRequest, ProvisionedKernelOwnerSource.publishedRestoreBatchSelection(a, 172, descriptor, roundtrip_mixed.req));
+    decoded_mixed = decoded_finish.req;
+    decoded_mixed.row_policy_principal_proof = "must-not-borrow-row-authority";
+    try std.testing.expectError(error.InvalidBatchRequest, ProvisionedKernelOwnerSource.publishedRestoreBatchSelection(a, 172, descriptor, decoded_mixed));
+    decoded_mixed = decoded_finish.req;
+    decoded_mixed.relational_repair = true;
+    try std.testing.expectError(error.InvalidBatchRequest, ProvisionedKernelOwnerSource.publishedRestoreBatchSelection(a, 172, descriptor, decoded_mixed));
     finish.deletes = &.{"must-not-delete"};
     try std.testing.expectError(error.InvalidBatchRequest, ProvisionedKernelOwnerSource.publishedRestoreBatchSelection(a, 172, descriptor, finish));
     finish.deletes = &.{};

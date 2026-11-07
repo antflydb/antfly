@@ -14712,7 +14712,10 @@ pub const DataServer = struct {
         const table_index = indexed.table_id_indexes.get(namespace.table_id) orelse return error.RestoreStagingInProgress;
         const table = indexed.snapshot.value.tables[table_index];
         if (!std.mem.eql(u8, table.name, table_name)) return error.RestoreStagingScopeChanged;
-        if (expected) |value| if (!antfly.metadata.table_manager.tableDefinitionsEqual(value, table)) return error.RestoreStagingScopeChanged;
+        // Routing generations intentionally omit schema/index bytes. Their
+        // preserved native identity is checked here; Source separately demands
+        // the full current definition from the same-cut fixed Boot query.
+        if (expected) |value| if (!std.meta.eql(value.sql_persistence, table.sql_persistence)) return error.RestoreStagingScopeChanged;
         const range_index = indexed.group_indexes.get(group_id) orelse return error.RestoreStagingScopeChanged;
         const range = indexed.snapshot.value.ranges[range_index];
         if (range.table_id != namespace.table_id or antfly.metadata.table_manager.rangeDocIdentityShardId(range) != namespace.shard_id or

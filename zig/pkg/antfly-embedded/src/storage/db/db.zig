@@ -22354,7 +22354,22 @@ pub const DB = struct {
         // The private initialization/adoption port reads only immutable image
         // facts. It must work before a reserved restore image imports data;
         // adding any row/index/digest option retains the ordinary scope gate.
-        const binding_only = key.len == 0 and std.meta.eql(opts, types.LookupOptions{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}" });
+        const binding_only = binding_only: {
+            if (key.len != 0 or !std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"sql_relation_binding\"}")) break :binding_only false;
+            const defaults: types.LookupOptions = .{};
+            var normalized = opts;
+            normalized.relational_topology_json = defaults.relational_topology_json;
+            // Decoded wire strings and empty slices need not share the
+            // defaults' address. Only semantic empty defaults are normalized;
+            // every nondefault selector/authority still keeps the scope gate.
+            inline for (@typeInfo(types.LookupOptions).@"struct".field_names) |field| switch (@typeInfo(@FieldType(types.LookupOptions, field))) {
+                .pointer => |pointer| if (comptime pointer.size == .slice) {
+                    if (@field(normalized, field).len == 0 and @field(defaults, field).len == 0) @field(normalized, field) = @field(defaults, field);
+                },
+                else => {},
+            };
+            break :binding_only std.meta.eql(normalized, defaults);
+        };
         if (!binding_only and (self.local_execution.restore_staging_required.load(.acquire) or opts.restore_staging_scope != null)) {
             var staging_read = try self.core.store.beginProbeTxn();
             defer staging_read.abort();
@@ -153017,6 +153032,17 @@ test "db native unpublished empty image replacement uses real new roots and pres
         defer if (alive) db.closeImmutableSnapshot();
         try db.reserveRestoreStagingScoped(a, scope);
         try db.installRestoreStagingBootstrap(a, bootstrap);
+        const decoded_selector = try a.dupe(u8, "{\"mode\":\"sql_relation_binding\"}");
+        defer a.free(decoded_selector);
+        const empty_fields = try a.alloc([]const u8, 0);
+        defer a.free(empty_fields);
+        var immutable_image = (try db.lookup(a, "", .{ .relational_topology_json = decoded_selector, .fields = empty_fields })) orelse return error.TestUnexpectedResult;
+        defer immutable_image.deinit(a);
+        var image = try std.json.parseFromSlice(p.NativeBinding, a, immutable_image.json, .{});
+        defer image.deinit();
+        try std.testing.expectEqual(db.root_incarnation, image.value.physical_root_incarnation);
+        try std.testing.expectError(error.RestoreStagingInProgress, db.lookup(a, "", .{ .relational_topology_json = decoded_selector, .fields = &.{"id"} }));
+        try std.testing.expectError(error.RestoreStagingInProgress, db.lookup(a, "hidden-row", .{ .relational_topology_json = decoded_selector }));
         try std.testing.expectError(error.RestoreStagingInProgress, db.lookup(a, "hidden-row", .{}));
         try std.testing.expectError(error.RestoreStagingInProgress, db.lookup(a, "", .{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}", .include_primary_digest = true }));
         const root = db.root_incarnation;

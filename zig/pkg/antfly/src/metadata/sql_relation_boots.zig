@@ -101,7 +101,29 @@ pub const MaintenanceLease = struct {
     }
 };
 
+/// A closed read request for the published current table definition. It is
+/// delivery evidence only; it authorizes no native rows or generic controls.
+pub const PublishedRestoreRequest = struct {
+    creation_scope: @import("sql_relation_attestation.zig").CreationScope,
+    scope_digest: [32]u8,
+    table_id: u64,
+    group_id: u64,
+    pub fn validate(self: @This()) !void {
+        try self.creation_scope.validate();
+        if (self.table_id == 0 or self.group_id == 0 or std.mem.allEqual(u8, &self.scope_digest, 0)) return error.RestoreStagingScopeChanged;
+    }
+};
+pub const PublishedRestoreProof = struct {
+    request: PublishedRestoreRequest,
+    revision: u64,
+    pub fn requireFor(self: @This(), expected: PublishedRestoreRequest) !void {
+        try expected.validate();
+        if (self.revision == 0 or !std.meta.eql(self.request, expected)) return error.RestoreStagingScopeChanged;
+    }
+};
+
 pub const Observation = struct {
+    published_restore: ?PublishedRestoreProof = null,
     maintenance: ?MaintenanceLease = null,
     restore_terminal: ?@import("sql_relation_restore_terminal.zig").Proof = null,
     data_version_ready: ?bool = null,
@@ -122,6 +144,7 @@ pub const Observation = struct {
     lost_generation: ?@import("sql_relation_recovery.zig").RetiredGeneration = null,
 
     pub fn jsonStringify(self: Observation, writer: anytype) !void {
+        if (self.published_restore != null) return writer.write(.{ .record = self.record, .registration_current = self.registration_current, .initialized = self.initialized, .attempt = self.attempt, .published_restore = self.published_restore });
         if (self.maintenance != null) return writer.write(.{ .record = self.record, .registration_current = self.registration_current, .initialized = self.initialized, .maintenance = self.maintenance });
         if (self.restore_terminal != null) return writer.write(.{ .record = self.record, .registration_current = self.registration_current, .restore_terminal = self.restore_terminal });
         if (self.data_version_ready) |ready| return writer.write(.{ .record = self.record, .registration_current = self.registration_current, .data_version_ready = ready });
@@ -164,6 +187,7 @@ pub const AbandonedTemporaryPage = struct {
 };
 
 pub const Query = struct {
+    published_restore: ?PublishedRestoreRequest = null,
     maintenance: ?MaintenanceRequest = null,
     restore_terminal: ?@import("sql_relation_restore_terminal.zig").Query = null,
     required_data_version: ?u16 = null,
@@ -187,7 +211,7 @@ pub const Query = struct {
     pub fn jsonStringify(self: Query, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Query).@"struct".field_names) |field| {
-            if (comptime std.mem.eql(u8, field, "maintenance") or std.mem.eql(u8, field, "restore_terminal") or std.mem.eql(u8, field, "required_data_version") or std.mem.eql(u8, field, "binding_table") or std.mem.eql(u8, field, "report_group") or std.mem.eql(u8, field, "creation_scope") or std.mem.eql(u8, field, "temporary_namespaces") or std.mem.eql(u8, field, "temporary_retirement") or std.mem.eql(u8, field, "lost_generation") or std.mem.eql(u8, field, "lost_temporary") or std.mem.eql(u8, field, "temporary_abandonment") or std.mem.eql(u8, field, "unpublished_retirement") or std.mem.eql(u8, field, "unpublished_group") or std.mem.eql(u8, field, "recovery_capture") or std.mem.eql(u8, field, "retired_group")) {
+            if (comptime std.mem.eql(u8, field, "published_restore") or std.mem.eql(u8, field, "maintenance") or std.mem.eql(u8, field, "restore_terminal") or std.mem.eql(u8, field, "required_data_version") or std.mem.eql(u8, field, "binding_table") or std.mem.eql(u8, field, "report_group") or std.mem.eql(u8, field, "creation_scope") or std.mem.eql(u8, field, "temporary_namespaces") or std.mem.eql(u8, field, "temporary_retirement") or std.mem.eql(u8, field, "lost_generation") or std.mem.eql(u8, field, "lost_temporary") or std.mem.eql(u8, field, "temporary_abandonment") or std.mem.eql(u8, field, "unpublished_retirement") or std.mem.eql(u8, field, "unpublished_group") or std.mem.eql(u8, field, "recovery_capture") or std.mem.eql(u8, field, "retired_group")) {
                 if (@field(self, field) != null) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));

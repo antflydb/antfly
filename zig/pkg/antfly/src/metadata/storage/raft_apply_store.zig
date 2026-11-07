@@ -22795,10 +22795,49 @@ pub const RaftApplyStore = struct {
         return @import("../sql_relation_recovery_store.zig").read(a, txn, group, incarnation, query);
     }
 
+    fn publishedRestoreDefinitionTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, selected: sql_relation_boots.PublishedRestoreRequest) !sql_relation_boots.PublishedRestoreProof {
+        try selected.validate();
+        var key: [384]u8 = undefined;
+        const raw = (try stagingGet(txn, try restore_staging.jobKey(&key, group, selected.creation_scope.plan_id))) orelse return error.RestoreStagingScopeChanged;
+        if (raw.len == 0 or raw.len > restore_staging.max_encoded_bytes) return error.InvalidRestoreStaging;
+        const job = try std.json.parseFromSliceLeaky(restore_staging.Job, a, raw, .{});
+        if (!std.mem.eql(u8, &job.plan.id, &selected.creation_scope.plan_id) or !std.mem.eql(u8, &job.plan_digest, &selected.creation_scope.plan_digest) or
+            !std.mem.eql(u8, &try job.plan.digest(a), &job.plan_digest)) return error.RestoreStagingScopeChanged;
+        const target = for (job.plan.targets) |candidate| {
+            if (candidate.table.table_id == selected.table_id) break candidate;
+        } else return error.RestoreStagingScopeChanged;
+        const captured = for (target.ranges) |candidate| {
+            if (candidate.group_id == selected.group_id) break candidate;
+        } else return error.RestoreStagingScopeChanged;
+        const scope = try restore_staging.ownerScope(a, job.plan, job.plan_digest, target, captured);
+        if (scope.native_empty_origin == null or target.table.sql_persistence == null or !std.mem.eql(u8, &scope.digest(), &selected.scope_digest)) return error.RestoreStagingScopeChanged;
+        const progress_raw = (try stagingGet(txn, try restore_staging.progressKey(&key, group, job.plan.id))) orelse return error.InvalidRestoreStaging;
+        if (progress_raw.len == 0 or progress_raw.len > restore_staging.max_encoded_bytes) return error.InvalidRestoreStaging;
+        const progress = try std.json.parseFromSliceLeaky(restore_staging.Progress, a, progress_raw, .{});
+        if (progress.state != .published) return error.RestoreStagingInProgress;
+        const actual = (try self.getTableTxn(a, txn, group, selected.table_id)) orelse return error.RestoreStagingScopeChanged;
+        var expected = target.table;
+        expected.restore_backup_id = "";
+        expected.restore_location = "";
+        if (!metadata_table_manager.tableDefinitionsEqual(expected, actual)) return error.RestoreStagingScopeChanged;
+        const range = try decodeRangeRecord(a, (try stagingGet(txn, try rangeKeyForGroup(&key, group, selected.group_id))) orelse return error.RestoreStagingScopeChanged);
+        if (range.table_id != actual.table_id or metadata_table_manager.rangeDocIdentityShardId(range) != scope.target_namespace.shard_id or
+            metadata_table_manager.rangeDocIdentityRangeId(range) != scope.target_namespace.range_id or !std.mem.eql(u8, range.start_key, captured.start_key) or
+            ((range.end_key == null) != (captured.end_key == null)) or !std.mem.eql(u8, range.end_key orelse "", captured.end_key orelse "")) return error.RestoreStagingScopeChanged;
+        return .{ .request = selected, .revision = progress.revision };
+    }
+
     pub fn sqlRelationBootJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, query: sql_relation_boots.Query) ![]u8 {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         _ = try self.standbyRelationActivationTxn(&txn, group, topology_protocol.sql_relation_persistence_version);
+        if (query.published_restore) |selected| {
+            try selected.validate();
+            if (query.node == null or query.binding_table != selected.table_id or !std.meta.eql(query.creation_scope, @as(?@import("../sql_relation_attestation.zig").CreationScope, selected.creation_scope))) return error.RestoreStagingScopeChanged;
+            inline for (@typeInfo(sql_relation_boots.Query).@"struct".field_names) |field| {
+                if (comptime !std.mem.eql(u8, field, "published_restore") and !std.mem.eql(u8, field, "node") and !std.mem.eql(u8, field, "binding_table") and !std.mem.eql(u8, field, "creation_scope") and !std.mem.eql(u8, field, "limit")) if (@field(query, field) != null) return error.InvalidSqlRelationPersistence;
+            }
+        }
         if (query.maintenance) |selected| {
             try selected.validate();
             inline for (@typeInfo(sql_relation_boots.Query).@"struct".field_names) |field| {
@@ -23069,7 +23108,8 @@ pub const RaftApplyStore = struct {
         const empty_target = if (current and value != null) try self.sqlRelationEmptyTargetTxn(report_arena.allocator(), &txn, group, query, value.?) else null;
         const effective_attempt = if (query.creation_scope != null and query.binding_table != null) try @import("../sql_relation_target_images.zig").effectiveAttempt(report_arena.allocator(), &txn, group, query.creation_scope.?, query.binding_table.?) else null;
         const image_attempt = if (query.creation_scope != null and query.binding_table != null) try @import("../sql_relation_target_images.zig").currentAttempt(&txn, group, query.creation_scope.?, query.binding_table.?) else null;
-        return try std.json.Stringify.valueAlloc(alloc, sql_relation_boots.Observation{ .record = value, .registration_current = current, .initialized = initialized, .uninitialized = uninitialized, .report_digest = report_digest, .empty_target = empty_target, .attempt = if (effective_attempt) |attempt| .{ .number = attempt.number, .digest = attempt.digest } else null, .image_attempt = image_attempt }, .{});
+        const publication = if (query.published_restore) |selected| try self.publishedRestoreDefinitionTxn(report_arena.allocator(), &txn, group, selected) else null;
+        return try std.json.Stringify.valueAlloc(alloc, sql_relation_boots.Observation{ .published_restore = publication, .record = value, .registration_current = current, .initialized = initialized, .uninitialized = uninitialized, .report_digest = report_digest, .empty_target = empty_target, .attempt = if (effective_attempt) |attempt| .{ .number = attempt.number, .digest = attempt.digest } else null, .image_attempt = image_attempt }, .{});
     }
 
     fn sqlRelationUninitializedAdmissionTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, query: sql_relation_boots.Query, boot: sql_relation_boots.Record) !?@import("antfly_local_sources").common_topology_records.RelationPersistence.UninitializedAdmission {
@@ -77784,5 +77824,132 @@ test "SQL scope retirement TEMP maintenance joins live metadata source separatel
             try txn.commit();
             try std.testing.expectError(error.SqlTemporaryRelationNotOwned, store.sqlRelationBootJson(a, group, .{ .maintenance = request }));
         }
+    }
+}
+
+test "SQL native image published restore proof binds full current metadata across cold reopen" {
+    const backing = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-published-proof", .{tmp.sub_path});
+    const group = group_ids.main_metadata_group_id;
+    const incarnation = "07070707070707070707070707070707".*;
+    const seed: [32]u8 = @splat(7);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const root: @import("antfly_local_sources").storage_db_root_signing_identity.State = .{ .root_incarnation = 11, .seed = seed, .public_key = pair.public_key.toBytes() };
+    const identity: store_root_enrollment.Identity = .{ .metadata_incarnation = incarnation, .node_id = 1, .store_id = 1, .root_incarnation = root.root_incarnation, .public_key = root.public_key };
+    const boot: sql_relation_boots.Record = .{ .node_id = 1, .identity = identity, .reporter_incarnation = 1, .generation = 2, .instance = @splat(8), .claim_digest = @splat(9), .unclean_restart = true, .phase = .ready };
+    const table: metadata.TableRecord = .{ .table_id = 8, .name = "table:hidden-publish", .schema_json = "{\"version\":1}", .desired_replica_count = 1, .sql_persistence = .{ .kind = .unlogged, .owner_node_id = 1, .owner_store_id = 1, .generation_instance = boot.instance, .data_generation = 1 } };
+    const range: metadata.RangeRecord = .{ .table_id = table.table_id, .group_id = 43, .range_id = 43, .doc_identity_shard_id = 43, .doc_identity_range_id = 43, .start_key = "" };
+    const schema_digest = try restore_staging.runtimeSchemaDigestForTable(a, table.schema_json);
+    const target: restore_staging.Target = .{ .source_table_id = 7, .table = table, .ranges = &.{range}, .empty_generation = true, .schema_only_snapshot = .{ .manifest_digest = @splat(3), .schema_digest = schema_digest, .source_table_id = 7 } };
+    const plan: restore_staging.Plan = .{ .id = @splat(1), .cohort_digest = @splat(2), .targets = &.{target} };
+    try plan.validate(a);
+    const job: restore_staging.Job = .{ .plan = plan, .plan_digest = try plan.digest(a) };
+    const scope: @import("../sql_relation_attestation.zig").CreationScope = .{ .plan_id = plan.id, .plan_digest = job.plan_digest };
+    const proof = try @import("../sql_relation_attestation.zig").SignedBinding.sign(.{ .kind = .initialized, .creation_scope = scope, .metadata_group_id = group, .boot_generation = boot.generation, .identity = identity, .reporter_incarnation = boot.reporter_incarnation, .binding = .{ .descriptor = table.sql_persistence.?, .native_instance = boot.instance, .table_id = table.table_id, .shard_id = 43, .range_id = 43, .physical_root_incarnation = 91, .schema_version = 1, .schema_digest = schema_digest, .catalog_generation = 1, .catalog_fingerprint = @splat(4) } }, root);
+    const owner_scope = try restore_staging.ownerScope(a, plan, job.plan_digest, target, range);
+    const selected: sql_relation_boots.PublishedRestoreRequest = .{ .creation_scope = scope, .scope_digest = owner_scope.digest(), .table_id = table.table_id, .group_id = range.group_id };
+    const query: sql_relation_boots.Query = .{ .node = boot.node_id, .binding_table = table.table_id, .creation_scope = scope, .published_restore = selected };
+    for (0..2) |pass| {
+        var store = try RaftApplyStore.init(backing, .{ .root_dir = path });
+        defer store.deinit();
+        if (pass == 0) {
+            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+            {
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                const reporter: metadata.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 1, .replica_root_incarnation = root.root_incarnation, .replica_root_public_key = root.public_key, .schema_reader = metadata_table_manager.SchemaReaderCapabilities.current, .role = "data", .live = true, .relational_topology_protocol_version = metadata_table_manager.native_relation_protocol_version };
+                _ = try store.writeStoreComponentsTxn(&txn, group, reporter.store_id, reporter, false, null, null);
+                try txn.commit();
+            }
+            try store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = try std.json.Stringify.valueAlloc(a, try store_root_enrollment.Request.sign(identity, seed), .{}) });
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var key: [320]u8 = undefined;
+            try txn.put(try sql_relation_boots.key(&key, group, boot.node_id), try std.json.Stringify.valueAlloc(a, boot, .{}));
+            try txn.put(try restore_staging.jobKey(&key, group, plan.id), try std.json.Stringify.valueAlloc(a, job, .{}));
+            try txn.put(try restore_staging.progressKey(&key, group, plan.id), try std.json.Stringify.valueAlloc(a, restore_staging.Progress{ .state = .importing }, .{}));
+            try txn.put(try restore_staging.identityKey(&key, group, .table, table.table_id), &plan.id);
+            try txn.put(try restore_staging.identityKey(&key, group, .group, range.group_id), &plan.id);
+            try @import("../sql_relation_hidden_lifetimes.zig").stagePlan(&txn, group, plan, job.plan_digest);
+            // Existing receiver validates the actual Boot, initialized signature,
+            // reservation and immutable schema before storing this image.
+            try store.stageSqlRelationInitializedBindingTxn(&txn, group, proof);
+            try txn.put(try restore_staging.progressKey(&key, group, plan.id), try std.json.Stringify.valueAlloc(a, restore_staging.Progress{ .state = .activating }, .{}));
+            // Metadata component: model the accepted public cut using the
+            // real prepared table/lifetime writers and retained canonical job.
+            // No physical install/activation ACK is fabricated or asserted.
+            var table_buffer: [320]u8 = undefined;
+            const table_key = try tableKeyForGroup(&table_buffer, group, table.table_id);
+            var prepared = (try store.prepareTableRecordWithNativePublicationTxnMode(&txn, group, table_key, table, false, .{}, &.{}, scope, null)) orelse return error.TestUnexpectedResult;
+            defer prepared.deinit(backing);
+            try store.writePreparedTableRecordTxn(&txn, group, table_key, prepared);
+            try txn.put(try rangeKeyForGroup(&key, group, range.group_id), try encodeRangeRecord(a, range));
+            try store.putTableRangeIndexTxn(&txn, group, table.table_id, range.group_id);
+            try txn.put(try restore_staging.progressKey(&key, group, plan.id), try std.json.Stringify.valueAlloc(a, restore_staging.Progress{ .state = .published, .revision = 9, .completed_owners = 1 }, .{}));
+            try @import("../sql_relation_hidden_lifetimes.zig").removePlan(&txn, group, plan, job.plan_digest);
+            try txn.delete(try restore_staging.identityKey(&key, group, .table, table.table_id));
+            try txn.delete(try restore_staging.identityKey(&key, group, .group, range.group_id));
+            try txn.commit();
+        }
+
+        const bytes = try store.sqlRelationBootJson(a, group, query);
+        const observed = try std.json.parseFromSliceLeaky(sql_relation_boots.Observation, a, bytes, .{});
+        try observed.published_restore.?.requireFor(selected);
+        try std.testing.expectEqual(@as(u64, 9), observed.published_restore.?.revision);
+        try std.testing.expect(observed.registration_current and observed.record.?.phase == .ready);
+        try observed.initialized.?.verify();
+        try std.testing.expectEqualSlices(u8, &try proof.digest(), &try observed.initialized.?.digest());
+        // Immutable Job state is not the mutable published Progress.
+        var key: [384]u8 = undefined;
+        {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            const retained_job = try std.json.parseFromSliceLeaky(restore_staging.Job, a, try read.get(try restore_staging.jobKey(&key, group, plan.id)), .{});
+            try std.testing.expectEqual(restore_staging.State.importing, retained_job.state);
+        }
+        for (0..7) |negative| {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var request = selected;
+            switch (negative) {
+                0 => request.scope_digest[0] ^= 1,
+                1 => request.creation_scope.plan_id[0] ^= 1,
+                2 => request.creation_scope.plan_digest[0] ^= 1,
+                3, 4, 5 => {
+                    var changed = table;
+                    if (negative == 3) changed.schema_json = "{\"version\":2}";
+                    if (negative == 4) changed.indexes_json = "{\"by_id\":{\"type\":\"full_text\",\"field\":\"id\"}}";
+                    if (negative == 5) changed.sql_persistence.?.data_generation += 1;
+                    // Aborted current-record substitutions demonstrate that a
+                    // compact routing definition cannot certify the full cut.
+                    try txn.put(try tableKeyForGroup(&key, group, table.table_id), try encodeTableRecord(a, changed));
+                },
+                6 => {
+                    var changed = range;
+                    changed.doc_identity_shard_id += 1;
+                    try txn.put(try rangeKeyForGroup(&key, group, range.group_id), try encodeRangeRecord(a, changed));
+                },
+                else => unreachable,
+            }
+            try std.testing.expectError(error.RestoreStagingScopeChanged, store.publishedRestoreDefinitionTxn(a, &txn, group, request));
+        }
+        {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            try txn.put(try restore_staging.progressKey(&key, group, plan.id), try std.json.Stringify.valueAlloc(a, restore_staging.Progress{ .state = .activating, .revision = 8 }, .{}));
+            try std.testing.expectError(error.RestoreStagingInProgress, store.publishedRestoreDefinitionTxn(a, &txn, group, selected));
+        }
+        // Every negative abort leaves the exact current published proof intact,
+        // including after the next genuine DocStore cold reopen.
+        const replay = try store.sqlRelationBootJson(a, group, query);
+        const again = try std.json.parseFromSliceLeaky(sql_relation_boots.Observation, a, replay, .{});
+        try again.published_restore.?.requireFor(selected);
+        try std.testing.expectEqual(@as(u64, 9), again.published_restore.?.revision);
     }
 }
