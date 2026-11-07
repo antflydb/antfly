@@ -2770,6 +2770,48 @@ pub const Owner = struct {
         if (self.embedding_memo) |*memo| memo.deinit(&self.embedding_memo_budget);
         for (self.retired.items) |retired| h.closeHandle(retired);
         if (self.current) |current| {
+            // This is the owner's own, still-authoritative generation going
+            // away for good (the last Connection closed) -- not a
+            // generation retired because another owner already committed a
+            // newer one (see the `previous.lease_snapshot = true` sites
+            // above, where discarding pending writes is correct because a
+            // newer durable generation already exists). There is no newer
+            // generation here, so any work still riding along on this
+            // owner's native file (a background text-segment merge, a WS5
+            // retirement turn, a deferred progress-v2 record -- anything
+            // committed through `setDurable(false)`/`.ride_along` that has
+            // not yet piggybacked on a later durable sync) must be flushed
+            // durable before teardown. Without this, `closeHandle` would
+            // route through `DB.closeImmutableSnapshot()` (via
+            // `handle.lease_snapshot`), which sets `discard_storage_writes`
+            // and skips `deinitWrapperState`'s own close-time
+            // `syncStore(true)` (gated on `open_mode.allowsIndexWorkers()`,
+            // false once `closeImmutableSnapshot` switches to
+            // `.query_readonly`) -- silently dropping the most recently
+            // acknowledged write's ride-along effects on an entirely
+            // ordinary, crash-free `close()`.
+            //
+            // `DB.sync`/`DB.syncIndexes` are the wrong tool here: both
+            // forward through `backend_erased`'s type-erased `sync(ptr,
+            // force)`, which is a silent no-op unless the concrete backend
+            // Handle declares its own `sync` method -- Lite's
+            // `storage/lite/backend.zig` `Backend` does not, so those calls
+            // would do nothing. The actual durability barrier for Lite's
+            // native file is `NativeFile.sync()` (publishes
+            // `durable_header` if a deferred/ride-along commit left one
+            // pending), reached here through `Store.syncIndexContents()`
+            // (storage/lite/docstore.zig) -- named for its other caller
+            // (the LSM virtual-filesystem sync hook in index_storage.zig)
+            // but generic: "a durability barrier [that] allocates no pages
+            // and requires no allocator admission, retirement service, or
+            // synthetic mutation transaction."
+            if (!current.lease_snapshot and current.owned_lite_backend != null and h.liteOpenModeCanWrite(current.open_mode)) {
+                if (current.owned_lite_backend.?.native_docstore) |store| {
+                    store.syncIndexContents() catch |err| {
+                        std.log.warn("owner close-time sync deferred: {s}", .{@errorName(err)});
+                    };
+                }
+            }
             current.lease_snapshot = true;
             h.closeHandle(current);
         }
@@ -6089,3 +6131,36 @@ test "capi native recovery agenda repeated compaction invalidates a clean metada
         try std.testing.expectError(error.SqlStatementReadUnavailable, @import("sql_ddl.zig").requireRecovered(refreshed, &refreshed.db, "default"));
     }
 }
+
+// docs/design/lite-performance/throughput-profile.md §6: a sustained
+// single-writer `sync_level: full_index` run eventually acknowledges a
+// write that is never searchable again, even after close + reopen +
+// run_until_idle(), with no crash involved. Root cause: `Owner.deinit()`
+// (the real shutdown path behind `antfly_db_close` for the last Connection
+// on an Owner -- the path every real SDK/capi caller, including the
+// scripts/bench/lite_sqlite_comparison.py repro, goes through) marked its
+// own still-current, still-authoritative generation `lease_snapshot = true`
+// before closing it. That flag means "a NEWER generation already committed
+// over this one, so discard whatever this one has pending" (see the
+// `previous.lease_snapshot = true` call sites earlier in this file, where
+// that is true). There is no newer generation at ordinary shutdown -- this
+// generation IS the durable truth -- so `closeHandle` routed it through
+// `DB.closeImmutableSnapshot()` (`discard_storage_writes = true`,
+// `.query_readonly`), skipping the owner's own idle-flush/close durability
+// barrier. Anything still riding along on the shared native file at that
+// moment -- a background text-segment merge's catalog commit
+// (`persistent.zig`'s `replaceSegmentsWithReservedIdOwned`,
+// `txn.setDurable(false)`), a WS5 retirement turn (`DocStore.serviceRetirement`
+// -> `commitRideAlong`), or a deferred progress-v2 record
+// (`apply_state.contributeProgressDeferred`) -- never got published and was
+// silently discarded, not rolled back to a consistent prior state: the
+// write had already returned success to its caller. See
+// `storage/lite/crash_consistency_test.zig`'s "a ride-along commit needs an
+// explicit durability barrier before close, or it is lost" for a
+// deterministic, native-file-level proof of exactly this mechanism (one
+// `commitTransactionWithDurability(false)` that disappears on a plain
+// close + reopen unless something -- a later durable commit, or an
+// explicit `NativeFile.sync()` -- publishes it first), and the fix above
+// in `Owner.deinit()`, which supplies that durability barrier
+// (`Store.syncIndexContents()`, which reaches `NativeFile.sync()`) for the
+// owner's own final generation instead of skipping it.
