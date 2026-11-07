@@ -4297,6 +4297,27 @@ pub const NativeGenerationPipeline = struct {
         return self.lockExecutionPhase(mutex, .step);
     }
 
+    fn storeGeneratedPrefixBestEffort(
+        self: *const NativeGenerationPipeline,
+        cache: *runtime.kv.prompt_cache.PromptPrefixCache,
+        namespace: []const u8,
+        tokens: []const i64,
+        sequence_id: runtime.kv.manager.SequenceId,
+    ) void {
+        // Simple/block_hash modes do not retain continuations. Check under the
+        // metadata lock before waiting for execution; store revalidates later.
+        if (!cache.generatedPrefixStoreEnabled()) return;
+        var scope = if (self.execution_lock) |mutex| self.lockExecution(mutex) catch |err| {
+            // Optional publication must not fail an already completed result.
+            std.log.warn("radix continuation cache scope unavailable: {s}", .{@errorName(err)});
+            return;
+        } else null;
+        defer if (scope) |*active| active.deinit();
+        cache.storeGeneratedPrefixFromSequence(namespace, tokens, sequence_id) catch |err| {
+            std.log.warn("radix continuation cache store failed: {s}", .{@errorName(err)});
+        };
+    }
+
     fn lockKvMetadata(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) !ExecutionScope {
         // Backends without an explicit stream-drain contract keep the normal
         // request transition. The CUDA cooperative scope can advance host KV
@@ -7046,8 +7067,6 @@ pub const NativeGenerationPipeline = struct {
         // page-aligns that valid prefix and is a no-op for non-radix modes.
         if (tokens_generated > 0) {
             if (self.prompt_cache) |cache| {
-                var cache_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
-                defer if (cache_scope) |*scope| scope.deinit();
                 const cache_eligible =
                     config.prompt_cache_enabled and
                     config.prompt_cache_key != null and
@@ -7061,15 +7080,12 @@ pub const NativeGenerationPipeline = struct {
                     decode_state.kv_manager == cache.managerPtr();
                 if (cache_eligible) {
                     if (decode_state.sequence_id) |sequence_id| {
-                        cache.storeGeneratedPrefixFromSequence(
+                        self.storeGeneratedPrefixBestEffort(
+                            cache,
                             config.prompt_cache_key.?,
                             token_ids[0 .. seq_len - 1],
                             sequence_id,
-                        ) catch |err| {
-                            // A cache admission failure must not discard an
-                            // otherwise complete generation response.
-                            std.log.warn("radix continuation cache store failed: {s}", .{@errorName(err)});
-                        };
+                        );
                     }
                 }
             }
@@ -17910,6 +17926,67 @@ test "execution scope KV metadata requires an attached cache and drain capabilit
         defer scope.deinit();
     }
     try std.testing.expectEqual(@as(usize, if (enabled) 2 else 3), probe.entries);
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+}
+
+test "prompt cache continuation publication skips unused modes and preserves completed results" {
+    const Probe = struct {
+        const Failure = enum { none, timeout, cancelled, enter };
+        failure: Failure = .none,
+        checks: usize = 0,
+        entries: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            switch (self.failure) {
+                .timeout => return error.Timeout,
+                .cancelled => return error.Cancelled,
+                else => {},
+            }
+        }
+        fn enter(raw: *anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.entries += 1;
+            if (self.failure == .enter) return error.TestScopeUnavailable;
+        }
+    };
+    var probe = Probe{ .failure = .timeout };
+    var mutex: std.atomic.Mutex = .unlocked;
+    var cache = runtime.kv.prompt_cache.PromptPrefixCache.init(std.testing.allocator);
+    defer cache.deinit();
+    cache.configure(.{ .enabled = true, .mode = .simple, .min_tokens = 2 });
+    const pool = (try cache.ensurePool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2 })).?;
+    const sequence = try cache.manager.attachSequence(pool);
+    try cache.manager.appendTokens(sequence, 4);
+    const pipeline = NativeGenerationPipeline{
+        .allocator = std.testing.allocator,
+        .cb = .{ .ptr = &probe, .vtable = undefined, .execution_enter = Probe.enter, .execution_owner = 1 },
+        .gpt_config = .{},
+        .tokenizer = undefined,
+        .execution_lock = &mutex,
+        .execution_control = .{ .ptr = &probe, .check_fn = Probe.check },
+    };
+    for ([_]runtime.kv.prompt_cache.Mode{ .simple, .block_hash }) |mode| {
+        cache.configure(.{ .enabled = true, .mode = mode, .min_tokens = 2 });
+        pipeline.storeGeneratedPrefixBestEffort(&cache, "tenant", &.{ 1, 2, 3, 4 }, sequence);
+        try std.testing.expectEqual(@as(usize, 0), probe.checks);
+        try std.testing.expectEqual(@as(usize, 0), probe.entries);
+        try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
+    }
+    cache.configure(.{ .enabled = true, .mode = .radix, .min_tokens = 2 });
+    for ([_]Probe.Failure{ .timeout, .cancelled, .enter }) |failure| {
+        probe = .{ .failure = failure };
+        pipeline.storeGeneratedPrefixBestEffort(&cache, "tenant", &.{ 1, 2, 3, 4 }, sequence);
+        try std.testing.expect(probe.checks > 0);
+        try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
+        try std.testing.expect(mutex.tryLock());
+        mutex.unlock();
+    }
+    probe = .{};
+    pipeline.storeGeneratedPrefixBestEffort(&cache, "tenant", &.{ 1, 2, 3, 4 }, sequence);
+    try std.testing.expectEqual(@as(usize, 1), probe.entries);
+    try std.testing.expectEqual(@as(usize, 1), cache.stats().live_entries);
     try std.testing.expect(mutex.tryLock());
     mutex.unlock();
 }

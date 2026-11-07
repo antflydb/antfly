@@ -285,8 +285,8 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     var batch_imports = suite.tests.root_module.import_table.iterator();
     while (batch_imports.next()) |entry| batch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     batch_root.link_libc = true;
-    // Focused aarch64 CPU/CUDA builds peak at 1 GiB; reserve 2 GiB for cold CI.
-    const batch_tests = b.addTest(.{ .max_rss = 2 * 1024 * 1024 * 1024, .root_module = batch_root, .filters = &.{ "execution scope", "execution owner transitions", "execution resource release", "execution batch", "cooperative decode batches", "cooperative decode publication", "generation cooperative execution", "generation admission work", "prompt cache", "runtime.scheduler.native_generate", "test_0" } });
+    // The expanded aarch64 Debug suite peaks at 3.7 GB; reserve 6 GiB for cold CI.
+    const batch_tests = b.addTest(.{ .max_rss = 6 * 1024 * 1024 * 1024, .root_module = batch_root, .filters = &.{ "execution scope", "execution owner transitions", "execution resource release", "execution batch", "cooperative decode batches", "cooperative decode publication", "generation cooperative execution", "generation admission work", "prompt cache", "runtime.scheduler.native_generate", "test_0" } });
     const run_batch_tests = ctx.addRunArtifact(batch_tests);
     test_step.dependOn(&run_batch_tests.step);
     ctx.step("test-execution-batch", "Verify cohort budgets, scope retirement and decode arithmetic without a GPU").dependOn(&run_batch_tests.step);

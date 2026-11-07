@@ -501,6 +501,14 @@ pub const PromptPrefixCache = struct {
         self.evictToBudget();
     }
 
+    /// Whether continuation publication can do work. Callers can skip acquiring
+    /// an execution scope when false; publication revalidates the configuration.
+    pub fn generatedPrefixStoreEnabled(self: *PromptPrefixCache) bool {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.config.enabled and self.config.mode == .radix and self.pool_id != null;
+    }
+
     /// Retain a materialized prompt-plus-generation prefix in the radix tree.
     /// Callers must exclude the final sampled token: autoregressive decoding
     /// has allocated its logical slot, but does not write that token's KV until

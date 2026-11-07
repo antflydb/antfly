@@ -25582,7 +25582,7 @@ pub const Node = struct {
             return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
         if (try self.acquireSlotUnits(ctx, 1)) |response| return response;
         defer self.releaseSlotUnits(1);
-        const selected = self.resolveRequestModelSelection(ctx.allocator, ctx.io, body.model, "generators") catch |err| return requestModelResolutionError(ctx, err);
+        const selected = self.resolveRequestModelSelection(ctx.allocator, ctx.io, if (body.model.len > 0) body.model else null, "generators") catch |err| return requestModelResolutionError(ctx, err);
         const path = selected.path;
         defer ctx.allocator.free(path);
         if (try rejectDisallowedModel(self, ctx, path)) |response| return response;
@@ -50696,6 +50696,46 @@ test "generation placement empty request cannot activate model or reserve KV" {
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 400), response.status.code);
     try std.testing.expectEqual(InferenceHttpRouteAdmission.inference, inferenceHttpRouteAdmission("POST", "/_placement/generate"));
+}
+
+test "generation placement empty model resolves the default generator without loading" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/generators/default");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/generators/default/config.json",
+        .data = "{\"model_type\":\"llama\"}",
+    });
+    const tensor_header = "{\"probe\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    const tensor_header_size = comptime std.mem.alignForward(usize, tensor_header.len, 8);
+    var weights: [8 + tensor_header_size + 4]u8 = @splat(0);
+    std.mem.writeInt(u64, weights[0..8], tensor_header_size, .little);
+    @memset(weights[8..][0..tensor_header_size], ' ');
+    @memcpy(weights[8..][0..tensor_header.len], tensor_header);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/generators/default/model.safetensors",
+        .data = &weights,
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true });
+    defer node.deinit();
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/_placement/generate");
+    defer request.deinit();
+    request.body =
+        \\{"model":"","messages":[{"role":"user","content":"hello"}]}
+    ;
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.estimateGeneratePlacement(&ctx);
+    defer response.deinit();
+    if (response.status.code != 409) std.debug.print("unexpected placement response: {s}\n", .{response.body orelse ""});
+    try std.testing.expectEqual(@as(u16, 409), response.status.code);
+    try std.testing.expectEqualStrings("{\"error\":\"MODEL_NOT_LOADED\"}", response.body.?);
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.in_flight_loads.count());
 }
 
 test "generation placement rejects grammar before model resolution" {
