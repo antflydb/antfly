@@ -3204,7 +3204,12 @@ const LocalStandaloneMetadata = struct {
                 defer if (owned) alloc.free(prior);
                 var previous = try std.json.parseFromSlice(wire.Observation, alloc, prior, .{});
                 defer previous.deinit();
+                try previous.value.requireFor(query.value);
                 if (previous.value.outcome != null) {
+                    // An accepted/lost reply may precede cache adoption. Rejoin
+                    // the canonical catalog head before returning its outcome;
+                    // never rebuild or resubmit the retained scope manifest.
+                    self.certifyProjectionRevisionLocked(try store.standaloneRevision()) catch return error.MetadataMutationOutcomeUnknown;
                     owned = false;
                     return prior;
                 }
@@ -6190,8 +6195,15 @@ const LocalStandaloneMetadata = struct {
     /// Certify a bounded delta against the same authoritative projection
     /// watermark used by metadata admission. Control commits only advance CAS.
     fn certifyProjectionRevisionLocked(self: *LocalStandaloneMetadata, revision: u64) !void {
-        const state = try (self.lifecycle_store orelse return error.UnsupportedOperation).standaloneRevisionState();
+        const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+        const state = try store.standaloneRevisionState();
         if (state.revision != revision) return self.reloadLifecycleProjectionLocked();
+        // A control reply cannot certify a newer logical catalog while this
+        // owner's resource view is older. Check the O(1) native head first;
+        // changed catalogs reload one coherent physical/logical snapshot.
+        // Ordinary progress/ACKs keep their bounded control-only path.
+        const meta = try store.systemCatalogMeta(self.alloc, group_ids.main_metadata_group_id);
+        if (meta.revision != self.systemCatalogState().revision) return self.reloadLifecycleProjectionLocked();
         self.epoch = @max(1, state.projection_revision);
         self.durable_revision = revision;
     }
@@ -19664,6 +19676,101 @@ test "system catalog prepared ordinary DDL submits exact native outcomes through
             try std.testing.expectEqualStrings("retained standalone annotation", annotated.description);
             try std.testing.expectEqualDeep(before, try metadata.lifecycle_store.?.systemCatalogMeta(scratch, group_ids.main_metadata_group_id));
         }
+    }
+}
+
+test "SQL scope retirement standalone publication refreshes the shared catalog before conditional CREATE and cold replay" {
+    if (comptime control_only_storage_sources) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const wire = @import("../metadata/scope_retirement_wire.zig");
+    const protocol = @import("../metadata/topology_protocol.zig");
+    const C = @import("../system_catalog/catalog_mutations.zig");
+    const Command = @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand;
+    const Helper = struct {
+        fn conditionalCreate(alloc: std.mem.Allocator, api: *ApiHttpServer) !void {
+            const body = "{\"statement\":\"CREATE TABLE IF NOT EXISTS scope_after_publication(id INT)\"}";
+            var reply = try antfly.public_api.http_server.RestoreWorkerTestDriver.request(api, .{ .method = .POST, .uri = "/sql", .content_type = "application/json", .body = body });
+            defer reply.deinit(alloc);
+            if (reply.status != 200) std.debug.print("scope publication conditional CREATE status={d} body={s}\n", .{ reply.status, reply.body });
+            try std.testing.expectEqual(@as(u16, 200), reply.status);
+            var result = try std.json.parseFromSlice(struct { command_tag: []const u8 }, alloc, reply.body, .{ .ignore_unknown_fields = true });
+            defer result.deinit();
+            try std.testing.expectEqualStrings("CREATE TABLE", result.value.command_tag);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/scope-publication-cache.json", .{tmp.sub_path});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer backend.deinit();
+    const context: antfly.public_api.operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true };
+    var publication: wire.Request = undefined;
+    var accepted: wire.Outcome = undefined;
+    for (0..2) |pass| {
+        var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        var cancellation: antfly.common.runtime_lifecycle.CancellationSource = .{};
+        try metadata.awaitInitialRelationPublication(std.testing.io, cancellation.token());
+        const source = metadata.statusSource();
+        const store = metadata.lifecycle_store.?;
+        var api = ApiHttpServer.init(a, .{ .backend_runtime = backend.ptr(), .deployment_mode = .standalone }, source, null, null);
+        defer api.deinit();
+        if (pass == 0) {
+            _ = try source.systemCatalog(scratch, context, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .namespace, .name = "scope_to_close" } } });
+            const manifest = try std.json.parseFromSliceLeaky(system_catalog.scope_retirement.Manifest, scratch, try source.systemCatalog(scratch, context, .{ .scope_retirement_prepare = .{ .kind = .namespace, .database = "default", .name = "scope_to_close", .creator = .bootstrap } }), .{});
+            try std.testing.expectEqual(@as(usize, 0), manifest.tables.len);
+            const activation: protocol.Activation = .{ .version = protocol.current_version, .incarnation = std.fmt.bytesToHex(manifest.metadata_incarnation, .lower), .member_count = 1, .membership_fingerprint = @splat(7) };
+            try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(scratch, activation, .{}) });
+            const reserve: wire.Request = .{ .admission = .{ .nonce = @splat(41), .head = manifest.catalog_revision }, .operation = .{ .reserve = manifest } };
+            const reserved = try std.json.parseFromSliceLeaky(wire.Observation, scratch, try source.systemCatalog(scratch, context, .{ .scope_retirement_submit = reserve }), .{});
+            const lookup = reserved.current.?.lookup;
+            const reloads = metadata.lifecycle_projection_reloads;
+            const epoch = metadata.epoch;
+            const drain: wire.Request = .{ .admission = .{ .nonce = @splat(42), .head = 0 }, .operation = .{ .drain = .{ .lookup = lookup, .expected_revision = reserved.current.?.progress.revision } } };
+            const drained = try std.json.parseFromSliceLeaky(wire.Observation, scratch, try source.systemCatalog(scratch, context, .{ .scope_retirement_submit = drain }), .{});
+            try std.testing.expectEqual(system_catalog.scope_retirement.Phase.publishing_catalog, drained.current.?.progress.phase);
+            try std.testing.expectEqual(reloads, metadata.lifecycle_projection_reloads);
+            try std.testing.expectEqual(epoch, metadata.epoch);
+            const stale = try std.json.parseFromSliceLeaky(Command, scratch, try source.systemCatalog(scratch, context, .{ .sql_catalog_prepare = .{ .nonce = @splat(44), .request = .{ .mutation = .{ .action = .create, .kind = .namespace, .name = "stale_scope_create" } } } }), .{});
+            var old_view: ?system_catalog.MutableState = try system_catalog.MutableState.clone(a, metadata.systemCatalogState());
+            defer if (old_view) |*view| view.deinit();
+            publication = .{ .admission = .{ .nonce = @splat(43), .head = 0 }, .operation = .{ .publish = .{ .lookup = lookup, .expected_revision = drained.current.?.progress.revision } } };
+            const published = try std.json.parseFromSliceLeaky(wire.Observation, scratch, try source.systemCatalog(scratch, context, .{ .scope_retirement_submit = publication }), .{});
+            accepted = published.outcome.?;
+            try std.testing.expectEqual(system_catalog.scope_retirement.Phase.published, published.current.?.progress.phase);
+            try std.testing.expectError(error.NamespaceNotFound, metadata.systemCatalogState().namespaceFor("default", "scope_to_close"));
+            try std.testing.expectEqual((try store.systemCatalogMeta(scratch, group_ids.main_metadata_group_id)).revision, metadata.systemCatalogState().revision);
+            try std.testing.expectEqual((try store.standaloneRevisionState()).projection_revision, metadata.epoch);
+            try std.testing.expect(metadata.lifecycle_projection_reloads > reloads);
+            // Reproduce a lost cache-adoption/old-certification window after
+            // the REAL native publication; no native outcome or ACK is forged.
+            if (metadata.system_catalog_state) |*current| current.deinit();
+            metadata.system_catalog_state = old_view.?;
+            old_view = null;
+            metadata.durable_revision = try store.standaloneRevision();
+            const replay = try std.json.parseFromSliceLeaky(wire.Observation, scratch, try source.systemCatalog(scratch, context, .{ .scope_retirement_submit = publication }), .{});
+            try std.testing.expectEqualDeep(accepted, replay.outcome.?);
+            try std.testing.expectError(error.NamespaceNotFound, metadata.systemCatalogState().namespaceFor("default", "scope_to_close"));
+            try std.testing.expectEqual((try store.systemCatalogMeta(scratch, group_ids.main_metadata_group_id)).revision, metadata.systemCatalogState().revision);
+            // The revision guard remains strict for an actually stale command.
+            const rejection = try std.json.parseFromSliceLeaky(C.Outcome, scratch, try source.systemCatalog(scratch, context, .{ .sql_catalog_mutate = stale }), .{});
+            try std.testing.expectError(error.CatalogGenerationChanged, rejection.result());
+        } else {
+            const replay = try std.json.parseFromSliceLeaky(wire.Observation, scratch, try source.systemCatalog(scratch, context, .{ .scope_retirement_submit = publication }), .{});
+            try std.testing.expectEqualDeep(accepted, replay.outcome.?);
+            try std.testing.expectError(error.NamespaceNotFound, metadata.systemCatalogState().namespaceFor("default", "scope_to_close"));
+        }
+        try Helper.conditionalCreate(a, &api);
+        const created = try store.systemCatalogMeta(scratch, group_ids.main_metadata_group_id);
+        try Helper.conditionalCreate(a, &api);
+        try std.testing.expectEqualDeep(created, try store.systemCatalogMeta(scratch, group_ids.main_metadata_group_id));
+        const replay = try std.json.parseFromSliceLeaky(wire.Observation, scratch, try source.systemCatalog(scratch, context, .{ .scope_retirement_submit = publication }), .{});
+        try std.testing.expectEqualDeep(accepted, replay.outcome.?);
+        try std.testing.expectEqual(created.revision, metadata.systemCatalogState().revision);
+        try std.testing.expect((try metadata.resolveSystemCatalogLocked(.{ .table = "scope_after_publication" })) != null);
     }
 }
 
