@@ -118,6 +118,7 @@ pub const Request = struct {
     sql_document_preimage: bool = false,
     include_content_hashes: bool = false,
     include_range_proofs: bool = false,
+    privacy_policy_version: ?[64]u8 = null,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     writes: []const types.BatchWrite = &.{},
@@ -241,6 +242,7 @@ pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope:
         },
         .open => {
             const opened = try owner.openQualified(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, input.from, input.to, .{
+                .privacy_policy_version = input.privacy_policy_version,
                 .relational_query = input.query orelse return error.InvalidRetainedReadQuery,
                 .filter_query_json = input.filter_query_json,
                 .inclusive_from = input.inclusive_from,
@@ -257,6 +259,7 @@ pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope:
         },
         .open_snapshot => {
             const token = try owner.openSnapshot(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, input.from, input.to, .{
+                .privacy_policy_version = input.privacy_policy_version,
                 .relational_query = input.query orelse return error.InvalidRetainedReadQuery,
                 .filter_query_json = input.filter_query_json,
                 .inclusive_from = input.inclusive_from,

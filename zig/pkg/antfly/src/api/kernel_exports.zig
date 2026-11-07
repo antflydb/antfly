@@ -186,6 +186,10 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         }
     else
         server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, imported_cfg, source.*, reads.*, writes.*);
+    state.server.initializeDistributedSql() catch |err| {
+        state.server.deinit();
+        return fail(err);
+    };
     state.server.startPgwire() catch |err| {
         std.log.err("API pgwire listener startup failed: error.{s}", .{@errorName(err)});
         state.server.deinit();
@@ -1227,6 +1231,43 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
         destroy(handle.?);
         handle = null;
         try Probe.run(std.testing.io);
+    }
+}
+
+test "API kernel combined privacy profile rejects34 and mismatched types before borrowed inputs" {
+    var allocator = std.testing.allocator;
+    const owner_alloc = abi.memory_abi.Allocator.fromStd(&allocator);
+    var handle: ?*anyopaque = null;
+    var request_alloc: ?*const abi.memory_abi.Allocator = null;
+    var context: CreateContext = .{
+        .abi_version = 34,
+        .owner_alloc = &owner_alloc,
+        // A rejected profile/contract must never dereference these inputs.
+        .cfg = @ptrFromInt(1),
+        .cfg_contract = .of(server_mod.ApiHttpServerConfig),
+        .source = @ptrFromInt(1),
+        .source_contract = .of(server_mod.StatusSource),
+        .table_reads = @ptrFromInt(1),
+        .table_reads_contract = .of(?table_reads.TableReadSource),
+        .table_writes = @ptrFromInt(1),
+        .table_writes_contract = .of(?table_writes.TableWriteSource),
+        .out_handle = &handle,
+        .out_request_alloc = &request_alloc,
+    };
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(create(&context)));
+    context.abi_version = 33;
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(create(&context)));
+    context.abi_version = 32;
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(create(&context)));
+    context.abi_version = 31;
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(create(&context)));
+    context.abi_version = abi.abi_version;
+    inline for (.{ "cfg_contract", "source_contract", "table_reads_contract", "table_writes_contract" }) |field| {
+        const retained = @field(context, field);
+        @field(context, field).layout_id ^= 1;
+        try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(create(&context)));
+        try std.testing.expect(handle == null and request_alloc == null);
+        @field(context, field) = retained;
     }
 }
 

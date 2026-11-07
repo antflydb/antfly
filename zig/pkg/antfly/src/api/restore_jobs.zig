@@ -5299,3 +5299,10 @@ test "restore trigger actor incarnation survives recovery and cannot change thro
     // an executable actor through a read-only idempotency match.
     try std.testing.expect(legacy.routine_actor == null);
 }
+
+/// The immutable generation Plan owns the notices. Durable compact job records
+/// retain only its exact reference; public observations may project the data.
+pub fn projectTruncatePreparationResultAlloc(a: std.mem.Allocator, base_result: ?[]const u8, prepared: @import("../metadata/restore_staging.zig").TruncatePreparation, digest: [32]u8, include_notices: bool, release_after: bool) ![]u8 {
+    if (prepared.format_version != 1 or prepared.vm_contract_version != @import("antfly_local_sources").sql_catalog.trigger_runtime.predecision_contract_version) return error.InvalidRestoreStaging;
+    return if (include_notices) prepared.projectResultAlloc(a, base_result, digest, release_after) else prepared.projectReferenceAlloc(a, base_result, digest);
+}

@@ -201,3 +201,87 @@ SQL providers.
 Validate quality, thresholds and resource limits on your workload before
 deployment. Preparation and limits are in [Laya](../guides/models/laya.mdx) and
 [EmbeddingGemma 2](../guides/models/embeddinggemma2.mdx).
+
+## Decider cascades
+
+A cascade is a named decider that asks a cheap decider first and sends only
+uncertain inputs to a stronger one. Configure it under `deciders` with
+`decision_method: cascade`; each stage is an inline typed or generated decider.
+
+```yaml
+deciders:
+  same-entity:
+    decision_method: cascade
+    cascade:
+      stages:
+        - name: fast
+          decider: {provider: jev, model: jev-latest}
+        - name: strong
+          decider:
+            decision_method: generated
+            probabilities: verdict_only
+            generator: {provider: anthropic, model: your-strong-model}
+          when:
+            question: same
+            choice: same
+            probability_between: [0.3, 0.9]
+      budget: {max_model_calls: 2, deadline_ms: 10000}
+```
+
+Select it like any other decider: `"model": "deciders/same-entity"` on
+`/ai/v1/decisions`, the decider name in SQL, or the inline configuration in a
+resolver `adjudicate` policy or decision enrichment.
+
+- The first stage answers every input. A later stage runs only for inputs whose
+  previous answer falls inside its inclusive `probability_between` band, and
+  those inputs share one call. `question` limits the band to one question, and
+  `choice` measures that value's probability instead of the selected value's.
+- The final answer is the last answering stage's. Usage is summed over the
+  stages that ran for the input. Shared generated-batch usage is apportioned
+  evenly across each call's inputs, with integer remainders assigned in input
+  order, and marked `usage.estimated: true`. Request totals remain measured.
+  If reported usage exceeds a stage's token limit, every completed call is
+  charged before the stage fails and future windows stop. `keep_previous`
+  retains those paid costs in the failed-stage trace and final usage; inputs
+  that were not submitted incur no model usage.
+- Only choice and predicate questions are accepted, because bands read
+  probabilities. Embedding-similarity deciders and nested cascades cannot be
+  stages, and a band cannot follow a `verdict_only` generated stage.
+- Escalation applies to successful answers. It is not failover: a stage error
+  ends the input unless that stage sets `on_failure: keep_previous`, which keeps
+  the previous answer and records the error. The first stage defaults to `fail`;
+  explicitly setting `on_failure: fail` is equivalent to omission, while
+  `keep_previous` requires a preceding stage. A later stage's operational failure
+  does not discard confident siblings that already completed an earlier stage.
+- `budget.max_model_calls` (at most 8, at least the stage count) bounds stage
+  invocations; `budget.deadline_ms` narrows the caller's deadline.
+- Each stage keeps its own rate limits, row and token budgets, and media
+  limits across batches in the same statement. Set row, token and batch limits
+  on the stage deciders. The cascade admits images and message evidence only
+  when every stage does. Question and choice selectors are validated against
+  the request before any stage runs. Native model discovery runs only when a
+  stage is reached, under its deadline and failure policy.
+
+Responses carry a `cascade` trace per input (top-level for single input, on each
+batch row otherwise):
+
+```json
+{"cascade": {"decider": "same-entity", "definition_sha256": "…", "answered_by": "strong",
+  "stages": [
+    {"name": "fast", "decision_method": "typed", "model": "jev-latest", "answers": [...], "usage": {...}, "escalated": true},
+    {"name": "strong", "decision_method": "generated", "model": "your-strong-model", "answers": [...], "usage": {...}, "escalated": false}]}}
+```
+
+`definition_sha256` identifies the cascade definition without credentials.
+Anthropic stages require `probabilities: verdict_only`, since they do not
+provide token logprobs. Such stages can appear only last. Resolver probability
+thresholds still apply to the probabilistic stages; a terminal verdict-only
+stage must choose categorically, and its reported 0/1 distribution is not a
+calibrated confidence estimate.
+Stage traces include `model_revision` when the provider reports an immutable
+revision. Resolver adjudication verifies the definition, escalation decisions,
+stage order, and agreement between the trace and the final answer.
+Probabilities from different models are not calibrated against each other, so
+set each band on labelled examples for the models involved and measure how
+often inputs escalate. The trace has what an evaluation needs: the answering
+stage, whether each answer escalated, and per-stage usage.

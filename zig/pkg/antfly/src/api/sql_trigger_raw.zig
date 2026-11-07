@@ -340,7 +340,7 @@ pub const Owner = struct {
             options.row_policy_principal_proof = proof.token;
             options.row_policy_database = proof.database;
         };
-        const old = try reader.lookup(a, record.name, key, options, .read_index);
+        const old = try reader.lookupMutationPreimage(a, record.name, key, options);
         if (old) |value| {
             if (value.version == 0 or value.expected_content_digest == null) return error.MissingPrimaryObservation;
             try self.charge(value.json.len);

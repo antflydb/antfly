@@ -928,7 +928,7 @@ test "native index owner adapter inspects cold native ownership and rejects fore
             // opened descriptor whose lazy catalog has not been exercised.
             const row = try table_writes.encodeStorageKernelBatchRequest(alloc, .{ .timestamp_ns = 1, .writes = &.{.{ .key = "replacement", .value = "{\"id\":1}" }} });
             defer alloc.free(row);
-            var committed = try provisioned.replicatedBatchAtRaftEntryJson("items", row, 1, 1);
+            var committed = try applyCommittedSnapshotFixtureEntry(&provisioned, "items", row, 1, 1);
             committed.deinit();
         }
         // Directory renames bypass the normal snapshot publication callback.

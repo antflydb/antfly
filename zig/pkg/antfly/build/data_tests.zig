@@ -45,6 +45,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime hosted FK retirement",
         "pure policy control bypasses only ordinary dense repair writer preflight",
         "native retirement preparation rejects untrusted and malformed requests before metadata or owner access",
+        "data runtime native restore phase two rejoins activating descriptor authority",
         "pure topology control bypasses only ordinary dense repair writer preflight",
         "data ownership fallback requires a single store across all roles",
         "data relational maintenance yields to raft persistence and follows elections",
@@ -141,6 +142,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "provisioned root re-pairs a changed metadata head without publishing mixed snapshots",
         "remote metadata source restore staging authority binds every owner read",
         "remote metadata mutation failover preserves ambiguous and deterministic outcomes",
+        "privacy remote mutation forwarding retains response metadata through the status source",
+        "privacy remote read bindings pin metadata identity and never fall back to full catalogs",
         "remote metadata mutation discovery preserves forwarding budget for the configured leader",
         "remote metadata mutation discovery preserves endpoint coverage and delivery time",
         "remote metadata source retains mutation authority across cache invalidation",
@@ -292,6 +295,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_data_runtime_tests = @import("linked_tests.zig").runPair(b, lib_data_runtime_tests, implementation_tests);
     const lib_data_runtime_test_step = b.step("antfly-data-runtime-test", "Run focused data runtime tests");
     lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
+    const privacy_forwarding_tests = @import("linked_tests.zig").add(b, .{
+        .name = "data-privacy-forwarding-tests",
+        .root_module = data_runtime_test_mod,
+        .filters = &.{ "privacy remote mutation forwarding retains response metadata through the status source", "privacy remote read bindings pin metadata identity and never fall back to full catalogs" },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-data-privacy-forwarding-test", "Verify privacy response metadata through remote discovery and the status-source handoff")
+        .dependOn(&privacy_forwarding_tests.run(b).step);
     const private_initial_owner_predicate_tests = b.addTest(.{
         .name = "data-private-initial-owner-predicate-tests",
         .root_module = options.data_implementation_module,
@@ -302,6 +313,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, private_initial_owner_predicate_tests).step);
 
     const lib_data_storage_default_filters = [_][]const u8{
+        "privacy data raft apply batches WAL-durable commands without one SST per entry",
+        "privacy data raft apply compaction families are contiguous and separate hot metadata from history",
         "membership reducer",
         "FK retirement worker",
         "data raft online topology arbitration persists exact rejection and scopes release across reopen",

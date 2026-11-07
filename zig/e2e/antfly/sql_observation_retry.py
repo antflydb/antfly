@@ -18,8 +18,15 @@ def definite_observation_abort(status, result, *, pure_observation):
         and all(
             result.get(key) is None
             for key in (
-                "transaction_id", "mutation_outcome", "admission_outcome", "status",
-                "ddl_receipt", "catalog_receipt", "rows", "columns", "rows_affected",
+                "transaction_id",
+                "mutation_outcome",
+                "admission_outcome",
+                "status",
+                "ddl_receipt",
+                "catalog_receipt",
+                "rows",
+                "columns",
+                "rows_affected",
                 "command_tag",
             )
         )

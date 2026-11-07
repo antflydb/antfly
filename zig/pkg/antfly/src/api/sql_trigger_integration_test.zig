@@ -27,9 +27,20 @@ fn query(ctx: *fixture.Context, statement: []const u8) !std.json.Parsed(wire.SQL
     return std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{ .allocate = .alloc_always });
 }
 fn command(ctx: *fixture.Context, statement: []const u8) !void {
+    return commandWithNotices(ctx, statement, null);
+}
+fn commandWithNotices(ctx: *fixture.Context, statement: []const u8, expected_notices: ?usize) !void {
     var result = try query(ctx, statement);
     defer result.deinit();
-    if (result.value.ddl_receipt) |ddl| if (ddl.restore_job_id) |id| {
+    if (expected_notices) |count| {
+        const notices = result.value.notices orelse &.{};
+        try std.testing.expectEqual(count, notices.len);
+        for (notices) |notice| try std.testing.expectEqualStrings("audit fired", notice.message);
+    }
+    return awaitCommandResult(ctx, result.value);
+}
+fn awaitCommandResult(ctx: *fixture.Context, result: wire.SQLResponse) !void {
+    if (result.ddl_receipt) |ddl| if (ddl.restore_job_id) |id| {
         const key = ddl.idempotency_key orelse return error.MissingTriggerJobKey;
         const deadline = @import("antfly_platform").time.monotonicNs() +| 60 * std.time.ns_per_s;
         var complete = false;
@@ -67,8 +78,8 @@ fn command(ctx: *fixture.Context, statement: []const u8) !void {
         }
         if (!complete) return error.TriggerDdlDeadlineExceeded;
     };
-    const receipt = result.value.catalog_receipt orelse return awaitDdlActivation(ctx, result.value.ddl_receipt);
-    if (receipt.state == .committed) return awaitDdlActivation(ctx, result.value.ddl_receipt);
+    const receipt = result.catalog_receipt orelse return awaitDdlActivation(ctx, result.ddl_receipt);
+    if (receipt.state == .committed) return awaitDdlActivation(ctx, result.ddl_receipt);
     if (receipt.state == .rejected) return error.TriggerDdlRejected;
     const body = try std.json.Stringify.valueAlloc(ctx.alloc, wire.SQLCatalogRecoveryRequest{ .recovery_token = receipt.recovery_token }, .{});
     defer ctx.alloc.free(body);
@@ -86,7 +97,7 @@ fn command(ctx: *fixture.Context, statement: []const u8) !void {
         try std.testing.expectEqual(receipt.operation, actual.operation);
         try std.testing.expectEqual(receipt.kind, actual.kind);
         inline for (.{ "database", "namespace", "name" }) |field| try std.testing.expectEqualStrings(@field(receipt, field), @field(actual, field));
-        if (actual.state == .committed) return awaitDdlActivation(ctx, result.value.ddl_receipt);
+        if (actual.state == .committed) return awaitDdlActivation(ctx, result.ddl_receipt);
         if (actual.state == .rejected) return error.TriggerDdlRejected;
         try ctx.io.sleep(.fromMilliseconds(20), .awake);
     }
@@ -296,4 +307,165 @@ const LogicalRelationCampaign = struct {
 };
 test "mounted trigger logical relation identity survives TRUNCATE cold restart and fresh same-name CREATE gets a new identity" {
     try fixture.run(LogicalRelationCampaign);
+}
+
+const OrdinaryTriggerCampaign = struct {
+    truncate_job: ?[]const u8 = null,
+    truncate_result: ?[]const u8 = null,
+    fn tableIdentity(ctx: *fixture.Context) !u64 {
+        var transport = ctx.catalogClient();
+        var response = try transport.readSystemCatalog(ctx.metadata_uri, .{ .resolve_many = .{ .sql_sources = &.{.{ .name = .{ .table = "truncate_notices" } }} } }, 15000, null);
+        defer response.deinit(ctx.alloc);
+        var resolved = try std.json.parseFromSlice(local.system_catalog_domain.ResolvedMany, ctx.alloc, response.body, .{});
+        defer resolved.deinit();
+        return resolved.value.sql_sources[0].?.value.table.binding.table_id;
+    }
+    fn completedNotices(ctx: *fixture.Context, id: []const u8) ![]u8 {
+        var response = try fixture.job(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.metadata_uri, id);
+        defer response.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var job = try std.json.parseFromSlice(wire.RestoreJob, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+        defer job.deinit();
+        try std.testing.expectEqualStrings("succeeded", job.value.phase);
+        const summary = job.value.result orelse return error.MissingTriggerJobResult;
+        const prepared = summary.object.get("truncate_preparation") orelse return error.MissingTriggerJobResult;
+        const notices = prepared.object.get("notices") orelse return error.MissingTriggerJobResult;
+        try std.testing.expectEqual(@as(usize, 2), notices.array.items.len);
+        for (notices.array.items) |notice| try std.testing.expectEqualStrings("audit fired", notice.object.get("message").?.string);
+        return std.json.Stringify.valueAlloc(ctx.alloc, prepared, .{});
+    }
+    fn truncatePhases(self: *@This(), ctx: *fixture.Context) !void {
+        try command(ctx, "CREATE TABLE truncate_notices(id BIGINT PRIMARY KEY)");
+        _ = try fixture.waitServingSchema(ctx, "truncate_notices", 0);
+        try command(ctx, "INSERT INTO truncate_notices VALUES(1)");
+        try command(ctx, "CREATE FUNCTION truncate_before() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'audit fired'; RETURN NEW; END $$");
+        try command(ctx, "CREATE FUNCTION truncate_after_error() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'must stay private'; PERFORM 1/TG_NARGS; RETURN NEW; END $$");
+        try command(ctx, "CREATE TRIGGER before_truncate BEFORE TRUNCATE ON truncate_notices EXECUTE FUNCTION truncate_before()");
+        try command(ctx, "CREATE TRIGGER after_truncate AFTER TRUNCATE ON truncate_notices EXECUTE FUNCTION truncate_after_error()");
+        _ = try fixture.waitServingSchema(ctx, "truncate_notices", 0);
+        const before = try tableIdentity(ctx);
+        var authorized = ctx.*;
+        authorized.headers = ctx.admin_headers;
+        var failed = try client.execute(&authorized, "TRUNCATE truncate_notices", .write_admission);
+        defer failed.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 400), failed.status);
+        var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, failed.body, .{ .ignore_unknown_fields = true });
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings("22012", diagnostic.value.code);
+        try std.testing.expectEqual(@as(usize, 0), (diagnostic.value.notices orelse &.{}).len);
+        try std.testing.expectEqual(before, try tableIdentity(ctx));
+        var rows = try query(ctx, "SELECT count(*) FROM truncate_notices");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(i64, 1), try fixture.sqlInteger(rows.value.rows[0][0]));
+        try command(ctx, "CREATE OR REPLACE FUNCTION truncate_after_error() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'audit fired'; RETURN NEW; END $$");
+        _ = try fixture.waitServingSchema(ctx, "truncate_notices", 0);
+        var accepted = try query(ctx, "TRUNCATE truncate_notices");
+        defer accepted.deinit();
+        try std.testing.expectEqual(@as(usize, 1), (accepted.value.notices orelse &.{}).len);
+        try std.testing.expectEqualStrings("audit fired", accepted.value.notices.?[0].message);
+        self.truncate_job = try ctx.alloc.dupe(u8, accepted.value.ddl_receipt.?.restore_job_id.?);
+        try awaitCommandResult(ctx, accepted.value);
+        self.truncate_result = try completedNotices(ctx, self.truncate_job.?);
+        const repeated = try completedNotices(ctx, self.truncate_job.?);
+        defer ctx.alloc.free(repeated);
+        try std.testing.expectEqualStrings(self.truncate_result.?, repeated);
+        try std.testing.expect(before != try tableIdentity(ctx));
+    }
+
+    pub const native_auth = true;
+    pub const native_sessions = true;
+    pub const cold_catalog = true;
+    pub fn configureAuth(manager: *@import("../usermgr/mod.zig").UserManager) !void {
+        try Campaign.configureAuth(manager);
+    }
+    fn count(ctx: *fixture.Context, expected: i64) !void {
+        var rows = try query(ctx, "SELECT count(*) FROM usage_records");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.value.rows.len);
+        try std.testing.expectEqual(expected, try fixture.sqlInteger(rows.value.rows[0][0]));
+    }
+    fn status(ctx: *fixture.Context, id: []const u8, expected: []const u8) !void {
+        const sql = try std.fmt.allocPrint(ctx.alloc, "SELECT status FROM usage_records WHERE id='{s}'", .{id});
+        defer ctx.alloc.free(sql);
+        var rows = try query(ctx, sql);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.value.rows.len);
+        try std.testing.expectEqualStrings(expected, rows.value.rows[0][0].string);
+    }
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try self.truncatePhases(ctx);
+        try command(ctx, "CREATE TABLE usage_records(id UUID PRIMARY KEY,status TEXT)");
+        _ = try fixture.waitServingSchema(ctx, "usage_records", 0);
+        try command(ctx, "CREATE FUNCTION audit_usage() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'audit fired'; RETURN NEW; END $$");
+        var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+        defer corpus.deinit();
+        for ([_][]const u8{ "sql-1150", "sql-1153", "sql-1154", "sql-1155", "sql-1157" }, 0..) |id, index| {
+            try command(ctx, "DELETE FROM usage_records");
+            try command(ctx, "INSERT INTO usage_records VALUES ('00000000-0000-0000-0000-000000000001','old')");
+            // The trigger VM supports straight-line procedural steps. Use a
+            // proper common callable for the no-argument declarations, then
+            // replace its body for the actual argument-bearing declaration;
+            // procedural IF is outside the currently supported routine subset.
+            if (index == 4) try command(ctx, "CREATE OR REPLACE FUNCTION audit_usage() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.status := TG_ARGV[0]; RAISE NOTICE 'audit fired'; RETURN NEW; END $$");
+            // Exact immutable original declaration, with the genuine table and
+            // callable it needs. An absent dependency is not an implementation.
+            try command(ctx, (try corpus.get(id)).sql);
+            var state = try attachments(ctx);
+            defer state.deinit();
+            try std.testing.expectEqual(@as(usize, 1), state.value.entries.len);
+            const entry = state.value.entries[0];
+            try std.testing.expectEqual(index == 0, entry.timing == .after);
+            try std.testing.expectEqual(index != 1, entry.level == .row);
+            try std.testing.expectEqual(@as(usize, @intFromBool(index == 4)), entry.arguments.len);
+            if (index == 4) try std.testing.expectEqualStrings("audit-context", entry.arguments[0]);
+            switch (index) {
+                0, 4 => try commandWithNotices(ctx, "INSERT INTO usage_records VALUES ('00000000-0000-0000-0000-000000000002','inserted')", 1),
+                1 => try commandWithNotices(ctx, "TRUNCATE usage_records", 1),
+                2 => {
+                    try commandWithNotices(ctx, "UPDATE usage_records SET id=id", 0);
+                    try commandWithNotices(ctx, "UPDATE usage_records SET status='new'", 1);
+                },
+                3 => {
+                    try commandWithNotices(ctx, "UPDATE usage_records SET status=status", 0);
+                    try commandWithNotices(ctx, "UPDATE usage_records SET status='new'", 1);
+                },
+                else => unreachable,
+            }
+            try count(ctx, if (index == 1) 0 else if (index == 0 or index == 4) 2 else 1);
+            if (index == 4) try status(ctx, "00000000-0000-0000-0000-000000000002", "audit-context");
+            if (index != 4) {
+                const drop = try std.fmt.allocPrint(ctx.alloc, "DROP TRIGGER {s} ON usage_records", .{entry.name});
+                defer ctx.alloc.free(drop);
+                try command(ctx, drop);
+                var absent = try attachments(ctx);
+                defer absent.deinit();
+                try std.testing.expectEqual(@as(usize, 0), absent.value.entries.len);
+            }
+        }
+    }
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        defer ctx.alloc.free(self.truncate_job.?);
+        defer ctx.alloc.free(self.truncate_result.?);
+        const cold = try completedNotices(ctx, self.truncate_job.?);
+        defer ctx.alloc.free(cold);
+        try std.testing.expectEqualStrings(self.truncate_result.?, cold);
+        _ = try fixture.waitServingSchema(ctx, "usage_records", 0);
+        var state = try attachments(ctx);
+        defer state.deinit();
+        try std.testing.expectEqual(@as(usize, 1), state.value.entries.len);
+        try std.testing.expectEqualStrings("usage_args", state.value.entries[0].name);
+        try std.testing.expectEqualStrings("audit-context", state.value.entries[0].arguments[0]);
+        try commandWithNotices(ctx, "INSERT INTO usage_records VALUES ('00000000-0000-0000-0000-000000000003','cold')", 1);
+        try status(ctx, "00000000-0000-0000-0000-000000000003", "audit-context");
+        try command(ctx, "DROP TRIGGER usage_args ON usage_records");
+        try commandWithNotices(ctx, "INSERT INTO usage_records VALUES ('00000000-0000-0000-0000-000000000004','dropped')", 0);
+        try status(ctx, "00000000-0000-0000-0000-000000000004", "dropped");
+        try count(ctx, 4);
+    }
+};
+
+test "mounted PostgreSQL original ordinary trigger supersessions preserve events predicates arguments and cold activation" {
+    // sql-1150 sql-1153 sql-1154 sql-1155 sql-1157: old corpus rejections are
+    // superseded by genuine supported trigger execution, not missing setup.
+    try fixture.run(OrdinaryTriggerCampaign);
 }

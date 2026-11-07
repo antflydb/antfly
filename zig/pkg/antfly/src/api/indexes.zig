@@ -81,7 +81,10 @@ pub fn addIndexToTableIndexesJsonWithIo(
     index_name: []const u8,
     index_json: []const u8,
 ) ![]u8 {
-    if (!@import("antfly_local_sources").api_index_metadata.isValidIndexName(index_name)) return error.InvalidCreateIndexRequest;
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
+    try @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(alloc, index_json);
+    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name) or
+        !@import("antfly_local_sources").api_index_metadata.isValidIndexName(index_name)) return error.InvalidCreateIndexRequest;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
     var config = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
@@ -195,6 +198,7 @@ pub fn removeIndexFromTableIndexesJson(
     current_indexes_json: []const u8,
     index_name: []const u8,
 ) !?[]u8 {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
     if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.ExtensionOwnedObject;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
@@ -264,6 +268,8 @@ pub fn addEnrichmentToTableIndexesJson(
     enrichment_name: []const u8,
     enrichment_json: []const u8,
 ) ![]u8 {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, enrichment_name);
+    try @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(alloc, enrichment_json);
     try validateEnrichmentConfigName(alloc, enrichment_name, enrichment_json);
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
@@ -321,6 +327,7 @@ pub fn removeEnrichmentFromTableIndexesJson(
     current_indexes_json: []const u8,
     enrichment_name: []const u8,
 ) !?[]u8 {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, enrichment_name);
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
 
@@ -1286,9 +1293,17 @@ pub fn indexesConfigUsesArtifactSources(alloc: std.mem.Allocator, indexes_json: 
     if (parsed.value != .object) return error.InvalidCreateTableRequest;
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
+            @import("antfly_local_sources").api_index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
         if (try indexConfigValueUsesArtifactSources(entry.value_ptr.*)) return true;
     }
     return false;
+}
+
+test "privacy restore artifact admission skips opaque state and declarations in any order" {
+    const a = std.testing.allocator;
+    try std.testing.expect(!try indexesConfigUsesArtifactSources(a, "{\"enrichments\":[],\"_privacy\":{\"coverage\":{}},\"resolvers\":[],\"full_text_index_v0\":{\"type\":\"full_text\"}}"));
+    try std.testing.expect(try indexesConfigUsesArtifactSources(a, "{\"_privacy\":{},\"enrichments\":[],\"full_text_index_v0\":{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"safe\"}]}}"));
 }
 
 fn appendIndexConfig(

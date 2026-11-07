@@ -561,7 +561,7 @@ test "SQL implicit lock cleanup preserves native admission across failure envelo
     const callbacks = @import("antfly_runtime_abi").error_abi;
     const status = identity.statusFromError(error.RaftApplyWriterUnavailable);
     try std.testing.expectEqual(failure.Status.raft_apply_writer_unavailable, status);
-    try std.testing.expectEqual(@as(u32, 956), @backingInt(status));
+    try std.testing.expectEqual(@as(u32, 848), @backingInt(status));
     try std.testing.expectError(error.RaftApplyWriterUnavailable, identity.statusToError(status));
     const callback = callbacks.statusFromError(error.RaftApplyWriterUnavailable);
     try std.testing.expectEqual(@backingInt(callbacks.Code.retryable), callback.code);

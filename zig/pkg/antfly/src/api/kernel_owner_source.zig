@@ -1073,7 +1073,9 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .graph_edges_group_local_routed = graphEdgesGroupLocalRouted,
                 .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
                 .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
+                .document_artifact_manifest_group_local_controlled = documentArtifactManifestGroupLocalControlled,
                 .document_artifact_manifest_group_local_routed = documentArtifactManifestGroupLocalRouted,
+                .document_artifact_manifest_group_local_routed_controlled = documentArtifactManifestGroupLocalRoutedControlled,
                 .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocal,
                 .document_artifact_manifests_group_local_routed = documentArtifactManifestsGroupLocalRouted,
             },
@@ -8044,9 +8046,23 @@ pub const ProvisionedKernelOwnerSource = struct {
         artifact_name: []const u8,
         consistency: read_gate.ReadConsistency,
     ) !?db_types.DocumentArtifactManifest {
+        return documentArtifactManifestGroupLocalRoutedControlled(ptr, alloc, fence, group_id, table_name, doc_key, artifact_name, consistency, .{});
+    }
+
+    fn documentArtifactManifestGroupLocalRoutedControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: read_gate.ReadConsistency,
+        opts: db_types.LookupOptions,
+    ) !?db_types.DocumentArtifactManifest {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         try self.validateRoutedRead(alloc, fence, group_id, table_name);
-        return try documentArtifactManifestGroupLocalAdmitted(ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency, fence);
+        return try documentArtifactManifestGroupLocalAdmitted(ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency, opts, fence);
     }
 
     fn documentArtifactManifestsGroupLocalRouted(
@@ -8194,15 +8210,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn validateRowPolicyReceiptLookupOptions(key: []const u8, opts: db_types.LookupOptions) !void {
-        if (key.len != 0 or opts.row_policy_receipt == null) return error.InvalidRowPolicyReceipt;
-        const defaults: db_types.LookupOptions = .{};
-        inline for (@typeInfo(db_types.LookupOptions).@"struct".field_names, @typeInfo(db_types.LookupOptions).@"struct".field_types) |name, T| {
-            if (comptime !std.mem.eql(u8, name, "row_policy_receipt") and !std.mem.eql(u8, name, "execution_deadline_ns") and !std.mem.eql(u8, name, "execution_io") and !std.mem.eql(u8, name, "cancellation")) {
-                if (comptime @typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice) {
-                    if (@field(opts, name).len != 0) return error.InvalidRowPolicyReceipt;
-                } else if (!std.meta.eql(@field(opts, name), @field(defaults, name))) return error.InvalidRowPolicyReceipt;
-            }
-        }
+        try table_read_source.PrivateLookup.requireReceipt(key, opts);
     }
 
     fn validateNativeLockLookupOptions(opts: db_types.LookupOptions) !void {
@@ -8448,7 +8456,20 @@ pub const ProvisionedKernelOwnerSource = struct {
         artifact_name: []const u8,
         consistency: read_gate.ReadConsistency,
     ) !?db_types.DocumentArtifactManifest {
-        return documentArtifactManifestGroupLocalAdmitted(ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency, null);
+        return documentArtifactManifestGroupLocalAdmitted(ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency, .{}, null);
+    }
+
+    fn documentArtifactManifestGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: read_gate.ReadConsistency,
+        opts: db_types.LookupOptions,
+    ) !?db_types.DocumentArtifactManifest {
+        return documentArtifactManifestGroupLocalAdmitted(ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency, opts, null);
     }
 
     fn documentArtifactManifestGroupLocalAdmitted(
@@ -8459,17 +8480,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
         consistency: read_gate.ReadConsistency,
+        opts: db_types.LookupOptions,
         route: ?metadata_api.CatalogRouteFence,
     ) !?db_types.DocumentArtifactManifest {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        if (!nativeReadRoute(route)) try self.prepareLookupRead(group_id, doc_key, .{}, consistency);
+        if (!nativeReadRoute(route)) try self.prepareLookupRead(group_id, doc_key, opts, consistency);
         const request_json = try table_reads.encodeStorageKernelDocumentArtifactManifestRequest(
             alloc,
             doc_key,
             artifact_name,
         );
         defer alloc.free(request_json);
-        var lease = try self.acquireWithControls(group_id, table_name, controlsForReadRoute(.{}, route));
+        var lease = try self.acquireWithControls(group_id, table_name, controlsForReadRoute(.from(opts), route));
         defer lease.deinit();
         var response = lease.owner().documentArtifactManifestJson(
             table_name,
@@ -9351,8 +9373,10 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     pub fn restoreDescriptorUseForBatch(req: db_types.BatchRequest) RestoreDescriptorUse {
         if (req.restore_staging) |control| switch (control) {
-            .finish => return .resolve,
-            else => {},
+            // These controls complete an already admitted private target after
+            // cutover; the receiver still validates its exact scope and Plan.
+            .finish, .install_native_empty, .install_generation_admissions => return .resolve,
+            .begin, .import_page, .rewrite_page => {},
         };
         // Empty-generation admission is installed after old-owner cutover,
         // while the target is still private. This is a bounded Plan-bound
@@ -12922,6 +12946,157 @@ test "row-policy coupled schema deferred receipt lookup rejects mixed selectors 
     try std.testing.expectError(error.InvalidRowPolicyReceipt, Source.lookupGroupLocal(&inert, std.testing.allocator, 17, "rows", "", mixed[0], .stale));
     // Mixed receipt selectors reject before consuming the routed fence.
     for (mixed) |opts| try std.testing.expectError(error.InvalidRowPolicyReceipt, Source.lookupGroupLocalRouted(&inert, std.testing.allocator, undefined, 17, "rows", "", opts, .stale));
+}
+
+test "privacy value-free lookup classification preserves row fences and closed receiver guards" {
+    const Private = table_read_source.PrivateLookup;
+    const Fake = struct {
+        privacy_reads: usize = 0,
+        lookups: usize = 0,
+        fn privacy(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?u64) ![64]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.privacy_reads += 1;
+            return @splat('a');
+        }
+        fn lookup(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, key: []const u8, opts: db_types.LookupOptions, _: read_gate.ReadConsistency) !?table_read_source.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.lookups += 1;
+            if (opts.row_policy_receipt != null) {
+                try ProvisionedKernelOwnerSource.validateRowPolicyReceiptLookupOptions(key, opts);
+            } else if (opts.sql_lock_query_json.len != 0) {
+                if (key.len != 0) return error.InvalidLockScope;
+                try @import("native_sql_lock_read.zig").validateOptions(opts);
+            } else if (std.mem.eql(u8, opts.relational_topology_json, Private.handoff_install) or std.mem.eql(u8, opts.relational_topology_json, Private.handoff_identity)) {
+                if (!Private.isHandoff(key, opts)) return error.RestoreStagingScopeChanged;
+            } else {
+                const version = opts.privacy_policy_version orelse return error.MissingPrivacyFence;
+                try std.testing.expectEqualSlices(u8, &@as([64]u8, @splat('a')), &version);
+            }
+            return null;
+        }
+        fn group(raw: *anyopaque, a: std.mem.Allocator, group_id: u64, table: []const u8, key: []const u8, opts: db_types.LookupOptions, consistency: read_gate.ReadConsistency) !?table_read_source.LookupResponse {
+            try std.testing.expectEqual(@as(u64, 17), group_id);
+            return lookup(raw, a, table, key, opts, consistency);
+        }
+        fn routed(raw: *anyopaque, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table: []const u8, key: []const u8, opts: db_types.LookupOptions, consistency: read_gate.ReadConsistency) !?table_read_source.LookupResponse {
+            try std.testing.expectEqual(group_id, fence.route.group_id);
+            return group(raw, a, group_id, table, key, opts, consistency);
+        }
+    };
+    var fake: Fake = .{};
+    var source: table_read_source.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = undefined, .query = undefined, .lookup_group_local = Fake.group, .lookup_group_local_routed = Fake.routed, .privacy_policy_version = Fake.privacy } };
+    const a = std.testing.allocator;
+    const receipt: db_types.LookupOptions = .{ .row_policy_receipt = .{ .generation = 2, .phase = .serving_install } };
+    const controls = [_]db_types.LookupOptions{
+        receipt,
+        .{ .sql_lock_query_json = "private-control" },
+        .{ .restore_staging_scope = @splat(1), .restore_staging_plan_id = @splat(2), .relational_topology_json = Private.handoff_install },
+        .{ .restore_staging_scope = @splat(1), .restore_staging_plan_id = @splat(2), .relational_topology_json = Private.handoff_identity },
+    };
+    for (controls) |opts| {
+        try std.testing.expect(Private.classify("", opts) != null);
+        try std.testing.expect((try source.lookup(a, "rows", "", opts, .read_index)) == null);
+        try std.testing.expect((try source.lookupGroupLocal(a, 17, "rows", "", opts, .read_index)) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.privacy_reads);
+    source.route_fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('a'), .catalog_revision = 2, .table_id = 7, .topology_epoch = 3, .route = .{ .group_id = 17, .range_id = 9, .identity_namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 } } };
+    for (controls) |opts| try std.testing.expect((try source.lookupGroupLocal(a, 17, "rows", "", opts, .read_index)) == null);
+    try std.testing.expectEqual(@as(usize, 0), fake.privacy_reads);
+
+    // These existing integrity/FK paths may return real preimages. They must
+    // still capture the real privacy version, not use a generic control flag.
+    const row_observations = [_]db_types.LookupOptions{
+        .{},
+        .{ .include_primary_digest = true },
+        .{ .include_json_null_fields = true },
+        .{ .fields = &.{"id"} },
+        .{ .relational_integrity_catalog = true },
+        .{ .relational_integrity_jobs_json = "[]" },
+    };
+    for (row_observations) |opts| {
+        try std.testing.expect(Private.classify("", opts) == null);
+        const before = fake.privacy_reads;
+        try std.testing.expect((try source.lookup(a, "rows", "a", opts, .read_index)) == null);
+        try std.testing.expect((try source.lookupGroupLocal(a, 17, "rows", "a", opts, .read_index)) == null);
+        try std.testing.expectEqual(before + 2, fake.privacy_reads);
+    }
+    for ([_]db_types.LookupOptions{
+        .{ .row_policy_receipt = receipt.row_policy_receipt, .include_primary_digest = true },
+        .{ .row_policy_receipt = receipt.row_policy_receipt, .include_json_null_fields = true },
+        .{ .row_policy_receipt = receipt.row_policy_receipt, .fields = &.{"id"} },
+        .{ .row_policy_receipt = receipt.row_policy_receipt, .row_policy_principal_proof = "proof" },
+        .{ .row_policy_receipt = receipt.row_policy_receipt, .sql_lock_query_json = "control" },
+    }) |mixed| {
+        try std.testing.expect(Private.classify("", mixed) == null);
+        const before = fake.privacy_reads;
+        try std.testing.expectError(error.InvalidRowPolicyReceipt, source.lookup(a, "rows", "", mixed, .read_index));
+        try std.testing.expectError(error.InvalidRowPolicyReceipt, source.lookupGroupLocal(a, 17, "rows", "", mixed, .read_index));
+        try std.testing.expectEqual(before + 2, fake.privacy_reads);
+    }
+    var mixed_lock = controls[1];
+    mixed_lock.include_primary_digest = true;
+    try std.testing.expect(Private.classify("", mixed_lock) == null);
+    try std.testing.expectError(error.InvalidLockScope, source.lookupGroupLocal(a, 17, "rows", "", mixed_lock, .read_index));
+    var mixed_handoff = controls[2];
+    mixed_handoff.include_json_null_fields = true;
+    try std.testing.expect(Private.classify("", mixed_handoff) == null);
+    try std.testing.expectError(error.RestoreStagingScopeChanged, source.lookupGroupLocal(a, 17, "rows", "", mixed_handoff, .read_index));
+    var fake_original = receipt;
+    fake_original.privacy_original = true;
+    try std.testing.expect(Private.classify("", fake_original) == null);
+    try std.testing.expectError(error.InvalidRowPolicyReceipt, source.lookup(a, "rows", "", fake_original, .read_index));
+    try std.testing.expectError(error.InvalidRowPolicyReceipt, Private.requireReceipt("row", receipt));
+    var changed_privacy = receipt;
+    changed_privacy.privacy_policy_version = @splat('b');
+    const before_changed = fake.lookups;
+    try std.testing.expectError(error.IndexRebuilding, source.lookup(a, "rows", "", changed_privacy, .read_index));
+    try std.testing.expectEqual(before_changed, fake.lookups);
+    // Purely structural eligibility never validates the claimed command body.
+    // The native receiver must still authenticate/parse "private-control".
+}
+
+test "privacy mutation preimage lookup preserves trusted original typed cells RLS and privacy fence" {
+    const Fixture = struct {
+        reads: usize = 0,
+        fences: usize = 0,
+        original: bool = false,
+        fn privacy(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?u64) anyerror![64]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.fences += 1;
+            return @splat('a');
+        }
+        fn lookup(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, opts: db_types.LookupOptions, consistency: read_gate.ReadConsistency) anyerror!?table_read_source.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            try std.testing.expectEqual(read_gate.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqual(self.original, opts.privacy_original);
+            try std.testing.expectEqualStrings("signed-principal", opts.row_policy_principal_proof);
+            try std.testing.expectEqualStrings("main", opts.row_policy_database);
+            try std.testing.expectEqualSlices(u8, &@as([64]u8, @splat('a')), &(opts.privacy_policy_version orelse return error.MissingPrivacyFence));
+            if (self.original) {
+                try std.testing.expect(opts.include_primary_digest and opts.include_json_null_fields);
+                return .{ .json = try a.dupe(u8, "{\"secret\":7,\"payload\":null}"), .version = 9, .expected_content_digest = @splat(1), .json_null_fields = try db_types.cloneJsonNullFields(a, &.{"payload"}) };
+            }
+            return .{ .json = try a.dupe(u8, "{\"secret\":null}"), .version = 9 };
+        }
+    };
+    var fixture: Fixture = .{};
+    const source: table_read_source.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined, .privacy_policy_version = Fixture.privacy } };
+    const opts: db_types.LookupOptions = .{ .include_primary_digest = true, .include_json_null_fields = true, .row_policy_principal_proof = "signed-principal", .row_policy_database = "main" };
+    var public = (try source.lookup(std.testing.allocator, "rows", "a", opts, .read_index)).?;
+    defer public.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{\"secret\":null}", public.json);
+    fixture.original = true;
+    var original = (try source.lookupMutationPreimage(std.testing.allocator, "rows", "a", opts)).?;
+    defer original.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{\"secret\":7,\"payload\":null}", original.json);
+    try std.testing.expectEqualStrings("payload", original.json_null_fields[0]);
+    try std.testing.expectEqual(@as(usize, 2), fixture.reads);
+    try std.testing.expectEqual(@as(usize, 2), fixture.fences);
+    var mixed = opts;
+    mixed.relational_integrity_catalog = true;
+    try std.testing.expectError(error.InvalidArgument, source.lookupMutationPreimage(std.testing.allocator, "rows", "a", mixed));
+    try std.testing.expectEqual(@as(usize, 2), fixture.reads);
 }
 
 test "row-policy coupled Source CAPI desired descriptor preserves predecessor until exact ordered install" {

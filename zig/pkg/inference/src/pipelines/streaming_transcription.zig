@@ -131,10 +131,12 @@ pub const Session = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Session {
         try config.validate();
+        if (config.vad.silero_owner) |owner| owner.retain();
         return .{ .allocator = allocator, .config = config };
     }
 
     pub fn deinit(self: *Session) void {
+        if (self.config.vad.silero_owner) |owner| owner.release();
         self.buffer.deinit(self.allocator);
         self.clearHypothesis();
         if (self.initial_prompt_tokens) |tokens| self.allocator.free(tokens);

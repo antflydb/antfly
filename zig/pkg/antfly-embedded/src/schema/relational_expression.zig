@@ -2031,7 +2031,7 @@ test "relational declarations typed array programs share PostgreSQL values acros
         defer original.deinit();
         const canonical = try @import("../sql/array_storage.zig").encodeAlloc(r, original.value, .{});
         const envelope = try @import("../sql/array_wire.zig").encodeAlloc(r, original.value, .{});
-        const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_array_expressions = true, .relational_columns = &.{
+        const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_array_expressions = true, .relational_columns = &.{
             .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = entry.element_type },
         } };
         const text = try std.fmt.allocPrint(r, "{{\"op\":\"eq\",\"args\":[{{\"op\":\"column\",\"column\":\"a\"}},{{\"op\":\"literal\",\"type\":\"sql_array\",\"sql_type\":\"{s}\",\"value\":{s}}}]}}", .{ @tagName(entry.element_type), envelope });
@@ -2247,6 +2247,11 @@ test "relational declarations public array defaults and direct CHECKs match Post
         try checks.validateDefinitions(r, runtime, &.{.{ .name = "nonnull", .column = "a", .op = .is_not_null }});
         var nonrelational = runtime;
         nonrelational.storage_mode = .document;
+        // A genuine document expression schema remains structurally valid;
+        // the direct relational CHECK API must reject its storage domain.
+        nonrelational.requires_document_expressions = true;
+        const document_schema_bytes = try schema.serializeSchema(r, nonrelational);
+        defer r.free(document_schema_bytes);
         try std.testing.expectError(error.InvalidRelationalIndexDefinition, checks.validateDefinitions(r, nonrelational, &.{.{ .name = "nonnull", .column = "a", .op = .is_not_null }}));
         try std.testing.expectError(error.UnsupportedRelationalIndexCollation, checks.validateDefinitions(r, runtime, &.{.{ .name = "bad_collation", .column = "a", .op = .is_null, .collation = "ci" }}));
     }

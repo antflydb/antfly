@@ -1335,7 +1335,38 @@ pub const StatisticsSketch = struct {
         return result;
     }
 };
+/// Durable, authorized external read identity exported from an already pinned
+/// statement cursor. It must never acquire a newer snapshot or WAL cut.
+pub const BucketLayout = struct { column: []const u8, count: u32 };
+pub const ReadCapability = struct {
+    bucket: ?BucketLayout = null,
+    /// Minimum parallelism for bounded retained WAL images, independent of
+    /// the committed base scan row budget.
+    min_splits: u32 = 1,
+    token: []const u8,
+    schema: [64]u8,
+    snapshot: []const u8,
+    wal_cut: u64,
+    expires_ms: u64,
+    estimated_bytes: u64,
+    estimated_rows: u64,
+};
+/// Result batches borrow the producer's current page until the next pull or
+/// close. A pull may return fewer than maximum rows at a physical page boundary;
+/// only an empty batch marks EOF. Retaining consumers copy before advancing.
+pub const RelationCursor = struct {
+    ptr: *anyopaque,
+    next: *const fn (*anyopaque, std.mem.Allocator, usize) anyerror!@import("execution_batch.zig").Batch,
+    close: *const fn (*anyopaque) void,
+};
+pub const DistributedJoin = struct {
+    ptr: *anyopaque,
+    /// A local lowering port. The provider must emit its own versioned IR;
+    /// relation nodes and captured cursor pointers never cross the transport.
+    open: *const fn (*anyopaque, std.mem.Allocator, *const @import("relation_binding.zig").Node, []const StatementScan, []const Cursor, []const std.json.Value, @import("../api/operation.zig").RequestContext) anyerror!?RelationCursor,
+};
 pub const Cursor = struct {
+    export_snapshot: ?struct { ptr: *anyopaque, export_cut: *const fn (*anyopaque, std.mem.Allocator) anyerror!?ReadCapability } = null,
     /// True only when this cursor preserves every requested Scan.order key.
     order_satisfied: bool = false,
     /// Snapshot-local optimizer estimates; absent means unknown, never zero.
@@ -1712,6 +1743,8 @@ pub const Backend = struct {
         abort: *const fn (*anyopaque) void,
     };
     pub const PreparedRead = struct { name: ast.Name, relation: ReadRelation };
+    distributed_join: ?DistributedJoin = null,
+    distributed_context: @import("../api/operation.zig").RequestContext = .{},
     /// Immutable name/type scope pinned by one statement-effect binding.
     statement_ctes: ?*const @import("statement_cte_scope.zig").Scope = null,
     statement_cte_visibility: usize = std.math.maxInt(usize),

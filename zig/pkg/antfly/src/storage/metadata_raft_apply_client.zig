@@ -360,7 +360,7 @@ pub const RaftApplyStore = struct {
         var encoded: std.Io.Writer.Allocating = .init(self.alloc);
         defer encoded.deinit();
         var stream: std.json.Stringify = .{ .writer = &encoded.writer, .options = .{} };
-        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(update, &stream);
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.writeCompact(update, &stream);
         _ = try self.projection(bool, .{ .kind = .replace_standalone_catalog, .group_id = group_id, .arg0 = expected_revision, .key = .fromSlice(encoded.written()) });
     }
 
@@ -1304,6 +1304,20 @@ pub const RaftApplyStore = struct {
         return self.projectionWithAllocator(?metadata.MergeTransitionRecord, alloc, .{ .kind = .merge_transition, .group_id = group_id, .arg0 = transition_id });
     }
 
+    pub fn nextPrivacyTable(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, now: i64) !?metadata.TableRecord {
+        return self.catalogProjection(?metadata.TableRecord, alloc, group_id, .{ .privacy_due_table = now }) catch |err| switch (err) {
+            error.InvalidArgument => error.InvalidDerivedCatalogIndex,
+            else => err,
+        };
+    }
+
+    pub fn tableByName(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8) !?metadata.TableRecord {
+        return self.catalogProjection(?metadata.TableRecord, alloc, group_id, .{ .table_by_name = name }) catch |err| switch (err) {
+            error.InvalidArgument => error.InvalidDerivedCatalogIndex,
+            else => err,
+        };
+    }
+
     pub fn listTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.TableRecord {
         return try self.projectionWithAllocator([]metadata.TableRecord, alloc, .{ .kind = .tables, .group_id = group_id });
     }
@@ -1365,7 +1379,7 @@ pub const RaftApplyStore = struct {
     pub fn pendingResolverNamespaceSources(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.TableRecord {
         return self.projectionWithAllocator([]metadata.TableRecord, alloc, .{ .kind = .resolver_namespace_work, .group_id = group_id, .arg0 = 1 });
     }
-    pub fn resolverNamespaceReplacementRejected(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, term: u64, index: u64, expected: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
+    pub fn tableDefinitionReplacementRejected(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, term: u64, index: u64, expected: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
         const bytes = try std.json.Stringify.valueAlloc(alloc, .{ .current = expected, .replacement = replacement, .term = term, .index = index }, .{});
         defer alloc.free(bytes);
         return self.projectionWithAllocator(bool, alloc, .{ .kind = .resolver_namespace_replacement_matches, .group_id = group_id, .arg0 = 1, .key = .fromSlice(bytes) });

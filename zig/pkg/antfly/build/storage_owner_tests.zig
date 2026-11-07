@@ -83,6 +83,12 @@ pub fn add(
                         "source owner deadlines normalize executor clock epochs",
                         "distributed txn native lookup read-index rejects leader loss before storage execution",
                     }
+                else if (index == 0)
+                    &.{
+                        b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])}),
+                        "opaque graph decoder ABI rejects ABI115 context and batch ingress before effects",
+                        "opaque privacy decoder ABI rejects ABI117 ABI118 and ABI119 context and lookup before effects",
+                    }
                 else
                     &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},
                 .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },

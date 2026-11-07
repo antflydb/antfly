@@ -6120,11 +6120,11 @@ test "SQL original multi-output mutation selector rejects before backend access"
 }
 
 test "SQL original unsupported catalog object commands reject before backend access" {
-    // Event triggers, rules, transforms, ordinary triggers, foreign wrappers
+    // Event triggers, rules, transforms, unsupported trigger forms, foreign wrappers
     // and mappings, operator classes and families, and text-search objects.
     // sql-1141, sql-1142, sql-1143, sql-1144, sql-1145, sql-1146, sql-1147.
-    // sql-1148, sql-1149, sql-1150, sql-1151, sql-1152, sql-1153, sql-1154.
-    // sql-1155, sql-1156, sql-1157, sql-1158, sql-1159, sql-1160, sql-1161.
+    // sql-1148, sql-1149, sql-1151, sql-1152, sql-1156, sql-1158.
+    // sql-1159, sql-1160, sql-1161.
     // sql-1162, sql-1163, sql-1164, sql-1165, sql-1166, sql-1167, sql-1168.
     // sql-1169, sql-1170, sql-1171, sql-1172, sql-1173, sql-1174, sql-1175.
     // sql-1176, sql-1177, sql-1178, sql-1179, sql-1180, sql-1181, sql-1182.
@@ -6136,6 +6136,9 @@ test "SQL original unsupported catalog object commands reject before backend acc
         const id = entry.object.get("id").?.string;
         const ordinal = if (std.mem.startsWith(u8, id, "sql-")) std.fmt.parseInt(usize, id[4..], 10) catch continue else continue;
         if (ordinal < 1141 or ordinal > 1192 or ordinal == 1183 or ordinal == 1184) continue;
+        // Ordinary trigger declarations now bind through the real trigger
+        // catalog; their behavior is qualified by the mounted semantic gate.
+        if (ordinal == 1150 or ordinal == 1153 or ordinal == 1154 or ordinal == 1155 or ordinal == 1157) continue;
         try std.testing.expectEqualStrings("rejection", entry.object.get("source_expectation").?.string);
         var diagnostic: Diagnostic = .{};
         if (compileDiagnostic(std.testing.allocator, entry.object.get("sql").?.string, .{}, &diagnostic)) |compiled| {
@@ -6149,7 +6152,35 @@ test "SQL original unsupported catalog object commands reject before backend acc
         }
         covered += 1;
     }
-    try std.testing.expectEqual(@as(usize, 50), covered);
+    try std.testing.expectEqual(@as(usize, 45), covered);
+}
+
+test "SQL original ordinary trigger declarations preserve supported catalog intents" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    // sql-1150 sql-1153 sql-1154 sql-1155 sql-1157: syntax admission alone
+    // grants no catalog authority and is not execution/disposition evidence.
+    for ([_][]const u8{ "sql-1150", "sql-1153", "sql-1154", "sql-1155", "sql-1157" }, 0..) |id, index| {
+        var parsed = try compile(a, (try corpus.get(id)).sql, .{});
+        defer parsed.deinit();
+        const ddl = parsed.statement.catalog_ddl;
+        try std.testing.expectEqual(.alter_schema, ddl.action);
+        const syntax = ddl.trigger.?;
+        const create = syntax.operation.create;
+        try std.testing.expectEqualStrings("usage_records", syntax.table.table);
+        try std.testing.expectEqualStrings("audit_usage", create.function.table);
+        try std.testing.expectEqual(index == 0, create.timing == .after);
+        try std.testing.expectEqual(index != 1, create.level == .row);
+        try std.testing.expectEqual(index == 0 or index == 4, create.events.insert);
+        try std.testing.expectEqual(index == 1, create.events.truncate);
+        try std.testing.expectEqual(index == 2 or index == 3, create.events.update);
+        try std.testing.expectEqual(index == 3, create.predicate != null);
+        try std.testing.expectEqual(@as(usize, @intFromBool(index == 2)), create.update_columns.len);
+        if (index == 2) try std.testing.expectEqualStrings("status", create.update_columns[0]);
+        try std.testing.expectEqual(@as(usize, @intFromBool(index == 4)), create.arguments.len);
+        if (index == 4) try std.testing.expectEqualStrings("audit-context", create.arguments[0]);
+    }
 }
 
 test "compiler implicit projection aliases preserve clause and expression boundaries" {

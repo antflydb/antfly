@@ -141,7 +141,7 @@ pub const Source = struct {
 };
 
 const test_columns = [_]schema.RelationalColumn{
-    .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .allows_null = true },
+    .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any, .allows_null = true },
     .{ .name = "n", .path = "n", .column_type = .integer, .allows_null = true },
     .{ .name = "missing", .path = "missing", .column_type = .string, .allows_null = true },
 };

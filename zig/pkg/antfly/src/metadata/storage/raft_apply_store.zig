@@ -13351,7 +13351,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "12";
+const derived_catalog_index_version = "13";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -18280,6 +18280,11 @@ fn policyArtifactProfile(alloc: std.mem.Allocator, indexes_json: []const u8) !Po
     var result: PolicyArtifactProfile = .{};
     var indexes = parsed.object.iterator();
     while (indexes.next()) |index| {
+        // Declarations and opaque control state share indexes_json with the
+        // actual indexes. Match the catalog owner's declaration boundary;
+        // their presence does not turn them into searchable index configs.
+        if (std.mem.eql(u8, index.key_ptr.*, "enrichments") or std.mem.eql(u8, index.key_ptr.*, "resolvers") or
+            @import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index.key_ptr.*)) continue;
         const config = index.value_ptr.*;
         if (config != .object) return error.InvalidCatalogRecord;
         const kind = config.object.get("type") orelse return error.InvalidCatalogRecord;
@@ -20142,11 +20147,16 @@ pub const RaftApplyStore = struct {
             const key = try tableKeyForGroup(&key_buf, group_id, change.expected.table_id);
             const before = try decodeTableRecord(self.alloc, (try stagingGet(&txn, key)) orelse return error.TableGenerationChanged);
             defer metadata_table_manager.freeTable(self.alloc, before);
-            if (!metadata_table_manager.tableDefinitionsEqual(before, change.expected)) return error.TableGenerationChanged;
+            var expected = change.expected;
+            if (change.expected_indexes_digest) |digest| {
+                if (expected.indexes_json.len != 0 or !std.mem.eql(u8, &digest, &@import("../job_state.zig").digest(before.indexes_json))) return error.TableGenerationChanged;
+                expected.indexes_json = before.indexes_json;
+            }
+            if (!metadata_table_manager.tableDefinitionsEqual(before, expected)) return error.TableGenerationChanged;
             // Reuse replicated lifecycle admission, including owner coverage,
             // dependencies and topology fences. A rejected CAS aborts the whole
             // local transaction, including its logical delta and standby record.
-            if (!try self.tryApplyTableCompareAndReplaceTxn(&txn, group_id, change.expected, change.replacement))
+            if (!try self.tryApplyTableCompareAndReplaceTxn(&txn, group_id, expected, change.replacement))
                 return error.TableLifecycleConflict;
             const actual = try decodeTableRecord(self.alloc, (try stagingGet(&txn, key)) orelse return error.TableLifecycleConflict);
             defer metadata_table_manager.freeTable(self.alloc, actual);
@@ -30499,6 +30509,65 @@ pub const RaftApplyStore = struct {
         }
     }
 
+    fn privacyPrefix(buf: []u8, group: u64) ![]const u8 {
+        return std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:privacy_due:{d}:", .{group});
+    }
+    fn privacyReverseKey(buf: []u8, group: u64, id: u64) ![]const u8 {
+        return std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:privacy_table:{d}:{d}", .{ group, id });
+    }
+    fn removePrivacyWork(txn: *docstore.DocStore.Txn, group: u64, id: u64) !void {
+        var buf: [160]u8 = undefined;
+        const reverse = try privacyReverseKey(&buf, group, id);
+        if (try stagingGet(txn, reverse)) |due_key| {
+            try txn.delete(due_key);
+            try txn.delete(reverse);
+        }
+    }
+    fn putPrivacyWork(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: metadata.TableRecord) !void {
+        try attachPrivacyKeys(a, txn, group, table);
+        try removePrivacyWork(txn, group, table.table_id);
+        const due = (try @import("antfly_local_sources").privacy_catalog.workDue(a, table.indexes_json)) orelse return;
+        var prefix_buf: [128]u8 = undefined;
+        var key_buf: [192]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "{s}{x:0>16}:{x:0>16}", .{ try privacyPrefix(&prefix_buf, group), @as(u64, @intCast(due)), table.table_id });
+        var id: [8]u8 = undefined;
+        std.mem.writeInt(u64, &id, table.table_id, .little);
+        try txn.put(key, &id);
+        var reverse_buf: [160]u8 = undefined;
+        try txn.put(try privacyReverseKey(&reverse_buf, group, table.table_id), key);
+    }
+
+    /// One indexed due lookup and one primary table read. The derived index is
+    /// rebuilt on open/restore by the ordinary catalog-index migration path.
+    pub fn nextPrivacyTable(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, now: i64) !?metadata.TableRecord {
+        var read = try self.beginQueryCatalogReadTxn(group);
+        defer read.abort();
+        var buf: [128]u8 = undefined;
+        const prefix = try privacyPrefix(&buf, group);
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const row = (try cursor.seekAtOrAfter(prefix)) orelse return null;
+        if (!std.mem.startsWith(u8, row.key, prefix)) return null;
+        if (row.key.len != prefix.len + 33 or row.value.len != 8) return error.InvalidDerivedCatalogIndex;
+        const due = std.fmt.parseInt(u64, row.key[prefix.len..][0..16], 16) catch return error.InvalidDerivedCatalogIndex;
+        if (due > std.math.maxInt(i64) or row.key[prefix.len + 16] != ':') return error.InvalidDerivedCatalogIndex;
+        if (due > @as(u64, @intCast(@max(0, now)))) return null;
+        const id = std.mem.readInt(u64, row.value[0..8], .little);
+        const indexed_id = std.fmt.parseInt(u64, row.key[prefix.len + 17 ..], 16) catch return error.InvalidDerivedCatalogIndex;
+        if (id != indexed_id) return error.InvalidDerivedCatalogIndex;
+        var table_buf: [160]u8 = undefined;
+        const raw = (try stagingGet(&read, try tableKeyForGroup(&table_buf, group, id))) orelse return error.InvalidDerivedCatalogIndex;
+        const table = try decodeTableRecord(a, raw);
+        errdefer metadata_table_manager.freeTable(a, table);
+        if ((try @import("antfly_local_sources").privacy_catalog.workDue(a, table.indexes_json)) != @as(?i64, @intCast(due))) return error.InvalidDerivedCatalogIndex;
+        return table;
+    }
+    pub fn tableByName(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, name: []const u8) !?metadata.TableRecord {
+        var read = try self.beginQueryCatalogReadTxn(group);
+        defer read.abort();
+        return self.getTableByNameTxn(a, &read, group, name);
+    }
+
     pub fn listTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.TableRecord {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
@@ -33199,6 +33268,10 @@ pub const RaftApplyStore = struct {
     ) !void {
         var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
         const key = try tableNameIndexKey(&key_buf, group_id, table_name);
+        if (try stagingGet(txn, key)) |raw| {
+            if (raw.len != 8) return error.InvalidDerivedCatalogIndex;
+            try removePrivacyWork(txn, group_id, std.mem.readInt(u64, raw[0..8], .little));
+        }
         try self.deleteLegacyListingTxn(txn, group_id, table_name);
         txn.delete(key) catch |err| switch (err) {
             error.NotFound => {},
@@ -33382,6 +33455,9 @@ pub const RaftApplyStore = struct {
             try putRestoreProgressRangeIndexTxn(txn, group_id, record);
         }
 
+        var privacy_buf: [160]u8 = undefined;
+        try self.deleteDerivedPrefixTxn(txn, try privacyPrefix(&privacy_buf, group_id));
+        try self.deleteDerivedPrefixTxn(txn, try std.fmt.bufPrint(&privacy_buf, "\x00\x00__metadata_derived__:privacy_table:{d}:", .{group_id}));
         const tables = try listPhysicalTableIdentities(self.alloc, txn, group_id);
         defer freePhysicalTableIdentities(self.alloc, tables);
         for (tables) |table| {
@@ -33390,6 +33466,13 @@ pub const RaftApplyStore = struct {
                 return error.InvalidDerivedCatalogIndex;
             } else |err| if (err != error.NotFound) return err;
             try self.putTableNameIndexTxn(txn, group_id, table.name, table.id);
+            var privacy_row_arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer privacy_row_arena.deinit();
+            const privacy_alloc = privacy_row_arena.allocator();
+            var privacy_table_buf: [160]u8 = undefined;
+            const privacy_raw = try txn.get(try tableKeyForGroup(&privacy_table_buf, group_id, table.id));
+            try putPrivacyWork(privacy_alloc, txn, group_id, try decodeTableRecord(privacy_alloc, privacy_raw));
+
             var fence = try self.loadTableTransitionFenceTxn(txn, group_id, table.id);
             fence.range_membership = .{};
             var fence_key_buf: [192]u8 = undefined;
@@ -33553,6 +33636,152 @@ pub const RaftApplyStore = struct {
         if (value.len != 8) return error.InvalidDocumentCheckpoint;
         return std.mem.readInt(u64, value[0..8], .big);
     }
+    const privacy_keys = @import("antfly_local_sources").privacy_catalog.checkpoints;
+
+    fn privacyHeader(a: std.mem.Allocator, raw: []const u8) !privacy_keys.Header {
+        const parsed = try std.json.parseFromSlice(privacy_keys.Header, a, raw, .{});
+        defer parsed.deinit();
+        const value = parsed.value;
+        if (value.length == 0 or value.length > privacy_keys.max_bytes or value.created_at_millis < 0 or value.deleted_chunks > value.chunks()) return error.InvalidDocumentCheckpoint;
+        return value;
+    }
+    fn privacyIndexes(txn: *docstore.DocStore.Txn, group: u64, table: u64) ![]const u8 {
+        var buffer: [160]u8 = undefined;
+        const raw = txn.get(try tableKeyForGroup(&buffer, group, table)) catch |err| if (err == error.NotFound) return "" else return err;
+        const record = try borrowTableProjection(raw, .query);
+        // Borrow the pinned transaction bytes: GC must not duplicate the table
+        // schema and catalog for every checkpoint examined.
+        return record.query_definition.?.indexes_json;
+    }
+    fn privacyReferenced(txn: *docstore.DocStore.Txn, group: u64, table: u64, ref: privacy_keys.Ref) !bool {
+        // Tokens are printable and escape-free. A conservative substring hit
+        // can retain extra data, but can never reclaim a live reference.
+        return std.mem.indexOf(u8, try privacyIndexes(txn, group, table), &ref.token()) != null;
+    }
+    fn privacyQuota(txn: *docstore.DocStore.Txn, group: u64, table: u64, bytes: usize, increase: bool, retained: bool) !void {
+        var logical_buffer: [64]u8 = undefined;
+        const logical = try privacy_keys.quotaKey(&logical_buffer, table, retained);
+        var buffer: [256]u8 = undefined;
+        const selected = try jobStateKeyForGroup(&buffer, group, logical);
+        const raw = txn.get(selected) catch |err| if (err == error.NotFound) null else return err;
+        if (raw != null and raw.?.len != 8) return error.InvalidDocumentCheckpoint;
+        const previous = if (raw) |value| std.mem.readInt(u64, value[0..8], .little) else 0;
+        const charge = @max(bytes, 4096);
+        const next = if (increase) std.math.add(u64, previous, charge) catch return error.ResourceBudgetExceeded else std.math.sub(u64, previous, charge) catch return error.InvalidDocumentCheckpoint;
+        if (next > (if (retained) privacy_keys.max_retained_bytes else privacy_keys.max_pending_bytes)) return error.ResourceBudgetExceeded;
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, next, .little);
+        if (next == 0) {
+            txn.delete(selected) catch |err| if (err != error.NotFound) return err;
+        } else try txn.put(selected, &encoded);
+    }
+    const PrivacyWrite = enum { store, skip, erase };
+    fn privacyWrite(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, logical: []const u8, current: ?[]const u8, value: []const u8) !PrivacyWrite {
+        _ = self;
+        const selected = try privacy_keys.parseKey(logical);
+        if (selected.kind == .quota) return error.InvalidDocumentCheckpoint;
+        if (selected.kind == .gc) {
+            if (value.len > 256) return error.InvalidDocumentCheckpoint;
+            return .store;
+        }
+        const ref = selected.ref.?;
+        var logical_buffer: [128]u8 = undefined;
+        var buffer: [256]u8 = undefined;
+        if (selected.kind == .chunk) {
+            const raw_header = txn.get(try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, selected.table, null))) catch |err| if (err == error.NotFound) return .skip else return err;
+            const header = try privacyHeader(a, raw_header);
+            if (header.state != .staged) return .skip;
+            if (selected.index >= header.chunks() or value.len != @min(privacy_keys.chunk_bytes, @as(usize, header.length) - selected.index * privacy_keys.chunk_bytes) + 1 or value[0] != 'V') return error.InvalidDocumentCheckpoint;
+            return .store;
+        }
+        const old: ?privacy_keys.Header = if (current) |raw| try privacyHeader(a, raw) else null;
+        if (std.mem.eql(u8, value, privacy_keys.erase)) {
+            const header = old orelse return .skip;
+            if (header.state != .deleting or header.deleted_chunks != header.chunks()) return error.InvalidDocumentCheckpoint;
+            if (header.accounted) try privacyQuota(txn, group, selected.table, header.length, false, true);
+            return .erase;
+        }
+        const next = try privacyHeader(a, value);
+        if (old == null) {
+            if (next.state != .staged or next.attached or next.deleted_chunks != 0) return error.InvalidDocumentCheckpoint;
+            _ = txn.get(try tableKeyForGroup(&buffer, group, selected.table)) catch |err| if (err == error.NotFound) return .skip else return err;
+            if (next.accounted) {
+                const quota_key = try privacy_keys.quotaKey(&logical_buffer, selected.table, true);
+                const quota = txn.get(try jobStateKeyForGroup(&buffer, group, quota_key)) catch |err| if (err == error.NotFound) null else return err;
+                if (quota != null and quota.?.len != 8) return error.InvalidDocumentCheckpoint;
+                const used = if (quota) |bytes| std.mem.readInt(u64, bytes[0..8], .little) else 0;
+                if (@max(next.length, 4096) > privacy_keys.max_retained_bytes -| used) return .skip;
+            }
+            privacyQuota(txn, group, selected.table, next.length, true, false) catch |err| if (err == error.ResourceBudgetExceeded) return .skip else return err;
+            if (next.accounted) try privacyQuota(txn, group, selected.table, next.length, true, true);
+            return .store;
+        }
+        const previous = old.?;
+        if (next.length != previous.length or next.created_at_millis != previous.created_at_millis or next.attached != previous.attached or next.accounted != previous.accounted) return error.InvalidDocumentCheckpoint;
+        if (next.state == .ready) {
+            if (previous.state != .staged) return .skip;
+            if (next.deleted_chunks != 0) return error.InvalidDocumentCheckpoint;
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            for (0..next.chunks()) |index| {
+                const raw = txn.get(try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, selected.table, index))) catch |err| if (err == error.NotFound) return .skip else return err;
+                if (raw.len != @min(privacy_keys.chunk_bytes, @as(usize, next.length) - index * privacy_keys.chunk_bytes) + 1 or raw[0] != 'V') return error.InvalidDocumentCheckpoint;
+                hash.update(raw[1..]);
+            }
+            var digest: [32]u8 = undefined;
+            hash.final(&digest);
+            if (!std.mem.eql(u8, &std.fmt.bytesToHex(digest, .lower), &ref.digest)) return error.InvalidDocumentCheckpoint;
+            return .store;
+        }
+        if (next.state != .deleting or (previous.state == .deleting and next.deleted_chunks < previous.deleted_chunks) or next.deleted_chunks > previous.deleted_chunks + privacy_keys.gc_chunks) return error.InvalidDocumentCheckpoint;
+        if (try privacyReferenced(txn, group, selected.table, ref)) return .skip;
+        if (previous.state != .deleting and !previous.attached) try privacyQuota(txn, group, selected.table, previous.length, false, false);
+        for (previous.deleted_chunks..next.deleted_chunks) |index| {
+            txn.delete(try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, selected.table, index))) catch |err| if (err != error.NotFound) return err;
+        }
+        return .store;
+    }
+    fn privacyKeysReady(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: metadata.TableRecord) !bool {
+        if (std.mem.indexOf(u8, table.indexes_json, "\"_privacy\"") == null) return true;
+        const catalog = @import("antfly_local_sources").privacy_catalog;
+        const tree = try std.json.parseFromSlice(std.json.Value, a, table.indexes_json, .{});
+        defer tree.deinit();
+        var resource = (try catalog.current(a, tree.value)) orelse return true;
+        defer resource.deinit();
+        const refs = try privacy_keys.refs(a, resource.value);
+        defer a.free(refs);
+        for (refs) |ref| {
+            var logical_buffer: [128]u8 = undefined;
+            var buffer: [256]u8 = undefined;
+            const raw = txn.get(try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, table.table_id, null))) catch |err| if (err == error.NotFound) return false else return err;
+            if ((try privacyHeader(a, raw)).state != .ready) return false;
+        }
+        return true;
+    }
+
+    fn attachPrivacyKeys(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: metadata.TableRecord) !void {
+        const catalog = @import("antfly_local_sources").privacy_catalog;
+        const tree = try std.json.parseFromSlice(std.json.Value, a, table.indexes_json, .{});
+        defer tree.deinit();
+        var resource = (try catalog.current(a, tree.value)) orelse return;
+        defer resource.deinit();
+        const refs = try privacy_keys.refs(a, resource.value);
+        defer a.free(refs);
+        for (refs) |ref| {
+            var logical_buffer: [128]u8 = undefined;
+            var buffer: [256]u8 = undefined;
+            const selected = try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, table.table_id, null));
+            var header = try privacyHeader(a, try txn.get(selected));
+            if (header.state != .ready) return error.InvalidDocumentCheckpoint;
+            if (!header.attached) {
+                header.attached = true;
+                const raw = try std.json.Stringify.valueAlloc(a, header, .{});
+                defer a.free(raw);
+                try txn.put(selected, raw);
+                try privacyQuota(txn, group, table.table_id, header.length, false, false);
+            }
+        }
+    }
+
     pub fn getJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
         var buf: [256]u8 = undefined;
         return self.store.get(alloc, try jobStateKeyForGroup(&buf, group_id, logical_key)) catch |err| switch (err) {
@@ -33565,6 +33794,36 @@ pub const RaftApplyStore = struct {
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         const work = scratch.allocator();
+        if (after) |cursor| if (std.mem.startsWith(u8, cursor, "privacy/m/")) {
+            try @import("../job_state.zig").validateKey(cursor);
+            var prefix_buffer: [128]u8 = undefined;
+            const prefix = try jobStateKeyForGroup(&prefix_buffer, group, "privacy/m/");
+            var after_buffer: [256]u8 = undefined;
+            const rows = try self.store.scanPrefixPage(work, prefix, try jobStateKeyForGroup(&after_buffer, group, cursor), contract.max_page_rows);
+            var selected: std.ArrayList(contract.Row) = .empty;
+            var txn = try self.store.beginReadTxn();
+            defer txn.abort();
+            // Manifest keys are ordered by table. Reuse the pinned catalog
+            // even on read backends that allocate a value for each get call.
+            var cached_table: ?u64 = null;
+            var cached_indexes: []const u8 = "";
+            for (rows) |row| {
+                const logical = row.key[prefix.len - "privacy/m/".len ..];
+                const key = try privacy_keys.parseKey(logical);
+                const header = try privacyHeader(work, row.value);
+                const expired = @as(i64, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_ms))) -| header.created_at_millis >= privacy_keys.lease_ms;
+                if (header.state != .deleting) {
+                    if (!header.attached and !expired) continue;
+                    if (cached_table == null or cached_table.? != key.table) {
+                        cached_indexes = try privacyIndexes(&txn, group, key.table);
+                        cached_table = key.table;
+                    }
+                    if (std.mem.indexOf(u8, cached_indexes, &key.ref.?.token()) != null) continue;
+                }
+                try selected.append(work, .{ .key = logical, .value = row.value });
+            }
+            return std.json.Stringify.valueAlloc(a, contract.Page{ .rows = selected.items, .next = if (rows.len == contract.max_page_rows) rows[rows.len - 1].key[prefix.len - "privacy/m/".len ..] else null }, .{});
+        };
         var base_buf: [128]u8 = undefined;
         const base = try jobSchedulePrefixForGroup(&base_buf, group);
         if (after) |cursor| if (cursor.len < 19 or cursor.len > 160 or (cursor[0] != '0' and cursor[0] != '1') or cursor[1] != ':') return error.InvalidDocumentCheckpoint;
@@ -37770,6 +38029,16 @@ pub const RaftApplyStore = struct {
                     const hash = @import("../job_state.zig").digest(bytes);
                     if (!std.mem.eql(u8, &hash, record.expected_hash)) return;
                 } else if (record.expected_hash.len != 0) return;
+                var erase_privacy = false;
+                if (std.mem.startsWith(u8, record.key, "privacy/")) {
+                    var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                    defer scratch.deinit();
+                    switch (try self.privacyWrite(scratch.allocator(), txn, group_id, record.key, current, record.value)) {
+                        .skip => return,
+                        .erase => erase_privacy = true,
+                        .store => {},
+                    }
+                }
                 if (std.mem.startsWith(u8, record.key, "documents/")) {
                     const contract = @import("../job_state.zig");
                     var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -37811,7 +38080,7 @@ pub const RaftApplyStore = struct {
                     try txn.put(quota_key, &encoded_count);
                     self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = quota_key });
                 }
-                try txn.put(key, record.value);
+                if (erase_privacy) try txn.delete(key) else try txn.put(key, record.value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group_id });
             },
@@ -38172,6 +38441,8 @@ pub const RaftApplyStore = struct {
         };
         var retained: ?metadata.TableRecord = null;
         defer if (retained) |existing| metadata_table_manager.freeTable(self.alloc, existing);
+        var privacy_indexes: ?[]u8 = null;
+        defer if (privacy_indexes) |raw| self.alloc.free(raw);
         var admission = record;
         if (encoded_existing) |encoded| {
             const existing = try decodeTableRecord(self.alloc, encoded);
@@ -38185,6 +38456,8 @@ pub const RaftApplyStore = struct {
             // retains internal state so schema reconciliation can continue
             // without taking ownership of the publication lifecycle.
             if (record.lake_index_catalog_json.len == 0) admission.lake_index_catalog_json = existing.lake_index_catalog_json else if (!std.mem.eql(u8, existing.lake_index_catalog_json, record.lake_index_catalog_json)) return .rejected;
+            privacy_indexes = (try @import("antfly_local_sources").privacy_catalog.reconcileIndexes(self.alloc, existing.indexes_json, admission.indexes_json)) orelse return .rejected;
+            admission.indexes_json = privacy_indexes.?;
             if (metadata_table_manager.tableDefinitionsEqual(existing, admission)) return .unchanged;
             if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, existing, admission)) return .rejected;
             if ((existing.relational_retirement_json.len != 0 or admission.relational_retirement_json.len != 0) and
@@ -38750,7 +39023,7 @@ pub const RaftApplyStore = struct {
         // Replays, cancellation and prior admission win before any reservation
         // is inspected or created. The caller receives the durable first row.
         if (try stagingGet(txn, logical_key) != null) return;
-        const Header = struct { job_id: u64, attempt_id: u64, staging_attempt_id: u64, source_kind: []const u8, phase: []const u8, cancel_requested: bool = false, table_names: []const []const u8 = &.{}, restore_mode: []const u8 = "fail_if_exists" };
+        const Header = struct { job_id: u64, attempt_id: u64, staging_attempt_id: u64, source_kind: []const u8, phase: []const u8, cancel_requested: bool = false, table_names: []const []const u8 = &.{}, restore_mode: []const u8 = "fail_if_exists", idempotency_namespace: []const u8 = "", destination_authorization_principal: []const u8 = "", location: []const u8 = "", connection: []const u8 = "" };
         var header = std.json.parseFromSlice(Header, self.alloc, record.value, .{ .ignore_unknown_fields = true }) catch |err| {
             if (err == error.OutOfMemory) return err;
             return;
@@ -38771,6 +39044,27 @@ pub const RaftApplyStore = struct {
         const query_population = std.mem.eql(u8, header.value.source_kind, "query_population");
         if (!std.mem.eql(u8, &plan.value.id, &expected_id) or plan.value.preparing_sources != (!empty_generation and !query_population)) return;
         for (plan.value.targets) |target| if (target.empty_generation != empty_generation or (target.population != null) != query_population) return;
+        const sql_truncate = empty_generation and std.mem.startsWith(u8, header.value.idempotency_namespace, "sql-truncate:");
+        if (sql_truncate) {
+            plan.value.validate(self.alloc) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return;
+            };
+            const a = self.alloc;
+            const expected_namespace = try std.fmt.allocPrint(a, "sql-truncate:{s}", .{header.value.destination_authorization_principal});
+            defer a.free(expected_namespace);
+            const expected_location = try std.fmt.allocPrint(a, "metadata://empty-generation/{s}", .{std.fmt.bytesToHex(expected_id, .lower)});
+            defer a.free(expected_location);
+            if (header.value.destination_authorization_principal.len == 0 or !std.mem.eql(u8, expected_namespace, header.value.idempotency_namespace) or
+                !std.mem.eql(u8, expected_location, header.value.location) or !std.mem.eql(u8, header.value.connection, "internal") or
+                !std.mem.eql(u8, header.value.restore_mode, "overwrite")) return;
+            self.requireTruncatePreparationTxn(txn, group_id, plan.value, true) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.CatalogGenerationChanged, error.InvalidRestoreStaging, error.InvalidSqlTriggerManifest, error.SqlTriggerCoordinationRequired => return,
+                else => return err,
+            };
+        } else if (plan.value.truncate_preparation != null) return;
+
         if (query_population) {
             if (header.value.table_names.len != plan.value.targets.len) return;
             for (plan.value.targets) |target| {
@@ -38815,7 +39109,22 @@ pub const RaftApplyStore = struct {
             }
             return;
         }
-        try txn.put(logical_key, record.value);
+        if (plan.value.truncate_preparation) |prepared| {
+            // Admission already owns the exact immutable Plan. Store its
+            // compact result with this first logical job write, so a lost
+            // response or cold observer never needs to execute triggers.
+            var region: std.heap.ArenaAllocator = .init(self.alloc);
+            defer region.deinit();
+            const a = region.allocator();
+            var state = try std.json.parseFromSliceLeaky(std.json.Value, a, record.value, .{});
+            if (state != .object) return error.InvalidRestoreStaging;
+            const result = try prepared.projectReferenceAlloc(self.alloc, null, try plan.value.digest(self.alloc));
+            defer self.alloc.free(result);
+            try state.object.put(a, "result_json", .{ .string = result });
+            const encoded_state = try std.json.Stringify.valueAlloc(self.alloc, state, .{});
+            defer self.alloc.free(encoded_state);
+            try txn.put(logical_key, encoded_state);
+        } else try txn.put(logical_key, record.value);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = logical_key });
         self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group_id });
     }
@@ -39271,6 +39580,63 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    /// Rejoin executable preparation against the actual reserve writer cut.
+    /// No statement VM or externally observable callback runs during apply.
+    fn requireTruncatePreparationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, plan: restore_staging.Plan, required: bool) !void {
+        const preparation = plan.truncate_preparation;
+        if (!required and preparation == null) return;
+        var region: std.heap.ArenaAllocator = .init(self.alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        if (preparation) |prepared| {
+            prepared.validate(a, plan) catch |err| return if (err == error.OutOfMemory) err else error.InvalidRestoreStaging;
+            _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_truncate_preparation_version);
+        }
+        var strict_coverage = preparation != null;
+        if (required and preparation == null) {
+            // Published176 entries must replay with their original semantics.
+            // The sender requires177 for new affected SQL commands; only the
+            // actual durable all-voter activation enables the omission guard.
+            var activation_key: [160]u8 = undefined;
+            if (try stagingGet(txn, try topologyActivationKeyForGroup(&activation_key, group)) != null) {
+                const activation = try self.requireTopologyActivationTxn(txn, group, 0);
+                strict_coverage = activation.version >= topology_protocol.sql_truncate_preparation_version;
+            }
+        }
+        const meta = try system_catalog_storage.readMeta(a, txn, group);
+        const incarnation = try catalogIncarnationTxn(txn, group);
+        const manifest = @import("antfly_local_sources").sql_catalog.trigger_manifest;
+        for (plan.targets) |target| {
+            const old = target.replace orelse return error.InvalidRestoreStaging;
+            if (!target.empty_generation or target.source_table_id != old.table.table_id or target.native_reset != null or target.schema_only_snapshot != null) return error.InvalidRestoreStaging;
+            var key: [256]u8 = undefined;
+            const current = try decodeTableRecord(a, (try stagingGet(txn, try tableKeyForGroup(&key, group, target.source_table_id))) orelse return error.CatalogGenerationChanged);
+            if (!std.mem.eql(u8, current.schema_json, old.table.schema_json) or !std.mem.eql(u8, current.indexes_json, old.table.indexes_json)) return error.CatalogGenerationChanged;
+            var state = try @import("../trigger_catalog.zig").schemaState(a, current);
+            defer if (state) |*value| value.deinit();
+            const receipt: ?@import("antfly_local_sources").sql_catalog.trigger_handoff.Receipt = if (preparation) |prepared| found: {
+                for (prepared.receipts) |item| if (item.program.table.id == current.table_id) break :found item;
+                break :found null;
+            } else null;
+            const has_truncate = if (state) |captured| restore_staging.truncateStateRequired(captured.value) else false;
+            if (receipt == null) {
+                if (required and strict_coverage and has_truncate) return error.SqlTriggerCoordinationRequired;
+                continue;
+            }
+            const actual = if (state) |captured| captured.value else return error.CatalogGenerationChanged;
+            const proof = receipt.?.program;
+            const expected: manifest.Table = .{ .id = current.table_id, .schema_version = try @import("../../api/tables.zig").schemaVersion(current.schema_json), .schema_digest = @import("antfly_local_sources").storage_db_relational_schema_owner_contract.hash(current.schema_json), .attachment_generation = actual.generation, .attachment_digest = try manifest.attachmentDigest(actual) };
+            try proof.requireFor(expected, incarnation);
+            if (proof.catalog_revision != meta.revision or proof.absence != null) return error.CatalogGenerationChanged;
+            for (proof.routines) |captured| {
+                const now = try @import("../trigger_catalog.zig").captureRoutine(a, txn, group, captured.record.id);
+                const expected_bytes = try std.json.Stringify.valueAlloc(a, captured, .{});
+                const actual_bytes = try std.json.Stringify.valueAlloc(a, now, .{});
+                if (!std.mem.eql(u8, expected_bytes, actual_bytes)) return error.CatalogGenerationChanged;
+            }
+        }
+    }
+
     fn applyRestoreStagingTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         if (@import("../schema_reader_wire.zig").requiresLogicalRelations(bytes)) _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_table_triggers_version);
         var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -39281,6 +39647,9 @@ pub const RaftApplyStore = struct {
         };
         defer parsed.deinit();
         const command = parsed.value;
+        if (command.plan) |plan| if (plan.truncate_preparation != null) {
+            _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_truncate_preparation_version);
+        };
         if (command.plan) |plan| for (plan.targets) |target| {
             if (target.population != null) {
                 // New captures are inadmissible until the exact metadata
@@ -39326,6 +39695,11 @@ pub const RaftApplyStore = struct {
             if (current != null) return; // Immutable identity; callers verify plan digest after apply.
             if (try stagingGet(txn, progress_key) != null) return; // Canceled before admission.
             const plan = command.plan.?;
+            self.requireTruncatePreparationTxn(txn, group_id, plan, false) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.CatalogGenerationChanged, error.InvalidRestoreStaging, error.InvalidSqlTriggerManifest, error.SqlTriggerCoordinationRequired => return,
+                else => return err,
+            };
             if (try restoreLogicalOidRangeTxn(catalog_arena.allocator(), txn, group_id, plan, false))
                 _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_table_triggers_version);
             try @import("../trigger_restore_claims.zig").validate(catalog_arena.allocator(), txn, group_id, plan);
@@ -40811,7 +41185,39 @@ pub const RaftApplyStore = struct {
         };
         const current = try decodeTableRecord(self.alloc, encoded);
         defer metadata_table_manager.freeTable(self.alloc, current);
-        if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return false;
+        if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) {
+            if (!try metadata_table_manager.privacyProgressOnly(self.alloc, expected, replacement))
+                try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
+            return false;
+        }
+        if (!try privacyKeysReady(self.alloc, txn, group_id, replacement)) {
+            if (!try metadata_table_manager.privacyProgressOnly(self.alloc, current, replacement))
+                try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
+            return false;
+        }
+        if (try metadata_table_manager.privacyProgressOnly(self.alloc, current, replacement)) {
+            // Runtime-only telemetry still changes indexes_json. A reserved
+            // retirement freezes that exact source preimage, including before
+            // an ancestor has materialized its table child. Reuse the existing
+            // point-read exclusions in this writer before any work/stamp write.
+            if (try @import("../scope_retirement_fence.zig").occupied(txn, group_id, "table", current.table_id) or
+                try table_retirement.member(txn, group_id, current.table_id) != null or
+                try @import("../table_lifecycle_lock.zig").read(txn, group_id, current.table_id) != null) return false;
+            if ((try self.loadTableTransitionFenceTxn(txn, group_id, current.table_id)).active()) return false;
+            // The same writer refuses pending policy custody before writing
+            // any progress/work/fingerprint byte. ACTIVE progress refreshes
+            // only the live stamp; immutable install history is untouched.
+            const fingerprint = policyTableSchemaRecordDigest(replacement);
+            if (!try system_catalog_storage.refreshPolicyRuntimeFingerprint(self.alloc, txn, group_id, current.table_id, policyTableSchemaRecordDigest(current), fingerprint)) return false;
+            const value = try encodeTableRecord(self.alloc, replacement);
+            defer self.alloc.free(value);
+            try putPrivacyWork(self.alloc, txn, group_id, replacement);
+            try txn.put(key, value);
+            var fingerprint_key_buf: [192]u8 = undefined;
+            try txn.put(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, replacement.table_id), &fingerprint);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            return true;
+        }
         return self.tryApplyKnownTableCompareAndReplaceTxn(txn, group_id, current, replacement, renames);
     }
 
@@ -40822,16 +41228,13 @@ pub const RaftApplyStore = struct {
     fn tryApplyKnownTableCompareAndReplacePolicyTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, current: metadata.TableRecord, replacement: metadata.TableRecord, renames: []const object_annotations.Rename, publication: ?sql_policies.Publication, binding: ?system_catalog.Resource, command_hash: [32]u8) !bool {
         var key_buf: [160]u8 = undefined;
         const key = try tableKeyForGroup(&key_buf, group_id, current.table_id);
+        if (!try privacyKeysReady(self.alloc, txn, group_id, replacement)) return false;
         {
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
             const a = arena.allocator();
             if (!try resolverNamespaceAdoptionAllowedTxn(txn, group_id, a, current, replacement) or !try self.resolverProjectionValidTxn(a, txn, group_id, replacement)) {
-                try txn.put(try resolverRejectionKey(a, group_id, current.table_id), try std.json.Stringify.valueAlloc(a, ResolverRejection{
-                    .digest = try resolverReplacementDigest(a, current, replacement),
-                    .term = self.active_resolver_apply_position.term,
-                    .index = self.active_resolver_apply_position.index,
-                }, .{}));
+                try self.recordTableDefinitionRejectionTxn(txn, group_id, current, replacement);
                 return false;
             }
             try txn.delete(try resolverRejectionKey(a, group_id, current.table_id));
@@ -42889,7 +43292,21 @@ pub const RaftApplyStore = struct {
         }
         return projected;
     }
-    const ResolverRejection = struct { digest: [32]u8, term: u64, index: u64 };
+    // One bounded rejection per table, shared with existing resolver failures.
+    // Keep the durable key and encoding compatible. Later progress commits do
+    // not erase the marker; a later authored replacement may supersede it, in
+    // which case its receipt reader conservatively retains outcome-unknown.
+    fn recordTableDefinitionRejectionTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, expected: metadata.TableRecord, replacement: metadata.TableRecord) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        try txn.put(try resolverRejectionKey(a, group_id, expected.table_id), try std.json.Stringify.valueAlloc(a, TableDefinitionRejection{
+            .digest = try resolverReplacementDigest(a, expected, replacement),
+            .term = self.active_resolver_apply_position.term,
+            .index = self.active_resolver_apply_position.index,
+        }, .{}));
+    }
+    const TableDefinitionRejection = struct { digest: [32]u8, term: u64, index: u64 };
     fn resolverRejectionKey(a: std.mem.Allocator, group_id: u64, table_id: u64) ![]const u8 {
         return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:rejected:{x:0>16}", .{ group_id, table_id });
     }
@@ -42898,14 +43315,19 @@ pub const RaftApplyStore = struct {
         std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ expected, replacement }, .{}), &digest, .{});
         return digest;
     }
+    // Preserve the existing resolver-specific caller contract while main's
+    // generalized authored-CAS rejection receipt uses the same durable key.
     pub fn resolverNamespaceReplacementRejected(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, term: u64, index: u64, expected: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
+        return self.tableDefinitionReplacementRejected(alloc, group_id, term, index, expected, replacement);
+    }
+    pub fn tableDefinitionReplacementRejected(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, term: u64, index: u64, expected: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         const value = (try stagingGet(&txn, try resolverRejectionKey(a, group_id, expected.table_id))) orelse return false;
-        const receipt = try std.json.parseFromSliceLeaky(ResolverRejection, a, value, .{});
+        const receipt = try std.json.parseFromSliceLeaky(TableDefinitionRejection, a, value, .{});
         return receipt.term == term and receipt.index == index and std.mem.eql(u8, &receipt.digest, &(try resolverReplacementDigest(a, expected, replacement)));
     }
     pub fn resolverNamespaceReplacementMatches(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, current: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
@@ -43667,6 +44089,7 @@ pub const RaftApplyStore = struct {
             try txn.put(try lakeIndexLifecycleKeyForGroup(&buffer, group_id, record.table_id), bytes);
         }
         if (prepared.source_changed) try relation_reconciliation.advanceSource(txn, group_id);
+        try putPrivacyWork(self.alloc, txn, group_id, definition);
         try txn.put(key, prepared.value);
         var fingerprint_key_buf: [192]u8 = undefined;
         try txn.put(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, record.table_id), &prepared.fingerprint);
@@ -55602,6 +56025,8 @@ fn validateSchemaReaderSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows
         } else {
             for (plan_prefixes) |prefix| {
                 if (std.mem.startsWith(u8, row.key, prefix)) {
+                    if (@import("../schema_reader_wire.zig").requiresTruncatePreparation(row.value))
+                        required_version = @max(required_version, topology_protocol.sql_truncate_preparation_version);
                     if (@import("../schema_reader_wire.zig").requiresInitialCreationCopy(row.value))
                         required_version = @max(required_version, topology_protocol.initial_fk_creation_copy_version);
                     if (@import("../schema_reader_wire.zig").requiresInitialCounterEffects(row.value))
@@ -67044,16 +67469,16 @@ test "resolver curation namespace propagation rejects alias cycles without poiso
     try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 52, .name = "new-consumer", .indexes_json = indexes } });
     try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, .{ .table_name = "entities", .expected_revision = revision, .standalone = true }));
     try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = replacement } });
-    try std.testing.expect(try store.resolverNamespaceReplacementRejected(std.testing.allocator, group, 0, 0, before, replacement));
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(std.testing.allocator, group, 0, 0, before, replacement));
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(before, (try store.getTable(a, group, 1)).?));
     const rejected_command = try encodeTransitionCommand(a, .{ .compare_and_replace_table = .{ .expected = before, .replacement = replacement } });
     for ([_]u64{ 1, 2 }) |index| {
         var outcome = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 7, .index = index, .entry_type = .normal, .data = rejected_command }});
         outcome.deinit();
-        try std.testing.expect(try store.resolverNamespaceReplacementRejected(std.testing.allocator, group, 7, index, before, replacement));
-        try std.testing.expect(!try store.resolverNamespaceReplacementRejected(std.testing.allocator, group, 7, index + 1, before, replacement));
+        try std.testing.expect(try store.tableDefinitionReplacementRejected(std.testing.allocator, group, 7, index, before, replacement));
+        try std.testing.expect(!try store.tableDefinitionReplacementRejected(std.testing.allocator, group, 7, index + 1, before, replacement));
     }
-    try std.testing.expect(!try store.resolverNamespaceReplacementRejected(std.testing.allocator, group, 7, 1, before, replacement));
+    try std.testing.expect(!try store.tableDefinitionReplacementRejected(std.testing.allocator, group, 7, 1, before, replacement));
     // Replay a proposal that bypassed public preflight with the relation
     // journal enabled, then prove the next committed entry still applies.
     {
@@ -67120,7 +67545,7 @@ test "resolver curation namespace propagation rejects source edits racing adopti
     const command = try encodeTransitionCommand(a, .{ .compare_and_replace_table = .{ .expected = source, .replacement = replacement } });
     var outcome = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 9, .index = 1, .entry_type = .normal, .data = command }});
     outcome.deinit();
-    try std.testing.expect(try store.resolverNamespaceReplacementRejected(a, group, 9, 1, source, replacement));
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(a, group, 9, 1, source, replacement));
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(source, (try store.getTable(a, group, 2)).?));
     // An ordinary source definition edit is allowed to inherit the namespace.
     var ordinary = source;
@@ -67193,7 +67618,7 @@ test "resolver curation namespace propagation rejects source edits racing propos
     const command = try encodeTransitionCommand(a, .{ .compare_and_replace_table = .{ .expected = source, .replacement = replacement } });
     var outcome = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 9, .index = 1, .entry_type = .normal, .data = command }});
     outcome.deinit();
-    try std.testing.expect(try store.resolverNamespaceReplacementRejected(a, group, 9, 1, source, replacement));
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(a, group, 9, 1, source, replacement));
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(source, (try store.getTable(a, group, 2)).?));
     // The same source-only CAS remains rejected when replicated again, while
     // unrelated schema changes still commit without adopting resolver policy.
@@ -73736,6 +74161,87 @@ test "SQL command fence guards native catalog and counter effects through cold r
     }
 }
 
+test "privacy work index follows atomic table updates deletion and derived index rebuild" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/privacy-work", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    const group = 7301;
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    resource.coverage.updated_at_millis = 10;
+    resource.coverage.retry_after_millis = 20;
+    for (1..33) |id| try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = id, .name = try std.fmt.allocPrint(a, "unrelated-{d}", .{id}) } });
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 100) == null);
+    const table = metadata.TableRecord{ .table_id = 50, .name = "private", .indexes_json = try privacy.install(a, "{}", resource) };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 19) == null);
+    try std.testing.expectEqual(@as(u64, 50), (try store.nextPrivacyTable(a, group, 20)).?.table_id);
+    const before = (try store.tableByName(a, group, "private")).?;
+    const revision = try store.writeValidationRevision(group);
+    try std.testing.expect(!try metadata_table_manager.privacyProgressOnly(a, before, before));
+    resource.coverage.retry_after_millis = 200;
+    var replacement = before;
+    replacement.indexes_json = try privacy.replaceResource(a, before.indexes_json, resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = replacement } });
+    try std.testing.expectEqual(revision, try store.writeValidationRevision(group));
+    // A second CAS based on the same cut cannot overwrite committed progress.
+    var stale = replacement;
+    resource.coverage.retry_after_millis = 300;
+    stale.indexes_json = try privacy.replaceResource(a, before.indexes_json, resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = stale } });
+    const committed = (try store.tableByName(a, group, "private")).?;
+    try std.testing.expectEqualStrings(replacement.indexes_json, committed.indexes_json);
+    try std.testing.expect(!try store.tableDefinitionReplacementRejected(a, group, 0, 0, before, stale));
+    // An authored save based on an older runtime cut must also produce a known
+    // rejection. Later successful progress must retain that exact receipt.
+    var policy_save = before;
+    const saved_resource = try privacy.next(a, resource, resource.policy, try privacy.etag(a, resource));
+    policy_save.indexes_json = try privacy.install(a, before.indexes_json, saved_resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = policy_save } });
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(a, group, 0, 0, before, policy_save));
+    var later_resource = resource;
+    later_resource.coverage.retry_after_millis = 200;
+    later_resource.coverage.updated_at_millis += 1;
+    var later = committed;
+    later.indexes_json = try privacy.replaceResource(a, committed.indexes_json, later_resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = committed, .replacement = later } });
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(a, group, 0, 0, before, policy_save));
+    // Restore this test's expected runtime cut through another valid CAS.
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = later, .replacement = committed } });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = before });
+    const after_reconcile = (try store.tableByName(a, group, "private")).?;
+    try std.testing.expectEqualStrings(replacement.indexes_json, after_reconcile.indexes_json);
+    try std.testing.expectEqual(revision, try store.writeValidationRevision(group));
+    var schema_reconcile = before;
+    schema_reconcile.description = "reconciled";
+    try store.applyStandaloneCommand(group, .{ .upsert_table = schema_reconcile });
+    const after_schema = (try store.tableByName(a, group, "private")).?;
+    try std.testing.expectEqualStrings("reconciled", after_schema.description);
+    try std.testing.expectEqualStrings(replacement.indexes_json, after_schema.indexes_json);
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 100) == null);
+    try store.rebuildDerivedCatalogIndexes(group);
+    try std.testing.expectEqual(@as(u64, 50), (try store.nextPrivacyTable(a, group, 200)).?.table_id);
+    // Derived hints are omitted from the replicated snapshot and rebuilt from
+    // durable policy/job state in the destination store.
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+    const rows = try decodeMetadataSnapshotAlloc(a, snapshot);
+    for (rows) |row| try std.testing.expect(!std.mem.startsWith(u8, row.key, "\x00\x00__metadata_derived__:"));
+    var restored = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = try std.fmt.allocPrint(a, "{s}-restored", .{root}) });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(a, group, 100, snapshot));
+    try std.testing.expect(try restored.nextPrivacyTable(a, group, 100) == null);
+    try std.testing.expectEqual(@as(u64, 50), (try restored.nextPrivacyTable(a, group, 200)).?.table_id);
+    const fence = try store.getTableTransitionFence(group, 50);
+    try store.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = 50, .expected_transition_generation = fence.generation } });
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 999) == null);
+    try std.testing.expect(try store.tableByName(a, group, "private") == null);
+}
+
 test "system catalog relation namespace transaction FK generation publication completion history survives replacement and restart" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -75916,6 +76422,147 @@ test "SQL table trigger source generation handoff captures retained state withou
     try std.testing.expectEqualStrings(schema, unchanged.schema_json);
 }
 
+test "SQL TRUNCATE preparation rejoins actual writer schema routines notices and cold callable leases" {
+    const backing = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const local = @import("antfly_local_sources");
+    const triggers = local.sql_catalog.triggers;
+    const manifest = local.sql_catalog.trigger_manifest;
+    const handoff = local.sql_catalog.trigger_handoff;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/truncate-preparation", .{tmp.sub_path});
+    const group = group_ids.main_metadata_group_id;
+    var store = try RaftApplyStore.init(backing, .{ .root_dir = path });
+    var live = true;
+    defer if (live) store.deinit();
+    const incarnation = "09090909090909090909090909090909".*;
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+    const old_activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.privacy_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+    try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = old_activation });
+    {
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.standbyRelationActivationTxn(&read, group, topology_protocol.sql_truncate_preparation_version));
+    }
+    const record: local.sql_catalog.routines.records.Record = .{ .id = 9, .generation = 1, .definition = .{ .returns_trigger = true, .arguments = &.{}, .language = .plpgsql, .body = "BEGIN RAISE NOTICE 'captured truncate'; RETURN NULL; END", .owner = .auth_disabled } };
+    const reference: local.sql_catalog.routines.records.RoutineReference = .{ .id = 9, .namespace_id = system_catalog.default_namespace_id, .database = system_catalog.default_database_name, .namespace = system_catalog.default_namespace_name, .name = "truncate_notice" };
+    const before_state = try triggers.prepare(a, .{ .metadata_incarnation = @splat(9), .table_id = 7, .generation = 1 }, .{ .name = "before_notice", .timing = .before, .events = .{ .truncate = true }, .level = .statement, .function = reference }, false);
+    const state = try triggers.prepare(a, before_state, .{ .name = "after_notice", .timing = .after, .events = .{ .truncate = true }, .level = .statement, .function = reference }, false);
+    const schema = try std.fmt.allocPrint(a, "{{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"id\":{{\"type\":\"integer\"}}}},\"additionalProperties\":false}}}}}},\"sql_triggers\":{s}}}", .{try state.encode(a)});
+    const before: metadata.TableRecord = .{ .table_id = 7, .name = "truncate-source", .schema_json = schema };
+    const resources = [_]system_catalog.Resource{
+        .{ .kind = .table, .id = 7, .parent_id = system_catalog.default_namespace_id, .name = "truncate_source", .storage_name = before.name },
+        .{ .kind = .routine, .id = 9, .parent_id = system_catalog.default_namespace_id, .name = reference.name, .signature = try record.catalogSignatureAlloc(a), .source_json = try record.encode(a) },
+    };
+    // Bootstrap a genuine bare schema and its callable catalog first. The
+    // normal writer validates attached routine IDs before import_catalog runs.
+    var bare_schema = try std.json.parseFromSliceLeaky(std.json.Value, a, schema, .{});
+    _ = bare_schema.object.swapRemove("sql_triggers");
+    try bare_schema.object.put(a, "version", .{ .integer = 1 });
+    var bare_table = before;
+    bare_table.schema_json = try std.json.Stringify.valueAlloc(a, bare_schema, .{});
+    try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .tables = &.{bare_table}, .ranges = &.{}, .auxiliary_json = "{}", .import_catalog = .{ .revision = 1, .next_id = 10, .resources = &resources } });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = before });
+    try std.testing.expectEqualStrings(schema, (try store.getTable(a, group, before.table_id)).?.schema_json);
+    const meta = try store.systemCatalogMeta(a, group);
+    const program: manifest.Manifest = .{ .metadata_incarnation = @splat(9), .catalog_revision = meta.revision, .table = .{ .id = 7, .schema_version = 2, .schema_digest = local.storage_db_relational_schema_owner_contract.hash(schema), .attachment_generation = state.generation, .attachment_digest = try manifest.attachmentDigest(state) }, .attachments = state, .routines = &.{.{ .reference = reference, .record = record }} };
+    // Execute the real closed VM before making a rowless receipt. This test
+    // exercises the metadata reserve component, not physical generation ACKs.
+    var view = try local.sql_catalog.trigger_preparation.captureView(a, schema);
+    defer view.release();
+    const owner = try local.sql_catalog.trigger_preparation.Owner.create(a, view, .{ .id = 7, .physical_name = before.name, .schema_version = 2, .schema_json = schema, .columns = &.{}, .has_triggers = true }, program, .{});
+    defer owner.deinit();
+    const notices = try owner.statement(.before, .truncate, &.{});
+    try std.testing.expectEqual(@as(usize, 1), notices.len);
+    const after_notices = try owner.statement(.after, .truncate, &.{});
+    try std.testing.expectEqual(@as(usize, 1), after_notices.len);
+    const receipt: handoff.Receipt = .{ .program = program, .processed = .{ .header = .{ .statement_id = @splat(3), .metadata_incarnation = program.metadata_incarnation, .table = program.table, .program_digest = try program.digest(), .events = .{ .truncate = true } }, .rows = &.{} } };
+    var successor = before;
+    successor.table_id = 8;
+    const target: restore_staging.Target = .{ .source_table_id = 7, .table = successor, .ranges = &.{}, .empty_generation = true, .replace = .{ .table = before, .ranges = &.{}, .fences = &.{} } };
+    const plan: restore_staging.Plan = .{ .id = @splat(4), .cohort_digest = @splat(5), .targets = &.{target}, .truncate_preparation = .{ .format_version = 1, .vm_contract_version = local.sql_catalog.trigger_runtime.predecision_contract_version, .plan_id = @splat(4), .before_notice_count = notices.len, .receipts = &.{receipt}, .notices = &.{ .{ .code = notices[0].code, .message = notices[0].message, .severity = notices[0].severity }, .{ .code = after_notices[0].code, .message = after_notices[0].message, .severity = after_notices[0].severity } } } };
+    const canonical = try std.json.Stringify.valueAlloc(a, plan, .{});
+    const decoded = try std.json.parseFromSliceLeaky(restore_staging.Plan, a, canonical, .{});
+    try std.testing.expectEqual(notices[0].severity, decoded.truncate_preparation.?.notices[0].severity);
+    try std.testing.expectEqualStrings("captured truncate", decoded.truncate_preparation.?.notices[0].message);
+    const projected = try decoded.truncate_preparation.?.projectResultAlloc(a, "{\"completed_tables\":1}", try decoded.digest(a), false);
+    const result = try std.json.parseFromSliceLeaky(std.json.Value, a, projected, .{});
+    try std.testing.expectEqual(@as(i64, 1), result.object.get("completed_tables").?.integer);
+    try std.testing.expect(result.object.get("truncate_preparation") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.object.get("truncate_preparation").?.object.get("notices").?.array.items.len);
+    const complete = try decoded.truncate_preparation.?.projectResultAlloc(a, null, try decoded.digest(a), true);
+    const complete_result = try std.json.parseFromSliceLeaky(std.json.Value, a, complete, .{});
+    try std.testing.expectEqual(@as(usize, 2), complete_result.object.get("truncate_preparation").?.object.get("notices").?.array.items.len);
+
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        var legacy = decoded;
+        legacy.truncate_preparation = null;
+        // Exact already-published176 bare-command semantics are preserved.
+        try store.requireTruncatePreparationTxn(&txn, group, legacy, true);
+        // A new proof is never accepted under the old activation.
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.requireTruncatePreparationTxn(&txn, group, decoded, true));
+    }
+    const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.sql_truncate_preparation_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+    try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+    inline for (.{ false, true }) |cold| {
+        if (cold) {
+            store.deinit();
+            live = false;
+            store = try RaftApplyStore.init(backing, .{ .root_dir = path });
+            live = true;
+        }
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try store.requireTruncatePreparationTxn(&txn, group, decoded, true);
+        var bare = decoded;
+        bare.truncate_preparation = null;
+        try std.testing.expectError(error.SqlTriggerCoordinationRequired, store.requireTruncatePreparationTxn(&txn, group, bare, true));
+        // Automatic empty-generation recovery has no SQL invocation purpose.
+        try store.requireTruncatePreparationTxn(&txn, group, bare, false);
+        var wrong = decoded;
+        wrong.truncate_preparation.?.plan_id[0] ^= 1;
+        try std.testing.expectError(error.InvalidRestoreStaging, store.requireTruncatePreparationTxn(&txn, group, wrong, true));
+        var wrong_vm = decoded;
+        wrong_vm.truncate_preparation.?.vm_contract_version += 1;
+        try std.testing.expectError(error.InvalidRestoreStaging, store.requireTruncatePreparationTxn(&txn, group, wrong_vm, true));
+        var table_key: [256]u8 = undefined;
+        const source_key = try a.dupe(u8, try tableKeyForGroup(&table_key, group, before.table_id));
+        const source_bytes = try a.dupe(u8, try txn.get(source_key));
+        var changed_table = before;
+        changed_table.schema_json = "{\"version\":2}";
+        try txn.put(source_key, try encodeTableRecord(a, changed_table));
+        try std.testing.expectError(error.CatalogGenerationChanged, store.requireTruncatePreparationTxn(&txn, group, decoded, true));
+        try txn.put(source_key, source_bytes);
+        var altered_record = record;
+        altered_record.generation += 1;
+        altered_record.definition.body = "BEGIN RETURN NULL; END";
+        var changed_resource = resources[1];
+        changed_resource.source_json = try altered_record.encode(a);
+        const key = try system_catalog_storage.recordKeyAlloc(a, group, .routine, record.id);
+        const original = try a.dupe(u8, try txn.get(key));
+        try txn.put(key, try std.json.Stringify.valueAlloc(a, changed_resource, .{}));
+        try std.testing.expectError(error.CatalogGenerationChanged, store.requireTruncatePreparationTxn(&txn, group, decoded, true));
+        try txn.put(key, original);
+        const claims = @import("../trigger_restore_claims.zig");
+        try claims.acquire(a, &txn, group, decoded);
+        try claims.requireHeld(a, &txn, group, decoded);
+        try std.testing.expectError(error.SqlDependentCallable, @import("../../system_catalog/trigger_restore_leases.zig").requireResourceMutable(&txn, group, .{ .kind = .routine, .id = record.id }));
+        try claims.release(a, &txn, group, decoded);
+        try @import("../../system_catalog/trigger_restore_leases.zig").requireResourceMutable(&txn, group, .{ .kind = .routine, .id = record.id });
+    }
+    var ordinary = plan;
+    ordinary.truncate_preparation = null;
+    const old_bytes = try std.json.Stringify.valueAlloc(a, ordinary, .{});
+    try std.testing.expect(std.mem.indexOf(u8, old_bytes, "truncate_preparation") == null);
+    try std.testing.expect(@import("../schema_reader_wire.zig").requiresTruncatePreparation(canonical));
+    try std.testing.expect(!@import("../schema_reader_wire.zig").requiresTruncatePreparation(old_bytes));
+}
+
 test "SQL relation lifetime native restore authority reads bind exact hidden plan and owner without Raft placement" {
     const backing = std.testing.allocator;
     var region = std.heap.ArenaAllocator.init(backing);
@@ -76014,7 +76661,21 @@ test "row-policy coupled schema metadata preserves predecessor through exact own
     const schema_alloc = schema_arena.allocator();
     const group = group_ids.main_metadata_group_id;
     const opaque_table_id: u64 = 1114256765381137445;
-    const table: metadata.TableRecord = .{ .table_id = opaque_table_id, .name = "table:policies", .schema_json = "{\"version\":5,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}" };
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    var privacy_resource = try privacy.next(schema_alloc, null, .{ .mode = .monitor, .fields = &.{"id"} }, null);
+    privacy_resource.coverage.updated_at_millis = 10;
+    privacy_resource.coverage.retry_after_millis = 20;
+    const table: metadata.TableRecord = .{ .indexes_json = try privacy.install(schema_alloc, "{}", privacy_resource), .table_id = opaque_table_id, .name = "table:policies", .schema_json = "{\"version\":5,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}" };
+    // A real privacy installation includes enrichment declarations and
+    // opaque progress, while user index modalities remain independently gated.
+    try std.testing.expect(!try policyHasUnsupportedArtifactIndexes(schema_alloc, table.indexes_json));
+    inline for (.{ "full_text", "dense_vector", "embeddings", "enrichment" }) |kind| {
+        var with_index = try std.json.parseFromSlice(std.json.Value, schema_alloc, table.indexes_json, .{});
+        defer with_index.deinit();
+        const config = try std.json.parseFromSliceLeaky(std.json.Value, schema_alloc, try std.fmt.allocPrint(schema_alloc, "{{\"type\":\"{s}\"}}", .{kind}), .{});
+        try with_index.value.object.put(schema_alloc, "policy_artifact_negative", config);
+        try std.testing.expect(try policyHasUnsupportedArtifactIndexes(schema_alloc, try std.json.Stringify.valueAlloc(schema_alloc, with_index.value, .{})));
+    }
     var parsed_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(schema_alloc, table.schema_json);
     defer parsed_schema.deinit(schema_alloc);
     const native_schema = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(schema_alloc, parsed_schema);
@@ -76196,9 +76857,91 @@ test "row-policy coupled schema metadata preserves predecessor through exact own
         try std.testing.expect(!ordinary.record.?.policy_pair);
         try std.testing.expect(ordinary.record.?.complete);
     }
+    // Actual mainline privacy worker CAS: a pending paired schema must keep
+    // table bytes, due-work index and its fingerprint stable in this writer.
+    const pending_table = (try store.getTable(a, group, opaque_table_id)).?;
+    privacy_resource.coverage.updated_at_millis = 11;
+    privacy_resource.coverage.retry_after_millis = 30;
+    var pending_progress = pending_table;
+    pending_progress.indexes_json = try privacy.replaceResource(a, pending_table.indexes_json, privacy_resource);
+    const ProgressCut = struct {
+        fingerprint: []const u8,
+        reverse: []const u8,
+        due: []const u8,
+        revision: u64,
+        fn capture(owner_store: *RaftApplyStore, alloc_: std.mem.Allocator, g: u64, id: u64) !@This() {
+            var txn = try owner_store.store.beginReadTxn();
+            defer txn.abort();
+            var key: [192]u8 = undefined;
+            const fingerprint = try alloc_.dupe(u8, try txn.get(try tableSchemaFingerprintKeyForGroup(&key, g, id)));
+            const reverse = try alloc_.dupe(u8, try txn.get(try RaftApplyStore.privacyReverseKey(&key, g, id)));
+            return .{ .fingerprint = fingerprint, .reverse = reverse, .due = try alloc_.dupe(u8, try txn.get(reverse)), .revision = (try system_catalog_storage.readMeta(alloc_, &txn, g)).revision };
+        }
+    };
+    const pending_cut = try ProgressCut.capture(&store, a, group, opaque_table_id);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = pending_table, .replacement = pending_progress } });
+    const unchanged_progress = (try store.getTable(a, group, opaque_table_id)).?;
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(pending_table, unchanged_progress));
+    const refused_cut = try ProgressCut.capture(&store, a, group, opaque_table_id);
+    try std.testing.expectEqualSlices(u8, pending_cut.fingerprint, refused_cut.fingerprint);
+    try std.testing.expectEqualSlices(u8, pending_cut.reverse, refused_cut.reverse);
+    try std.testing.expectEqualSlices(u8, pending_cut.due, refused_cut.due);
+    try std.testing.expectEqual(pending_cut.revision, refused_cut.revision);
     // Missing serving ACKs cannot clear predecessor or complete publication.
     try std.testing.expectError(error.RowPolicyCatalogChanged, Helper.command(&store, a, group, .{ .promote = .{ .table_id = opaque_table_id, .generation = 2, .phase = .active } }));
     try Helper.finish(&store, a, group, 2);
+    // ACTIVE has cleared the live Pair. The same genuine progress producer
+    // can now advance without changing the immutable install snapshot or epoch.
+    const active_before_progress = (try store.getTable(a, group, opaque_table_id)).?;
+    var active_progress = active_before_progress;
+    active_progress.indexes_json = try privacy.replaceResource(a, active_before_progress.indexes_json, privacy_resource);
+    const active_cut = try ProgressCut.capture(&store, a, group, opaque_table_id);
+    const RuntimeCut = struct {
+        meta: system_catalog_storage.Meta,
+        publication_json: []const u8,
+        history: []const u8,
+        fn capture(owner_store: *RaftApplyStore, arena: std.mem.Allocator, g: u64) !@This() {
+            var txn = try owner_store.store.beginReadTxn();
+            defer txn.abort();
+            var publication = (try system_catalog_storage.loadPolicyPublication(arena, &txn, g, opaque_table_id)).?;
+            defer publication.deinit();
+            const stamp = (try system_catalog_storage.loadPolicyPublicationStamp(arena, &txn, g, opaque_table_id)).?;
+            try std.testing.expectEqualDeep(sql_policies.PublicationStamp.fromPublication(publication.value), stamp);
+            const key = try system_catalog_storage.policyInstallSnapshotKeyAlloc(arena, g, opaque_table_id, 2, .active);
+            return .{
+                .meta = try system_catalog_storage.readMeta(arena, &txn, g),
+                .publication_json = try std.json.Stringify.valueAlloc(arena, publication.value, .{}),
+                .history = try arena.dupe(u8, try txn.get(key)),
+            };
+        }
+        fn requireRefresh(before_cut: @This(), after_cut: @This(), arena: std.mem.Allocator, fingerprint: [32]u8) !void {
+            try std.testing.expectEqualDeep(before_cut.meta, after_cut.meta);
+            try std.testing.expectEqualStrings(before_cut.history, after_cut.history);
+            var expected = try std.json.parseFromSlice(sql_policies.Publication, arena, before_cut.publication_json, .{});
+            defer expected.deinit();
+            expected.value.schema_record_digest = fingerprint;
+            var observed = try std.json.parseFromSlice(sql_policies.Publication, arena, after_cut.publication_json, .{});
+            defer observed.deinit();
+            // Generation, epoch, owner ACK arrays and all other publication
+            // fields remain exactly the genuinely acknowledged journal cut.
+            try std.testing.expectEqualDeep(expected.value, observed.value);
+        }
+    };
+    const active_runtime = try RuntimeCut.capture(&store, a, group);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = active_before_progress, .replacement = active_progress } });
+    const progressed = (try store.getTable(a, group, opaque_table_id)).?;
+    try std.testing.expectEqualStrings(active_progress.indexes_json, progressed.indexes_json);
+    const progressed_cut = try ProgressCut.capture(&store, a, group, opaque_table_id);
+    try std.testing.expectEqual(active_cut.revision, progressed_cut.revision);
+    try std.testing.expect(!std.mem.eql(u8, active_cut.fingerprint, progressed_cut.fingerprint));
+    try std.testing.expect(!std.mem.eql(u8, active_cut.reverse, progressed_cut.reverse));
+    try RuntimeCut.requireRefresh(active_runtime, try RuntimeCut.capture(&store, a, group), a, policyTableSchemaRecordDigest(active_progress));
+    store.deinit();
+    live_store = false;
+    store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    live_store = true;
+    try RuntimeCut.requireRefresh(active_runtime, try RuntimeCut.capture(&store, a, group), a, policyTableSchemaRecordDigest(active_progress));
+    _ = try store.sqlPolicyPublicationStatusJson(a, group, opaque_table_id);
     try Late.create(&store, a, group, 0x66, .prepare, true);
     try Late.create(&store, a, group, 0x67, .pin, true);
     {
@@ -76282,6 +77025,7 @@ test "row-policy coupled schema metadata preserves predecessor through exact own
     live_store = false;
     store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
     live_store = true;
+    _ = try store.sqlPolicyPublicationStatusJson(a, group, opaque_table_id);
     try Late.create(&store, a, group, 0x68, .prepare, true);
     try Late.create(&store, a, group, 0x69, .pin, true);
     {
@@ -76290,6 +77034,7 @@ test "row-policy coupled schema metadata preserves predecessor through exact own
         const complete = (try store.getTableTxn(a, &txn, group, opaque_table_id)).?;
         try std.testing.expectEqualStrings("", complete.read_schema_json);
         try std.testing.expectEqualStrings(superseding_after.schema_json, complete.schema_json);
+        try std.testing.expectEqualStrings(active_progress.indexes_json, complete.indexes_json);
         var publication = (try system_catalog_storage.loadPolicyPublication(a, &txn, group, opaque_table_id)).?;
         defer publication.deinit();
         try std.testing.expectEqual(sql_policies.Publication.Phase.active, publication.value.phase);
@@ -76321,4 +77066,324 @@ test "row-policy coupled schema metadata preserves predecessor through exact own
         const journal: outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = @splat(0x45) };
         try std.testing.expectError(error.InvalidSequenceOutcome, journal.lookup(a, admission, admitted_digest));
     }
+}
+
+test "privacy key attachment and incremental reclamation are atomic and survive snapshots" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/privacy-keys", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const keys = privacy.checkpoints;
+    const jobs = @import("../job_state.zig");
+    const group = 7302;
+    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    const table: metadata.TableRecord = .{ .table_id = 1, .name = "private", .indexes_json = try privacy.install(a, "{}", resource) };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const content = try a.alloc(u8, keys.chunk_bytes * 9 + 3);
+    @memset(content, 'x');
+    const ref: keys.Ref = .{ .digest = std.fmt.bytesToHex(jobs.digest(content), .lower), .generation = @splat('a') };
+    var buffer: [128]u8 = undefined;
+    const manifest = try a.dupe(u8, try ref.storageKey(&buffer, 1, null));
+    var header: keys.Header = .{ .accounted = true, .length = @intCast(content.len), .created_at_millis = 1 };
+    const initial = try std.json.Stringify.valueAlloc(a, header, .{});
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = "", .value = initial } });
+    resource.checkpoint_encoding = 1;
+    resource.coverage.cursor = try a.dupe(u8, &ref.token());
+    var attached = table;
+    attached.indexes_json = try privacy.replaceResource(a, table.indexes_json, resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = table, .replacement = attached } });
+    try std.testing.expectEqualStrings(table.indexes_json, (try store.tableByName(a, group, "private")).?.indexes_json);
+    header.state = .ready;
+    const ready = try std.json.Stringify.valueAlloc(a, header, .{});
+    const initial_hash = jobs.digest(initial);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &initial_hash, .value = ready } });
+    try std.testing.expectEqualStrings(initial, (try store.getJobState(a, group, manifest)).?);
+    for (0..header.chunks()) |index| {
+        const start = index * keys.chunk_bytes;
+        const part = content[start..@min(content.len, start + keys.chunk_bytes)];
+        try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = try ref.storageKey(&buffer, 1, index), .expected_hash = "", .value = try std.mem.concat(a, u8, &.{ "V", part }) } });
+    }
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &initial_hash, .value = ready } });
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = table, .replacement = attached } });
+    const attached_header = (try store.getJobState(a, group, manifest)).?;
+    var parsed_header = try std.json.parseFromSlice(keys.Header, a, attached_header, .{});
+    defer parsed_header.deinit();
+    try std.testing.expect(parsed_header.value.attached);
+    const retained_key = try a.dupe(u8, try keys.quotaKey(&buffer, 1, true));
+    try std.testing.expectEqual(@as(u64, content.len), std.mem.readInt(u64, (try store.getJobState(a, group, retained_key)).?[0..8], .little));
+    // Reclamation and table attachment serialize through the same transaction.
+    header = parsed_header.value;
+    header.state = .deleting;
+    header.deleted_chunks = 8;
+    const deleting = try std.json.Stringify.valueAlloc(a, header, .{});
+    const attached_hash = jobs.digest(attached_header);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &attached_hash, .value = deleting } });
+    try std.testing.expectEqualStrings(attached_header, (try store.getJobState(a, group, manifest)).?);
+    const live = try store.scanJobState(a, group, "privacy/m/");
+    var live_page = try std.json.parseFromSlice(jobs.Page, a, live, .{});
+    defer live_page.deinit();
+    try std.testing.expectEqual(@as(usize, 0), live_page.value.rows.len);
+    resource.coverage.cursor = null;
+    var detached = attached;
+    detached.indexes_json = try privacy.replaceResource(a, attached.indexes_json, resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = attached, .replacement = detached } });
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &attached_hash, .value = deleting } });
+    try std.testing.expect(try store.getJobState(a, group, try ref.storageKey(&buffer, 1, 0)) == null);
+    try std.testing.expect(try store.getJobState(a, group, try ref.storageKey(&buffer, 1, 8)) != null);
+    // Snapshot restores both remaining chunks and the deletion checkpoint.
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+    var restored = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = try std.fmt.allocPrint(a, "{s}-restored", .{root}) });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(a, group, 100, snapshot));
+    const deleting_hash = jobs.digest(deleting);
+    header.deleted_chunks = @intCast(header.chunks());
+    const final = try std.json.Stringify.valueAlloc(a, header, .{});
+    try restored.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &deleting_hash, .value = final } });
+    const final_hash = jobs.digest(final);
+    try restored.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &final_hash, .value = keys.erase } });
+    try std.testing.expect(try restored.getJobState(a, group, manifest) == null);
+    try std.testing.expect(try restored.getJobState(a, group, retained_key) == null);
+    try std.testing.expect(try restored.getJobState(a, group, try ref.storageKey(&buffer, 1, 9)) == null);
+    // A late uploader cannot recreate chunks after the manifest was erased.
+    try restored.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = try ref.storageKey(&buffer, 1, 9), .expected_hash = "", .value = "Vxxx" } });
+    try std.testing.expect(try restored.getJobState(a, group, try ref.storageKey(&buffer, 1, 9)) == null);
+}
+
+test "main privacy progress CAS retains table and ancestor retirement cuts until actual cancellation across cold reopen" {
+    const a = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const wire = @import("../scope_retirement_wire.zig");
+    const group: u64 = 21;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/privacy-retirement-reservation", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    var live = true;
+    defer if (live) store.deinit();
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = @splat('1') });
+    try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(scratch, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = @splat('1'), .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+    try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(scratch, SystemCatalogCommand{ .expected_revision = 0, .mutation = .{ .action = .create, .kind = .database, .name = "privacy_ops" } }, .{}) });
+    try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(scratch, SystemCatalogCommand{ .expected_revision = 1, .mutation = .{ .action = .create, .kind = .namespace, .database = "privacy_ops", .name = "retiring" } }, .{}) });
+    var resource = try privacy.next(scratch, null, .{ .mode = .monitor, .fields = &.{"id"} }, null);
+    resource.coverage.updated_at_millis = 10;
+    resource.coverage.retry_after_millis = 20;
+    const table: metadata.TableRecord = .{ .table_id = 42, .name = "table:42", .schema_json = "{\"version\":1}", .indexes_json = try privacy.install(scratch, "{}", resource), .min_ranges = 1 };
+    const ranges = [_]metadata.RangeRecord{.{ .table_id = 42, .group_id = 301, .range_id = 301, .start_key = "" }};
+    try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(scratch, SystemCatalogCommand{ .expected_revision = 2, .mutation = .{ .action = .create, .kind = .table, .database = "privacy_ops", .namespace = "retiring", .name = "events", .table_id = 42, .storage_name = "table:42" }, .topology = .{ .create = .{ .expected_transition_generation = 0, .table = table, .ranges = &ranges } } }, .{}) });
+    // Use the production catalog adoption/directory producers before asking
+    // for a reserved retirement, rather than fabricating membership or epochs.
+    try adoptRelationWriterForTest(&store, scratch, group);
+    _ = try publishLiveRelationRootWithCoverageForTest(&store, scratch, group, .constraint_names);
+    while ((try store.relationReconciliationWork(group)).foreign_key_backfill) |cut| {
+        try store.applyStandaloneCommand(group, .{ .apply_relation_reconciliation = try (relation_control.Command{ .foreign_keys = cut }).encodeAlloc(scratch) });
+    }
+    const Cut = struct {
+        table_bytes: []const u8,
+        fingerprint: []const u8,
+        reverse: []const u8,
+        due: []const u8,
+        catalog_revision: u64,
+        fn capture(owner: *RaftApplyStore, alloc: std.mem.Allocator) !@This() {
+            var txn = try owner.store.beginReadTxn();
+            defer txn.abort();
+            var key: [192]u8 = undefined;
+            const table_bytes = try alloc.dupe(u8, try txn.get(try tableKeyForGroup(&key, group, 42)));
+            const fingerprint = try alloc.dupe(u8, try txn.get(try tableSchemaFingerprintKeyForGroup(&key, group, 42)));
+            const reverse = try alloc.dupe(u8, try txn.get(try RaftApplyStore.privacyReverseKey(&key, group, 42)));
+            return .{ .table_bytes = table_bytes, .fingerprint = fingerprint, .reverse = reverse, .due = try alloc.dupe(u8, try txn.get(reverse)), .catalog_revision = (try system_catalog_storage.readMeta(alloc, &txn, group)).revision };
+        }
+        fn unchanged(before: @This(), after: @This()) !void {
+            try std.testing.expectEqualStrings(before.table_bytes, after.table_bytes);
+            try std.testing.expectEqualSlices(u8, before.fingerprint, after.fingerprint);
+            try std.testing.expectEqualStrings(before.reverse, after.reverse);
+            try std.testing.expectEqualSlices(u8, before.due, after.due);
+            try std.testing.expectEqual(before.catalog_revision, after.catalog_revision);
+        }
+    };
+    inline for (.{ false, true }) |ancestor| {
+        const expected = (try store.getTable(scratch, group, 42)).?;
+        resource.coverage.updated_at_millis += 1;
+        resource.coverage.retry_after_millis += 10;
+        var progress = expected;
+        progress.indexes_json = try privacy.replaceResource(scratch, expected.indexes_json, resource);
+        try std.testing.expect(try metadata_table_manager.privacyProgressOnly(scratch, expected, progress));
+        var table_lookup: ?table_retirement.Lookup = null;
+        var scope_lookup: ?scope_retirement.Lookup = null;
+        if (ancestor) {
+            const manifest = try std.json.parseFromSliceLeaky(system_catalog.scope_retirement.Manifest, scratch, try store.prepareScopeRetirementManifestJsonWithContext(scratch, group, .{ .kind = .namespace, .database = "privacy_ops", .name = "retiring", .creator = .bootstrap, .cascade = true }, .{}), .{});
+            const reserve: wire.Request = .{ .admission = .{ .nonce = @splat(0x73), .head = manifest.catalog_revision }, .operation = .{ .reserve = manifest } };
+            try store.applyStandaloneCommand(group, .{ .apply_scope_retirement = try reserve.encodeAlloc(scratch) });
+            const work = (try std.json.parseFromSliceLeaky(?scope_retirement.Work, scratch, try store.scopeRetirementWorkJson(scratch, group, 0), .{})).?;
+            scope_lookup = work.head.lookup;
+        } else {
+            const resolved = try store.resolveSystemCatalogIdentities(scratch, group, .{ .relations = &.{.{ .database = "privacy_ops", .namespace = "retiring", .name = "events" }} });
+            defer resolved.deinit(scratch);
+            const guard: system_catalog.RelationMutationGuard = .{ .target = .{ .database = "privacy_ops", .namespace = "retiring", .name = "events" }, .logical_table = resolved.relations[0].?.logical_table, .owner = resolved.relations[0].?.owner, .incarnation = resolved.relation_epoch.?.incarnation };
+            var manifest = try store.prepareTableRetirementManifest(scratch, group, guard, .{});
+            defer manifest.deinit();
+            table_lookup = .{ .group = group, .table = 42, .id = @splat(0x72) };
+            const scope_resource = namespace: {
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                const view: system_catalog_storage.View = .{ .alloc = scratch, .txn = &read, .group_id = group, .meta = try system_catalog_storage.readMeta(scratch, &read, group) };
+                break :namespace try view.namespaceFor("privacy_ops", "retiring");
+            };
+            try store.applyStandaloneCommand(group, .{ .apply_table_retirement = try (table_retirement.Command{ .begin = .{ .id = table_lookup.?.id, .scope = .{ .database = scope_resource.parent_id, .namespace = scope_resource.id, .creator = .bootstrap }, .manifest = manifest.value } }).encodeAlloc(scratch) });
+        }
+        const captured = try Cut.capture(&store, scratch);
+        if (ancestor) {
+            // The standalone envelope rejects an occupied ancestor before the
+            // inner compare-and-replace no-op lane; both preserve the cut.
+            try std.testing.expectError(error.TableTransitionActive, store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = expected, .replacement = progress } }));
+        } else try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = expected, .replacement = progress } });
+        try Cut.unchanged(captured, try Cut.capture(&store, scratch));
+        store.deinit();
+        live = false;
+        store = try RaftApplyStore.init(a, .{ .root_dir = path });
+        live = true;
+        if (ancestor) {
+            // The standalone envelope rejects an occupied ancestor before the
+            // inner compare-and-replace no-op lane; both preserve the cut.
+            try std.testing.expectError(error.TableTransitionActive, store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = expected, .replacement = progress } }));
+        } else try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = expected, .replacement = progress } });
+        try Cut.unchanged(captured, try Cut.capture(&store, scratch));
+        {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            if (ancestor) {
+                try std.testing.expect(try @import("../scope_retirement_fence.zig").occupied(&read, group, "table", 42));
+                // Ancestor-only reservation is sufficient; no physical child,
+                // table lifecycle lock or table-retirement member is invented.
+                try std.testing.expect((try table_retirement.member(&read, group, 42)) == null);
+                try std.testing.expect((try @import("../table_lifecycle_lock.zig").read(&read, group, 42)) == null);
+            } else {
+                const head = (try table_retirement.head(&read, table_lookup.?)).?;
+                try std.testing.expectEqual(table_retirement.Phase.reserved, head.phase);
+                try std.testing.expectEqual(@as(u64, 1), head.revision);
+                try std.testing.expect(head.physical == null);
+                try std.testing.expect((try table_retirement.member(&read, group, 42)) != null);
+            }
+        }
+        if (ancestor) {
+            const meta = try store.systemCatalogMeta(scratch, group);
+            const cancel: wire.Request = .{ .admission = .{ .nonce = @splat(0x74), .head = meta.revision }, .operation = .{ .cancel = .{ .lookup = scope_lookup.?, .expected_revision = 1 } } };
+            try store.applyStandaloneCommand(group, .{ .apply_scope_retirement = try cancel.encodeAlloc(scratch) });
+        } else {
+            try store.applyStandaloneCommand(group, .{ .apply_table_retirement = try (table_retirement.Command{ .cancel = .{ .lookup = table_lookup.?, .expected_revision = 1 } }).encodeAlloc(scratch) });
+        }
+        {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            if (ancestor) {
+                const head = (try scope_retirement.head(&read, scope_lookup.?)).?;
+                try std.testing.expectEqual(system_catalog.scope_retirement.Phase.canceled, head.progress.phase);
+                try std.testing.expect((try scope_retirement.member(&read, group, .table, 42)) == null);
+                try std.testing.expect(!try @import("../scope_retirement_fence.zig").occupied(&read, group, "table", 42));
+            } else {
+                const head = (try table_retirement.head(&read, table_lookup.?)).?;
+                try std.testing.expectEqual(table_retirement.Phase.canceled, head.phase);
+                try std.testing.expect((try table_retirement.member(&read, group, 42)) == null);
+                try std.testing.expect((try @import("../table_lifecycle_lock.zig").read(&read, group, 42)) == null);
+            }
+        }
+        try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = expected, .replacement = progress } });
+        try std.testing.expectEqualStrings(progress.indexes_json, (try store.getTable(scratch, group, 42)).?.indexes_json);
+        store.deinit();
+        live = false;
+        store = try RaftApplyStore.init(a, .{ .root_dir = path });
+        live = true;
+        try std.testing.expectEqualStrings(progress.indexes_json, (try store.getTable(scratch, group, 42)).?.indexes_json);
+    }
+}
+
+test "privacy checkpoint ownership borrows large table records without allocator growth" {
+    const a = std.testing.allocator;
+    const schema = try a.alloc(u8, 8 * 1024 * 1024);
+    defer a.free(schema);
+    @memset(schema, ' ');
+    const record = try encodeTableRecord(a, .{ .table_id = 7, .name = "privacy", .schema_json = schema, .indexes_json = "{\"_privacy\":{}}" });
+    defer a.free(record);
+    // A complete GC page can examine the same large record without creating
+    // any schema/catalog copies. The projection retains the pinned row.
+    for (0..32) |_| {
+        const view = try borrowTableProjection(record, .query);
+        const indexes = view.query_definition.?.indexes_json;
+        try std.testing.expectEqualStrings("{\"_privacy\":{}}", indexes);
+        try std.testing.expect(@intFromPtr(indexes.ptr) >= @intFromPtr(record.ptr));
+        try std.testing.expect(@intFromPtr(indexes.ptr) + indexes.len <= @intFromPtr(record.ptr) + record.len);
+    }
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, borrowTableProjection(record[0 .. record.len - 1], .query));
+}
+
+test "privacy retained capacity denies staging atomically and releases only on final erase" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/privacy-capacity", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group = 7305;
+    const keys = RaftApplyStore.privacy_keys;
+    const jobs = @import("../job_state.zig");
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "capacity" } });
+    var logical_buffer: [128]u8 = undefined;
+    const quota = try a.dupe(u8, try keys.quotaKey(&logical_buffer, 1, true));
+    defer a.free(quota);
+    var physical_buffer: [256]u8 = undefined;
+    // Model already-attached payloads without allocating gigabytes in a test.
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, keys.max_retained_bytes - 4096, .little);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(try jobStateKeyForGroup(&physical_buffer, group, quota), &encoded);
+        try txn.commit();
+    }
+    const ref: keys.Ref = .{ .digest = @splat('a'), .generation = @splat('b') };
+    const manifest = try a.dupe(u8, try ref.storageKey(&logical_buffer, 1, null));
+    defer a.free(manifest);
+    var header: keys.Header = .{ .accounted = true, .length = 1, .created_at_millis = 1 };
+    const staged = try std.json.Stringify.valueAlloc(a, header, .{});
+    defer a.free(staged);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = "", .value = staged } });
+    const second: keys.Ref = .{ .digest = @splat('c'), .generation = @splat('d') };
+    const denied = try a.dupe(u8, try second.storageKey(&logical_buffer, 1, null));
+    defer a.free(denied);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = denied, .expected_hash = "", .value = staged } });
+    try std.testing.expect(try store.getJobState(a, group, denied) == null);
+    const pending_key = try a.dupe(u8, try keys.quotaKey(&logical_buffer, 1, false));
+    defer a.free(pending_key);
+    const pending = (try store.getJobState(a, group, pending_key)).?;
+    defer a.free(pending);
+    try std.testing.expectEqual(@as(u64, 4096), std.mem.readInt(u64, pending[0..8], .little));
+    header.state = .deleting;
+    header.deleted_chunks = 1;
+    const deleting = try std.json.Stringify.valueAlloc(a, header, .{});
+    defer a.free(deleting);
+    const staged_hash = jobs.digest(staged);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &staged_hash, .value = deleting } });
+    const retained = (try store.getJobState(a, group, quota)).?;
+    defer a.free(retained);
+    try std.testing.expectEqual(keys.max_retained_bytes, std.mem.readInt(u64, retained[0..8], .little));
+    const deleting_hash = jobs.digest(deleting);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &deleting_hash, .value = keys.erase } });
+    const released = (try store.getJobState(a, group, quota)).?;
+    defer a.free(released);
+    try std.testing.expectEqual(keys.max_retained_bytes - 4096, std.mem.readInt(u64, released[0..8], .little));
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = denied, .expected_hash = "", .value = staged } });
+    const admitted = (try store.getJobState(a, group, denied)).?;
+    defer a.free(admitted);
+    try std.testing.expectEqualStrings(staged, admitted);
+    var legacy = try std.json.parseFromSlice(keys.Header, a, "{\"length\":1,\"created_at_millis\":1}", .{});
+    defer legacy.deinit();
+    try std.testing.expect(!legacy.value.accounted);
 }

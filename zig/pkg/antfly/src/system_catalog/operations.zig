@@ -2846,6 +2846,16 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.systemCatalogRead(alloc, svc.metadata_group_id, request);
         },
+        .table_record_read => |name| blk: {
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const table = try store.tableByName(alloc, svc.metadata_group_id, name);
+            defer if (table) |value| table_manager.freeTable(alloc, value);
+            const bytes = try std.json.Stringify.valueAlloc(alloc, table, .{});
+            errdefer alloc.free(bytes);
+            try context.ensureActive();
+            break :blk bytes;
+        },
         .query_definition => |name| blk: {
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;

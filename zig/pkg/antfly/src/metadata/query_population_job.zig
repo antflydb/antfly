@@ -202,10 +202,60 @@ pub fn bindAdmission(a: A, source: anytype, context: operation.RequestContext, r
     const id = stages.idForAttempt(state.value.job_id, state.value.staging_attempt_id) catch return error.MetadataMutationOutcomeUnknown;
     const bytes = (source.getRestoreStaging(a, id, context) catch return error.MetadataMutationOutcomeUnknown) orelse return error.MetadataMutationOutcomeUnknown;
     defer a.free(bytes);
+    if (@import("schema_reader_wire.zig").requiresTruncatePreparation(bytes)) {
+        var retained = requireRetainedTruncateJob(a, bytes, id) catch return error.MetadataMutationOutcomeUnknown;
+        defer retained.deinit();
+        const projected = jobs.projectTruncatePreparationResultAlloc(a, state.value.result_json, retained.value.plan.truncate_preparation.?, retained.value.plan_digest, false, false) catch return error.MetadataMutationOutcomeUnknown;
+        defer a.free(projected);
+        state.value.result_json = projected;
+        const accepted = std.json.Stringify.valueAlloc(a, state.value, .{ .emit_null_optional_fields = false }) catch return error.MetadataMutationOutcomeUnknown;
+        a.free(result.accepted);
+        return .{ .result = .{ .accepted = accepted }, .plan_digest = retained.value.plan_digest };
+    }
     var header = std.json.parseFromSlice(struct { plan_digest: stages.Digest, plan: struct { id: stages.Id } }, a, bytes, .{ .ignore_unknown_fields = true }) catch return error.MetadataMutationOutcomeUnknown;
     defer header.deinit();
     if (!std.mem.eql(u8, &header.value.plan.id, &id) or std.mem.allEqual(u8, &header.value.plan_digest, 0)) return error.MetadataMutationOutcomeUnknown;
     return .{ .result = result, .plan_digest = header.value.plan_digest };
+}
+
+/// Join only the immutable SQL TRUNCATE job, never execute a trigger on a
+/// worker or status reader. Ordinary jobs require no staging-plan lookup.
+pub fn projectRetainedTruncateResult(a: A, source: anytype, context: operation.RequestContext, state: jobs.JobState, base_result: ?[]const u8, include_notices: bool) !?[]u8 {
+    if (state.source_kind != .empty_generation or !std.mem.startsWith(u8, state.idempotency_namespace, "sql-truncate:")) return null;
+    const id = try stages.idForAttempt(state.job_id, state.staging_attempt_id);
+    const bytes = (try source.getRestoreStaging(a, id, context)) orelse {
+        // A rejected/canceled job may precede staging reservation. Preserve its
+        // authored failure without granting notice or publication authority.
+        const has_reference = if (state.result_json) |result| @import("schema_reader_wire.zig").requiresTruncatePreparation(result) else false;
+        if (!has_reference and (state.phase == .failed or state.phase == .cancelled)) return null;
+        return error.InvalidGenerationPublication;
+    };
+    defer a.free(bytes);
+    if (!@import("schema_reader_wire.zig").requiresTruncatePreparation(bytes)) return null;
+    var retained = try requireRetainedTruncateJob(a, bytes, id);
+    defer retained.deinit();
+    const reference: Reference = .{ .job_id = state.job_id, .namespace = state.idempotency_namespace, .key = state.idempotency_key, .fingerprint = state.request_fingerprint, .plan_digest = retained.value.plan_digest };
+    try reference.requireState(a, state);
+    var release_after = false;
+    if (include_notices and retained.value.state == .published) {
+        const progress = (try source.getRestoreStagingProgress(a, id, context)) orelse return error.InvalidGenerationPublication;
+        if (progress.state != .published or progress.revision != retained.value.revision or progress.completed_owners != retained.value.completed_owners) return error.InvalidGenerationPublication;
+        release_after = true;
+    }
+    return try jobs.projectTruncatePreparationResultAlloc(a, base_result, retained.value.plan.truncate_preparation.?, retained.value.plan_digest, include_notices, release_after);
+}
+
+fn requireRetainedTruncateJob(a: A, bytes: []const u8, id: stages.Id) !std.json.Parsed(stages.Job) {
+    if (bytes.len > stages.max_encoded_bytes) return error.InvalidGenerationPublication;
+    var retained = try std.json.parseFromSlice(stages.Job, a, bytes, .{});
+    errdefer retained.deinit();
+    if (!std.mem.eql(u8, &retained.value.plan.id, &id) or retained.value.plan.truncate_preparation == null) return error.InvalidGenerationPublication;
+    var validation: std.heap.ArenaAllocator = .init(a);
+    defer validation.deinit();
+    try retained.value.plan.validate(validation.allocator());
+    const digest = try retained.value.plan.digest(validation.allocator());
+    if (!std.mem.eql(u8, &digest, &retained.value.plan_digest)) return error.InvalidGenerationPublication;
+    return retained;
 }
 
 pub const Port = struct {

@@ -99,6 +99,18 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         };
         return gib * 1024 * 1024 * 1024;
     }
+    if (unit == .api_kernel and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        profile.host.os.tag == .linux and profile.host.cpu.arch == .aarch64 and
+        target.os.tag == .linux and target.cpu.arch == .aarch64 and target.abi == .gnu and
+        target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
+        profile.optimize == .debug and !profile.strip and profile.cpu_inference and !profile.sanitize_thread)
+    {
+        // Native Glowworm qualification at 8a674eebe7 peaked at
+        // 15,947,554,816 bytes, exceeding the fallback 12 GiB claim.
+        // Reserve 20 GiB for >=25% headroom; other units retain their claims.
+        return 20 * 1024 * 1024 * 1024;
+    }
     if (std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
         profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and
         target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
@@ -183,6 +195,16 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // Do not transfer these cross-target measurements to native x86,
         // Debug, sanitizers or other runtime units.
         return 15 * 1024 * 1024 * 1024;
+    }
+    if (unit == .api_kernel and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        profile.host.os.tag == .linux and profile.host.cpu.arch == .aarch64 and
+        target.os.tag == .linux and target.cpu.arch == .aarch64 and target.abi == .gnu and
+        profile.optimize == .debug)
+    {
+        // CUDA Debug on a Grace host peaked at 15,747,330,048 bytes, the same on
+        // main as with media changes. 18 GiB retains about 20% headroom.
+        return 18 * 1024 * 1024 * 1024;
     }
     return switch (unit) {
         // Claims conservatively cover clean production ReleaseFast
@@ -576,6 +598,20 @@ test "native Linux LLVM Debug claims cover measured peaks and account for overla
     try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
 }
 
+test "native aarch64 Linux Debug API claim covers the measured CUDA build peak" {
+    if (!std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0")) return error.SkipZigTest;
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .cpu_model = .baseline, .os_tag = .linux, .abi = .gnu });
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
+    const profile: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .debug, .strip = false, .cpu_inference = false };
+    const peak: usize = 15_747_330_048;
+    const claim = runtimeCompileMaxRss(.api_kernel, profile);
+    try std.testing.expectEqual(@as(usize, 18 * 1024 * 1024 * 1024), claim);
+    try std.testing.expect(claim >= peak + peak / 5);
+    var cross = profile;
+    cross.host = macos;
+    try std.testing.expectEqual(@as(usize, 12 * 1024 * 1024 * 1024), runtimeCompileMaxRss(.api_kernel, cross));
+}
+
 test "linked LLVM Debug test reservations cover native peaks without lowering authored claims" {
     const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
@@ -799,4 +835,35 @@ test "native Linux LLVM fast API covers measured peak and preserves overlap" {
     profile.strip = true;
     profile.sanitize_thread = true;
     try std.testing.expect(runtimeCompileMaxRss(.api_kernel, profile) > claim);
+}
+
+test "native Linux ARM64 CPU Debug API claim covers its measured peak" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .cpu_model = .baseline, .os_tag = .linux, .abi = .gnu });
+    const profile: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .debug, .strip = false, .cpu_inference = true };
+    const gib = 1024 * 1024 * 1024;
+    const peak: usize = 15_947_554_816;
+    const api = runtimeCompileMaxRss(.api_kernel, profile);
+    try std.testing.expect(api >= peak + peak / 4);
+    try std.testing.expect(api + runtimeCompileMaxRss(.distributed, profile) <= 32 * gib);
+    try std.testing.expect(api + runtimeCompileMaxRss(.storage_kernel, profile) > 32 * gib);
+    for (0..7) |i| {
+        var fallback = profile;
+        switch (i) {
+            0 => fallback.strip = true,
+            1 => fallback.cpu_inference = false,
+            2 => fallback.sanitize_thread = true,
+            3 => fallback.optimize = .fast,
+            4 => fallback.host.cpu.arch = .x86_64,
+            5 => fallback.target.abi = .musl,
+            6 => fallback.target.cpu.features.removeFeature(@backingInt(std.Target.aarch64.Feature.neon)),
+            else => unreachable,
+        }
+        // Other native GNU Debug profiles retain main's measured CUDA
+        // reservation; this CPU qualification must not lower that floor.
+        const expected_gib: usize = switch (i) {
+            0, 1, 2, 6 => 18,
+            else => 12,
+        };
+        try std.testing.expectEqual(expected_gib * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    }
 }

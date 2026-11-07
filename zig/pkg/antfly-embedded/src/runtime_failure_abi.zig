@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 91;
+pub const abi_version: u32 = 92;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -804,7 +804,8 @@ pub const Status = enum(u32) {
     gcs_connection_not_found_or_out_of_scope = 845,
     ambiguous_gcs_connection = 846,
     invalid_connection_credentials = 847,
-    catalog_occupancy_not_ready = 848,
+    raft_apply_writer_unavailable = 848,
+    catalog_occupancy_not_ready = 984,
     immutable_relational_index_definition_conflict = 849,
     invalid_index_publication_candidate = 850,
     invalid_private_index_cancellation = 851,
@@ -912,7 +913,6 @@ pub const Status = enum(u32) {
     lock_owner_changed = 953,
     lock_owner_not_registered = 954,
     lock_plan_limit_exceeded = 955,
-    raft_apply_writer_unavailable = 956,
     sql_database_in_use = 957,
     scope_retirement_changed = 958,
     invalid_scope_retirement = 959,
@@ -984,11 +984,11 @@ test "concurrent main and SQL statuses retain distinct wire identities" {
     try std_test.testing.expectEqual(@as(u32, 778), @backingInt(Status.seed_replica_policy_mismatch));
     try std_test.testing.expectEqual(@as(u32, 779), @backingInt(Status.document_artifact_publication_failed));
     try std_test.testing.expectEqual(@as(u32, 834), @backingInt(Status.grouped_source_owner_changed));
-    // Main owns 838-847; SQL catalog additions must follow those released IDs.
+    // Main owns 838-848; SQL catalog occupancy appends after existing IDs.
     try std_test.testing.expectEqual(@as(u32, 838), @backingInt(Status.unsupported_exact_sort));
     try std_test.testing.expectEqual(@as(u32, 839), @backingInt(Status.invalid_document_checkpoint));
     try std_test.testing.expectEqual(@as(u32, 840), @backingInt(Status.too_many_active_jobs));
-    try std_test.testing.expectEqual(@as(u32, 848), @backingInt(Status.catalog_occupancy_not_ready));
+    try std_test.testing.expectEqual(@as(u32, 984), @backingInt(Status.catalog_occupancy_not_ready));
 }
 
 test "released native value search Status identifiers retain their numeric values" {

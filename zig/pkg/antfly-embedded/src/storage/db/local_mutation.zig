@@ -263,6 +263,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const loadDenseArtifactCounterBootstrap = materialization.loadDenseArtifactCounterBootstrap;
         pub const loadDenseArtifactTargetCounter = materialization.loadDenseArtifactTargetCounter;
         pub const lockApplyForPortableRuntime = commit.lockApplyForPortableRuntime;
+        pub const tryLockApplyForPortableRuntime = commit.tryLockApplyForPortableRuntime;
         pub const maintenanceRequiresOrderedApply = commit.maintenanceRequiresOrderedApply;
         pub const markPrecomputedEnrichmentAppliedForSync = commit.markPrecomputedEnrichmentAppliedForSync;
         pub const maybeFinalizePendingRowPolicyPublication = commit.maybeFinalizePendingRowPolicyPublication;

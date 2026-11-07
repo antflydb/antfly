@@ -16,10 +16,16 @@
       "types": "./dist/sources-client.d.ts",
       "import": "./dist/sources-client.js",
       "require": "./dist/sources-client.cjs"
+    },
+    "./kysely": {
+      "types": "./dist/kysely.d.ts",
+      "import": "./dist/kysely.js",
+      "require": "./dist/kysely.cjs"
     }
   },
   "files": [
     "dist",
+    "docs",
     "README.md",
     "LICENSE"
   ],
@@ -61,17 +67,32 @@
   "homepage": "https://github.com/antflydb/antfly/tree/main/ts/packages/sdk#readme",
   "devDependencies": {
     "@types/node": "^25.9.3",
+    "@types/pg": "8.15.6",
+    "@types/pg-cursor": "2.7.2",
     "@vitest/ui": "^4.1.9",
+    "kysely": "^0.29.6",
     "openapi-typescript": "^7.13.0",
+    "pg": "8.16.3",
+    "pg-cursor": "2.15.3",
     "tsup": "^8.5.1",
     "tsx": "^4.22.4",
+    "typescript": "~5.9.3",
     "vitest": "^4.1.9"
   },
   "dependencies": {
     "lossless-json": "^4.3.2",
-    "openapi-fetch": "^0.17.0"
+    "openapi-fetch": "^0.17.0",
+    "postgres-array": "2.0.0"
   },
   "engines": {
     "node": ">=24.0"
+  },
+  "peerDependencies": {
+    "kysely": "^0.29.6"
+  },
+  "peerDependenciesMeta": {
+    "kysely": {
+      "optional": true
+    }
   }
 }

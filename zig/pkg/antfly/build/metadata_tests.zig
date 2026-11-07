@@ -61,7 +61,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const coupled_policy_tests = b.addTest(.{
         .root_module = options.metadata_storage_test_mod,
-        .filters = &.{"row-policy coupled schema"},
+        .filters = &.{ "row-policy coupled schema", "main privacy progress CAS retains table and ancestor retirement cuts until actual cancellation across cold reopen" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     @import("../../../build_support/antfly/test_support.zig").addTestCheckStep(b, coupled_policy_tests, "antfly-metadata-coupled-policy-check", "Type-check paired schema and policy metadata tests without emitting their binary");
@@ -79,7 +79,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-metadata-graph-committed-test", "Verify native graph admission outcomes and reader floors across mixed stores and cold Raft replay").dependOn(&graph_committed_run.step);
     const storage_query_binding_tests = b.addTest(.{
         .root_module = options.metadata_storage_test_mod,
-        .filters = &.{ "SQL authorization catalog table creation captures defaults atomically and drop retires ACL references", "SQL table trigger source physical query bindings retain incomplete and corrupt coverage refusal", "SQL logical relation native reverse lookup survives cold publication and rejects missing orphan substituted indexes", "SQL table trigger source no sequence table publication persists typed and document attributes through cold snapshot", "SQL table trigger source generation handoff captures retained state without sequence ownership", "SQL relation OID", "trigger catalog stages routine edges atomically and previews without writes", "SQL relation lifetime native restore authority reads bind exact hidden plan and owner without Raft placement", "staged trigger handoff validates actual source attributes and recomputes fresh physical state" },
+        .filters = &.{ "SQL authorization catalog table creation captures defaults atomically and drop retires ACL references", "SQL table trigger source physical query bindings retain incomplete and corrupt coverage refusal", "SQL logical relation native reverse lookup survives cold publication and rejects missing orphan substituted indexes", "SQL table trigger source no sequence table publication persists typed and document attributes through cold snapshot", "SQL table trigger source generation handoff captures retained state without sequence ownership", "SQL TRUNCATE preparation", "SQL relation OID", "trigger catalog stages routine edges atomically and previews without writes", "SQL relation lifetime native restore authority reads bind exact hidden plan and owner without Raft placement", "staged trigger handoff validates actual source attributes and recomputes fresh physical state" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const storage_query_binding_run = addFilteredTestRunArtifact(b, storage_query_binding_tests);

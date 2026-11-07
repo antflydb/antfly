@@ -168,7 +168,9 @@ const std = @import("std");
 // unreleased SQL profile reserves floors above 78; historical notes above
 // describe its development sequence before this rebasing. Published transition
 // tag 81 remains SQL completion references; private SQL tags begin at 82.
-pub const current_version: u16 = coupled_schema_policy_version;
+pub const current_version: u16 = sql_truncate_preparation_version;
+/// Immutable, pre-executed statement trigger receipts/results on SQL TRUNCATE.
+pub const sql_truncate_preparation_version: u16 = 177;
 /// Atomically acknowledged trigger-schema and active row-policy pairs.
 pub const coupled_schema_policy_version: u16 = 175;
 /// Native TEMP/UNLOGGED process ownership and authenticated boot recovery.
@@ -297,6 +299,13 @@ pub const resolver_namespaces_version: u16 = 128;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;
+
+/// Main's privacy v82 meaning is new relative to this branch's reader v82.
+/// The merged serving profile admits it only through coordinated floor176.
+pub const privacy_version: u16 = 176;
+pub fn usesPrivacy(indexes_json: []const u8) bool {
+    return std.mem.indexOf(u8, indexes_json, "\"_privacy\"") != null or std.mem.indexOf(u8, indexes_json, "_privacy_document") != null;
+}
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {

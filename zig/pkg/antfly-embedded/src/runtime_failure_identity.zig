@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const abi = @import("runtime_failure_abi");
+pub const Status = abi.Status;
 
 test "merged runtime failure ABI preserves published reader and GCS status numbers" {
     try std.testing.expectEqual(@as(u32, 841), @backingInt(abi.Status.hierarchy_cursor_stale));
@@ -52,6 +53,7 @@ test "SQL relation persistence native failures preserve every stable boundary id
 }
 
 const mappings = [_]Mapping{
+    .{ .status = .raft_apply_writer_unavailable, .err = error.RaftApplyWriterUnavailable },
     .{ .status = .invalid_sql_relation_persistence, .err = error.InvalidSqlRelationPersistence },
     .{ .status = .sql_relation_owner_changed, .err = error.SqlRelationOwnerChanged },
     .{ .status = .sql_temporary_relation_not_owned, .err = error.SqlTemporaryRelationNotOwned },
@@ -1456,6 +1458,19 @@ test "native decision uncertainty retains its exact shared runtime identity" {
     try std.testing.expectEqualStrings("CommitDecisionUnknown", failure.errorName());
     failure.boundary_version = 89;
     try std.testing.expectError(error.InvalidBoundaryFailureIdentity, validateFailureEnvelope(status, &failure, abi.abi_version));
+}
+
+test "privacy committed Raft contention survives the active storage owner ABI" {
+    for ([_]anyerror{ error.WriterLocked, error.RaftApplyWriterUnavailable }) |err| {
+        const value = statusFromError(err);
+        try std.testing.expect(value != .internal);
+        try std.testing.expectError(err, statusToError(value));
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
+        try validateFailureEnvelope(value, &failure, abi.abi_version);
+        try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
+    try std.testing.expect(statusFromError(error.WriterLocked) != statusFromError(error.RaftApplyWriterUnavailable));
+    try std.testing.expectEqual(@as(u32, 848), @backingInt(statusFromError(error.RaftApplyWriterUnavailable)));
 }
 
 // Invalid membership remains a protocol refusal across the owner boundary.

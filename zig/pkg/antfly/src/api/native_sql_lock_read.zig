@@ -10,14 +10,7 @@ const Fence = local.metadata_catalog_route_contract.CatalogRouteFence;
 const Options = local.storage_db_types.LookupOptions;
 
 pub fn validateOptions(opts: Options) !void {
-    const defaults: Options = .{};
-    inline for (@typeInfo(Options).@"struct".field_names, @typeInfo(Options).@"struct".field_types) |name, T| {
-        if (comptime !std.mem.eql(u8, name, "sql_lock_query_json") and !std.mem.eql(u8, name, "execution_deadline_ns") and !std.mem.eql(u8, name, "execution_io") and !std.mem.eql(u8, name, "cancellation") and !std.mem.eql(u8, name, "relation_owner_minter")) {
-            if (comptime @typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice) {
-                if (@field(opts, name).len != 0) return error.InvalidLockScope;
-            } else if (!std.meta.eql(@field(opts, name), @field(defaults, name))) return error.InvalidLockScope;
-        }
-    }
+    try local.api_table_read_source.PrivateLookup.requireSqlLockOptions(opts);
 }
 
 pub fn requireSameRoute(outer: Fence, control: Fence) !void {

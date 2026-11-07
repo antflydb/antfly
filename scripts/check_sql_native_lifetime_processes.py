@@ -25,7 +25,9 @@ def require_four_passes(report):
         raise ValueError(f"expected exactly four process campaigns, found {len(cases)}")
     observed = set()
     for case in cases:
-        match = re.fullmatch(re.escape(TEST) + r"\[(sql-[0-9]{4})\]", case.get("name", ""))
+        match = re.fullmatch(
+            re.escape(TEST) + r"\[(sql-[0-9]{4})\]", case.get("name", "")
+        )
         if match is None or match[1] not in EXPECTED or match[1] in observed:
             raise ValueError("unexpected or duplicate process campaign identity")
         if any(case.find(tag) is not None for tag in ("failure", "error", "skipped")):
@@ -64,9 +66,14 @@ def run_bounded(command, *, cwd, env, timeout):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     compiler = parser.add_mutually_exclusive_group(required=True)
-    compiler.add_argument("--zig", help="Explicit Zig executable/path for the matching Debug build")
-    compiler.add_argument("--reuse-built-cli", type=Path,
-                          help="Explicit already-qualified matching Debug CLI; caller retains build provenance")
+    compiler.add_argument(
+        "--zig", help="Explicit Zig executable/path for the matching Debug build"
+    )
+    compiler.add_argument(
+        "--reuse-built-cli",
+        type=Path,
+        help="Explicit already-qualified matching Debug CLI; caller retains build provenance",
+    )
     args = parser.parse_args()
     env = dict(os.environ, TZ="UTC")
     # Never inherit user-supplied selection or parallelism into this exact gate.
@@ -80,7 +87,9 @@ def main():
         print(f"Building matching Debug CLI with explicit Zig: {zig}", flush=True)
         run_bounded(
             [str(zig), "build", "antfly", "-Doptimize=Debug", "-j1"],
-            cwd=ROOT / "zig", env=env, timeout=1500,
+            cwd=ROOT / "zig",
+            env=env,
+            timeout=1500,
         )
         binary = (ROOT / "zig/zig-out/bin/antfly").resolve(strict=True)
     else:
@@ -93,23 +102,43 @@ def main():
     with tempfile.TemporaryDirectory(prefix="antfly-native-lifetime-") as directory:
         report = Path(directory) / "processes.xml"
         run_bounded(
-            ["uv", "run", "--offline", "--project", "e2e/antfly", "--locked",
-             "python", "-m", "pytest",
-             "e2e/antfly/test_sql_unlogged_lifecycle.py", "-q", "-s",
-             "-n", "0", "--maxfail=1",
-             "--junitxml=" + str(report)],
-            cwd=ROOT / "zig", env=env, timeout=1800,
+            [
+                "uv",
+                "run",
+                "--offline",
+                "--project",
+                "e2e/antfly",
+                "--locked",
+                "python",
+                "-m",
+                "pytest",
+                "e2e/antfly/test_sql_unlogged_lifecycle.py",
+                "-q",
+                "-s",
+                "-n",
+                "0",
+                "--maxfail=1",
+                "--junitxml=" + str(report),
+            ],
+            cwd=ROOT / "zig",
+            env=env,
+            timeout=1800,
         )
         require_four_passes(report)
-    print("Matching Debug CLI: four real native lifetime process campaigns passed, no skips.")
+    print(
+        "Matching Debug CLI: four real native lifetime process campaigns passed, no skips."
+    )
 
 
 if __name__ == "__main__":
+
     def interrupt(signum, _frame):
         raise KeyboardInterrupt(signum)
 
-    previous = {signum: signal.signal(signum, interrupt)
-                for signum in (signal.SIGINT, signal.SIGTERM)}
+    previous = {
+        signum: signal.signal(signum, interrupt)
+        for signum in (signal.SIGINT, signal.SIGTERM)
+    }
     try:
         main()
     finally:

@@ -191,7 +191,7 @@ pub fn sourceColumnsDigest(a: A, columns: attributes.State) ![32]u8 {
 
 test "SQL trigger restore source directory digest binds identity churn and ignores descriptions" {
     const a = std.testing.allocator;
-    const original: attributes.State = .{ .table_id = 7, .epoch = .{ .version = 2, .digest = @splat(1) }, .next_id = 12, .columns = &.{.{ .id = 11, .name = "a", .signature = @splat(3) }} };
+    const original: attributes.State = .{ .format = 1, .table_id = 7, .epoch = .{ .version = 2, .digest = @splat(1) }, .next_id = 12, .columns = &.{.{ .id = 11, .name = "a", .signature = @splat(3) }} };
     const first = try sourceColumnsDigest(a, original);
     var annotated = original;
     annotated.columns = &.{.{ .id = 11, .name = "a", .signature = @splat(3), .description = "presentation-only" }};

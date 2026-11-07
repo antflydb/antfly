@@ -594,12 +594,25 @@ pub const ApiHttpClient = struct {
         var headers: std.ArrayListUnmanaged(http_common.RequestHeader) = .empty;
         const authority = @import("antfly_local_sources").common_relation_owner_authority;
 
+        // Body-key manifest transport shares the same captured route as its
+        // path-key counterpart. Sign only after the final envelope is built.
+        if (self.relation_owner_route) |fence| if (request.header(route_metadata_api.catalog_route_fence_header) == null) {
+            if (!internal_service_auth.requestTargetsInternalApi(request.uri)) return error.Forbidden;
+            try headers.appendSlice(a, request.headers);
+            try headers.append(a, .{ .name = route_metadata_api.catalog_route_fence_header, .value = try std.json.Stringify.valueAlloc(a, fence, .{}) });
+            if (request.header(route_metadata_api.catalog_route_deadline_ms_header) == null) {
+                const budget = @max(@as(u32, 1), @min(request.timeout_ms orelse route_metadata_api.catalog_route_default_deadline_ms, route_metadata_api.catalog_route_max_deadline_ms));
+                try headers.append(a, .{ .name = route_metadata_api.catalog_route_deadline_ms_header, .value = try std.fmt.allocPrint(a, "{d}", .{budget}) });
+            }
+            forwarded.headers = headers.items;
+        };
+
         if (self.relation_owner_route) |fence| if (fence.route.execution == .native_local and fence.route.execution.native_local.kind == .temporary) {
             if (!internal_service_auth.requestTargetsInternalApi(request.uri)) return error.Forbidden;
             const minter = fence.admission_relation_minter orelse return error.SqlTemporaryRelationNotOwned;
             try fence.route.execution.native_local.requireConnectionOwner(minter.owner);
             const owner_grant = try minter.mint(a, .{ .purpose = self.relation_owner_purpose, .table_id = fence.table_id, .group_id = fence.route.group_id, .descriptor_fingerprint = try fence.route.execution.native_local.fingerprint(), .body_digest = authority.bodyDigest(request.body) });
-            try headers.appendSlice(a, request.headers);
+            if (headers.items.len == 0) try headers.appendSlice(a, request.headers);
             try headers.append(a, .{ .name = authority.header, .value = owner_grant });
             if (minter.command_fence_digest) |digest| {
                 const command_hex = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
@@ -797,6 +810,8 @@ pub const ApiHttpClient = struct {
     pub const GroupLookupOptions = struct {
         /// Process-local captured route; transported through the existing
         /// private route header and requiring receiver acknowledgement.
+        privacy_original: bool = false,
+        privacy_policy_version: ?[64]u8 = null,
         catalog_route_fence: ?route_metadata_api.CatalogRouteFence = null,
         relational_integrity_catalog: bool = false,
         relational_integrity_action: bool = false,
@@ -814,7 +829,15 @@ pub const ApiHttpClient = struct {
         row_policy_database: []const u8 = "",
     };
 
+    /// Compatibility entrypoint for main callers. All native authority,
+    /// typed provenance and privacy controls converge on the named options.
+    pub fn fetchGroupLookupWithMode(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, key: []const u8, fields: ?[]const u8, read_consistency: []const u8, timeout_ms: ?u32, cancellation: ?*const http_common.RequestCancellation, relational_integrity_catalog: bool, relational_integrity_action: bool, relational_integrity_jobs_json: []const u8, relational_activation_json: []const u8, relational_index_status_json: []const u8, relational_topology_json: []const u8, group_source_query_json: []const u8, restore_staging_scope: ?[32]u8, restore_staging_plan_id: ?[16]u8, include_primary_digest: bool, privacy_original: bool, privacy_policy_version: ?[64]u8) !LookupResponse {
+        return self.fetchGroupLookupWithOptions(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, .{ .relational_integrity_catalog = relational_integrity_catalog, .relational_integrity_action = relational_integrity_action, .relational_integrity_jobs_json = relational_integrity_jobs_json, .relational_activation_json = relational_activation_json, .relational_index_status_json = relational_index_status_json, .relational_topology_json = relational_topology_json, .group_source_query_json = group_source_query_json, .restore_staging_scope = restore_staging_scope, .restore_staging_plan_id = restore_staging_plan_id, .include_primary_digest = include_primary_digest, .privacy_original = privacy_original, .privacy_policy_version = privacy_policy_version });
+    }
+
     pub fn fetchGroupLookupWithOptions(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, key: []const u8, fields: ?[]const u8, read_consistency: []const u8, timeout_ms: ?u32, cancellation: ?*const http_common.RequestCancellation, options: GroupLookupOptions) !LookupResponse {
+        const privacy_original = options.privacy_original;
+        const privacy_policy_version = options.privacy_policy_version;
         const relational_integrity_catalog = options.relational_integrity_catalog;
         const relational_integrity_action = options.relational_integrity_action;
         const relational_integrity_jobs_json = options.relational_integrity_jobs_json;
@@ -868,7 +891,8 @@ pub const ApiHttpClient = struct {
         const special = sql_lock_query_json.len != 0 or group_source_query_json.len != 0 or relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0 or relational_index_status_json.len != 0;
         // Routing uses the actual logical key, including empty first-range
         // boundaries. Only the already-routed HTTP path needs a placeholder.
-        const encoded_key = try percentEncodePathComponent(self.alloc, if (special and key.len == 0) "\x00relational_control" else key);
+        const key_in_body = documentKeyNeedsBody(key);
+        const encoded_key = try percentEncodePathComponent(self.alloc, if (key_in_body) "" else if (special and key.len == 0) "\x00relational_control" else key);
         defer self.alloc.free(encoded_key);
         const encoded_consistency = try percentEncodePathComponent(self.alloc, read_consistency);
         defer self.alloc.free(encoded_consistency);
@@ -897,7 +921,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(suffix);
         // Keep bounded control batches out of URI/header limits. The same
         // routed read-index lookup accepts its control JSON as a POST body.
-        const body_control = relational_integrity_jobs_json.len > 1024;
+        const body_control = relational_integrity_jobs_json.len > 1024 and !key_in_body;
         if (relational_integrity_jobs_json.len > @import("antfly_local_sources").storage_db_relational_integrity_contract.max_preparation_bytes) return error.InvalidArgument;
         const jobs = if (relational_integrity_jobs_json.len != 0 and !body_control) try percentEncodePathComponent(self.alloc, relational_integrity_jobs_json) else "";
         defer if (jobs.len != 0) self.alloc.free(jobs);
@@ -932,14 +956,24 @@ pub const ApiHttpClient = struct {
         defer if (sql_lock_path) |value| self.alloc.free(value);
         const null_path = if (options.include_json_null_fields) try std.fmt.allocPrint(self.alloc, "{s}&_json_null_fields=true", .{sql_lock_path orelse group_path orelse index_path orelse observation_path orelse path}) else null;
         defer if (null_path) |value| self.alloc.free(value);
-        const uri = try self.joinRoute(base_uri, null_path orelse sql_lock_path orelse group_path orelse index_path orelse observation_path orelse path);
+        const typed_path = null_path orelse sql_lock_path orelse group_path orelse index_path orelse observation_path orelse path;
+        const privacy_path = if (privacy_original) try std.fmt.allocPrint(self.alloc, "{s}&_privacy_original=true", .{typed_path}) else null;
+        defer if (privacy_path) |value| self.alloc.free(value);
+        const policy_path = if (privacy_policy_version) |version| try std.fmt.allocPrint(self.alloc, "{s}&_privacy_policy_version={s}", .{ privacy_path orelse typed_path, if (std.mem.allEqual(u8, &version, 0)) "none" else &version }) else null;
+        defer if (policy_path) |value| self.alloc.free(value);
+        const legacy_path = policy_path orelse privacy_path orelse typed_path;
+        const body = if (key_in_body) try @import("http_routes.zig").DocumentReadRequest.encode(self.alloc, .lookup, key, legacy_path[(std.mem.indexOfScalar(u8, legacy_path, '?') orelse return error.InvalidArgument) + 1 ..], "") else null;
+        defer if (body) |value| self.alloc.free(value);
+        const target = if (key_in_body) try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}/document-read", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_table_name }) else null;
+        defer if (target) |value| self.alloc.free(value);
+        const uri = try self.joinRoute(base_uri, target orelse legacy_path);
         defer self.alloc.free(uri);
 
         var resp = try self.executeRequest(.{
-            .method = if (body_control) .POST else .GET,
+            .method = if (key_in_body or body_control) .POST else .GET,
             .uri = uri,
-            .body = if (body_control) relational_integrity_jobs_json else "",
-            .content_type = if (body_control) "application/json" else null,
+            .body = body orelse if (body_control) relational_integrity_jobs_json else "",
+            .content_type = if (key_in_body or body_control) "application/json" else null,
             .headers = headers[0..header_count],
             .timeout_ms = timeout_ms,
             .cancellation = cancellation,
@@ -947,7 +981,7 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, privacy_policy_version),
             404 => {
                 if (std.mem.eql(u8, read_consistency, "read_index") and
                     std.mem.eql(u8, resp.header(route_metadata_api.catalog_route_fence_ack_header) orelse "", route_metadata_api.catalog_route_fence_ack_value) and
@@ -1691,6 +1725,18 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: ?[]const u8,
     ) !ScanResponse {
+        return self.fetchGroupScanControlled(base_uri, group_id, table_name, body, null, null);
+    }
+
+    pub fn fetchGroupScanControlled(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: ?[]const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !ScanResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -1707,11 +1753,13 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = if (body != null) "application/json" else null,
             .body = body orelse "",
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         if (remoteRelationalRowError(resp.status, resp.body)) |err| return err;
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, try privacyVersionFromBody(self.alloc, body)),
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
@@ -1744,6 +1792,7 @@ pub const ApiHttpClient = struct {
             alloc: std.mem.Allocator,
             downstream: http_common.StreamWriter,
             status: u16 = 0,
+            privacy_version: ?[64]u8 = null,
             error_body: std.ArrayListUnmanaged(u8) = .empty,
 
             pub fn deinit(adapter: *@This()) void {
@@ -1753,7 +1802,10 @@ pub const ApiHttpClient = struct {
             fn start(raw: *anyopaque, response_alloc: std.mem.Allocator, response: http_common.StreamingResponse) anyerror!void {
                 const adapter: *@This() = @ptrCast(@alignCast(raw));
                 adapter.status = response.status;
-                if (response.status == 200) try adapter.downstream.start(response_alloc, response);
+                if (response.status == 200) {
+                    try requirePrivacyAck(response, adapter.privacy_version);
+                    try adapter.downstream.start(response_alloc, response);
+                }
             }
 
             fn writeAll(raw: *anyopaque, bytes: []const u8) anyerror!void {
@@ -1777,7 +1829,7 @@ pub const ApiHttpClient = struct {
                 } };
             }
         };
-        var status_writer = StatusWriter{ .alloc = self.alloc, .downstream = downstream };
+        var status_writer = StatusWriter{ .alloc = self.alloc, .downstream = downstream, .privacy_version = try privacyVersionFromBody(self.alloc, body) };
         defer status_writer.deinit();
         const handled = (try self.executeRequestStream(.{
             .method = .POST,
@@ -1939,7 +1991,7 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, try privacyVersionFromBody(self.alloc, body)),
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
@@ -2008,7 +2060,7 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, try privacyVersionFromBody(self.alloc, body)),
             408 => return error.Timeout,
             400 => return remotePreflightError(resp.body),
             404 => return remotePreflightError(resp.body),
@@ -2272,7 +2324,7 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200 => {},
+            200 => try requirePrivacyAck(resp, try privacyVersionFromBody(self.alloc, body)),
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
@@ -3393,6 +3445,58 @@ pub const ApiHttpClient = struct {
         return response;
     }
 
+    fn fetchDocumentRead(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, op: @import("http_routes.zig").DocumentReadRequest.Operation, key: []const u8, artifact: []const u8) !QueryResponse {
+        const encoded_table = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}/document-read", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_table });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try @import("http_routes.zig").DocumentReadRequest.encode(self.alloc, op, key, "", artifact);
+        defer self.alloc.free(body);
+        var resp = try self.executeRequest(.{ .method = .POST, .uri = uri, .body = body });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
+            404 => return error.NotFound,
+            408, 504 => return error.Timeout,
+            409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
+    pub fn fetchGroupDocumentArtifactManifestControlled(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, key: []const u8, artifact: []const u8, opts: db_mod.types.LookupOptions) !QueryResponse {
+        if (opts.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        const now = opts.executionNowNs();
+        const timeout: ?u32 = if (opts.execution_deadline_ns) |deadline| blk: {
+            if (now >= deadline) return error.Timeout;
+            break :blk @intCast(@min(@as(u64, std.math.maxInt(u32)), @max(@as(u64, 1), std.math.divCeil(u64, deadline - now, std.time.ns_per_ms) catch 1)));
+        } else null;
+        const encoded_table = try percentEncodePathComponent(self.alloc, table);
+        defer self.alloc.free(encoded_table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}/document-read", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_table });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try @import("http_routes.zig").DocumentReadRequest.encode(self.alloc, .manifest, key, "", artifact);
+        defer self.alloc.free(body);
+        var cancellation = if (opts.cancellation) |token| http_common.RequestCancellation.fromToken(token) else http_common.RequestCancellation{};
+        var buffer: [20]u8 = undefined;
+        const budget = if (timeout) |milliseconds| try std.fmt.bufPrint(&buffer, "{d}", .{@min(milliseconds, @import("antfly_public_limits").Execution.max_timeout_ms)}) else "";
+        const headers = [_]http_common.RequestHeader{.{ .name = @import("antfly_public_limits").Execution.timeout_header, .value = budget }};
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .headers = if (timeout != null) &headers else &.{}, .timeout_ms = timeout, .cancellation = if (opts.cancellation != null) &cancellation else null });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => return .{ .body = try self.alloc.dupe(u8, response.body) },
+            404 => return error.NotFound,
+            408, 504 => return error.Timeout,
+            409 => return remoteGroupConflictError(response.body),
+            503 => return remoteStorageReadUnavailableError(response.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
     pub fn fetchGroupDocumentArtifactManifest(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -3401,6 +3505,10 @@ pub const ApiHttpClient = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
     ) !QueryResponse {
+        if (documentKeyNeedsBody(doc_key)) {
+            const response = try self.fetchDocumentRead(base_uri, group_id, table_name, .manifest, doc_key, artifact_name);
+            return response;
+        }
         const escaped_key = try percentEncodePathComponent(self.alloc, doc_key);
         defer self.alloc.free(escaped_key);
         const escaped_artifact_name = try percentEncodePathComponent(self.alloc, artifact_name);
@@ -3440,6 +3548,10 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         doc_key: []const u8,
     ) !QueryResponse {
+        if (documentKeyNeedsBody(doc_key)) {
+            const response = try self.fetchDocumentRead(base_uri, group_id, table_name, .manifests, doc_key, "");
+            return response;
+        }
         const escaped_key = try percentEncodePathComponent(self.alloc, doc_key);
         defer self.alloc.free(escaped_key);
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}{s}", .{
@@ -3545,7 +3657,7 @@ pub const ApiHttpClient = struct {
             200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
-            else => return error.UnexpectedHttpStatus,
+            else => return remoteArtifactReprocessError(resp.status, resp.body),
         }
     }
 
@@ -4902,6 +5014,32 @@ fn remoteStorageReadUnavailableError(body: []const u8) anyerror {
         return error.StorageReadTemporarilyUnavailable;
     }
     return error.UnexpectedHttpStatus;
+}
+
+const privacy_ack_header = "X-Antfly-Privacy-Fence";
+
+pub fn privacyVersionFromBody(a: std.mem.Allocator, body: ?[]const u8) !?[64]u8 {
+    const bytes = body orelse return null;
+    if (bytes.len == 0) return null;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const envelope = parsed.value.object.get("query_request") orelse parsed.value;
+    if (envelope != .object) return null;
+    const value = parsed.value.object.get("_privacy_policy_version") orelse envelope.object.get("_privacy_policy_version") orelse return null;
+    if (value != .string) return error.InvalidResponse;
+    if (std.mem.eql(u8, value.string, "none")) return null;
+    if (value.string.len != 64) return error.InvalidResponse;
+    return value.string[0..64].*;
+}
+
+fn requirePrivacyAck(response: anytype, expected: ?[64]u8) !void {
+    const version = expected orelse return;
+    if (std.mem.allEqual(u8, &version, 0)) return;
+    for (response.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, privacy_ack_header) and std.mem.eql(u8, header.value, &version)) return;
+    }
+    return error.StorageReadTemporarilyUnavailable;
 }
 
 fn parseIdentityReadGenerationHeader(resp: http_common.HttpResponse) !?u64 {
@@ -7364,6 +7502,12 @@ test "SQL relation lifetime buffered and streamed envelopes bind exact owner tri
             try std.testing.expectEqualStrings("prepared-read", request.header(@import("prepared_query_routing.zig").header_name).?);
             try std.testing.expectEqualStrings("unchanged", request.header("X-Ordinary").?);
             try std.testing.expectEqual(@as(?u32, 50), request.timeout_ms);
+            const encoded_route = request.header(route_metadata_api.catalog_route_fence_header) orelse return error.TestMissingCapturedRoute;
+            var route = try std.json.parseFromSlice(route_metadata_api.CatalogRouteFence, alloc, encoded_route, .{});
+            defer route.deinit();
+            try std.testing.expectEqual(@as(u64, 5), route.value.route.group_id);
+            try std.testing.expect(route.value.admission_relation_minter == null);
+            try std.testing.expectEqualStrings("50", request.header(route_metadata_api.catalog_route_deadline_ms_header) orelse return error.TestMissingCapturedBudget);
             const body = if (fixture.changed_body) "substituted" else request.body;
             const scope: authority.Scope = .{ .purpose = fixture.purpose, .table_id = 3, .group_id = 5, .descriptor_fingerprint = try fixture.actual.fingerprint(), .body_digest = authority.bodyDigest(body), .command_fence_digest = fixture.command };
             const owner = try authority.verify(alloc, secret, issuer, scope, fixture.actual, 101, request.header(authority.header) orelse return error.Forbidden);
@@ -7425,6 +7569,21 @@ test "SQL relation lifetime buffered and streamed envelopes bind exact owner tri
     fixture.purpose = .read;
     client.relation_owner_purpose = .read;
     try std.testing.expectEqual(@as(?bool, true), try client.executeRequestStream(request, sink.writer()));
+    // Both body-key manifest arms carry the real final envelope, captured
+    // route and bounded deadline. Changing an operation/key/body after mint
+    // fails the same actual OwnerGrant verifier used by the receiver.
+    inline for (.{ @import("http_routes.zig").DocumentReadRequest.Operation.manifest, @import("http_routes.zig").DocumentReadRequest.Operation.manifests }) |op| {
+        const body = try @import("http_routes.zig").DocumentReadRequest.encode(a, op, "binary\x00key", "", if (op == .manifest) "chunks" else "");
+        defer a.free(body);
+        var manifest_request = request;
+        manifest_request.uri = "http://owner/internal/v1/groups/5/tables/docs/document-read";
+        manifest_request.body = body;
+        var accepted = try client.executeRequest(manifest_request);
+        accepted.deinit(a);
+        fixture.changed_body = true;
+        try std.testing.expectError(error.Forbidden, client.executeRequest(manifest_request));
+        fixture.changed_body = false;
+    }
     fixture.purpose = .prepare;
     client.relation_owner_purpose = .prepare;
     // Verification uses the actual received body/current generation, not the
@@ -7558,6 +7717,28 @@ test "SQL native lock lookup transports captured route and rejects unacknowledge
     probe.expected = null;
     var ordinary = try client.fetchGroupLookupWithOptions("http://owner", 72, "docs", "", null, "read_index", null, null, .{});
     defer ordinary.deinit(a);
+}
+
+/// Stop counting early and avoid constructing a potentially enormous escaped
+/// URL. Small keys retain the legacy GET transport during rolling upgrades.
+fn documentKeyNeedsBody(key: []const u8) bool {
+    var bytes: usize = 0;
+    for (key) |c| {
+        bytes += if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') @as(usize, 1) else 3;
+        if (bytes > 1024) return true;
+    }
+    return false;
+}
+
+fn remoteArtifactReprocessError(status: u16, body: []const u8) anyerror {
+    if (status == 503 and std.mem.eql(u8, body, "artifact publication pending")) return error.ArtifactPublicationPending;
+    return error.UnexpectedHttpStatus;
+}
+
+test "privacy reprocess transport preserves pending catalog retries without accepting unrelated failures" {
+    try std.testing.expectEqual(error.ArtifactPublicationPending, remoteArtifactReprocessError(503, "artifact publication pending"));
+    try std.testing.expectEqual(error.UnexpectedHttpStatus, remoteArtifactReprocessError(500, "artifact publication pending"));
+    try std.testing.expectEqual(error.UnexpectedHttpStatus, remoteArtifactReprocessError(503, "internal server error"));
 }
 
 test "table retirement preparation transport reuses strict private schema route without replay" {

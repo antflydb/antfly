@@ -15,7 +15,8 @@
 
 const std = @import("std");
 
-pub const artifact_sources_protocol_version: u16 = 1;
+// Version 2 additionally enforces managed privacy sources and read fences.
+pub const artifact_sources_protocol_version: u16 = 2;
 /// The store understands native HBC authority markers, WAL recovery, and the
 /// fail-closed placement contract used during rolling upgrades.
 pub const dense_native_storage_protocol_version: u16 = 1;
@@ -41,7 +42,7 @@ comptime {
 }
 /// Artifact-backed native restoration requires independently qualified image
 /// repair and replay after owner loss. A decoder ceiling is not readiness.
-pub const native_nonempty_restore_protocol_version: u16 = 9;
+pub const native_nonempty_restore_protocol_version: u16 = 10;
 /// Paired schema/policy install requires the batch35 decoder at every owner.
 pub const coupled_schema_policy_protocol_version: u16 = 8;
 
@@ -57,7 +58,10 @@ pub fn nativeRestoreRequiredProtocolVersion(target: anytype) u16 {
 /// new capability. This ceiling grants neither placement nor native opens.
 pub const maximum_decodable_relational_topology_floor_version: u16 = native_nonempty_restore_protocol_version;
 
-pub const relational_topology_protocol_version: u16 = coupled_schema_policy_protocol_version;
+/// Main's privacy read/write fences compose with the already qualified SQL
+/// native/graph/coupled profile. This does not admit future artifact repair.
+pub const privacy_protocol_version: u16 = 9;
+pub const relational_topology_protocol_version: u16 = privacy_protocol_version;
 pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("antfly_local_sources").common_group_ids;
 const topology_records = @import("antfly_local_sources").common_topology_records;
@@ -104,7 +108,29 @@ pub const PlacementClass = enum {
 
 pub const TableRecord = @import("antfly_local_sources").metadata_local_catalog.TableRecord;
 
+pub const PrivacyWork = struct { table: TableRecord, term: u64 };
 pub const TableDefinition = TableRecord;
+
+/// Runtime progress has no effect on routing, planning, or owner definitions.
+/// The ordinary full-definition CAS still supplies concurrency protection.
+pub fn privacyProgressOnly(a: std.mem.Allocator, before: TableRecord, after: TableRecord) !bool {
+    // Unchanged CAS commands also drive resolver namespace maintenance.
+    if (tableDefinitionsEqual(before, after)) return false;
+    var immutable = after;
+    immutable.indexes_json = before.indexes_json;
+    if (!tableDefinitionsEqual(before, immutable)) return false;
+    return @import("antfly_local_sources").privacy_catalog.progressOnly(a, before.indexes_json, after.indexes_json);
+}
+
+/// Policy installation acknowledges an immutable resource version. Worker
+/// progress after the commit must not make that logical result ambiguous.
+pub fn privacyPolicyInstallationMatches(a: std.mem.Allocator, before: TableRecord, requested: TableRecord, visible: TableRecord) !bool {
+    if (!try privacyProgressOnly(a, requested, visible)) return false;
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const prior = (try privacy.resourceVersion(a, before.indexes_json)) orelse 0;
+    const installed = (try privacy.resourceVersion(a, requested.indexes_json)) orelse return false;
+    return installed > prior;
+}
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
     return std.meta.eql(lhs.sql_persistence, rhs.sql_persistence) and std.mem.eql(u8, lhs.sql_native_indexes_json, rhs.sql_native_indexes_json) and lhs.sql_materialized_view_id == rhs.sql_materialized_view_id and std.meta.eql(lhs.schema_reader_requirements, rhs.schema_reader_requirements) and
@@ -1020,8 +1046,12 @@ pub fn artifactSourcesProtocolValid(reporter_incarnation: u64, protocol_version:
 /// the store can materialize the generalized artifact-source index contract.
 pub fn artifactSourcesProtocolSupported(reporter_incarnation: u64, protocol_version: u16) bool {
     return reporter_incarnation != 0 and
-        protocol_version >= artifact_sources_protocol_version and
+        protocol_version >= 1 and
         artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
+}
+
+pub fn privacyProtocolSupported(reporter_incarnation: u64, protocol_version: u16) bool {
+    return reporter_incarnation != 0 and protocol_version >= 2 and artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
 }
 
 pub fn denseNativeStorageProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
@@ -1504,6 +1534,7 @@ pub const TableManager = struct {
     alloc: std.mem.Allocator,
     tables: std.AutoHashMapUnmanaged(u64, TableRecord) = .empty,
     table_names: std.StringHashMapUnmanaged(u64) = .empty,
+    privacy_work: @import("antfly_local_sources").privacy_catalog.WorkIndex = .{},
     // Provisioning holds published and unpublished generations with the same
     // name. It is an ID-only topology, never a public name-resolution source.
     index_table_names: bool = true,
@@ -1520,6 +1551,7 @@ pub const TableManager = struct {
     }
 
     pub fn deinit(self: *TableManager) void {
+        self.privacy_work.deinit(self.alloc);
         self.table_names.deinit(self.alloc);
         var table_it = self.tables.valueIterator();
         while (table_it.next()) |table| freeTable(self.alloc, table.*);
@@ -1581,6 +1613,7 @@ pub const TableManager = struct {
         // borrowed name. Replacement/rollback cannot publish half an index.
         try self.tables.ensureUnusedCapacity(self.alloc, 1);
         if (self.index_table_names) try self.table_names.ensureUnusedCapacity(self.alloc, 1);
+        try self.privacy_work.update(self.alloc, record.table_id, try @import("antfly_local_sources").privacy_catalog.workDue(self.alloc, record.indexes_json));
         if (self.tables.getPtr(record.table_id)) |existing| {
             _ = self.table_names.remove(existing.name);
             freeTable(self.alloc, existing.*);
@@ -1622,6 +1655,7 @@ pub const TableManager = struct {
     }
 
     pub fn clearTopology(self: *TableManager) void {
+        self.privacy_work.deinit(self.alloc);
         self.table_names.clearRetainingCapacity();
         var table_it = self.tables.valueIterator();
         while (table_it.next()) |table| freeTable(self.alloc, table.*);
@@ -1660,6 +1694,7 @@ pub const TableManager = struct {
     pub fn removeTable(self: *TableManager, table_id: u64) bool {
         const removed = self.tables.fetchRemove(table_id);
         if (removed) |entry| {
+            self.privacy_work.update(self.alloc, table_id, null) catch unreachable;
             _ = self.table_names.remove(entry.value.name);
             freeTable(self.alloc, entry.value);
             return true;
@@ -3692,4 +3727,23 @@ test "native restore capability distinguishes artifact replay from populations a
     target.rewrite = 1;
     try std.testing.expectEqual(native_nonempty_restore_protocol_version, nativeRestoreRequiredProtocolVersion(target));
     try std.testing.expect(relational_topology_protocol_version < native_nonempty_restore_protocol_version);
+}
+
+test "privacy policy installation acknowledgement survives progress but never acknowledges a different version" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const before = TableRecord{ .table_id = 1, .name = "private" };
+    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    var requested = before;
+    requested.indexes_json = try privacy.install(a, "{}", resource);
+    resource.coverage.retry_after_millis = 100;
+    var visible = requested;
+    visible.indexes_json = try privacy.replaceResource(a, requested.indexes_json, resource);
+    try std.testing.expect(try privacyPolicyInstallationMatches(a, before, requested, visible));
+    try std.testing.expect(!try privacyPolicyInstallationMatches(a, requested, requested, visible));
+    resource.resource_version += 1;
+    visible.indexes_json = try privacy.replaceResource(a, requested.indexes_json, resource);
+    try std.testing.expect(!try privacyPolicyInstallationMatches(a, before, requested, visible));
 }

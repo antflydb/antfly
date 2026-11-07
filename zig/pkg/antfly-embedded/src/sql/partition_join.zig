@@ -98,6 +98,7 @@ pub const Join = struct {
     scalar_row: @import("execution_batch.zig").ScalarRow = .{},
     scratch: std.heap.ArenaAllocator,
     candidate: std.heap.ArenaAllocator,
+    residual_scratch: std.heap.ArenaAllocator,
     output_arena: std.heap.ArenaAllocator,
     partitions_loaded: usize = 0,
     filter: []u64,
@@ -320,7 +321,7 @@ pub const Join = struct {
         const partitions = std.math.ceilPowerOfTwo(usize, @intCast(wanted)) catch unreachable;
         const lanes = requested_lanes orelse @import("parallel_scheduler.zig").global().fanout(partitions, bytes, 256 * 1024);
         const parallel = !assigned and bytes >= 512 * 1024 and lanes >= 2;
-        self.* = .{ .a = a, .manager = manager, .workspace_bytes = bytes, .build_lanes = lanes, .limits = .{ .bytes = @max(8192, if (parallel) bytes / (lanes + 1) else bytes), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .scratch = .init(a), .candidate = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = parallel };
+        self.* = .{ .a = a, .manager = manager, .workspace_bytes = bytes, .build_lanes = lanes, .limits = .{ .bytes = @max(8192, if (parallel) bytes / (lanes + 1) else bytes), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .scratch = .init(a), .candidate = .init(a), .residual_scratch = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = parallel };
         return self;
     }
     pub fn addBatch(self: *Join, build_side: bool, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum, begin: usize) !void {
@@ -381,6 +382,7 @@ pub const Join = struct {
         self.scalar_row.deinit(self.a);
         self.scratch.deinit();
         self.candidate.deinit();
+        self.residual_scratch.deinit();
         self.output_arena.deinit();
         self.a.free(self.filter);
         self.a.destroy(self);
@@ -427,7 +429,7 @@ pub const Join = struct {
         if (hash) |value| {
             const bit = value % (self.filter.len * 64);
             const mask = @as(u64, 1) << @as(u6, @intCast(bit % 64));
-            if (build) self.filter[bit / 64] |= mask else if (!self.outer_left and self.filter[bit / 64] & mask == 0) {
+            if (build) self.filter[@intCast(bit / 64)] |= mask else if (!self.outer_left and self.filter[@intCast(bit / 64)] & mask == 0) {
                 self.filtered_rows += 1;
                 return null;
             }
@@ -793,10 +795,14 @@ pub const Join = struct {
         // budgets and decision execution must use the evaluator that owns them.
         return limits.steps == defaults.steps and limits.input_bytes == defaults.input_bytes and
             limits.output_bytes == defaults.output_bytes and limits.depth == defaults.depth and
-            limits.decision_values == null and limits.decision_demand == null;
+            limits.decision_values == null and limits.decision_demand == null and limits.shared_budget == null;
     }
-    fn evaluateNative(self: *Join, a: A, view: *NativeRows) !bool {
+    fn evaluateNative(self: *Join, view: *NativeRows) !bool {
         if (view.evaluation.condition) |program| {
+            // Candidate payload leases survive the cohort. Residual temporaries
+            // belong to one row and must not accumulate across that cohort.
+            _ = self.residual_scratch.reset(.{ .retain_with_limit = @min(64 * 1024, self.limits.bytes / 16) });
+            const a = self.residual_scratch.allocator();
             const cells = try self.scalar_row.prepare(self.a, view.evaluation.left_width + view.evaluation.right_width);
             for (program.required_columns) |logical| {
                 if (logical >= cells.len) return error.InvalidSqlBackendResponse;
@@ -925,7 +931,7 @@ pub const Join = struct {
                         self.scalar_residual_rows += 1;
                         var one: NativeRows = .{ .rows = &.{pair}, .evaluation = self.evaluation.? };
                         // Scalar fallback preserves the first demanded error and prefix.
-                        accepted = self.evaluateNative(work, &one) catch |err| {
+                        accepted = self.evaluateNative(&one) catch |err| {
                             upstream = err;
                             break;
                         };
@@ -2001,4 +2007,34 @@ test "SQL partitioned join batches one-to-one probes and defers outer residual d
     try std.testing.expectEqual(@as(usize, 500), right);
     try std.testing.expect(join.vector_residual_batches > 0);
     try std.testing.expect(join.scalar_residual_rows < 100);
+}
+
+test "SQL native partition scalar residual scratch retires between cohort lanes" {
+    const a = std.testing.allocator;
+    var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 4 * 1024 * 1024 };
+    defer std.debug.assert(budget.live == 0);
+    var marker: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .compression = .none, .async_writes = false };
+    defer manager.deinit();
+    var compiled = try @import("compiler.zig").compileScalar(a, "length(repeat(l, 64)) = 0", .{});
+    defer compiled.deinit();
+    var program = try @import("scalar.zig").bind(a, compiled.expression, &.{ .{ .name = "l", .type = .string }, .{ .name = "r", .type = .integer } }, &.{}, .{});
+    defer program.deinit();
+    const join = try Join.create(a, &manager, 1024 * 1024, 1024, 0, false, false);
+    defer join.close();
+    join.parallel_builds = false;
+    // A custom scalar step budget deliberately exercises scalar residuals.
+    join.evaluation = .{ .condition = &program, .left_width = 1, .right_width = 1, .limits = .{ .steps = 10000 } };
+    const key = Datum.json(.{ .integer = 7 });
+    try join.add(true, &.{key}, &.{key}, 0);
+    const payload: [1024]u8 = @splat('x');
+    for (0..256) |row| try join.add(false, &.{Datum.json(.{ .string = &payload })}, &.{key}, row);
+    var page = std.heap.ArenaAllocator.init(a);
+    defer page.deinit();
+    const batch = try join.nextBatch(page.allocator(), 256, null);
+    try std.testing.expectEqual(@as(usize, 0), batch.len());
+    try std.testing.expectEqual(@as(usize, 256), join.scalar_residual_rows);
+    try std.testing.expect(!budget.isLocallyExhausted());
 }

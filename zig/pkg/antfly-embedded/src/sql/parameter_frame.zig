@@ -921,7 +921,7 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
                     const parsed = conversion: {
                         var context: exact.Context = .{ .alloc = a, .remaining = work.remaining, .max_output_bytes = limits.bytes };
                         const initial = context.remaining;
-                        defer work.consume(initial - context.remaining) catch {};
+                        defer work.consume(@intCast(initial - context.remaining)) catch {};
                         break :conversion try exact.fromFloat(&context, datum.value.float, false);
                     };
                     const value = try a.create(exact.Value);

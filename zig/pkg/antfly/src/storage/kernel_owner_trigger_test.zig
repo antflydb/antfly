@@ -155,3 +155,36 @@ test "opaque graph decoder ABI rejects ABI115 context and batch ingress before e
     defer found.deinit();
     try std.testing.expect(std.mem.indexOf(u8, found.bytes(), "\"n\":1") != null);
 }
+
+test "opaque privacy decoder ABI rejects ABI117 ABI118 and ABI119 context and lookup before effects" {
+    const a = std.testing.allocator;
+    const abi = @import("kernel_owner_abi");
+    try std.testing.expectEqual(@as(u32, 120), abi.abi_version);
+    var rejected_context: ?*anyopaque = null;
+    for ([_]u32{ 117, 118, 119 }) |old_version| {
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_context_create(&.{ .version = old_version }, &rejected_context));
+    }
+    try std.testing.expect(rejected_context == null);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/privacy-decoder-abi", .{tmp.sub_path});
+    defer a.free(path);
+    var context: client.Context = .{};
+    try context.ensure();
+    defer context.deinit();
+    var owner = try client.Owner.open(.{ .context = context.handle, .path = .fromSlice(path), .table_name = .fromSlice("rows"), .group_id = 72 });
+    defer owner.deinit();
+    var response: abi.OwnedBytes = .{};
+    defer abi.antfly_storage_owner_buffer_destroy(&response);
+    // The combined profile must reject before looking at privacy flags or
+    // dereferencing the old provider's opaque JSON payload.
+    for ([_]u32{ 117, 118, 119 }) |old_version| {
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_lookup_json(owner.handle, &.{ .version = old_version, .table_name = .fromSlice("rows"), .request_json = .{ .ptr = @ptrFromInt(1), .len = 64 } }, &response));
+    }
+    try std.testing.expect(response.ptr == null and response.len == 0);
+    var accepted = try owner.batchJson("rows", "{\"inserts\":{\"probe\":{\"n\":1}}}");
+    accepted.deinit();
+    var found = try owner.lookupJson("rows", "{\"key\":\"probe\"}");
+    defer found.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, found.bytes(), "\"n\":1") != null);
+}

@@ -33,10 +33,13 @@ pub const StatusDetail = error_abi.Detail;
 // Native range activation carries body-bound owner signers in request contexts.
 // Lookup callbacks carry borrowed native owner minters through checked preparation.
 // Captured schema publication carries the authenticated optional policy pair.
+// Combined privacy callbacks/options and native owner policy contracts.
 // Required core callback drains durable SQL sources before native close.
+// Main privacy fields plus the required native SQL shutdown callback.
 // Config callbacks add exact reserved-retirement owner preparation.
+// Main privacy fields compose with exact reserved-retirement capture.
 // Borrowed StatusSource adds exact native node/store endpoint discovery.
-pub const abi_version: u32 = 34;
+pub const abi_version: u32 = 35;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -290,6 +293,10 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     try std.testing.expect(!validContext(CallContext, abi_version - 1, @sizeOf(CallContext)));
     try std.testing.expect(!validContext(CallContext, 29, @sizeOf(CallContext)));
     try std.testing.expect(!validContext(CallContext, 30, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, 31, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, 32, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, 33, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, 34, @sizeOf(CallContext)));
     try std.testing.expect(!validContext(CallContext, abi_version, @sizeOf(CallContext) - 1));
 
     var table: FunctionTable = undefined;
@@ -297,7 +304,7 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     table.struct_size = @sizeOf(FunctionTable);
     table.capabilities = Capability.core;
     try std.testing.expect(validFunctionTable(&table, Capability.core));
-    table.abi_version = abi_version - 1; // Previous StatusSource lacks exact native owner endpoint discovery.
+    table.abi_version = abi_version - 1; // Previous API34 lacks the combined main privacy contract.
     try std.testing.expect(!validFunctionTable(&table, Capability.core));
     table.abi_version = abi_version;
     table.struct_size = functionTableFieldEnd("authorize_sql_lock");

@@ -1585,7 +1585,7 @@ const Job = struct {
             .rows = result.output.rows,
             .sql_nulls = result.output.sql_nulls,
             .rows_affected = result.output.rows_affected,
-            .notices = if (self.request.diagnostics) |diagnostic| if (diagnostic.notice_allocator != null) &.{} else result.output.notices else result.output.notices,
+            .notices = if (native_adapter.result_ddl_notices.len != 0) native_adapter.result_ddl_notices else if (self.request.diagnostics) |diagnostic| if (diagnostic.notice_allocator != null) &.{} else result.output.notices else result.output.notices,
             .command_tag = try commandTag(self.alloc, result.output.command_tag, result.output.completion_rows orelse result.output.rowCount(), result.output.rows_affected),
             .mutation_outcome = if (result.output.mutation_outcome) |outcome| switch (outcome) {
                 inline else => |kind| @field(wire.MutationOutcome, @tagName(kind)),

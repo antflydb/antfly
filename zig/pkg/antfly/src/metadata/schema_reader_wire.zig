@@ -42,6 +42,32 @@ pub fn requiresStrongestDecoder(bytes: []const u8) bool {
     };
 }
 
+/// A delayed old producer may omit the new preparation. The existing
+/// canonical SQL job purpose plus captured source facts still require every
+/// metadata voter to understand the177 omission guard before new admission.
+/// This is a bounded sender projection, not metadata execution authority.
+pub fn requiresLegacySqlTruncatePreparation(job_json: []const u8, plan_json: []const u8) bool {
+    if (job_json.len > 64 * 1024 or plan_json.len > 32 * 1024 * 1024) return true;
+    var region: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer region.deinit();
+    const a = region.allocator();
+    const Header = struct { source_kind: []const u8 = "", idempotency_namespace: []const u8 = "" };
+    const header = std.json.parseFromSliceLeaky(Header, a, job_json, .{ .ignore_unknown_fields = true }) catch return true;
+    if (!std.mem.eql(u8, header.source_kind, "empty_generation") or !std.mem.startsWith(u8, header.idempotency_namespace, "sql-truncate:")) return false;
+    const TruncatePlanProjection = struct {
+        targets: []const struct { replace: ?struct { table: struct { schema_json: []const u8 = "" } } = null },
+    };
+    const plan = std.json.parseFromSliceLeaky(TruncatePlanProjection, a, plan_json, .{ .ignore_unknown_fields = true, .max_value_len = 32 * 1024 * 1024 }) catch return true;
+    for (plan.targets) |target| if (target.replace) |old| {
+        if (@import("restore_staging.zig").hasTruncateAttachments(a, old.table.schema_json) catch return true) return true;
+    };
+    return false;
+}
+
+pub fn requiresTruncatePreparation(bytes: []const u8) bool {
+    return requiresMarker(bytes, "truncate_preparation");
+}
+
 pub fn requiresCoupledSchemaPolicy(bytes: []const u8) bool {
     return requiresMarker(bytes, "schema_pair") or requiresMarker(bytes, "policy_pair");
 }
@@ -595,4 +621,33 @@ test "SQL logical relation identity requires structural metadata174 and ignores 
         try std.testing.expect(requiresLogicalRelations(bytes));
         try std.testing.expect(requiresSqlTableTriggers(bytes));
     }
+}
+
+test "SQL TRUNCATE preparation marker distinguishes actual plans from ordinary strings and omission" {
+    try std.testing.expect(requiresTruncatePreparation("{\"plan\":{\"truncate_preparation\":{\"format_version\":1}}}"));
+    try std.testing.expect(!requiresTruncatePreparation("{\"plan\":{\"truncate_preparation\":null}}"));
+    try std.testing.expect(!requiresTruncatePreparation("{\"source_location\":\"truncate_preparation\"}"));
+}
+
+test "SQL TRUNCATE preparation sender recognizes legacy source attachments without upgrading reset or plain plans" {
+    var region: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer region.deinit();
+    const a = region.allocator();
+    const triggers = @import("antfly_local_sources").sql_catalog.triggers;
+    const before: triggers.State = .{ .metadata_incarnation = @splat(9), .table_id = 7, .generation = 1 };
+    const function = @import("antfly_local_sources").sql_catalog.routines.records.RoutineReference{ .id = 9, .namespace_id = 2, .database = "antfly", .namespace = "public", .name = "notice" };
+    const truncate_state = try triggers.prepare(a, before, .{ .name = "truncate", .timing = .before, .events = .{ .truncate = true }, .level = .statement, .function = function }, false);
+    const insert_state = try triggers.prepare(a, before, .{ .name = "insert", .timing = .before, .events = .{ .insert = true }, .level = .statement, .function = function }, false);
+    const sql_job = "{\"source_kind\":\"empty_generation\",\"idempotency_namespace\":\"sql-truncate:basic:owner\"}";
+    const reset_job = "{\"source_kind\":\"empty_generation\",\"idempotency_namespace\":\"native-unlogged-recovery\"}";
+    const schema = try std.fmt.allocPrint(a, "{{\"sql_triggers\":{s}}}", .{try truncate_state.encode(a)});
+    const insert_schema = try std.fmt.allocPrint(a, "{{\"sql_triggers\":{s}}}", .{try insert_state.encode(a)});
+    const affected = try std.json.Stringify.valueAlloc(a, .{ .targets = &.{.{ .replace = .{ .table = .{ .schema_json = schema } } }} }, .{});
+    defer a.free(affected);
+    const plain = try std.json.Stringify.valueAlloc(a, .{ .targets = &.{.{ .replace = .{ .table = .{ .schema_json = insert_schema } } }} }, .{});
+    defer a.free(plain);
+    try std.testing.expect(requiresLegacySqlTruncatePreparation(sql_job, affected));
+    try std.testing.expect(!requiresLegacySqlTruncatePreparation(reset_job, affected));
+    try std.testing.expect(!requiresLegacySqlTruncatePreparation(sql_job, plain));
+    try std.testing.expect(!requiresLegacySqlTruncatePreparation("{\"source_kind\":\"query_population\"}", affected));
 }

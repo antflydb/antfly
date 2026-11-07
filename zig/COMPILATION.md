@@ -2055,3 +2055,14 @@ this point, so the wait never replays partially committed work. A deterministic
 real-lock regression covers a competing writer, immediate failure and background
 yield; it and both resolver concurrency cases pass 20/20 seeded Debug runs
 (25 physical tests per run, zero failures/skips/leaks).
+
+### Native Linux ARM64 CPU Debug API admission (2026-11-05)
+
+Glowworm qualification of privacy revision `8a674eebe7` with Zig 0.17.0,
+baseline aarch64 GNU/Linux, unstripped Debug, and CPU inference measured
+15,947,554,816 bytes for the API archive, exceeding the fallback 12 GiB
+reservation. This exact profile now reserves 20 GiB, providing over 25%
+headroom. With a 32 GiB aggregate budget, distributed work can overlap the
+API, while the storage archive must wait. Other owners, build modes,
+backends, custom CPU targets and sanitizer profiles retain their claims.
+The build policy regression checks the measured margin and overlap limits.

@@ -2649,13 +2649,15 @@ pub fn localArtifactStatsEqual(
 
 pub fn createTableRequestFromManifest(alloc: std.mem.Allocator, manifest: *const TableBackupManifest) !tables_api.CreateTableRequest {
     if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
-    try tables_api.validateStoredIndexesJson(alloc, manifest.indexes_json);
-    var bindings = try @import("../system_catalog/native_indexes.zig").read(alloc, manifest.sql_native_indexes_json, manifest.indexes_json);
-    defer bindings.deinit();
     var request: tables_api.CreateTableRequest = .{ .storage = .{ .dense_embeddings = .primary_lsm } };
     errdefer request.deinit(alloc);
+    // Restore policy/consumers but never source-owned privacy checkpoints.
+    // The request takes ownership before any validation that may fail.
+    request.indexes_json = try @import("../privacy/catalog.zig").prepareRestore(alloc, manifest.indexes_json);
+    try tables_api.validateStoredIndexesJson(alloc, request.indexes_json.?);
+    var bindings = try @import("../system_catalog/native_indexes.zig").read(alloc, manifest.sql_native_indexes_json, request.indexes_json.?);
+    defer bindings.deinit();
     if (manifest.description.len > 0) request.description = try alloc.dupe(u8, manifest.description);
-    request.indexes_json = try alloc.dupe(u8, manifest.indexes_json);
     if (manifest.sql_native_indexes_json.len > 0) request.sql_native_indexes_json = try alloc.dupe(u8, manifest.sql_native_indexes_json);
     if (manifest.schema_json.len > 0) request.schema_json = try alloc.dupe(u8, manifest.schema_json);
     if (manifest.replication_sources_json.len > 0) request.replication_sources_json = try alloc.dupe(u8, manifest.replication_sources_json);
@@ -4110,4 +4112,32 @@ test "UNLOGGED portable logical manifest preserves artifact content and explicit
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"persistence_kind\":\"unlogged\"") != null);
     logical.content_policy = .schema_only;
     try std.testing.expectError(error.UnsupportedBackupFormat, validatePublishedTableManifest(a, &logical, "daily"));
+}
+
+test "privacy restore sanitizes source progress while retaining SQL native index authority" {
+    const a = std.testing.allocator;
+    const privacy = @import("../privacy/catalog.zig");
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var resource = try privacy.next(scratch, null, .{ .mode = .monitor, .fields = &.{"status"}, .execution = .{ .batch_items = 1, .max_attempts = 5 } }, null);
+    _ = try privacy.startScan(scratch, &resource, "source-cursor", "upper", 1);
+    resource.checkpoint_encoding = 1;
+    resource.coverage.cursor = "source-census";
+    const indexes = try privacy.install(scratch, "{\"status_fts\":{\"type\":\"full_text\",\"field\":\"status\",\"_index_incarnation\":19}}", resource);
+    const manifest: TableBackupManifest = .{ .format = .native, .backup_id = "snapshot", .table_name = "rows", .description = "", .schema_json = "{}", .read_schema_json = "", .indexes_json = indexes, .sql_native_indexes_json = "{\"version\":1,\"names\":[\"status_fts\"]}", .replication_sources_json = "[]", .shards = &.{} };
+    var request = try createTableRequestFromManifest(a, &manifest);
+    defer request.deinit(a);
+    try std.testing.expectEqualStrings(manifest.sql_native_indexes_json, request.sql_native_indexes_json.?);
+    var tree = try std.json.parseFromSlice(std.json.Value, a, request.indexes_json.?, .{});
+    defer tree.deinit();
+    var restored = (try privacy.current(a, tree.value)).?;
+    defer restored.deinit();
+    try std.testing.expectEqual(resource.policy_version, restored.value.policy_version);
+    try std.testing.expectEqual(resource.generation, restored.value.generation);
+    try std.testing.expectEqual(@as(u8, 0), restored.value.checkpoint_encoding);
+    try std.testing.expect(restored.value.coverage.cursor == null);
+    try std.testing.expectEqual(@as(usize, 1), restored.value.scans.len);
+    try std.testing.expectEqualStrings("", restored.value.scans[0].from_key);
+    try std.testing.expect(tree.value.object.get("status_fts") != null);
 }

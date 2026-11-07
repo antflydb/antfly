@@ -594,6 +594,97 @@ pub fn nativeEmptyInstallForGroupAlloc(a: std.mem.Allocator, plan: Plan, plan_di
     return null;
 }
 
+/// Pure event selection shared by frontend capture, sender compatibility and
+/// the actual writer. Disabled/nonfiring attachments still require a witness;
+/// deciding runtime firing is exclusively the captured VM's job.
+pub fn truncateStateRequired(state: @import("antfly_local_sources").sql_catalog.triggers.State) bool {
+    for (state.entries) |entry| if (entry.events.truncate) return true;
+    return false;
+}
+pub fn hasTruncateAttachments(a: std.mem.Allocator, schema_json: []const u8) !bool {
+    if (schema_json.len == 0) return false;
+    if (schema_json.len > max_encoded_bytes) return error.InvalidRestoreStaging;
+    const Header = struct { sql_triggers: ?std.json.Value = null };
+    var parsed = try std.json.parseFromSlice(Header, a, schema_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const value = parsed.value.sql_triggers orelse return false;
+    var state = try @import("antfly_local_sources").schema_mod.table_triggers.parseValue(a, value);
+    defer state.deinit();
+    return truncateStateRequired(state.value);
+}
+
+/// Canonical internal notices retain severity, unlike the public SQL JSON
+/// projection. Execution occurred before admission; workers only replay data.
+pub const TruncateNotice = struct {
+    code: []const u8 = "00000",
+    message: []const u8,
+    severity: @import("antfly_local_sources").sql_catalog.notices.Severity = .notice,
+};
+pub const TruncatePreparation = struct {
+    format_version: u16,
+    vm_contract_version: u16,
+    plan_id: Id,
+    before_notice_count: usize,
+    receipts: []const @import("antfly_local_sources").sql_catalog.trigger_handoff.Receipt,
+    notices: []const TruncateNotice = &.{},
+
+    /// Compact, replaceable result projection. The immutable admitted Plan,
+    /// not this public observation, remains the receipt/notices authority.
+    pub fn projectResultAlloc(self: @This(), a: std.mem.Allocator, base_result_json: ?[]const u8, plan_digest: Digest, release_after: bool) ![]u8 {
+        return self.projectAlloc(a, base_result_json, plan_digest, true, release_after);
+    }
+    /// Persistent JobState stays compact; the complete notices are fetched
+    /// from the immutable exact-digest Plan by the existing observer.
+    pub fn projectReferenceAlloc(self: @This(), a: std.mem.Allocator, base_result_json: ?[]const u8, plan_digest: Digest) ![]u8 {
+        return self.projectAlloc(a, base_result_json, plan_digest, false, false);
+    }
+    fn projectAlloc(self: @This(), a: std.mem.Allocator, base_result_json: ?[]const u8, plan_digest: Digest, complete: bool, release_after: bool) ![]u8 {
+        const limit: usize = if (complete) 512 * 1024 else 8 * 1024;
+        if (std.mem.allEqual(u8, &plan_digest, 0) or self.before_notice_count > self.notices.len) return error.InvalidRestoreStaging;
+        if (base_result_json) |bytes| if (bytes.len > limit) return error.InvalidRestoreStaging;
+        var region: std.heap.ArenaAllocator = .init(a);
+        defer region.deinit();
+        const scratch = region.allocator();
+        var root = try std.json.parseFromSliceLeaky(std.json.Value, scratch, base_result_json orelse "{}", .{});
+        if (root != .object) return error.InvalidRestoreStaging;
+        const projected = if (complete)
+            try std.json.Stringify.valueAlloc(a, .{ .format_version = self.format_version, .vm_contract_version = self.vm_contract_version, .plan_id = self.plan_id, .plan_digest = plan_digest, .notices = if (release_after) self.notices else self.notices[0..self.before_notice_count] }, .{})
+        else
+            try std.json.Stringify.valueAlloc(a, .{ .format_version = self.format_version, .vm_contract_version = self.vm_contract_version, .plan_id = self.plan_id, .plan_digest = plan_digest }, .{});
+        defer a.free(projected);
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, projected, .{});
+        try root.object.put(scratch, "truncate_preparation", value);
+        var count = std.Io.Writer.Discarding.init(&.{});
+        try std.json.Stringify.value(root, .{}, &count.writer);
+        if (count.fullCount() > limit) return error.InvalidRestoreStaging;
+        return std.json.Stringify.valueAlloc(a, root, .{});
+    }
+
+    pub fn validate(self: @This(), a: std.mem.Allocator, plan: Plan) !void {
+        const handoff = @import("antfly_local_sources").sql_catalog.trigger_handoff;
+        if (self.format_version != 1 or self.vm_contract_version != @import("antfly_local_sources").sql_catalog.trigger_runtime.predecision_contract_version or
+            self.before_notice_count > self.notices.len or !std.mem.eql(u8, &self.plan_id, &plan.id) or self.receipts.len == 0 or self.receipts.len > plan.targets.len or
+            plan.preparing_sources or plan.type_retirement != null or plan.constraint_name_guard != null) return error.InvalidRestoreStaging;
+        var notice_buffer: @import("antfly_local_sources").sql_catalog.notices.Buffer = .{};
+        for (self.notices) |notice| try notice_buffer.append(.{ .code = notice.code, .message = notice.message, .severity = notice.severity });
+        for (plan.targets) |target| if (!target.empty_generation or target.replace == null or target.native_reset != null or
+            target.schema_only_snapshot != null or target.population != null or target.rewrite != null or target.materialized_view != null or target.source_artifacts.len != 0) return error.InvalidRestoreStaging;
+        for (self.receipts, 0..) |receipt, i| {
+            try receipt.validate(a);
+            const header = receipt.processed.header;
+            if (receipt.processed.rows.len != 0 or !header.events.truncate or header.events.insert or header.events.update or header.events.delete or
+                header.sequence != 0 or !std.mem.eql(u8, &header.statement_id, &self.receipts[0].processed.header.statement_id)) return error.InvalidRestoreStaging;
+            for (self.receipts[0..i]) |prior| if (prior.program.table.id == receipt.program.table.id) return error.InvalidRestoreStaging;
+            const selected = for (plan.targets) |target| {
+                if (target.source_table_id == receipt.program.table.id and target.replace.?.table.table_id == receipt.program.table.id) break true;
+            } else false;
+            if (!selected) return error.InvalidRestoreStaging;
+        }
+        const encoded = try handoff.encodeReceipts(a, self.receipts);
+        defer a.free(encoded);
+    }
+};
+
 pub const Plan = struct {
     /// The exact owner geometry already required by the publication writer.
     /// Rejoining a burned logical OID must require this same completed phase,
@@ -634,7 +725,8 @@ pub const Plan = struct {
         // external parents became an optional part of the envelope.
         return (std.mem.eql(u8, name, "external_fk_parents") and self.external_fk_parents.len == 0) or
             (std.mem.eql(u8, name, "constraint_name_guard") and self.constraint_name_guard == null) or
-            (std.mem.eql(u8, name, "type_retirement") and self.type_retirement == null);
+            (std.mem.eql(u8, name, "type_retirement") and self.type_retirement == null) or
+            (std.mem.eql(u8, name, "truncate_preparation") and self.truncate_preparation == null);
     }
 
     id: Id,
@@ -651,6 +743,7 @@ pub const Plan = struct {
     /// digests retain it through source freezing, cutover and cancellation.
     constraint_name_guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard = null,
     type_retirement: ?@import("../system_catalog/named_types.zig").Retirement = null,
+    truncate_preparation: ?TruncatePreparation = null,
 
     pub fn jsonStringify(self: Plan, jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, jw);
@@ -671,6 +764,7 @@ pub const Plan = struct {
     }
 
     pub fn validate(self: Plan, alloc: std.mem.Allocator) !void {
+        if (self.truncate_preparation) |preparation| try preparation.validate(alloc, self);
         if (self.targets.len == 0 or self.targets.len > 128 or self.external_fk_parents.len > 128) return error.InvalidRestoreStaging;
         for (self.targets) |target| if (target.catalog_binding) |binding| try binding.validateLogicalRelationId();
         for (self.targets) |target| if (target.schema_only_snapshot != null) {

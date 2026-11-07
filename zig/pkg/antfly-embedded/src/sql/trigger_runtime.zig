@@ -34,6 +34,9 @@ pub const Dispatch = struct {
     frame: *procedure.TriggerFrame,
     owned: ?*frames.Owned = null,
 };
+/// Closed captured scalar VM used before an irreversible generation decision.
+pub const predecision_contract_version: u16 = 1;
+
 pub const Output = struct { row: ?*const catalog.Row, notices: []const procedure.Notice, fired: usize };
 const Prepared = struct { body: *procedure.Resolved, predicate: ?scalar.Program = null, variables: ?[]const scalar.Datum = null };
 
@@ -105,6 +108,28 @@ pub const Statement = struct {
             .statement_clock = if (self.clocks) |*clock| clock.view else null,
             .clock_values = if (self.clocks) |*clock| clock else null,
         };
+    }
+    pub fn requirePredecisionContract(self: *Statement, version: u16) !void {
+        if (version != predecision_contract_version) return error.InvalidSqlTriggerManifest;
+        const actual = self.backend();
+        const closed_vtable: catalog.Backend.VTable = .{ .resolve = rejectResolve, .scan = rejectScan, .mutate = rejectMutation, .checkpoint = charge };
+        inline for (@typeInfo(catalog.Backend.VTable).@"struct".field_names) |field| {
+            if (!std.meta.eql(@field(actual.vtable.*, field), @field(closed_vtable, field))) return error.InvalidSqlTriggerManifest;
+        }
+        const closed: catalog.Backend = .{ .ptr = self, .vtable = &closed_vtable };
+        // New backend capabilities are refused unless this versioned closed
+        // contract explicitly admits them. Captured scalar helpers cannot open
+        // rows, stage writes, or call an external provider.
+        inline for (@typeInfo(catalog.Backend).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "ptr") and !std.mem.eql(u8, field, "vtable") and
+                !std.mem.eql(u8, field, "scalar_control") and !std.mem.eql(u8, field, "settings_view") and
+                !std.mem.eql(u8, field, "notice_sink") and !std.mem.eql(u8, field, "routine_resolver") and
+                !std.mem.eql(u8, field, "regex_execution") and !std.mem.eql(u8, field, "statement_clock") and
+                !std.mem.eql(u8, field, "clock_values"))
+            {
+                if (!std.meta.eql(@field(actual, field), @field(closed, field))) return error.InvalidSqlTriggerManifest;
+            }
+        }
     }
     fn resolver(self: *Statement) bindings.Resolver {
         return .{ .ptr = self, .resolve = resolve, .resolve_reference = resolveReference, .resolve_operator = resolveOperator };
@@ -288,6 +313,12 @@ test "SQL trigger dispatcher fires default statement triggers once even without 
     defer arena.deinit();
     const a = arena.allocator();
     const owner = try Statement.init(a, try Test.captured(a), null, .{});
+    try owner.requirePredecisionContract(predecision_contract_version);
+    try std.testing.expectError(error.InvalidSqlTriggerManifest, owner.requirePredecisionContract(predecision_contract_version + 1));
+    const closed = owner.backend();
+    try std.testing.expect(closed.sequence_provider == null and closed.advisory_provider == null and closed.decision_provider == null and closed.notification_provider == null and closed.execution_io == null);
+    try std.testing.expectError(error.UnsupportedSqlShape, closed.vtable.resolve(closed.ptr, a, .{ .table = "forbidden" }, .read));
+
     var marker: u8 = 0;
     var frame: procedure.TriggerFrame = .{ .columns = &.{}, .values = &.{}, .width = 0, .new_offset = 0, .old_offset = 0, .new = null, .old = null, .ptr = &marker, .assign = Test.assign };
     const call: Dispatch = .{ .timing = .before, .level = .statement, .event = .update, .frame = &frame };
@@ -297,6 +328,30 @@ test "SQL trigger dispatcher fires default statement triggers once even without 
     try std.testing.expectEqualStrings("statement fired", result.notices[0].message);
     try std.testing.expectEqual(@as(?*const catalog.Row, null), result.row);
     try std.testing.expectError(error.InvalidSqlBackendResponse, owner.fire(call));
+
+    // A demanded failure after NOTICE remains inside the private predecision
+    // buffer. No public transport sink participates in this evaluation.
+    var failed_capture = try Test.captured(a);
+    const failed_routines = try a.dupe(manifest.Routine, failed_capture.routines);
+    failed_routines[0].record.definition.body = "BEGIN RAISE NOTICE 'private before failure'; PERFORM 1 / (TG_NARGS - 1); RETURN NEW; END";
+    failed_capture.routines = failed_routines;
+    var private_notices: catalog.notices.Buffer = .{};
+    const Private = struct {
+        fn emit(raw: *anyopaque, notice: catalog.notices.Notice) !void {
+            const buffer: *catalog.notices.Buffer = @ptrCast(@alignCast(raw));
+            try buffer.append(notice);
+        }
+    };
+    const failed_owner = try Statement.init(a, failed_capture, null, .{ .notice_sink = .{ .ptr = &private_notices, .emit = Private.emit } });
+    try failed_owner.requirePredecisionContract(predecision_contract_version);
+    // The initial no-image witness intentionally has no TG variables. This
+    // body demands TG_NARGS, so use the same real owned layout as Owner.statement.
+    const failed_layout = try FrameLayout.init(a, &.{}, failed_capture.table.id, "items", "public");
+    const failed_frame = try failed_layout.frame(a, null, null);
+    try std.testing.expectError(error.SqlDivisionByZero, failed_owner.fire(.{ .timing = call.timing, .level = call.level, .event = call.event, .frame = &failed_frame.frame, .owned = failed_frame }));
+    try std.testing.expectEqual(@as(i64, 1), failed_frame.frame.values[7].value.integer);
+    try std.testing.expectEqual(@as(usize, 1), private_notices.count);
+    try std.testing.expectEqualStrings("private before failure", private_notices.get(0).message);
 }
 
 test "SQL trigger manifest is canonical and stable IDs survive routine namespace moves" {

@@ -15,6 +15,18 @@ const leaseKey = leases.leaseKey;
 fn resources(a: A, txn: anytype, group: u64, plan: stages.Plan) ![]Resource {
     var seen: std.AutoHashMap(Resource, void) = .init(a);
     defer seen.deinit();
+    if (plan.truncate_preparation) |prepared| for (prepared.receipts) |receipt| for (receipt.program.routines) |captured| {
+        var function = (try storage.getById(a, txn, group, .routine, captured.record.id)) orelse return error.CatalogGenerationChanged;
+        defer function.deinit();
+        try storage.requireScopeResourceWritable(a, txn, group, function.value, try storage.readMeta(a, txn, group));
+        const current = try @import("trigger_catalog.zig").captureRoutine(a, txn, group, captured.record.id);
+        if (!std.mem.eql(u8, try std.json.Stringify.valueAlloc(a, current, .{}), try std.json.Stringify.valueAlloc(a, captured, .{}))) return error.CatalogGenerationChanged;
+        var namespace = (try storage.getById(a, txn, group, .namespace, function.value.parent_id)) orelse return error.CatalogGenerationChanged;
+        defer namespace.deinit();
+        try seen.put(.{ .kind = .routine, .id = function.value.id }, {});
+        try seen.put(.{ .kind = .namespace, .id = namespace.value.id }, {});
+        try seen.put(.{ .kind = .database, .id = namespace.value.parent_id }, {});
+    };
     var claims: std.AutoHashMap(u64, local.sql_catalog.trigger_restore.RoutineMove) = .init(a);
     defer claims.deinit();
     for (plan.targets) |target| if (target.trigger_handoff) |handoff| for (handoff.routines) |claim| {
@@ -95,12 +107,13 @@ pub fn verifyDirectory(backing: A, reader: anytype, group: u64, rows: anytype, c
         const job = try std.json.parseFromSliceLeaky(stages.Job, a, row.value, .{ .allocate = .alloc_always });
         var key_buffer: [256]u8 = undefined;
         if (!std.mem.eql(u8, row.key, try stages.jobKey(&key_buffer, group, job.plan.id))) return error.InvalidRestoreStaging;
-        const claims_present = found: for (job.plan.targets) |target| {
+        const claims_present = (if (job.plan.truncate_preparation) |prepared| prepared.receipts.len != 0 else false) or found: for (job.plan.targets) |target| {
             if (target.trigger_handoff) |handoff| for (handoff.routines) |claim| {
                 if (claim.destination_generation != 0) break :found true;
             };
         } else false;
         if (!claims_present) continue;
+        if (job.plan.truncate_preparation) |prepared| try prepared.validate(a, job.plan);
         present = true;
         if (!std.mem.eql(u8, &job.plan_digest, &try job.plan.digest(a))) return error.InvalidRestoreStaging;
         const progress_bytes = reader.get(try stages.progressKey(&key_buffer, group, job.plan.id)) catch |failure| return if (failure == error.NotFound) error.InvalidRestoreStaging else failure;

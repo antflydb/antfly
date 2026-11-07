@@ -907,6 +907,7 @@ fn publicApiHttpxConfig(
         .host = cfg.bind_host,
         .port = cfg.bind_port,
         .max_body_size = cfg.max_request_bytes,
+        .max_route_body_size = @import("antfly_public_limits").max_route_body_bytes,
         .header_read_timeout_ms = cfg.header_read_timeout_ms,
         .body_read_timeout_ms = cfg.body_read_timeout_ms,
         .response_write_timeout_ms = cfg.header_read_timeout_ms,
@@ -8610,7 +8611,7 @@ pub const DataServer = struct {
         if (self.hotStandbyWriteGate()) |gate| try gate.check();
         if (self.group_leadership_source) |leadership| if (!leadership.isLocalLeader(group_id)) return error.NotLeader;
         const recovery = try @import("antfly_local_sources").storage_db_artifact_publication_transport.RecoveryHint.decode(command);
-        const class: artifact_publication_dispatch.Queue.Class = if (recovery != null or @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.controlAdmissionHint(command)) .control else .producer;
+        const class: artifact_publication_dispatch.Queue.Class = if (std.mem.startsWith(u8, command, "ACP1") or recovery != null or @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.controlAdmissionHint(command)) .control else .producer;
         const proposal = (try self.artifact_publication_queue.reserveClass(io, self.alloc, group_id, namespace, command, class)) orelse return;
         errdefer self.artifact_publication_queue.release(io, proposal);
         const job = try self.alloc.create(ArtifactPublicationJob);
@@ -8662,6 +8663,22 @@ pub const DataServer = struct {
         // Until the native publication apply path is installed, do not
         // substitute a Raft-shaped receipt for a standalone owner's clock.
         if (self.data_raft == null) return error.ArtifactCatalogDrift;
+        // A privacy producer can request catalog admission, but only this
+        // routed Raft owner may publish the catalog and activate its epoch.
+        // Both commands retain ordinary ordered apply validation and receipts.
+        if (std.mem.startsWith(u8, job.proposal.command, "ACP1")) {
+            const inventory = @import("antfly_local_sources").storage_db_artifact_inventory;
+            var parsed = try std.json.parseFromSlice(inventory.Command, self.alloc, job.proposal.command[4..], .{});
+            defer parsed.deinit();
+            const catalog = parsed.value;
+            try catalog.validate();
+            if (!std.mem.eql(u8, &catalog.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_catalog = catalog, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+            activation.publication_digest = activation.digest();
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = activation, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            return;
+        }
         if (try transport.RecoveryHint.decode(job.proposal.command)) |hint| {
             if (!std.mem.eql(u8, &hint.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
             try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = hint.request(), .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
@@ -8689,7 +8706,7 @@ pub const DataServer = struct {
                 const offset = ordinal * codec.chunk_bytes;
                 hashes[ordinal] = transport.chunkDigest(ordinal, job.proposal.command[offset..@min(offset + codec.chunk_bytes, job.proposal.command.len)]);
             }
-            const begin: transport.Request = .{ .action = .begin, .namespace = command.namespace, .publication_digest = command.publication_digest, .command_digest = command.publication_digest, .encoded_len = @intCast(job.proposal.command.len), .chunk_hashes = hashes[0..count], .control = command.mode != .publish };
+            const begin: transport.Request = .{ .action = .begin, .namespace = command.namespace, .publication_digest = command.publication_digest, .command_digest = command.publication_digest, .encoded_len = @intCast(job.proposal.command.len), .chunk_hashes = hashes[0..count], .control = transport.usesReservedControl(command.mode, job.proposal.command.len) };
             try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = begin, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
             job.upload_root = begin.proposedManifest().root();
             job.publication_digest = command.publication_digest;
@@ -10664,11 +10681,18 @@ pub const DataServer = struct {
 
     fn syncInferenceRuntimeConfig(self: *DataServer) void {
         const inference_api_url = self.configuredInferenceAPIURL();
+        // The default endpoint's credential travels with it: background
+        // enrichment must authenticate exactly like create-time probes and
+        // query embedding, which read the same node-level key.
+        const inference_api_key = self.api_server_cfg.inference_api_key;
         _ = self.read_source.withDecisionRegistry(if (self.api_server_cfg.node_config) |config| &config.registry else null);
         _ = self.read_source.withInferenceAPIURL(inference_api_url);
+        _ = self.read_source.withInferenceAPIKey(inference_api_key);
         _ = self.write_source.withInferenceAPIURL(inference_api_url);
+        _ = self.write_source.withInferenceAPIKey(inference_api_key);
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withInferenceAPIURL(inference_api_url);
+            _ = apply_sm.write_source.withInferenceAPIKey(inference_api_key);
         }
     }
 
@@ -12824,6 +12848,14 @@ pub const DataServer = struct {
         return std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
     }
 
+    fn restoreOwnerDescriptorUse(action: @FieldType(antfly.public_api.restore_owner.Request, "action")) antfly.public_api.ProvisionedKernelOwnerSource.RestoreDescriptorUse {
+        return switch (action) {
+            .begin, .import_page, .validate => .mutate,
+            // These complete an admitted decision; they cannot import rows.
+            .status, .publish, .cancel, .install_native_empty, .install_generation_admissions => .resolve,
+        };
+    }
+
     fn restoreOwnerControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, input: antfly.public_api.restore_owner.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.restore_owner.Response {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
@@ -12845,7 +12877,7 @@ pub const DataServer = struct {
                 } else break :blk null;
             }
             if (comptime !linked_storage) return error.InvalidSqlRelationPersistence;
-            captured = try recoverRestoreDescriptor(self, alloc, group_id, table_name, input.scope.digest(), input.scope.plan_id, if (input.action == .cancel or input.action == .publish or input.action == .status) .resolve else .mutate, context);
+            captured = try recoverRestoreDescriptor(self, alloc, group_id, table_name, input.scope.digest(), input.scope.plan_id, restoreOwnerDescriptorUse(input.action), context);
             const native = captured.?.descriptor.sql_persistence orelse return error.GroupLeaderUnavailable;
             if (input.native_execution) |hint| if (!hint.eql(native)) return error.SqlRelationOwnerChanged;
             break :blk null;
@@ -14714,6 +14746,30 @@ pub const DataServer = struct {
         return error.RestoreStagingScopeChanged;
     }
 
+    fn requireRestoreOwnerControlPhase(action: @FieldType(antfly.public_api.restore_owner.Request, "action"), state: @import("../metadata/restore_staging.zig").State) !void {
+        switch (action) {
+            .status => {},
+            .publish => if (state != .published) return error.RestoreStagingInProgress,
+            .cancel => if (state != .canceling and state != .canceled) return error.RestoreStagingScopeChanged,
+            .install_native_empty => switch (state) {
+                .activating, .published => {},
+                .importing, .validating, .cutover, .preparing_sources => return error.RestoreStagingInProgress,
+                .canceling, .canceled => return error.RestoreStagingCanceled,
+            },
+            .install_generation_admissions => switch (state) {
+                .activating => {},
+                .importing, .validating, .cutover, .preparing_sources => return error.RestoreStagingInProgress,
+                .canceling, .canceled => return error.RestoreStagingCanceled,
+                .published => return error.RestoreStagingScopeChanged,
+            },
+            .begin, .import_page, .validate => switch (state) {
+                .importing, .validating, .cutover => {},
+                .canceling, .canceled => return error.RestoreStagingCanceled,
+                .activating, .published, .preparing_sources => return error.RestoreStagingScopeChanged,
+            },
+        }
+    }
+
     fn restoreOwnerControlCompiled(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, input: antfly.public_api.restore_owner.Request, context: antfly.public_api.operation.RequestContext, local_term: ?u64, captured_descriptor: ?@import("../storage/kernel_owner_descriptor.zig").Descriptor) !antfly.public_api.restore_owner.Response {
         const metadata_staging = @import("../metadata/restore_staging.zig");
         const owner = try self.ensureKernelOwnerSource();
@@ -14721,27 +14777,7 @@ pub const DataServer = struct {
         // The immutable owner descriptor is already authenticated by its exact
         // scope; its cache entry is not itself a lease across the Raft proposal.
         const progress = (try self.status_source.getRestoreStagingProgress(alloc, input.scope.plan_id, context)) orelse return error.RestoreStagingScopeChanged;
-        switch (input.action) {
-            .status => {},
-            .publish => if (progress.state != .published) return error.RestoreStagingInProgress,
-            .cancel => if (progress.state != .canceling and progress.state != .canceled) return error.RestoreStagingScopeChanged,
-            .install_native_empty => switch (progress.state) {
-                .activating, .published => {},
-                .importing, .validating, .cutover, .preparing_sources => return error.RestoreStagingInProgress,
-                .canceling, .canceled => return error.RestoreStagingCanceled,
-            },
-            .install_generation_admissions => switch (progress.state) {
-                .activating => {},
-                .importing, .validating, .cutover, .preparing_sources => return error.RestoreStagingInProgress,
-                .canceling, .canceled => return error.RestoreStagingCanceled,
-                .published => return error.RestoreStagingScopeChanged,
-            },
-            .begin, .import_page, .validate => switch (progress.state) {
-                .importing, .validating, .cutover => {},
-                .canceling, .canceled => return error.RestoreStagingCanceled,
-                .activating, .published, .preparing_sources => return error.RestoreStagingScopeChanged,
-            },
-        }
+        try requireRestoreOwnerControlPhase(input.action, progress.state);
         var cached = if (captured_descriptor == null) try owner.cachedRestoreDescriptor(alloc, group_id, table_name, input.scope.digest()) else null;
         defer if (cached) |*value| value.deinit(alloc);
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -27531,6 +27567,10 @@ pub const DataServer = struct {
                 storage_kernel_context = context;
                 try storage_kernel_context.?.configureRemoteContent(cfg.api_server_cfg.remote_content);
                 try storage_kernel_context.?.configureSecrets(cfg.api_server_cfg.secret_store);
+                try storage_kernel_context.?.configureInferenceDefaults(
+                    if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null,
+                    cfg.api_server_cfg.inference_api_key,
+                );
                 if (cfg.api_server_cfg.node_config != null and cfg.api_server_cfg.node_config.?.storage.artifacts.connection != null) {
                     const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg.api_server_cfg.node_config, cfg.api_server_cfg.deployment_mode, cfg.api_server_cfg.native_lake_artifact_base_dir);
                     defer alloc.free(retained_setup);
@@ -29705,6 +29745,7 @@ const RemoteMetadataSource = struct {
                 .table_routing_snapshot = remoteTableRoutingSnapshot,
                 .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = remoteLinearizableTableRoutingSnapshot,
+                .privacy_policy_binding = remotePrivacyPolicyBinding,
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
                 .wait_for_routing_change = remoteWaitForRoutingChange,
                 .await_route = remoteAwaitRoute,
@@ -29740,6 +29781,7 @@ const RemoteMetadataSource = struct {
             .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .system_catalog = remoteSystemCatalog,
+                .table_record = remoteTableRecord,
                 .tracks_sql_submission = true,
                 .supports_query_definitions = true,
                 .supports_index_annotations = true,
@@ -29768,6 +29810,7 @@ const RemoteMetadataSource = struct {
                 .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
                 .create_table = remoteCreateTable,
+                .privacy_mutation = remotePrivacyMutation,
                 .replace_table_definition = remoteReplaceTableDefinition,
                 .replace_table_definition_stamped = remoteReplaceTableDefinitionStamped,
                 .get_lake_index_lifecycle = remoteGetLakeIndexLifecycle,
@@ -29939,8 +29982,23 @@ const RemoteMetadataSource = struct {
         comptime callFn: anytype,
         ctx: anytype,
     ) !T {
-        const deadline_ns = self.awakeNs() +|
+        return self.withMetadataMutationApiClientControlled(T, callFn, ctx, null);
+    }
+
+    fn withMetadataMutationApiClientControlled(
+        self: *RemoteMetadataSource,
+        comptime T: type,
+        comptime callFn: anytype,
+        ctx: anytype,
+        request: ?antfly.public_api.operation.RequestContext,
+    ) !T {
+        var deadline_ns = self.awakeNs() +|
             @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
+        var signal = if (request) |control| antfly.raft.transport.http_common.RequestCancellation.fromToken(control.cancellation) else antfly.raft.transport.http_common.RequestCancellation{};
+        if (request) |control| {
+            const normalized = try control.platformDeadline();
+            if (normalized.deadline_ns) |deadline| deadline_ns = @min(deadline_ns, self.awakeNs() +| (deadline -| @import("antfly_platform").time.monotonicNs()));
+        }
         var mutation_driver = antfly.public_api.raft_mutation_forwarding.AbsoluteDriver.init(deadline_ns);
         var replay_proof_error: anyerror = error.NotLeader;
         var last_pre_admission_err: anyerror = error.MissingMetadataApi;
@@ -29952,6 +30010,7 @@ const RemoteMetadataSource = struct {
         // make it skip an endpoint or probe the same endpoint twice.
         const start_index = self.metadataApiIndexForAttempt(0);
         for (0..self.base_uris.len) |attempt| {
+            if (request) |control| try control.ensureActive();
             const now_ns = self.awakeNs();
             if (now_ns >= deadline_ns)
                 return replay_proof_error;
@@ -29962,6 +30021,7 @@ const RemoteMetadataSource = struct {
             const discovery_budget = antfly.metadata_http_client.RequestBudget{
                 .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline_ns, self.base_uris.len - attempt + 1),
                 .io = self.io,
+                .cancellation = if (request != null) &signal else null,
             };
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
@@ -30007,6 +30067,7 @@ const RemoteMetadataSource = struct {
             return result;
         }
         for (endpoint_discovery.fallbacks()) |index| {
+            if (request) |control| try control.ensureActive();
             if (self.awakeNs() >= deadline_ns)
                 return replay_proof_error;
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -30735,6 +30796,34 @@ const RemoteMetadataSource = struct {
     fn remoteTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         return try self.remoteTableRoutingSnapshotWithMode(table_name, deadline_ns, false);
+    }
+
+    fn remotePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.PrivacyPolicyBinding {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const outer_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| .{ .deadline_ns = deadline, .io = self.io } else null;
+        var last_err: anyerror = error.MissingMetadataApi;
+        for (0..self.base_uris.len) |attempt| {
+            ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+            const index = self.metadataReadApiIndexForAttempt(attempt);
+            const budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| .{ .deadline_ns = catalogRoutingAttemptDeadline(self.awakeNs(), deadline, self.base_uris.len - attempt), .io = self.io } else null;
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var client = self.metadataClient(arena.allocator());
+            var parsed = client.fetchPrivacyPolicyBinding(self.base_uris[index], table_name, budget) catch |err| {
+                last_err = if (err == error.UnsupportedOperation) error.StorageReadTemporarilyUnavailable else normalizeCatalogRoutingSnapshotError(err);
+                continue;
+            };
+            defer parsed.deinit();
+            ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+            self.acceptMetadataIdentityWithBudget(parsed.value.metadata_group_id, parsed.value.metadata_incarnation, budget) catch |err| {
+                last_err = err;
+                continue;
+            };
+            self.noteMetadataReadSuccess(index);
+            return parsed.value;
+        }
+        ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+        return last_err;
     }
 
     fn remoteLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
@@ -31569,6 +31658,14 @@ const RemoteMetadataSource = struct {
         };
     }
 
+    fn remoteTableRecord(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) !?antfly.metadata.TableRecord {
+        const bytes = try remoteSystemCatalog(ptr, a, .{}, .{ .table_record_read = name });
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(?antfly.metadata.TableRecord, a, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        return if (parsed.value) |table| try antfly.metadata.table_manager.cloneTable(a, table) else null;
+    }
+
     fn remoteGetLakeIndexLifecycle(ptr: *anyopaque, a: std.mem.Allocator, table_id: u64, request: antfly.public_api.operation.RequestContext) ![]u8 {
         return remoteSystemCatalog(ptr, a, request, .{ .lake_index_lifecycle_read = table_id });
     }
@@ -31656,9 +31753,22 @@ const RemoteMetadataSource = struct {
         self.invalidateCache();
     }
 
+    fn remotePrivacyMutation(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, body: []const u8, if_match: ?[]const u8, scan: bool, request: antfly.public_api.operation.RequestContext) !@import("../api/privacy.zig").Response {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        defer self.invalidateCache();
+        return self.withMetadataMutationApiClientControlled(@import("../api/privacy.zig").Response, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, _: antfly.public_api.raft_mutation_forwarding.Context, ctx: anytype) !@import("../api/privacy.zig").Response {
+                var result = try client.forwardPrivacyMutation(base_uri, ctx.table, ctx.body, ctx.if_match, ctx.scan, ctx.request);
+                defer result.deinit(client.alloc);
+                return result.cloneMutation(ctx.a);
+            }
+        }.call, .{ .a = a, .table = table, .body = body, .if_match = if_match, .scan = scan, .request = request }, request);
+    }
+
     fn remoteReplaceTableDefinition(ptr: *anyopaque, expected: antfly.metadata.TableRecord, replacement: antfly.metadata.TableRecord) !void {
         var zig017_return_error: ?anyerror = null;
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const invalidates_catalog = !try antfly.metadata.table_manager.privacyProgressOnly(self.alloc, expected, replacement);
         const body = (std.json.Stringify.valueAlloc(self.alloc, .{
             .expected = expected,
             .definition = replacement,
@@ -31667,7 +31777,7 @@ const RemoteMetadataSource = struct {
             return zig017_err;
         });
         defer self.alloc.free(body);
-        errdefer if (zig017_return_error) |err| if (err == error.MetadataMutationOutcomeUnknown)
+        errdefer if (zig017_return_error) |err| if (invalidates_catalog and err == error.MetadataMutationOutcomeUnknown)
             self.invalidateCache();
         (self.withMetadataMutationApiClient(void, struct {
             fn call(
@@ -31683,12 +31793,13 @@ const RemoteMetadataSource = struct {
             zig017_return_error = zig017_err;
             return zig017_err;
         });
-        self.invalidateCache();
+        if (invalidates_catalog) self.invalidateCache();
     }
 
     fn remoteReplaceTableDefinitionStamped(ptr: *anyopaque, expected: antfly.metadata.TableRecord, replacement: antfly.metadata.TableRecord) !?antfly.metadata_api.CatalogMutationStamp {
         var zig017_return_error: ?anyerror = null;
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const invalidates_catalog = !try antfly.metadata.table_manager.privacyProgressOnly(self.alloc, expected, replacement);
         const body = (std.json.Stringify.valueAlloc(self.alloc, .{
             .expected = expected,
             .definition = replacement,
@@ -31697,7 +31808,7 @@ const RemoteMetadataSource = struct {
             return zig017_err;
         });
         defer self.alloc.free(body);
-        errdefer if (zig017_return_error) |err| if (err == error.MetadataMutationOutcomeUnknown)
+        errdefer if (zig017_return_error) |err| if (invalidates_catalog and err == error.MetadataMutationOutcomeUnknown)
             self.invalidateCache();
         const stamp = (self.withMetadataMutationApiClient(?antfly.metadata_api.CatalogMutationStamp, struct {
             fn call(
@@ -31713,7 +31824,7 @@ const RemoteMetadataSource = struct {
             zig017_return_error = zig017_err;
             return zig017_err;
         });
-        self.invalidateCache();
+        if (invalidates_catalog) self.invalidateCache();
         return stamp;
     }
 
@@ -34804,6 +34915,7 @@ pub fn runFromIterator(
         process_storage_kernel_context = context;
         try process_storage_kernel_context.?.configureRemoteContent(remote_content);
         try process_storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
+        if (loaded_config) |*cfg| try process_storage_kernel_context.?.configureInferenceDefaults(cfg.inference.api_url, cfg.inference.api_key);
         if (loaded_config) |*cfg| if (cfg.storage.artifacts.connection != null) {
             const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg, .distributed, null);
             defer alloc.free(retained_setup);
@@ -36156,6 +36268,10 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                         defer response_alloc.free(tables);
                         for (input.targets, tables) |target, *table| table.* = resolve(snapshot, target);
                         break :blk try std.json.Stringify.valueAlloc(response_alloc, catalog.ResolvedMany{ .revision = snapshot.status.metadata_epoch, .tables = tables }, .{});
+                    },
+                    .table_record_read => |name| blk: {
+                        const table = antfly.public_api.tables.findTableByName(snapshot, name);
+                        break :blk try std.json.Stringify.valueAlloc(response_alloc, if (table) |value| @as(?antfly.metadata.TableRecord, value.*) else null, .{});
                     },
                     .query_definition => |name| blk: {
                         const table = antfly.public_api.tables.findTableByName(snapshot, name) orelse return .{ .status = 404 };
@@ -50241,6 +50357,144 @@ fn consumerTests() type {
             );
         }
 
+        test "privacy remote mutation forwarding retains response metadata through the status source" {
+            const a = std.testing.allocator;
+            const Fake = struct {
+                status: u16 = 202,
+                probes: usize = 0,
+                mutations: usize = 0,
+                scan: bool = false,
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (std.mem.endsWith(u8, request.uri, "/metadata/v1/runtime-topology")) {
+                        self.probes += 1;
+                        try std.testing.expectEqual(.GET, request.method);
+                        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.MetadataRuntimeTopology{
+                            .metadata_group_id = 9,
+                            .metadata_incarnation = @splat('1'),
+                            .metadata_raft_local_node_id = 1,
+                            .metadata_raft_leader_id = 1,
+                            .metadata_raft_role = "leader",
+                        }, .{}) };
+                    }
+                    self.mutations += 1;
+                    try std.testing.expectEqual(if (self.scan) antfly.common.http.Method.POST else .PUT, request.method);
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, if (self.scan) "/privacy/scans" else "/privacy"));
+                    try std.testing.expectEqualStrings("{}", request.body);
+                    const headers = try alloc.alloc(antfly.common.http.Header, if (self.status == 202) 1 else 3);
+                    headers[0] = .{ .name = try alloc.dupe(u8, "ETag"), .value = try alloc.dupe(u8, "upstream-etag") };
+                    if (self.status != 202) {
+                        headers[1] = .{ .name = try alloc.dupe(u8, "X-Antfly-Raft-Mutation-Outcome"), .value = try alloc.dupe(u8, "unknown-v1") };
+                        headers[2] = .{ .name = try alloc.dupe(u8, "Retry-After"), .value = try alloc.dupe(u8, "1") };
+                    }
+                    return .{ .status = self.status, .body = try alloc.dupe(u8, "{\"code\":\"upstream\"}"), .headers = headers };
+                }
+            };
+            var fake: Fake = .{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            defer source.deinit();
+            var expected_calls: usize = 0;
+            for ([_]u16{ 202, 409, 503 }) |status| for ([_]bool{ false, true }) |scan| {
+                fake.status = status;
+                fake.scan = scan;
+                var response = (try source.statusSource().forwardPrivacyMutation(a, "docs", "{}", if (scan) null else "etag", scan, .{})).?;
+                defer response.deinit(a);
+                expected_calls += 1;
+                try std.testing.expectEqual(expected_calls, fake.mutations);
+                try std.testing.expectEqual(expected_calls, fake.probes);
+                try std.testing.expectEqual(status, response.response.status);
+                try std.testing.expect(response.response.json);
+                try std.testing.expectEqualStrings("{\"code\":\"upstream\"}", response.response.body);
+                try std.testing.expectEqualStrings("upstream-etag", response.etag.?);
+                try std.testing.expectEqual(if (status == 202) null else @as(?u32, 1), response.response.retry_after_seconds);
+                try std.testing.expectEqual(if (status == 202) null else @as(?@import("../api/public_table_http.zig").MetadataMutationOutcome, .unknown), response.response.metadata_mutation_outcome);
+                // Exercise the real status-source/discovery handoff rather
+                // than just a standalone response clone. Both caller-buffer
+                // failures happen after one accepted/ambiguous upstream reply.
+                for (0..2) |index| {
+                    var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+                    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.statusSource().forwardPrivacyMutation(fail.allocator(), "docs", "{}", if (scan) null else "etag", scan, .{}));
+                    expected_calls += 1;
+                    try std.testing.expectEqual(expected_calls, fake.mutations);
+                    try std.testing.expectEqual(expected_calls, fake.probes);
+                    try std.testing.expectEqualStrings("upstream-etag", response.etag.?);
+                }
+            };
+        }
+
+        test "privacy remote read bindings pin metadata identity and never fall back to full catalogs" {
+            const a = std.testing.allocator;
+            const Fake = struct {
+                calls: usize = 0,
+                reject_first: bool = true,
+                wrong_identity: bool = false,
+                malformed: bool = false,
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/catalog/privacy-policy-binding"));
+                    try std.testing.expectEqual(@as(?usize, 4096), request.max_response_bytes);
+                    if (self.reject_first and std.mem.startsWith(u8, request.uri, "http://old")) return .{ .status = 404, .body = try alloc.dupe(u8, "unsupported") };
+                    if (self.malformed) return .{ .status = 200, .body = try alloc.dupe(u8, "{}") };
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.PrivacyPolicyBinding{ .metadata_group_id = 9, .metadata_incarnation = @splat(if (self.wrong_identity) @as(u8, '2') else '1'), .catalog_revision = 7, .policy_version = @splat('a') }, .{}) };
+                }
+            };
+            var fake: Fake = .{};
+            const executor: antfly.common.http.RequestExecutor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } };
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{ "http://old", "http://new" }, &.{ executor, executor }, std.testing.io);
+            defer source.deinit();
+            const capture = source.catalogSource().vtable.privacy_policy_binding.?;
+            const result = try capture(&source, "docs", null);
+            try std.testing.expectEqual(@as([64]u8, @splat('a')), result.policy_version);
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+            fake.wrong_identity = true;
+            fake.reject_first = false;
+            try std.testing.expectError(error.MetadataIncarnationMismatch, capture(&source, "docs", null));
+            fake.wrong_identity = false;
+            fake.malformed = true;
+            try std.testing.expectError(error.MissingField, capture(&source, "docs", null));
+            fake.malformed = false;
+            const calls = fake.calls;
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, capture(&source, "docs", 1));
+            try std.testing.expectEqual(calls, fake.calls);
+        }
+
+        test "privacy remote table reads observe progress without invalidating semantic caches" {
+            const a = std.testing.allocator;
+            const Fake = struct {
+                calls: usize = 0,
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+                    var call = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, alloc, request.body, .{});
+                    defer call.deinit();
+                    try std.testing.expect(call.value == .table_record_read);
+                    try std.testing.expectEqualStrings("private", call.value.table_record_read);
+                    self.calls += 1;
+                    const description = try std.fmt.allocPrint(alloc, "progress-{d}", .{self.calls});
+                    defer alloc.free(description);
+                    const body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata.TableRecord{ .table_id = 1, .name = "private", .description = description }, .{});
+                    const headers = try alloc.alloc(antfly.common.http.Header, 2);
+                    headers[0] = .{ .name = try alloc.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try alloc.dupe(u8, "9") };
+                    headers[1] = .{ .name = try alloc.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try alloc.dupe(u8, "11111111111111111111111111111111") };
+                    return .{ .status = 200, .body = body, .headers = headers };
+                }
+            };
+            var fake = Fake{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            defer source.deinit();
+            try source.acceptMetadataIdentity(9, "11111111111111111111111111111111".*);
+            const generation = source.snapshot_invalidation_generation;
+            const first = (try source.statusSource().tableRecord(a, "private")).?;
+            defer antfly.metadata.table_manager.freeTable(a, first);
+            const second = (try source.statusSource().tableRecord(a, "private")).?;
+            defer antfly.metadata.table_manager.freeTable(a, second);
+            try std.testing.expectEqualStrings("progress-1", first.description);
+            try std.testing.expectEqualStrings("progress-2", second.description);
+            try std.testing.expectEqual(generation, source.snapshot_invalidation_generation);
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+        }
+
         test "remote metadata status source advertises exact table drop cleanup" {
             var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
             defer backend_runtime.deinit();
@@ -61527,4 +61781,77 @@ test "grouped source protocol dominates coexisting graph envelope features" {
     var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@TypeOf(request.group_source.?.action).activate_catalog, decoded.batch.req.group_source.?.action);
+}
+
+test "data runtime native restore phase two rejoins activating descriptor authority" {
+    const stages = @import("../metadata/restore_staging.zig");
+    const a = std.testing.allocator;
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    const native: @import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor = .{
+        .kind = .unlogged,
+        .owner_node_id = 9,
+        .owner_store_id = 11,
+        .generation_instance = @splat(3),
+        .data_generation = 1,
+    };
+    const table: @import("antfly_local_sources").common_topology_records.TableRecord = .{ .table_id = 71, .name = "native-phase-two", .schema_json = "{}", .sql_persistence = native };
+    const range: @import("antfly_local_sources").common_topology_records.RangeRecord = .{ .table_id = table.table_id, .group_id = 72, .range_id = 72, .start_key = "" };
+    const target: stages.Target = .{ .source_table_id = 7, .table = table, .ranges = &.{range}, .empty_generation = true, .schema_only_snapshot = .{ .manifest_digest = @splat(4), .schema_digest = try stages.runtimeSchemaDigestForTable(scratch, table.schema_json), .source_table_id = 7 } };
+    const plan: stages.Plan = .{ .id = @splat(5), .cohort_digest = @splat(6), .targets = &.{target} };
+    try plan.validate(scratch);
+    const digest = try plan.digest(scratch);
+    const scope = try stages.ownerScope(scratch, plan, digest, target, range);
+    const Probe = struct {
+        job: stages.Job,
+        progress: stages.Progress,
+        job_reads: usize = 0,
+        progress_reads: usize = 0,
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return error.TestUnexpectedGenericCatalogRead;
+        }
+        fn jobRead(raw: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, _: antfly.public_api.operation.RequestContext) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.job.plan.id, id);
+            self.job_reads += 1;
+            return try std.json.Stringify.valueAlloc(alloc, self.job, .{});
+        }
+        fn progressRead(raw: *anyopaque, _: std.mem.Allocator, id: [16]u8, _: antfly.public_api.operation.RequestContext) !?stages.Progress {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.job.plan.id, id);
+            self.progress_reads += 1;
+            return self.progress;
+        }
+    };
+    var probe: Probe = .{ .job = .{ .plan = plan, .plan_digest = digest, .state = .activating, .revision = 7 }, .progress = .{ .state = .activating, .revision = 7 } };
+    // Exercise the actual metadata-backed receiver descriptor path. No Raft
+    // route, physical initialization or serving proof is supplied by this unit.
+    var server: DataServer = undefined;
+    server.status_source = .{ .ptr = &probe, .vtable = &.{ .status = Probe.status, .get_restore_staging = Probe.jobRead, .get_restore_staging_progress = Probe.progressRead } };
+    server.provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a);
+    defer server.provisioned_storage.deinit();
+    try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, .mutate, .{}));
+    try std.testing.expectEqual(@as(usize, 0), probe.progress_reads);
+    inline for (.{ @FieldType(antfly.public_api.restore_owner.Request, "action").install_native_empty, .install_generation_admissions }) |action| {
+        try std.testing.expectEqual(antfly.public_api.ProvisionedKernelOwnerSource.RestoreDescriptorUse.resolve, DataServer.restoreOwnerDescriptorUse(action));
+        var captured = try DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, DataServer.restoreOwnerDescriptorUse(action), .{});
+        defer captured.deinit(a);
+        try std.testing.expect(captured.descriptor.sql_persistence.?.eql(native));
+        try std.testing.expectEqual(table.table_id, captured.descriptor.identity.table_id);
+        try DataServer.requireRestoreOwnerControlPhase(action, .activating);
+        try std.testing.expectError(error.RestoreStagingInProgress, DataServer.requireRestoreOwnerControlPhase(action, .validating));
+        try std.testing.expectError(error.RestoreStagingCanceled, DataServer.requireRestoreOwnerControlPhase(action, .canceled));
+    }
+    try std.testing.expectEqual(@as(usize, 2), probe.progress_reads);
+    try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, @splat(8), plan.id, .resolve, .{}));
+    probe.progress.revision += 1;
+    try std.testing.expectError(error.RestoreStagingProgressChanged, DataServer.recoverRestoreDescriptor(&server, a, range.group_id, table.name, scope.digest(), plan.id, .resolve, .{}));
+    inline for (.{ @FieldType(antfly.public_api.restore_owner.Request, "action").begin, .import_page, .validate }) |action| {
+        try std.testing.expectEqual(antfly.public_api.ProvisionedKernelOwnerSource.RestoreDescriptorUse.mutate, DataServer.restoreOwnerDescriptorUse(action));
+        try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.requireRestoreOwnerControlPhase(action, .activating));
+        try DataServer.requireRestoreOwnerControlPhase(action, .importing);
+    }
+    try DataServer.requireRestoreOwnerControlPhase(.install_native_empty, .published);
+    try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.requireRestoreOwnerControlPhase(.install_generation_admissions, .published));
 }

@@ -252,6 +252,31 @@ pub fn loadPolicyPublicationStamp(alloc: std.mem.Allocator, txn: *docstore.DocSt
     return parsed.value;
 }
 
+/// Same-writer runtime progress admission. Authored/schema/policy changes use
+/// the ordinary journal; this helper only refreshes its current physical stamp.
+/// Pending policy custody must remain byte-stable until its exact ACK cut.
+pub fn refreshPolicyRuntimeFingerprint(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: u64, expected: [32]u8, replacement: [32]u8) !bool {
+    var publication = (try loadPolicyPublication(alloc, txn, group, table)) orelse return true;
+    defer publication.deinit();
+    if (publication.value.schema_pair != null or policyPublicationNeedsWork(publication.value)) return false;
+    if (publication.value.phase != .active and publication.value.phase != .disabled) return false;
+    if (!std.mem.eql(u8, &publication.value.schema_record_digest, &expected)) return false;
+    const stamp = (try loadPolicyPublicationStamp(alloc, txn, group, table)) orelse return false;
+    if (!std.meta.eql(stamp, policies.PublicationStamp.fromPublication(publication.value))) return false;
+    publication.value.schema_record_digest = replacement;
+    const key = try policyPublicationKeyAlloc(alloc, group, table);
+    defer alloc.free(key);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, publication.value, .{});
+    defer alloc.free(bytes);
+    const stamp_key = try policyPublicationStampKeyAlloc(alloc, group, table);
+    defer alloc.free(stamp_key);
+    const stamp_bytes = try std.json.Stringify.valueAlloc(alloc, policies.PublicationStamp.fromPublication(publication.value), .{});
+    defer alloc.free(stamp_bytes);
+    try txn.put(key, bytes);
+    try txn.put(stamp_key, stamp_bytes);
+    return true;
+}
+
 pub fn loadPolicyPublications(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) ![]const policies.Publication {
     const prefix = try keyAlloc(alloc, group_id, "policy-publication:");
     defer alloc.free(prefix);

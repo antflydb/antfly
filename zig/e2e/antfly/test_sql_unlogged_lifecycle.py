@@ -222,7 +222,9 @@ def test_unlogged_originals_preserve_clean_rows_and_reset_real_process_loss(case
                 )
                 if (
                     not_admitted
-                    or definite_observation_abort(response.status_code, result, pure_observation=read)
+                    or definite_observation_abort(
+                        response.status_code, result, pure_observation=read
+                    )
                     or (
                         read
                         and response.status_code == 503

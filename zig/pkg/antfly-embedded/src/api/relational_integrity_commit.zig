@@ -424,6 +424,10 @@ const Builder = struct {
     }
 
     fn lookup(self: *Builder, table: []const u8, key: []const u8, options: types.LookupOptions) !?reads.LookupResponse {
+        return self.lookupCaptured(table, key, options, false);
+    }
+
+    fn lookupCaptured(self: *Builder, table: []const u8, key: []const u8, options: types.LookupOptions, observation_preimages: bool) !?reads.LookupResponse {
         try self.control.ensureActive();
         // Preparation observes many primary rows and claims. Pin one routing
         // generation for the request instead of fetching the catalog for each
@@ -442,7 +446,11 @@ const Builder = struct {
         opts.execution_io = self.control.deadline_io;
         opts.cancellation = self.control.cancellation;
         opts = try authorizedLookupOptions(self.control, self.alloc, table, opts);
-        return self.source.lookup(self.alloc, table, key, opts, .read_index) catch |err| {
+        const response = if (opts.include_primary_digest or observation_preimages)
+            self.source.lookupMutationPreimage(self.alloc, table, key, opts)
+        else
+            self.source.lookup(self.alloc, table, key, opts, .read_index);
+        return response catch |err| {
             if (preparation_diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs())) std.log.warn("preparation lookup failed catalog={} jobs={} work={d} class={s}", .{ opts.relational_integrity_catalog, opts.relational_integrity_jobs_json.len != 0, self.work.items.len, @errorName(err) });
             return err;
         };
@@ -631,7 +639,7 @@ const Builder = struct {
     }
 
     fn observeWorkQuery(self: *Builder, table: *Loaded, keys: []const []const u8, query: []const u8) !void {
-        var response = (try self.lookup(table.name, keys[0], .{ .relational_integrity_jobs_json = query })) orelse return error.InvalidIntegrityRecord;
+        var response = (try self.lookupCaptured(table.name, keys[0], .{ .relational_integrity_jobs_json = query }, true)) orelse return error.InvalidIntegrityRecord;
         defer response.deinit(self.alloc);
         const Observation = struct {
             json: []u8,
@@ -708,7 +716,7 @@ const Builder = struct {
                     slot.failure = err;
                     return;
                 };
-                slot.row = source.lookup(slot.arena.allocator(), name, key, options, .read_index) catch |err| {
+                slot.row = source.lookupMutationPreimage(slot.arena.allocator(), name, key, options) catch |err| {
                     slot.failure = err;
                     return;
                 };

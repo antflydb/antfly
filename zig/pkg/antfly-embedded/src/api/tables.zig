@@ -79,6 +79,10 @@ pub fn validateIndexesValue(value: std.json.Value, comptime trusted_catalog: boo
     var index_it = value.object.iterator();
     while (index_it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+        if (@import("index_metadata.zig").isOpaqueEntry(entry.key_ptr.*)) {
+            if (!trusted_catalog) return error.InvalidCreateTableRequest;
+            continue;
+        }
         if (trusted_catalog) {
             coverage_policy_mod.validateStoredIndexConfig(entry.value_ptr.*) catch return error.InvalidCreateTableRequest;
         } else {
@@ -325,4 +329,12 @@ test "lake catalog admission bounds recipes across indexes before commit" {
     _ = configs.orderedRemove("index64");
     const accepted = try std.json.Stringify.valueAlloc(aa, std.json.Value{ .object = configs }, .{});
     try validateLakeIndexCapacity(a, schema, accepted);
+}
+
+test "privacy restored catalogs accept opaque state only at trusted validation" {
+    const a = std.testing.allocator;
+    var root = try std.json.parseFromSlice(std.json.Value, a, "{\"_privacy\":{\"coverage\":{}},\"full_text_index_v0\":{\"type\":\"full_text\"}}", .{});
+    defer root.deinit();
+    try validateIndexesValue(root.value, true);
+    try std.testing.expectError(error.InvalidCreateTableRequest, validateIndexesValue(root.value, false));
 }

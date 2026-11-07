@@ -285,6 +285,19 @@ fn pendingReceipt(alloc: std.mem.Allocator, target: domain.Target, source_id: u6
 }
 
 pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: ast.CatalogDdl) !catalog.DdlOutcome {
+    var owned_identity = identity;
+    var root: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = &owned_identity, .context = context, .database = database, .namespace = namespace };
+    defer root.releaseExecutionOwners();
+    defer freeCapturedNotices(alloc, root.result_ddl_notices);
+    return executeWithAdapter(&root, alloc, ddl);
+}
+
+pub fn executeWithAdapter(root: *@import("sql_execution.zig").Adapter, alloc: std.mem.Allocator, ddl: ast.CatalogDdl) !catalog.DdlOutcome {
+    const server = root.server;
+    const identity = root.identity.*;
+    const context = root.context;
+    const database = root.database;
+    const namespace = root.namespace;
     try context.ensureActive();
     if (server.cfg.auth_enabled and identity == null) return error.Forbidden;
     if (ddl.truncate_tables.len == 0 or ddl.truncate_tables.len > 128) return error.InvalidSqlSyntax;
@@ -424,7 +437,36 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     var digest: [32]u8 = undefined;
     const cohort_manifest = try std.json.Stringify.valueAlloc(a, .{ .targets = planned, .external_fk_parents = external_parents }, .{});
     std.crypto.hash.Blake3.hash(cohort_manifest, &digest, .{});
-    const plan: stages.Plan = .{ .id = id, .cohort_digest = digest, .targets = planned, .external_fk_parents = external_parents };
+    // Both phases run in the closed captured VM, before admission. Its eager
+    // notice callback is private: errors and unknown proposals expose nothing.
+    var private_notices: catalog.notices.Buffer = .{};
+    const previous_sink = root.notice_sink;
+    root.notice_sink = .{ .ptr = &private_notices, .emit = captureNotice, .reserve = reserveNotices };
+    defer root.notice_sink = previous_sink;
+    var capture: TruncateCapture = .{ .a = a, .root = root };
+    defer if (capture.broker) |broker| broker.deinit();
+    try prepareTruncateStatements(a, selected, &capture);
+    const before_notice_count = private_notices.count;
+    if (capture.broker) |broker| try broker.finish();
+    const receipts: []const catalog.trigger_handoff.Receipt = if (capture.broker) |broker| try broker.receipts(a) else &.{};
+    // Only BEFORE notices need a result owner now. The complete private
+    // buffer is serialized into the Plan before this stack frame ends.
+    const canonical_notices = try copyCapturedNotices(alloc, &private_notices, before_notice_count);
+    var notices_transferred = false;
+    defer if (!notices_transferred) freeCapturedNotices(alloc, canonical_notices);
+    const durable_notices = try a.alloc(stages.TruncateNotice, private_notices.count);
+    for (durable_notices, 0..) |*out, ordinal| {
+        const notice = private_notices.get(ordinal);
+        out.* = .{ .code = notice.code, .message = notice.message, .severity = notice.severity };
+    }
+    const plan: stages.Plan = .{ .id = id, .cohort_digest = digest, .targets = planned, .external_fk_parents = external_parents, .truncate_preparation = if (receipts.len == 0) null else .{
+        .format_version = 1,
+        .vm_contract_version = catalog.trigger_runtime.predecision_contract_version,
+        .plan_id = id,
+        .receipts = receipts,
+        .before_notice_count = before_notice_count,
+        .notices = durable_notices,
+    } };
     try plan.validate(a);
     const primary_target = for (planned) |target| {
         if (target.source_table_id == resolved.tables[0].?.table_id) break target.table;
@@ -470,6 +512,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     };
     defer a.free(state_bytes);
     var unknown_admission = accepted == .unknown;
+    var known_admission = false;
     if (!unknown_admission) {
         const state = std.json.parseFromSliceLeaky(jobs.JobState, a, state_bytes, .{}) catch null;
         if (state) |actual| {
@@ -477,6 +520,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
                 unknown_admission = true;
             };
             if (actual.phase != .failed and (admission.plan_digest == null or !std.mem.eql(u8, &admission.plan_digest.?, &reference.plan_digest))) unknown_admission = true;
+            known_admission = actual.phase != .failed and !unknown_admission;
         } else unknown_admission = true;
     }
     if (server.restore_job_store.replicated != null) server.schedulePendingRestoreJobs() catch {};
@@ -485,6 +529,10 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         submitted = true;
         result.state = .admission_unknown;
         result.diagnostic = "TRUNCATE admission is unresolved. Reconcile restore_job_id; do not replay the statement.";
+    }
+    if (known_admission) {
+        root.result_ddl_notices = canonical_notices;
+        notices_transferred = true;
     }
     return .{ .mutation_outcome = if (unknown_admission) null else .committed_pending, .receipt = result };
 }
@@ -854,4 +902,100 @@ fn selectRecoveryTable(a: std.mem.Allocator, selected: *std.ArrayList(records.Ta
     const descriptor = table.sql_persistence orelse return error.SqlRelationPersistenceForeignKeyMismatch;
     if (descriptor.kind != .unlogged) return error.SqlRelationPersistenceForeignKeyMismatch;
     try selected.append(a, table);
+}
+
+fn captureNotice(raw: *anyopaque, notice: catalog.notices.Notice) !void {
+    const buffer: *catalog.notices.Buffer = @ptrCast(@alignCast(raw));
+    try buffer.append(notice);
+}
+fn reserveNotices(raw: *anyopaque, count: usize, bytes: usize) !void {
+    const buffer: *catalog.notices.Buffer = @ptrCast(@alignCast(raw));
+    try buffer.reserve(count, bytes);
+}
+
+fn copyCapturedNotices(a: std.mem.Allocator, buffer: *const catalog.notices.Buffer, count: usize) ![]const catalog.notices.Notice {
+    const result = try a.alloc(catalog.notices.Notice, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |notice| {
+            a.free(notice.code);
+            a.free(notice.message);
+        }
+        a.free(result);
+    }
+    for (result, 0..) |*out, ordinal| {
+        const notice = buffer.get(ordinal);
+        const code = try a.dupe(u8, notice.code);
+        errdefer a.free(code);
+        out.* = .{ .code = code, .message = try a.dupe(u8, notice.message), .severity = notice.severity };
+        initialized += 1;
+    }
+    return result;
+}
+fn freeCapturedNotices(a: std.mem.Allocator, notices: []const catalog.notices.Notice) void {
+    for (notices) |notice| {
+        a.free(notice.code);
+        a.free(notice.message);
+    }
+    a.free(notices);
+}
+
+const TruncateCapture = struct {
+    a: std.mem.Allocator,
+    root: *@import("sql_execution.zig").Adapter,
+    broker: ?*@import("sql_trigger_commit.zig").Broker = null,
+    fn begin(self: *@This(), table: records.TableRecord) !void {
+        if (self.broker == null) self.broker = try @import("sql_trigger_commit.zig").Broker.create(self.a, self.root);
+        try self.broker.?.beginTruncate(table);
+    }
+};
+
+/// Preflight the actual source declarations, not a global active-trigger flag.
+/// No matching definition means no Broker, metadata snapshot, column identity
+/// or routine capture. Definitions are included without an enabled filter so
+/// the writer still receives any required disabled-attachment witness.
+fn prepareTruncateStatements(a: std.mem.Allocator, selected: []const records.TableRecord, capture: anytype) !void {
+    for (selected) |table| {
+        if (try stages.hasTruncateAttachments(a, table.schema_json)) try capture.begin(table);
+    }
+}
+
+test "SQL TRUNCATE preparation skips absent and other-event definitions without opening captures or unrelated FK tables" {
+    var region: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer region.deinit();
+    const a = region.allocator();
+    const Fixture = struct {
+        fn schema(alloc: std.mem.Allocator, id: u64, events: @FieldType(catalog.triggers.Declaration, "events")) ![]u8 {
+            const initial: catalog.triggers.State = .{ .metadata_incarnation = @splat(1), .table_id = id, .generation = 1 };
+            const state = try catalog.triggers.prepare(alloc, initial, .{ .name = "capture", .timing = .before, .events = events, .level = .statement, .function = .{ .database = "antfly", .namespace = "public", .namespace_id = 2, .name = "capture", .id = 15 } }, false);
+            const foreign_keys = if (id == 9)
+                "[{\"name\":\"fk\",\"child_columns\":[\"id\"],\"parent_table\":\"unselected_fk_parent\",\"parent_columns\":[\"id\"]}]"
+            else
+                "[]";
+            return std.fmt.allocPrint(alloc, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"sql_triggers\":{s},\"unique_constraints\":[{{\"name\":\"pk\",\"columns\":[\"id\"]}}],\"foreign_keys\":{s},\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"id\":{{\"type\":\"integer\"}}}},\"additionalProperties\":false}}}}}}}}", .{ try state.encode(alloc), foreign_keys });
+        }
+    };
+    const sources = [_]records.TableRecord{
+        .{ .table_id = 7, .name = "schema_free" },
+        .{ .table_id = 8, .name = "insert_only", .schema_json = try Fixture.schema(a, 8, .{ .insert = true }) },
+        .{ .table_id = 9, .name = "selected_child", .schema_json = try Fixture.schema(a, 9, .{ .truncate = true }) },
+        .{ .table_id = 11, .name = "unselected_fk_parent", .schema_json = try Fixture.schema(a, 11, .{ .truncate = true }) },
+    };
+    var child_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, sources[2].schema_json);
+    defer child_schema.deinit(a);
+    try std.testing.expectEqualStrings("unselected_fk_parent", child_schema.foreign_keys.?.value[0].parent_table);
+    const Capture = struct {
+        calls: usize = 0,
+        fn begin(self: *@This(), table: records.TableRecord) !void {
+            try std.testing.expectEqual(@as(u64, 9), table.table_id);
+            self.calls += 1;
+        }
+    };
+    var capture: Capture = .{};
+    try prepareTruncateStatements(a, sources[0..2], &capture);
+    try std.testing.expectEqual(@as(usize, 0), capture.calls);
+    // The selected child can depend on an untouched parent. TRUNCATE's FK
+    // cohort selection owns that distinction; trigger capture never expands it.
+    try prepareTruncateStatements(a, sources[0..3], &capture);
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
 }

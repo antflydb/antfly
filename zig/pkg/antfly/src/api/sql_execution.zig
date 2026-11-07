@@ -543,6 +543,7 @@ pub const Adapter = struct {
                 return;
             }
             if (self.scope_bound) return error.RowPolicyCatalogChanged;
+            try self.adapter.requireUnprotectedMutation(self.alloc, table);
             try self.targets.put(self.journal.arena.allocator(), table.physical_name, table);
         }
         fn integrityRead(raw: *anyopaque, a: std.mem.Allocator, physical: []const u8) !?operation.RowPolicyIntegrityRead.Proof {
@@ -635,6 +636,8 @@ pub const Adapter = struct {
     sequence_owner: ?*@import("sql_sequence_execution.zig").Owner = null,
     routine_owner: ?*@import("sql_routine_execution.zig").Owner = null,
     notice_sink: ?catalog.notices.Sink = null,
+    /// Canonical accepted DDL notices; never delivered by the predecision VM.
+    result_ddl_notices: []const catalog.notices.Notice = &.{},
     /// Pgwire retains the original durable owner scope independently of its
     /// mutable, freshly authorized lookup namespace. HTTP leaves this null.
     session_namespace: ?[]const u8 = null,
@@ -716,12 +719,14 @@ pub const Adapter = struct {
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
         if (@import("sql_copy_server.zig").target(compiled.statement) != null)
             return @import("sql_copy_server.zig").execute(self, alloc, compiled, parameters, limits, guarded_backend);
+        self.result_ddl_notices = &.{};
         defer self.releaseExecutionOwners();
         var result = self.executeInner(alloc, compiled, parameters, limits, guarded_backend) catch |err| {
             return self.finishFailure(err);
         };
         errdefer result.deinit();
         try @import("sql_sequence_execution.zig").flush(self);
+        if (self.result_ddl_notices.len != 0) result.output.notices = self.result_ddl_notices;
         if (self.routine_owner) |owner| {
             result.retainExecution(&owner.lease);
             self.routine_owner = null;
@@ -1328,7 +1333,7 @@ pub const Adapter = struct {
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
         self.lock_provider.ptr = self;
-        return .{ .notification_provider = if (self.context.sql_command_fence != null) .{ .ptr = self, .stage = @import("sql_notification_execution.zig").stage } else null, .locking_provider = if (self.context.sql_command_fence != null) &self.lock_provider else null, .prepare_definition_copy = .{ .ptr = self, .prepare = @import("sql_definition_copy.zig").prepare }, .named_type_resolver = if (self.server.source.vtable.supports_sql_types) .{ .ptr = self, .resolve = @import("sql_type_schema.zig").bindCast } else null, .resolve_declared_types = if (self.server.source.vtable.supports_sql_types) .{ .ptr = self, .resolve = @import("sql_type_schema.zig").bindDeclaredColumns } else null, .validate_persisted_expressions = .{ .ptr = self, .validate = @import("sql_persisted_expressions.zig").validate }, .copy_filter = self.copy_filter, .notice_sink = self.notice_sink, .procedure_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bindProcedure } else null, .routine_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bind, .resolve_operator = @import("sql_routine_execution.zig").bindOperator, .resolve_aggregate = @import("sql_routine_execution.zig").bindAggregate, .resolve_cast = @import("sql_routine_execution.zig").bindCast } else null, .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .advisory_provider = if (self.context.sql_command_fence != null) .{ .ptr = self, .invoke = @import("sql_advisory_execution.zig").invoke } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null or self.pending_transaction_cut != null) .{ .ptr = self, .validate = validatePreparedExecution } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .temporary_relation_owner = self.temporaryLookupOwner(), .supports_native_relation_lifetimes = @import("../metadata/topology_protocol.zig").current_version >= @import("../metadata/topology_protocol.zig").sql_relation_persistence_version, .supports_graph_relations = true, .supports_text_predicates = true, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .statement_mutations = if (self.active_transaction != null and self.range_reads != null) .{ .ptr = self, .begin = beginCommand } else null, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.dynamic_snapshot == null and self.pending_transaction_cut == null and self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null or self.pending_transaction_cut != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
+        return .{ .distributed_join = self.server.cfg.distributed_sql_join, .distributed_context = self.context, .notification_provider = if (self.context.sql_command_fence != null) .{ .ptr = self, .stage = @import("sql_notification_execution.zig").stage } else null, .locking_provider = if (self.context.sql_command_fence != null) &self.lock_provider else null, .prepare_definition_copy = .{ .ptr = self, .prepare = @import("sql_definition_copy.zig").prepare }, .named_type_resolver = if (self.server.source.vtable.supports_sql_types) .{ .ptr = self, .resolve = @import("sql_type_schema.zig").bindCast } else null, .resolve_declared_types = if (self.server.source.vtable.supports_sql_types) .{ .ptr = self, .resolve = @import("sql_type_schema.zig").bindDeclaredColumns } else null, .validate_persisted_expressions = .{ .ptr = self, .validate = @import("sql_persisted_expressions.zig").validate }, .copy_filter = self.copy_filter, .notice_sink = self.notice_sink, .procedure_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bindProcedure } else null, .routine_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bind, .resolve_operator = @import("sql_routine_execution.zig").bindOperator, .resolve_aggregate = @import("sql_routine_execution.zig").bindAggregate, .resolve_cast = @import("sql_routine_execution.zig").bindCast } else null, .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .advisory_provider = if (self.context.sql_command_fence != null) .{ .ptr = self, .invoke = @import("sql_advisory_execution.zig").invoke } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null or self.pending_transaction_cut != null) .{ .ptr = self, .validate = validatePreparedExecution } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .temporary_relation_owner = self.temporaryLookupOwner(), .supports_native_relation_lifetimes = @import("../metadata/topology_protocol.zig").current_version >= @import("../metadata/topology_protocol.zig").sql_relation_persistence_version, .supports_graph_relations = true, .supports_text_predicates = true, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .statement_mutations = if (self.active_transaction != null and self.range_reads != null) .{ .ptr = self, .begin = beginCommand } else null, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.dynamic_snapshot == null and self.pending_transaction_cut == null and self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null or self.pending_transaction_cut != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
     }
 
     pub fn lockingFrame(self: *Adapter) !@import("sql_advisory_execution.zig").Frame {
@@ -1424,6 +1429,7 @@ pub const Adapter = struct {
     fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
+        try self.requireUnprotectedMutation(alloc, table);
         const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
         const predicates = try @import("antfly_local_sources").sql_conflict_predicate.toNative(alloc, target.conditions);
         const keys = try @import("antfly_local_sources").sql_conflict_predicate.expressionsToNative(alloc, target.expressions);
@@ -1470,6 +1476,8 @@ pub const Adapter = struct {
         // their namespace change independently of an explicit SQL transaction.
         if (input == .catalog_ddl and input.catalog_ddl.kind == .database and input.catalog_ddl.action == .drop and self.active_transaction != null) return error.SqlDdlInsideTransaction;
         if ((input == .populate or (input == .catalog_ddl and input.catalog_ddl.action == .setting_default)) and self.active_transaction != null) return error.UnsupportedSqlExecution;
+        if (input == .catalog_ddl and input.catalog_ddl.action == .truncate)
+            return @import("sql_truncate.zig").executeWithAdapter(self, allocators.result, input.catalog_ddl);
         if (input == .catalog_ddl and input.catalog_ddl.action == .maintenance) return @import("sql_maintenance.zig").execute(self, allocators, input.catalog_ddl);
         if (input == .catalog_ddl and input.catalog_ddl.kind == .named_type) return @import("sql_type_ddl.zig").execute(self, allocators, input.catalog_ddl);
         if (input == .catalog_ddl and input.catalog_ddl.kind == .cast) return @import("sql_cast_ddl.zig").execute(self, allocators, input.catalog_ddl);
@@ -1823,9 +1831,17 @@ pub const Adapter = struct {
         return self.rowPolicyProof(alloc, normalizing);
     }
 
+    fn requireUnprotectedMutation(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
+        const source = self.server.table_reads orelse return;
+        if (source.vtable.privacy_policy_version == null) return;
+        const version = try source.privacyPolicyVersion(alloc, table.physical_name, self.context.deadline_ns);
+        if (!std.mem.allEqual(u8, &version, 0)) return error.UnsupportedSqlExecution;
+    }
+
     fn prepareScan(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !helpers.OwnedScanKeysRequest {
         try self.verify(alloc, table);
         if (request.text_predicate != null and (table.storage_mode != .document or table.external_base_source != null or self.dynamic_snapshot != null or self.range_reads != null or (self.staged != null and self.staged.?.tables.len != 0) or request.primary_order or request.index_equality != null or request.primary_key != null)) return error.UnsupportedSqlExecution;
+        if (request.include_document or request.include_primary_digest) try self.requireUnprotectedMutation(alloc, table);
         if (request.index_equality) |probe| {
             if (self.range_reads == null or request.primary_key != null or request.after != null or request.primary_order or
                 probe.name.len == 0 or probe.values.len == 0 or probe.values.len > 32) return error.UnsupportedSqlExecution;
@@ -2285,10 +2301,45 @@ pub const Adapter = struct {
         }
     }
 
+    const DistributedCut = struct {
+        adapter: *Adapter,
+        table: catalog.Table,
+        source: *@import("antfly_local_sources").serverless_query_lake_serving.ServingSource,
+        pending: ?@import("../serverless/lake_ingestion.zig").Pending,
+        fn capture(raw: *anyopaque, a: std.mem.Allocator) !?catalog.ReadCapability {
+            const self: *DistributedCut = @ptrCast(@alignCast(raw));
+            const adapter = self.adapter;
+            try adapter.context.ensureActive();
+            const binding = self.table.external_base_source.?.binding;
+            if (binding.catalog == null or binding.catalog.?.type != .managed or binding.write_policy != .iceberg_writer) return null;
+            const estimates = self.source.estimates() orelse return null;
+            const metadata = self.source.catalog_metadata orelse return null;
+            const lake = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog;
+            const root = try lake.metadata.parse(a, metadata.metadata_json);
+            const base = try @import("lake_search_overlay.zig").snapshotCoverage(root, self.source.inventory.snapshot_id);
+            const pending = self.pending orelse @import("../serverless/lake_ingestion.zig").Pending{ .lsn = base, .base_lsn = base, .key_fields = &.{} };
+            const now: u64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+            const expires = now + 60 * 60 * 1000;
+            const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = adapter.server.cfg.node_config, .secret_store = adapter.server.cfg.secret_store, .catalog_table_id = self.table.id, .catalog_generation = if (self.table.external_indexes) |indexes| indexes.object_generation else 0 };
+            var opened = try @import("../serverless/lake_ingestion.zig").openQueue(a, binding, options);
+            defer opened.deinit();
+            const pins = @import("../serverless/lake_snapshot_pins.zig");
+            const normalized = try adapter.context.platformDeadline();
+            const pin: pins.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = try pins.namespace(a, opened.prefix, binding, try lake.metadata.str(try lake.metadata.get(root, "table-uuid"))), .context = .{ .io = adapter.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) } };
+            _ = try pin.acquireFor(a, self.source.inventory.snapshot_id, now * std.time.ns_per_ms, (expires - now) * std.time.ns_per_ms);
+            var store = try @import("lake_index_store.zig").Store.openNative(a, adapter.server.cfg.node_config, adapter.server.cfg.secret_store, false, adapter.server.cfg.deployment_mode, adapter.server.cfg.native_lake_artifact_base_dir);
+            defer store.deinit();
+            var artifacts = store.artifactStore();
+            const token = try @import("lake_sql_retained_cut.zig").saveDistributed(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), adapter.server.embedding_provider_runtime.io, .{ .table_id = self.table.id, .schema_version = self.table.schema_version, .object_generation = options.catalog_generation, .expires_ms = expires, .metadata_location = metadata.metadata_location, .metadata_json = metadata.metadata_json, .table_uuid = try lake.metadata.str(try lake.metadata.get(root, "table-uuid")), .snapshot_id = self.source.inventory.snapshot_id, .pending = pending, .authorization = if (adapter.server.cfg.distributed_sql_scope_seed) |seed| .{ .scope = @import("../serverless/sql/bridge.zig").principalScope(seed, adapter.context), .table = @import("lake_sql_retained_cut.zig").ReadTable.from(self.table) } else null }, adapter.context.cancellation);
+            return .{ .token = token.token, .min_splits = token.minimumSplits(), .schema = try @import("../serverless/sql/lake_source.zig").Host.fingerprint(a, self.table), .snapshot = try a.dupe(u8, self.source.inventory.snapshot_id), .wal_cut = pending.lsn, .expires_ms = expires, .estimated_bytes = estimates.bytes +| token.bytes, .estimated_rows = estimates.rows +| token.rows, .bucket = if (token.paged) null else try @import("../serverless/sql/lake_source.zig").Host.bucketLayout(a, self.source, pin.context) };
+        }
+    };
+
     const LakeStatement = struct {
         alloc: std.mem.Allocator,
         cursors: []catalog.Cursor,
         sources: std.AutoHashMapUnmanaged(u64, *@import("antfly_local_sources").serverless_query_lake_serving.ServingSource) = .empty,
+        raw_pending: std.AutoHashMapUnmanaged(u64, @import("../serverless/lake_ingestion.zig").Pending) = .empty,
         opened: usize = 0,
         overlays: std.AutoHashMapUnmanaged(u64, *const @import("lake_sql_overlay.zig").Cut) = .empty,
         overlay_arena: ?std.heap.ArenaAllocator = null,
@@ -2303,6 +2354,7 @@ pub const Adapter = struct {
                 self.alloc.destroy(source.*);
             }
             self.sources.deinit(self.alloc);
+            self.raw_pending.deinit(self.alloc);
             self.overlays.deinit(self.alloc);
             if (self.overlay_arena) |*arena| arena.deinit();
             self.alloc.free(self.cursors);
@@ -2499,6 +2551,7 @@ pub const Adapter = struct {
                 if (retained) |cut| {
                     if (!std.mem.eql(u8, source.inventory.snapshot_id, cut.snapshot_id)) return error.CatalogGenerationChanged;
                     const oa = owner.overlay_arena.?.allocator();
+                    try owner.raw_pending.put(alloc, request.table.id, cut.pending);
                     const overlay = try oa.create(@import("lake_sql_overlay.zig").Cut);
                     overlay.* = try @import("lake_sql_overlay.zig").Cut.initForTable(oa, cut.pending, request.table);
                     if (cut.pending.count() != 0) try owner.overlays.put(alloc, request.table.id, overlay);
@@ -2535,6 +2588,7 @@ pub const Adapter = struct {
                         .snapshot_id = source.inventory.snapshot_id,
                         .pending = pending,
                     }, lake_options, context);
+                    try owner.raw_pending.put(alloc, request.table.id, pending);
                     overlay.* = try @import("lake_sql_overlay.zig").Cut.initForTable(oa, pending, request.table);
                     if (pending.count() != 0) try owner.overlays.put(alloc, request.table.id, overlay);
                 }
@@ -2560,6 +2614,15 @@ pub const Adapter = struct {
                     };
                 errdefer cursor.close(cursor.ptr);
                 if (!owner.overlays.contains(request.table.id)) cursor.* = try @import("lake_index_sql_rows.zig").wrapDynamic(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?, cursor.*);
+                if (self.server.cfg.distributed_sql_join != null) {
+                    if (owner.overlay_arena == null) owner.overlay_arena = .init(alloc);
+                    const export_owner = try owner.overlay_arena.?.allocator().create(DistributedCut);
+                    export_owner.* = .{ .adapter = self, .table = request.table, .source = owner.sources.get(request.table.id).?, .pending = owner.raw_pending.get(request.table.id) };
+                    cursor.export_snapshot = .{ .ptr = export_owner, .export_cut = DistributedCut.capture };
+                    if (owner.raw_pending.get(request.table.id)) |pending| {
+                        if (cursor.estimated_bytes) |*bytes| bytes.* +|= try @import("../serverless/sql/lake_source.zig").overlayBytes(pending);
+                    }
+                }
                 try self.verify(scratch.allocator(), request.table);
             } else {
                 cursor.* = owner.native.?.cursors[native_index];
@@ -3168,6 +3231,7 @@ pub const Adapter = struct {
         if (table.read_authority != null) return error.Forbidden;
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
+        try self.requireUnprotectedMutation(alloc, table);
         const source = self.server.table_reads orelse return error.UnsupportedSqlExecution;
         if (source.route_fence != null or source.vtable.open_relational_read == null) return error.UnsupportedSqlExecution;
         const upper = try pointUpperBound(alloc, key);
@@ -3199,6 +3263,8 @@ pub const Adapter = struct {
         return .{ .ptr = owner, .candidates = MutationPreparation.candidates, .prepare = MutationPreparation.prepare, .finish = MutationPreparation.finish, .close = MutationPreparation.close };
     }
     fn prepareMutationsWithVisibility(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation, require_visible: bool) ![]const catalog.Mutation {
+        const self: *Adapter = @ptrCast(@alignCast(ptr));
+        try self.requireUnprotectedMutation(alloc, table);
         const key = for (input) |mutation| {
             if (mutation.row != null or (table.has_triggers and !mutation.predicate_only)) break mutation.key;
         } else return input;
@@ -3231,6 +3297,7 @@ pub const Adapter = struct {
         if (table.read_authority != null) return error.Forbidden;
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
+        try self.requireUnprotectedMutation(alloc, table);
         // Normalize final images before enforcing ingress row filters, even
         // for relational INSERTs without RETURNING. Unfiltered ordinary rows
         // retain their single native commit preparation. Volatile defaults
@@ -6141,4 +6208,34 @@ test "SQL implicit abort rejoins exact owned terminal abort without contradictin
     try std.testing.expectError(error.SqlTransactionNotActive, ImplicitTransaction.rollbackOwnedSession(&session, id));
     try std.testing.expectEqual(@as(usize, 4), probe.rollbacks);
     try std.testing.expectEqual(@as(?sql.Id, id), session.transaction_id);
+}
+
+test "privacy SQL effect target and typed preparation reject before preimages or trigger VM" {
+    const Reads = @import("antfly_local_sources").api_table_read_source;
+    const Fake = struct {
+        captures: usize = 0,
+        fn capture(raw: *anyopaque, _: std.mem.Allocator, table: []const u8, _: ?u64) anyerror![64]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("physical", table);
+            self.captures += 1;
+            return @splat('a');
+        }
+    };
+    const a = std.testing.allocator;
+    var fake: Fake = .{};
+    // Only the privacy admission port is initialized: an accidental row,
+    // normalization, catalog or VM dispatch must not occur in this negative.
+    var server: http_server.ApiHttpServer = undefined;
+    server.table_reads = Reads.TableReadSource{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .privacy_policy_version = Fake.capture } };
+    var adapter: Adapter = undefined;
+    adapter.server = &server;
+    adapter.context = .{};
+    const table: catalog.Table = .{ .id = 7, .physical_name = "physical", .schema_version = 1, .columns = &.{}, .has_triggers = true };
+    var command: Adapter.StatementCommand = .{ .adapter = &adapter, .alloc = a, .journal = .init(a) };
+    defer command.journal.deinit();
+    try std.testing.expectError(error.UnsupportedSqlExecution, command.noteTarget(table));
+    try std.testing.expectEqual(@as(usize, 0), command.targets.count());
+    try std.testing.expectError(error.UnsupportedSqlExecution, Adapter.prepareMutationsWithVisibility(&adapter, a, table, &.{}, false));
+    try std.testing.expectError(error.UnsupportedSqlExecution, Adapter.prepareMutations(&adapter, a, table, &.{}));
+    try std.testing.expectEqual(@as(usize, 3), fake.captures);
 }

@@ -96,6 +96,8 @@ pub const CatalogCursor = struct {
 /// Replacement/import is reserved for bootstrap; normal DDL sends touched rows.
 pub const StandaloneCatalogUpdate = struct {
     pub const TableReplacement = struct {
+        /// A compact exact-CAS proof avoids duplicating large legacy indexes.
+        expected_indexes_digest: ?[32]u8 = null,
         expected: metadata.TableRecord,
         replacement: metadata.TableRecord,
     };
@@ -385,6 +387,8 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_export_standalone_portable: void,
     sql_snapshot_cohort: @import("../../system_catalog/server_call.zig").SqlSnapshotCohortRequest,
     catalog_list_tables: system_catalog.TableList,
+    privacy_due_table: i64,
+    table_by_name: []const u8,
     catalog_meta: void,
     catalog_admission: system_catalog.Mutation,
     catalog_admission_bound: struct { mutation: system_catalog.Mutation, binding_guard: system_catalog.RelationMutationGuard },

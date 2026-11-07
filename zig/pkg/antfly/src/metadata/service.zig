@@ -493,6 +493,74 @@ fn replaceTableDefinitionStampedWithReceipt(
     return replaceTableDefinitionGuardedWithReceipt(service, expected, replacement, null);
 }
 
+/// Shared by HTTP ingress and the in-process API adapter. Semantic snapshots
+/// may retain older runtime progress; only the physical point read is a CAS
+/// preimage. Foreign/test services may borrow their uncached supplied snapshot.
+pub fn validateCurrentTableDefinitionOnService(svc: anytype, snapshot: anytype, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+    if (replacement.table_id != expected.table_id) return error.TableGenerationChanged;
+    if (comptime @hasDecl(@TypeOf(svc.*), "tableRecord")) {
+        const current = (try svc.tableRecord(std.heap.page_allocator, replacement.name)) orelse return error.TableNotFound;
+        defer metadata_table_manager.freeTable(std.heap.page_allocator, current);
+        if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return error.TableGenerationChanged;
+    } else {
+        for (snapshot.tables) |current| {
+            if (!std.mem.eql(u8, current.name, replacement.name)) continue;
+            if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return error.TableGenerationChanged;
+            return;
+        }
+        return error.TableNotFound;
+    }
+}
+
+/// The allowlist plus a current physical preimage suffices for runtime-only
+/// updates. No ownership/catalog enumeration or semantic revalidation is needed
+/// because every authored field is unchanged. Missing point-read capability
+/// retains the ordinary admission path for foreign services.
+pub fn admitPrivacyProgressOnService(svc: anytype, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !bool {
+    if (comptime @hasDecl(@TypeOf(svc.*), "tableRecord")) {
+        if (!try metadata_table_manager.privacyProgressOnly(std.heap.page_allocator, expected, replacement)) return false;
+        try validateCurrentTableDefinitionOnService(svc, .{ .tables = &[_]metadata_table_manager.TableRecord{} }, expected, replacement);
+        return true;
+    } else return false;
+}
+
+test "privacy definition preflight uses current progress while semantic snapshots remain cached" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    const cached = metadata_table_manager.TableRecord{ .table_id = 1, .name = "private", .indexes_json = try privacy.install(a, "{}", resource) };
+    resource.coverage.retry_after_millis = 200;
+    var current = cached;
+    current.indexes_json = try privacy.replaceResource(a, cached.indexes_json, resource);
+    resource.coverage.retry_after_millis = 300;
+    var desired = current;
+    desired.indexes_json = try privacy.replaceResource(a, current.indexes_json, resource);
+    const Fake = struct {
+        current: metadata_table_manager.TableRecord,
+        reads: usize = 0,
+        pub fn tableRecord(self: *@This(), alloc: std.mem.Allocator, name: []const u8) !?metadata_table_manager.TableRecord {
+            self.reads += 1;
+            if (!std.mem.eql(u8, name, self.current.name)) return null;
+            return try metadata_table_manager.cloneTable(alloc, self.current);
+        }
+    };
+    var fake = Fake{ .current = current };
+    const snapshot = .{ .tables = &[_]metadata_table_manager.TableRecord{cached} };
+    try validateCurrentTableDefinitionOnService(&fake, snapshot, current, desired);
+    try std.testing.expectEqual(@as(usize, 1), fake.reads);
+    // Fake deliberately has no adminSnapshot method: runtime admission must
+    // require only its bounded physical point-read capability.
+    try std.testing.expect(try admitPrivacyProgressOnService(&fake, current, desired));
+    try std.testing.expectEqual(@as(usize, 2), fake.reads);
+    var semantic = desired;
+    semantic.description = "changed definition";
+    try std.testing.expect(!try admitPrivacyProgressOnService(&fake, current, semantic));
+    try std.testing.expectEqual(@as(usize, 2), fake.reads);
+    try std.testing.expectError(error.TableGenerationChanged, validateCurrentTableDefinitionOnService(&fake, snapshot, cached, desired));
+}
+
 /// Cheap admission uses the same bounded point contract as SQL name binding.
 /// It is not authority to commit: native apply repeats the exact owner/binding
 /// check in the replacing transaction. Never retain a group-wide revision CAS.
@@ -686,46 +754,45 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
         return error.MetadataMutationOutcomeUnknown;
     };
 
-    // Exact receipt application makes the local projection authoritative for
-    // this command. Inspect it once; polling leadership after admission would
-    // incorrectly turn a committed mutation into a retryable NotLeader error.
-    const current = store.getTable(
-        service.alloc,
-        service.metadata_group_id,
-        expected.table_id,
-    ) catch |err| {
+    // One post-admission boundary covers every fallible observation, including
+    // receipt reads and semantic comparisons. A failed observation cannot
+    // establish rejection or authorize replay of this already-admitted write.
+    const outcome = observeTableDefinitionApply(store, service.alloc, service.metadata_group_id, expected, replacement, receipt) catch |err| {
         std.log.warn(
-            "table definition mutation applied but projection observation failed table={s} table_id={} term={} index={} err={s}",
+            "table definition mutation applied but outcome observation failed table={s} table_id={} term={} index={} err={s}",
             .{ expected.name, expected.table_id, receipt.term, receipt.index, @errorName(err) },
         );
         return error.MetadataMutationOutcomeUnknown;
-    } orelse {
-        std.log.warn(
-            "table definition mutation applied but table is absent from projection table={s} table_id={} term={} index={}",
-            .{ expected.name, expected.table_id, receipt.term, receipt.index },
-        );
-        return error.MetadataMutationOutcomeUnknown;
     };
-    defer metadata_table_manager.freeTable(service.alloc, current);
-    if (try store.resolverNamespaceReplacementRejected(service.alloc, service.metadata_group_id, receipt.term, receipt.index, expected, replacement)) return error.TableGenerationChanged;
-    const acknowledged = @import("schema_migration_finalization.zig").matchesPublishedDefinition(service.alloc, current, replacement) catch |err| {
-        std.log.warn("table definition mutation acknowledgement failed table={s} table_id={} term={} index={} err={s}", .{ expected.name, expected.table_id, receipt.term, receipt.index, @errorName(err) });
-        return error.MetadataMutationOutcomeUnknown;
-    };
-    if (acknowledged or try store.resolverNamespaceReplacementMatches(service.alloc, service.metadata_group_id, current, replacement)) return .{
-        .metadata_group_id = service.metadata_group_id,
-        .metadata_incarnation = metadata_incarnation,
-        .term = receipt.term,
-        .index = receipt.index,
-    };
-    // Only the exact replacement or its deterministic migration finalization
-    // proves the published logical state. Any other supersession remains
-    // ambiguous; never turn it back into a replayable conflict.
-    std.log.warn(
-        "table definition mutation applied but exact replacement is no longer projected table={s} table_id={} term={} index={} same_prior_schema={} prior_read_bytes={} current_read_bytes={} proposed_read_bytes={} same_proposed_indexes={}",
-        .{ expected.name, expected.table_id, receipt.term, receipt.index, std.mem.eql(u8, current.schema_json, expected.schema_json), expected.read_schema_json.len, current.read_schema_json.len, replacement.read_schema_json.len, std.mem.eql(u8, current.indexes_json, replacement.indexes_json) },
-    );
-    return error.MetadataMutationOutcomeUnknown;
+    switch (outcome) {
+        .rejected => return error.TableGenerationChanged,
+        .accepted => return .{
+            .metadata_group_id = service.metadata_group_id,
+            .metadata_incarnation = metadata_incarnation,
+            .term = receipt.term,
+            .index = receipt.index,
+        },
+        .unknown => {
+            // A later command may have superseded or reverted this definition.
+            std.log.warn(
+                "table definition mutation applied but exact replacement is no longer projected table={s} table_id={} term={} index={}",
+                .{ expected.name, expected.table_id, receipt.term, receipt.index },
+            );
+            return error.MetadataMutationOutcomeUnknown;
+        },
+    }
+}
+
+const TableDefinitionApplyOutcome = enum { accepted, rejected, unknown };
+
+fn observeTableDefinitionApply(store: anytype, alloc: std.mem.Allocator, group_id: u64, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, receipt: MetadataProposalReceipt) !TableDefinitionApplyOutcome {
+    const current = (try store.getTable(alloc, group_id, expected.table_id)) orelse return .unknown;
+    defer metadata_table_manager.freeTable(alloc, current);
+    if (try store.tableDefinitionReplacementRejected(alloc, group_id, receipt.term, receipt.index, expected, replacement)) return .rejected;
+    if (try @import("schema_migration_finalization.zig").matchesPublishedDefinition(alloc, current, replacement)) return .accepted;
+    if (try store.resolverNamespaceReplacementMatches(alloc, group_id, current, replacement) or
+        try metadata_table_manager.privacyPolicyInstallationMatches(alloc, expected, replacement, current)) return .accepted;
+    return .unknown;
 }
 
 test "relation mutation admission uses exact point ownership without source revision serialization" {
@@ -795,15 +862,19 @@ test "relation mutation admission uses exact point ownership without source revi
     try std.testing.expectError(error.CatalogGenerationChanged, requireRelationMutationOwner(&service, expected, guard));
 }
 
-test "table definition stamp distinguishes rejection from post-admission ambiguity" {
+test "privacy table definition stamp distinguishes rejection from all post-admission failures" {
     const FakeStore = struct {
         current: metadata_table_manager.TableRecord,
         reads: usize = 0,
         rejected_index: ?u64 = null,
-        pub fn resolverNamespaceReplacementRejected(self: *@This(), _: std.mem.Allocator, _: u64, term: u64, index: u64, _: metadata_table_manager.TableRecord, _: metadata_table_manager.TableRecord) !bool {
+        observation_error: ?anyerror = null,
+        failure_stage: enum { projection, rejection, comparison } = .projection,
+        pub fn tableDefinitionReplacementRejected(self: *@This(), _: std.mem.Allocator, _: u64, term: u64, index: u64, _: metadata_table_manager.TableRecord, _: metadata_table_manager.TableRecord) !bool {
+            if (self.failure_stage == .rejection) if (self.observation_error) |err| return err;
             return term == 7 and self.rejected_index == index;
         }
-        pub fn resolverNamespaceReplacementMatches(_: *@This(), _: std.mem.Allocator, _: u64, current: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !bool {
+        pub fn resolverNamespaceReplacementMatches(self: *@This(), _: std.mem.Allocator, _: u64, current: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !bool {
+            if (self.failure_stage == .comparison) if (self.observation_error) |err| return err;
             return metadata_table_manager.tableDefinitionsEqual(current, replacement);
         }
 
@@ -822,6 +893,7 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
             _: u64,
         ) !?metadata_table_manager.TableRecord {
             self.reads += 1;
+            if (self.failure_stage == .projection) if (self.observation_error) |err| return err;
             return try metadata_table_manager.cloneTable(alloc, self.current);
         }
     };
@@ -915,6 +987,24 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
     try std.testing.expectEqual(@as(u64, 19), stamp.index);
     try std.testing.expectEqual(@as(usize, 1), committed.wait_calls);
     try std.testing.expectEqual(@as(usize, 1), committed.store.reads);
+
+    // Storage, allocation and control failures at every post-apply stage
+    // remain ambiguous even when the installed replacement is already visible.
+    for ([_]anyerror{ error.StorageBusy, error.NotLeader, error.DeadlineExceeded, error.OutOfMemory }) |err| {
+        inline for (.{ .projection, .rejection, .comparison }) |stage| {
+            var observed: FakeService = .{ .alloc = std.testing.allocator, .store = .{ .current = replacement, .observation_error = err, .failure_stage = stage } };
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, replaceTableDefinitionStampedWithReceipt(&observed, expected, replacement));
+            try std.testing.expectEqual(@as(usize, 1), observed.wait_calls);
+            try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(observed.store.current, replacement));
+        }
+    }
+    // The privacy-specific semantic comparison shares the same boundary.
+    var malformed = replacement;
+    malformed.indexes_json = "{";
+    var semantic: FakeService = .{ .alloc = std.testing.allocator, .store = .{ .current = replacement } };
+    semantic.store.current.indexes_json = "{}";
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, replaceTableDefinitionStampedWithReceipt(&semantic, expected, malformed));
+    try std.testing.expectEqual(@as(usize, 1), semantic.wait_calls);
 
     var superseded: FakeService = .{
         .alloc = std.testing.allocator,
@@ -3285,6 +3375,13 @@ fn storesHaveDenseNativeAuthority(stores: []const metadata_table_manager.StoreRe
     return false;
 }
 
+fn requirePrivacyStoreAdmission(service: anytype, record: metadata_table_manager.StoreRecord) !void {
+    if (!metadata_table_manager.storeServesTableData(record.role) or metadata_table_manager.privacyProtocolSupported(record.reporter_incarnation, record.artifact_sources_protocol_version)) return;
+    const tables = try service.listProjectedTables(service.alloc);
+    defer service.freeProjectedTables(service.alloc, tables);
+    for (tables) |table| if (metadata_topology_protocol.usesPrivacy(table.indexes_json)) return error.PrivacyProtocolUpgradeRequired;
+}
+
 fn validateDenseNativeStoreAdmission(
     stores: []const metadata_table_manager.StoreRecord,
     activated_version: u16,
@@ -3583,6 +3680,11 @@ test "relation mutation admission projects naming capability without materializi
 }
 
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .create_restore_job_with_staging) {
+        const request = command.create_restore_job_with_staging;
+        if (@import("schema_reader_wire.zig").requiresLegacySqlTruncatePreparation(request.value, request.plan_json)) return metadata_topology_protocol.sql_truncate_preparation_version;
+    }
+    if (command == .compare_and_set_job_state) return if (std.mem.startsWith(u8, command.compare_and_set_job_state.key, "privacy/")) metadata_topology_protocol.privacy_version else metadata_topology_protocol.job_state_version;
     const paired = switch (command) {
         .apply_system_catalog, .apply_sql_policy_publication => |bytes| @import("schema_reader_wire.zig").requiresCoupledSchemaPolicy(bytes),
         else => false,
@@ -3594,6 +3696,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         .create_restore_job_with_staging => |request| request.plan_json,
         else => null,
     };
+    if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresTruncatePreparation(bytes)) return @max(native_index, metadata_topology_protocol.sql_truncate_preparation_version);
     if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresStrongestDecoder(bytes)) return @max(native_index, metadata_topology_protocol.current_version);
     if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresInitialCreationCopy(bytes)) return @max(native_index, metadata_topology_protocol.initial_fk_creation_copy_version);
     if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresInitialCounterEffects(bytes)) return @max(native_index, metadata_topology_protocol.initial_fk_column_sequences_version);
@@ -3800,6 +3903,7 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
         },
         else => "",
     };
+    if (metadata_topology_protocol.usesPrivacy(namespace_indexes)) return metadata_topology_protocol.privacy_version;
     if (metadata_topology_protocol.usesResolverRecords(namespace_indexes)) return metadata_topology_protocol.resolver_records_version;
     if (metadata_topology_protocol.usesResolverNamespaces(namespace_indexes)) return metadata_topology_protocol.resolver_namespaces_version;
     switch (command) {
@@ -7707,6 +7811,7 @@ pub const MetadataService = struct {
         else
             0;
         try validateDenseNativeStoreAdmission(stores, activated_version, record);
+        try requirePrivacyStoreAdmission(self, record);
         const topology_floor = if (self.projectedStore()) |store| try store.getRelationalTopologyProtocolActivationVersion(self.metadata_group_id) else 0;
         try @import("relational_topology_admission.zig").requireStoreAtFloor(topology_floor, record);
         const reader_floor = if (self.projectedStore()) |store| try store.getSchemaReaderFloor(self.metadata_group_id) else metadata_table_manager.SchemaReaderFloor{};
@@ -8472,6 +8577,28 @@ pub const MetadataService = struct {
         return current_status;
     }
 
+    pub fn privacyAuthorityTerm(self: *MetadataService) !?u64 {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const observation = serviceGroupRaftTopologyObservation(self, self.metadata_group_id);
+        if (!std.mem.eql(u8, observation.role, "leader")) return null;
+        return observation.term;
+    }
+    pub fn nextPrivacyWork(self: *MetadataService, a: std.mem.Allocator, now: i64) !?metadata_table_manager.PrivacyWork {
+        const term = (try self.privacyAuthorityTerm()) orelse return null;
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const table = (store.nextPrivacyTable(a, self.metadata_group_id, now) catch |err| blk: {
+            if (err != error.InvalidDerivedCatalogIndex) return err;
+            try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
+            break :blk try store.nextPrivacyTable(a, self.metadata_group_id, now);
+        }) orelse return null;
+        return .{ .table = table, .term = term };
+    }
+    pub fn tableRecord(self: *MetadataService, a: std.mem.Allocator, name: []const u8) !?metadata_table_manager.TableRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return store.tableByName(a, self.metadata_group_id, name);
+    }
+
     pub fn nativeOwnerDataUri(self: *MetadataService, alloc: std.mem.Allocator, node_id: u64, store_id: u64, context: api_operation.RequestContext) !?[]u8 {
         try context.ensureActive();
         const records = try self.listProjectedStores(alloc);
@@ -8501,6 +8628,10 @@ pub const MetadataService = struct {
             self.catalogProjectionSource(),
             deadline_ns,
         );
+    }
+
+    pub fn privacyPolicyBinding(self: *MetadataService, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
+        return self.catalog_projection_reader.privacyPolicyBinding(self.alloc, self.metadata_group_id, self.catalogProjectionSource(), table_name, deadline_ns);
     }
 
     pub fn catalogTableRoutingSnapshot(self: *MetadataService, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
@@ -10559,6 +10690,7 @@ pub const MetadataHttpService = struct {
         else
             0;
         try validateDenseNativeStoreAdmission(stores, activated_version, record);
+        try requirePrivacyStoreAdmission(self, record);
         const topology_floor = if (self.projectedStore()) |store| try store.getRelationalTopologyProtocolActivationVersion(self.metadata_group_id) else 0;
         try @import("relational_topology_admission.zig").requireStoreAtFloor(topology_floor, record);
         const reader_floor = if (self.projectedStore()) |store| try store.getSchemaReaderFloor(self.metadata_group_id) else metadata_table_manager.SchemaReaderFloor{};
@@ -12579,6 +12711,28 @@ pub const MetadataHttpService = struct {
         );
     }
 
+    pub fn privacyAuthorityTerm(self: *MetadataHttpService) !?u64 {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const observation = serviceGroupRaftTopologyObservation(self, self.metadata_group_id);
+        if (!std.mem.eql(u8, observation.role, "leader")) return null;
+        return observation.term;
+    }
+    pub fn nextPrivacyWork(self: *MetadataHttpService, a: std.mem.Allocator, now: i64) !?metadata_table_manager.PrivacyWork {
+        const term = (try self.privacyAuthorityTerm()) orelse return null;
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const table = (store.nextPrivacyTable(a, self.metadata_group_id, now) catch |err| blk: {
+            if (err != error.InvalidDerivedCatalogIndex) return err;
+            try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
+            break :blk try store.nextPrivacyTable(a, self.metadata_group_id, now);
+        }) orelse return null;
+        return .{ .table = table, .term = term };
+    }
+    pub fn tableRecord(self: *MetadataHttpService, a: std.mem.Allocator, name: []const u8) !?metadata_table_manager.TableRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return store.tableByName(a, self.metadata_group_id, name);
+    }
+
     pub fn nativeOwnerDataUri(self: *MetadataHttpService, alloc: std.mem.Allocator, node_id: u64, store_id: u64, context: api_operation.RequestContext) !?[]u8 {
         try context.ensureActive();
         if (!self.projection_mutex.tryLock()) return error.ResourceTemporarilyUnavailable;
@@ -12610,6 +12764,10 @@ pub const MetadataHttpService = struct {
             self.catalogProjectionSource(),
             deadline_ns,
         );
+    }
+
+    pub fn privacyPolicyBinding(self: *MetadataHttpService, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
+        return self.catalog_projection_reader.privacyPolicyBinding(self.alloc, self.metadata_group_id, self.catalogProjectionSource(), table_name, deadline_ns);
     }
 
     pub fn catalogTableRoutingSnapshot(self: *MetadataHttpService, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
@@ -24720,4 +24878,21 @@ test "row-policy coupled schema metadata175 is selected before historical catalo
     try std.testing.expectEqual(metadata_topology_protocol.coupled_schema_policy_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"sql_relation\":{\"change\":{\"definition\":{\"policy_pair\":{}}}}}" }));
     try std.testing.expectEqual(metadata_topology_protocol.coupled_schema_policy_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_sql_policy_publication = "{\"change\":{\"begin\":{\"schema_pair\":{}}}}" }));
     try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"schema_json\":\"schema_pair\",\"policy_pair\":null}" }) < metadata_topology_protocol.coupled_schema_policy_version);
+}
+
+test "SQL TRUNCATE preparation metadata177 precedes ordinary restore selectors" {
+    try std.testing.expectEqual(metadata_topology_protocol.sql_truncate_preparation_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{\"plan\":{\"truncate_preparation\":{}}}" }));
+    try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{\"plan\":{}}" }) < metadata_topology_protocol.sql_truncate_preparation_version);
+    var region: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer region.deinit();
+    const a = region.allocator();
+    const triggers = @import("antfly_local_sources").sql_catalog.triggers;
+    const state = try triggers.prepare(a, .{ .metadata_incarnation = @splat(9), .table_id = 7, .generation = 1 }, .{ .name = "truncate", .timing = .before, .events = .{ .truncate = true }, .level = .statement, .function = .{ .id = 9, .namespace_id = 2, .database = "antfly", .namespace = "public", .name = "notice" } }, false);
+    const schema = try std.fmt.allocPrint(a, "{{\"sql_triggers\":{s}}}", .{try state.encode(a)});
+    const plan = try std.json.Stringify.valueAlloc(a, .{ .targets = &.{.{ .replace = .{ .table = .{ .schema_json = schema } } }} }, .{});
+    defer a.free(plan);
+    const sql_job = "{\"source_kind\":\"empty_generation\",\"idempotency_namespace\":\"sql-truncate:basic:owner\"}";
+    try std.testing.expectEqual(metadata_topology_protocol.sql_truncate_preparation_version, transitionRequiredCoordinatedDecoderVersion(.{ .create_restore_job_with_staging = .{ .key = "job", .value = sql_job, .plan_json = plan } }));
+    const reset_job = "{\"source_kind\":\"empty_generation\",\"idempotency_namespace\":\"native-unlogged-recovery\"}";
+    try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(.{ .create_restore_job_with_staging = .{ .key = "job", .value = reset_job, .plan_json = plan } }) < metadata_topology_protocol.sql_truncate_preparation_version);
 }

@@ -3176,6 +3176,7 @@ test "relational nullness probes authenticate metadata without reading dense or 
         columns[0].column_type = .boolean;
         columns[1].column_type = .json;
         columns[1].is_json = true;
+        columns[1].json_kind = .any;
         const table = runtime_schema.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = columns };
         var layout = try PhysicalLayout.init(a, table);
         defer layout.deinit();
@@ -3217,7 +3218,7 @@ test "ordinal rows bind layout support projection checksum and canonical bytes" 
         .{ .name = "name", .path = "name", .column_type = .string, .required = true },
         .{ .name = "count", .path = "count", .column_type = .integer, .required = true },
         .{ .name = "active", .path = "active", .column_type = .boolean, .allows_null = true },
-        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true },
+        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any },
         .{ .name = "note", .path = "note", .column_type = .string },
     };
     const schema = runtime_schema.TableSchema{
@@ -3363,10 +3364,10 @@ test "ordinal typed projection preserves SQL types null absence and exact JSON" 
         .{ .name = "f", .path = "f", .column_type = .number },
         .{ .name = "b", .path = "b", .column_type = .boolean },
         .{ .name = "d", .path = "d", .column_type = .datetime },
-        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true },
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
         .{ .name = "n", .path = "n", .column_type = .string, .allows_null = true },
         .{ .name = "absent", .path = "absent", .column_type = .string },
-        .{ .name = "json_null", .path = "json_null", .column_type = .json, .is_json = true },
+        .{ .name = "json_null", .path = "json_null", .column_type = .json, .is_json = true, .json_kind = .any },
     };
     const schema: runtime_schema.TableSchema = .{ .version = 2, .storage_mode = .relational, .relational_columns = &columns };
     const cells = [_]Cell{
@@ -3420,7 +3421,7 @@ test "ordinal typed projection preserves SQL types null absence and exact JSON" 
 test "ordinal root materialization preserves exact nested JSON numbers" {
     const alloc = std.testing.allocator;
     const columns = [_]runtime_schema.RelationalColumn{
-        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true },
+        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any },
     };
     const schema: runtime_schema.TableSchema = .{
         .version = 10,
@@ -3607,7 +3608,7 @@ test "ordinal native SQL projection owns arrays numeric and missing cells across
         .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .int64 },
         .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric },
         .{ .name = "s", .path = "s", .column_type = .string },
-        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true },
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any },
         .{ .name = "missing", .path = "missing", .column_type = .integer, .allows_null = true },
         .{ .name = "null", .path = "null", .column_type = .string, .allows_null = true },
     };

@@ -160,6 +160,9 @@ pub const Broker = struct {
     pub fn begin(self: *Broker, record: Table, event: @FieldType(preparation.Input, "event"), updated: []const []const u8) !void {
         const entry = try self.load(record);
         try self.captureClosure(entry);
+        return self.beginCaptured(entry, event, updated);
+    }
+    fn beginCaptured(self: *Broker, entry: *Entry, event: @FieldType(preparation.Input, "event"), updated: []const []const u8) !void {
         const already = switch (event) {
             .insert => entry.begun.insert,
             .update => entry.begun.update,
@@ -179,6 +182,16 @@ pub const Broker = struct {
             .delete => entry.begun.delete = true,
             .truncate => entry.begun.truncate = true,
         }
+    }
+    /// Called before either phase of predecision TRUNCATE evaluation.
+    pub fn beginTruncate(self: *Broker, record: Table) !void {
+        const entry = try self.load(record);
+        // TRUNCATE has no row mutations or referential-action VM calls. Its
+        // authoritative CASCADE set is already selected by the DDL owner;
+        // never capture unrelated incoming FK executable closures here.
+        const vm = entry.owner.execution orelse return error.CatalogGenerationChanged;
+        try vm.requirePredecisionContract(catalog.trigger_runtime.predecision_contract_version);
+        try self.beginCaptured(entry, .truncate, &.{});
     }
     pub fn beginStatement(self: *Broker, table: catalog.Table, statement: local.sql_ast.Statement) !void {
         return self.statementPhase(table, statement, false);

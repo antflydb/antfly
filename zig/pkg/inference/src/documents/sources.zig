@@ -92,6 +92,51 @@ pub fn audioMime(bytes: []const u8) ![]const u8 {
         .webm => "audio/webm",
     };
 }
+// Semantic replacements are logical regions, independent of how many source
+// glyphs painted them. Borrow text until ordering/limits are resolved, then
+// allocate each emitted region once. The Reader retains original glyphs.
+fn nativePdfRegionsAlloc(a: A, analysis: pdf.reader.PageTextAnalysis, limit: usize, control: c.Control) ![]c.Region {
+    var regions = std.ArrayList(c.Region).empty;
+    defer regions.deinit(a);
+    for (analysis.runs, 0..) |run, index| {
+        if (index % 256 == 0) try control.check();
+        if (run.semantic_span_index != std.math.maxInt(usize)) continue;
+        const span = run.output_span orelse continue;
+        if (span.start >= span.end or span.end > analysis.text.len) continue;
+        if (regions.items.len >= limit) return error.DocumentRegionLimitExceeded;
+        const box = run.bounds();
+        try regions.append(a, .{ .id = span.start, .text = analysis.text[span.start..span.end], .bbox = if (box) |b| .{ b.min_x, b.min_y, b.max_x, b.max_y } else null, .origin = .native });
+    }
+    for (analysis.semantic_spans, 0..) |span, index| {
+        if (index % 256 == 0) try control.check();
+        const output = span.output_span orelse continue;
+        if (output.start >= output.end or output.end > analysis.text.len) continue;
+        if (regions.items.len >= limit) return error.DocumentRegionLimitExceeded;
+        const box = span.output_bounds;
+        try regions.append(a, .{ .id = output.start, .text = analysis.text[output.start..output.end], .bbox = if (box) |b| .{ b.min_x, b.min_y, b.max_x, b.max_y } else null, .origin = .native });
+    }
+    try control.check();
+    // IDs temporarily carry emitted byte offsets for reading order.
+    std.mem.sort(c.Region, regions.items, {}, struct {
+        fn less(_: void, left: c.Region, right: c.Region) bool {
+            return left.id < right.id;
+        }
+    }.less);
+    const owned = try regions.toOwnedSlice(a);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |region| a.free(region.text);
+        a.free(owned);
+    }
+    for (owned, 0..) |*region, index| {
+        if (index % 256 == 0) try control.check();
+        region.text = try a.dupe(u8, region.text);
+        initialized += 1;
+        region.id = index;
+    }
+    return owned;
+}
+
 pub const Source = struct {
     input: Input,
     fingerprint: [64]u8,
@@ -258,12 +303,10 @@ pub const Source = struct {
                 page.kind = .page;
                 page.coordinate_space = .pdf_points;
                 page.native_text = try a.dupe(u8, analysis.text);
-                const regions = try a.alloc(c.Region, analysis.runs.len);
-                for (regions, analysis.runs, 0..) |*region, run, i| {
-                    const box = run.bounds();
-                    region.* = .{ .id = i, .text = try a.dupe(u8, run.text), .bbox = if (box) |b| .{ b.min_x, b.min_y, b.max_x, b.max_y } else null, .origin = .native };
-                }
-                page.regions = regions;
+                page.regions = try nativePdfRegionsAlloc(a, analysis, limit, control);
+                if (analysis.diagnostics.unaligned_runs > 0 or analysis.diagnostics.unpositioned_spans > 0)
+                    try @import("representation.zig").finding(a, &page, "native_text_alignment_unavailable", true);
+                if (analysis.diagnostics.actual_text_incomplete) try @import("representation.zig").finding(a, &page, "native_actual_text_unavailable", true);
                 if (analysis.has_unrendered_annotations) try @import("representation.zig").finding(a, &page, "pdf_annotation_rendering_unavailable", true);
                 if (analysis.outline_fallback) try @import("representation.zig").finding(a, &page, "native_font_fallback", true);
                 if (analysis.has_nontext_visual) try @import("representation.zig").finding(a, &page, "visual_content_requires_inspection", true);
@@ -874,4 +917,42 @@ test "document audio MIME case and inline generic types preserve canonical sourc
         try std.testing.expectEqual(lower.fingerprint, source.fingerprint);
     }
     try std.testing.expectError(error.UnsupportedInferenceMimeType, audioInput(a, "data:Image/Png;base64,AA=="));
+}
+
+test "document PDF semantic regions retain replacement ordering geometry and limits" {
+    const Check = struct {
+        fn run(a: A) !void {
+            const analysis = pdf.reader.PageTextAnalysis{
+                .text = @constCast("Before Label After Unknown"),
+                .runs = @constCast(&[_]pdf.reader.TextRun{
+                    .{ .text = "before source", .x = 10, .y = 20, .font_size = 10, .advance_width = 20, .ascent = 8, .descent = 2, .output_span = .{ .start = 0, .end = 6 } },
+                    .{ .text = "first glyph", .x = 30, .y = 20, .font_size = 10, .semantic_span_index = 0, .output_span = .{ .start = 7, .end = 12 } },
+                    .{ .text = "second glyph", .x = 40, .y = 20, .font_size = 10, .semantic_span_index = 0, .output_span = .{ .start = 7, .end = 12 } },
+                    .{ .text = "after source", .x = 60, .y = 20, .font_size = 10, .advance_width = 20, .ascent = 8, .descent = 2, .output_span = .{ .start = 13, .end = 18 } },
+                }),
+                .semantic_spans = @constCast(&[_]pdf.reader.SemanticTextSpan{
+                    .{ .text = "Label", .run_start = 1, .run_end = 3, .output_span = .{ .start = 7, .end = 12 }, .output_bounds = .{ .min_x = 30, .min_y = 18, .max_x = 60, .max_y = 28 } },
+                    .{ .text = "Unknown", .run_start = 4, .run_end = 4, .output_span = .{ .start = 19, .end = 26 } },
+                }),
+            };
+            const regions = try nativePdfRegionsAlloc(a, analysis, 4, .{});
+            defer {
+                for (regions) |region| a.free(region.text);
+                a.free(regions);
+            }
+            try std.testing.expectEqual(@as(usize, 4), regions.len);
+            for (regions, [_][]const u8{ "Before", "Label", "After", "Unknown" }, 0..) |region, expected, index| {
+                try std.testing.expectEqualStrings(expected, region.text);
+                try std.testing.expectEqual(index, region.id);
+            }
+            try std.testing.expectEqual(@as(?[4]f64, .{ 30, 18, 60, 28 }), regions[1].bbox);
+            try std.testing.expect(regions[3].bbox == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, nativePdfRegionsAlloc(std.testing.allocator, .{
+        .text = @constCast("Label"),
+        .runs = &.{},
+        .semantic_spans = @constCast(&[_]pdf.reader.SemanticTextSpan{.{ .text = "Label", .run_start = 0, .run_end = 0, .output_span = .{ .start = 0, .end = 5 } }}),
+    }, 0, .{}));
 }

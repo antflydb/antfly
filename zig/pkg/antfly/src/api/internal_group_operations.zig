@@ -61,6 +61,7 @@ pub const Error = @import("external_transaction_errors.zig").Error || operation.
     GenerationTransitionActive,
     HierarchyCursorStale,
     DocumentArtifactPublicationFailed,
+    ArtifactPublicationPending,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
     ReadIndexTimeout,
@@ -1050,6 +1051,7 @@ pub const Operations = struct {
             input,
         ) catch |err| switch (err) {
             error.InvalidBatchRequest, error.InvalidArgument => return error.InvalidArgument,
+            error.ArtifactPublicationPending => return error.ArtifactPublicationPending,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
@@ -1218,9 +1220,9 @@ pub const Operations = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
     ) Error!db_mod.types.DocumentArtifactManifest {
-        try request.ensureActive();
+        const control = try request.platformDeadline();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .read_index) catch |err| {
+        return (reads.documentArtifactManifestGroupLocalControlled(alloc, group_id, table_name, doc_key, artifact_name, .read_index, .{ .execution_deadline_ns = control.deadline_ns, .cancellation = control.cancellation }) catch |err| {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
                 error.UnknownGroup, error.TableNotFound, error.NotFound => error.NotFound,

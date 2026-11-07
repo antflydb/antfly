@@ -960,6 +960,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break :blk owned_row_plan.?.rows[0].requests;
                 };
                 if (generated_templates.len == 0) continue;
+                const privacy_protected = for (generated_templates) |template| {
+                    if (@import("../../privacy/document.zig").isProtectedArtifactName(template.artifact_name)) break true;
+                } else false;
+                if (privacy_protected and (extracted[i].dense_embeddings.len != 0 or extracted[i].sparse_embeddings.len != 0)) return error.PrivacyExternalVectorsUnsupported;
                 const generated = try alloc.dupe(enrichment_types.GeneratedEnrichmentRequest, generated_templates);
                 defer alloc.free(generated);
                 for (generated) |*request| {
@@ -1549,6 +1553,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             request: enrichment_types.GeneratedEnrichmentRequest,
         ) !bool {
             _ = self;
+            // Managed privacy work publishes through the ordered producer lane.
+            // Synchronous source commits cannot substitute a local skip-state
+            // digest for the receiver-owned producer witness used by serving.
+            for ([_][]const u8{ request.artifact_name, request.embedding_name, request.upstream_artifact_name }) |name| {
+                if (std.mem.startsWith(u8, name, "_privacy_")) return false;
+            }
             // Neighbor context depends on committed adjacency, including graph effects
             // in this batch. The precommit producer path has neither that snapshot nor
             // the composed neighbor input/skip hash. Retain this request for postcommit

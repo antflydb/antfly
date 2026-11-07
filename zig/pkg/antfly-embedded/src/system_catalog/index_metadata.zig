@@ -25,7 +25,7 @@ pub fn isReservedEntry(name: []const u8) bool {
 }
 
 pub fn isOpaqueEntry(name: []const u8) bool {
-    return std.mem.eql(u8, name, "_resolver_record_store") or std.mem.eql(u8, name, "_resolver_record_owners") or
+    return std.mem.eql(u8, name, "_privacy") or std.mem.eql(u8, name, "_resolver_record_store") or std.mem.eql(u8, name, "_resolver_record_owners") or
         std.mem.eql(u8, name, "_resolver_curation") or
         std.mem.eql(u8, name, "_resolver_namespaces") or
         std.mem.eql(u8, name, "_curation_proposals");
@@ -42,4 +42,11 @@ pub fn isValidIndexName(name: []const u8) bool {
 test "native index names reject metadata slots and path traversal without restricting Unicode components" {
     for ([_][]const u8{ "indexes", "resolvers", "enrichments", "_resolver_record_store", "_curation_proposals", "../outside", "a/b", "a\\b", ".", "..", "", "a\x00b" }) |name| try std.testing.expect(!isValidIndexName(name));
     for ([_][]const u8{ "status_fts", "quoted index", "索引", "index.v2", "index-v3" }) |name| try std.testing.expect(isValidIndexName(name));
+}
+
+test "privacy metadata stays opaque and reserved through the shared index owner" {
+    try std.testing.expect(isOpaqueEntry("_privacy"));
+    try std.testing.expect(isReservedEntry("_privacy"));
+    try std.testing.expect(!isValidIndexName("_privacy"));
+    try std.testing.expect(isValidIndexName("privacy_index"));
 }

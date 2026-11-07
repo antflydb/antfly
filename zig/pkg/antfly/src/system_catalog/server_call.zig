@@ -269,6 +269,9 @@ pub const Call = union(enum) {
     relation_schema_mutate: RelationSchemaMutation,
     relation_description_mutate: RelationDescriptionMutation,
     query_definition: []const u8,
+    /// Current physical definition, including runtime progress. This private
+    /// point read is deliberately independent of semantic catalog caches.
+    table_record_read: []const u8,
     /// Private body-bound native service provisioning. Old metadata peers
     /// reject this tag before any table or private source is published.
     native_memory_create: Request,
@@ -969,4 +972,10 @@ test "graph preparation calls separate readonly vote authority from independent 
         try std.testing.expectEqual(writes, call.tracksSQLSubmission());
         try std.testing.expectEqual(!writes, call.requiresSettingAuthorityReadGrant());
     }
+}
+
+test "privacy table record transport is a service read without mutation authority" {
+    const read: Call = .{ .table_record_read = "private" };
+    try std.testing.expect(!read.isMutation());
+    try std.testing.expect(!read.requiresAdministrativeGrant());
 }
