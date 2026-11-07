@@ -1058,6 +1058,61 @@ fn runDenseVectorAddIndexMidScenario(allocator: Allocator, path: []const u8, io:
     try handle.db.batch(.{ .writes = &.{.{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker\",\"_embeddings\":{\"dv_idx\":[1.0,0.0]}}" }}, .sync_level = .full_index });
 }
 
+/// Dense-one-commit task 4: an update then a delete of an already-indexed
+/// dense-vector document, each acked at `sync_level: .full_index` (the
+/// level that blocks until the dense index itself is visible, not just the
+/// primary row -- `lite-single-commit-write-path.md` §3.3a). Covers the
+/// crash invariants that scenario doesn't: `commitDenseVectorMappingsWithRollback`
+/// 's own separate commit (`.hbc_metadata_commit`) and
+/// `saveProjectionCheckpointMetadata`'s now-`.ride_along` commit
+/// (`.hbc_checkpoint_commit`) both run on every dense write, not just a
+/// first insert, so an update/delete sweep exercises them repeatedly
+/// (including a ride-along commit losable at any crash point) while the
+/// harness's generic `splitCheckpoints`/`checkInFlightResolution` machinery
+/// still proves "every acknowledged write's effects survive a crash
+/// exactly once, never partially" for each -- the document-level stand-in
+/// this harness has for "every acked vector is queryable after reopen"
+/// (there is no dedicated vector-query `Expectation` field the way
+/// `searchable_after`/`graph_edge_after` exist for full-text/graph; the
+/// marker-field substring check below is this harness's existing
+/// mechanism, same as the add-index-mid scenario above).
+fn runDenseVectorUpdateDeleteScenario(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    var handle = try openDbWithIo(allocator, path, io, true);
+    defer handle.close();
+
+    try handle.db.addIndex(.{
+        .name = "dv_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "dv-doc", .before = null, .after = "dv-doc-marker-v1" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker-v1\",\"_embeddings\":{\"dv_idx\":[1.0,0.0]}}" }}, .sync_level = .full_index });
+
+    // Update: a second write to the SAME key, with a different vector --
+    // exercises `deleteDenseBatchByNameWithOptions`'s replacement-delete
+    // lane (index_manager.zig) ahead of the re-insert, not just a fresh
+    // insert's empty-index fast path.
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "dv-doc", .before = "dv-doc-marker-v1", .after = "dv-doc-marker-v2" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker-v2\",\"_embeddings\":{\"dv_idx\":[0.0,1.0]}}" }}, .sync_level = .full_index });
+
+    // Delete: the dense-vector mapping and HBC posting entry must both be
+    // gone after reopen, in lockstep with the primary row's own tombstone
+    // -- an acknowledged delete whose dense side survives a crash would be
+    // exactly the "published metadata pointing at unwritten/removed
+    // postings" invariant this change's ride-along collapse must not
+    // introduce (lite-single-commit-write-path.md §3.2a).
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "dv-doc", .before = "dv-doc-marker-v2", .after = null }} });
+    try handle.db.batch(.{ .deletes = &.{"dv-doc"}, .sync_level = .full_index });
+
+    // One more insert after the delete, proving the index (and its
+    // ride-along checkpoint commit) is still writable/consistent --
+    // nothing about the delete or the checkpoint's ride-along durability
+    // left the index wedged.
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "dv-doc-2", .before = null, .after = "dv-doc-marker-v3" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "dv-doc-2", .value = "{\"marker\":\"dv-doc-marker-v3\",\"_embeddings\":{\"dv_idx\":[0.5,0.5]}}" }}, .sync_level = .full_index });
+}
+
 /// Sparse analog of `runDenseVectorAddIndexMidScenario`: same bug, same
 /// fix, same shape, with a `sparse_vector` index and the flat
 /// `{"<token id>": <weight>}` `_embeddings` wire shape instead of a dense
@@ -1458,6 +1513,18 @@ test "crash sweep: dense vector add-index mid-scenario" {
     var report = try runCrashSweep(std.testing.allocator, .{
         .name = "dense-vector-add-index-mid-scenario",
         .run = runDenseVectorAddIndexMidScenario,
+        .via_db = true,
+        .search_index = "body_text",
+        .search_field = "body",
+    }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep: dense vector update and delete" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "dense-vector-update-delete",
+        .run = runDenseVectorUpdateDeleteScenario,
         .via_db = true,
         .search_index = "body_text",
         .search_field = "body",
