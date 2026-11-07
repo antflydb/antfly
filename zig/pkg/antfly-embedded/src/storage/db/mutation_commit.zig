@@ -1679,7 +1679,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         if (prepared_relational) |*prepared|
                             if (restored_version) |version| @as(i128, version) else try resolveWriteTimestampFromValue(self, batch_timestamp_ns, prepared.parsedValue())
                         else
-                            try resolveWriteTimestampNs(self, batch_timestamp_ns, write.value)
+                            try resolveWriteTimestampNs(self, restored_version orelse batch_timestamp_ns, write.value)
                     else
                         null;
                     if (!use_preprepared_rows) if (prepared_relational) |*prepared|

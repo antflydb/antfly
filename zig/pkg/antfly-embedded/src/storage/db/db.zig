@@ -148368,6 +148368,20 @@ test "time series historical TTL sources preserve write versions and signed visi
     var reading = (try db.lookup(a, "historical", .{})) orelse return error.TestUnexpectedResult;
     defer reading.deinit(a);
     try std.testing.expectEqual(@as(?u64, 12345), reading.version);
+    var restored_versions: std.StringHashMapUnmanaged(u64) = .empty;
+    defer restored_versions.deinit(a);
+    try restored_versions.put(a, "historical_restored", 12345);
+    try restored_versions.put(a, "fallback_restored", 12347);
+    try db.batchInternal(.{
+        .timestamp_ns = 99999,
+        .writes = &.{
+            .{ .key = "historical_restored", .value = "{\"observed_at\":\"1969-12-31T23:59:59Z\",\"v\":1}" },
+            .{ .key = "fallback_restored", .value = "{}" },
+        },
+    }, null, .{ .restore_timestamps = &restored_versions, .preserve_logical_values = true });
+    try std.testing.expectEqual(@as(u64, 12345), try db.getTimestamp(a, "historical_restored"));
+    try std.testing.expectEqual(@as(?i128, -1_000_000_000), try ttl_mod.readSourceTimestamp(db.core.store, a, "historical_restored"));
+    try std.testing.expectEqual(@as(?i128, 12347), try ttl_mod.readSourceTimestamp(db.core.store, a, "fallback_restored"));
     try db.setSchema(.{ .version = 2, .ttl_field = "observed_at", .ttl_duration_ns = std.time.ns_per_day });
     try db.batch(.{
         .timestamp_ns = 12346,
@@ -148384,4 +148398,5 @@ test "time series historical TTL sources preserve write versions and signed visi
     try db.runUntilIdle();
     try std.testing.expect((try ttl_mod.readSourceTimestamp(db.core.store, a, "historical")) == null);
     try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(a, "epoch"));
+    try std.testing.expect((try ttl_mod.readSourceTimestamp(db.core.store, a, "epoch")) == null);
 }
