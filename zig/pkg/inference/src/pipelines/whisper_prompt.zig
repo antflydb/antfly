@@ -103,7 +103,7 @@ pub const PromptCache = struct {
         var languages = std.ArrayListUnmanaged(LanguageToken).empty;
         defer languages.deinit(allocator);
         for (whisper_language_codes) |code| {
-            const token_id = encodeLanguageToken(allocator, tokenizer, code) orelse continue;
+            const token_id = (try encodeLanguageToken(allocator, tokenizer, code)) orelse continue;
             try languages.append(allocator, .{ .token_id = token_id, .code = code });
         }
         const language_tokens = try languages.toOwnedSlice(allocator);
@@ -131,9 +131,9 @@ pub const PromptCache = struct {
         // <|startofprev|> and <|nospeech|> sit two and one slots before
         // <|notimestamps|>, and <|endoftext|> one before <|startoftranscript|>.
         var decode = DecodeSettings{
-            .start_of_prev_id = encodeSingleSpecialToken(allocator, tokenizer, "<|startofprev|>") orelse no_timestamps_id - 2,
-            .eot_id = encodeSingleSpecialToken(allocator, tokenizer, "<|endoftext|>") orelse 50257,
-            .timestamp_begin_id = encodeSingleSpecialToken(allocator, tokenizer, "<|0.00|>") orelse no_timestamps_id + 1,
+            .start_of_prev_id = (try encodeSingleSpecialToken(allocator, tokenizer, "<|startofprev|>")) orelse no_timestamps_id - 2,
+            .eot_id = (try encodeSingleSpecialToken(allocator, tokenizer, "<|endoftext|>")) orelse 50257,
+            .timestamp_begin_id = (try encodeSingleSpecialToken(allocator, tokenizer, "<|0.00|>")) orelse no_timestamps_id + 1,
         };
         if (generation_data) |data| try parseDecodeSettings(allocator, data, &decode);
         errdefer allocator.free(decode.suppress_tokens);
@@ -211,8 +211,10 @@ pub const PromptCache = struct {
 };
 
 fn parseDecodeSettings(allocator: std.mem.Allocator, data: []const u8, decode: *DecodeSettings) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch
-        return error.InvalidWhisperDecoderConfig;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidWhisperDecoderConfig,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidWhisperDecoderConfig;
     const object = parsed.value.object;
@@ -251,18 +253,18 @@ pub fn nonSpeechTokens(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.To
     };
     const musical = [_][]const u8{ "♩", "♪", "♫", "♬", "♭", "♮", "♯" };
     for ([_][]const u8{ " -", " '" }) |leading| {
-        if (firstToken(allocator, tokenizer, leading)) |id| try appendUnique(allocator, &out, id);
+        if (try firstToken(allocator, tokenizer, leading)) |id| try appendUnique(allocator, &out, id);
     }
     var spaced_buf: [32]u8 = undefined;
     for (symbols) |symbol| {
-        if (singleToken(allocator, tokenizer, symbol)) |id| try appendUnique(allocator, &out, id);
+        if (try singleToken(allocator, tokenizer, symbol)) |id| try appendUnique(allocator, &out, id);
         const spaced = std.fmt.bufPrint(&spaced_buf, " {s}", .{symbol}) catch continue;
-        if (singleToken(allocator, tokenizer, spaced)) |id| try appendUnique(allocator, &out, id);
+        if (try singleToken(allocator, tokenizer, spaced)) |id| try appendUnique(allocator, &out, id);
     }
     for (musical) |symbol| {
-        if (firstToken(allocator, tokenizer, symbol)) |id| try appendUnique(allocator, &out, id);
+        if (try firstToken(allocator, tokenizer, symbol)) |id| try appendUnique(allocator, &out, id);
         const spaced = std.fmt.bufPrint(&spaced_buf, " {s}", .{symbol}) catch continue;
-        if (firstToken(allocator, tokenizer, spaced)) |id| try appendUnique(allocator, &out, id);
+        if (try firstToken(allocator, tokenizer, spaced)) |id| try appendUnique(allocator, &out, id);
     }
     // Control tokens never appear inside a transcript.
     var control: i32 = eot_id + 1;
@@ -274,20 +276,20 @@ pub fn nonSpeechTokens(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.To
 pub fn beginSuppressTokens(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, eot_id: i32) ![]const i32 {
     var out = std.ArrayListUnmanaged(i32).empty;
     errdefer out.deinit(allocator);
-    if (singleToken(allocator, tokenizer, " ")) |id| try appendUnique(allocator, &out, id);
+    if (try singleToken(allocator, tokenizer, " ")) |id| try appendUnique(allocator, &out, id);
     try appendUnique(allocator, &out, eot_id);
     return out.toOwnedSlice(allocator);
 }
 
-fn singleToken(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, text: []const u8) ?i32 {
-    const ids = tokenizer.encode(allocator, text) catch return null;
+fn singleToken(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, text: []const u8) !?i32 {
+    const ids = try tokenizer.encode(allocator, text);
     defer allocator.free(ids);
     if (ids.len != 1 or ids[0] == tokenizer.specialTokens().unk_id) return null;
     return ids[0];
 }
 
-fn firstToken(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, text: []const u8) ?i32 {
-    const ids = tokenizer.encode(allocator, text) catch return null;
+fn firstToken(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, text: []const u8) !?i32 {
+    const ids = try tokenizer.encode(allocator, text);
     defer allocator.free(ids);
     if (ids.len == 0 or ids[0] == tokenizer.specialTokens().unk_id) return null;
     return ids[0];
@@ -350,8 +352,10 @@ fn loadForcedDecoderIdsFromBytes(allocator: std.mem.Allocator, generation_data: 
 }
 
 fn parseForcedDecoderIds(allocator: std.mem.Allocator, data: []const u8) !?[]ForcedDecoderId {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch
-        return error.InvalidWhisperDecoderConfig;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidWhisperDecoderConfig,
+    };
     defer parsed.deinit();
 
     if (parsed.value != .object) return error.InvalidWhisperDecoderConfig;
@@ -429,15 +433,15 @@ fn requireSpecialToken(
     tokenizer: tokenizer_mod.Tokenizer,
     text: []const u8,
 ) !i32 {
-    return encodeSingleSpecialToken(allocator, tokenizer, text) orelse error.MissingWhisperSpecialToken;
+    return (try encodeSingleSpecialToken(allocator, tokenizer, text)) orelse error.MissingWhisperSpecialToken;
 }
 
 fn encodeLanguageToken(
     allocator: std.mem.Allocator,
     tokenizer: tokenizer_mod.Tokenizer,
     language: []const u8,
-) ?i32 {
-    const language_token = std.fmt.allocPrint(allocator, "<|{s}|>", .{language}) catch return null;
+) !?i32 {
+    const language_token = try std.fmt.allocPrint(allocator, "<|{s}|>", .{language});
     defer allocator.free(language_token);
     return encodeSingleSpecialToken(allocator, tokenizer, language_token);
 }
@@ -446,8 +450,8 @@ fn encodeSingleSpecialToken(
     allocator: std.mem.Allocator,
     tokenizer: tokenizer_mod.Tokenizer,
     text: []const u8,
-) ?i32 {
-    const ids = tokenizer.encode(allocator, text) catch return null;
+) !?i32 {
+    const ids = try tokenizer.encode(allocator, text);
     defer allocator.free(ids);
     if (ids.len != 1 or ids[0] == tokenizer.specialTokens().unk_id) return null;
     return ids[0];
