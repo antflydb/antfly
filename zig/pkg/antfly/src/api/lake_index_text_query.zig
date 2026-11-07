@@ -373,7 +373,11 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         request_profile.record(&server.lake_query_metrics, .total, total_started);
         server.lake_query_metrics.retainSlowLake(request_profile);
     };
-    const shared = if (!build_recent and req.dense == null and req.sparse == null and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.full_text_queries.len == 0) scope else null;
+    // The public full_text_index selector normalizes one text query into a
+    // named component. It still uses this same immutable prepared source;
+    // exclude actual multi-component requests, not explicit index selection.
+    const shared = if (!build_recent and req.dense == null and req.sparse == null and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and
+        (req.full_text_queries.len == 0 or (req.full_text_queries.len == 1 and req.full_text == null))) scope else null;
     const reused = if (shared) |owner| try owner.find(current_table, req) else null;
     if (reused != null) {
         is_lake = true;
