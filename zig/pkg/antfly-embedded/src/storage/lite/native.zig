@@ -12701,11 +12701,46 @@ pub const NativeFile = struct {
         writes.undo.shrinkRetainingCapacity(sp.undo_mark);
     }
 
+    /// Evicts `self.page_cache` for every page noted in
+    /// `self.manifest_builder.entries` (every page any commit in the
+    /// current since-last-durable window has written, appended or reused --
+    /// `PageWriteBatch.flushCount`'s `note` call is the one choke point
+    /// every page write passes through) that is below `boundary_page_count`.
+    ///
+    /// Both callers (`rollbackTransactionSavepoint`, `discardTransactionTail`)
+    /// restore some earlier checkpoint's root pointers after a member or a
+    /// whole transaction fails, which un-references any page it *reused*
+    /// (a recycled, pre-existing id below the restored checkpoint's own
+    /// `page_count`) -- but a reused page's fresh content was already
+    /// write-through-cached under that id by `PageWriteBatch.flushCount`
+    /// (`file.cacheWrittenPage`) before the failure, and restoring root
+    /// pointers alone does not touch the cache. Left alone, that stale,
+    /// never-durable content stays live under the page id for whichever
+    /// later allocation reuses it next -- deterministically likely, since
+    /// the free list this failed attempt drew from is otherwise untouched.
+    /// A retry (of the same mutation, or any other transaction that reuses
+    /// the same ids) can then read that abandoned content back by page id
+    /// for its own bookkeeping and wrongly conclude part of its work is
+    /// already done, silently skipping it -- an acknowledged write quietly
+    /// missing content. Evicting a page that an earlier, still-valid
+    /// non-durable commit in the same window wrote is a harmless,
+    /// reads-through-to-disk no-op (that commit's bytes are correct and
+    /// durable-in-memory), never a correctness cost. Must run before the
+    /// caller resets `manifest_builder` (neither caller does so beforehand).
+    fn evictCacheForPagesReusedSince(self: *NativeFile, boundary_page_count: u64) void {
+        if (!manifest_commits_enabled) return;
+        var it = self.manifest_builder.entries.keyIterator();
+        while (it.next()) |page_id| {
+            if (page_id.* < boundary_page_count) self.page_cache.remove(self.allocator, page_id.*);
+        }
+    }
+
     /// Undo every entry staged since `sp`. Restores the private checkpoint
     /// snapshot unconditionally (a no-op if nothing flushed since `sp`), and
     /// additionally replays the undo log against `writes.maps` when the
     /// `TransactionWrites` instance from `sp` is still the live one.
     pub fn rollbackTransactionSavepoint(self: *NativeFile, sp: TransactionSavepoint) void {
+        self.evictCacheForPagesReusedSince(sp.checkpoint.page_count);
         defer self.header.checkpoints[self.header.active_checkpoint] = sp.checkpoint;
         const writes = self.transaction_writes orelse return;
         if (self.transaction_writes_generation != sp.writes_generation) return; // already superseded by the checkpoint restore above.
@@ -12763,9 +12798,18 @@ pub const NativeFile = struct {
         self.namespace_directory_delta_depth = 0;
     }
 
+    /// Rolls back a failed/aborted transaction. `page_cache.discardFrom`
+    /// only evicts pages `>= first_page` (the newly appended tail, which
+    /// `setLength` below also physically truncates away) -- it
+    /// deliberately preserves everything below that boundary as belonging
+    /// to the restored checkpoint (`self.header`, already reset to
+    /// `previous` by every caller before this runs). `evictCacheForPagesReusedSince`
+    /// (see its own doc comment) closes the gap that leaves for a page this
+    /// failed attempt *reused* rather than appended.
     fn discardTransactionTail(self: *NativeFile) void {
         const first_page = self.activeCheckpoint().page_count;
         self.page_cache.discardFrom(self.allocator, first_page);
+        self.evictCacheForPagesReusedSince(first_page);
         const size = first_page * @as(u64, self.header.page_size);
         self.file.setLength(self.runtimeIo(), size) catch {
             self.checkpoint_publication_uncertain = true;
