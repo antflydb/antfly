@@ -13549,6 +13549,7 @@ const DocumentPreparationPipeline = struct {
             var context = self.producer.invocation_context;
             context.cancellation = .{ .ptr = self, .is_cancelled_fn = isCancelled };
             context.progress = null;
+            context.document_checkpoints = null;
             const producer = scopedAssetProducer(&self.context, self.producer.withInvocationContext(context), &cancellation);
             const a = self.allocator();
             if (isCancelled(self)) return error.Canceled;
