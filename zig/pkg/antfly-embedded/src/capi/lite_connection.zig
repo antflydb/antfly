@@ -8276,14 +8276,20 @@ test "capi native maintenance nested admission preserves index and outcome fence
     defer fixture.deinit();
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
     const owner = fixture.connection.owner;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var catalog: PublicationCatalog = undefined;
     const root = blk: {
         var lease = try fixture.connection.acquire();
         defer {
             lease.close();
             fixture.connection.gate.mutex.unlock(h.handleLockIo());
         }
-        break :blk try owner.refreshMaintenanceSnapshot(try owner.refresh(), .source);
+        const snapshot = try owner.refreshMaintenanceSnapshot(try owner.refresh(), .source);
+        catalog = try PublicationCatalog.captureForStoragePublication(arena.allocator(), snapshot, &snapshot.db, "default");
+        break :blk snapshot;
     };
+    defer catalog.deinit();
     var publication_overhead: std.atomic.Value(u64) = .init(0);
     var publication: PreparedPublication = .{
         .owner = owner,
@@ -8304,6 +8310,11 @@ test "capi native maintenance nested admission preserves index and outcome fence
         root.maintenance_owner = null;
         root.maintenance_publication = null;
     }
+    // Production admission requires the owned catalog witness. Missing proof
+    // must fail closed; the valid nesting exercise below supplies a real one.
+    try std.testing.expectError(error.EnrichmentWaitCanceled, Owner.enterMaintenanceWriter(root, .primary));
+    try std.testing.expectEqual(@as(usize, 0), root.maintenance_writer_references);
+    publication.catalog = &catalog;
     const hold_before = owner.publication_stats.publication_hold_ns;
     const site_before = owner.publication_stats.maintenance_hold_sites.writer_primary.count;
     try Owner.enterMaintenanceWriter(root, .primary);
