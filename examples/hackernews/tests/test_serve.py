@@ -26,7 +26,13 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from serve import Gateway, next_cursor, search_request
+from serve import (
+    Gateway,
+    MAX_CURSOR_BYTES,
+    MAX_SEARCH_REQUEST_BYTES,
+    next_cursor,
+    search_request,
+)
 
 
 class SearchGatewayTest(unittest.TestCase):
@@ -107,6 +113,7 @@ class SearchGatewayTest(unittest.TestCase):
         self.assertIsNone(next_cursor(first, {"hits": {"hits": []}}))
 
     def test_wire_views_route_to_their_query_owner_and_resume(self):
+        composed_cursor = "source3:" + "a" * 200_000
         pages = []
         owner = self
 
@@ -139,7 +146,7 @@ class SearchGatewayTest(unittest.TestCase):
                 self.end_headers()
                 result = owner.page()
                 if self.path == "/db/v1/query":
-                    result["next_source_cursor"] = "composed-page"
+                    result["next_source_cursor"] = composed_cursor
                 elif "search_after" in query:
                     result["hits"]["hits"] = []
                 self.wfile.write(json.dumps({"responses": [result]}).encode())
@@ -184,7 +191,7 @@ class SearchGatewayTest(unittest.TestCase):
             first = call({"q": "database"})
             call({"q": "database", "cursor": first["cursor"]})
             self.assertEqual(pages[-1][0], "/db/v1/query")
-            self.assertEqual(pages[-1][1]["source_cursor"], "composed-page")
+            self.assertEqual(pages[-1][1]["source_cursor"], composed_cursor)
             from qualify_gateway import probe
 
             result, evidence = probe(
@@ -213,10 +220,103 @@ class SearchGatewayTest(unittest.TestCase):
             {"q": "database", "statement": "DELETE FROM private"},
             {"q": "database", "view": []},
             {"q": "database", "cursor": {}},
-            {"q": "database", "cursor": "x" * 65537},
+            {"q": "database", "cursor": "x" * (MAX_CURSOR_BYTES + 1)},
+            {"q": "database", "cursor": "非ASCII"},
         ):
             with self.subTest(value=str(value)[:80]), self.assertRaises(ValueError):
                 search_request(value)
+
+    def test_backend_cursor_bound_is_checked_before_returning_a_page(self):
+        query = search_request({"q": "database"})
+        for cursor in ({}, "x" * (MAX_CURSOR_BYTES + 1), "非ASCII"):
+            with self.assertRaises(ValueError):
+                next_cursor(query, {"next_source_cursor": cursor})
+
+    def test_body_deadline_and_truncated_upload_release_capacity(self):
+        import socket
+        import time
+
+        class ShortDeadline(Gateway):
+            body_read_timeout_seconds = 0.2
+
+            def log_message(self, *args):
+                pass
+
+            def upstream(self, *args, **kwargs):
+                return {"responses": [{"hits": {"hits": []}}]}
+
+        for truncated in (False, True):
+            with self.subTest(truncated=truncated):
+                server = ThreadingHTTPServer(("127.0.0.1", 0), ShortDeadline)
+                server.searches = threading.BoundedSemaphore(1)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                client = socket.create_connection(server.server_address, timeout=2)
+                stop = threading.Event()
+
+                def trickle():
+                    while not stop.wait(0.03):
+                        try:
+                            client.sendall(b" ")
+                        except OSError:
+                            return
+
+                writer = threading.Thread(target=trickle, daemon=True)
+                try:
+                    started = time.monotonic()
+                    client.sendall(
+                        b"POST /api/search HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100000\r\n\r\n{"
+                    )
+                    if truncated:
+                        client.shutdown(socket.SHUT_WR)
+                    else:
+                        writer.start()
+                    with client.makefile("rb") as response:
+                        self.assertIn(b" 400 ", response.readline())
+                    self.assertLess(time.monotonic() - started, 1.5)
+                    stop.set()
+                    self.assertTrue(server.searches.acquire(timeout=1))
+                    server.searches.release()
+                    with urlopen(
+                        Request(
+                            f"http://127.0.0.1:{server.server_port}/api/search",
+                            json.dumps({"q": "database"}).encode(),
+                        ),
+                        timeout=2,
+                    ) as response:
+                        self.assertEqual(response.status, 200)
+                finally:
+                    stop.set()
+                    if writer.ident is not None:
+                        writer.join()
+                    client.close()
+                    server.shutdown()
+                    server.server_close()
+                    thread.join()
+
+    def test_saturated_gateway_rejects_before_waiting_for_request_body(self):
+        from http.client import HTTPConnection
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Gateway)
+        server.searches = threading.BoundedSemaphore(1)
+        server.searches.acquire()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        try:
+            connection.putrequest("POST", "/api/search")
+            connection.putheader("Content-Length", str(MAX_SEARCH_REQUEST_BYTES))
+            connection.endheaders()
+            # Deliberately do not send a body: admission must reject first.
+            response = connection.getresponse()
+            self.assertEqual(response.status, 429)
+            response.read()
+        finally:
+            connection.close()
+            server.searches.release()
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
     def test_wire_routes_do_not_proxy_administration_or_invalid_input(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), Gateway)

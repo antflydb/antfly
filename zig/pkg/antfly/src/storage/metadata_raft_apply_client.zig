@@ -279,6 +279,9 @@ pub const RaftApplyStore = struct {
     pub fn getLakeIndexLifecycle(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
         return self.projectionWithAllocator([]u8, alloc, .{ .kind = .lake_index_lifecycle, .group_id = group_id, .arg0 = table_id });
     }
+    pub fn getLakeSourceOwner(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
+        return self.projectionWithAllocator([]u8, alloc, .{ .kind = .lake_source_owner, .group_id = group_id, .arg0 = table_id });
+    }
     pub fn lakeIndexLifecycleWork(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after: ?u64) ![]u8 {
         return self.projectionWithAllocator([]u8, alloc, .{ .kind = .lake_index_lifecycle_work, .group_id = group_id, .arg0 = after orelse 0, .arg1 = @intFromBool(after != null) });
     }
