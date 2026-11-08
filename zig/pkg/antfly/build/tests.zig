@@ -467,7 +467,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
     const lake_catalog_step = b.step("antfly-lake-index-catalog-test", "Run durable native lake index generation framing and decoder admission contracts");
     for ([_]*std.Build.Module{ metadata_unit_baseline_mods[8], metadata_unit_baseline_mods[1] }) |module| {
-        const tests = b.addTest(.{ .root_module = module, .filters = &.{"metadata.lake index"} });
+        const tests = b.addTest(.{ .root_module = module, .filters = &.{ "metadata.lake index", "metadata.lake reader authority", "metadata raft apply store snapshot key registry" } });
         lake_catalog_step.dependOn(&b.addRunArtifact(tests).step);
     }
     const system_catalog_projection_tests = b.addTest(.{

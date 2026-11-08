@@ -154,3 +154,34 @@ def test_native_cohort_consumes_only_foreign_markers_without_a_false_checkpoint(
         )
     assert list(state.db.entries("change:"))
     state.db.close()
+
+
+def test_unknown_native_acceptance_preserves_exact_request_and_checkpoint(monkeypatch):
+    from types import SimpleNamespace
+
+    intent = {
+        "endpoint": "https://antfly/db/v1/tables/hn/lake/changes",
+        "body": {"batch_id": "stable", "checkpoint": "10", "expected_checkpoint": "9"},
+        "pending": [["change:1", "marker"]],
+    }
+    values = {
+        "native_changes_request": json.dumps(intent),
+        "native_changes_checkpoint": "9",
+    }
+    state = SimpleNamespace(get=values.get, set=values.__setitem__)
+    sent = []
+
+    def unknown(request, **kwargs):
+        sent.append(request.data)
+        response = Accepted(1)
+        response.data = json.dumps({"state": "unknown", "searchable": False})
+        return response
+
+    monkeypatch.setattr(native_ingest, "authorization_headers", lambda: {})
+    monkeypatch.setattr(native_ingest, "urlopen", unknown)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="unconfirmed"):
+            native_ingest.publish(state, "https://antfly/db/v1", "hn")
+        assert json.loads(values["native_changes_request"]) == intent
+        assert values["native_changes_checkpoint"] == "9"
+    assert sent[0] == sent[1]
