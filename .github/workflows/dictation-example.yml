@@ -1,20 +1,24 @@
 name: Dictation example
 
 on:
-  # Keep macOS runs scoped to example build/test inputs; documentation-only
-  # and unrelated repository changes do not need this runner.
-  pull_request:
-    paths:
-      - 'examples/dictation/Sources/**'
-      - 'examples/dictation/Tests/**'
-      - 'examples/dictation/Assets/**'
-      - 'examples/dictation/presets/**'
-      - 'examples/dictation/*.swift'
-      - 'examples/dictation/*.sh'
-      - 'examples/dictation/Package.resolved'
-      - 'examples/dictation/Info.plist'
-      - 'examples/dictation/antfly.yaml'
-      - '.github/workflows/dictation-example.yml'
+  workflow_call:
+    inputs:
+      pr_number:
+        type: string
+        default: ''
+      head_sha:
+        type: string
+        default: ''
+      base_sha:
+        type: string
+        default: ''
+      check_id:
+        type: string
+        default: ''
+      comment_id:
+        type: string
+        default: ''
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -31,17 +35,39 @@ on:
 
 permissions:
   contents: read
+  checks: read
+  pull-requests: read
 
 concurrency:
-  group: dictation-${{ github.ref }}
+  group: dictation-${{ inputs.pr_number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  admission:
+    uses: ./.github/workflows/pr-ci-admission.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ inputs.head_sha }}
+      base_sha: ${{ inputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+      suite: dictation
+
   macos:
+    needs: admission
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) }}
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
       - name: Test configuration, streaming, and persistence clients
         run: examples/dictation/test.sh
       - name: Build signed application bundle

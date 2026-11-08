@@ -132,6 +132,7 @@ pub const LeannStore = struct {
 
     /// Opens the store kept in `dir_path`, loading its file when present.
     pub fn open(alloc: Allocator, io: std.Io, dir_path: []const u8, opts: Options) !*LeannStore {
+        if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
         if (opts.dims == 0) return error.InvalidIndexConfig;
         // Reject a graph configuration the first build would refuse (for
         // example RaBitQ below two dimensions) before any write is accepted;
@@ -923,6 +924,9 @@ fn normalize(v: []f32) void {
 }
 
 fn writeFileAtomicallyDurable(alloc: Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
+    // In-memory browser indexes never publish host files. Keep their close and
+    // sync paths independent of native directory handles and POSIX constants.
+    if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
     const fs_paths = @import("antfly_runtime_fs").fs_paths;
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
     defer alloc.free(tmp_path);
