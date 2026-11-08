@@ -2102,6 +2102,13 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     for ([_][]const u8{ "{", "{\"query_json\":\"{\"}" }) |invalid_json| {
         try std.testing.expectError(error.InvalidQueryRequest, owner.queryJson("docs", invalid_json));
     }
+    // Kernel operations relay query-provider errors under the query version,
+    // while failures originating in the outer owner retain its own version.
+    try std.testing.expectError(error.InvalidQueryRequest, owner.preflightJson("docs", "{"));
+    try std.testing.expectError(error.InvalidQueryRequest, owner.textStatsJson("docs", "{"));
+    try std.testing.expectError(error.InvalidQueryRequest, owner.algebraicPartialsJson("docs", "{"));
+    try std.testing.expectError(error.InvalidQueryRequest, owner.graphExpandJson("docs", "{", null, null, null));
+    try std.testing.expectError(error.InvalidArgument, owner.preflightJson("other", "{}"));
 
     // The nested distributed -> storage-owner -> local-query path must retain
     // both the semantic status and its originating stage, not merely rethrow a
