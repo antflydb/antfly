@@ -7,6 +7,9 @@ import SwiftUI
 
 @main enum DictationLauncher {
   static func main() {
+    if CommandLine.arguments.dropFirst().first == "--managed-runtime-child" {
+      executeManagedRuntimeChild(arguments: CommandLine.arguments)
+    }
     if ["--managed-runtime", "--managed-runtime-pull"].contains(
       CommandLine.arguments.dropFirst().first ?? "")
     {
@@ -71,6 +74,7 @@ struct MenuContent: View {
       Text("Antfly Dictation").font(.headline)
       Text(store.phase.label).font(.headline)
       Text(store.message).font(.caption).textSelection(.enabled)
+      if store.config.usesManagedRuntime { RuntimeSummary(runtime: store.runtime) }
       if !store.processingWarning.isEmpty {
         Text(store.processingWarning).font(.caption).foregroundStyle(.secondary)
       }
@@ -78,8 +82,10 @@ struct MenuContent: View {
       HStack {
         Button(store.state == .recording ? "Finish" : "Record") {
           if store.state == .recording { store.finish() } else { store.start() }
-        }.disabled(store.state == .processing)
-        Button("Cancel") { store.cancel() }.disabled(store.state == .idle)
+        }.disabled(store.state == .processing || store.working)
+        Button("Cancel") {
+          if store.settingUpModel { store.cancelModelSetup() } else { store.cancel() }
+        }.disabled(store.state == .idle && !store.settingUpModel)
         Button("Copy") { store.copy(store.result.isEmpty ? store.preview : store.result) }.disabled(
           store.result.isEmpty && store.preview.isEmpty)
       }
@@ -136,7 +142,9 @@ struct SettingsView: View {
           store.state != .idle || store.working || store.capturingShortcut)
         Button("Export JSON…") { store.exportSettings() }
         Spacer()
-        Button("Cancel recording / request") { store.cancel() }.disabled(store.state == .idle)
+        Button(store.settingUpModel ? "Cancel model setup" : "Cancel recording / request") {
+          if store.settingUpModel { store.cancelModelSetup() } else { store.cancel() }
+        }.disabled(store.state == .idle && !store.settingUpModel)
       }
     }.padding(20)
   }
@@ -418,4 +426,9 @@ private struct RuntimeControls: View {
       "Whisper requires a model download. Apple speech requires macOS 26; selecting it allows Apple speech asset downloads. Model discovery shows readiness. No cleanup model is selected automatically."
     ).font(.caption)
   }
+}
+
+private struct RuntimeSummary: View {
+  @ObservedObject var runtime: ManagedRuntime
+  var body: some View { Text(runtime.status).font(.caption).foregroundStyle(.secondary) }
 }

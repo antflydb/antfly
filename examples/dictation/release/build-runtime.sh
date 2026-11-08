@@ -24,14 +24,15 @@ if (( ${sdk_version%%.*} < 27 )); then
   exit 1
 fi
 stage="$root/examples/dictation/.build/runtime"
+rm -rf "$stage/universal"
 mkdir -p "$stage/slices" "$stage/universal/lib"
 # App and engine are one compatibility unit, pinned to this source commit.
 # Keep one Zig prefix and reuse its worktree-local cache across architectures.
 for arch in arm64 x86_64; do
   target=aarch64-macos.14.0
   if [[ "$arch" == x86_64 ]]; then target=x86_64-macos.14.0; fi
-  (cd zig && zig build antfly apple-native-bridge -Dtarget="$target" -Dcpu=baseline \
-    -Doptimize=fast -Dapple-providers=true -Dmetal=true -Dsystem-blas=true \
+  (cd zig && python3 tools/run_bounded_zig_build.py --zig zig --report "$stage/progress-$arch.json" -- build --summary all antfly apple-native-bridge -Dtarget="$target" -Dcpu=baseline \
+    -Doptimize=fast -Dstrip=true -Dapple-providers=true -Dmetal=true -Dsystem-blas=true \
     --prefix "$root/zig/zig-out" --cache-dir "$root/zig/.zig-cache")
   mkdir -p "$stage/slices/$arch"
   cp zig/zig-out/bin/antfly "$stage/slices/$arch/antfly"
@@ -46,3 +47,5 @@ from pathlib import Path
 Path(sys.argv[1]).write_text(json.dumps({"schema_version": 1, "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()}) + "\n")
 PY
 chmod +x "$stage/universal/antfly"
+# Execute only in the credential-free source build, never in the signing job.
+env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin "$stage/universal/antfly" --version

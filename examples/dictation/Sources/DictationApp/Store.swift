@@ -10,6 +10,8 @@ import SwiftUI
   @Published var config = Configuration()
   let runtime: ManagedRuntime
   private var runtimeModeTask: Task<Void, Never>?
+  private var modelSetupTask: Task<Void, Never>?
+  @Published private(set) var settingUpModel = false
   @Published var history: [HistoryEntry] = []
   @Published var state = RecordingState.idle
   @Published var phase = DictationPhase.idle { didSet { updateOverlay() } }
@@ -880,29 +882,56 @@ import SwiftUI
       refreshModels()
     }
   }
+  private func runModelSetup(_ action: @escaping @MainActor () async throws -> Void) {
+    guard !working, !terminating, state == .idle, config.usesManagedRuntime else { return }
+    working = true
+    settingUpModel = true
+    message = "Setting up local recognition…"
+    modelSetupTask = Task {
+      defer {
+        if !terminating { working = false }
+        settingUpModel = false
+        modelSetupTask = nil
+      }
+      do {
+        try Task.checkCancellation()
+        try await action()
+        try Task.checkCancellation()
+        guard !terminating else { throw CancellationError() }
+        _ = try persistSettings()
+      } catch is CancellationError {
+        message = "Model setup canceled."
+        if !terminating, config.usesManagedRuntime { runtime.start() }
+      } catch {
+        message = error.localizedDescription
+      }
+    }
+  }
+  func cancelModelSetup() {
+    modelSetupTask?.cancel()
+    runtime.cancelDownload()
+  }
   func installLocalWhisper() {
-    guard config.usesManagedRuntime else { return }
-    run {
+    runModelSetup {
       try await self.runtime.installWhisper()
+      try Task.checkCancellation()
       for index in self.config.presets.indices {
         self.config.presets[index].model = "transcribers/whisper"
         self.config.presets[index].transcriberRoute = .gateway
         self.config.presets[index].cleanupModel = ""
       }
-      _ = try self.persistSettings()
       self.message = "Whisper selected. The local engine is restarting."
     }
   }
   func useLocalApple() {
-    guard config.usesManagedRuntime else { return }
-    run {
+    runModelSetup {
       try await self.runtime.enableAppleAssets()
+      try Task.checkCancellation()
       for index in self.config.presets.indices {
         self.config.presets[index].model = "transcribers/apple-speech"
         self.config.presets[index].transcriberRoute = .gateway
         self.config.presets[index].cleanupModel = ""
       }
-      _ = try self.persistSettings()
       self.message = "Apple speech selected. The engine will report asset and locale readiness."
     }
   }
@@ -984,6 +1013,8 @@ import SwiftUI
     await audioArchiveTask?.value
     runtimeModeTask?.cancel()
     await runtimeModeTask?.value
+    cancelModelSetup()
+    await modelSetupTask?.value
     await runtime.stop()
   }
   /// Sparkle may fail or the user may cancel after local work has drained.

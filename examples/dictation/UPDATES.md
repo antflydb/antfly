@@ -268,7 +268,8 @@ protects the runtime data directory. Its Antfly child binds only to
 127.0.0.1 on ports 47831 and 47832. Occupied ports block startup; the app never
 attaches to or kills an unrelated server. A private pipe ties the supervisor's
 lifetime to the app: EOF on quit, update, or app crash terminates the owned child,
-with a ten-second grace period before killing only that still-owned process.
+with a ten-second grace period before killing its isolated process group, including
+any owned inference workers. It never signals a shared process group.
 Unexpected exits get at most three retries with exponential backoff. Startup
 has a one-minute readiness deadline, and Settings provides status, retry, and
 bounded diagnostics. Startup does not imply a transcription model is ready.
@@ -280,11 +281,11 @@ Public inference and table APIs require authentication. Missing credentials for
 existing data cause a recoverable error; the app does not reset the database.
 The supervised environment excludes developer DYLD overrides and provider keys.
 
-Models and data live in `~/Library/Application Support/AntflyDictation/Runtime`,
+Whisper models and engine data live in `~/Library/Application Support/AntflyDictation/Runtime`,
 outside the app. **Download Whisper Tiny…** explicitly downloads the transcription
-model and restarts the engine to discover it. Downloads have their own supervisor
+model and restarts the engine to discover it. Downloads have their own supervisor, an explicit Cancel model setup action,
 and stop when the app exits. **Use Apple speech** selects native recognition and
-allows Apple's asset setup; locale, OS, hardware, and Apple Intelligence readiness
+allows Apple's OS-managed asset setup; locale, OS, hardware, and Apple Intelligence readiness
 remain visible through model discovery. Both choices select recognition without
 cleanup. Users can choose a discovered cleanup generator explicitly. An existing
 server configuration is never edited or upgraded by this flow.

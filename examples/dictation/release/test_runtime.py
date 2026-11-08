@@ -117,8 +117,128 @@ while true; do sleep 0.1; done
             args[args.index("--models-dir") + 1], str(self.root / "models")
         )
 
+    def test_termination_reaches_owned_worker_processes(self):
+        self.child.write_text(
+            "#!/bin/bash\ntrap 'exit 0' TERM\nsleep 300 &\necho $! > '"
+            + str(self.root / "worker")
+            + "'\necho $$ > '"
+            + str(self.root / "pid")
+            + "'\nwait\n"
+        )
+        process = self.launch()
+        self.wait_file("pid")
+        worker = int(self.wait_file("worker").read_text())
+        self.finish(process)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(worker, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("owned inference worker survived supervisor shutdown")
+
+    def test_stubborn_engine_is_force_stopped_after_its_grace_period(self):
+        self.child.write_text(
+            "#!/bin/bash\ntrap '' TERM\necho $$ > '"
+            + str(self.root / "pid")
+            + "'\nexec /bin/sleep 300\n"
+        )
+        process = self.launch()
+        pid = int(self.wait_file("pid").read_text())
+        began = time.monotonic()
+        self.finish(process)
+        self.assertGreaterEqual(time.monotonic() - began, 8)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
     def test_noisy_engine_has_a_bounded_log(self):
         self.child.write_text("#!/bin/bash\nhead -c 4194304 /dev/zero\nsleep 0.2\n")
         process = self.launch("--managed-runtime-pull")
         self.assertEqual(process.wait(timeout=10), 0)
         self.assertLessEqual((self.root / "download.log").stat().st_size, 1048576)
+
+
+@unittest.skipUnless(
+    os.environ.get("DICTATION_TEST_RUNTIME") and os.environ.get("DICTATION_TEST_APP"),
+    "Set app and real runtime paths for a live bundled-engine smoke test",
+)
+class LiveRuntimeTests(unittest.TestCase):
+    def test_bundled_engine_bootstraps_auth_and_stops_with_the_app(self):
+        import base64
+        import json
+        import urllib.request
+        import urllib.error
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "antfly.json").write_text(
+                json.dumps(
+                    {
+                        "enable_auth": True,
+                        "public_inference": {"enabled": True},
+                        "transcribers": {
+                            "whisper": {
+                                "provider": "antfly",
+                                "model": "openai/whisper-tiny",
+                            },
+                            "apple-speech": {
+                                "provider": "apple",
+                                "language_code": "en-US",
+                                "download_assets": False,
+                            },
+                        },
+                        "generators": {
+                            "cleanup": {"provider": "apple", "max_tokens": 1024}
+                        },
+                    }
+                )
+            )
+            password = "synthetic-live-bootstrap-password"
+            process = subprocess.Popen(
+                [
+                    os.environ["DICTATION_TEST_APP"],
+                    "--managed-runtime",
+                    os.environ["DICTATION_TEST_RUNTIME"],
+                    str(root),
+                ],
+                stdin=subprocess.PIPE,
+            )
+            try:
+                process.stdin.write((password + "\n").encode())
+                process.stdin.flush()
+                url = "http://127.0.0.1:47831/ai/v1/models"
+                request = urllib.request.Request(
+                    url,
+                    headers={
+                        "Authorization": "Basic "
+                        + base64.b64encode(("admin:" + password).encode()).decode()
+                    },
+                )
+                deadline = time.monotonic() + 60
+                body = None
+                while time.monotonic() < deadline and process.poll() is None:
+                    try:
+                        with urllib.request.urlopen(request, timeout=1) as response:
+                            body = json.load(response)
+                        break
+                    except (OSError, urllib.error.HTTPError):
+                        time.sleep(0.2)
+                self.assertIsNotNone(
+                    body,
+                    (root / "runtime.log").read_text()
+                    if (root / "runtime.log").exists()
+                    else "no runtime log",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as unauthenticated:
+                    urllib.request.urlopen(url, timeout=2)
+                self.assertIn(unauthenticated.exception.code, (401, 403))
+                self.assertTrue((root / "data").is_dir())
+            finally:
+                process.stdin.close()
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()

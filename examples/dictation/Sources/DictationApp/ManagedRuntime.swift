@@ -209,9 +209,11 @@ import Security
     busy = false
     status = "Local engine stopped."
   }
+  func cancelDownload() { try? downloadControl?.fileHandleForWriting.close() }
   func enableAppleAssets() async throws {
     try Data().write(to: directory.appendingPathComponent("apple-assets-enabled"), options: .atomic)
     await stop()
+    try Task.checkCancellation()
     start()
   }
   func installWhisper() async throws {
@@ -220,6 +222,9 @@ import Security
     }
     busy = true
     defer {
+      if status == "Downloading Whisper Tiny…" {
+        status = Task.isCancelled ? "Model download canceled." : "Model download stopped."
+      }
       if startup == nil { busy = false }
       download = nil
       try? downloadControl?.fileHandleForWriting.close()
@@ -252,6 +257,7 @@ import Security
     }
     status = "Whisper downloaded. Restarting the local engine…"
     await stop()
+    try Task.checkCancellation()
     start()
   }
 }
@@ -304,7 +310,7 @@ func superviseManagedRuntime(arguments: [String]) -> Int32 {
     guard (12...72).contains(bootstrapPassword.count) else { return 77 }
   }
   let child = Process()
-  child.executableURL = URL(fileURLWithPath: runtime)
+  child.executableURL = Bundle.main.executableURL
   child.arguments = [
     "standalone", "--host", "127.0.0.1", "--port", "47831", "--health-port", "47832",
     "--config", root.appendingPathComponent("antfly.json").path,
@@ -317,6 +323,7 @@ func superviseManagedRuntime(arguments: [String]) -> Int32 {
       "--models-dir", root.appendingPathComponent("models").path,
     ]
   }
+  child.arguments = ["--managed-runtime-child", runtime] + (child.arguments ?? [])
   // Never inherit developer DYLD overrides or provider credentials.
   child.environment = [
     "HOME": NSHomeDirectory(), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
@@ -337,19 +344,39 @@ func superviseManagedRuntime(arguments: [String]) -> Int32 {
     logger.write(Data((error.localizedDescription + "\n").utf8))
     return 70
   }
-  DispatchQueue.global().async {
-    // EOF means normal quit, Sparkle replacement, or an app crash.
-    while !FileHandle.standardInput.availableData.isEmpty {}
-    if child.isRunning { child.terminate() }
-    for _ in 0..<100 {
-      if !child.isRunning { return }
-      Thread.sleep(forTimeInterval: 0.1)
+  // The exec trampoline puts Antfly and any inference workers in a new
+  // process group before exec. Never signal the app's or another server's group.
+  while child.isRunning {
+    var descriptor = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN | POLLHUP), revents: 0)
+    let result = poll(&descriptor, 1, 200)
+    if result < 0 && errno != EINTR { break }
+    if result > 0 {
+      if descriptor.revents & Int16(POLLHUP | POLLERR) != 0 { break }
+      if FileHandle.standardInput.readData(ofLength: 4096).isEmpty { break }
     }
-    if child.isRunning { kill(child.processIdentifier, SIGKILL) }
   }
+  let group = -child.processIdentifier
+  if kill(group, SIGTERM) != 0, child.isRunning { child.terminate() }
+  for _ in 0..<100 {
+    if kill(group, 0) != 0 { break }
+    Thread.sleep(forTimeInterval: 0.1)
+  }
+  if kill(group, 0) == 0 { kill(group, SIGKILL) }
   child.waitUntilExit()
   output.fileHandleForReading.readabilityHandler = nil
   return child.terminationStatus
+}
+
+/// No application state is initialized in this mode. exec preserves the child's
+/// PID as its process-group identity, including for a runtime that forks workers.
+func executeManagedRuntimeChild(arguments: [String]) -> Never {
+  guard arguments.count >= 3, getpgrp() == getpid() || setpgid(0, 0) == 0 else { exit(71) }
+  var values = arguments.dropFirst(2).map { strdup($0) }
+  values.append(nil)
+  values.withUnsafeMutableBufferPointer { buffer in
+    _ = execv(arguments[2], buffer.baseAddress!)
+  }
+  exit(70)
 }
 
 private final class RuntimeLog: @unchecked Sendable {
@@ -357,8 +384,10 @@ private final class RuntimeLog: @unchecked Sendable {
   private var handle: FileHandle?
   private var bytes = 0
   init(_ url: URL) {
-    _ = FileManager.default.createFile(
-      atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600])
+    if !FileManager.default.fileExists(atPath: url.path) {
+      _ = FileManager.default.createFile(
+        atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600])
+    }
     handle = try? FileHandle(forWritingTo: url)
     bytes = Int((try? handle?.seekToEnd()) ?? 0)
   }

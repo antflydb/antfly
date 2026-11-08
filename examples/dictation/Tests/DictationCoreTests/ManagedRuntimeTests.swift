@@ -65,3 +65,20 @@ import Testing
   )
   await runtime.stop()
 }
+
+@MainActor @Test func quitDrainsModelSetupAndKeepsInstallationQuiesced() async throws {
+  let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let store = Store(
+    directory: root, registerHotkey: false, credentialReader: { _ in "" },
+    credentialWriter: { _, _ in })
+  store.config.connectionMode = .managed
+  let original = store.config.presets
+  store.installLocalWhisper()
+  #expect(store.settingUpModel && store.working)
+  await store.prepareToQuit()
+  #expect(!store.settingUpModel)
+  #expect(store.working)
+  #expect(store.config.presets == original)
+  #expect(!store.runtime.ready)
+}

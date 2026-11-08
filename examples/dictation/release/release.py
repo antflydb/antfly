@@ -215,7 +215,9 @@ def verify_bundle(bundle, identity, key):
     for path in (executable, bridge):
         for arch in ("arm64", "x86_64"):
             run("lipo", "-verify_arch", arch, str(path))
-        for dependency in run("otool", "-L", str(path)).splitlines()[1:]:
+        for dependency in run("otool", "-L", str(path)).splitlines():
+            if not dependency[:1].isspace():
+                continue  # Fat binary architecture headings are not dependencies.
             linked = dependency.strip().split(" ", 1)[0]
             if linked.startswith("/") and not linked.startswith(
                 ("/System/Library/", "/usr/lib/")
@@ -230,14 +232,6 @@ def verify_bundle(bundle, identity, key):
     ):
         raise ValueError("Bundled runtime requires a newer macOS than the app")
     # Apple bridge is deliberately lazy loaded only on supported macOS versions.
-    run(
-        "env",
-        "-i",
-        "HOME=" + str(Path.home()),
-        "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
-        str(executable),
-        "--version",
-    )
 
 
 def verify_unsigned_zip(archive):

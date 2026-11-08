@@ -60,6 +60,9 @@ jobs:
           persist-credentials: false
       - id: toolchain
         uses: ./.github/actions/load-toolchain-policy
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ steps.toolchain.outputs.python_build }}
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
@@ -76,6 +79,7 @@ jobs:
           UNIVERSAL_BUILD: '1'
         run: |
           examples/dictation/build-app.sh
+          DICTATION_TEST_APP="$PWD/examples/dictation/dist/Antfly Dictation.app/Contents/MacOS/AntflyDictation" DICTATION_TEST_RUNTIME="$PWD/examples/dictation/dist/Antfly Dictation.app/Contents/Resources/Runtime/antfly" python3 -m unittest discover -s examples/dictation/release -p 'test_runtime.py'
           ditto -c -k --sequesterRsrc --keepParent 'examples/dictation/dist/Antfly Dictation.app' dist-unsigned.zip
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
