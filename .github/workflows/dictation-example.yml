@@ -9,12 +9,14 @@ on:
       - 'examples/dictation/Tests/**'
       - 'examples/dictation/Assets/**'
       - 'examples/dictation/presets/**'
+      - 'examples/dictation/release/**'
       - 'examples/dictation/*.swift'
       - 'examples/dictation/*.sh'
       - 'examples/dictation/Package.resolved'
       - 'examples/dictation/Info.plist'
       - 'examples/dictation/antfly.yaml'
       - '.github/workflows/dictation-example.yml'
+      - '.github/workflows/dictation-release*.yml'
   push:
     branches: [main]
     paths:
@@ -22,12 +24,14 @@ on:
       - 'examples/dictation/Tests/**'
       - 'examples/dictation/Assets/**'
       - 'examples/dictation/presets/**'
+      - 'examples/dictation/release/**'
       - 'examples/dictation/*.swift'
       - 'examples/dictation/*.sh'
       - 'examples/dictation/Package.resolved'
       - 'examples/dictation/Info.plist'
       - 'examples/dictation/antfly.yaml'
       - '.github/workflows/dictation-example.yml'
+      - '.github/workflows/dictation-release*.yml'
 
 permissions:
   contents: read
@@ -42,6 +46,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test release policy
+        run: |
+          bash examples/dictation/release/fetch-tools.sh
+          python3 -m unittest discover -s examples/dictation/release -p 'test_*.py'
       - name: Test configuration, streaming, and persistence clients
         run: examples/dictation/test.sh
       - name: Build signed application bundle

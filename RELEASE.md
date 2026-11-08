@@ -57,6 +57,17 @@ platform archive, and run `./install.sh --prefix "$HOME/.local"`. The installer
 copies only grep and its supporting assets; no Antfly server or libantfly is
 required. Add the selected prefix's `bin` directory to `PATH`.
 
+## Independent dictation app releases
+
+The macOS dictation app has independent `dictation/vX.Y.Z` and
+`dictation/vX.Y.Z-{beta,rc}.N` tags. Its default-branch controller builds a
+universal app without credentials, then uses a protected `dictation-release`
+environment for Developer ID signing, notarization, and signed Sparkle updates.
+Publication consumes the exact signed artifact and advances stable/beta feeds
+after immutable downloads exist. It does not update Antfly servers, models, or
+the repository-wide Latest release. See
+[dictation updates and release setup](examples/dictation/UPDATES.md).
+
 ## Release Artifacts
 
 The canonical Zig runtime artifacts are tarballs named:

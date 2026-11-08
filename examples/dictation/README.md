@@ -9,7 +9,7 @@ per-app preset selection, a dictionary, incremental Whisper cleanup, JSON import
 Antfly settings snapshots, and optional searchable history.
 
 The app uses SwiftUI, AVAudioEngine, Carbon global hotkeys, Accessibility, and
-Keychain. It has no third-party Swift dependencies. Apple Speech runs through
+Keychain. Sparkle is its pinned third-party update dependency. Apple Speech runs through
 Antfly's existing native provider; the app does not ship a second speech engine.
 
 ## Build and run
@@ -377,3 +377,14 @@ an ad hoc signed bundle can invalidate its existing macOS Accessibility grant.
 The macOS example workflow runs only for changes to this example’s build/test
 inputs or its workflow definition. Documentation-only and unrelated repository
 changes skip the dictation test and signed-app build job.
+
+## App updates
+
+Official releases use Sparkle for signed stable/beta updates, with update controls
+in Settings and the application menu. Development builds never enable updating.
+Install official releases in Applications; restarts wait for dictation and local
+persistence to finish. Server and model updates remain independent.
+
+See [updates and release setup](UPDATES.md) for organization signing credentials,
+notarization, protected GitHub setup, independent release tags, recovery, and the
+optional managed-local-server design.

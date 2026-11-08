@@ -444,3 +444,16 @@ prevent later publication. A canceled clip permanently loses publication eligibi
 canceling a newer queued clip cannot restore it. Both native and TypeScript stream clients treat
 completion as terminal for transcript and delta events, rejecting late mutations
 and duplicate completions rather than accepting unvalidated text.
+
+### Desktop app updates
+
+Official macOS releases support signed Sparkle updates, automatic-check and
+download preferences, and beta opt-in. Install the signed app in Applications.
+An update restart waits for dictation and setup to finish, then drains owned
+clipboard restoration and local persistence. Development builds have updating
+disabled. App updates preserve Application Support and Keychain data and do not
+replace the configured Antfly server or models.
+
+See the [release setup guide](https://github.com/antflydb/antfly/blob/main/examples/dictation/UPDATES.md)
+for organization signing, notarization, release qualification, and the separate
+optional managed-local-runtime design.

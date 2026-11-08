@@ -11,5 +11,6 @@
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSMicrophoneUsageDescription</key><string>Record audio while you hold the dictation shortcut and send it to your configured Antfly server.</string>
+<key>AntflyUpdatesEnabled</key><false/>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

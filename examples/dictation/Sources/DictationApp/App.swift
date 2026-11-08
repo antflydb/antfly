@@ -8,13 +8,25 @@ import SwiftUI
 @main struct DictationApp: App {
   @NSApplicationDelegateAdaptor(DictationLifecycle.self) private var lifecycle
   @StateObject private var store = Store()
+  @StateObject private var updates = AppUpdates()
   var body: some Scene {
     WindowGroup("Antfly Dictation", id: "settings") {
-      SettingsView(store: store).frame(minWidth: 760, minHeight: 640)
-        .onAppear { lifecycle.store = store }
+      SettingsView(store: store, updates: updates).frame(minWidth: 760, minHeight: 640)
+        .onAppear {
+          lifecycle.store = store
+          updates.start(store: store)
+        }
+    }
+    .commands {
+      CommandGroup(after: .appInfo) {
+        Button("Check for Updates…") { updates.check() }.disabled(!updates.canCheck)
+      }
     }
     MenuBarExtra {
-      MenuContent(store: store).onAppear { lifecycle.store = store }
+      MenuContent(store: store, updates: updates).onAppear {
+        lifecycle.store = store
+        updates.start(store: store)
+      }
     } label: {
       Image(
         systemName: store.state == .recording
@@ -41,6 +53,7 @@ import SwiftUI
 
 struct MenuContent: View {
   @ObservedObject var store: Store
+  @ObservedObject var updates: AppUpdates
   @Environment(\.openWindow) var openWindow
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
@@ -69,6 +82,7 @@ struct MenuContent: View {
         openWindow(id: "settings")
         NSApp.activate(ignoringOtherApps: true)
       }
+      Button("Check for Updates…") { updates.check() }.disabled(!updates.canCheck)
       Button("Quit") {
         store.cancel()
         NSApp.terminate(nil)
@@ -79,6 +93,7 @@ struct MenuContent: View {
 
 struct SettingsView: View {
   @ObservedObject var store: Store
+  @ObservedObject var updates: AppUpdates
   var body: some View {
     VStack(alignment: .leading) {
       HStack {
@@ -156,6 +171,7 @@ struct SettingsView: View {
           Toggle("Press to toggle recording instead of hold to talk", isOn: $store.config.toggle)
           Toggle("Paste into the original focused text field", isOn: $store.config.autoPaste)
         }
+        UpdateSettings(updates: updates)
         Section("Retention") {
           Toggle("Save transcript history locally and in Antfly", isOn: $store.config.retainHistory)
           Toggle("Keep last audio recording locally", isOn: $store.config.retainAudio)

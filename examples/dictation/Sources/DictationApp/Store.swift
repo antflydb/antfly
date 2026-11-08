@@ -914,6 +914,15 @@ import SwiftUI
     await historyPersistenceTask?.value
     await audioArchiveTask?.value
   }
+  /// Sparkle may fail or the user may cancel after local work has drained.
+  /// Keep the current installed app usable when no replacement was installed.
+  func resumeAfterFailedUpdate() {
+    guard terminating else { return }
+    terminating = false
+    working = false
+    do { try registerShortcut() } catch { shortcutStatus = error.localizedDescription }
+    message = "Update canceled or failed. The current app is ready to use."
+  }
   func retry() {
     guard state == .idle, !working, let recording = retryRecording, let original = retryPreset
     else {
